@@ -50,6 +50,8 @@ jobs:
         run: |
           mkdir -p rust-micro/.tmp/reactos/reactos/inf
           cp references/reactos/win32ss/drivers/miniport/bochs/bochsmp.inf rust-micro/.tmp/reactos/reactos/inf/bochsmp.inf
+      - name: Executive layout static rule
+        run: scripts/check_executive_layout_statics.sh
       - uses: dtolnay/rust-toolchain@stable
       - name: Workspace unit, integration and doc specs
         run: cargo test --workspace --locked --no-fail-fast 2>&1 | tee crate-specs.log
