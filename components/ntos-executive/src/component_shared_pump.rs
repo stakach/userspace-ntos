@@ -21,10 +21,12 @@ static INLINE_SOURCE_WORK_TRACE_N: AtomicU64 = AtomicU64::new(0);
 
 /// Observation only: a nested physical Receive bypasses the root's outer
 /// preflight, so retain evidence if a live registry retry is not covered.
-fn trace_nested_registry_wake_gap(ch: &PumpChannel, route: PeerRoute, blocking: bool) {
+fn trace_nested_registry_wake_gap(
+    ch: &PumpChannel, route: PeerRoute, blocking: bool, clock: &mut nt_time::PhaseClock,
+) {
     if !blocking { return; }
     let Some(deadline) = crate::registry_mutation_work::next_deadline() else { return; };
-    let now = crate::monotonic_time_100ns();
+    let now = clock.now(|| crate::monotonic_time_100ns());
     if crate::LAST_REARM_AUTHORITY.covers(now, deadline)
         || NESTED_REGISTRY_WAKE_GAP_TRACE_N.fetch_add(1, Ordering::Relaxed) >= 16
     {
@@ -531,13 +533,15 @@ impl ReceiveCensusScope {
 
 fn record_active_syscall_provider_arrival(
     scope: &ReceiveCensusScope, kind: u64, route: u64, reply: u64, info: u64,
+    clock: &mut nt_time::PhaseClock,
 ) {
     let Some((index, sequence)) = scope.syscall_snapshot else { return; };
     let slot = &ACTIVE_SYSCALL_SNAPSHOTS[index];
     if slot.sequence.load(Ordering::Acquire) != sequence { return; }
     slot.begin_update();
     slot.provider_arrivals.fetch_add(1, Ordering::Relaxed);
-    slot.last_provider_at_100ns.store(crate::monotonic_time_100ns(), Ordering::Relaxed);
+    slot.last_provider_at_100ns.store(
+        clock.now(|| crate::monotonic_time_100ns()), Ordering::Relaxed);
     slot.last_arrival_kind.store(kind, Ordering::Relaxed);
     slot.last_arrival_route.store(route, Ordering::Relaxed);
     slot.last_arrival_reply.store(reply, Ordering::Relaxed);
@@ -547,6 +551,7 @@ fn record_active_syscall_provider_arrival(
 
 fn record_active_syscall_notification(
     scope: &ReceiveCensusScope, badge: u64, info: u64, timer_probe: bool,
+    clock: &mut nt_time::PhaseClock,
 ) {
     let Some((index, sequence)) = scope.syscall_snapshot else { return; };
     let slot = &ACTIVE_SYSCALL_SNAPSHOTS[index];
@@ -555,26 +560,32 @@ fn record_active_syscall_notification(
     slot.notification_badge.store(badge, Ordering::Relaxed);
     slot.notification_info.store(info, Ordering::Relaxed);
     slot.notification_timer_probe.store(u64::from(timer_probe), Ordering::Relaxed);
-    slot.notification_at_100ns.store(crate::monotonic_time_100ns(), Ordering::Relaxed);
+    slot.notification_at_100ns.store(
+        clock.now(|| crate::monotonic_time_100ns()), Ordering::Relaxed);
     slot.end_update();
 }
 
-fn record_active_syscall_transition(scope: &ReceiveCensusScope, phase: u64) {
+fn record_active_syscall_transition(
+    scope: &ReceiveCensusScope, phase: u64, clock: &mut nt_time::PhaseClock,
+) {
     let Some((index, sequence)) = scope.syscall_snapshot else { return; };
     let slot = &ACTIVE_SYSCALL_SNAPSHOTS[index];
     if slot.sequence.load(Ordering::Acquire) != sequence { return; }
     if slot.phase.load(Ordering::Relaxed) == phase { return; }
     slot.begin_update();
-    slot.last_transition_at_100ns.store(crate::monotonic_time_100ns(), Ordering::Relaxed);
+    slot.last_transition_at_100ns.store(
+        clock.now(|| crate::monotonic_time_100ns()), Ordering::Relaxed);
     slot.phase.store(phase, Ordering::Release);
     slot.end_update();
 }
 
-fn record_active_syscall_physical_owner(scope: &ReceiveCensusScope, route: PeerRoute, tcb: u64) {
+fn record_active_syscall_physical_owner(
+    scope: &ReceiveCensusScope, route: PeerRoute, tcb: u64, clock: &mut nt_time::PhaseClock,
+) {
     let Some((index, sequence)) = scope.syscall_snapshot else { return; };
     let slot = &ACTIVE_SYSCALL_SNAPSHOTS[index];
     if slot.sequence.load(Ordering::Acquire) != sequence { return; }
-    let now = crate::monotonic_time_100ns();
+    let now = clock.now(|| crate::monotonic_time_100ns());
     let last = slot.last_binding_at_100ns.load(Ordering::Relaxed);
     // This samples the binding before Recv; Recv can change it while blocked. The kernel query
     // can be expensive, so refresh at most once per five seconds and print the sample's age.
@@ -599,9 +610,12 @@ fn record_active_syscall_physical_owner(scope: &ReceiveCensusScope, route: PeerR
             route, route_domain, route_generation, lane_index, lane_generation, tcb, reply,
         ) }
     };
+    // The kernel query above is not back-to-back bookkeeping: time the sample after it.
+    clock.end_phase();
     slot.begin_update();
     slot.reply_binding.store(observation as u64, Ordering::Relaxed);
-    slot.last_binding_at_100ns.store(crate::monotonic_time_100ns(), Ordering::Release);
+    slot.last_binding_at_100ns.store(
+        clock.now(|| crate::monotonic_time_100ns()), Ordering::Release);
     slot.end_update();
 }
 
@@ -829,8 +843,12 @@ pub(super) unsafe fn receive(
     let mut irq_checkpoint = inline_irq_checkpoint && inline_irq_work_pending();
     let mut timer_probe_consumed = false;
     let mut observed_nested_file = false;
+    // Census timestamps only. One reading covers the bookkeeping before a physical Receive
+    // and one covers the bookkeeping after it; the pump work in between ends each phase.
+    let mut census_clock = nt_time::PhaseClock::new();
     loop {
-        record_active_syscall_transition(&census_scope, SYSCALL_PHASE_PUMP_WORK);
+        record_active_syscall_transition(
+            &census_scope, SYSCALL_PHASE_PUMP_WORK, &mut census_clock);
         trace_ps_create_receive(ch, b"loop", Some(route));
         if !retained_seh {
             let _stage = StageScope::enter(ch, Stage::YieldPreflight);
@@ -1186,8 +1204,10 @@ pub(super) unsafe fn receive(
         trace_ps_create_receive(ch, b"physical-receive", Some(route));
         let file_receive = crate::driver_launch::file_rpc_pump_for_diagnostic(ch);
         let receive_started = if file_receive { crate::disk_census_ticks() } else { 0 };
-        record_active_syscall_physical_owner(&census_scope, route, ch.tcb);
-        record_active_syscall_transition(&census_scope, SYSCALL_PHASE_PHYSICAL_WAIT);
+        census_clock.end_phase();
+        record_active_syscall_physical_owner(&census_scope, route, ch.tcb, &mut census_clock);
+        record_active_syscall_transition(
+            &census_scope, SYSCALL_PHASE_PHYSICAL_WAIT, &mut census_clock);
         if observed_nested_file {
             crate::driver_launch::trace_port_connect_outer_probe(45, ch, 0);
         }
@@ -1196,26 +1216,31 @@ pub(super) unsafe fn receive(
             crate::print_str(b"[pump-ingress] registry retry timer unavailable\n");
             return PumpMessage::transport_wall();
         }
-        trace_nested_registry_wake_gap(ch, route, blocking);
+        trace_nested_registry_wake_gap(ch, route, blocking, &mut census_clock);
+        // The Receive below can block: nothing after it may reuse a reading taken before it.
+        census_clock.end_phase();
         let arrival = runtime::receive(execution, ch.tcb, blocking);
         match arrival {
             Ok(runtime::Arrival::Hosted) => {
                 observe_pump_receive_return(ch, observed_nested_file, file_receive,
                     receive_started, &FILE_RECEIVE_HOSTED, true);
-                record_active_syscall_transition(&census_scope, SYSCALL_PHASE_HOSTED);
-                record_active_syscall_provider_arrival(&census_scope, 1, 0, 0, 0);
+                record_active_syscall_transition(
+                    &census_scope, SYSCALL_PHASE_HOSTED, &mut census_clock);
+                record_active_syscall_provider_arrival(
+                    &census_scope, 1, 0, 0, 0, &mut census_clock);
                 trace_ps_create_receive(ch, b"hosted-arrival", Some(route));
                 trace_ps_create_event(b"hosted-arrival", route, 0, 0);
             }
             Ok(runtime::Arrival::Call { route: sender, reply }) => {
                 observe_pump_receive_return(ch, observed_nested_file, file_receive,
                     receive_started, &FILE_RECEIVE_CALL, true);
-                record_active_syscall_transition(&census_scope, SYSCALL_PHASE_CALL);
+                record_active_syscall_transition(
+                    &census_scope, SYSCALL_PHASE_CALL, &mut census_clock);
                 let info = runtime::pending_route_snapshot(sender)
                     .ok().flatten().filter(|(held_reply, _)| *held_reply == reply)
                     .map_or(0, |(_, info)| info);
                 record_active_syscall_provider_arrival(
-                    &census_scope, 2, sender.badge(), reply, info,
+                    &census_scope, 2, sender.badge(), reply, info, &mut census_clock,
                 );
                 trace_ps_create_receive(ch, b"call-arrival", Some(sender));
                 trace_ps_create_event(b"call-arrival", sender, reply, 0);
@@ -1230,9 +1255,11 @@ pub(super) unsafe fn receive(
                 };
                 observe_pump_receive_return(ch, observed_nested_file, file_receive,
                     receive_started, counter, true);
-                record_active_syscall_transition(&census_scope, SYSCALL_PHASE_NOTIFICATION);
+                record_active_syscall_transition(
+                    &census_scope, SYSCALL_PHASE_NOTIFICATION, &mut census_clock);
                 record_active_syscall_notification(
                     &census_scope, message.badge(), message.info(), timer_checkpoint,
+                    &mut census_clock,
                 );
                 trace_ps_create_receive(ch, b"notification", Some(route));
                 // The shared ingress has already proven NoCall with a free Reply. An empty
@@ -1249,7 +1276,8 @@ pub(super) unsafe fn receive(
                 }
                 {
                     let _stage = StageScope::enter(ch, Stage::CensusTick);
-                    crate::census_tick_static(crate::monotonic_time_100ns());
+                    crate::census_tick_static(
+                        census_clock.now(|| crate::monotonic_time_100ns()));
                 }
                 let (event, _, irq) = {
                     let _stage = StageScope::enter(ch, Stage::EventBadge);

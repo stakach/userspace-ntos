@@ -13,6 +13,8 @@ pub use deferred_work::{CoalescedRetryWake, DeferredWorkWake, RetainedWakeLatenc
     RetryWakeAttempt, WakeLatencySample, WakeLatencySnapshot};
 mod rearm_request;
 pub use rearm_request::{DeferredRearm, RearmRequest};
+mod phase_clock;
+pub use phase_clock::PhaseClock;
 mod rearm_checkpoint;
 pub use rearm_checkpoint::{reconcile_rearm, RearmCheckpoint};
 
