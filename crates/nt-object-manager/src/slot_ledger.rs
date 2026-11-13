@@ -8,7 +8,11 @@
 //!   index plus generation cannot resolve to a later occupant of the same index;
 //! - an index returns to the free queue only through [`SlotLedger::release`], which refuses
 //!   while the caller still counts references to the occupant. A refused slot stays occupied;
-//! - free indices are reused oldest first, and the table is extended only when none is free.
+//! - free indices are reused oldest first, and the table is extended only when none is
+//!   reusable. With a reuse delay of `n`, the `n` most recently released indices are held
+//!   back, so an index stays vacant for at least `n` further releases. The delay bounds how
+//!   soon an index can name a new occupant; it is a margin for references that carry no
+//!   generation, not a substitute for the release check.
 //!
 //! The free queue is threaded through the slot records, so releasing never allocates.
 
@@ -65,23 +69,35 @@ pub struct SlotLedger {
     /// Most recently released slot.
     free_tail: Option<usize>,
     free: usize,
+    reuse_delay: usize,
     issued: u64,
 }
 
 impl SlotLedger {
     pub const fn new() -> Self {
+        Self::with_reuse_delay(0)
+    }
+
+    /// A ledger that keeps the `reuse_delay` most recently released indices vacant.
+    pub const fn with_reuse_delay(reuse_delay: usize) -> Self {
         Self {
             slots: Vec::new(),
             free_head: None,
             free_tail: None,
             free: 0,
+            reuse_delay,
             issued: 0,
         }
     }
 
+    /// Free slots old enough to be handed out again.
+    fn reusable(&self) -> usize {
+        self.free.saturating_sub(self.reuse_delay)
+    }
+
     /// How many of the next `allocations` would extend the table.
     pub fn appends_needed(&self, allocations: usize) -> usize {
-        allocations.saturating_sub(self.free)
+        allocations.saturating_sub(self.reusable())
     }
 
     /// Make the next `allocations` infallible with respect to ledger memory.
@@ -96,7 +112,7 @@ impl SlotLedger {
             .issued
             .checked_add(1)
             .ok_or(SlotError::GenerationExhausted)?;
-        let index = match self.free_head {
+        let index = match self.free_head.filter(|_| self.reusable() != 0) {
             Some(index) => {
                 let Slot::Free { next } = self.slots[index] else {
                     unreachable!("the free queue names an occupied slot");

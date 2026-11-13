@@ -6985,6 +6985,20 @@ pub(crate) static CENSUS_PERIODIC_DUMPS: AtomicU64 = AtomicU64::new(0);
 /// without the main loop top ever being reached — which is exactly why the previous batch's failing
 /// boot produced no census at all past its 6th dump. The dispatch arm ticks the same clock.
 pub(crate) static CENSUS_LAST_DUMP: AtomicU64 = AtomicU64::new(0);
+/// Object namespace table length, live entries and free slots. The service loop samples them
+/// when a dump is due; a dump raised from a nested pump prints the previous sample.
+static OBJ_NS_CENSUS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Refresh the object namespace sample if the next [`census_tick_static`] will dump.
+pub(crate) fn sample_object_namespace_census(namespace: &ObjectNamespace, now: u64) {
+    if now.wrapping_sub(CENSUS_LAST_DUMP.load(Ordering::Relaxed)) < CENSUS_PERIOD_100NS {
+        return;
+    }
+    let census = namespace.census();
+    for (sample, value) in OBJ_NS_CENSUS.iter().zip([census.len, census.live, census.free]) {
+        sample.store(value as u64, Ordering::Relaxed);
+    }
+}
 
 /// ═══ PER-SSN WIN32K WALL-CLOCK ═══════════════════════════════════════════════════════════════
 ///
@@ -7257,6 +7271,11 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     print_u64(heap.transient_high_water as u64);
     print_str(b"/");
     print_u64(heap.transient_capacity as u64);
+    print_str(b" obj-ns-len/live/free=");
+    for (index, sample) in OBJ_NS_CENSUS.iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(sample.load(Ordering::Relaxed));
+    }
     print_str(b" timer=");
     print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));
     print_str(b"/");

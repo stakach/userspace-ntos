@@ -890,6 +890,7 @@ pub(super) unsafe fn maintain(
                 crate::disk_census_ticks().wrapping_sub(quiesce_started),
                 Ordering::Relaxed,
             );
+            crate::sample_object_namespace_census(&nt_handler.obj_ns, now);
             census_tick_static(now);
             native_process_time_census::sample_after_census(&nt_handler);
             installer_child_span_census::maybe_sample_gap(&nt_handler, now);

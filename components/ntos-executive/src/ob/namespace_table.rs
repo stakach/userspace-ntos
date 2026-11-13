@@ -1,11 +1,22 @@
 //! The executive's compact object namespace table.
 //!
 //! An entry's index is the native identity of its object: handles, dispatcher state and wait
-//! records name the object by index. The table is the only place an index is handed out, and
-//! the only place a newly created entry is taken back before publication.
+//! records name the object by index. The table is the only place an index is handed out and
+//! the only place one is taken back.
+//!
+//! Slot policy lives in `nt_object_manager::slot_ledger`. A retired slot is reused, oldest
+//! first, only when its retirement reported no outstanding reference; every occupant gets a
+//! fresh `identity`, so a reference that records index plus identity cannot resolve to a later
+//! occupant. An entry deleted in place with [`ObjEntry::unlink`] keeps its slot for good.
+//!
+//! Handles, dispatcher state and wait records name an object by bare index. They are counted
+//! before a slot is freed (`slot_retirement.rs`, and the Event registry's retirement proof),
+//! and the [`SLOT_REUSE_DELAY`] most recently freed slots are held back as a margin for an
+//! index a running operation still holds in a local.
 
 use crate::*;
 use core::ops::{Deref, DerefMut};
+use nt_object_manager::slot_ledger::SlotLedger;
 
 /// One node in the executive's minimal object-manager namespace. Inline, `Copy`, no nested heap
 /// allocation. NT object leaf names are allowed to be long enough for BaseNamedObjects mutexes
@@ -15,7 +26,7 @@ use core::ops::{Deref, DerefMut};
 /// unlinked when their final body reference goes away.
 #[derive(Clone, Copy)]
 pub(crate) struct ObjEntry {
-    /// Issued once per entry and never reused, unlike the entry's index.
+    /// The slot generation: issued once per entry and never reused, unlike the entry's index.
     pub(crate) identity: u64,
     pub(crate) name: [u8; OBJ_NAME_CAP], // stored ASCII leaf; directory objects retain caller spelling
     pub(crate) name_len: u8,
@@ -55,7 +66,8 @@ impl ObjEntry {
         &self.target[..self.target_len as usize]
     }
 
-    /// Delete the object in place. The slot keeps its index and is never handed out again.
+    /// Delete the object in place. The slot stays occupied, so its index is not handed out
+    /// again; [`ObjectNamespace::retire`] is the form that can free it.
     pub(crate) fn unlink(&mut self) {
         self.name = [0; OBJ_NAME_CAP];
         self.name_len = 0;
@@ -69,11 +81,28 @@ impl ObjEntry {
     }
 }
 
+/// Freed slots held back from reuse. The table's length is bounded by its peak live entries
+/// plus this many slots.
+const SLOT_REUSE_DELAY: usize = 64;
+
+/// What the periodic census reports about the table.
+#[derive(Clone, Copy)]
+pub(crate) struct ObjectNamespaceCensus {
+    /// Table length: every index ever handed out.
+    pub(crate) len: usize,
+    pub(crate) live: usize,
+    /// Retired slots waiting to be reused.
+    pub(crate) free: usize,
+}
+
 /// The namespace entries plus the policy that hands out their indices. Entries are read and
-/// updated in place through the slice view; only the table adds or removes one.
+/// updated in place through the slice view; only the table adds or frees one. Every slot the
+/// ledger knows has an entry, and a free slot's entry is deleted.
 pub(crate) struct ObjectNamespace {
     entries: Vec<ObjEntry>,
-    next_identity: u64,
+    slots: SlotLedger,
+    /// The most recent allocation, until it is retired.
+    newest: Option<usize>,
     growth_traces: u64,
 }
 
@@ -93,19 +122,30 @@ impl DerefMut for ObjectNamespace {
 
 impl ObjectNamespace {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
+        let mut slots = SlotLedger::with_reuse_delay(SLOT_REUSE_DELAY);
+        slots
+            .reserve(capacity)
+            .expect("initial object namespace slot ledger");
         Self {
             entries: Vec::with_capacity(capacity),
-            next_identity: 1,
+            slots,
+            newest: None,
             growth_traces: 0,
         }
     }
 
     /// Make the next `additional` insertions infallible.
     pub(crate) fn try_reserve(&mut self, additional: usize) -> Result<(), ()> {
+        let appends = self.slots.appends_needed(additional);
+        if appends == 0 {
+            return Ok(());
+        }
+        // The table outlives any transient scope its caller is in.
+        let _durable = allocator::enter_durable();
         let old_capacity = self.entries.capacity();
-        self.entries.try_reserve(additional).map_err(|_| ())?;
+        self.entries.try_reserve(appends).map_err(|_| ())?;
         self.trace_growth(old_capacity);
-        Ok(())
+        self.slots.reserve(additional).map_err(|_| ())
     }
 
     fn trace_growth(&mut self, old_capacity: usize) {
@@ -125,18 +165,27 @@ impl ObjectNamespace {
         }
     }
 
-    fn push_vacant(&mut self) -> Option<usize> {
-        let identity = self.next_identity;
-        let next_identity = identity.checked_add(1)?;
-        if self.entries.len() == self.entries.capacity() {
-            let old_capacity = self.entries.capacity();
-            self.entries.try_reserve(64).ok()?;
-            self.trace_growth(old_capacity);
+    /// Hand out a slot holding a deleted entry with a fresh identity: a retired slot if one is
+    /// free, otherwise a new index at the end of the table.
+    fn allocate_vacant(&mut self) -> Option<usize> {
+        if self.slots.appends_needed(1) != 0 {
+            let _durable = allocator::enter_durable();
+            if self.entries.len() == self.entries.capacity() {
+                let old_capacity = self.entries.capacity();
+                self.entries.try_reserve(64).ok()?;
+                self.trace_growth(old_capacity);
+            }
+            self.slots.reserve(1).ok()?;
         }
-        self.next_identity = next_identity;
-        let index = self.entries.len();
-        self.entries.push(ObjEntry::vacant(identity));
-        Some(index)
+        let slot = self.slots.allocate().ok()?;
+        let entry = ObjEntry::vacant(slot.generation());
+        if slot.index() == self.entries.len() {
+            self.entries.push(entry);
+        } else {
+            self.entries[slot.index()] = entry;
+        }
+        self.newest = Some(slot.index());
+        Some(slot.index())
     }
 
     pub(crate) fn push_kind(
@@ -147,7 +196,7 @@ impl ObjectNamespace {
         target: &[u8],
         permanent: bool,
     ) -> Option<usize> {
-        let index = self.push_vacant()?;
+        let index = self.allocate_vacant()?;
         let entry = &mut self.entries[index];
         entry.parent = parent;
         entry.kind = kind;
@@ -177,13 +226,40 @@ impl ObjectNamespace {
         self.push_kind(name, parent, OBJ_KIND_SYMBOLIC_LINK, target, permanent)
     }
 
-    /// Take back an entry the current operation created, before any reference to it was
-    /// published. Returns whether the entry was removed; the caller then drops its backing.
-    pub(crate) fn discard_unpublished(&mut self, index: usize) -> bool {
-        if index + 1 != self.entries.len() {
+    /// Delete the live object at `index` and decide whether its slot may be reused.
+    ///
+    /// `outstanding_references` counts whatever outside the table still names the index:
+    /// process handles, wait records, dispatcher state, the Event registry binding. Only a
+    /// retirement that reports none queues the slot for reuse; otherwise the entry is deleted
+    /// in place and keeps its slot, exactly as [`ObjEntry::unlink`] does. Returns whether a
+    /// live entry was deleted.
+    pub(crate) fn retire(&mut self, index: usize, outstanding_references: usize) -> bool {
+        let Some(entry) = self.entries.get_mut(index).filter(|entry| entry.is_live()) else {
             return false;
+        };
+        entry.unlink();
+        if self.newest == Some(index) {
+            self.newest = None;
         }
-        self.entries.pop();
+        if let Some(slot) = self.slots.current(index) {
+            // A refusal leaves the slot occupied by the deleted entry.
+            let _ = self.slots.release(slot, outstanding_references);
+        }
         true
+    }
+
+    /// Whether `index` is the table's most recent allocation and still live. A creator that
+    /// fails before publishing its object rolls back only such an entry: nothing allocated
+    /// since can name it as a parent.
+    pub(crate) fn is_newest(&self, index: usize) -> bool {
+        self.newest == Some(index) && self.entries.get(index).is_some_and(ObjEntry::is_live)
+    }
+
+    pub(crate) fn census(&self) -> ObjectNamespaceCensus {
+        ObjectNamespaceCensus {
+            len: self.entries.len(),
+            live: self.entries.iter().filter(|entry| entry.is_live()).count(),
+            free: self.slots.census().free,
+        }
     }
 }

@@ -25114,27 +25114,31 @@ impl ExecNtHandler {
                 let _ = self.request_event_object_delete(id, b"new-event-rollback", true);
             }
         }
-        if self.obj_ns.discard_unpublished(index) {
+        if self.obj_ns.is_newest(index) {
             self.events.remove_existing(index as u64);
+            self.retire_namespace_slot(index);
         }
     }
 
     fn rollback_new_timer(&mut self, index: usize) {
-        if self.obj_ns.discard_unpublished(index) {
+        if self.obj_ns.is_newest(index) {
             self.events.remove_existing(index as u64);
             self.user_timer_remove(index as u64);
+            self.retire_namespace_slot(index);
         }
     }
 
     fn rollback_new_semaphore(&mut self, index: usize) {
-        if self.obj_ns.discard_unpublished(index) {
+        if self.obj_ns.is_newest(index) {
             self.semaphores.remove(index as u64);
+            self.retire_namespace_slot(index);
         }
     }
 
     fn rollback_new_mutant(&mut self, index: usize) {
-        if self.obj_ns.discard_unpublished(index) {
+        if self.obj_ns.is_newest(index) {
             self.mutants.remove(index as u64);
+            self.retire_namespace_slot(index);
         }
     }
 
@@ -25145,7 +25149,8 @@ impl ExecNtHandler {
         let identity = entry.identity;
         let parent = entry.parent;
         let parent_identity = self.obj_ns.get(parent).map(|entry| entry.identity);
-        if self.obj_ns.discard_unpublished(index) {
+        if self.obj_ns.is_newest(index) {
+            self.retire_namespace_slot(index);
             self.directory_security.retain(|record| record.identity() != identity);
             if let Some(identity) = parent_identity {
                 self.retire_directory_security_body(parent, identity);
@@ -25814,7 +25819,13 @@ impl ExecNtHandler {
         }
         let parent = self.obj_ns[index].parent;
         let parent_identity = self.obj_ns.get(parent).map(|entry| entry.identity);
-        self.obj_ns[index].unlink();
+        if Self::object_namespace_handle_tag(kind, index).is_some() {
+            // Handles to these kinds encode the index, so the slot is reused only once the
+            // handle tables, the wait records and the dispatcher stores no longer name it.
+            self.retire_namespace_slot(index);
+        } else {
+            self.obj_ns[index].unlink();
+        }
         if let Some(identity) = parent_identity {
             self.retire_directory_security_body(parent, identity);
         }
@@ -31816,12 +31827,12 @@ impl ExecNtHandler {
             },
             false,
         ) {
-            self.obj_ns.discard_unpublished(index);
+            self.retire_namespace_slot(index);
             return None;
         }
         if self.user_timer_ensure(index as u64).is_err() {
-            self.obj_ns.discard_unpublished(index);
             self.events.remove_existing(index as u64);
+            self.retire_namespace_slot(index);
             return None;
         }
         Some(index)
@@ -32017,7 +32028,7 @@ impl ExecNtHandler {
             .initialize(index as u64, initial, maximum)
             .is_err()
         {
-            self.obj_ns.discard_unpublished(index);
+            self.retire_namespace_slot(index);
             return None;
         }
         Some(index)

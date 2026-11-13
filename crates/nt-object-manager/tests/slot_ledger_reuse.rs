@@ -147,3 +147,36 @@ fn reservation_covers_the_next_allocations_and_counts_free_slots() {
     }
     assert_eq!(ledger.census().slots, 5);
 }
+
+#[test]
+fn a_retired_index_stays_vacant_until_the_reuse_delay_has_passed() {
+    let delay = 16;
+    let mut ledger = SlotLedger::with_reuse_delay(delay);
+    let first = ledger.allocate().unwrap();
+    assert_eq!(ledger.release(first, 0), Ok(()));
+
+    // The next `delay` create/close cycles must not hand `first`'s index out again.
+    for _ in 0..delay {
+        let slot = ledger.allocate().unwrap();
+        assert_ne!(slot.index(), first.index(), "retired index reused inside the delay");
+        assert_eq!(ledger.release(slot, 0), Ok(()));
+    }
+    assert_eq!(ledger.allocate().unwrap().index(), first.index());
+}
+
+#[test]
+fn a_delayed_ledger_under_churn_is_bounded_by_live_plus_delay() {
+    let delay = 64;
+    let mut ledger = SlotLedger::with_reuse_delay(delay);
+    let mut live: VecDeque<SlotRef> = VecDeque::new();
+    for _ in 0..20_000 {
+        if live.len() == 8 {
+            let oldest = live.pop_front().unwrap();
+            assert_eq!(ledger.release(oldest, 0), Ok(()));
+        }
+        live.push_back(ledger.allocate().unwrap());
+    }
+    let census = ledger.census();
+    assert!(census.slots <= 8 + delay + 1, "table grew to {}", census.slots);
+    assert_eq!(ledger.appends_needed(1), usize::from(census.free <= delay));
+}

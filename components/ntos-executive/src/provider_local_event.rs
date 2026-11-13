@@ -69,9 +69,10 @@ impl<'a> LocalEventState<'a> {
         {
             Ok(id) => id,
             Err(_) => {
-                // Publication has not escaped; only this newly created namespace entry exists.
+                // Publication has not escaped: the registry refused the record and the
+                // dispatcher state is removed here, so nothing names the new entry.
                 assert!(self.events.remove_existing(index as u64));
-                assert!(self.obj_ns.discard_unpublished(index));
+                assert!(self.obj_ns.retire(index, 0));
                 return Err(INSUFFICIENT_RESOURCES);
             }
         };
@@ -238,7 +239,7 @@ impl<'a> LocalEventState<'a> {
 /// A canonical retirement cannot be rolled back or reported complete without removing backing.
 /// This is also used when the final retained wait lease drains after a local retirement request.
 pub(crate) fn finalize_local_backing(
-    obj_ns: &mut [ObjEntry],
+    obj_ns: &mut ObjectNamespace,
     events: &mut EventStore,
     retired: nt_kernel_exec::RetiredEventObject,
 ) {
@@ -248,15 +249,18 @@ pub(crate) fn finalize_local_backing(
     let index = usize::try_from(retired.native_identity)
         .expect("retired provider-local Event native identity");
     let entry = obj_ns
-        .get_mut(index)
+        .get(index)
         .expect("retired provider-local Event namespace backing");
     assert!(entry.is_live() && entry.kind == OBJ_KIND_EVENT);
     assert_eq!(entry.wait_references, 0);
     assert!(events.remove_existing(retired.native_identity));
-    entry.unlink();
+    // `retired` is the registry's proof that no handle, pointer, wait, operation or signal
+    // lease remains; the wait references and the dispatcher state were checked just above.
+    obj_ns.retire(index, 0);
 }
 
-/// Anonymous namespace entries are append-only; their index is the native dispatcher identity.
+/// An anonymous namespace entry's index is its native dispatcher identity. The slot is reused
+/// after the Event's final retirement, under a new entry identity.
 pub(crate) fn create_anonymous_event(
     obj_ns: &mut ObjectNamespace,
     anon_event_seq: &mut u32,
@@ -289,7 +293,8 @@ pub(crate) fn create_anonymous_event(
         },
         initial_state,
     ) {
-        obj_ns.discard_unpublished(index);
+        // Dispatcher state left under this index means something still names it.
+        obj_ns.retire(index, usize::from(events.contains(index as u64)));
         return None;
     }
     Some(index)

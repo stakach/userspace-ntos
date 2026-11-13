@@ -118,7 +118,7 @@ pub(crate) unsafe fn ack_retire_sync(
 }
 
 pub(crate) struct NativeEventBacking<'a> {
-    pub objects: &'a mut [ObjEntry],
+    pub objects: &'a mut ObjectNamespace,
     pub file_completion: Option<&'a mut ExecFileCompletion>,
     pub pm: Option<&'a mut nt_process::ProcessManager>,
 }
@@ -231,7 +231,7 @@ impl ProviderEventBacking for NativeEventBacking<'_> {
 }
 
 pub(crate) fn finalize_retired_event(
-    obj_ns: &mut [ObjEntry],
+    obj_ns: &mut ObjectNamespace,
     events: &mut nt_kernel_exec::EventStore,
     retired: nt_kernel_exec::RetiredEventObject,
 ) {
@@ -249,7 +249,10 @@ pub(crate) fn finalize_retired_event(
         return;
     }
     events.remove_existing(index as u64);
-    obj_ns[index].unlink();
+    // `retired` is the registry's proof that no handle, pointer, wait, operation or signal
+    // lease remains. Dispatcher state that could not be removed (a prepared completion
+    // signal) still names the index, so the slot then stays retired for good.
+    obj_ns.retire(index, usize::from(events.contains(index as u64)));
     if retired.provider_body.is_some() {
         // Only publish the existing memory-local reclaim marker; no provider IPC here.
         unsafe { crate::win32k_subsystem::mark_event_provider_reclaim_pending() };
