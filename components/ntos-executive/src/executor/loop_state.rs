@@ -8,6 +8,8 @@
 //! This file is declared from `service_sec_image.rs`: the loop still reaches that module's
 //! private helpers, so the hoisted files stay its children until those helpers are ported.
 
+use core::sync::atomic::AtomicU64;
+
 /// The verdict the service loop returns to `_start`, and the working fault counters of the
 /// process whose event is being served.
 pub(super) struct LoopExit {
@@ -64,7 +66,34 @@ pub(super) struct Parks {
     pub(super) wait_parked: u64,
 }
 
+/// Diagnostic rings, the forward-progress watchdog and the wall-clock census.
+pub(super) struct Diag {
+    /// Ring of the last serviced SSNs and the badge that issued each.
+    pub(super) ssn_ring: &'static mut [u16; 32],
+    pub(super) ssn_ring_badge: &'static mut [u8; 32],
+    /// winlogon-main-only ring (badge==WINLOGON_BADGE), isolating winlogon's sequence from
+    /// the services noise that dominates the shared ring.
+    pub(super) wl_ring: &'static mut [u16; 48],
+    pub(super) wl_ri: usize,
+    pub(super) ssn_ri: usize,
+    /// Boot-milestone watchdog state is wall-clock based: `last_progress_t` is the monotonic
+    /// time (100ns units) at the last epoch bump. An expired milestone window requests
+    /// bounded stall validation, not proof of a deadlock.
+    pub(super) progress_epoch: fn() -> u64,
+    pub(super) last_progress_epoch: u64,
+    pub(super) last_progress_t: u64,
+    pub(super) stall_deferrals: nt_hosted_runtime::ProgressDeferralBudget<super::StallDeferralSnapshot>,
+    /// FORWARD-PROGRESS CENSUS (see `print_progress_census`): attribute the wall-clock
+    /// between two consecutive loop tops to the badge that was serviced in between.
+    pub(super) census_prev_t: u64,
+    pub(super) census_prev_badge: usize,
+    /// Print budgets of the ALPC create and send ingress traces.
+    pub(super) alpc_create_ingress_trace: AtomicU64,
+    pub(super) alpc_send_ingress_trace: AtomicU64,
+}
+
 pub(super) struct LoopState {
     pub(super) exit: LoopExit,
     pub(super) parks: Parks,
+    pub(super) diag: Diag,
 }

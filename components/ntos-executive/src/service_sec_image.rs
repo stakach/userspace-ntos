@@ -8,7 +8,7 @@ use nt_user_host::hosted_return_target::HostedReturnTarget;
 
 #[path = "executor/loop_state.rs"]
 mod loop_state;
-use loop_state::{LoopExit, LoopState, Parks};
+use loop_state::{Diag, LoopExit, LoopState, Parks};
 #[path = "hosted_quiesce.rs"]
 mod hosted_quiesce;
 use hosted_quiesce::dump_all_hosted_thread_quiesce;
@@ -10576,8 +10576,8 @@ pub(crate) unsafe fn service_sec_image(
     // services (badge 6) noise that dominates the shared ring, to diagnose the StartLsass wall.
     let wl_ring = &mut *core::ptr::addr_of_mut!(SERVICE_WL_RING_WORK);
     wl_ring.fill(0);
-    let mut wl_ri = 0usize;
-    let mut ssn_ri = 0usize;
+    let wl_ri = 0usize;
+    let ssn_ri = 0usize;
     // Distinct fake handles for objects we don't model yet (ports/threads/events/sections) now live
     // on `nt_handler.next_handle` (Workstream A group A) — a single monotonic source shared by the
     // migrated create-handle handlers and the remaining ladder cases (NtCreateSection/Process/File).
@@ -10903,14 +10903,14 @@ pub(crate) unsafe fn service_sec_image(
     // is investigated; the outer boot harness bounds the whole run to one hour.
     const STALL_BUDGET_100NS: u64 = 180 * 10_000_000;
     let progress_epoch = boot_progress_epoch;
-    let mut last_progress_epoch = progress_epoch();
-    let mut last_progress_t = monotonic_time_100ns();
-    let mut stall_deferrals =
+    let last_progress_epoch = progress_epoch();
+    let last_progress_t = monotonic_time_100ns();
+    let stall_deferrals =
         nt_hosted_runtime::ProgressDeferralBudget::new(last_progress_epoch, 2);
     // FORWARD-PROGRESS CENSUS (see `print_progress_census`): attribute the wall-clock between two
     // consecutive loop tops to the badge that was serviced in between, and count the iterations.
-    let mut census_prev_t = last_progress_t;
-    let mut census_prev_badge = usize::MAX;
+    let census_prev_t = last_progress_t;
+    let census_prev_badge = usize::MAX;
     // …and dump that census every `CENSUS_PERIOD_100NS`, so a boot that never quiesces (killed by
     // the harness at RUNEXIT=124, before the gate/final census ever runs) STILL says where its
     // wall-clock went. Successive dumps turn a runaway into a measurable RATE. The clock is a
@@ -10951,6 +10951,21 @@ pub(crate) unsafe fn service_sec_image(
     let mut lp = LoopState {
         exit: LoopExit::new(),
         parks: Parks { crash_parked, crash_logged: 0, wait_parked: 0 },
+        diag: Diag {
+            ssn_ring,
+            ssn_ring_badge,
+            wl_ring,
+            wl_ri,
+            ssn_ri,
+            progress_epoch,
+            last_progress_epoch,
+            last_progress_t,
+            stall_deferrals,
+            census_prev_t,
+            census_prev_badge,
+            alpc_create_ingress_trace: AtomicU64::new(0),
+            alpc_send_ingress_trace: AtomicU64::new(0),
+        },
     };
     'service_loop: loop {
     macro_rules! record_service_loop_exit {
@@ -12217,18 +12232,18 @@ pub(crate) unsafe fn service_sec_image(
         // progress); quiesce if no progress for STALL_BUDGET_100NS.
         {
             let quiesce_started = crate::disk_census_ticks();
-            let ep = progress_epoch();
+            let ep = (lp.diag.progress_epoch)();
             let now = monotonic_time_100ns();
             {
                 let slot = census_slot(badge);
-                if census_prev_badge != usize::MAX {
-                    let elapsed = now.wrapping_sub(census_prev_t);
-                    BADGE_TIME_100NS[census_prev_badge].fetch_add(elapsed, Ordering::Relaxed);
+                if lp.diag.census_prev_badge != usize::MAX {
+                    let elapsed = now.wrapping_sub(lp.diag.census_prev_t);
+                    BADGE_TIME_100NS[lp.diag.census_prev_badge].fetch_add(elapsed, Ordering::Relaxed);
                 }
                 BADGE_EVENTS[slot].fetch_add(1, Ordering::Relaxed);
                 BADGE_LAST_T[slot].store(now, Ordering::Relaxed);
-                census_prev_badge = slot;
-                census_prev_t = now;
+                lp.diag.census_prev_badge = slot;
+                lp.diag.census_prev_t = now;
                 crate::LOOP_QUIESCE_TICKS.fetch_add(
                     crate::disk_census_ticks().wrapping_sub(quiesce_started),
                     Ordering::Relaxed,
@@ -12240,25 +12255,25 @@ pub(crate) unsafe fn service_sec_image(
                 if CENSUS_LAST_DUMP.load(Ordering::Relaxed) == now {
                 }
             }
-            if ep != last_progress_epoch {
-                last_progress_epoch = ep;
-                last_progress_t = now;
-                let _ = stall_deferrals.observe_progress(ep);
+            if ep != lp.diag.last_progress_epoch {
+                lp.diag.last_progress_epoch = ep;
+                lp.diag.last_progress_t = now;
+                let _ = lp.diag.stall_deferrals.observe_progress(ep);
             } else if cfg!(not(feature = "mup-provider-kernel-only"))
                 && ingress.is_none()
-                && now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS
+                && now.wrapping_sub(lp.diag.last_progress_t) >= STALL_BUDGET_100NS
             {
                 let deferral =
                     progress_stall_deferral_snapshot(&nt_handler, lp.parks.crash_parked, lp.parks.wait_parked);
-                if deferral.is_some() && stall_deferrals.grant(ep, deferral.unwrap()) {
+                if deferral.is_some() && lp.diag.stall_deferrals.grant(ep, deferral.unwrap()) {
                     let snapshot = deferral.unwrap();
                     trace_progress_stall_deferral(snapshot, &nt_handler, lp.parks.crash_parked, lp.parks.wait_parked);
-                    last_progress_t = now;
+                    lp.diag.last_progress_t = now;
                 } else if nt_handler.grant_installer_inf_progress(ep, now, STALL_BUDGET_100NS) {
                     print_str(b"[quiesce] deferring installer INF traversal grant=");
                     print_u64(nt_handler.installer_inf_grants() as u64);
                     print_str(b"/2\n");
-                    last_progress_t = now;
+                    lp.diag.last_progress_t = now;
                 } else {
                     dump_lsa_readiness_quiesce(
                         &nt_handler,
@@ -14634,16 +14649,16 @@ pub(crate) unsafe fn service_sec_image(
             if let Some((ctx, _)) = authoritative_syscall_context.as_ref() {
                 trace_unknown_syscall_tcb_restage(m0, badge, pi, ctx);
             }
-            ssn_ring[ssn_ri % 32] = m0 as u16;
-            ssn_ring_badge[ssn_ri % 32] = badge as u8;
-            ssn_ri += 1;
+            lp.diag.ssn_ring[lp.diag.ssn_ri % 32] = m0 as u16;
+            lp.diag.ssn_ring_badge[lp.diag.ssn_ri % 32] = badge as u8;
+            lp.diag.ssn_ri += 1;
             if hosted_main_badge_has_role(
                 &nt_handler,
                 badge,
                 nt_exe_image::HostedProcessRole::InteractiveLogon,
             ) {
-                wl_ring[wl_ri % 48] = m0 as u16;
-                wl_ri += 1;
+                lp.diag.wl_ring[lp.diag.wl_ri % 48] = m0 as u16;
+                lp.diag.wl_ri += 1;
             }
             let resume_ip = m2; // Ingress coordinates retained for explicit waits/APCs and retries.
             let sp = get_recv_mr(16);
@@ -15554,8 +15569,7 @@ pub(crate) unsafe fn service_sec_image(
                     == Some(nt_syscall_abi::NativeAlpcService::CreatePort)
                 {
                     handled = true;
-                    static ALPC_CREATE_INGRESS_TRACE: AtomicU64 = AtomicU64::new(0);
-                    if ALPC_CREATE_INGRESS_TRACE.fetch_add(1, Ordering::Relaxed) < 8 {
+                    if lp.diag.alpc_create_ingress_trace.fetch_add(1, Ordering::Relaxed) < 8 {
                         print_str(b"[native-alpc-create-ingress] badge=");
                         print_u64(badge);
                         print_str(b" output=0x");
@@ -15659,8 +15673,7 @@ pub(crate) unsafe fn service_sec_image(
                     handled = true;
                     let ingress = crate::native_alpc_send_receive_work::begin(&mut nt_handler,
                         [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]]);
-                    static ALPC_SEND_INGRESS_TRACE: AtomicU64 = AtomicU64::new(0);
-                    let trace = ALPC_SEND_INGRESS_TRACE.fetch_add(1, Ordering::Relaxed);
+                    let trace = lp.diag.alpc_send_ingress_trace.fetch_add(1, Ordering::Relaxed);
                     if trace < 16 {
                         let mut return_bytes = [0u8; 8];
                         let return_readable = nt_handler.xas_read(sp, &mut return_bytes);
@@ -22276,6 +22289,7 @@ pub(crate) unsafe fn service_sec_image(
     let LoopState {
         exit: LoopExit { stop, stop_ssn, service_loop_exit_site, service_loop_exit_reason, iters, dbgsvc, .. },
         parks: Parks { crash_parked, wait_parked, .. },
+        diag: Diag { ssn_ring, ssn_ring_badge, wl_ring, wl_ri, ssn_ri, .. },
     } = lp;
     // One terminal receipt, before checkpointing can obscure the branch that ended the
     // serialized loop. Every field below is an observation; no owner or dirty bit is consumed.
