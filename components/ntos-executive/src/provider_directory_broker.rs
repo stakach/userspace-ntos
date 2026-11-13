@@ -926,7 +926,15 @@ unsafe fn redrive_effect_one(handler: &mut ExecNtHandler) -> bool {
 }
 
 pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) -> bool {
-    if handler.is_null() || crate::monotonic_time_100ns() < NEXT_RETRY.load(Ordering::Acquire) {
+    // An empty broker has no row for either pass to advance and no retry deadline to
+    // compare, so the clock is not read.
+    let empty = {
+        let broker = &*core::ptr::addr_of!(BROKER);
+        broker.pending.is_empty() && broker.effects.is_empty()
+    };
+    if handler.is_null() || empty
+        || crate::monotonic_time_100ns() < NEXT_RETRY.load(Ordering::Acquire)
+    {
         return false;
     }
     trace_redrive_entry(b"outer");

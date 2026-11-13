@@ -610,7 +610,9 @@ enum Step {
 }
 
 pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_execution::Queue) {
-    let Some(wake_attempt) = WAKE.begin_redrive(monotonic_time_100ns(), has_work()) else {
+    // No retained row means no due decision to make, so the clock is not read.
+    let Some((wake_attempt, _)) =
+        WAKE.begin_redrive_with_clock(has_work(), || monotonic_time_100ns()) else {
         return;
     };
     if ACTIVE.swap(true, Ordering::AcqRel) {

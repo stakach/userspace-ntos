@@ -319,14 +319,15 @@ pub(crate) fn wake_due(now: u64) -> u64 {
     0
 }
 
-pub(crate) unsafe fn retry_cleanup(now: u64) {
+/// `clock` is read only when a retained cleanup has a retry deadline to compare.
+pub(crate) unsafe fn retry_cleanup(clock: impl FnOnce() -> u64) {
     if PENDING.load(Ordering::Relaxed) == 0 {
         NEXT.store(0, Ordering::Relaxed);
         READY.store(0, Ordering::Relaxed);
         DELAY.store(MIN_DELAY, Ordering::Relaxed);
         return;
     }
-    if READY.swap(0, Ordering::Relaxed) == 0 && now < NEXT.load(Ordering::Relaxed) {
+    if READY.swap(0, Ordering::Relaxed) == 0 && clock() < NEXT.load(Ordering::Relaxed) {
         return;
     }
     let count = (&*core::ptr::addr_of!(ROWS)).len();

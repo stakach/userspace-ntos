@@ -585,8 +585,8 @@ pub(super) unsafe fn maintain(
     crate::client_frame_cleanup::retry_pending(&*nt_handler);
     crate::pagefile_retirement::retry_pending(&*nt_handler);
     // CM retries run only between hosted events, never inside a timer callback or nested pump.
-    crate::cm_key_ownership::retry_cleanup(monotonic_time_100ns());
-    crate::cm_snapshot_ownership::retry_cleanup(monotonic_time_100ns());
+    crate::cm_key_ownership::retry_cleanup(|| monotonic_time_100ns());
+    crate::cm_snapshot_ownership::retry_cleanup(|| monotonic_time_100ns());
     let alpc_reply_committed;
     {
         let _message = crate::ipc_message::SavedMessageBuffer::capture();

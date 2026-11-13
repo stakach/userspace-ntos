@@ -250,8 +250,9 @@ pub(crate) fn print_hold_snapshot(now: u64) {
             calls_record.bytes()
         });
     }
-    let calls = crate::MONOTONIC_CALLS.snapshot::<8>();
-    let mut callers = nt_printf::record::RecordBuffer::<2048>::new();
+    // The eight busiest sites covered under half of the sampled reads; print the tail too.
+    let calls = crate::MONOTONIC_CALLS.snapshot::<24>();
+    let mut callers = nt_printf::record::RecordBuffer::<4096>::new();
     let _ = write!(callers, "[clock-callers] calls={} sampled={} overflow={}",
         calls.calls, calls.sampled, calls.overflow);
     for sample in calls.top.into_iter().flatten() {

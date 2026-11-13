@@ -382,8 +382,10 @@ unsafe fn step(handler: &mut ExecNtHandler, work: &mut PendingNativeDirectoryOpe
 
 /// Progress one exact retained operation at a safe service-loop boundary.
 pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> bool {
-    if monotonic_time_100ns() < NEXT_RETRY.load(Ordering::Acquire)
-        || ACTIVE.swap(true, Ordering::AcqRel) {
+    // Without a runnable retained open there is no retry deadline to compare, so the
+    // clock is not read. The claimed pass below would find nothing to select either.
+    let Some(retry) = next_deadline() else { return false; };
+    if monotonic_time_100ns() < retry || ACTIVE.swap(true, Ordering::AcqRel) {
         return false;
     }
     let queue = &mut *core::ptr::addr_of_mut!(PENDING);
