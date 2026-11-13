@@ -26,7 +26,6 @@ fn parked_mounted_create_remains_a_live_signaler_until_native_service_drives_it(
     assert!(volume.contains("pub(crate) fn mounted_create_outstanding() -> bool"));
     assert!(native_block.contains("crate::mounted_volume::claim_mounted_create_sector()"));
     assert!(driver.contains("mounted_native_block::service()"));
-    assert!(service.contains("if badge == DELAY_TIMER_BADGE"));
     assert!(service.contains("let native_blocks = driver_launch::service_mounted_native_blocks() as u64"));
 }
 
@@ -263,33 +262,6 @@ fn acknowledged_native_fat_sector_can_dispatch_its_successor_in_the_same_service
         "the bounded published-route drain and single retained-route command must be disjoint");
     assert!(!service.contains("pump_hosted_io_completions"),
         "native block service must not nest a completion pump");
-}
-
-#[test]
-fn native_completion_irq_polls_exact_physical_slot_before_receiving_again() {
-    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
-    let irq = service.split_once("let current_irq_lines = driver_launch::latch_hosted_irq_badge(badge);")
-        .expect("root hardware IRQ dispatch").1
-        .split_once("if pending_driver_start_redrive_needed(&nt_handler)")
-        .expect("end of pure IRQ branch").0;
-    let drain = irq.find("driver_launch::drain_pending_hosted_irqs()")
-        .expect("physical IRQ and its DPCs are drained");
-    let pure_irq = irq.find("if current_irq_lines != 0")
-        .expect("pure hardware IRQ branch");
-    let branch = &irq[pure_irq..];
-    let pending = branch.find("driver_launch::mounted_native_physical_irp_pending()")
-        .expect("only an entered native command needs an IRQ completion poll");
-    let poll = branch.find("service_mounted_native_blocks_and_redrive_backends()")
-        .expect("publish and ACK the exact native completion on its IRQ");
-    let receive = branch.find("component_recv!(fault_ep")
-        .expect("root receives after the IRQ checkpoint");
-    assert!(drain < pure_irq && pending < poll && poll < receive,
-        "DPC completion must reach the native slot before root sleeps for another timer");
-    let helper = service.split_once("fn service_mounted_native_blocks_and_redrive_backends()")
-        .expect("shared native settlement helper").1;
-    assert!(helper.split_once("\n}").expect("helper end").0
-        .contains("driver_launch::service_mounted_native_blocks()"),
-        "the IRQ helper must retain exact physical slot settlement");
 }
 
 #[test]

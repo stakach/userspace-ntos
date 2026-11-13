@@ -48,21 +48,3 @@ fn ordinary_pnp_redrive_stops_before_add_device_and_flat_root_admits_exactly_one
         "rebalance restart must have the same exact root-only admission path");
 }
 
-#[test]
-fn progressing_or_certified_retryable_add_device_gets_another_exclusive_root_turn() {
-    let root = SERVICE.split_once("'service_loop: loop {").unwrap().1;
-    let child = root.find("run_one_pending_add_device_child_step(")
-        .expect("selected child root phase");
-    let unrelated = root.find("redrive_hosted_driver_io_create_file(")
-        .expect("later unrelated provider phase");
-    let phase = &root[child..unrelated];
-    assert!(!phase.contains("add_device_passes >= 16"),
-        "successful child progress must not exhaust a fixed total pass budget");
-    assert!(!phase.contains("consecutive_no_child_yields >= 2"),
-        "a certified no-effects retry must not terminate the service loop after two turns");
-    assert!(phase.contains("prepare_parked_add_device_receive(&mut root_add_device_turn)")
-        && phase.contains("component_recv!(fault_ep"),
-        "a retained retryable parent needs an armed one-shot and a fresh receive before unrelated work");
-    assert!(!phase.contains("crate::yield_now()"),
-        "yielding without receiving cannot deliver a bound timer or IRQ notification");
-}

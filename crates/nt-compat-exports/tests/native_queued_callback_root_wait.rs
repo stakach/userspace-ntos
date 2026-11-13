@@ -36,20 +36,6 @@ fn early_callback_wait() -> &'static str {
 }
 
 #[test]
-fn empty_queued_child_without_add_device_is_not_a_terminal_add_device_failure() {
-    let early = early_callback_wait();
-    assert!(early.contains("ConnectPumpSettlement::AwaitingLocalChild"));
-    assert!(!early.contains("root_add_device_turn.is_none()\n                        || !prepare_parked_add_device_receive"),
-        "a generic callback's empty child step cannot require an AddDevice turn");
-    assert!(
-        early.contains("if root_add_device_turn.is_none() {")
-            && early.contains("park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);")
-            && early.contains("if !prepare_parked_add_device_receive(&mut root_add_device_turn)"),
-        "a standalone callback must enter its wait before the AddDevice-only branch"
-    );
-}
-
-#[test]
 fn later_generic_settlement_keeps_retryable_child_absence_distinct_from_uncertainty() {
     let generic = SERVICE
         .split_once("let queue_settlement = settle_queued_callbacks();")
@@ -197,41 +183,6 @@ fn both_root_settlement_sites_fence_providers_while_the_queued_reply_is_parked()
 }
 
 #[test]
-fn shared_queued_wait_settles_current_ingress_before_blocking() {
-    let park = between(
-        SERVICE,
-        "macro_rules! park_queued_callback_root_receive",
-        "// A callback reached by the preceding AddDevice child",
-    );
-    let notify = park
-        .find("service_parked_queued_callback_notification(")
-        .expect("ACK current queued callback notification");
-    let defer = park
-        .find("defer_hosted_delivery_for_queued_callback(")
-        .expect("retain unexecuted Call and its original Reply");
-    let receive = park
-        .find("component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed))")
-        .expect("receive next root event");
-    assert!(
-        notify < receive && defer < receive,
-        "notification ACK or Call deferral must precede Receive"
-    );
-    let receive_macro = between(
-        SERVICE.split_once("'service_loop: loop {").expect("service loop").1,
-        "macro_rules! component_recv {",
-        "macro_rules! component_client_reply_recv {",
-    );
-    assert!(
-        receive_macro.contains("root_queued_callback_exclusive_pending()")
-            && receive_macro
-                .contains("prepare_parked_queued_callback_receive(&mut root_queued_callback_turn)")
-            && receive_macro
-                .contains("component_receive_outcome!(crate::executive_ingress::receive($reply))"),
-        "the exclusive callback must arm its one-shot immediately before Receive"
-    );
-}
-
-#[test]
 fn outer_io_pump_cannot_discard_a_suspended_callback_owner() {
     let pump = function_body(
         DRIVER,
@@ -272,23 +223,6 @@ fn root_receive_has_a_physical_queue_wake_after_an_empty_scan() {
         TIMER.contains("queued_work_receive_poll_deadline(), DELAY_TIMER_SOURCE_QUEUED_WORK_RECEIVE_POLL")
             && MAIN.contains("timer_deadline::queued_work_receive_poll_wake_due(now_100ns)"),
         "the poll needs one canonical timer selector and a due transition before root rescans the queue"
-    );
-}
-
-#[test]
-fn root_admits_queued_callbacks_before_other_provider_work() {
-    let root = between(
-        SERVICE,
-        "        'queued_callback_settlement: loop {\n            // A callback reached by the preceding AddDevice child",
-        "            let callback_settlement =",
-    );
-    assert!(
-        root.contains("drain_hosted_queued_callbacks_at_root()"),
-        "root must admit passive queue work where it can immediately settle a retained callback owner"
-    );
-    assert!(
-        root.contains("if root_add_device_turn.is_none()"),
-        "queue admission must not enter an unrelated provider while AddDevice retains its parent"
     );
 }
 

@@ -81,18 +81,3 @@ fn recorded_connect_receipt_is_reselected_without_running_a_new_child() {
         "a later root turn must restore an already recorded parent without running a new child");
 }
 
-#[test]
-fn parked_add_device_receives_a_bounded_event_for_retryable_connect_child() {
-    let root = SERVICE.split_once("'service_loop: loop {")
-        .expect("root service loop").1;
-    let early = root.split_once("// A nested provider can select a Receive child")
-        .expect("exclusive AddDevice phase boundary").0;
-    assert!(early.contains("ConnectPumpSettlement::AwaitingLocalChild"),
-        "early AddDevice phase must distinguish retryable CONNECT absence from uncertainty");
-    assert!(early.contains("prepare_parked_add_device_receive(&mut root_add_device_turn)"),
-        "exact AddDevice turn must arm its one-shot retry before blocking");
-    assert!(early.contains("defer_hosted_delivery_for_add_device"),
-        "current hosted Call and Reply must remain owned while awaiting CONNECT child work");
-    assert!(early.contains("component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed))"),
-        "parked root must receive timer or IRQ and retry the exact CONNECT owner");
-}

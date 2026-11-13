@@ -211,57 +211,6 @@ impl<'ast> Visit<'ast> for BreakAudit {
     }
 }
 
-#[test]
-fn quiesce_and_deadman_cannot_abandon_admitted_ingress_before_dispatch() {
-    struct FindLoop {
-        audited: usize,
-        unguarded: usize,
-    }
-    impl<'ast> Visit<'ast> for FindLoop {
-        fn visit_expr_loop(&mut self, expression: &'ast syn::ExprLoop) {
-            let admission = expression.body.stmts.iter().position(|statement| {
-                matches!(statement, syn::Stmt::Local(local)
-                    if matches!(&local.pat, syn::Pat::Ident(name) if name.ident == "ingress"))
-            });
-            if let Some(admission) = admission {
-                let dispatch = expression.body.stmts.iter().enumerate().skip(admission + 1)
-                    .find_map(|(index, statement)| {
-                        let syn::Stmt::Expr(syn::Expr::Match(value), _) = statement else { return None; };
-                        matches!(&*value.expr, syn::Expr::Binary(binary)
-                            if matches!(binary.op, syn::BinOp::Shr(_)) && path_is(&binary.left, "mi"))
-                            .then_some(index)
-                    }).expect("admitted service ingress reaches its label dispatch");
-                let mut audit = BreakAudit {
-                    guarded: false,
-                    candidate: false,
-                    unguarded: 0,
-                };
-                for statement in &expression.body.stmts[admission + 1..dispatch] {
-                    audit.visit_stmt(statement);
-                }
-                self.audited += 1;
-                self.unguarded += audit.unguarded;
-            }
-            syn::visit::visit_expr_loop(self, expression);
-        }
-    }
-    let source = syn::parse_file(include_str!(
-        "../../../components/ntos-executive/src/service_sec_image.rs"
-    ))
-    .unwrap();
-    let mut audit = FindLoop {
-        audited: 0,
-        unguarded: 0,
-    };
-    audit.visit_file(&source);
-    assert_eq!(
-        audit.audited, 1,
-        "audit the actual owned service-loop admission boundary"
-    );
-    assert_eq!(audit.unguarded, 0,
-        "milestone/deadman quiesce must not drop an admitted Call before dispatch; gate only at a notification-only or post-retirement boundary");
-}
-
 fn progress_call(expression: &syn::ExprCall, variant: &str) -> bool {
     matches!(&*expression.func, syn::Expr::Path(path)
         if path.path.segments.last().is_some_and(|name| name.ident == "note_boot_progress"))

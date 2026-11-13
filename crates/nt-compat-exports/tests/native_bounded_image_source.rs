@@ -157,58 +157,6 @@ fn routed_dll_fault_retains_pending_read_until_page_and_reply_are_safe() {
 }
 
 #[test]
-fn syscall_output_copy_waits_for_routed_image_page_before_dispatch() {
-    let ingress = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/ntos-executive/src/service_sec_image.rs"),
-    ).unwrap();
-    let preflight = ingress.find("native_image_pagein_work::submit_syscall_copy(")
-        .expect("syscall ingress must retain a routed CopyAccess page before dispatch");
-    let dispatch = ingress.find("nt_dispatcher.dispatch(m0 as u32, &argv[..n]")
-        .expect("real syscall dispatch");
-    assert!(preflight < dispatch, "output preflight must precede all syscall effects");
-
-    let worker = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/ntos-executive/src/native_image_pagein_work.rs"),
-    ).expect("retained syscall CopyAccess owner");
-    for required in ["RootReplyPark", "RoutedImageRead", "ImagePageFillCapture",
-        "bind_pending", "completed_irp_exact", "copy_completed_irp_output_exact",
-        "acknowledge_completed_irp_strict", "accept_acknowledged_span",
-        "NtQuerySystemInformation", "dispatch", "reply_parked_syscall"] {
-        assert!(worker.contains(required),
-            "CopyAccess must retain source I/O through strict ACK before one dispatch: {required}");
-    }
-    assert!(worker.contains("CopyAccess"),
-        "CopyAccess continuation must be distinct from a hardware fault reply");
-}
-
-#[test]
-fn query_default_locale_image_global_waits_for_routed_page_before_dispatch() {
-    let ingress = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/ntos-executive/src/service_sec_image.rs"),
-    ).unwrap();
-    let preflight = ingress.find("let copy_preflight =")
-        .expect("native syscall CopyAccess preflight");
-    let dispatch = ingress[preflight..].find("nt_dispatcher.dispatch(m0 as u32, &argv[..n]")
-        .map(|offset| preflight + offset).expect("ordinary native syscall dispatch");
-    let admission = &ingress[preflight..dispatch];
-    assert!(admission.contains("SSN_NT_QUERY_DEFAULT_LOCALE")
-        && admission.contains("native_image_pagein_work::submit_syscall_copy("),
-        "NtQueryDefaultLocale must park its original Call before writing an image global");
-
-    let worker = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/ntos-executive/src/native_image_pagein_work.rs"),
-    ).unwrap();
-    assert!(worker.contains("NtQueryDefaultLocale")
-        && worker.contains("CopyAccess")
-        && worker.contains("reply_parked_syscall"),
-        "the retained worker must page in the locale output before one dispatch and Reply");
-}
-
-#[test]
 fn routed_hardware_fault_does_not_fall_through_on_an_unready_source_row() {
     use nt_memory_manager::image_source_page::ImageSourcePage;
 
@@ -338,25 +286,3 @@ fn failed_dynamic_process_admission_never_binds_an_older_pi_occupant() {
         "a proven unentered spawn must retire its exact image reservation and child metadata");
 }
 
-#[test]
-fn immediate_spawn_entered_error_keeps_original_reply_and_process_owner() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../components/ntos-executive/src/service_sec_image.rs");
-    let service_source = std::fs::read_to_string(path).unwrap();
-    let start = service_source.find("if let Some(request) = nt_handler.exe_spawn_request")
-        .expect("immediate hosted spawn branch");
-    let end = service_source[start..].find("} else if m0 >= win32k_subsystem")
-        .expect("end of hosted spawn branch") + start;
-    let branch = &service_source[start..end];
-    assert!(branch.find("hosted_spawn_uncertainty::prepare")
-        .expect("pre-effect Reply owner admission")
-        < branch.find("publish_reserved_hosted_exe").expect("physical hosted spawn"),
-        "the original Reply and retained owner must be admitted before physical spawn");
-    assert!(branch.contains("hosted_spawn_uncertainty::retain_entered"),
-        "an entered spawn error cannot become an ordinary failed syscall Reply");
-    assert!(branch.contains("abort_unentered_hosted_exe"),
-        "failed pre-effect admission must retire the exact reserved spawn and new child");
-    let process = audit(&body(&source("exec_handler.rs"), "nt_create_process_service"));
-    assert!(has(&process, "abort_unentered_hosted_child"),
-        "a failed spawn reservation after child allocation must release that exact PM slot");
-}

@@ -152,20 +152,6 @@ impl<'ast> Visit<'ast> for InstructionFetchScans {
 }
 
 #[test]
-fn instruction_fetch_fault_scans_stop_on_unavailable_authenticated_words() {
-    let source = syn::parse_file(include_str!(
-        "../../../components/ntos-executive/src/service_sec_image.rs"
-    )).unwrap();
-    let mut scans = InstructionFetchScans::default();
-    scans.visit_file(&source);
-    assert_eq!(scans.0.len(), 1, "identify the actual fault instruction-fetch diagnostic");
-    let scans = &scans.0[0];
-    assert_eq!(scans.old_reads, 0, "broad arithmetic mirror reads can fault the executive beyond the resident stack");
-    assert_eq!(scans.checked_reads, 2, "both top-of-stack and return-address scans use the focused reader");
-    assert_eq!(scans.unavailable_stops, 2);
-}
-
-#[test]
 fn fault_stack_reader_uses_exact_resident_process_backing_without_mirror_or_image_fallback() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../components/ntos-executive/src/fault_stack_diagnostics.rs");

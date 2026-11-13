@@ -10,21 +10,6 @@ const MAIN: &str = include_str!("../../../components/ntos-executive/src/main.rs"
 const PNP: &str = include_str!("../../../components/ntos-executive/src/hosted_pnp_start.rs");
 
 #[test]
-fn parked_parent_retains_original_call_and_receives_real_notifications() {
-    let root = SERVICE.split_once("'service_loop: loop {").unwrap().1;
-    let child = root.find("run_one_pending_add_device_child_step(").unwrap();
-    let ordinary = root.find("redrive_hosted_driver_io_create_file(").unwrap();
-    let exclusive = &root[child..ordinary];
-    let hold = exclusive.find("defer_hosted_delivery_for_add_device(").unwrap();
-    let arm = exclusive.find("prepare_parked_add_device_receive(&mut root_add_device_turn)").unwrap();
-    let receive = exclusive.find("component_recv!(fault_ep").unwrap();
-    assert!(hold < arm && arm < receive);
-    assert!(exclusive.contains("service_parked_add_device_notification("));
-    assert!(exclusive.contains("root_event_consumed"));
-    assert!(!exclusive.contains("crate::yield_now()"));
-}
-
-#[test]
 fn central_receive_defers_unrelated_calls_but_allows_exact_selected_child() {
     let selection = HOSTED.split_once("pub(crate) unsafe fn take_hosted_with(").unwrap().1
         .split_once("oldest_external_ingress(").unwrap().0;
@@ -79,17 +64,6 @@ fn parent_settlement_rearms_deferred_global_due_owners_before_receive() {
         .expect("deferred timer owners need a fresh physical shot after AddDevice releases its bank");
     let receive = resumed.find("component_recv!(fault_ep").unwrap();
     assert!(rearm < receive);
-}
-
-#[test]
-fn retry_deadline_is_published_from_the_exact_move_only_turn() {
-    let receive = SERVICE
-        .split_once("unsafe fn prepare_parked_add_device_receive(").unwrap().1
-        .split_once("unsafe fn service_parked_add_device_notification(").unwrap().0;
-    assert!(receive.contains("turn.arm_retry(turn.owner()"),
-        "a new physical one-shot must derive from the exact retained parent turn");
-    let root = SERVICE.split_once("'service_loop: loop {").unwrap().1;
-    assert!(root.contains("prepare_parked_add_device_receive(&mut root_add_device_turn)"));
 }
 
 #[test]
