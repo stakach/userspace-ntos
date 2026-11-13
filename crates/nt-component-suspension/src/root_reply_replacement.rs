@@ -125,7 +125,7 @@ impl RootReplySlotTable {
 
     pub fn new(initial_capacity: usize) -> Result<Self, RootReplyReplacementError> {
         let generation = NEXT_TABLE_GENERATION
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| RootReplyReplacementError::NoCapacity)?;

@@ -126,7 +126,7 @@ pub(crate) unsafe fn retain(
     let Some(slot @ Some(Slot::Reserved)) = rows.get_mut(reservation.0) else {
         return Err(pending);
     };
-    let generation = NEXT_GENERATION.fetch_update(
+    let generation = NEXT_GENERATION.try_update(
         Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1),
     ).map_err(|_| pending)?;
     let yielded = pending.yielded;

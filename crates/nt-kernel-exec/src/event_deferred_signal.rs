@@ -62,7 +62,7 @@ impl DeferredEventSignals {
         self.pending.try_reserve(1).map_err(|_| ())?;
         if self.authority == 0 {
             self.authority = NEXT_STORE_AUTHORITY
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_add(1)
                 })
                 .map_err(|_| ())?;

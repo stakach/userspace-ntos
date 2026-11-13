@@ -124,7 +124,7 @@ impl ProcessManager {
             .filter(|_| tid != 0 && tid % CLIENT_ID_GRANULARITY == 0)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let nonce = NEXT_NONCE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let mut thread = NtThread::try_construct(
             tid,

@@ -174,7 +174,7 @@ impl PeerRegistry {
             .map_err(|_| PeerError::NoCapacity)?;
         // Burn identities forever, including aborted registrations and destroyed registries.
         let badge = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 (next > COMPONENT_BADGE && next <= ENDPOINT_BADGE_MAX).then(|| next + 1)
             })
             .map_err(|_| PeerError::BadgeExhausted)?;

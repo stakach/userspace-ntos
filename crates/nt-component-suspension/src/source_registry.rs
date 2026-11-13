@@ -76,7 +76,7 @@ pub struct IngressSourceRegistry<S: IngressSource> {
 
 fn fresh_identity() -> Result<u64, SourceError> {
     NEXT_IDENTITY
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             if next == 0 {
                 None
             } else {

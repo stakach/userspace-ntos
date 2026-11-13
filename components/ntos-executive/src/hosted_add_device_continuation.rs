@@ -12,7 +12,7 @@ unsafe fn reserve_add_device_bank(
     secondary_shared_va: Option<u64>,
     instance_index: usize,
 ) -> Result<SuspendedActiveHostedIrpTransfer, nt_status::NtStatus> {
-    let id = NEXT_ADD_DEVICE_BANK_ID.fetch_update(
+    let id = NEXT_ADD_DEVICE_BANK_ID.try_update(
         Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1),
     ).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let transfers = active_hosted_irp_transfers_mut();

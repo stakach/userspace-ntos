@@ -199,7 +199,7 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
             && image.role == nt_exe_image::HostedProcessRole::Win32Subsystem
     });
     let native_port = captured.port;
-    let sequence = NEXT_INVOCATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+    let sequence = NEXT_INVOCATION.try_update(Ordering::Relaxed, Ordering::Relaxed,
         |next| next.checked_add(1)).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     if trace_scm {
         print_str(b"[scm-alpc] begin tid="); print_u64(thread);

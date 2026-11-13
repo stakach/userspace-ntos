@@ -91,7 +91,7 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
         bytes.resize(plan.capacity(), 0);
         if self.store == 0 {
             let Ok(store) =
-                NEXT_STORE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                NEXT_STORE.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_add(1)
                 })
             else {

@@ -395,7 +395,7 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
                 return STATUS_INSUFFICIENT_RESOURCES_I32;
             }
         };
-        let nonce = match NEXT_PNP_NONCE.fetch_update(
+        let nonce = match NEXT_PNP_NONCE.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |n| n.checked_add(1),

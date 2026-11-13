@@ -129,7 +129,7 @@ impl SystemHiveKeyOpenAttempts {
         let vacant = self.slots.iter().position(|slot| !slot.active && slot.sequence != u64::MAX);
         if vacant.is_none() { self.slots.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?; }
         let requester = if self.requester == 0 {
-            LAST_REQUESTER.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| last.checked_add(1))
+            LAST_REQUESTER.try_update(Ordering::Relaxed, Ordering::Relaxed, |last| last.checked_add(1))
                 .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)? + 1
         } else { self.requester };
         let index = vacant.unwrap_or(self.slots.len());

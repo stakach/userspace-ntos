@@ -126,7 +126,7 @@ impl<D: Copy + Eq> PrivatePageInstallation<D> {
             return Err(INVALID);
         }
         let operation = LAST_INSTALLATION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| 0xc000009a_u32)?

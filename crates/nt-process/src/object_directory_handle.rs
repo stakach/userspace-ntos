@@ -47,7 +47,7 @@ impl ProcessManager {
         admit_owner(self, pid)?;
         if self.directory_publication_identity == 0 {
             self.directory_publication_identity = NEXT_IDENTITY
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                     next.checked_add(1)
                 })
                 .map_err(|_| crate::STATUS_INSUFFICIENT_RESOURCES)?;

@@ -200,7 +200,7 @@ fn repeated_same_frame_repark_prepares_one_generation_bound_owner_before_acquire
     assert!(!prepare.contains("physical.acquire()"),
         "native acquisition must be attempted only after both durable owners agree");
     assert!(OWNER.contains("generation: u64")
-        && OWNER.contains("generation = NEXT_GENERATION.fetch_update(")
+        && OWNER.contains("generation = NEXT_GENERATION.try_update(")
         && OWNER.contains("row.generation == ticket.generation"),
         "the retained fresh ticket must be bound to its exact generation");
 }

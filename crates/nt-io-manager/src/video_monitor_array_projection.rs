@@ -145,7 +145,7 @@ impl MonitorPdoReferenceLedger {
         {
             return Err(MonitorProjectionError::InvalidIdentity);
         }
-        let id = NEXT_REFERENCE_LEDGER.fetch_update(
+        let id = NEXT_REFERENCE_LEDGER.try_update(
             Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1),
         ).map_err(|_| MonitorProjectionError::InvalidTransition)?;
         let mut entries = Vec::new();

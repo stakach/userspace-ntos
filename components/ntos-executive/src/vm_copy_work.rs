@@ -111,7 +111,7 @@ static NEXT_PAGE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 fn fresh_page_token() -> Option<u64> {
     NEXT_PAGE_TOKEN
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             value.checked_add(1)
         })
         .ok()

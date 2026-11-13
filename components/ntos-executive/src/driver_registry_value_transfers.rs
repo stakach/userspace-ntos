@@ -101,7 +101,7 @@ pub(crate) unsafe fn begin(
     }
     let upload = nt_config_client::SystemHiveValueUpload::new(total)?;
     let token = NEXT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;

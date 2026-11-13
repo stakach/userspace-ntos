@@ -59,7 +59,7 @@ impl FileProjectionSlot {
             return None;
         }
         let previous = LAST_RESERVATION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .ok()?;

@@ -139,7 +139,7 @@ fn release_key_owner(handler: &mut ExecNtHandler, mut owner: RegistryKeyHandlePu
 }
 
 fn reserve_order() -> Result<u64, u32> {
-    NEXT_ORDER.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |order|
+    NEXT_ORDER.try_update(Ordering::Relaxed, Ordering::Relaxed, |order|
         order.checked_add(1)).map_err(|_| 0xC000_009A)
 }
 

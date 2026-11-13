@@ -159,7 +159,7 @@ impl<T> ObjectWaiterTable<T> {
             return Err(payload);
         }
         if self.identity == 0 {
-            let identity = source.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            let identity = source.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 if next == 0 {
                     None
                 } else {

@@ -208,7 +208,7 @@ fn reserve_first_packet_cleanup() -> Result<u64, i32> {
     let _ = retry_first_packet_cleanup_locked();
     let rows = first_packet_cleanup();
     rows.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-    let id = FIRST_PACKET_CLEANUP_NEXT_ID.fetch_update(
+    let id = FIRST_PACKET_CLEANUP_NEXT_ID.try_update(
         Ordering::Relaxed, Ordering::Relaxed,
         |value| value.checked_add(1).filter(|next| *next != 0),
     ).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
@@ -270,7 +270,7 @@ fn commit_first_projected_packet(
     {
         return Err(FirstPacketCommitRefusal { prepared, callback_owner: None });
     }
-    let serial = match FIRST_PACKET_NEXT_ID.fetch_update(
+    let serial = match FIRST_PACKET_NEXT_ID.try_update(
         Ordering::Relaxed, Ordering::Relaxed,
         |value| value.checked_add(1).filter(|next| *next != 0),
     ) {
@@ -746,7 +746,7 @@ fn service_start_next_packet_locked(
         if first_packet_transactions().try_reserve(1).is_err() {
             return (STATUS_INSUFFICIENT_RESOURCES, 0, 0, 0);
         }
-        let serial = match FIRST_PACKET_NEXT_ID.fetch_update(
+        let serial = match FIRST_PACKET_NEXT_ID.try_update(
             Ordering::Relaxed, Ordering::Relaxed,
             |value| value.checked_add(1).filter(|next| *next != 0),
         ) {

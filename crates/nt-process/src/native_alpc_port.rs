@@ -69,7 +69,7 @@ impl ProcessManager {
     fn alpc_manager_identity(&mut self) -> Result<u64, u32> {
         if self.alpc_publication_identity == 0 {
             self.alpc_publication_identity = NEXT_MANAGER_IDENTITY
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
                 .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         }
         Ok(self.alpc_publication_identity)

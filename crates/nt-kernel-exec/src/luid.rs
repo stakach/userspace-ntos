@@ -15,7 +15,7 @@ impl LocalLuidAllocator {
 
     pub fn allocate(&self) -> Option<u64> {
         self.next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
             .ok()
     }
 }

@@ -123,7 +123,7 @@ impl ProcessManager {
         }
         let lifetime = self.thread_lifetime(tid).ok_or(STATUS_INVALID_HANDLE)?;
         let nonce = NEXT_NONCE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;

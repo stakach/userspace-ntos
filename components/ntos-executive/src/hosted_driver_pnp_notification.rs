@@ -245,7 +245,7 @@ pub(crate) fn service(
     let guid = unsafe { read_unaligned((inst.exec_arg_va + ARG_GUID) as *const [u8; 16]) };
     let rows = unsafe { &mut *core::ptr::addr_of_mut!(REGISTRATIONS) };
     if rows.try_reserve(1).is_err() { return (STATUS_INSUFFICIENT_RESOURCES, 0); }
-    let cookie = match NEXT_COOKIE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| last.checked_add(1)) {
+    let cookie = match NEXT_COOKIE.try_update(Ordering::Relaxed, Ordering::Relaxed, |last| last.checked_add(1)) {
         Ok(last) => last + 1,
         Err(_) => return (STATUS_INSUFFICIENT_RESOURCES, 0),
     };
@@ -314,7 +314,7 @@ unsafe fn register_target(
             return (status.raw(), 0);
         }
     };
-    let cookie = match NEXT_COOKIE.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+    let cookie = match NEXT_COOKIE.try_update(Ordering::Relaxed, Ordering::Relaxed,
         |last| last.checked_add(1)) {
         Ok(last) => last + 1,
         Err(_) => {
@@ -448,7 +448,7 @@ unsafe fn report_target(
         Ok(owner) => owner,
         Err(status) => return (status.raw(), 0),
     };
-    let ticket = match NEXT_EVENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+    let ticket = match NEXT_EVENT.try_update(Ordering::Relaxed, Ordering::Relaxed,
         |last| last.checked_add(1)) {
         Ok(last) => last + 1,
         Err(_) => {
@@ -482,7 +482,7 @@ pub(super) unsafe fn set_hosted_device_interface_state(
     let matches = registrations.iter().filter(|row| row.class_guid == guid).count();
     let events = &mut *core::ptr::addr_of_mut!(EVENTS);
     events.try_reserve(matches).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    let first = NEXT_EVENT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+    let first = NEXT_EVENT.try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
         last.checked_add(matches as u64)
     }).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     for (offset, row) in registrations.iter().filter(|row| row.class_guid == guid).enumerate() {

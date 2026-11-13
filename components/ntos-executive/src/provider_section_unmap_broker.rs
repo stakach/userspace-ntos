@@ -60,7 +60,7 @@ unsafe fn unmap(
             Ok(captured) => captured,
             Err(status) => return (status as i32, 0, 0, 0),
         };
-    let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    let token = match NEXT_TOKEN.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
         next.checked_add(1)
     }) {
         Ok(token) => token,

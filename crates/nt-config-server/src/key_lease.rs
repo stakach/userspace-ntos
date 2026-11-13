@@ -248,7 +248,7 @@ mod tests {
     fn new_bank() -> SystemKeyLeaseBank {
         static NEXT_INCARNATION: AtomicU32 = AtomicU32::new(1);
         let incarnation = NEXT_INCARNATION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .unwrap();

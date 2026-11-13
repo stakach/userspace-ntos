@@ -146,7 +146,7 @@ pub fn initialize<M: PoolMemory>(memory: &mut M) -> Result<(), PoolError> {
         return Err(PoolError::ArenaTooSmall);
     }
     let authority = NEXT_ARENA_AUTHORITY
-        .fetch_update(
+        .try_update(
             core::sync::atomic::Ordering::Relaxed,
             core::sync::atomic::Ordering::Relaxed,
             |next| next.checked_add(1),

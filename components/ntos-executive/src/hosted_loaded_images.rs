@@ -102,7 +102,7 @@ impl HostedLoadedImageTable {
             return false;
         }
         if self.authority == 0 {
-            let Ok(authority) = HOSTED_LOADED_IMAGE_AUTHORITIES.fetch_update(
+            let Ok(authority) = HOSTED_LOADED_IMAGE_AUTHORITIES.try_update(
                 Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1),
             ) else { return false; };
             self.authority = authority;

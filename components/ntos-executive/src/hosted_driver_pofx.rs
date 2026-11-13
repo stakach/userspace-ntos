@@ -313,7 +313,7 @@ pub(crate) fn service(
             return (STATUS_INSUFFICIENT_RESOURCES, 0);
         }
         components.resize_with(b as usize, || None);
-        let cookie = match NEXT_COOKIE.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+        let cookie = match NEXT_COOKIE.try_update(Ordering::Relaxed, Ordering::Relaxed,
             |last| last.checked_add(1)) {
             Ok(last) => last + 1,
             Err(_) => return (STATUS_INSUFFICIENT_RESOURCES, 0),

@@ -21308,7 +21308,7 @@ pub(crate) unsafe fn service_sec_image(
                         record_service_loop_exit!(b"root-maintenance-worker");
                         break 'service_loop;
                     }
-                    let Some(observed_pass) = ROOT_MAINTENANCE_PASS.fetch_update(
+                    let Some(observed_pass) = ROOT_MAINTENANCE_PASS.try_update(
                         Ordering::AcqRel, Ordering::Acquire, |old| old.checked_add(1),
                     ).ok().and_then(|old| old.checked_add(1)) else {
                         print_str(b"[root-maintenance] outer pass epoch exhausted\n");
@@ -30858,7 +30858,7 @@ unsafe fn redrive_file_mode_input(
                 }
                 Err(status) => table!().fail_mode_input_exact(identity, pending.irp_id, status).is_some(),
                 Ok(exec_handler::CopyPageAdmission::NeedsRoutedPageIn) => {
-                    let Some(token) = NEXT_FILE_MODE_INPUT_PAGE_TOKEN.fetch_update(
+                    let Some(token) = NEXT_FILE_MODE_INPUT_PAGE_TOKEN.try_update(
                         Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1)
                     ).ok().filter(|token| *token != 0) else {
                         return table!().fail_mode_input_exact(identity, pending.irp_id,

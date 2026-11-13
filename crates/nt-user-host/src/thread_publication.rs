@@ -65,7 +65,7 @@ impl ThreadPublicationSlot {
             return Err(PublicationError::Busy);
         }
         let attempt = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| PublicationError::Exhausted)?;

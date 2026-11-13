@@ -261,7 +261,7 @@ impl crate::ExecNtHandler {
         if u64::from(caller.effective_process()) != prepared.process_id {
             return Err(STATUS_INVALID_HANDLE);
         }
-        let sequence = NEXT_ALPC_CREATE_INVOCATION.fetch_update(
+        let sequence = NEXT_ALPC_CREATE_INVOCATION.try_update(
             Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let token = (prepared.process_generation, sequence);

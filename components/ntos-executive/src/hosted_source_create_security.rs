@@ -187,7 +187,7 @@ pub(super) unsafe fn capture(
         return Err(STATUS_INVALID_HANDLE_LOCAL);
     }
     let serial = NEXT_TICKET
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_LOCAL)?;

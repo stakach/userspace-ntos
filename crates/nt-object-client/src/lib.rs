@@ -393,7 +393,7 @@ impl<B: Backend> ObjectClient<B> {
 
     /// Wrap a transport backend.
     pub fn new(backend: B) -> Self {
-        let owned_client_id = NEXT_OWNED_CLIENT_ID.fetch_update(
+        let owned_client_id = NEXT_OWNED_CLIENT_ID.try_update(
             Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1),
         ).expect("object client identity exhausted");
         Self { backend, owned_client_id, owned_request_state: OwnedRequestState::Idle }

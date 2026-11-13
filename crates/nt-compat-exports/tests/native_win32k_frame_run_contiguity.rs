@@ -104,7 +104,7 @@ static ROOT_CSPACE_END: AtomicU64 = AtomicU64::new(200);
 static NEXT_SLOT: AtomicU64 = AtomicU64::new(100);
 static RECYCLED: AtomicU64 = AtomicU64::new(2);
 fn try_recycled_root_slot() -> Option<u64> {
-    match RECYCLED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)) {
+    match RECYCLED.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)) {
         Ok(2) => Some(17),
         Ok(1) => Some(9),
         _ => None,

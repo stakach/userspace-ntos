@@ -15083,7 +15083,7 @@ impl ServiceLaunchContext {
             return None;
         }
         let incarnation = NEXT_SERVICE_INCARNATION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current
                     .checked_add(1)
                     .filter(|next| *next <= u32::MAX as u64)
@@ -23523,7 +23523,7 @@ struct ObjEntry {
 impl ObjEntry {
     fn push_zeroed(entries: &mut alloc::vec::Vec<Self>) -> Option<usize> {
         let identity = NEXT_OBJ_NS_IDENTITY
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
             .ok()?;
         if entries.len() == entries.capacity() {
             let old_capacity = entries.capacity();

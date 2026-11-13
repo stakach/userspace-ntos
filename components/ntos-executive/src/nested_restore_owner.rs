@@ -181,7 +181,7 @@ unsafe fn prepare_row(
     let Ok(return_target) = HostedReturnTarget::new(root_reply, None) else {
         return Err(pending);
     };
-    let generation = match NEXT_GENERATION.fetch_update(
+    let generation = match NEXT_GENERATION.try_update(
         Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1),
     ) {
         Ok(generation) => generation,

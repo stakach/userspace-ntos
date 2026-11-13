@@ -229,7 +229,7 @@ pub(crate) fn service(
     if transfers.try_reserve(1).is_err() {
         return (STATUS_INSUFFICIENT_RESOURCES, 0, 0, 0);
     }
-    let token = match NEXT_TRANSFER.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| last.checked_add(1)) {
+    let token = match NEXT_TRANSFER.try_update(Ordering::Relaxed, Ordering::Relaxed, |last| last.checked_add(1)) {
         Ok(last) => last + 1,
         Err(_) => return (STATUS_INSUFFICIENT_RESOURCES, 0, 0, 0),
     };

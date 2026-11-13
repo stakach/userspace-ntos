@@ -20,7 +20,7 @@ use index::FrameKeyIndex;
 
 fn allocate_record_id(counter: &AtomicU64) -> Result<u64, ClientFrameInsertError> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .map_err(|_| ClientFrameInsertError::IdentityExhausted)

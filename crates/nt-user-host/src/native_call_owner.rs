@@ -24,7 +24,7 @@ static LAST_OWNER: AtomicU64 = AtomicU64::new(0);
 
 fn issue_owner(counter: &AtomicU64) -> Result<u64, NativeCallError> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             last.checked_add(1)
         })
         .map(|last| last + 1)

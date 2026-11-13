@@ -39,7 +39,7 @@ const _: () = assert!(
 
 fn report_fat_read_failure(context: &[u8], sector: u64, count: u32, status: u32) {
     use core::sync::atomic::Ordering;
-    let reported = FAT_READ_FAILURE_REPORTS.fetch_update(
+    let reported = FAT_READ_FAILURE_REPORTS.try_update(
         Ordering::Relaxed,
         Ordering::Relaxed,
         |reported| Some(reported.saturating_add(1)),

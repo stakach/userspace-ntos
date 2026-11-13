@@ -92,7 +92,7 @@ pub fn take_matching_bootstrap_completion<T: Eq, R>(
 impl<T: Copy + Eq> BootstrapCoordinator<T> {
     pub fn new(target: T) -> Result<Self, BootstrapReceiveError> {
         let owner = NEXT_OWNER
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| BootstrapReceiveError::IdentityExhausted)?;

@@ -78,7 +78,7 @@ impl ProjectionAllocationLedger {
             .try_reserve(1)
             .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
         let nonce = NEXT_OWNER
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;

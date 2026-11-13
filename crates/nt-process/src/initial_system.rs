@@ -82,7 +82,7 @@ impl ProcessManager {
             .checked_add(1)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let designation = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 if value == 0 {
                     None
                 } else {

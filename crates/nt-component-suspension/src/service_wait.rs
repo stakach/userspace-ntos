@@ -14,7 +14,7 @@ impl ServiceWaitTokenIssuer {
     }
 
     pub fn issue(&self) -> Option<u64> {
-        self.next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
+        self.next.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
             .ok()
             .filter(|token| *token != 0)
     }

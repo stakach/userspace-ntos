@@ -72,7 +72,7 @@ unsafe fn map(
     request: SectionMapRequest,
 ) -> Result<(u64, u64, u64), u32> {
     let token = NEXT_TOKEN
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     let owner = Owner {
         route,

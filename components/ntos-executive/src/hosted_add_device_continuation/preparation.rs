@@ -466,7 +466,7 @@ pub(super) unsafe fn call_add_device_for_existing_pdo_progress(
 ) -> HostedAddDeviceProgress {
     let _durable = crate::allocator::enter_durable();
     // Exhaustion is checked before any PDO or native effect, so no move-only owner can be lost.
-    let epoch = match NEXT_ADD_DEVICE_CONTINUATION_EPOCH.fetch_update(
+    let epoch = match NEXT_ADD_DEVICE_CONTINUATION_EPOCH.try_update(
         Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1),
     ) {
         Ok(epoch) => epoch,

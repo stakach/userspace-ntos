@@ -134,7 +134,7 @@ impl ProcessManager {
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         if self.suspend_manager_identity == 0 {
             self.suspend_manager_identity = NEXT_MANAGER
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_add(1)
                 })
                 .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;

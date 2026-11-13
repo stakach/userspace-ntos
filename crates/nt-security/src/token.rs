@@ -919,7 +919,7 @@ impl TokenStore {
     pub(crate) fn acquire_subject_domain(&mut self) -> Result<u64, u32> {
         if self.subject_domain == 0 {
             self.subject_domain = NEXT_SUBJECT_DOMAIN
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
                 .map_err(|_| 0xc000_009au32)?;
         }
         Ok(self.subject_domain)

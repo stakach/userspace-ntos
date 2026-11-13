@@ -85,7 +85,7 @@ impl<K: Copy + Eq, B> RetainedOwnerTable<K, B> {
         let next = self.next_generation.checked_add(1)
             .ok_or(RetainedOwnerError::NoCapacity)?;
         let table = if self.table == 0 {
-            NEXT_TABLE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
+            NEXT_TABLE.try_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
                 .map_err(|_| RetainedOwnerError::NoCapacity)?
         } else { self.table };
         self.table = table;

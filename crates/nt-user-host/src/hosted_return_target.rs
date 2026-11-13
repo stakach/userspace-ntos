@@ -165,7 +165,7 @@ impl<C: Copy> HostedReturnTarget<C> {
             return Err(HostedReturnTargetError::NotReady);
         };
         let nonce = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 if value == 0 {
                     None
                 } else {

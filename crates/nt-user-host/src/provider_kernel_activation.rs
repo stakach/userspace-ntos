@@ -37,7 +37,7 @@ pub use shared_completion::KernelProviderSharedCompletion;
 
 fn next_activation(counter: &AtomicU64) -> Result<u64, u32> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             if value == 0 {
                 None
             } else {

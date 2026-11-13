@@ -59,7 +59,7 @@ pub(crate) struct DeviceReferenceStore {
 
 fn allocate_manager_identity(counter: &AtomicU64) -> Result<u64, NtStatus> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             if next == 0 {
                 None
             } else {

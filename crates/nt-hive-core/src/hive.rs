@@ -1555,7 +1555,7 @@ impl MutableHiveSet {
 
     fn reserve_retained_owner(&mut self) -> Option<u64> {
         self.retained_value_owners.try_reserve(1).ok()?;
-        NEXT_RETAINED_OWNER.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |owner|
+        NEXT_RETAINED_OWNER.try_update(Ordering::Relaxed, Ordering::Relaxed, |owner|
             owner.checked_add(1)).ok()
     }
 

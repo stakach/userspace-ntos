@@ -121,7 +121,7 @@ impl<P, R: Copy + Eq> PriorityTransitionOwner<P, R> {
                 return Err(PriorityTransitionError::DuplicateOwner);
             }
         }
-        let owner = NEXT_OWNER.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        let owner = NEXT_OWNER.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             if value == 0 { None } else { value.checked_add(1) }
         }).map_err(|_| PriorityTransitionError::OwnerExhausted)?;
         Ok(Self { owner, payload: Some(payload), effects, next: 0, phase: Phase::Ready })

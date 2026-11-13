@@ -144,7 +144,7 @@ impl ProcessManager {
     pub(crate) fn ensure_priority_plan_manager_identity(&mut self) -> Result<u64, u32> {
         if self.priority_plan_manager_identity == 0 {
             self.priority_plan_manager_identity = NEXT_MANAGER
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_add(1)
                 })
                 .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;

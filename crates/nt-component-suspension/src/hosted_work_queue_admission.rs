@@ -90,7 +90,7 @@ pub struct HostedWorkQueueAdmission<const N: usize> {
 impl<const N: usize> HostedWorkQueueAdmission<N> {
     pub fn new() -> Self {
         assert!(N > 0, "work queue capacity must be nonzero");
-        let id = NEXT_QUEUE_ID.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        let id = NEXT_QUEUE_ID.try_update(Ordering::AcqRel, Ordering::Acquire,
             |current| current.checked_add(1)).expect("work queue identity exhausted");
         Self { id, next: AtomicU64::new(0), dequeue: AtomicU64::new(0),
             retired: AtomicU64::new(0),

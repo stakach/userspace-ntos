@@ -6214,7 +6214,7 @@ fn trace_invalid_provider_wait_request(
 
 fn next_provider_wait_id() -> Option<u64> {
     PROVIDER_WAIT_NEXT_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .ok()
@@ -8650,7 +8650,7 @@ fn lpc_request_wait_reply_retained(
         return STATUS_INVALID_PARAMETER_I32;
     };
     let generation = LPC_WAIT_NEXT_GENERATION
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .ok()
@@ -13983,7 +13983,7 @@ impl Drop for EventReclaimDrainGuard {
 
 pub(crate) unsafe fn mark_event_provider_reclaim_pending() {
     if WIN32K_EVENT_RECLAIM_EPOCH
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| epoch.checked_add(1))
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| epoch.checked_add(1))
         .is_err()
     {
         park();

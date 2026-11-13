@@ -83,7 +83,7 @@ static USER_CALLBACK_DISPATCH_IDS: AtomicU64 = AtomicU64::new(0);
 /// Exhaustion refuses a fresh dispatch instead of wrapping to a live identity.
 pub(crate) fn next_win32k_dispatch_id() -> Option<u64> {
     USER_CALLBACK_DISPATCH_IDS
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
         .ok()?
         .checked_add(1)
 }
@@ -2866,7 +2866,7 @@ unsafe fn trace_nested_callback_frontier(
     phase: &[u8], dispatch_id: u64, ssn: u64, client: Win32kClientContext,
     completed: bool, callback_wait: bool, provider_wait: bool, lpc_wait: bool,
 ) {
-    if USER_CALLBACK_NESTED_FRONTIER_TRACES.fetch_update(
+    if USER_CALLBACK_NESTED_FRONTIER_TRACES.try_update(
         Ordering::Relaxed, Ordering::Relaxed,
         |count| (count < 4096).then_some(count + 1),
     ).is_err() {
@@ -3008,7 +3008,7 @@ unsafe fn begin_controlled_continuation(
     if callback_client.tcb <= 1 {
         return false;
     }
-    let Ok(external_token) = USER_CALLBACK_TRANSFER_IDS.fetch_update(
+    let Ok(external_token) = USER_CALLBACK_TRANSFER_IDS.try_update(
         Ordering::Relaxed,
         Ordering::Relaxed,
         |next| next.checked_add(1),

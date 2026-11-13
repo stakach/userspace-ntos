@@ -244,7 +244,7 @@ unsafe fn begin_owned(handler: &mut ExecNtHandler, caller: NativeCaller,
         return Err(STATUS_DEVICE_BUSY);
     }
     owners.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-    let sequence = NEXT_INVOCATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+    let sequence = NEXT_INVOCATION.try_update(Ordering::Relaxed, Ordering::Relaxed,
         |next| next.checked_add(1)).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     let token = (caller.generation, sequence);
     let request = match &kind {

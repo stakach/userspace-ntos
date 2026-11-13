@@ -64,7 +64,7 @@ impl RootReceiveIdleProbe {
         if !state.needs_evidence() {
             return false;
         }
-        if changed && self.transition_prints.fetch_update(
+        if changed && self.transition_prints.try_update(
             Ordering::Relaxed, Ordering::Relaxed,
             |count| (count < self.transition_cap).then_some(count + 1),
         ).is_ok() {
@@ -73,7 +73,7 @@ impl RootReceiveIdleProbe {
         }
         let prior = self.last_emit_at.load(Ordering::Relaxed);
         if now_100ns.saturating_sub(prior) >= self.periodic_interval_100ns
-            && self.periodic_prints.fetch_update(
+            && self.periodic_prints.try_update(
                 Ordering::Relaxed, Ordering::Relaxed,
                 |count| (count < self.periodic_cap).then_some(count + 1),
             ).is_ok()

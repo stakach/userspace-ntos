@@ -61,7 +61,7 @@ pub(crate) fn construction_rollback_id<T>(
 
 fn allocate_attempt(counter: &AtomicU64) -> Result<u64, ThreadRollbackError> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .map_err(|_| ThreadRollbackError::InsufficientResources)

@@ -40,7 +40,7 @@ impl WorkState {
             return None;
         }
         self.outstanding
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .ok()?;
@@ -50,7 +50,7 @@ impl WorkState {
         }
         let sequence = self
             .next_sequence
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .map(|previous| previous + 1);

@@ -79,7 +79,7 @@ unsafe fn allocate_waiter() -> u64 {
 unsafe fn add_queue_ref(address: u64) {
     if waiter(address)
         .refs
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |refs| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |refs| {
             refs.checked_add(1).filter(|_| refs != 0)
         })
         .is_err()

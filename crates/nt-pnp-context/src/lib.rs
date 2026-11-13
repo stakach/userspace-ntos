@@ -470,7 +470,7 @@ impl<D, O> ContextRegistry<D, O> {
     pub fn acquire_active(&mut self) -> Result<ContextLease, AcquireError> {
         if self.authority == 0 {
             self.authority = NEXT_REGISTRY_AUTHORITY
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_add(1)
                 })
                 .map_err(|_| AcquireError::IdExhausted)?;

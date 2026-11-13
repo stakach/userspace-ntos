@@ -821,7 +821,7 @@ impl PendingFileIoTable {
         }
         if self.identity == 0 {
             self.identity = source
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
                     (identity != 0).then(|| identity.checked_add(1)).flatten()
                 })
                 .ok()?;

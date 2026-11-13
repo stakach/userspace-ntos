@@ -30589,7 +30589,7 @@ impl ExecNtHandler {
         if is_csr_api_port {
             CSR_MSGS.fetch_add(1, Ordering::Relaxed);
             if received.msg_type == nt_lpc_abi::msg_type::LPC_CLIENT_DIED {
-                let _ = CSR_KERNEL_MESSAGES_PENDING.fetch_update(
+                let _ = CSR_KERNEL_MESSAGES_PENDING.try_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |pending| Some(pending.saturating_sub(1)),

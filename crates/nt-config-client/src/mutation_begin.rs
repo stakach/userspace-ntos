@@ -255,7 +255,7 @@ impl CmMutationBeginAttempts {
             }
             let requester = if self.requester == 0 {
                 LAST_REQUESTER
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
                         last.checked_add(1)
                     })
                     .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?

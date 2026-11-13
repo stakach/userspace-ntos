@@ -7,7 +7,7 @@ static NEXT_UNPUBLISHED_IMAGE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn allocate_unpublished_image_lifetime() -> nt_memory_manager::MemoryLifetime {
     let token = NEXT_UNPUBLISHED_IMAGE_TOKEN
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
         .expect("unpublished SEC_IMAGE lifetime exhausted");
     nt_memory_manager::MemoryLifetime::UnpublishedImage(token)
 }

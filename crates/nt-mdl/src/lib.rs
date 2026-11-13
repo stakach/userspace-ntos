@@ -587,7 +587,7 @@ impl MdlRegistry {
             .try_reserve(1)
             .map_err(|_| MdlError::InsufficientResources)?;
         let lease_id = NEXT_READ_LEASE_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| MdlError::LeaseIdsExhausted)?;

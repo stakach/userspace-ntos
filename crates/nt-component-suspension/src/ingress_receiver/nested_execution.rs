@@ -152,7 +152,7 @@ impl<M> IngressReceiver<M> {
             return Err(NestedExecutionError::BindingMismatch);
         }
         let sequence = NEXT_SCOPE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 if next == 0 {
                     None
                 } else {

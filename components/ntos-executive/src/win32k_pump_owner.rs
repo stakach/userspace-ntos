@@ -134,7 +134,7 @@ pub(crate) unsafe fn begin_pump(
         .map_err(|_| BeginError::PhysicalIdentity)?;
     let reply = crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(route)
         .map_err(|_| BeginError::PhysicalIdentity)?;
-    let attempt = NEXT_ATTEMPT.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+    let attempt = NEXT_ATTEMPT.try_update(Ordering::AcqRel, Ordering::Acquire,
         |value| value.checked_add(1)).map_err(|_| BeginError::Exhausted)?;
     let key = ReturnedPumpKey::new(
         route, dispatch, context.dispatch,

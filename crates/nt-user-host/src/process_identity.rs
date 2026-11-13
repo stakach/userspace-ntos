@@ -124,7 +124,7 @@ impl TemporaryProcessSlots {
             return Err(TemporaryProcessError::DuplicatePid);
         }
         let generation = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 if value == 0 {
                     None
                 } else {

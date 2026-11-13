@@ -161,7 +161,7 @@ pub(super) unsafe fn claim(
         rows.resize_with(index + 1, || None);
     }
     if rows[index].is_some() { return false; }
-    let sequence = NEXT_SEQUENCE.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+    let sequence = NEXT_SEQUENCE.try_update(Ordering::AcqRel, Ordering::Acquire,
         |current| current.checked_add(1)).ok();
     let Some(sequence) = sequence else { return false; };
     rows[index] = Some(Row {

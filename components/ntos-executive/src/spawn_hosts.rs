@@ -1611,7 +1611,7 @@ fn dispatch_depth_enter() {
 }
 
 fn dispatch_depth_leave() {
-    let _ = PUMP_DISPATCH_DEPTH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+    let _ = PUMP_DISPATCH_DEPTH.try_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
         Some(d.saturating_sub(1))
     });
 }

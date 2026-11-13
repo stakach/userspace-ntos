@@ -1110,7 +1110,7 @@ impl HostedIrqArenaControl {
             }
         }
         self.direction_mask(direction)
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mask| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |mask| {
                 (mask & bit == 0).then_some(mask | bit)
             })
             .map_err(|_| HostedIrqArenaError::Busy)?;
@@ -1137,7 +1137,7 @@ impl HostedIrqArenaControl {
         self.token_is_active(identity, token)?;
         let bit = 1u32 << token.depth;
         self.direction_running_mask(token.direction)
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mask| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |mask| {
                 (mask & bit == 0).then_some(mask | bit)
             })
             .map_err(|_| HostedIrqArenaError::Busy)?;
@@ -1157,7 +1157,7 @@ impl HostedIrqArenaControl {
         self.token_is_active(identity, token)?;
         let bit = 1u32 << token.depth;
         self.direction_running_mask(token.direction)
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mask| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |mask| {
                 (mask & bit != 0).then_some(mask & !bit)
             })
             .map(|_| ())
@@ -1172,7 +1172,7 @@ impl HostedIrqArenaControl {
         self.token_is_active(identity, token)?;
         let bit = 1u32 << token.depth;
         self.direction_running_mask(token.direction)
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mask| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |mask| {
                 (mask & bit == 0).then_some(mask | bit)
             })
             .map(|_| ())
@@ -1196,7 +1196,7 @@ impl HostedIrqArenaControl {
         self.can_release(identity, token)?;
         let bit = 1u32 << token.depth;
         self.direction_mask(token.direction)
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mask| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |mask| {
                 (mask & bit != 0).then_some(mask & !bit)
             })
             .map(|_| ())
@@ -1279,7 +1279,7 @@ impl HostedIrqArenaControl {
 
     fn poison_lane(&self) -> Result<(), HostedIrqArenaError> {
         self.lane_state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 matches!(
                     state,
                     LANE_BOOTING | LANE_READY | LANE_ACTIVE | LANE_POISONED
@@ -1491,7 +1491,7 @@ impl HostedIrqArenaControl {
             return Err(HostedIrqArenaError::Busy);
         }
         self.lane_state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 (matches!(state, LANE_READY | LANE_ACTIVE | LANE_POISONED)
                     && self.fault_state.load(Ordering::Acquire) != FAULT_PUBLISHING
                     && self.bugcheck_state.load(Ordering::Acquire) != FAULT_PUBLISHING)
@@ -2032,7 +2032,7 @@ impl HostedIrqSlotPage {
         self.validate_token(identity, token, direction)?;
         let terminal_state = self
             .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 matches!(state, SLOT_COMPLETE | SLOT_FAULTED).then_some(SLOT_RELEASING)
             })
             .map_err(|_| HostedIrqArenaError::ResultNotReady)?;

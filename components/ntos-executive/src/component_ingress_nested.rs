@@ -563,7 +563,7 @@ unsafe fn park_current_attempt(
             rows.len() - 1
         }
     };
-    let generation = match NEXT_PARENT_GENERATION.fetch_update(
+    let generation = match NEXT_PARENT_GENERATION.try_update(
         Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1),
     ) {
         Ok(generation) => generation,
