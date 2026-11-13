@@ -42,6 +42,9 @@ pub(super) struct SyscallOutcome {
     // Checkpoint B: -1 = no wait-park; >=0 = NtWaitForSingleObject asked to park this caller on
     // the encoded WaitObject in nt_handler.wait_park_event after dispatch.
     pub(super) park_wait_event: i64,
+    /// Namespace identity captured when the park object's handle was resolved.
+    pub(super) park_wait_event_identity: u64,
+    pub(super) park_wait_identities: [u64; 64],
     // Array-wait park: the typed dispatcher/process/thread/File set + WaitAll flag.
     // count 0 = no array-park. Consumed next to park_wait_event in the reply block.
     pub(super) park_wait_set: &'static mut [WaitObject; 64],
@@ -94,6 +97,8 @@ impl SyscallOutcome {
             redirected_context_continue: false,
             active_callback_bad_resume: false,
             park_wait_event: -1,
+            park_wait_event_identity: 0,
+            park_wait_identities: [0; 64],
             park_wait_set: &mut *core::ptr::addr_of_mut!(PARK_WAIT_SET_WORK),
             park_wait_indices: &mut *core::ptr::addr_of_mut!(PARK_WAIT_INDEX_WORK),
             park_wait_set_n: 0,

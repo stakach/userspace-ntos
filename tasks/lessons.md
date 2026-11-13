@@ -842,3 +842,8 @@ diagnosis-free failure.
 - A value a macro argument read late (the Reply slot after a prepare step) must stay late in the function form; pass it as a closure. Check that every other argument is a plain read before evaluating it eagerly.
 - Rename a common local (`result`, `badge`) with a scope-aware pass and remove the old binding from scope, so a missed use fails to compile and a stale copy cannot be read after the loop.
 - An RAII guard declared in a hoisted section must be returned to the caller that owns the turn, or it drops when the section returns.
+
+## Count Every Holder Before Reusing An Identity
+- Before an index that names an object may be reused, enumerate every place the bare index is stored or carried, starting from each function that turns a handle into the index, not from the reference counters that already exist. A holder nobody counts (a pending I/O row's completion Event index) turns a stuck delivery into a signal on an unrelated object.
+- A reuse delay is a margin, never the argument. For each path state why it holds with a delay of zero: a lease, a counted reference, or an identity re-check after any call that can run other work (user-memory copies included).
+- Ask for the independent review before pushing a lifetime change, and wait for it; do not report a safety argument that only its author has read.

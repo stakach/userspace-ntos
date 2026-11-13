@@ -3121,6 +3121,8 @@ pub(super) unsafe fn report(
                         && wait_park(
                             &mut nt_handler,
                             WaitObject::dispatcher(park_index as usize),
+                            // A debug object's host Event is not a namespace entry.
+                            0,
                             false,
                             u64::from(debugger_wait_tid.unwrap()),
                             nt_delay_execution::Deadline::Infinite,

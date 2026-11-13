@@ -46,7 +46,7 @@ impl ExecNtHandler {
         };
         let completion_port_suppressed =
             nt_io_completion::io_event_suppresses_completion_port(args[1]);
-        let event_obj_idx = match self.prepare_io_event_for_request(args[1]) {
+        let event_obj_idx = match self.prepare_io_event_for_request(args[0], args[1]) {
             Ok(Some(index)) => index as u64,
             Ok(None) => u64::MAX,
             Err(status) => return status,

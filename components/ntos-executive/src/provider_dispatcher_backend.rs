@@ -242,10 +242,16 @@ pub(crate) fn finalize_retired_event(
     let Ok(index) = usize::try_from(retired.native_identity) else {
         return;
     };
-    let Some(entry) = obj_ns.get(index) else {
+    let Some(entry) = obj_ns.get_mut(index) else {
         return;
     };
-    if !entry.is_live() || entry.kind != OBJ_KIND_EVENT || entry.wait_references != 0 {
+    if !entry.is_live() || entry.kind != OBJ_KIND_EVENT {
+        return;
+    }
+    if entry.wait_references != 0 {
+        // Wait records taken before the registry knew this Event still name the entry. Their
+        // final release deletes it (`release_dispatcher_wait_reference`).
+        entry.retired_awaiting_waiters = true;
         return;
     }
     events.remove_existing(index as u64);

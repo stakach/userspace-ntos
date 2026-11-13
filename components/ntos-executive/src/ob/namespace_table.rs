@@ -35,6 +35,9 @@ pub(crate) struct ObjEntry {
     pub(crate) permanent: bool,
     /// References held by published native wait records after the caller's handle capture.
     pub(crate) wait_references: u32,
+    /// The Event registry has retired this Event, but wait records still reference the entry.
+    /// The entry is deleted when the last of them is released.
+    pub(crate) retired_awaiting_waiters: bool,
     pub(crate) target: [u8; OBJ_NAME_CAP], // symbolic-link target (kind == 1)
     pub(crate) target_len: u8,
     pub(crate) payload: u64,
@@ -50,6 +53,7 @@ impl ObjEntry {
             kind: OBJ_KIND_DELETED,
             permanent: false,
             wait_references: 0,
+            retired_awaiting_waiters: false,
             target: [0; OBJ_NAME_CAP],
             target_len: 0,
             payload: 0,
@@ -75,6 +79,7 @@ impl ObjEntry {
         self.kind = OBJ_KIND_DELETED;
         self.permanent = false;
         self.wait_references = 0;
+        self.retired_awaiting_waiters = false;
         self.target = [0; OBJ_NAME_CAP];
         self.target_len = 0;
         self.payload = 0;

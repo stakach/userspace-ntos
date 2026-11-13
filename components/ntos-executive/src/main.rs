@@ -18257,6 +18257,7 @@ unsafe fn cancel_io_completion_reply_transport(cap: u64) -> bool {
 unsafe fn wait_park(
     handler: &mut ExecNtHandler,
     object: WaitObject,
+    identity: u64,
     alertable: bool,
     tid: u64,
     deadline: nt_delay_execution::Deadline,
@@ -18265,6 +18266,7 @@ unsafe fn wait_park(
     wait_park_multi(
         handler,
         &[object],
+        &[identity],
         &[0],
         false,
         alertable,
@@ -19355,9 +19357,14 @@ unsafe fn teardown_job_terminated_processes(
 /// rotates a fresh pool object into REPLY_MAIN so subsequent recvs bind a new object. Returns true on
 /// success; false if the pool/queue is exhausted OR the set is too large (`objects.len() >
 /// WAITER_MAX_EVENTS`).
+///
+/// `identities[i]` is the namespace identity `objects[i]` had when its handle was resolved. The
+/// caller may have run other work since, so an object whose index now belongs to another entry
+/// is refused here, before any reference is taken.
 unsafe fn wait_park_multi(
     handler: &mut ExecNtHandler,
     objects: &[WaitObject],
+    identities: &[u64],
     result_indices: &[u8],
     wait_all: bool,
     alertable: bool,
@@ -19367,6 +19374,10 @@ unsafe fn wait_park_multi(
     if objects.is_empty()
         || objects.len() > WAITER_MAX_EVENTS
         || result_indices.len() != objects.len()
+        || identities.len() != objects.len()
+        || objects.iter().zip(identities).any(|(object, identity)| {
+            handler.wait_object_namespace_identity(*object) != *identity
+        })
     {
         WAIT_PARK_INVALID_SET.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -24112,6 +24123,10 @@ struct ExecNtHandler {
     /// WaitObject) instead of replying, and wake it on the matching state transition. -1 = no park.
     /// Reset each dispatch (group-A signal, like spawn_request).
     wait_park_event: i64,
+    /// Namespace identity of `wait_park_event`'s entry when its handle was resolved; 0 for an
+    /// object that is not a namespace entry. The park is refused if the index has since been
+    /// given to another object.
+    wait_park_event_identity: u64,
     /// Alertability captured with the pending single-object wait handoff.
     wait_alertable: bool,
     /// Raw NT timeout interval for the pending wait-object park. The loop converts it into a
@@ -24120,6 +24135,8 @@ struct ExecNtHandler {
     /// Typed set captured by `NtWaitForMultipleObjects` for reply-cap parking.
     wait_capture_handles: [u64; WAITER_MAX_EVENTS],
     wait_park_objects: [WaitObject; WAITER_MAX_EVENTS],
+    /// Per-object counterpart of `wait_park_event_identity`.
+    wait_park_identities: [u64; WAITER_MAX_EVENTS],
     wait_park_result_indices: [u8; WAITER_MAX_EVENTS],
     wait_park_count: usize,
     wait_park_all: bool,

@@ -111,6 +111,7 @@ pub(super) unsafe fn syscall_nt_route(
     nt_handler.exe_spawn_new_process = false;
     nt_handler.thread_spawn_request = None;
     nt_handler.wait_park_event = -1;
+    nt_handler.wait_park_event_identity = 0;
     nt_handler.wait_alertable = false;
     nt_handler.wait_timeout = PendingWaitTimeout::none();
     nt_handler.wait_park_count = 0;
@@ -1093,6 +1094,7 @@ pub(super) unsafe fn syscall_nt_route(
     // resume_ip/sp/flags are known).
     if nt_handler.wait_park_event >= 0 {
         sc.park_wait_event = nt_handler.wait_park_event;
+        sc.park_wait_event_identity = nt_handler.wait_park_event_identity;
         sc.park_wait_alertable = nt_handler.wait_alertable;
         sc.park_wait_deadline = nt_handler.wait_timeout.deadline();
     }
@@ -1103,6 +1105,8 @@ pub(super) unsafe fn syscall_nt_route(
         sc.park_wait_deadline = nt_handler.wait_timeout.deadline();
         sc.park_wait_set[..sc.park_wait_set_n]
             .copy_from_slice(&nt_handler.wait_park_objects[..sc.park_wait_set_n]);
+        sc.park_wait_identities[..sc.park_wait_set_n]
+            .copy_from_slice(&nt_handler.wait_park_identities[..sc.park_wait_set_n]);
         sc.park_wait_indices[..sc.park_wait_set_n]
             .copy_from_slice(&nt_handler.wait_park_result_indices[..sc.park_wait_set_n]);
     }

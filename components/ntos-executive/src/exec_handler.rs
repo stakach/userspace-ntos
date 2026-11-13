@@ -4370,6 +4370,8 @@ impl ExecNtHandler {
         write_field!(thread_spawn_request, None);
         write_field!(remote_thread_request, None);
         write_field!(wait_park_event, -1);
+        write_field!(wait_park_event_identity, 0);
+        write_field!(wait_park_identities, [0; WAITER_MAX_EVENTS]);
         write_field!(wait_alertable, false);
         write_field!(wait_timeout, PendingWaitTimeout::none());
         write_field!(wait_capture_handles, [0; WAITER_MAX_EVENTS]);
@@ -7477,6 +7479,16 @@ impl ExecNtHandler {
         }
     }
 
+    /// Run `nt_unload_key_ex` and release the Event lease it took, on every exit.
+    unsafe fn nt_unload_key(&mut self, target_oa: u64, flags: u32, event: u64) -> u32 {
+        let mut event_lease = None;
+        let status = self.nt_unload_key_ex(target_oa, flags, event, &mut event_lease);
+        if let Some(event) = event_lease {
+            self.release_transfer_event(event);
+        }
+        status
+    }
+
     /// `NtUnloadKey*` — ReactOS `ntoskrnl/config/ntapi.c:1796` (`NtUnloadKey2`) plus the event
     /// form. Detach a hive `NtLoadKey*` mounted: the mount goes, its backing slot is released, and
     /// the write overlay's keys under that path are detached too — otherwise the writes made
@@ -7484,7 +7496,16 @@ impl ExecNtHandler {
     ///
     /// # Safety
     /// Reads the caller's OBJECT_ATTRIBUTES through the bounds-checked cross-AS reader.
-    unsafe fn nt_unload_key_ex(&mut self, target_oa: u64, flags: u32, event: u64) -> u32 {
+    ///
+    /// The optional Event is leased into `event_lease` when its handle is resolved; the caller
+    /// releases it after this returns (`nt_unload_key`).
+    unsafe fn nt_unload_key_ex(
+        &mut self,
+        target_oa: u64,
+        flags: u32,
+        event: u64,
+        event_lease: &mut Option<nt_io_manager::FileTransferEvent>,
+    ) -> u32 {
         const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -7498,9 +7519,14 @@ impl ExecNtHandler {
             NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
             return STATUS_PRIVILEGE_NOT_HELD;
         }
+        // The unload commits the hive volume before it signals, and that can run other work.
+        // The lease keeps the caller's Event, and so its index, until the signal.
         let event_index = if event != 0 {
-            match self.event_index_for_handle(event, EVENT_MODIFY_STATE) {
-                Ok(index) => Some(index),
+            match self.lease_event_for_operation(event, EVENT_MODIFY_STATE) {
+                Ok(event) => {
+                    *event_lease = Some(event);
+                    Some(event.native_identity as usize)
+                }
                 Err(status) => {
                     NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
                     return status;
@@ -12264,6 +12290,8 @@ impl ExecNtHandler {
                     Ok(object) => object,
                     Err(status) => return status,
                 };
+            self.wait_park_identities[index] =
+                self.wait_object_namespace_identity(self.wait_park_objects[index]);
         }
 
         let wait_all = wait_type == 0;
@@ -12582,7 +12610,19 @@ impl ExecNtHandler {
             .checked_sub(1)
             .ok_or(STATUS_INVALID_PARAMETER)?;
         let kind = entry.kind;
+        let entry_identity = entry.identity;
+        let retired_awaiting_waiters = entry.retired_awaiting_waiters;
         self.obj_ns[index].wait_references = references;
+        if retired_awaiting_waiters {
+            // The registry retired this Event while these wait records held it; the last one
+            // completes the deletion that `finalize_retired_event` deferred.
+            if references == 0 {
+                self.named_event_security.retain(|(identity, _)| *identity != entry_identity);
+                self.events.remove_existing(index as u64);
+                self.retire_namespace_slot(index);
+            }
+            return Ok(());
+        }
         let final_handleless_reference = if kind == OBJ_KIND_EVENT {
             references == 0
                 && self
@@ -13388,7 +13428,7 @@ impl ExecNtHandler {
 
         let completion_port_suppressed =
             nt_io_completion::io_event_suppresses_completion_port(args[1]);
-        let event_obj_idx = match self.prepare_io_event_for_request(args[1]) {
+        let event_obj_idx = match self.prepare_io_event_for_request(args[0], args[1]) {
             Ok(Some(index)) => index as u64,
             Ok(None) => u64::MAX,
             Err(event_status) => {
@@ -13870,7 +13910,7 @@ impl ExecNtHandler {
                 .expect("local notify lost its route")
                 .synchronous()
         };
-        let event_obj_idx = match self.prepare_io_event_for_request(event) {
+        let event_obj_idx = match self.prepare_io_event_for_request(handle, event) {
             Ok(index) => index.map_or(u64::MAX, |index| index as u64),
             Err(status) => return status,
         };
@@ -14135,7 +14175,7 @@ impl ExecNtHandler {
         }) {
             return STATUS_INVALID_PARAMETER;
         }
-        let event_obj_idx = match self.prepare_lock_event_for_request(event) {
+        let event_obj_idx = match self.prepare_lock_event_for_request(handle, event) {
             Ok(index) => index.map_or(u64::MAX, |index| index as u64),
             Err(status) => return status,
         };
@@ -25111,7 +25151,14 @@ impl ExecNtHandler {
                         )
                 })
             {
-                let _ = self.request_event_object_delete(id, b"new-event-rollback", true);
+                if let Ok(Some(retired)) =
+                    self.request_event_object_delete(id, b"new-event-rollback", true)
+                {
+                    // One retirement path: it drops the security row, the dispatcher state
+                    // and the namespace slot together.
+                    self.finalize_retired_event_object(retired);
+                    return;
+                }
             }
         }
         if self.obj_ns.is_newest(index) {
@@ -29557,8 +29604,12 @@ impl ExecNtHandler {
         Ok(Some(route))
     }
 
-    fn prepare_lock_event_for_request(&mut self, event_handle: u64) -> Result<Option<usize>, u32> {
-        self.prepare_io_event_for_request(event_handle)
+    fn prepare_lock_event_for_request(
+        &mut self,
+        file_handle: u64,
+        event_handle: u64,
+    ) -> Result<Option<usize>, u32> {
+        self.prepare_io_event_for_request(file_handle, event_handle)
     }
 
     pub(crate) unsafe fn publish_local_byte_lock_completions(&mut self) -> usize {
@@ -29698,20 +29749,23 @@ impl ExecNtHandler {
     /// notification; the event object remains the untagged handle. Legacy opaque wait handles are
     /// accepted for the hosted immediate-wait model, but a real typed event must satisfy the same
     /// access check ReactOS uses before `KeClearEvent`.
+    ///
+    /// The reference is the request's Operation lease (`prepare_transfer_event`): the returned
+    /// index stays this Event until the request completes, whatever happens to the handle.
     pub(crate) fn prepare_io_event_for_request(
         &mut self,
+        file_handle: u64,
         handle: u64,
     ) -> Result<Option<usize>, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-        let Some(event_handle) = nt_io_completion::normalize_io_event_handle(handle) else {
-            return Ok(None);
-        };
-        match self.event_index_for_handle(event_handle, EVENT_MODIFY_STATE) {
-            Ok(index) => {
-                let _ = self.events.reset_existing(index as u64);
-                Ok(Some(index))
-            }
+        match self.prepare_transfer_event(file_handle, handle) {
+            Ok(index) => Ok(index),
+            // A promoted request has no handle to look up again.
+            Err(event_status) if self.active_synchronous_file_retry.is_some() => Err(event_status),
             Err(event_status) => {
+                let Some(event_handle) = nt_io_completion::normalize_io_event_handle(handle) else {
+                    return Err(event_status);
+                };
                 let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
                 match self
                     .pm
@@ -34200,11 +34254,11 @@ impl ExecNtHandler {
             NativeService::NtLoadKeyEx => unsafe {
                 self.nt_load_key_ex(args[0], args[1], nt_ulong_arg(args[2]), args[3])
             },
-            NativeService::NtUnloadKey => unsafe { self.nt_unload_key_ex(args[0], 0, 0) },
+            NativeService::NtUnloadKey => unsafe { self.nt_unload_key(args[0], 0, 0) },
             NativeService::NtUnloadKey2 => unsafe {
-                self.nt_unload_key_ex(args[0], nt_ulong_arg(args[1]), 0)
+                self.nt_unload_key(args[0], nt_ulong_arg(args[1]), 0)
             },
-            NativeService::NtUnloadKeyEx => unsafe { self.nt_unload_key_ex(args[0], 0, args[1]) },
+            NativeService::NtUnloadKeyEx => unsafe { self.nt_unload_key(args[0], 0, args[1]) },
             NativeService::NtLoadDriver => unsafe { self.nt_load_driver(args[0]) },
             NativeService::NtUnloadDriver => unsafe { self.nt_unload_driver(args[0]) },
             NativeService::NtDeleteKey => {
@@ -34769,7 +34823,7 @@ impl ExecNtHandler {
                 // request. In particular, rpcrt4 reuses a manual-reset event when it rearms a pipe
                 // listener; leaving the previous completion signalled manufactures a second accepted
                 // connection.
-                let event_obj_idx = match self.prepare_io_event_for_request(args[1]) {
+                let event_obj_idx = match self.prepare_io_event_for_request(args[0], args[1]) {
                     Ok(Some(index)) => index as u64,
                     Ok(None) => u64::MAX,
                     Err(event_status) => return event_status,
@@ -37097,15 +37151,17 @@ impl ExecNtHandler {
                 if previous_state != 0 && !self.probe_event_output(previous_state, 1) {
                     return 0xC000_0005;
                 }
-                let index = match self.timer_index_for_handle(args[0], TIMER_MODIFY_STATE) {
-                    Ok(index) => index,
-                    Err(status) => return status,
-                };
+                // Capture DueTime before referencing the Timer, as NtSetTimer does: the user
+                // read may run other work, and the index must not be held across it.
                 let mut due_bytes = [0u8; 8];
                 if !self.xas_read(due_time_ptr, &mut due_bytes) {
                     return 0xC000_0005;
                 }
                 let due_time = i64::from_le_bytes(due_bytes);
+                let index = match self.timer_index_for_handle(args[0], TIMER_MODIFY_STATE) {
+                    Ok(index) => index,
+                    Err(status) => return status,
+                };
                 let now = nt_time_snapshot();
                 let deadline = nt_delay_execution::Deadline::from_nt_timeout(Some(due_time), now);
                 let due_now = deadline.is_due(now);
@@ -38927,6 +38983,7 @@ impl ExecNtHandler {
                 let mut receipt_object = None;
                 let status = match self.wait_object_for_handle(handle, SYNCHRONIZE_ACCESS) {
                     Ok(object) => {
+                        self.wait_park_event_identity = self.wait_object_namespace_identity(object);
                         receipt_object = Some(object);
                         let timeout_ptr = args[2];
                         let timeout = match self.wait_timeout_interval(timeout_ptr) {
@@ -38975,6 +39032,7 @@ impl ExecNtHandler {
                     Ok(object) => object,
                     Err(status) => return status,
                 };
+                self.wait_park_event_identity = self.wait_object_namespace_identity(wait_object);
                 let status = self.signal_dispatcher_for_wait(signal_object);
                 if status != 0 {
                     return status;
@@ -39653,7 +39711,7 @@ impl ExecNtHandler {
                             }
                         };
                         let pattern = (args[9] != 0).then_some(&pattern[..pattern_len]);
-                        let event_index = match self.prepare_io_event_for_request(args[1]) {
+                        let event_index = match self.prepare_io_event_for_request(args[0], args[1]) {
                             Ok(index) => index,
                             Err(status) => return status,
                         };
@@ -39735,7 +39793,7 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let pattern = (args[9] != 0).then_some(&pattern[..pattern_len]);
-                let event_index = match self.prepare_io_event_for_request(args[1]) {
+                let event_index = match self.prepare_io_event_for_request(args[0], args[1]) {
                     Ok(index) => index,
                     Err(status) => return status,
                 };

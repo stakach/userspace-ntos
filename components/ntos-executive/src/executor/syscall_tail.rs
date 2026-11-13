@@ -828,6 +828,7 @@ pub(super) unsafe fn syscall_tail(
         } else if wait_park(
             &mut nt_handler,
             park_object,
+            sc.park_wait_event_identity,
             sc.park_wait_alertable,
             park_wait_tid,
             sc.park_wait_deadline,
@@ -877,6 +878,7 @@ pub(super) unsafe fn syscall_tail(
         } else if wait_park_multi(
             &mut nt_handler,
             &sc.park_wait_set[..sc.park_wait_set_n],
+            &sc.park_wait_identities[..sc.park_wait_set_n],
             &sc.park_wait_indices[..sc.park_wait_set_n],
             sc.park_wait_set_all,
             sc.park_wait_alertable,

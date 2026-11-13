@@ -34,13 +34,9 @@ impl ExecNtHandler {
     }
 
     fn validate_transfer_event(&self, event: FileTransferEvent) -> Result<usize, u32> {
-        let id = self.event_objects.event_for_lease(event.lease, EventLeaseKind::Operation)
-            .map_err(|_| STATUS_INVALID_HANDLE)?;
-        let snapshot = self.event_objects.snapshot(id).map_err(|_| STATUS_INVALID_HANDLE)?;
-        if id != event.id || snapshot.native_identity != event.native_identity {
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        usize::try_from(event.native_identity).map_err(|_| STATUS_INVALID_HANDLE)
+        event.resolve(&self.event_objects)
+            .and_then(|native| usize::try_from(native).ok())
+            .ok_or(STATUS_INVALID_HANDLE)
     }
 
     /// Reset only on original admission. A promoted request uses its retained Event, not a handle.
@@ -65,6 +61,20 @@ impl ExecNtHandler {
         self.current_file_transfer_event = Some(event);
         self.events.reset_existing(index as u64).ok_or(STATUS_INVALID_HANDLE)?;
         Ok(Some(index))
+    }
+
+    /// Resolve an Event handle and take an Operation lease on the Event, for a service that
+    /// uses the Event again after work that may run other requests. The Event cannot retire,
+    /// and its namespace index cannot be reused, until `release_transfer_event`.
+    pub(crate) fn lease_event_for_operation(
+        &mut self,
+        handle: u64,
+        access: u32,
+    ) -> Result<FileTransferEvent, u32> {
+        let (id, index) = self.event_object_for_handle_in_pi(self.pi, handle, access)?;
+        let lease = self.event_objects.acquire_wait(id, EventLeaseKind::Operation)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        Ok(FileTransferEvent { id, lease, native_identity: index as u64 })
     }
 
     pub(crate) fn release_transfer_event(&mut self, event: FileTransferEvent) {

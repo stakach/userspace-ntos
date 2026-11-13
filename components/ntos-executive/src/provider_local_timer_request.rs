@@ -27,7 +27,7 @@ pub(crate) fn dispatch(
         };
         if timers.is_none() {
             *timers =
-                Some(ProviderTimerTable::new(provider).map_err(|_| STATUS_INVALID_PARAMETER)?);
+                Some(ProviderTimerTable::new(provider).map_err(nt_provider_wait::ProviderTimerError::nt_status)?);
         }
         let table = timers
             .as_mut()
@@ -35,7 +35,7 @@ pub(crate) fn dispatch(
             .ok_or(STATUS_INVALID_PARAMETER)?;
         let object = table
             .publish(arg1, kind)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?
+            .map_err(nt_provider_wait::ProviderTimerError::nt_status)?
             .wait_object();
         return Ok((0, object.object_id, object.object_generation, arg2));
     }
@@ -47,7 +47,7 @@ pub(crate) fn dispatch(
         win32k_subsystem::W32_TIMER_OP_RETIRE_LOCAL => {
             let retirement = table
                 .request_retire_local(arg1)
-                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+                .map_err(nt_provider_wait::ProviderTimerError::nt_status)?;
             Ok(match retirement {
                 Some(retirement) => {
                     let object = retirement.id.wait_object();
@@ -64,24 +64,24 @@ pub(crate) fn dispatch(
                     id,
                     local_identity: arg1,
                 })
-                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+                .map_err(nt_provider_wait::ProviderTimerError::nt_status)?;
             Ok((0, 0, 0, 0))
         }
         win32k_subsystem::W32_TIMER_OP_SET_LOCAL => {
             let active = table
                 .set_local(arg1, arg2 as i64, arg3 as u32, crate::nt_time_snapshot())
-                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+                .map_err(nt_provider_wait::ProviderTimerError::nt_status)?;
             Ok((0, u64::from(active), 0, 0))
         }
         win32k_subsystem::W32_TIMER_OP_CANCEL_LOCAL => {
             let active = table
                 .cancel_local(arg1)
-                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+                .map_err(nt_provider_wait::ProviderTimerError::nt_status)?;
             Ok((0, u64::from(active), 0, 0))
         }
         win32k_subsystem::W32_TIMER_OP_READ_LOCAL => {
             let id = table.id_for_local(arg1).ok_or(STATUS_INVALID_PARAMETER)?;
-            let signaled = table.read_state(id).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let signaled = table.read_state(id).map_err(nt_provider_wait::ProviderTimerError::nt_status)?;
             Ok((0, u64::from(signaled), 0, 0))
         }
         _ => Err(STATUS_INVALID_PARAMETER),

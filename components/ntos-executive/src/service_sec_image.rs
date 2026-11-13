@@ -110,6 +110,23 @@ mod process_information_native;
 pub(crate) use process_information_native::service_win32k_process_query_request;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
+static UNLEASED_COMPLETION_EVENT_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// A completed request named an Event index it holds no lease on. Admission always leases, so
+/// this is a producer that skipped it; the Event is left unsignalled rather than guessed at.
+fn trace_unleased_completion_event(pending: &nt_io_manager::PendingFileIo) {
+    if UNLEASED_COMPLETION_EVENT_TRACES.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return;
+    }
+    print_str(b"[file-io] completion Event not signalled: no lease irp/major/tid/index=");
+    for (index, value) in [
+        pending.irp_id, u64::from(pending.major), pending.tid, pending.event_obj_idx,
+    ].into_iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(value);
+    }
+    print_str(b"\n");
+}
 const PRIMARY_ALIAS_RETRY_DELAY_100NS: u64 = 10_000_000;
 static PRIMARY_ALIAS_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 static PRIMARY_ALIAS_RETRY_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -16008,19 +16025,28 @@ unsafe fn pending_file_io_redrive_pass(
             pending = table.get_exact(identity).expect("settled File IOSB owner disappeared");
         }
 
-        if pending.event_obj_idx != u64::MAX
+        let completion_event = pending.completion_event();
+        if completion_event != nt_io_manager::CompletionEvent::None
             && delivery_state & nt_io_manager::IO_DELIVERY_EVENT_PUBLISHED == 0
         {
-            if nt_handler
-                .events
-                .set_existing(pending.event_obj_idx)
-                .is_none()
-            {
-                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                restore_file_io_mirrors!();
-                continue;
+            match completion_event {
+                // The request's lease keeps the caller's Event alive and proves the index is
+                // still that Event.
+                nt_io_manager::CompletionEvent::Leased(event) => {
+                    if event
+                        .resolve(&nt_handler.event_objects)
+                        .and_then(|native| nt_handler.events.set_existing(native))
+                        .is_none()
+                    {
+                        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                        restore_file_io_mirrors!();
+                        continue;
+                    }
+                    let _ = wait_wake_dispatcher_set(nt_handler);
+                }
+                // A bare index may name a later object. Nothing is signalled.
+                _ => trace_unleased_completion_event(&pending),
             }
-            let _ = wait_wake_dispatcher_set(nt_handler);
             delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .mark_delivery_exact(
                     slot,
