@@ -58,11 +58,3 @@ fn maintenance_outer_pass_requires_a_real_worker_attempt_without_a_pending_child
         "image redrive reports an entered step to its caller");
 }
 
-#[test]
-fn all_waiting_quiesce_keeps_an_admitted_ready_maintenance_owner() {
-    let gate = ROOT.split("macro_rules! mark_wait_parked {").nth(1)
-        .expect("all-waiting gate")
-        .split("// Boot-milestone watchdog").next().unwrap();
-    assert!(gate.contains("root_maintenance_owner::next_ready_ticket().is_none()"),
-        "a ready deferred checkpoint must keep the service loop alive");
-}

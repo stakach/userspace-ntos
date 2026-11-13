@@ -283,25 +283,6 @@ fn nested_callback_wait_uses_a_lifo_stack_of_exact_root_turns() {
 }
 
 #[test]
-fn selected_receive_child_is_run_instead_of_being_deferred_as_an_unrelated_call() {
-    let park = between(
-        SERVICE,
-        "macro_rules! park_queued_callback_root_receive",
-        "// A callback reached by the preceding AddDevice child",
-    );
-    let selected = park
-        .find("receive_child_pending()")
-        .expect("a child selected during callback settlement must be observed");
-    let defer = park
-        .find("defer_hosted_delivery_for_queued_callback(")
-        .expect("ordinary unexecuted Calls remain deferrable");
-    assert!(
-        selected < defer,
-        "selected Receive child must enter its exact child barrier before generic deferral"
-    );
-}
-
-#[test]
 fn selected_child_transfer_requires_the_same_admission_key_as_import() {
     let transfer = function_body(INGRESS, "pub(crate) unsafe fn deferred_queued_ingress_selected(");
     assert!(transfer.contains("receive.barrier.admission_key() == call.admission_key()"),

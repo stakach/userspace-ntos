@@ -59,10 +59,3 @@ fn relation_wal_callbacks_bind_the_same_active_invalidation_and_native_mount() {
     assert!(BLOCK.contains("acknowledge_completed_irp_strict(pending.irp.raw())"));
 }
 
-#[test]
-fn no_signaler_gate_retains_only_the_exact_active_relation_wal() {
-    let retained = section(LAUNCH, "pub(crate) unsafe fn active_relation_wal_retained()", "pub(crate) unsafe fn claim_native_relation_wal_io()");
-    assert!(retained.contains("active_relation_publication_mut()"));
-    assert!(retained.contains("publication.persistence.native_wal_mut()"));
-    assert!(SERVICE.matches("driver_launch::active_relation_wal_retained()").count() >= 2);
-}

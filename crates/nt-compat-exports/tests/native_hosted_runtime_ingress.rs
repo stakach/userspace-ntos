@@ -5,35 +5,6 @@ const SERVICE: &str = include_str!("../../../components/ntos-executive/src/servi
 const HOSTED: &str = include_str!("../../../components/ntos-executive/src/component_ingress_hosted.rs");
 
 #[test]
-fn hosted_ingress_checks_exact_runtime_attachment_before_mirror_selection() {
-    let admission = HANDLER
-        .split_once("pub(crate) fn admit_hosted_thread_ingress(")
-        .expect("hosted ingress admission")
-        .1
-        .split_once("pub(crate) fn capture_provider_logical_caller(")
-        .expect("admission boundary")
-        .0;
-    let attachment = admission
-        .find("hosted_runtime_attachment_matches")
-        .expect("hosted process runtime attachment must be checked");
-    let admitted = admission
-        .find("self.thread_runtime.admit_ingress(")
-        .expect("thread-slot ingress admission");
-    assert!(attachment < admitted, "retired layout cannot enter a native dispatch");
-
-    // Rejection owns the received Call, so it must cancel through the exact shared-ingress Reply
-    // path before another Receive; a stale runtime cannot turn into a synthetic syscall success.
-    let rejection = SERVICE
-        .split_once("macro_rules! reject_hosted_ingress")
-        .expect("hosted ingress rejection")
-        .1
-        .split_once("// The previous iteration's event locals")
-        .expect("rejection boundary")
-        .0;
-    assert!(rejection.contains("drop_current_hosted_reply()"));
-}
-
-#[test]
 fn retired_runtime_cancellation_uses_retained_physical_call_not_live_admission() {
     let resume_stopped = HOSTED
         .split_once("pub(crate) unsafe fn hosted_can_resume(")

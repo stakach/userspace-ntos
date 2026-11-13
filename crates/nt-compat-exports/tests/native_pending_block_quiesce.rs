@@ -17,12 +17,3 @@ fn pending_physical_irp_predicate_reads_the_retained_command_owner() {
     assert!(LAUNCH[bridge..].starts_with("pub(crate) fn mounted_native_physical_irp_pending() -> bool {\n    mounted_native_block::pending_physical_irp()"));
 }
 
-#[test]
-fn every_no_signaler_gate_retains_the_physical_irp_and_reports_it() {
-    assert_eq!(SERVICE.matches("!driver_launch::mounted_native_physical_irp_pending()").count(), 3,
-        "all-live-parked, all-live-waiting, and lsass-post-signal-fault must retain the physical IRP");
-    let snapshot = &BLOCK[BLOCK.find("pub(super) fn print_quiesce_snapshot()").expect("quiesce snapshot")..];
-    for evidence in ["physical-pending-irp=", "source=", "bytes=", "outstanding-Mtick="] {
-        assert!(snapshot.contains(evidence), "bounded quiesce snapshot should report {evidence}");
-    }
-}

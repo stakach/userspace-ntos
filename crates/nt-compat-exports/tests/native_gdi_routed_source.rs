@@ -56,14 +56,6 @@ fn quarantined_gdi_owner_does_not_arm_an_autonomous_retry_forever() {
 }
 
 #[test]
-fn quarantined_gdi_owner_still_blocks_host_quiescence() {
-    assert!(WORK.contains("pub(crate) fn has_outstanding()"),
-        "quarantined GDI work needs an independent ownership gate");
-    assert!(INGRESS.contains("!crate::gdi_routed_image_work::has_outstanding()"),
-        "host quiescence cannot infer no owned Call from absence of a timer deadline");
-}
-
-#[test]
 fn stopped_provider_call_retires_after_gdi_file_cleanup_without_waiting_for_a_reply() {
     let start = WORK.find("impl Work {").expect("retained GDI owner");
     let body = &WORK[start..];

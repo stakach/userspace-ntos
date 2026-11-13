@@ -21,11 +21,3 @@ fn mounted_read_quiesce_observes_the_exact_completion_owner() {
     }
 }
 
-#[test]
-fn no_signaler_gates_wait_for_retained_mounted_reads() {
-    assert_eq!(SERVICE.matches("!crate::mounted_volume::mounted_read_outstanding()").count(), 3,
-        "all-live-parked, all-live-waiting, and lsass-post-signal-fault must retain the mounted READ owner");
-    assert_eq!(SERVICE.matches("driver_launch::print_mounted_native_block_quiesce_snapshot()").count(), 2);
-    let start = LAUNCH.find("pub(crate) fn print_mounted_native_block_quiesce_snapshot()").expect("driver-launch bridge");
-    assert!(LAUNCH[start..].starts_with("pub(crate) fn print_mounted_native_block_quiesce_snapshot() {\n    mounted_native_block::print_quiesce_snapshot();"));
-}

@@ -11,6 +11,9 @@ mod loop_state;
 use loop_state::{Diag, Images, Ingress, LoopExit, LoopState, Message, Parks, Procs, Turn};
 #[path = "executor/receive.rs"]
 mod loop_receive;
+#[path = "executor/flow.rs"]
+mod loop_flow;
+use loop_flow::QueuedCallbackPark;
 use core::ops::ControlFlow;
 #[path = "hosted_quiesce.rs"]
 mod hosted_quiesce;
@@ -11005,256 +11008,6 @@ pub(crate) unsafe fn service_sec_image(
     macro_rules! record_service_loop_exit {
         ($reason:expr) => { lp.exit.record($reason) };
     }
-    // park_and_log!(label, ip, cr2): the generalized UNRECOVERABLE-fault handler. Logs once per
-    // top-level process (`[parked] pi=.. badge=.. fault=.. ip=.. cr2=..`), marks its crash bit,
-    // flushes this pi's fault bookkeeping, then QUIESCE-checks (if every live top-level process is
-    // now crash-parked, break → the gate runs + qemu_exit) else recv-next WITHOUT replying (the
-    // faulting thread stays blocked in-kernel, exactly like the cooperative listener-park) and
-    // continue the loop for another badge. Uses the surrounding loop locals directly (single call
-    // site style), so it must be invoked where they are all in scope.
-    macro_rules! park_and_log {
-        ($pi:expr, $label:expr, $ip:expr, $cr2:expr) => {{
-            let __pi: usize = $pi;
-            assert!(drop_current_hosted_reply(), "crash containment must retire the current Call");
-            let __bit = owner_bit_for_badge(&nt_handler, lp.msg.badge);
-            // ★ THE LOG LINE IS PER *THREAD* BADGE, the crash BIT is per process. A hosted process
-            // has several threads and one of them can already have milestone-parked (which sets the
-            // process's crash bit) — suppressing the print on the process bit then SILENCED a
-            // genuinely NEW fault on a different thread, and the boot quiesced with no fault line at
-            // all. Measured in batch 59: winlogon's worker parked on an empty GetMessage, then its
-            // main thread faulted post-profile-copy and printed NOTHING.
-            let __log_bit = 1u64 << (lp.msg.badge & 63);
-            let __already = (lp.parks.crash_logged & __log_bit) != 0;
-            lp.parks.crash_logged |= __log_bit;
-            lp.parks.crash_parked |= __bit;
-            service_watchdog_record_crash_parked(lp.parks.crash_parked);
-            if !__already {
-                print_str(b"[parked] pi=");
-                print_u64(__pi as u64);
-                print_str(b" badge=");
-                print_u64(lp.msg.badge);
-                print_str(b" fault=");
-                print_str($label);
-                print_str(b" ip=0x");
-                print_hex((($ip as u64) >> 32) as u32);
-                print_hex($ip as u32);
-                print_str(b" cr2=0x");
-                print_hex((($cr2 as u64) >> 32) as u32);
-                print_hex($cr2 as u32);
-                print_str(b" -> PARK process (unrecoverable); loop continues\n");
-            }
-            procs[__pi].faults = lp.exit.faults;
-            procs[__pi].first = lp.exit.first;
-            procs[__pi].ntfaults = lp.exit.ntfaults;
-            pfilled[__pi] = *filled_pages;
-            // ★ DEAD-CLIENT CALLBACK UNWIND. If this process died while it was running a win32k
-            // user-mode callback, win32k's dispatch is SUSPENDED inside `KeUserModeCallback` waiting
-            // for a reply this thread can no longer send. Unwind those continuations now and resume
-            // win32k with a failure NTSTATUS, so the isolated component returns to its idle dispatch
-            // receive loop instead of being stranded (which would block the shared loop's next `recv`
-            // forever = boot wedge, no gate, no measurement). No-op when the process held no
-            // callbacks. See win32k_glue::unwind_dead_client_user_callbacks.
-            let _ = win32k_glue::unwind_dead_client_user_callbacks(__pi as u32);
-            drain_deferred_user_callback_returns(
-                &mut nt_handler,
-                __pi,
-                lp.exit.faults as usize,
-                procs,
-                pfilled,
-                filled_pages,
-            );
-            // QUIESCE: no live top-level process can still make forward progress → nothing left to
-            // serve. `wait_parked` counts too (matching every other quiesce site): a crash-park plus
-            // all-others-cooperatively-waiting leaves NO runnable signaler, so the next `recv` would
-            // block forever. Additionally, winlogon dying at its post-OpenSCManager GUI/login
-            // frontier (LSA already signalled → services/lsass are just idle RPC servers with no live
-            // client left) is terminal for the boot by the same rule the null-deref arm already
-            // applies — generalized here so it holds for ANY unrecoverable winlogon fault.
-            if ((live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
-                || (__pi == 2 && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0))
-                && !pre_user_shell_frontier_pending(
-                    &nt_handler,
-                    lp.parks.crash_parked,
-                    lp.parks.wait_parked,
-                    b"all-live-parked",
-                )
-                && !defer_quiesce_for_active_user_callbacks(b"all-live-parked")
-                && !crate::mounted_volume::mounted_create_outstanding()
-                && !crate::mounted_volume::mounted_read_outstanding()
-                && !crate::mounted_volume::mounted_directory_outstanding()
-                && !driver_launch::mounted_native_physical_irp_pending()
-                && !crate::native_directory_open_work::occupied()
-                && !crate::native_file_target_open_work::occupied()
-                && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
-                && !crate::provider_directory_broker::has_outstanding()
-            {
-                print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
-                lp.exit.stop = $ip as u64;
-                record_service_loop_exit!(b"crash-all-live-parked");
-                break;
-            }
-            let _ = finalize_service_loop_state(&mut nt_handler);
-            let (nb, nmi, nm0, nm1, nm2, nm3) =
-                component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-            lp.msg.badge = nb;
-            lp.msg.mi = nmi;
-            lp.msg.m0 = nm0;
-            lp.msg.m1 = nm1;
-            lp.msg.m2 = nm2;
-            lp.msg.m3 = nm3;
-            // Diverges: park_and_log! always exits the current loop iteration (never yields a value).
-            continue
-        }};
-    }
-    // ★ dbgk_forward_exception!(pi, record) — `DbgkForwardException` on the REAL fault path.
-    //
-    // Invoked at each site where this loop has CLASSIFIED an unrecoverable USER exception
-    // (`#PF`/`#GP`/`#UD`/int3/single-step), immediately BEFORE that site's existing handling.
-    // `ExecNtHandler::dbgk_forward_exception` consults `EPROCESS.DebugPort`: a process with no
-    // debugger attached returns `false` having done NOTHING (two lookups, no log, no state change),
-    // so the whole fault path — `park_and_log!`, `crash_parked`, the dead-client callback unwind,
-    // the win32k arms — behaves byte-identically to before this existed. That is the case for every
-    // process on the current boot (nothing calls `NtDebugActiveProcess`), so the live serial output
-    // is unchanged. When a debugger IS attached, a real `DbgKmExceptionApi` event carrying the
-    // faithful `EXCEPTION_RECORD` (code / flags / address / parameters + FirstChance) is queued on
-    // its `DEBUG_OBJECT` and any thread parked in `NtWaitForDebugEvent` is woken.
-    //
-    // ★ TARGET-SIDE BLOCKING (`DbgkpQueueMessage`'s wait on `DebugEvent->ContinueEvent`). After a
-    // successful forward the FAULTING THREAD IS PARKED on the event — its reply capability is stolen
-    // into the `DEBUG_EVENT` — and the site must recv the next event WITHOUT replying
-    // (`dbgk_block_and_park!` below does exactly that). `NtDebugContinue` then applies the continue
-    // status: `DBG_CONTINUE` resumes it with the FAULT-flavoured reply (a `#PF` retries the faulting
-    // instruction, an int3 resumes past it), `DBG_EXCEPTION_NOT_HANDLED` leaves the site's own
-    // handling standing, and `DBG_TERMINATE_THREAD`/`DBG_TERMINATE_PROCESS` are ENFORCED.
-    // See `ntdll_plan.md` §D.
-    macro_rules! dbgk_forward_exception {
-        ($pi:expr, $record:expr) => {{
-            let __record: nt_process::dbgk::ExceptionRecord = $record;
-            let __tid = nt_handler.current_tid;
-            let __forwarded = nt_handler.dbgk_forward_exception($pi, __tid, __record, true);
-            if __forwarded {
-                print_str(b"[dbgk] exception forwarded to debugger pi=");
-                print_u64($pi as u64);
-                print_str(b" code=0x");
-                print_hex(__record.exception_code);
-                print_str(b" addr=0x");
-                print_hex((__record.exception_address >> 32) as u32);
-                print_hex(__record.exception_address as u32);
-                print_str(b"\n");
-            }
-            __forwarded
-        }};
-    }
-    // dbgk_block_and_park!(pi, kind, ip, sp, flags): BLOCK the faulting thread on the debug event it
-    // just reported, then recv the next event WITHOUT replying (the thread stays blocked in-kernel,
-    // exactly like `park_and_log!`'s park, but WAKEABLE — the debugger's continue resumes it).
-    //
-    // ★ SAFETY. Reached only when `dbgk_forward_exception!` returned true, i.e. the process really
-    // has an `EPROCESS.DebugPort` — never on the live boot. If the park cannot be taken (no reply
-    // object, pool exhausted) it yields `false` and the site's ordinary handling runs unchanged.
-    // A blocked reporter counts toward the all-parked QUIESCE (it is a cooperative wait), so a
-    // debugger that never continues still lets the boot reach the gate.
-    macro_rules! dbgk_block_and_park {
-        ($pi:expr, $kind:expr, $ip:expr, $sp:expr, $flags:expr) => {{
-            let __tid = nt_handler.current_tid;
-            let __blocked = nt_handler.dbgk_block_reporter(
-                $pi,
-                __tid,
-                lp.msg.badge,
-                $kind,
-                0,
-                $ip,
-                $sp,
-                $flags,
-                0,
-            );
-            if __blocked {
-                print_str(b"[dbgk] reporter BLOCKED on continue (fault kind=");
-                print_u64($kind as u64);
-                print_str(b") pi=");
-                print_u64($pi as u64);
-                print_str(b" ip=0x");
-                print_hex((($ip as u64) >> 32) as u32);
-                print_hex($ip as u32);
-                print_str(b"\n");
-                procs[$pi].faults = lp.exit.faults;
-                procs[$pi].first = lp.exit.first;
-                procs[$pi].ntfaults = lp.exit.ntfaults;
-                pfilled[$pi] = *filled_pages;
-                mark_wait_parked!($pi, $ip);
-                let _ = finalize_service_loop_state(&mut nt_handler);
-                let (nb, nmi, nm0, nm1, nm2, nm3) =
-                    component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-                lp.msg.badge = nb;
-                lp.msg.mi = nmi;
-                lp.msg.m0 = nm0;
-                lp.msg.m1 = nm1;
-                lp.msg.m2 = nm2;
-                lp.msg.m3 = nm3;
-            }
-            __blocked
-        }};
-    }
-    // mark_wait_parked!(pi): record the current hosted thread as blocked in a deadline-less wait, then
-    // recompute which process owners have no runnable hosted threads left. If every live owner is now
-    // crash-parked or wait-parked, QUIESCE (break -> the gate runs). `$ip` is the reported stop value.
-    macro_rules! mark_wait_parked {
-        ($pi:expr, $ip:expr) => {{
-            thread_wait_state_park_badge_waiting(&mut nt_handler, lp.msg.badge);
-            lp.parks.wait_parked = wait_parked_owner_mask(&nt_handler);
-            trace_wait_owner_mask_after_mark(
-                &nt_handler,
-                $pi,
-                lp.msg.badge,
-                live_top_badges(&nt_handler),
-                lp.parks.crash_parked,
-                lp.parks.wait_parked,
-            );
-            if !cfg!(feature = "mup-provider-kernel-only")
-                && (live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
-                && !pre_user_shell_frontier_pending(
-                    &nt_handler,
-                    lp.parks.crash_parked,
-                    lp.parks.wait_parked,
-                    b"all-live-waiting",
-                )
-                && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
-                && !driver_launch::native_disk_proof_hardware_irp_pending()
-                && !driver_launch::active_relation_wal_retained()
-                && root_maintenance_owner::next_ready_ticket().is_none()
-                && !crate::mounted_volume::mounted_create_outstanding()
-                && !crate::mounted_volume::mounted_read_outstanding()
-                && !crate::mounted_volume::mounted_directory_outstanding()
-                && !driver_launch::mounted_native_physical_irp_pending()
-                && crate::registry_mutation_work::next_deadline().is_none()
-                && crate::mutable_hive_mutation_work::next_deadline().is_none()
-                && crate::section_metadata_work::next_deadline().is_none()
-                && crate::process_image_snapshot_work::next_deadline().is_none()
-                && crate::section_pagein_work::next_deadline().is_none()
-                && crate::provider_section_map_work::next_deadline().is_none()
-                && crate::native_image_pagein_work::next_deadline().is_none()
-                && crate::vm_lock_pagein_work::next_deadline().is_none()
-                && crate::vm_copy_work::next_deadline().is_none()
-                && crate::provider_section_broker::next_deadline().is_none()
-                && !crate::gdi_routed_image_work::has_outstanding()
-                && !crate::native_directory_open_work::occupied()
-                && !crate::native_file_target_open_work::occupied()
-                && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
-                && !crate::provider_directory_broker::has_outstanding()
-                && crate::provider_directory_broker::next_deadline().is_none()
-            {
-                unsafe { driver_launch::print_hosted_pnp_enumeration_evidence(); }
-                driver_launch::print_mounted_native_block_quiesce_snapshot();
-                print_str(
-                    b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n",
-                );
-                lp.exit.stop = $ip as u64;
-                let _ = $pi;
-                record_service_loop_exit!(b"wait-all-live-parked");
-                break;
-            }
-        }};
-    }
         let queued_callback_fences_providers = root_queued_callback_exclusive_pending()
             || crate::driver_launch::unsettled_queued_callback();
         #[cfg(not(feature = "mup-provider-kernel-only"))]
@@ -11263,6 +11016,75 @@ pub(crate) unsafe fn service_sec_image(
         }
         if !queued_callback_fences_providers {
             hosted_spawn_uncertainty::redrive(&mut *delay_queue, &mut nt_handler);
+        }
+        // Adapters over `executor/flow.rs`. They keep the macros' names and call syntax while
+        // the loop body is still inline; each hoisted section replaces them with direct calls.
+        macro_rules! park_and_log {
+            ($pi:expr, $label:expr, $ip:expr, $cr2:expr) => {
+                match lp.park_and_log($pi, $label, $ip as u64, $cr2 as u64) {
+                    Turn::Next => continue 'service_loop,
+                    Turn::Exit => break 'service_loop,
+                }
+            };
+        }
+        macro_rules! dbgk_forward_exception {
+            ($pi:expr, $record:expr) => {
+                loop_flow::dbgk_forward_exception(&mut *nt_handler, $pi, $record)
+            };
+        }
+        macro_rules! dbgk_block_and_park {
+            ($pi:expr, $kind:expr, $ip:expr, $sp:expr, $flags:expr) => {
+                match loop_flow::dbgk_block_and_park(
+                    &mut lp.exit, &mut lp.parks, &mut lp.ingress, &mut *nt_handler,
+                    &mut *procs, &mut *pfilled, &*filled_pages, $pi, $kind, $ip, $sp, $flags,
+                    &mut lp.msg,
+                ) {
+                    ControlFlow::Continue(blocked) => blocked,
+                    ControlFlow::Break(Turn::Next) => continue 'service_loop,
+                    ControlFlow::Break(Turn::Exit) => break 'service_loop,
+                }
+            };
+        }
+        macro_rules! mark_wait_parked {
+            ($pi:expr, $ip:expr) => {
+                match loop_flow::mark_wait_parked(
+                    &mut lp.parks, &mut *nt_handler, &mut lp.exit, lp.msg.badge, $pi, $ip as u64,
+                ) {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(Turn::Next) => continue 'service_loop,
+                    ControlFlow::Break(Turn::Exit) => break 'service_loop,
+                }
+            };
+        }
+        macro_rules! park_queued_callback_root_receive {
+            ($root_event_consumed:ident) => {
+                match loop_flow::park_queued_callback_root_receive(
+                    &mut lp.msg, &mut lp.ingress, &mut *nt_handler, &mut lp.exit,
+                    &mut $root_event_consumed, false,
+                ) {
+                    QueuedCallbackPark::Retry => unreachable!(),
+                    QueuedCallbackPark::Turn(Turn::Next) => continue 'service_loop,
+                    QueuedCallbackPark::Turn(Turn::Exit) => break 'service_loop,
+                }
+            };
+            ($root_event_consumed:ident, $retry_label:lifetime) => {
+                match loop_flow::park_queued_callback_root_receive(
+                    &mut lp.msg, &mut lp.ingress, &mut *nt_handler, &mut lp.exit,
+                    &mut $root_event_consumed, true,
+                ) {
+                    QueuedCallbackPark::Retry => continue $retry_label,
+                    QueuedCallbackPark::Turn(Turn::Next) => continue 'service_loop,
+                    QueuedCallbackPark::Turn(Turn::Exit) => break 'service_loop,
+                }
+            };
+        }
+        macro_rules! reject_hosted_ingress {
+            () => {
+                match lp.reject_hosted_ingress() {
+                    Turn::Next => continue 'service_loop,
+                    Turn::Exit => break 'service_loop,
+                }
+            };
         }
         // Adapters over `executor/receive.rs`. A `Break` leaves the turn the way the macro did.
         macro_rules! component_recv {
@@ -11292,130 +11114,6 @@ pub(crate) unsafe fn service_sec_image(
             ($ep:expr, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
                 component_client_reply_recv!($ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed),
                     $len, $r0, $r1, $r2, $r3)
-            }};
-        }
-        // A retained queued callback is an independent root parent. Its exact queue selector
-        // and Reply remain owned while this root receives a child-producing notification.
-        macro_rules! park_queued_callback_root_receive {
-            ($root_event_consumed:ident $(, $retry_label:lifetime)?) => {{
-                let permit = match ParkedRootQueuedCallbackPermit::retained() {
-                    Some(permit) => permit,
-                    None => {
-                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        lp.exit.stop_ssn = 0;
-                        record_service_loop_exit!(b"queued-callback-owner");
-                        break 'service_loop;
-                    }
-                };
-                if !ensure_queued_callback_root_turn(&mut lp.ingress.root_queued_callback_turn, &permit) {
-                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    lp.exit.stop_ssn = 0;
-                    record_service_loop_exit!(b"queued-callback-owner-changed");
-                    break 'service_loop;
-                }
-                ROOT_QUEUED_CALLBACK_EXCLUSIVE.store(true, Ordering::Release);
-                if !$root_event_consumed {
-                    if badge_has_delay_timer(lp.msg.badge) || hosted_irq_lines_from_badge(lp.msg.badge) != 0 {
-                        let turn = lp.ingress.root_queued_callback_turn.last_mut()
-                            .expect("queued callback turn");
-                        if service_parked_queued_callback_notification(lp.msg.badge).is_err() {
-                            lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                            lp.exit.stop_ssn = 0;
-                            record_service_loop_exit!(b"queued-callback-notification");
-                            break 'service_loop;
-                        }
-                        let arrival = if badge_has_delay_timer(lp.msg.badge) {
-                            nt_driver_start::RootArrival::Timer { now: monotonic_time_100ns() }
-                        } else { nt_driver_start::RootArrival::Irq };
-                        if turn.observe_arrival(permit.0, arrival).is_err() {
-                            lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                            lp.exit.stop_ssn = 0;
-                            record_service_loop_exit!(b"queued-callback-arrival");
-                            break 'service_loop;
-                        }
-                    } else {
-                        let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                        let selected_child = crate::spawn_hosts::shared_ingress::owner::runtime::
-                            receive_child_pending()
-                            && hosted_ingress_binding(lp.msg.badge).is_some_and(|binding|
-                                crate::spawn_hosts::shared_ingress::owner::runtime::
-                                    receive_child_is_current(binding, reply));
-                        let retained = if selected_child {
-                            crate::spawn_hosts::shared_ingress::owner::runtime::
-                                defer_hosted_delivery_for_queued_callback(reply, lp.msg.badge, &permit)
-                                .is_ok()
-                        } else {
-                            retain_parked_queued_callback_ingress(
-                                &mut lp.ingress.root_queued_callback_turn, &permit, reply, lp.msg.badge)
-                        };
-                        if !retained {
-                            lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                            lp.exit.stop_ssn = 0;
-                            record_service_loop_exit!(b"queued-callback-ingress-defer");
-                            break 'service_loop;
-                        }
-                    }
-                    $root_event_consumed = true;
-                }
-                $(
-                    // This retry remains inside the same root-event settlement loop. The
-                    // consumed marker must survive until a different ingress is received.
-                    if let Some(crate::driver_launch::QueuedCallbackRootAction::RetryRestore(selector)) =
-                        crate::driver_launch::queued_callback_root_action()
-                    {
-                        if selector == permit.0 {
-                            let (dispatch, reply) = selector.dispatch_reply();
-                            if crate::spawn_hosts::shared_ingress::owner::runtime::
-                                root_idle_receive_after_child_yield(dispatch, reply)
-                            {
-                                continue $retry_label;
-                            }
-                        }
-                    }
-                )?
-                if !prepare_parked_queued_callback_receive(&mut lp.ingress.root_queued_callback_turn) {
-                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    lp.exit.stop_ssn = 0;
-                    record_service_loop_exit!(b"queued-callback-receive-prepare");
-                    break 'service_loop;
-                }
-                let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-                (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
-                continue 'service_loop;
-            }};
-        }
-        // This endpoint admits hosted faults/native Calls, not asynchronous Send traffic. A
-        // rejected caller's uniquely owned Reply must be cancelled before the next receive.
-        macro_rules! reject_hosted_ingress {
-            () => {{
-                print_str(b"[service-loop] rejected hosted ingress badge=");
-                print_u64(lp.msg.badge);
-                print_str(b" label=");
-                print_u64(lp.msg.mi >> 12);
-                print_str(b"\n");
-                if !drop_current_hosted_reply()
-                    && !crate::root_reply_park::quarantine_current_hosted_reply()
-                {
-                    // Stop is uncertain. Keep the original Reply and its Call owned; another
-                    // receive would reuse that Reply and could complete the wrong caller.
-                    print_str(b"[service-loop] rejected ingress Reply retained badge=");
-                    print_u64(lp.msg.badge);
-                    print_str(b" reply=");
-                    print_u64(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-                    print_str(b"\n");
-                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    lp.exit.stop_ssn = 0;
-                    record_service_loop_exit!(b"rejected-reply-retained");
-                    break 'service_loop;
-                }
-                let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-                lp.msg.badge = received.0;
-                lp.msg.mi = received.1;
-                lp.msg.m0 = received.2;
-                lp.msg.m1 = received.3;
-                lp.msg.m2 = received.4;
-                lp.msg.m3 = received.5;
-                continue 'service_loop;
             }};
         }
         // The previous iteration's event locals and borrows have ended. Restore before any
