@@ -265,7 +265,7 @@ pub use pending_io::{
     LocalFileObject, PendingFileRoute,
     FileIoBusyOwner, PendingFileBusy, PendingFileBusyError, PendingFileBusyPhase,
     PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,
-    PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoParkError,
+    CompletionEvent, PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoParkError,
     CreateOutputSettlement, PendingCreateOutput, PendingCreateOutputAction, PendingCreateOutputObservation,
     LocalFlushMode, PendingFileIoIdentity, PendingFileIoReservation, PendingFileIoTable, PendingLocalBuffered,
     PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingOwnedInline,

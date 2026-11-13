@@ -93,6 +93,11 @@ impl TimerTable {
         Ok(())
     }
 
+    /// Whether a timer record still names `object_id`.
+    pub fn contains(&self, object_id: u64) -> bool {
+        self.position(object_id).is_some()
+    }
+
     pub fn remove(&mut self, object_id: u64) -> bool {
         let Some(position) = self.position(object_id) else {
             return false;
@@ -254,6 +259,17 @@ mod tests {
             system_time_100ns,
             clock_generation: 0,
         }
+    }
+
+    #[test]
+    fn a_removed_timer_no_longer_names_its_object() {
+        let mut timers = TimerTable::new();
+        assert!(!timers.contains(7));
+        timers.ensure(7).unwrap();
+        assert!(timers.contains(7));
+        assert!(timers.remove(7));
+        assert!(!timers.contains(7));
+        assert!(!timers.remove(7));
     }
 
     #[test]

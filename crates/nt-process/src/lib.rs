@@ -3071,6 +3071,17 @@ impl ProcessManager {
         Ok(true)
     }
 
+    /// Whether any thread still has an APC queued by `source`, claimed or not. The source
+    /// names its owner by identity, so the owner's identity is not reusable until this is false.
+    pub fn has_kernel_user_apc_source(&self, source: KernelUserApcSource) -> bool {
+        self.threads.values().any(|thread| {
+            thread
+                .user_apc_queue
+                .iter()
+                .any(|queued| queued.source == Some(source))
+        })
+    }
+
     pub fn remove_kernel_user_apc(&mut self, tid: ThreadId, source: KernelUserApcSource) -> bool {
         let Some(thread) = self.threads.get_mut(&tid) else {
             return false;

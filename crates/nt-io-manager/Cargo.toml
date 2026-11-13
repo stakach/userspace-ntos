@@ -31,6 +31,7 @@ nt-object-manager = { workspace = true, optional = true }
 bitflags = { workspace = true }
 
 [dev-dependencies]
+nt-object-manager = { workspace = true }
 nt-time = { workspace = true }
 nt-driver-runtime = { workspace = true }
 nt-address-space = { workspace = true }

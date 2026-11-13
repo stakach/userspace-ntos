@@ -221,7 +221,8 @@ pub struct PendingFileIo {
     pub publish_iocp: bool,
     /// Executive event-object index, or `u64::MAX` when no event was supplied.
     pub event_obj_idx: u64,
-    /// Exact Event Operation lease transferred by READ/WRITE admission, not by handle lookup.
+    /// Exact Event Operation lease transferred by request admission, not by handle lookup.
+    /// Present whenever `event_obj_idx` names an Event.
     pub transfer_event: Option<crate::FileTransferEvent>,
     /// Stolen synchronous syscall reply cap. Async requests have no reply owner.
     pub reply_cap: u64,
@@ -236,7 +237,33 @@ pub struct PendingFileIo {
     pub resume_flags: u64,
 }
 
+/// The Event a completed request signals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionEvent {
+    None,
+    /// The request holds an Operation lease on the Event, so the Event is still the one the
+    /// caller supplied.
+    Leased(crate::FileTransferEvent),
+    /// The request names an Event index without a lease on it. The index may belong to a
+    /// later object, so it must not be signalled.
+    Unleased(u64),
+}
+
 impl PendingFileIo {
+    /// Which Event terminal completion signals. Only a lease taken at admission keeps the
+    /// caller's Event alive across the request; the bare index alone is not authority.
+    pub fn completion_event(&self) -> CompletionEvent {
+        if self.event_obj_idx == u64::MAX {
+            return CompletionEvent::None;
+        }
+        match self.transfer_event {
+            Some(event) if event.native_identity == self.event_obj_idx => {
+                CompletionEvent::Leased(event)
+            }
+            _ => CompletionEvent::Unleased(self.event_obj_idx),
+        }
+    }
+
     /// A live consumer needs its process mirrors for user delivery. A detached IRP retains
     /// provider ownership only and must finish without entering the retired process VSpace.
     pub const fn needs_consumer_context(&self) -> bool {

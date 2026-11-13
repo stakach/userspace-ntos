@@ -487,6 +487,28 @@ fn kernel_user_apc_targets_resolved_thread_without_user_handle() {
 }
 
 #[test]
+fn a_queued_kernel_user_apc_is_found_by_its_source_on_any_thread() {
+    // A timer's slot may be reused only when no queued APC still names it. The APC stays on
+    // the thread it was queued to, which need not be the timer's current APC target.
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("timer-apc.exe", None, None);
+    let first = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let second = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let timer = KernelUserApcSource::Timer(41);
+    let apc = UserApc { routine: 0x1110, normal_context: 0, system_argument1: 0, system_argument2: 0 };
+
+    assert!(!pm.has_kernel_user_apc_source(timer));
+    assert_eq!(pm.queue_kernel_user_apc_once(second, timer, apc), Ok(true));
+    assert!(pm.has_kernel_user_apc_source(timer));
+    assert!(!pm.has_kernel_user_apc_source(KernelUserApcSource::Timer(42)));
+
+    assert!(!pm.remove_kernel_user_apc(first, timer), "the APC is not on this thread");
+    assert!(pm.has_kernel_user_apc_source(timer));
+    assert!(pm.remove_kernel_user_apc(second, timer));
+    assert!(!pm.has_kernel_user_apc_source(timer));
+}
+
+#[test]
 fn kernel_owned_user_apc_is_unique_and_exactly_removable() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("owned-apc.exe", None, None);

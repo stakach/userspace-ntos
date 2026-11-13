@@ -37,6 +37,19 @@ pub enum ProviderTimerError {
     NoCapacity,
 }
 
+impl ProviderTimerError {
+    /// The NT status a refused Timer operation returns to its provider. Exhaustion and a
+    /// pending retirement keep their own status; every other variant is a wrong identity or
+    /// argument.
+    pub const fn nt_status(self) -> u32 {
+        match self {
+            Self::NoCapacity | Self::IdentityExhausted | Self::LeaseOverflow => 0xC000_009A,
+            Self::DeletePending => 0xC000_0056,
+            _ => 0xC000_000D,
+        }
+    }
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderLocalTimerId(u64);

@@ -90,6 +90,20 @@ pub struct FileTransferEvent {
     pub native_identity: u64,
 }
 
+impl FileTransferEvent {
+    /// The Event's native identity, if this exact Operation lease is still held on it. A
+    /// released lease, or one whose Event no longer has this identity, names nothing: the
+    /// identity is an index that a later object may have been given.
+    pub fn resolve(&self, registry: &nt_kernel_exec::EventObjectRegistry) -> Option<u64> {
+        let id = registry
+            .event_for_lease(self.lease, nt_kernel_exec::EventLeaseKind::Operation)
+            .ok()?;
+        let snapshot = registry.snapshot(id).ok()?;
+        (id == self.id && snapshot.native_identity == self.native_identity)
+            .then_some(self.native_identity)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SynchronousFileWaiter {
     pub route: FileIoWaitRoute,
