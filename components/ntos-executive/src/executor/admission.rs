@@ -18,4 +18,5 @@ pub(super) struct Event {
     pub(super) pi: usize,
     pub(super) native_ingress_request: Option<nt_syscall_abi::NativeSyscallRequest>,
     pub(super) scratch_base: u64,
+    pub(super) pml4: u64,
 }

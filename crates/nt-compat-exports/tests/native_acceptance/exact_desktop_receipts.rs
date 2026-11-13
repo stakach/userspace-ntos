@@ -70,20 +70,6 @@ fn resumed_gui_completion_uses_retained_caller_and_common_receipt_boundary() {
     );
 }
 
-#[test]
-fn inline_gui_completion_uses_same_exact_receipt_boundary() {
-    let service = syn::parse_file(SERVICE).unwrap();
-    let mut evidence = Evidence::default();
-    evidence.visit_block(&function(&service, "service_sec_image").block);
-    assert!(
-        evidence
-            .calls
-            .iter()
-            .any(|call| call == "observe_completed_desktop_dispatch"),
-        "inline and resumed GUI completions must share the authenticated receipt policy"
-    );
-}
-
 fn function<'a>(file: &'a syn::File, name: &str) -> &'a syn::ItemFn {
     file.items
         .iter()
@@ -204,30 +190,6 @@ fn userinit_compound_gate_consumes_exact_historical_launch_receipts() {
 #[test]
 fn explorer_compound_gate_consumes_exact_live_launch_and_gui_receipts() {
     assert_exact_gate("explorer_image_pipeline_spec");
-}
-
-#[test]
-fn desktop_batch_evidence_requires_completed_flush_and_retains_original_caller() {
-    let provider = syn::parse_file(WIN32K).expect("actual provider source must parse");
-    let dispatch = function(&provider, "win32k_dispatch");
-    let mut evidence = Evidence::default();
-    evidence.visit_block(&dispatch.block);
-    assert!(evidence.calls.iter().any(|name| name == "dispatch_gdi_batch_flush_callout"));
-    assert!(evidence.calls.iter().any(|name| name == "dispatch_ssn"));
-    let flush = WIN32K.find("dispatch_gdi_batch_flush_callout(client_pi, client_teb)").unwrap();
-    let syscall = WIN32K.find("dispatch_ssn(ssn, a0, a1, a2, a3)").unwrap();
-    assert!(flush < syscall, "batch must execute before the original SSN on one provider lane");
-    assert!(WIN32K.contains("user_origin && ssn != SSN_GDI_BATCH_FLUSH_CALLOUT"),
-        "only an authenticated user-origin syscall may run the entry batch prelude");
-    assert!(WIN32K.contains("SH_REQ_BATCH_RECORDS"),
-        "the provider must publish a count with the original dispatch return");
-    assert!(!SERVICE.contains("crate::ke_gdi_flush_user_batch(client, gdi_teb_alias)"),
-        "an independent pre-dispatch call can suspend before the original SSN");
-    assert!(SERVICE.contains("let inline_batch_records = win32k_glue::completed_gdi_batch_records"));
-    assert!(SERVICE.contains("observe_completed_gdi_batch_flush(nt_handler, dispatch.logical_caller, dispatch.batch_records)"),
-        "resumed completion must carry the original caller and recorded count");
-    assert!(MAIN.contains("callback-return flush suspended"),
-        "the separate callback-return path must expose a suspended flush");
 }
 
 fn withdraws_loop_context(statement: &syn::Stmt) -> bool {

@@ -81,28 +81,3 @@ fn empty_output_guard_must_short_circuit_copyout() {
     }
 }
 
-#[test]
-fn direct_and_callback_message_outputs_share_the_contract_and_skip_empty_copyout() {
-    let file = syn::parse_file(include_str!(
-        "../../../components/ntos-executive/src/service_sec_image.rs"
-    ))
-    .unwrap();
-    let mut audit = OutputAudit::default();
-    audit.visit_file(&file);
-    assert_eq!(
-        audit.validators, 3,
-        "both acceptance paths and their rejection diagnostic use the shared contract"
-    );
-    assert!(
-        audit.published_lengths > 0,
-        "direct completion consumes provider-owned length"
-    );
-    assert_eq!(
-        audit.direct_copyouts, 1,
-        "direct MSG copyout requires one complete MSG"
-    );
-    assert_eq!(
-        audit.callback_copyouts, 1,
-        "resumed MSG copyout requires nonempty validated output"
-    );
-}

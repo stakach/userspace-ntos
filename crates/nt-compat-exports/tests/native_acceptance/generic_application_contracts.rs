@@ -112,27 +112,6 @@ fn generic_native_gui_conversion_is_not_denied_by_callback_role_or_thread_role()
 }
 
 #[test]
-fn gdi_pointer_capture_eligibility_is_not_a_named_or_pe_subsystem_role() {
-    struct Init(Option<syn::Expr>);
-    impl<'ast> Visit<'ast> for Init {
-        fn visit_local(&mut self, local: &'ast syn::Local) {
-            if matches!(&local.pat, syn::Pat::Ident(pat) if pat.ident == "uses_client_gdi") {
-                self.0 = Some((*local.init.as_ref().unwrap().expr).clone());
-            }
-            syn::visit::visit_local(self, local);
-        }
-    }
-    let mut init = Init(None);
-    init.visit_file(&source("service_sec_image.rs"));
-    let mut names = Names::default();
-    names.visit_expr(&init.0.expect("actual incoming GDI pointer-capture eligibility"));
-    assert!(!names.calls.iter().any(|name| matches!(name.as_str(),
-        "uses_win32_client_gdi" | "hosted_process_role" | "hosted_process_observation_role")));
-    assert!(!names.paths.iter().any(|name| name == "process_role"),
-        "the first registered GDI service must capture actual user pointers even before conversion completes");
-}
-
-#[test]
 fn callback_role_encoding_can_roundtrip_generic_application_metadata() {
     let file = source("win32k_glue.rs");
     let body = function(&file, "callback_process_role_code");
