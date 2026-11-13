@@ -51,6 +51,7 @@ mod snapshot_region;
 mod registry_wal_store;
 mod hive_wal_publication;
 mod volume_wal_payload;
+mod file_delta_wal_payload;
 #[cfg(test)]
 mod snapshot_test_device;
 mod status;
@@ -131,6 +132,11 @@ pub use hive_wal_publication::{
     HiveSecurityWalPublicationRefusal, HiveWalPublicationError, HiveWalPublicationRefusal,
 };
 pub use volume_wal_payload::{decode_volume_wal_payload, encode_hive_log_wal_payload, HiveLogWalPayload, HiveLogWalReplay, HiveLogWalReplayError, VolumeWalPayload, VolumeWalPayloadError};
+pub use file_delta_wal_payload::{
+    changed_file_delta_extents, decode_file_delta_wal_payload, encode_file_delta_wal_payload,
+    FileDeltaExtent, FileDeltaRecord, FileDeltaReplayCursor, FileDeltaWalPayload,
+    FileDeltaWalPayloadError, FileDeltaWalReplayError, FILE_DELTA_BLOCK_BYTES,
+};
 mod snapshot_baseline_repair;
 pub use snapshot_baseline_repair::WalSnapshotBaselineRepair;
 pub use status::*;

@@ -34,6 +34,9 @@ mod snapshot_crc_compatibility_tests;
 #[path = "wal_log_protection_tests.rs"]
 mod wal_log_protection_tests;
 
+#[path = "file_delta_replay.rs"]
+mod file_delta_replay;
+
 #[path = "optional_file.rs"]
 mod optional_file;
 

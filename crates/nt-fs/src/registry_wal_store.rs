@@ -734,12 +734,12 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     }
 
     #[cfg(test)]
-    fn device_mut_for_test(&mut self) -> &mut D {
+    pub(crate) fn device_mut_for_test(&mut self) -> &mut D {
         self.device.as_mut().expect("retained WAL device")
     }
 
     #[cfg(test)]
-    fn into_device_for_test(mut self) -> D {
+    pub(crate) fn into_device_for_test(mut self) -> D {
         self.state = RegistryWalState::Ready;
         self.device.take().expect("retained WAL device")
     }
