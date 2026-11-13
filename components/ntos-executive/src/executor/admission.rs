@@ -16,4 +16,6 @@ pub(super) struct Event {
     pub(super) is_lsa_auth_server: bool,
     pub(super) is_wl_worker: bool,
     pub(super) pi: usize,
+    pub(super) native_ingress_request: Option<nt_syscall_abi::NativeSyscallRequest>,
+    pub(super) scratch_base: u64,
 }

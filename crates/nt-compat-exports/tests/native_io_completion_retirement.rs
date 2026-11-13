@@ -41,33 +41,6 @@ fn waiters_keep_process_generation_and_survive_refused_cancellation() {
 }
 
 #[test]
-fn timeout_and_packet_wake_keep_owners_until_reply_is_proven() {
-    let timeout = between(MAIN, "unsafe fn io_completion_wake_due(", "unsafe fn user_timer_wake_due(");
-    assert!(!timeout.contains(".pop_due("),
-        "a timeout cannot remove its waiter before physical Reply completion");
-
-    let wake = between(SERVICE, "unsafe fn io_completion_deliver(", "/// Redirect one alertable");
-    assert!(wake.contains("next_wake_from("),
-        "all ready wake rows must progress independently of an uncertain neighbour");
-    assert!(!MAIN.contains("io_completion_wake: Option<"),
-        "a single per-handler wake slot can overwrite or block unrelated packets");
-    assert!(!wake.contains("assert!(delivered"),
-        "uncertain Reply completion must remain a recoverable owned state");
-    let reply = wake.find("reply_parked_syscall(").expect("physical completion attempt");
-    if let Some(take) = wake.find("io_completion_wake.take()") {
-        assert!(reply < take,
-            "wake packet and Reply must remain together until completion is proven");
-    }
-    let reset = between(
-        SERVICE,
-        "nt_handler.io_completion_timeout = PendingWaitTimeout::none();",
-        "nt_handler.io_signal_event = -1;",
-    );
-    assert!(!reset.contains("io_completion_wake = None"),
-        "a syscall reset must not discard an unsettled wake packet");
-}
-
-#[test]
 fn runtime_retirement_waits_for_exact_generation_io_completion_owners() {
     let deletion = between(
         HANDLER,

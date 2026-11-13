@@ -10,6 +10,9 @@ pub(super) struct Syscall {
     pub(super) sp: u64,
     pub(super) flags: u64,
     pub(super) lsa_logon_trace_seq: Option<u64>,
+    pub(super) syscall_reply_context: SyscallReplyContext,
+    pub(super) current_tid: u64,
+    pub(super) table_entry: Option<nt_syscall::NativeServiceEntry>,
 }
 
 /// What one syscall decides: its result, whether the NT or win32k route handled it, and the
