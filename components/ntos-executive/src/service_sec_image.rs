@@ -4504,17 +4504,54 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
 }
 
 /// Claim dirty state and publish the mounted-volume checkpoint at the original service boundary.
+///
+/// A busy checkpoint is not a refusal of this boundary: its commit is still writing, or another
+/// owner holds the reserve. The durable requirement stays owed and the next boundary retries.
+/// Success here therefore means "no durability refusal", not "the volume is clean".
 fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
-    use crate::volume_checkpoint_deferral::{classify, Outcome};
+    use crate::volume_checkpoint_deferral::Outcome;
+    /// Episodes whose deferral and publication each get one trace line.
+    const TRACED_EPISODES: u64 = 16;
     let checkpoint_status = match publish_required_dirty_volume(nt_handler) {
         Ok(status) => status,
         Err(status) => return status,
     };
-    match classify(checkpoint_status) {
-        Outcome::Settled => match fold_background_system_wal(nt_handler) {
-            Ok(()) => nt_fs::STATUS_SUCCESS,
-            Err(status) => status,
-        },
+    match nt_handler.volume_checkpoint_deferral.observe(
+        checkpoint_status, crate::writable_fs::checkpoint_progress, monotonic_time_100ns,
+    ) {
+        Outcome::Settled { episode, deferrals, waited_100ns } => {
+            if deferrals != 0 && episode <= TRACED_EPISODES {
+                print_str(b"[writable-fs-snapshot] service-loop checkpoint published episode=");
+                print_u64(episode);
+                print_str(b" deferrals=");
+                print_u64(deferrals);
+                print_str(b" waited-100ns=");
+                print_u64(waited_100ns);
+                print_str(b"\n");
+            }
+            match fold_background_system_wal(nt_handler) {
+                Ok(()) => nt_fs::STATUS_SUCCESS,
+                Err(status) => status,
+            }
+        }
+        Outcome::Deferred { episode, first } => {
+            if first && episode <= TRACED_EPISODES {
+                print_str(b"[writable-fs-snapshot] service-loop checkpoint deferred episode=");
+                print_u64(episode);
+                print_str(b" status=0x");
+                print_hex(checkpoint_status);
+                print_str(b"\n");
+            }
+            nt_fs::STATUS_SUCCESS
+        }
+        Outcome::Stalled { status, deferrals, stalled_100ns } => {
+            print_str(b"[writable-fs-snapshot] service-loop checkpoint stalled deferrals=");
+            print_u64(deferrals);
+            print_str(b" stalled-100ns=");
+            print_u64(stalled_100ns);
+            print_str(b"\n");
+            report_service_finalize_failure(b"volume-checkpoint-stalled", status)
+        }
         Outcome::Failed(status) => {
             print_str(b"[writable-fs-snapshot] service-loop checkpoint status=0x");
             print_hex(status);

@@ -810,6 +810,15 @@ fn restore_unwritten_checkpoint_authority(
     status
 }
 
+/// What a busy checkpoint's owner has done so far: its phase, identity and completed native
+/// requests. Two equal observations mean the owner did not advance between them.
+pub(crate) type CheckpointProgress = (u8, u64, u64);
+
+/// Read-only: observing progress must not advance, claim or acknowledge the checkpoint.
+pub(crate) fn checkpoint_progress() -> CheckpointProgress {
+    unsafe { native_checkpoint::progress() }
+}
+
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
 /// `Ok(false)` means the volume was already clean.
 pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {

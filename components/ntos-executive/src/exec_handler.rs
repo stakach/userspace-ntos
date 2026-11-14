@@ -4467,6 +4467,10 @@ impl ExecNtHandler {
         write_field!(overlay, nt_hive_core::RegistryOverlay::with_capacity(64));
         write_field!(writable_fs_dirty, false);
         write_field!(writable_fs_commit_required, false);
+        write_field!(
+            volume_checkpoint_deferral,
+            crate::volume_checkpoint_deferral::Deferral::new()
+        );
         let handler = &mut *slot;
         for (pi, &pid) in bootstrap_pids.iter().enumerate() {
             let main_tid = bootstrap_main_tids[pi];

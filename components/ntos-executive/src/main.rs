@@ -24335,6 +24335,10 @@ struct ExecNtHandler {
     /// MemFs file object without forcing a whole-volume raw-reserve checkpoint in the hot syscall
     /// path.
     writable_fs_commit_required: bool,
+    /// The service-loop checkpoint's busy episode: an in-flight native commit or a held reserve
+    /// defers the publication `writable_fs_commit_required` still owes, within a stall bound.
+    volume_checkpoint_deferral:
+        volume_checkpoint_deferral::Deferral<crate::writable_fs::CheckpointProgress>,
 }
 
 const PENDING_DRIVER_LOAD_INITIAL_CAPACITY: usize = 8;

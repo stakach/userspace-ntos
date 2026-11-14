@@ -17,6 +17,8 @@ enum Work {
         bytes: usize,
         entered: bool,
         failed: bool,
+        /// Native requests this commit has completed.
+        settled: u64,
     },
     Done { generation: u64, bytes: usize },
 }
@@ -43,6 +45,15 @@ pub(super) unsafe fn print_quiesce_owner() {
     print_str(b" entered="); print_u64(u64::from(entered));
     print_str(b" failed="); print_u64(u64::from(failed));
     print_str(b"\n");
+}
+
+pub(super) unsafe fn progress() -> super::CheckpointProgress {
+    match (&*core::ptr::addr_of!(WORK)).as_ref() {
+        None => (0, 0, 0),
+        Some(Work::Rechecking { id }) => (1, *id, 0),
+        Some(Work::Committing { id, settled, .. }) => (2, *id, *settled),
+        Some(Work::Done { generation, .. }) => (3, *generation, 0),
+    }
 }
 
 #[must_use = "retain through exact native terminal and ACK"]
@@ -92,7 +103,7 @@ unsafe fn advance_recheck() -> Result<(), u32> {
         }
     };
     *slot = Some(Work::Committing { id, lease, token, old_proof: proof,
-        commit, bytes, entered: false, failed: false });
+        commit, bytes, entered: false, failed: false, settled: 0 });
     Ok(())
 }
 
@@ -206,7 +217,7 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
 {
     use super::native_snapshot_io::SnapshotCompletion;
     let slot = &mut *core::ptr::addr_of_mut!(WORK);
-    let Some(Work::Committing { id, commit, entered, failed, .. }) = slot.as_mut()
+    let Some(Work::Committing { id, commit, entered, failed, settled, .. }) = slot.as_mut()
         else { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); };
     if *id != ticket.id || !*entered || *failed || commit.pending() != Some(ticket.request) {
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
@@ -222,6 +233,7 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
         return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DEVICE_NOT_READY)));
     }
     *entered = false;
+    *settled += 1;
     if !commit.is_done() { return Ok(SnapshotCompletion::Settled); }
     let Some(Work::Committing { lease, token, old_proof, commit, bytes, .. }) = slot.take()
         else { unreachable!() };
