@@ -14960,14 +14960,40 @@ pub(crate) unsafe fn map_image_skeleton(pml4: u64, img_count: u64) {
     map_cluster_pt(pml4);
 }
 
-/// Map one contiguous root heap span. This path uses only cap/syscall/static bookkeeping, so the
-/// allocator can invoke it while holding its own lock when the durable arena needs more pages.
+/// Reports of a refused root heap commitment. Once Untyped memory or root CSpace is exhausted
+/// every further growth attempt is refused the same way.
+static HEAP_COMMIT_REFUSAL_REPORTS: AtomicU64 = AtomicU64::new(0);
+const HEAP_COMMIT_REFUSAL_REPORT_LIMIT: u64 = 8;
+
+fn heap_commit_refusal_reportable() -> bool {
+    HEAP_COMMIT_REFUSAL_REPORTS.fetch_add(1, Ordering::Relaxed) < HEAP_COMMIT_REFUSAL_REPORT_LIMIT
+}
+
+/// Bytes the boot Untyped can still back, as the root executive accounts them.
+pub(crate) fn root_untyped_free_bytes() -> u64 {
+    UT_TOTAL_BYTES
+        .load(Ordering::Relaxed)
+        .saturating_sub(UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed))
+}
+
+/// Map one contiguous root heap span, or nothing. This path uses only cap/syscall/static
+/// bookkeeping, so the allocator can invoke it while holding its own lock when the durable arena
+/// needs more pages. A refusal (no cap run, no Untyped memory, a failed map) returns every frame
+/// and slot it took and reports `false`: the allocation that needed the pages fails, the heap
+/// keeps its published extent, and the executive keeps running.
 unsafe fn map_own_heap_frames(first: u64, count: u64) -> bool {
     let Some(frame_base) = try_alloc_slot_run(count) else {
-        print_str(b"[paging] executive heap cap run unavailable\n");
+        if heap_commit_refusal_reportable() {
+            print_str(b"[paging] executive heap cap run unavailable frames=");
+            print_u64(count);
+            print_str(b" cspace-free=");
+            print_u64(root_slot_available_count());
+            print_str(b"\n");
+        }
         return false;
     };
     let mut retyped = 0u64;
+    let mut mapped = 0u64;
     while retyped < count {
         let batch = (count - retyped).min(ROOT_RETYPE_FAN_OUT_LIMIT);
         let error = untyped_retype_r(
@@ -14978,50 +15004,66 @@ unsafe fn map_own_heap_frames(first: u64, count: u64) -> bool {
             frame_base + retyped,
         );
         if error != 0 {
-            print_str(b"[paging] retype executive-heap-frame-run failed base=0x");
-            print_hex((frame_base >> 32) as u32);
-            print_hex(frame_base as u32);
-            print_str(b" index=");
-            print_u64(first + retyped);
-            print_str(b" batch=");
-            print_u64(batch);
-            print_str(b" error=");
-            print_u64(error);
-            print_str(b" root-ut-total=");
-            print_u64(UT_TOTAL_BYTES.load(Ordering::Relaxed));
-            print_str(b" cumulative-retyped=");
-            print_u64(UT_RETYPE_BYTES.load(Ordering::Relaxed));
-            print_str(b" live-retyped=");
-            print_u64(UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed));
-            print_str(b" released=");
-            print_u64(UT_RETYPE_RELEASED_BYTES.load(Ordering::Relaxed));
-            print_str(b"\n");
-            panic!("required executive heap frame retype failed");
+            if heap_commit_refusal_reportable() {
+                print_str(b"[paging] retype executive-heap-frame-run failed base=0x");
+                print_hex((frame_base >> 32) as u32);
+                print_hex(frame_base as u32);
+                print_str(b" index=");
+                print_u64(first + retyped);
+                print_str(b" batch=");
+                print_u64(batch);
+                print_str(b" error=");
+                print_u64(error);
+                print_str(b" root-ut-total=");
+                print_u64(UT_TOTAL_BYTES.load(Ordering::Relaxed));
+                print_str(b" cumulative-retyped=");
+                print_u64(UT_RETYPE_BYTES.load(Ordering::Relaxed));
+                print_str(b" live-retyped=");
+                print_u64(UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed));
+                print_str(b" released=");
+                print_u64(UT_RETYPE_RELEASED_BYTES.load(Ordering::Relaxed));
+                print_str(b"\n");
+            }
+            break;
         }
         retyped += batch;
     }
-    root_slot_pin_run(frame_base, count);
-    for i in 0..count {
-        let f = frame_base + i;
-        let va = allocator::HEAP_BASE as u64 + (first + i) * 0x1000;
+    while retyped == count && mapped < count {
+        let f = frame_base + mapped;
+        let va = allocator::HEAP_BASE as u64 + (first + mapped) * 0x1000;
         let map = page_map_r(f, va, RW_NX, CAP_INIT_THREAD_VSPACE);
         if map != 0 {
-            let _ = cnode_delete_recycle_r(f);
-            print_str(b"[paging] map executive-heap-page failed frame=0x");
-            print_hex((f >> 32) as u32);
-            print_hex(f as u32);
-            print_str(b" va=0x");
-            print_hex((va >> 32) as u32);
-            print_hex(va as u32);
-            print_str(b" error=");
-            print_u64(map);
-            print_str(b"\n");
-            panic!("required executive heap page map failed");
+            if heap_commit_refusal_reportable() {
+                print_str(b"[paging] map executive-heap-page failed frame=0x");
+                print_hex((f >> 32) as u32);
+                print_hex(f as u32);
+                print_str(b" va=0x");
+                print_hex((va >> 32) as u32);
+                print_hex(va as u32);
+                print_str(b" error=");
+                print_u64(map);
+                print_str(b"\n");
+            }
+            break;
         }
         // The initial rootserver has no external pager. Detect bad maps at their source.
         core::ptr::write_volatile(va as *mut u8, 0);
+        mapped += 1;
     }
-    true
+    if mapped == count {
+        root_slot_pin_run(frame_base, count);
+        return true;
+    }
+    // Deleting a frame cap unmaps it. The slots were never pinned, so each returns to the
+    // recycler, with its Untyped bytes for the ones that were retyped.
+    for slot in frame_base..frame_base + count {
+        if slot < frame_base + retyped {
+            let _ = cnode_delete_recycle_r(slot);
+        } else {
+            recycle_deleted_root_slot(slot);
+        }
+    }
+    false
 }
 
 /// Map initial durable pages and the fixed transient lane without committing the intervening VA.
@@ -15049,9 +15091,16 @@ pub(crate) unsafe fn grow_own_heap(requested_end: usize) -> bool {
     if target == current {
         return true;
     }
-    if !map_own_heap_frames(current, target - current) {
-        return false;
-    }
+    let target = if map_own_heap_frames(current, target - current) {
+        target
+    } else {
+        // The 2 MiB step is a batching convenience. When it cannot be backed, the pages this
+        // allocation needs may still be.
+        match allocator::root_commit_floor(current, requested_end) {
+            Some(floor) if floor < target && map_own_heap_frames(current, floor - current) => floor,
+            _ => return false,
+        }
+    };
     allocator::publish_root_heap_commit(target);
     print_str(b"[heap] executive durable committed frames=");
     print_u64(target);

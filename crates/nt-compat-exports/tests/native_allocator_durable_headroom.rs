@@ -21,6 +21,7 @@ fn logged(committed_frames: usize, logged_headroom: usize) -> DurableExtent {
         bump_end: committed_end - logged_headroom,
         committed_end,
         reservation_end: RESERVATION,
+        backing_free: usize::MAX,
     }
 }
 
@@ -46,6 +47,7 @@ fn a_reservation_that_cannot_cover_the_image_is_still_refused() {
         bump_end: RESERVATION - required + 1,
         committed_end: RESERVATION,
         reservation_end: RESERVATION,
+        backing_free: usize::MAX,
     };
     assert_eq!(full.growable(), 0);
     assert!(full.obtainable() < required);
@@ -54,6 +56,7 @@ fn a_reservation_that_cannot_cover_the_image_is_still_refused() {
         bump_end: RESERVATION - required + 1,
         committed_end: RESERVATION - 512 * PAGE,
         reservation_end: RESERVATION,
+        backing_free: usize::MAX,
     };
     assert_eq!(nearly.obtainable(), required - 1);
     let exact = DurableExtent { bump_end: RESERVATION - required, ..nearly };
@@ -67,9 +70,51 @@ fn an_eagerly_mapped_heap_has_nothing_to_grow() {
         bump_end: METADATA + 4096,
         committed_end: 128 * PAGE,
         reservation_end: 128 * PAGE,
+        backing_free: 0,
     };
     assert_eq!(extent.growable(), 0);
     assert_eq!(extent.obtainable(), extent.committed_free());
+}
+
+/// A reservation is address space. With 22 MiB of it uncommitted but 1 MiB of Untyped memory
+/// left, a 4.6 MiB image cannot be built, and admission must say so before the commitment fails.
+#[test]
+fn uncommitted_reservation_counts_only_as_far_as_memory_can_back_it() {
+    let extent = DurableExtent { backing_free: 1 << 20, ..logged(15872, 2_095_952) };
+    assert_eq!(extent.growable(), 1 << 20);
+    assert_eq!(extent.obtainable(), 2_095_952 + (1 << 20));
+    assert!(extent.obtainable() < 4_624_207);
+    let exhausted = DurableExtent { backing_free: 0, ..extent };
+    assert_eq!(exhausted.obtainable(), exhausted.committed_free());
+    // Memory beyond the reservation does not enlarge it.
+    let plentiful = DurableExtent { backing_free: 1 << 30, ..extent };
+    assert_eq!(plentiful.growable(), (21504 - 15872) * PAGE);
+}
+
+/// When a 2 MiB commitment step cannot be backed, the pages the allocation needs still may be.
+#[test]
+fn the_commit_floor_is_the_requested_page_count_inside_the_reservation() {
+    use allocator_headroom::commit_floor;
+    let (current, reserved) = (21_000u64, 21_504u64);
+    let committed = current as usize * PAGE;
+    assert_eq!(commit_floor(current, committed, reserved), None, "already committed");
+    assert_eq!(commit_floor(current, committed + 1, reserved), Some(current + 1));
+    assert_eq!(commit_floor(current, committed + 3 * PAGE + 1, reserved), Some(current + 4));
+    assert_eq!(commit_floor(current, RESERVATION, reserved), Some(reserved));
+    assert_eq!(commit_floor(current, RESERVATION + 1, reserved), None, "past the reservation");
+}
+
+/// A refused commitment fails the allocation that needed it; it must not stop the executive.
+#[test]
+fn a_refused_root_heap_commitment_is_an_allocation_failure() {
+    let main = include_str!("../../../components/ntos-executive/src/main.rs");
+    let commit = main
+        .split("unsafe fn map_own_heap_frames(").nth(1).unwrap()
+        .split("\nunsafe fn ").next().unwrap();
+    assert!(!commit.contains("panic!"), "commitment refusal must return false");
+    assert!(commit.contains("cnode_delete_recycle_r(slot)"), "a refused run returns its frames");
+    let allocator = include_str!("../../../components/ntos-executive/src/allocator.rs");
+    assert!(allocator.contains("crate::root_untyped_free_bytes()"));
 }
 
 /// The hive checkpoint admission asks for what the heap can obtain.

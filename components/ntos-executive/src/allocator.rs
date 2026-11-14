@@ -602,6 +602,16 @@ pub(crate) fn root_commit_target(current_frames: u64, requested_end: usize) -> O
     )
 }
 
+/// The fewest committed frames that satisfy a root allocation ending at `requested_end`, when
+/// that is more than `current_frames`.
+pub(crate) fn root_commit_floor(current_frames: u64, requested_end: usize) -> Option<u64> {
+    headroom::commit_floor(
+        current_frames,
+        requested_end.checked_sub(HEAP_BASE)?,
+        EXECUTIVE_DURABLE_HEAP_FRAMES,
+    )
+}
+
 #[inline]
 fn heap_size() -> usize {
     let configured = unsafe { read_word(COMPONENT_HEAP_LIMIT_BYTES) };
@@ -1068,7 +1078,7 @@ pub fn remaining() -> usize {
 }
 
 /// Bytes an allocation above the bump mark can still obtain: mapped and free, plus the pages
-/// the root heap may still commit below its transient lane.
+/// the root heap may still commit below its transient lane and Untyped memory can still back.
 pub fn obtainable() -> usize {
     let _guard = HeapLockGuard::acquire();
     durable_extent().obtainable()
@@ -1076,11 +1086,17 @@ pub fn obtainable() -> usize {
 
 /// Call with the heap lock held.
 fn durable_extent() -> headroom::DurableExtent {
+    // Only the root heap has a transient lane, and only the root heap grows.
+    let root = transient_heap_size() != 0;
     headroom::DurableExtent {
         bump_end: DATA + unsafe { read_word(CTR) },
         committed_end: durable_heap_end(),
-        // Only the root heap has a transient lane, and only the root heap grows.
         reservation_end: transient_heap_start(),
+        backing_free: if root {
+            usize::try_from(crate::root_untyped_free_bytes()).unwrap_or(usize::MAX)
+        } else {
+            0
+        },
     }
 }
 
@@ -1139,12 +1155,13 @@ const CENSUS_SITES: usize = 16;
 /// most. `scripts/symbolize_alloc_sites.py` turns the frames into function names.
 pub fn print_site_census() {
     let mut top = [sites::Site::default(); CENSUS_SITES];
-    let (classes, attributed, unattributed, sites_used, shown) = {
+    let (extent, classes, attributed, unattributed, sites_used, shown) = {
         let _lock = HeapLockGuard::acquire();
         let Some(ledger) = (unsafe { site_ledger() }) else {
             return;
         };
         (
+            durable_extent(),
             *ledger.classes(),
             ledger.attributed(),
             ledger.unattributed(),
@@ -1164,6 +1181,12 @@ pub fn print_site_census() {
     debug_usize(sites::SITE_CAPACITY);
     debug_bytes(b" ledger=");
     debug_usize(size_of::<SiteLedger>());
+    debug_bytes(b" obtainable=");
+    debug_usize(extent.obtainable());
+    debug_bytes(b" uncommitted=");
+    debug_usize(extent.reservation_end.saturating_sub(extent.committed_end));
+    debug_bytes(b" untyped-free=");
+    debug_usize(extent.backing_free);
     debug_bytes(b" class-log2:bytes/count=");
     for (class, tally) in classes.iter().enumerate().filter(|(_, tally)| tally.count != 0) {
         crate::debug_put_char(b' ');
