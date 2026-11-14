@@ -177,12 +177,23 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     /// A physical lane can park before its returned pump, Reply and shared publication have
     /// been transferred to the next wait or terminal owner. A fresh dispatch cannot borrow
     /// that publication during this interval.
+    ///
+    /// A kernel job resumed from a provider wait has no such publication: its resume restores
+    /// none, and while its provider is parked in its own service Call that retained service
+    /// wait owns the Reply. That entered frame is settled, so the job's inline terminal may
+    /// dispatch. Every other kernel-owned frame kind keeps the fence.
     fn returning_pump_is_unsettled(&self) -> bool {
         self.slots.iter().any(|slot| slot.lane.as_ref().is_some_and(|lane| {
-            lane.suspensions.frames().iter().any(|frame| matches!(frame.phase,
-                SuspensionPhase::Resuming { .. }
-                    | SuspensionPhase::ResumingChildQuarantined { .. }
-                    | SuspensionPhase::MaintenanceResuming { .. }))
+            let kernel_service_park = lane.phase == LanePhase::Suspended
+                && !lane.external_tokens.is_empty();
+            lane.suspensions.frames().iter().any(|frame| match frame.phase {
+                SuspensionPhase::Resuming { .. } => !(kernel_service_park
+                    && frame.key.kind == SuspensionKind::ProviderWait
+                    && matches!(frame.owner.caller, SuspensionCaller::Kernel { .. })),
+                SuspensionPhase::ResumingChildQuarantined { .. }
+                | SuspensionPhase::MaintenanceResuming { .. } => true,
+                _ => false,
+            })
         }))
     }
 

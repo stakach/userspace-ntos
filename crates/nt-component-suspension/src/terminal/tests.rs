@@ -637,3 +637,90 @@ fn filtered_selection_advances_past_failed_local_retirement_without_losing_it() 
     assert_eq!(lanes.next_terminal(), Some(first));
     assert_eq!(lanes.terminal_identities().count(), 2);
 }
+
+fn kernel_owner(lanes: &Lanes, lane: LaneHandle) -> SuspensionOwner {
+    SuspensionOwner {
+        provider_domain: 1,
+        provider_generation: 2,
+        caller: SuspensionCaller::Kernel { lane },
+        dispatch_id: lanes.active_dispatch_identity(lane).unwrap().unwrap().epoch(),
+    }
+}
+
+/// A lane whose selected provider wait has been entered again by `owner_of`.
+fn resumed_wait(
+    lanes: &mut Lanes,
+    id: u64,
+    owner_of: impl Fn(&Lanes, LaneHandle) -> SuspensionOwner,
+) -> (LaneHandle, SuspensionKey) {
+    let bind = binding(id);
+    let lane = lanes.allocate(bind).unwrap();
+    let key = SuspensionKey::provider_wait(id);
+    lanes.begin_dispatch(lane, bind.reply_object).unwrap();
+    let owner = owner_of(lanes, lane);
+    lanes
+        .admit_running(lane, bind.reply_object, key, id, owner, id * 100)
+        .unwrap();
+    lanes.select(key, 42).unwrap();
+    lanes.begin_resume(lane, bind.reply_object, key).unwrap();
+    (lane, key)
+}
+
+/// Issue #389: a kernel job resumed from a wait carries no shared publication, and while its
+/// provider is parked in its own service Call the retained service wait owns its Reply. Its
+/// inline source terminal must be able to enter the provider; nothing is left to fence.
+#[test]
+fn kernel_job_parked_in_its_own_service_call_does_not_fence_a_fresh_dispatch() {
+    let mut lanes = Lanes::new(4, 4);
+    let (lane, key) = resumed_wait(&mut lanes, 1, kernel_owner);
+    let reply = binding(1).reply_object;
+    assert!(lanes.fresh_dispatch_busy(), "an executing job holds the execution fence");
+
+    lanes.suspend_running(lane, reply, 41).unwrap();
+    assert_eq!(lanes.running(), None);
+    assert!(matches!(
+        lanes.frame(lane, key).unwrap().unwrap().phase,
+        SuspensionPhase::Resuming { .. }
+    ));
+    assert!(!lanes.execution_busy());
+    assert!(
+        !lanes.fresh_dispatch_busy(),
+        "the job's own inline terminal must not be fenced by its entered wait frame"
+    );
+
+    // The acknowledged service Reply returns the lane to the same entered frame.
+    lanes.resume_external(lane, reply, 41).unwrap();
+    lanes.retire_external_running(lane, reply, 41).unwrap();
+    assert!(lanes.fresh_dispatch_busy());
+    assert!(matches!(
+        lanes.frame(lane, key).unwrap().unwrap().phase,
+        SuspensionPhase::Resuming { .. }
+    ));
+}
+
+/// A hosted resumed pump owns a shared publication until its repark is retained, so the same
+/// physical state keeps the fence.
+#[test]
+fn hosted_resumed_pump_parked_in_a_service_call_still_fences_a_fresh_dispatch() {
+    let mut lanes = Lanes::new(4, 4);
+    let (lane, _) = resumed_wait(&mut lanes, 1, |_, _| owner(1));
+    let reply = binding(1).reply_object;
+    lanes.suspend_running(lane, reply, 41).unwrap();
+    assert!(!lanes.execution_busy());
+    assert!(
+        lanes.fresh_dispatch_busy(),
+        "an unsettled hosted return must fence fresh shared-page publication"
+    );
+}
+
+/// The exemption is per lane: another lane's unsettled hosted return still fences.
+#[test]
+fn kernel_service_park_does_not_lift_another_lanes_unsettled_return() {
+    let mut lanes = Lanes::new(4, 4);
+    let (kernel_lane, _) = resumed_wait(&mut lanes, 1, kernel_owner);
+    lanes.suspend_running(kernel_lane, binding(1).reply_object, 41).unwrap();
+    assert!(!lanes.fresh_dispatch_busy());
+    let (hosted_lane, _) = resumed_wait(&mut lanes, 2, |_, _| owner(2));
+    lanes.suspend_running(hosted_lane, binding(2).reply_object, 42).unwrap();
+    assert!(lanes.fresh_dispatch_busy());
+}
