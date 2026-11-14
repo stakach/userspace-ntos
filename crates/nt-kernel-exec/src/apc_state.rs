@@ -2,7 +2,12 @@
 
 use core::ptr::{copy_nonoverlapping, read_volatile, write_volatile};
 
+/// `sizeof(KAPC_STATE)`, the extent two states must not share.
 pub const KAPC_STATE_BYTES: usize = 0x30;
+/// Bytes that belong to the state itself: both list heads, `Process` and the three flags up to
+/// `UserApcPending`. The pinned `KTHREAD` overlays other thread fields on the padding after
+/// them (`Priority` after `ApcState`; `WaitReason` and `SuspendCount` after `SavedApcState`).
+const KAPC_STATE_MEMBER_BYTES: usize = 0x2b;
 pub const KAPC_PROCESS_OFFSET: usize = 0x20;
 const KAPC_FLAGS_OFFSET: usize = 0x28;
 
@@ -44,7 +49,7 @@ pub unsafe fn move_state(source: u64, destination: u64) -> Result<(), ApcStateEr
         }
     }
     unsafe {
-        copy_nonoverlapping(source as *const u8, destination as *mut u8, KAPC_STATE_BYTES);
+        copy_nonoverlapping(source as *const u8, destination as *mut u8, KAPC_STATE_MEMBER_BYTES);
     }
     for offset in [0, 0x10] {
         let old_head = source + offset;
@@ -112,6 +117,31 @@ mod tests {
         assert_eq!(destination[2], destination_va + 0x10);
         assert_eq!(destination[3], destination_va + 0x10);
         assert_eq!(destination[4], 0x1234);
+    }
+
+    /// The pinned `KTHREAD` declares `Priority`/`UserIdealProcessor` after `ApcState`'s last
+    /// flag and `WaitReason`/`SuspendCount` after `SavedApcState`'s, inside the same 0x30
+    /// bytes (`ketypes.h:2249` and `:2375`). `KiMoveApcState` assigns members and leaves them.
+    #[test]
+    fn a_move_leaves_the_thread_fields_that_share_the_structure_tail() {
+        let mut source = [0u64; 6];
+        let mut destination = [0u64; 6];
+        let source_va = source.as_mut_ptr() as u64;
+        let destination_va = destination.as_mut_ptr() as u64;
+        unsafe {
+            initialize(source_va, 0x1234);
+            write_volatile((source_va + 0x2a) as *mut u8, 1);
+            for offset in 0x2b..0x30u64 {
+                write_volatile((source_va + offset) as *mut u8, 0x11);
+                write_volatile((destination_va + offset) as *mut u8, 0x22);
+            }
+            move_state(source_va, destination_va).unwrap();
+            assert_eq!(read_volatile((destination_va + 0x2a) as *const u8), 1);
+            for offset in 0x2b..0x30u64 {
+                assert_eq!(read_volatile((destination_va + offset) as *const u8), 0x22);
+                assert_eq!(read_volatile((source_va + offset) as *const u8), 0x11);
+            }
+        }
     }
 
     #[test]
