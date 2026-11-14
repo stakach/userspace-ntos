@@ -110,7 +110,6 @@ impl<C> Journal<C> {
                 WRITABLE_FS_SNAPSHOT_DIRTY.store(false, Ordering::Release);
                 restore(filesystem);
                 drop(device);
-                publish_staged_profile();
                 Ok(context)
             }
             Err(storage) => Err(Self { storage, mount: self.mount, journal_bytes: self.journal_bytes }),
@@ -124,7 +123,6 @@ impl<C> Journal<C> {
                 WRITABLE_FS_SNAPSHOT_DIRTY.store(false, Ordering::Release);
                 restore(filesystem);
                 drop(device);
-                publish_staged_profile();
                 Ok(context)
             }
             Err(storage) => Err(Self { storage, mount: self.mount, journal_bytes: self.journal_bytes }),
@@ -138,12 +136,6 @@ unsafe fn restore(filesystem: nt_fs::FileSystem) {
     *slot = Some(filesystem);
     OWNED.store(false, Ordering::Release);
     mark_runtime_dirty();
-}
-
-unsafe fn publish_staged_profile() {
-    if let Some(image) = (&mut *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).take() {
-        let _ = set_default_user_ntuser_dat_image(image);
-    }
 }
 
 fn status(error: SnapshotJournalError) -> u32 {

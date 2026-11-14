@@ -118,23 +118,12 @@ pub(crate) const WRITABLE_OVERLAY_MOUNTED: bool = true;
 /// directories and the destination must share the writable namespace.
 pub(crate) const PROVISION_DEFAULT_USER_PROFILE: bool = true;
 
-/// Provide the default profile's `ntuser.dat` from the live setup-provisioned `.Default`
-/// hive. Winlogon's own `CopyDirectory` copies it to the newly created user profile.
-pub(crate) const PROVISION_NTUSER_DAT: bool = true;
-
-/// The `ntuser.dat` source profile and destination the copy must produce.
+/// The default profile's hive and the copy a created user profile must hold. Neither is
+/// provisioned here: setup saves the first from the live `HKU\.DEFAULT` hive
+/// (`SaveDefaultUserHive`: `RegSaveKeyExW` on a file it opens with `FILE_CREATE`), and
+/// Winlogon's own `CopyDirectory` produces the second.
 pub(crate) const DEFAULT_USER_NTUSER_DAT: &str = crate::installed_layout::NT_DEFAULT_NTUSER;
 pub(crate) const COPIED_PROFILE_NTUSER_DAT: &str = crate::installed_layout::NT_ADMIN_NTUSER;
-
-/// Bytes of the `ntuser.dat` really provisioned into the `Default` profile (0 = not present).
-pub(crate) static NTUSER_DAT_PROVISIONED: AtomicU64 = AtomicU64::new(0);
-
-/// The setup-provisioned `.Default` hive image to install into `Default\ntuser.dat`.
-///
-/// This is populated by the registry setup path after the mutable `.Default` hive has received
-/// ReactOS setup's locale and shell-folder writes. If it is absent, no profile hive is provisioned:
-/// copying the raw `config\default` prototype would reintroduce the stale setup-state bug.
-static mut SETUP_DEFAULT_USER_NTUSER_IMAGE: Option<alloc::vec::Vec<u8>> = None;
 
 const REGF_HIVE_MAGIC: [u8; 4] = *b"regf";
 
@@ -240,62 +229,6 @@ pub(crate) unsafe fn hive_image_value_len_at(
     match writable_fs() {
         Ok(fs) => hive_image_value_len_on(fs, path, key_path, value_name),
         Err(_) => 0,
-    }
-}
-
-/// Publish the setup-provisioned `.Default` hive image that the profile source should expose as
-/// `Default User\ntuser.dat`.
-///
-/// # Safety
-/// Single-threaded executive during boot/profile setup. The stored image is immutable after
-/// publication except for replacing the whole vector with a newer setup snapshot.
-pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8>) -> bool {
-    if !PROVISION_NTUSER_DAT || image.is_empty() || !hive_image_ok(&image) {
-        return false;
-    }
-    if registry_journal::owns_volume() {
-        *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(image);
-        return false;
-    }
-    let len = image.len() as u64;
-    if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some() {
-        let mut image_slot = Some(image);
-        let (already_current, provisioned) = {
-            let fs = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS))
-                .as_mut()
-                .unwrap();
-            let current_image = image_slot.as_ref().map(|image| image.as_slice());
-            let already_current = fs.file_bytes(DEFAULT_USER_NTUSER_DAT) == current_image;
-            let provisioned = if already_current {
-                true
-            } else {
-                match fs.provision_file_owned(DEFAULT_USER_NTUSER_DAT, image_slot.take().unwrap()) {
-                    Ok(()) => true,
-                    Err(returned) => {
-                        image_slot = Some(returned);
-                        false
-                    }
-                }
-            };
-            if provisioned {
-                refresh_live_profile_source_proofs(fs);
-            }
-            (already_current, provisioned)
-        };
-        if provisioned && !already_current {
-            mark_snapshot_dirty();
-        }
-        if provisioned {
-            *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = None;
-            NTUSER_DAT_PROVISIONED.store(len, Ordering::Relaxed);
-        } else {
-            *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = image_slot;
-        }
-        provisioned
-    } else {
-        *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(image);
-        NTUSER_DAT_PROVISIONED.store(len, Ordering::Relaxed);
-        true
     }
 }
 
@@ -1187,10 +1120,6 @@ fn refresh_live_profile_source_proofs(fs: &mut nt_fs::FileSystem) {
         count_entries(fs, DEFAULT_USER_PROFILE_DIR),
         Ordering::Relaxed,
     );
-    let ntuser_len = hive_image_len_on(fs, DEFAULT_USER_NTUSER_DAT);
-    if ntuser_len != 0 {
-        NTUSER_DAT_PROVISIONED.store(ntuser_len as u64, Ordering::Relaxed);
-    }
 }
 
 fn refresh_restored_config_proofs(fs: &nt_fs::FileSystem) {
@@ -3132,8 +3061,7 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     if attr & 0x10 == 0 {
         return;
     }
-    let mut stats =
-        provision_staged_tree(fs, &fat, root_cluster, PROFILES_VOLUME_ROOT_RELATIVE, 12);
+    let stats = provision_staged_tree(fs, &fat, root_cluster, PROFILES_VOLUME_ROOT_RELATIVE, 12);
     PROFILE_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
     PROFILE_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
     PROFILE_SOURCE_BYTES.store(stats.bytes, Ordering::Relaxed);
@@ -3143,37 +3071,6 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
         .is_some_and(|info| info.is_directory)
     {
         PROFILE_SOURCE_PROBE_OK.store(1, Ordering::Relaxed);
-    }
-    // ★ THE SETUP STEP THE LIVECD SKIPS (see `PROVISION_NTUSER_DAT`): give the `Default User`
-    // profile the `ntuser.dat` setup would have made for it from the setup-provisioned mutable
-    // `.Default` checkpoint image. Do not copy raw `config\default`: that prototype lacks setup's
-    // installed-user writes and is the bug this path replaces.
-    if PROVISION_NTUSER_DAT {
-        let setup_image = (*core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).take();
-        match setup_image {
-            Some(hive) if hive_image_ok(&hive) => {
-                let hive_len = hive.len();
-                match fs.provision_file_owned(DEFAULT_USER_NTUSER_DAT, hive) {
-                    Ok(()) => {
-                        stats.files += 1;
-                        stats.bytes += hive_len as u64;
-                        NTUSER_DAT_PROVISIONED.store(hive_len as u64, Ordering::Relaxed);
-                    }
-                    Err(returned) => {
-                        *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(returned);
-                    }
-                }
-            }
-            Some(_) => {
-                print_str(b"[profile-source] setup HKU\\.DEFAULT image invalid -> no ntuser.dat\n")
-            }
-            None => {
-                print_str(b"[profile-source] setup HKU\\.DEFAULT image absent -> no ntuser.dat\n")
-            }
-        }
-        PROFILE_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
-        PROFILE_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
-        PROFILE_SOURCE_BYTES.store(stats.bytes, Ordering::Relaxed);
     }
     PROFILE_SOURCE_ENTRIES.store(
         count_entries(fs, DEFAULT_USER_PROFILE_DIR),
@@ -3189,13 +3086,11 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     print_u64(PROFILE_SOURCE_ENTRIES.load(Ordering::Relaxed));
     print_str(b" probe-file-content-ok=");
     print_u64(PROFILE_SOURCE_PROBE_OK.load(Ordering::Relaxed));
-    print_str(b" ntuser.dat=");
-    print_u64(NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed));
-    print_str(b"B(hive-ok=");
-    // Read it back off the LIVE volume and parse it, so the claim "a real hive image is in the
-    // source profile" is measured through the same navigator the registry will mount it with.
+    // Setup saves the source profile hive; a restored volume may already hold one. Parse it
+    // through the same navigator the registry mounts a hive with.
+    print_str(b" ntuser.dat-hive=");
     print_u64(hive_image_len_on(fs, DEFAULT_USER_NTUSER_DAT) as u64);
-    print_str(b")\n");
+    print_str(b"B\n");
 }
 
 unsafe fn provision_staged_config(fs: &mut nt_fs::FileSystem) {

@@ -4539,9 +4539,6 @@ impl ExecNtHandler {
             trace_setup_provision_phase(b"profile-shell-begin", 0);
             self.provision_default_user_shell_folders();
             trace_setup_provision_phase(b"profile-shell-end", 0);
-            trace_setup_provision_phase(b"profile-image-begin", 0);
-            self.provision_default_user_ntuser_dat_image();
-            trace_setup_provision_phase(b"profile-image-end", 0);
             trace_setup_provision_phase(b"network-begin", 0);
             self.provision_reactos_network_setup();
             trace_setup_provision_phase(b"network-end", 0);
@@ -5056,84 +5053,15 @@ impl ExecNtHandler {
             print_u64(stats.user_shell_folder_values as u64);
             print_str(b"\n");
         }
-        // The serialized ntuser.dat is the source for a later interactive user's hive.
-        // A partial seed must never become that durable source, including on legacy media.
+        // Setup saves this hive as the default profile's ntuser.dat, the source of every later
+        // interactive user's hive. A partial seed must never become that durable source.
         if failed || !complete {
             print_str(b"[profile-setup] default-user shell-folder journal incomplete status=0x");
             print_hex(if failed { last_status } else { STATUS_UNSUCCESSFUL });
             print_str(b"\n");
-            panic!("default-user shell-folder seed incomplete before ntuser.dat publication");
+            panic!("default-user shell-folder seed incomplete before setup saves the hive");
         }
 
-    }
-
-    /// Serialize the setup-provisioned `.Default` hive into the profile source's `ntuser.dat`.
-    ///
-    /// ReactOS setup creates `Default User\ntuser.dat` from the prototype hive after setup has
-    /// applied installed-user values. This executive has already imported the real `config\default`
-    /// regf into `MutableHiveSet` and applied the setup-owned locale/shell-folder writes there, so
-    /// the file winlogon copies must come from that mutable authority rather than stale raw regf
-    /// bytes.
-    fn provision_default_user_ntuser_dat_image(&mut self) {
-        let Some(hive) = self.mutable_hives.hive(HIVE_SEL_USER_DEFAULT) else {
-            print_str(
-                b"[profile-setup] HKU\\.DEFAULT mutable hive absent -> no ntuser.dat image\n",
-            );
-            return;
-        };
-        print_str(b"[profile-setup] ntuser image enter cells=");
-        print_u64(hive.cell_count() as u64);
-        print_str(b" dirty=");
-        print_u64(hive.dirty_count() as u64);
-        print_str(b" heap-headroom=");
-        print_u64(crate::allocator::remaining() as u64);
-        print_str(b"\n");
-        print_str(b"[profile-setup] ntuser image measure begin\n");
-        match nt_hive_core::encoded_image_len(hive) {
-            Ok(len) => {
-                print_str(b"[profile-setup] ntuser image measure end len=");
-                print_u64(len as u64);
-                print_str(b"\n");
-            }
-            Err(err) => {
-                print_str(b"[profile-setup] ntuser image measure failed err=");
-                print_str(match err {
-                    nt_hive_core::HiveEncodeError::OutOfMemory => b"out-of-memory",
-                    nt_hive_core::HiveEncodeError::SizeOverflow => b"size-overflow",
-                });
-                print_str(b"\n");
-                return;
-            }
-        }
-        print_str(b"[profile-setup] ntuser image encode begin\n");
-        let image = match nt_hive_core::try_encode_image(hive) {
-            Ok(image) => image,
-            Err(err) => {
-                print_str(b"[profile-setup] HKU\\.DEFAULT image encode failed err=");
-                print_str(match err {
-                    nt_hive_core::HiveEncodeError::OutOfMemory => b"out-of-memory",
-                    nt_hive_core::HiveEncodeError::SizeOverflow => b"size-overflow",
-                });
-                print_str(b"\n");
-                return;
-            }
-        };
-        print_str(b"[profile-setup] ntuser image encode end len=");
-        print_u64(image.len() as u64);
-        print_str(b" heap-headroom=");
-        print_u64(crate::allocator::remaining() as u64);
-        print_str(b"\n");
-        let len = image.len();
-        print_str(b"[profile-setup] ntuser image publish begin\n");
-        if unsafe { crate::writable_fs::set_default_user_ntuser_dat_image(image) } {
-            self.writable_fs_dirty = true;
-            print_str(b"[profile-setup] Default User\\ntuser.dat <- mutable HKU\\.DEFAULT image ");
-            print_u64(len as u64);
-            print_str(b"B\n");
-        } else {
-            print_str(b"[profile-setup] Default User\\ntuser.dat image publication failed\n");
-        }
-        print_str(b"[profile-setup] ntuser image publish end\n");
     }
 
     /// ═══ THE SECOND SETUP STEP THE LIVECD SKIPS — the default user's LOCALE ═══════════════════

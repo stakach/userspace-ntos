@@ -4938,14 +4938,13 @@ unsafe fn explorer_framebuffer_final_readback() -> ExplorerFramebufferReadback {
     }
 }
 
-/// ═══ THE PROFILE HAS A REAL `ntuser.dat` — the setup step the LiveCD skips ══════════════════════
+/// ═══ THE PROFILE HAS A REAL `ntuser.dat` — saved by setup, copied by Winlogon ═══════════════════
 ///
 /// `CreateUserProfileExW` ends by `RegLoadKeyW(HKEY_USERS, <SID>, "<profile>\ntuser.dat")`
-/// (`profile.c:1088`). That returned **`Error: 2` (ERROR_FILE_NOT_FOUND)**: the ISO carries no
-/// `ntuser.dat` at all, because a LiveCD never runs the setup step that creates one. ReactOS setup
-/// makes it by copying `system32\config\default` — the genuine `$$$PROTO.HIV` the kernel also
-/// mounts as `HKEY_USERS\.DEFAULT` — into the Default User profile. This asserts that step ran,
-/// with that data, and that WINLOGON'S OWN `CopyDirectory` carried it into the user's profile.
+/// (`profile.c:1088`). The installed image carries no `ntuser.dat`: setup's
+/// `SaveDefaultUserHive` saves the live `HKEY_USERS\.DEFAULT` hive into the Default profile
+/// through `NtSaveKey`. This asserts that step ran, with that data, and that WINLOGON'S OWN
+/// `CopyDirectory` carried it into the user's profile.
 ///
 /// Every clause is CONTENT, not existence: both files must parse as mountable hive images (real
 /// `regf` or the mutable-hive checkpoint format `NtLoadKey` accepts) AND their roots must really
@@ -4954,7 +4953,7 @@ unsafe fn explorer_framebuffer_final_readback() -> ExplorerFramebufferReadback {
 /// values that the raw LiveCD prototype lacks.
 unsafe fn profile_ntuser_dat_spec(passed: &mut u64) {
     use crate::writable_fs::*;
-    let staged = NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed);
+    let saved = NT_SAVE_KEY_ROOT_SAVED.load(Ordering::Relaxed);
     let source = hive_image_len_at(DEFAULT_USER_NTUSER_DAT) as u64;
     let copied = hive_image_len_at(COPIED_PROFILE_NTUSER_DAT) as u64;
     let copied_appdata = hive_image_value_len_at(
@@ -4976,9 +4975,9 @@ unsafe fn profile_ntuser_dat_spec(passed: &mut u64) {
     } else {
         copied == source
     };
-    print_str(b"[wl-ntuser] Default User\\ntuser.dat provisioned=");
-    print_u64(staged);
-    print_str(b"B hive-image-parses=");
+    print_str(b"[wl-ntuser] Default User\\ntuser.dat NtSaveKey-saves=");
+    print_u64(saved);
+    print_str(b" hive-image-parses=");
     print_u64(source);
     print_str(b"B -> copied to the profile as a hive image of ");
     print_u64(copied);
@@ -4993,10 +4992,10 @@ unsafe fn profile_ntuser_dat_spec(passed: &mut u64) {
     print_str(b"B)\n");
     check(
         b"exec_profile_ntuser_dat_present",
-        !PROVISION_NTUSER_DAT
-            || (staged > 0
-                // the SOURCE profile really holds the setup hive image, byte-length exact …
-                && source == staged
+        // the SOURCE profile really holds a mountable hive image that setup saved: by NtSaveKey
+        // on this boot, or on an earlier boot of a restored volume …
+        (source > 0
+                && (saved > 0 || snapshot_restore_seen())
                 // … winlogon's own CopyDirectory produced a mountable destination image; after
                 // CreateUserHive mutates and flushes it, the destination is expected to be the
                 // checkpoint NtFlushKey wrote rather than the original source byte-for-byte. On a
@@ -5599,8 +5598,6 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
     let bytes = PROFILE_SOURCE_BYTES.load(Ordering::Relaxed);
     let entries = PROFILE_SOURCE_ENTRIES.load(Ordering::Relaxed);
     let probe = PROFILE_SOURCE_PROBE_OK.load(Ordering::Relaxed);
-    // The one file this executive deliberately adds to the ISO's own `Default User` tree.
-    let provisioned_ntuser = (NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed) != 0) as u64;
     let (staged_default_user_dir, staged_probe_ok) = staged_profiles_by_path();
     print_str(b"[profile-source] on-image \\Users: `Default` dir=");
     print_u64(staged_default_user_dir as u64);
@@ -5616,9 +5613,6 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
     print_u64(entries);
     print_str(b" AppData-provisioned=");
     print_u64(probe);
-    print_str(b" ntuser.dat=");
-    print_u64(crate::writable_fs::NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed));
-    print_str(b"B");
     print_str(b"\n");
     check(
         b"exec_default_user_profile_staged",
@@ -5626,11 +5620,7 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
         staged_default_user_dir && staged_probe_ok
             // The writable source must include both installed profile roots and Public files.
             && (!crate::writable_fs::PROVISION_DEFAULT_USER_PROFILE
-                || (dirs >= 2
-                    && files >= 1 + provisioned_ntuser
-                    && bytes >= crate::writable_fs::NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed)
-                    && entries >= 3 + provisioned_ntuser
-                    && probe == 1)),
+                || (dirs >= 2 && files >= 1 && entries >= 3 && probe == 1)),
         passed,
     );
 }
