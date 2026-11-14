@@ -7433,6 +7433,7 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
         &*core::ptr::addr_of!(EXPLORER_SSN_HIST)
     });
     print_str(b"\n");
+    allocator::print_site_census();
     let walks = allocator::walk_samples();
     print_str(b"[census] allocator-walk");
     for (label, sample) in [
@@ -29471,6 +29472,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // The executive front-end allocates (ObjectClient etc.), so give it its own heap.
     map_own_heap();
+    // `_start` never returns, so its frame is the outermost on this stack.
+    allocator::publish_root_stack(core::ptr::addr_of!(bi) as usize);
     ps_bootstrap::initialize(_start as *const () as u64, bootinfo as u64)
         .expect("initialize canonical Ps and token ownership before provider activation");
     atom_bootstrap::initialize()

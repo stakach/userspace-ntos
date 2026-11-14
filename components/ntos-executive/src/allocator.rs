@@ -30,6 +30,9 @@ mod oom_budget;
 #[path = "allocator_free_list.rs"]
 mod free_list;
 use free_list::align_up;
+#[path = "allocator_sites.rs"]
+mod sites;
+use sites::{Frames, SiteLedger};
 #[path = "allocator_walk_observation.rs"]
 mod walk_observation;
 use walk_observation::WalkCounter;
@@ -72,9 +75,12 @@ const OOM_CONTEXT: usize = HEAP_BASE + 72;
 const OOM_SCOPE_PTR: usize = HEAP_BASE + 80;
 const OOM_SCOPE_LEN: usize = HEAP_BASE + 88;
 const LARGE_REPORTED: usize = HEAP_BASE + 96; // `[alloc-large]` counts per size class
-// HEAP_BASE + 104..120 is reserved. With the word above it held the root transient lane's mark,
-// depth and high-water words, which now live in the executor-local block
-// (`executor::TransientLane`).
+// Root-only: the durable heap's owner ledger, carved from the heap by its first allocation, and
+// the end of the boot stack that site capture may read up to. Spawned components leave both zero.
+const SITE_LEDGER: usize = HEAP_BASE + 104;
+const ROOT_STACK_END: usize = HEAP_BASE + 112;
+/// [`SITE_LEDGER`] value once the ledger itself could not be allocated.
+const SITE_LEDGER_UNAVAILABLE: usize = 1;
 const ALLOC_LOCK: usize = HEAP_BASE + 120; // shared across lanes mapping the same heap frames
 const ROOT_COMMITTED_BYTES: usize = HEAP_BASE + 128; // root-only durable pages mapped from Untyped
 const DCERPC_TRACE_STATE: usize = HEAP_BASE + 136; // component-local tracing state pointer
@@ -85,7 +91,8 @@ const ALLOC_POISONED: usize = 2;
 const DATA: usize = HEAP_BASE + 152; // allocations start past allocator/local metadata
 const _: () = assert!(COMPONENT_HEAP_LIMIT_BYTES + size_of::<usize>() <= OOM_REPORTED);
 const _: () = assert!(OOM_SCOPE_LEN + size_of::<usize>() <= LARGE_REPORTED);
-const _: () = assert!(LARGE_REPORTED + size_of::<usize>() <= ALLOC_LOCK);
+const _: () = assert!(LARGE_REPORTED + size_of::<usize>() <= SITE_LEDGER);
+const _: () = assert!(ROOT_STACK_END + size_of::<usize>() <= ALLOC_LOCK);
 const _: () = assert!(ALLOC_LOCK + size_of::<usize>() <= DATA);
 const _: () = assert!(ROOT_COMMITTED_BYTES + size_of::<usize>() <= DATA);
 const _: () = assert!(DCERPC_TRACE_STATE + size_of::<usize>() <= DATA);
@@ -367,12 +374,127 @@ fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end
         // SAFETY: scopes are static byte strings installed through `enter_scope`.
         debug_bytes(unsafe { core::slice::from_raw_parts(scope_ptr as *const u8, scope_len) });
     }
+    debug_frames(&capture_frames());
     crate::debug_put_char(b'\n');
 }
 
-/// Name a large durable allocation and the scope that made it. A table that grows without
-/// bound shows up here as a run of doublings long before it exhausts the heap.
-fn report_large(size: usize) {
+/// The return-address chain of the code requesting an allocation, innermost first; all zero
+/// where it cannot be read. Only the root executive's boot stack is walked: its bounds are
+/// published, and the image there is built with frame pointers.
+#[inline(always)]
+fn capture_frames() -> Frames {
+    /// More than any stack the root executive runs on; a larger distance is another stack.
+    const STACK_SPAN_LIMIT: usize = 64 << 20;
+    let mut frames = [0usize; sites::SITE_FRAMES];
+    if transient_heap_size() == 0 {
+        return frames;
+    }
+    let stack_end = unsafe { read_word(ROOT_STACK_END) };
+    let frame: usize;
+    let stack_pointer: usize;
+    // SAFETY: reads two registers.
+    unsafe {
+        core::arch::asm!(
+            "mov {frame}, rbp",
+            "mov {stack_pointer}, rsp",
+            frame = out(reg) frame,
+            stack_pointer = out(reg) stack_pointer,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    if stack_pointer < stack_end && stack_end - stack_pointer <= STACK_SPAN_LIMIT {
+        // SAFETY: the live part of the boot stack, from its stack pointer to its published end,
+        // is mapped. Linker-provided symbols bound the image text.
+        frames = unsafe {
+            sites::walk_frames(
+                frame,
+                stack_pointer..stack_end,
+                core::ptr::addr_of!(__executive_text_start) as usize
+                    ..core::ptr::addr_of!(__executive_text_end) as usize,
+            )
+        };
+    }
+    frames
+}
+
+unsafe extern "C" {
+    static __executive_text_start: u8;
+    static __executive_text_end: u8;
+}
+
+/// Publish where the root executive's boot stack ends. `within_outermost_frame` is any address
+/// in the frame of the function that never returns; the rest of its page is mapped stack.
+pub(crate) unsafe fn publish_root_stack(within_outermost_frame: usize) {
+    assert!(unsafe { read_word(COMPONENT_HEAP_LIMIT_BYTES) } == 0);
+    unsafe { write_word(ROOT_STACK_END, (within_outermost_frame | 0xfff) + 1) };
+}
+
+fn debug_frames(frames: &Frames) {
+    if frames[0] == 0 {
+        return;
+    }
+    debug_bytes(b" site=");
+    for (index, &frame) in frames.iter().take_while(|&&frame| frame != 0).enumerate() {
+        if index != 0 {
+            crate::debug_put_char(b',');
+        }
+        debug_hex_usize(frame);
+    }
+}
+
+/// The root durable heap's owner ledger, created on first use. Call with the heap lock held.
+unsafe fn site_ledger() -> Option<&'static mut SiteLedger> {
+    if transient_heap_size() == 0 {
+        return None;
+    }
+    match unsafe { read_word(SITE_LEDGER) } {
+        SITE_LEDGER_UNAVAILABLE => None,
+        0 => {
+            let layout = Layout::new::<SiteLedger>();
+            let ledger = unsafe { Bump.alloc_durable(layout) };
+            if ledger.is_null() {
+                unsafe { write_word(SITE_LEDGER, SITE_LEDGER_UNAVAILABLE) };
+                return None;
+            }
+            // SAFETY: a fresh allocation of the ledger's layout; all-zero is its empty state.
+            unsafe {
+                core::ptr::write_bytes(ledger, 0, layout.size());
+                write_word(SITE_LEDGER, ledger as usize);
+                Some(&mut *(ledger as *mut SiteLedger))
+            }
+        }
+        // SAFETY: published above and never freed; the heap lock serializes access.
+        ledger => Some(unsafe { &mut *(ledger as *mut SiteLedger) }),
+    }
+}
+
+/// Charge a new durable allocation to its site. Returns the site's frames when it has one.
+#[inline(always)]
+unsafe fn note_alloc(ptr: *mut u8, size: usize) -> Frames {
+    let mut frames = [0usize; sites::SITE_FRAMES];
+    let (Some(bytes), Some(ledger)) = (block_size(size), unsafe { site_ledger() }) else {
+        return frames;
+    };
+    if SiteLedger::charges_site(bytes) {
+        frames = capture_frames();
+    }
+    ledger.record_alloc(ptr as usize, bytes, &frames);
+    frames
+}
+
+unsafe fn note_free(ptr: *mut u8, size: usize) {
+    if ptr.is_null() || size == 0 || is_transient_pointer(ptr as usize) {
+        return;
+    }
+    if let (Some(bytes), Some(ledger)) = (block_size(size), unsafe { site_ledger() }) {
+        ledger.record_free(ptr as usize, bytes);
+    }
+}
+
+/// Name a large durable allocation, the scope that made it and the code that asked for it. A
+/// table that grows without bound shows up here as a run of doublings long before it exhausts
+/// the heap.
+fn report_large(size: usize, frames: &Frames) {
     if size < oom_budget::LARGE_ALLOCATION_BYTES {
         return;
     }
@@ -392,6 +514,7 @@ fn report_large(size: usize) {
     } else {
         debug_bytes(b"none");
     }
+    debug_frames(frames);
     crate::debug_put_char(b'\n');
 }
 
@@ -801,7 +924,8 @@ unsafe impl GlobalAlloc for Bump {
         } else {
             let allocated = unsafe { self.alloc_durable(layout) };
             if !allocated.is_null() {
-                report_large(layout.size());
+                let frames = unsafe { note_alloc(allocated, layout.size()) };
+                report_large(layout.size(), &frames);
             }
             allocated
         }
@@ -809,17 +933,30 @@ unsafe impl GlobalAlloc for Bump {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let _guard = HeapLockGuard::acquire();
-        unsafe { self.dealloc_unlocked(ptr, layout) };
+        unsafe {
+            note_free(ptr, layout.size());
+            self.dealloc_unlocked(ptr, layout);
+        }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
         let _guard = HeapLockGuard::acquire();
         let resized = unsafe { self.realloc_locked(ptr, old_layout, new_size) };
-        if !resized.is_null()
-            && !is_transient_pointer(resized as usize)
-            && (ptr.is_null() || new_size > old_layout.size())
-        {
-            report_large(new_size);
+        if resized.is_null() {
+            // A refused resize leaves the old block live; a resize to nothing released it.
+            if new_size == 0 {
+                unsafe { note_free(ptr, old_layout.size()) };
+            }
+            return resized;
+        }
+        // A resize is the old block's release and a new block at the resizing site, whether or
+        // not it moved.
+        unsafe { note_free(ptr, old_layout.size()) };
+        if !is_transient_pointer(resized as usize) {
+            let frames = unsafe { note_alloc(resized, new_size) };
+            if ptr.is_null() || new_size > old_layout.size() {
+                report_large(new_size, &frames);
+            }
         }
         resized
     }
@@ -993,6 +1130,66 @@ pub fn usage() -> HeapUsage {
         transient_high_water: lane.map_or(0, |lane| lane.high_water.load(Ordering::Relaxed)),
         transient_capacity: transient_heap_size(),
     }
+}
+
+/// Owners shown by each [`print_site_census`].
+const CENSUS_SITES: usize = 16;
+
+/// Print who holds the root durable heap: live bytes by size class, then the sites holding the
+/// most. `scripts/symbolize_alloc_sites.py` turns the frames into function names.
+pub fn print_site_census() {
+    let mut top = [sites::Site::default(); CENSUS_SITES];
+    let (classes, attributed, unattributed, sites_used, shown) = {
+        let _lock = HeapLockGuard::acquire();
+        let Some(ledger) = (unsafe { site_ledger() }) else {
+            return;
+        };
+        (
+            *ledger.classes(),
+            ledger.attributed(),
+            ledger.unattributed(),
+            ledger.sites_used(),
+            ledger.top_sites(&mut top),
+        )
+    };
+    debug_bytes(b"[heap-owners] site-min=");
+    debug_usize(sites::TRACKED_MIN_BYTES);
+    debug_bytes(b" attributed=");
+    debug_tally(attributed);
+    debug_bytes(b" unattributed=");
+    debug_tally(unattributed);
+    debug_bytes(b" sites=");
+    debug_usize(sites_used);
+    debug_bytes(b"/");
+    debug_usize(sites::SITE_CAPACITY);
+    debug_bytes(b" ledger=");
+    debug_usize(size_of::<SiteLedger>());
+    debug_bytes(b" class-log2:bytes/count=");
+    for (class, tally) in classes.iter().enumerate().filter(|(_, tally)| tally.count != 0) {
+        crate::debug_put_char(b' ');
+        debug_usize(class);
+        crate::debug_put_char(b':');
+        debug_tally(*tally);
+    }
+    crate::debug_put_char(b'\n');
+    for (rank, site) in top[..shown].iter().enumerate() {
+        debug_bytes(b"[heap-owner] rank=");
+        debug_usize(rank + 1);
+        debug_bytes(b" live=");
+        debug_tally(site.live);
+        debug_bytes(b" peak=");
+        debug_usize(site.peak_bytes);
+        debug_bytes(b" allocations=");
+        debug_usize(site.allocations);
+        debug_frames(&site.frames);
+        crate::debug_put_char(b'\n');
+    }
+}
+
+fn debug_tally(tally: sites::Tally) {
+    debug_usize(tally.bytes);
+    crate::debug_put_char(b'/');
+    debug_usize(tally.count);
 }
 
 #[cfg(test)]

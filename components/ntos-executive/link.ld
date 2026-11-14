@@ -19,12 +19,15 @@ SECTIONS {
     . = 0x0000010000400000;
 
     .text : {
+        /* Bounds of executable code, for the allocator's return-address validation. */
+        __executive_text_start = .;
         *(.text._start)
         *(.text .text.*)
         /* Large-code-model text — code that references the surt-core crate
          * lands here. Must be in this loadable, executable segment or a
          * spawned thread whose entry is such a function never runs. */
         *(.ltext .ltext.*)
+        __executive_text_end = .;
     }
 
     . = ALIGN(0x1000);
