@@ -6,7 +6,8 @@ pub trait ImageSourcePageIo<D> {
     /// Acquire an exclusively owned, zeroed, unmapped frame. Failure retains partial backend work.
     fn acquire(&mut self, descriptor: D) -> Result<InstallationCap, u32>;
     /// Fill exact canonical bytes and retire every scratch alias before acknowledging success.
-    /// Any possible write or outstanding scratch alias on failure must return Uncertain.
+    /// Classify the attempt with [`source_fill_effect`]: only a scratch alias that may survive
+    /// is Uncertain.
     fn initialize(&mut self, descriptor: D, frame: InstallationCap) -> InstallationEffect;
     /// Retire all aliases before checked frame-pool transfer. Refusal retains the original owner.
     fn release(&mut self, descriptor: D, frame: InstallationCap) -> InstallationEffect;
@@ -48,6 +49,31 @@ pub const fn routed_source_read_decision(
     else if producer_active { RoutedSourceReadDecision::AwaitProducer }
     else if row_exists || uncertain_owner { RoutedSourceReadDecision::RetainUncertain }
     else { RoutedSourceReadDecision::EnterRead }
+}
+
+/// Classify one attempt to fill a canonical source frame through a scratch alias.
+///
+/// `alias` is `Err` when the alias itself failed and `Ok(read)` once it has retired, where
+/// `read` is the provider's result. `fill_entered` says the fill had started writing through
+/// the alias; `backing_release_available` that no earlier alias still owns its backing.
+///
+/// A provider that refuses the READ after the alias retired leaves an exclusively owned,
+/// unmapped frame that never became Ready. Releasing it is the same transfer a purge performs,
+/// and reading the page again has no effect to replay, so that is a refusal. The frame is
+/// uncertain only while an alias to it may still exist.
+pub const fn source_fill_effect(
+    alias: Result<Result<(), u32>, u32>,
+    fill_entered: bool,
+    backing_release_available: bool,
+) -> InstallationEffect {
+    match alias {
+        Ok(Ok(())) => InstallationEffect::Acknowledged,
+        Ok(Err(status)) => InstallationEffect::Refused(status),
+        Err(status) if fill_entered || !backing_release_available => {
+            InstallationEffect::Uncertain(status)
+        }
+        Err(status) => InstallationEffect::Refused(status),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,6 +244,31 @@ mod tests {
         assert_eq!(routed_source_read_decision(false, false, false, true),
             RoutedSourceReadDecision::RetainUncertain,
             "a quarantined owner cannot be replayed after its row disappears");
+    }
+
+    #[test]
+    fn refused_provider_read_releases_the_source_instead_of_quarantining_it() {
+        // KVM run 43595199385: the mounted file system pended a synchronous image READ. The
+        // scratch alias had retired and the frame was never shared, yet the row was quarantined
+        // and every later capture of `\LsaAuthenticationPort` failed for the rest of the boot.
+        let pended = source_fill_effect(Ok(Err(0xc000_0185)), true, true);
+        assert_eq!(pended, InstallationEffect::Refused(0xc000_0185));
+        let mut owner = ImageSourcePage::new((9, 0x20000));
+        let mut io = io();
+        io.initialize = pended;
+        assert_eq!(owner.advance(&mut io), ImageSourcePageOutcome::Failed(0xc000_0185));
+        assert_eq!(io.events, ["acquire", "initialize", "release"]);
+        assert!(!owner.owns_cap(7), "the next capture or fault may read the page again");
+    }
+
+    #[test]
+    fn source_fill_is_uncertain_only_while_a_scratch_alias_may_survive() {
+        assert_eq!(source_fill_effect(Ok(Ok(())), true, true), InstallationEffect::Acknowledged);
+        assert_eq!(source_fill_effect(Err(5), true, true), InstallationEffect::Uncertain(5),
+            "the alias failed after the fill entered the frame");
+        assert_eq!(source_fill_effect(Err(5), false, false), InstallationEffect::Uncertain(5),
+            "an earlier alias still owns its backing release");
+        assert_eq!(source_fill_effect(Err(5), false, true), InstallationEffect::Refused(5));
     }
 
     #[test]

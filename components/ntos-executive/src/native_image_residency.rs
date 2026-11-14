@@ -46,7 +46,7 @@ struct ResidentPage {
 }
 static mut REVALIDATION: Option<ResidentMappingRevalidation<ResidentPage>> = None;
 static BORROWED: AtomicBool = AtomicBool::new(false);
-static SOURCE_UNCERTAIN_TRACE: AtomicU64 = AtomicU64::new(0);
+static SOURCE_FILL_TRACE: AtomicU64 = AtomicU64::new(0);
 struct Borrow;
 impl Borrow {
     fn acquire() -> Result<Self, u32> {
@@ -83,27 +83,28 @@ struct SourceIo<'a> {
     revoke_acked: &'a mut bool,
     acknowledged_page: Option<&'a [u8; 4096]>,
 }
-fn trace_source_uncertain(
+fn trace_source_fill(
     handler: &ExecNtHandler,
     view: NativeImageViewDescriptor,
     key: SourceKey,
     offset: Option<u64>,
+    outcome: &str,
     status: u32,
 ) {
-    let sequence = SOURCE_UNCERTAIN_TRACE.fetch_add(1, Ordering::Relaxed);
+    let sequence = SOURCE_FILL_TRACE.fetch_add(1, Ordering::Relaxed);
     if sequence >= 16 && !sequence.is_power_of_two() {
         return;
     }
     let mut record = nt_printf::record::RecordBuffer::<384>::new();
     let _ = writeln!(
         record,
-        "[native-image-source] uncertain area={:?} rva=0x{:x} view_pi={} base=0x{:x} section_offset=0x{:x} read_offset={:?} caller_pi={} tid={} badge={} ssn=0x{:x} status=0x{:x}",
-        key.area, key.rva, view.pi, view.base, view.section_offset, offset,
+        "[native-image-source] {} area={:?} rva=0x{:x} view_pi={} base=0x{:x} section_offset=0x{:x} read_offset={:?} caller_pi={} tid={} badge={} ssn=0x{:x} status=0x{:x}",
+        outcome, key.area, key.rva, view.pi, view.base, view.section_offset, offset,
         handler.pi, handler.current_tid, handler.current_badge,
         handler.current_service_number, status,
     );
     sel4_rt::print_record(if record.overflowed() {
-        b"[native-image-source] uncertain trace truncated\n"
+        b"[native-image-source] trace truncated\n"
     } else {
         record.bytes()
     });
@@ -136,8 +137,8 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
                 0..4096,
                 true,
                 |address| {
-                    // read_into_page zeroes before its first read. Any refusal after entry
-                    // therefore retains this initializer owner rather than replaying it.
+                    // read_into_page zeroes before its first read, so the frame is dirty from
+                    // here on: an alias failure after entry is uncertain, a refused READ is not.
                     wrote = true;
                     let page = core::slice::from_raw_parts_mut(address as *mut u8, 4096);
                     if let Some(acknowledged_page) = self.acknowledged_page {
@@ -158,18 +159,16 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
                 },
             )
         };
-        match result {
-            Ok(Ok(())) => InstallationEffect::Acknowledged,
-            Ok(Err(status)) => {
-                trace_source_uncertain(self.handler, self.view, key, read_offset, status);
-                InstallationEffect::Uncertain(status)
-            }
-            Err(status) if wrote || !temporary_frame_alias::backing_release_available() => {
-                trace_source_uncertain(self.handler, self.view, key, read_offset, status);
-                InstallationEffect::Uncertain(status)
-            }
-            Err(status) => InstallationEffect::Refused(status),
+        let effect = nt_memory_manager::image_source_page::source_fill_effect(
+            result, wrote, temporary_frame_alias::backing_release_available());
+        match effect {
+            InstallationEffect::Acknowledged => {}
+            InstallationEffect::Refused(status) =>
+                trace_source_fill(self.handler, self.view, key, read_offset, "refused", status),
+            InstallationEffect::Uncertain(status) =>
+                trace_source_fill(self.handler, self.view, key, read_offset, "uncertain", status),
         }
+        effect
     }
     fn release(&mut self, key: SourceKey, frame: InstallationCap) -> InstallationEffect {
         release_source(key, frame, self.revoke_acked)
