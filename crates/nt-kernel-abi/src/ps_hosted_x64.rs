@@ -4,8 +4,9 @@
 //! unpublished storage only; never reinitialize a live projection to select a GUI caller.
 //! Most fields retain the ReactOS Win2003 AMD64 projection used by the hosted driver
 //! contract (`sdk/include/ndk/{ke,ps}types.h`, `ndk/tests/win2003_x64.c`). The pinned
-//! LiberNT win32k.sys reads `EPROCESS.Peb` directly at +0x2e0 during window creation;
-//! that field follows the released binary, not the older projection. ReactOS adds
+//! LiberNT win32k.sys reads `EPROCESS.Peb` directly at +0x2e0 during window creation and
+//! `KTHREAD.Win32Thread` directly at +0x1c8; those fields follow the released binary, not
+//! the older projection. ReactOS adds
 //! `KTHREAD.StateSaveArea` at 0x320, shifting ETHREAD fields by eight bytes relative
 //! to Windows 2003. Its final `ThreadName` is at 0x430.
 
@@ -33,7 +34,12 @@ pub const KTHREAD_APC_STATE_INDEX: usize = 0x1e4;
 pub const KTHREAD_PROCESS: usize = 0x200;
 pub const KTHREAD_APC_STATE_POINTERS: usize = 0x210;
 pub const KTHREAD_SAVED_APC_STATE: usize = 0x220;
-pub const KTHREAD_WIN32_THREAD: usize = 0x250;
+/// `KTHREAD.Win32Thread` as the pinned LiberNT win32k.sys reads it. That image never asks
+/// the kernel for another thread's slot; it loads `[ETHREAD + 0x1c8]` itself in
+/// `IntSetTimer`, `NtUserPostThreadMessage` and the inlined `PsGetCurrentThread()` form
+/// (`sdk/include/ndk/ketypes.h`, AMD64 layout). Like `EPROCESS.Peb`, this field follows
+/// the released binary; no other projected field occupies these bytes.
+pub const KTHREAD_WIN32_THREAD: usize = 0x1c8;
 pub const ETHREAD_CLIENT_ID_PROCESS: usize = 0x378;
 pub const ETHREAD_CLIENT_ID_THREAD: usize = 0x380;
 /// ReactOS AMD64 `ETHREAD.DeviceToVerify`, immediately before `ThreadsProcess`.

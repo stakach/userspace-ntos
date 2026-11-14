@@ -85,6 +85,36 @@ fn released_libernt_win32k_reads_the_projected_peb_at_0x2e0() {
 }
 
 #[test]
+fn released_libernt_win32k_reads_the_thread_win32_slot_at_0x1c8() {
+    // The pinned win32k.sys never asks the kernel for another thread's Win32Thread; it reads
+    // `Thread->Tcb.Win32Thread` out of the thread object. LiberNT's AMD64 KTHREAD places it at
+    // 0x1C8 (`sdk/include/ndk/ketypes.h`), and the released image agrees:
+    //   IntSetTimer (TMRF_TIFROMWND)  RVA 0xA457C  mov rcx,[rdi+0x10]; mov rcx,[rcx];
+    //                                              mov rcx,[rcx+0x1c8]
+    //   PsGetCurrentThread()->Tcb...  RVA 0x9CA8E  mov rax,gs:[0x188]; mov rcx,[rax+0x1c8]
+    //   after PsLookupThreadByThreadId RVA 0x7CFB6 and 0xAAB37  mov ..,[rcx+0x1c8]
+    // A slot published anywhere else leaves every window timer with a NULL owner, which
+    // `ProcessTimers` asserts on (`win32ss/user/ntuser/timer.c:519`).
+    assert_eq!(KTHREAD_WIN32_THREAD, 0x1c8);
+    let init = ThreadInitialization {
+        teb: GuestAddr(0x30_0000),
+        system_thread: false,
+        ..thread()
+    };
+    let mut bytes = [0xa5; ETHREAD_BODY_BYTES];
+    initialize_thread(&mut bytes, init).unwrap();
+    // A fresh thread is not a GUI thread, and no projected field shares the slot's bytes.
+    assert_eq!(u64_at(&bytes, 0x1c8), 0);
+    expected_u64(&mut bytes, KTHREAD_WIN32_THREAD, 0x50_0000);
+    let published = bytes;
+    refresh_thread_activation(&mut bytes, init).unwrap();
+    exchange_thread_previous_mode(&mut bytes, ThreadPreviousMode::UserMode).unwrap();
+    exchange_thread_stack_swap_enable(&mut bytes, false).unwrap();
+    assert_eq!(u64_at(&bytes, 0x1c8), 0x50_0000);
+    assert_eq!(&bytes[0x1c8..0x1d0], &published[0x1c8..0x1d0]);
+}
+
+#[test]
 fn apc_state_index_has_reactos_x64_offset_and_survives_activation_refresh() {
     assert_eq!(KTHREAD_APC_STATE_INDEX, 0x1e4);
     let init = thread();

@@ -51,7 +51,6 @@ pub mod fast_mutex_layout {
 pub mod kthread_layout {
     pub const KERNEL_APC_DISABLE: usize = 0x1b4;
     pub const SPECIAL_APC_DISABLE: usize = 0x1b6;
-    pub const WIN32_THREAD: usize = 0x250;
 }
 
 pub const RESOURCE_OWNED_EXCLUSIVE: u16 = 0x0080;

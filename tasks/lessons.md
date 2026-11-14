@@ -863,3 +863,8 @@ diagnosis-free failure.
 ## Follow A Stored Value To Its Reader
 - The mounted volume updated a synchronous File's position after every transfer and answered `FilePositionInformation` from it, but no READ or WRITE consumed it: the executive turned a missing ByteOffset into 0, so a sequential copy re-read offset 0 forever. A query that echoes a store proves nothing about the operation that should use it.
 - Before calling an information class served, name the operation that depends on it (`SetFilePointer` then `ReadFile`, `FileDispositionInformation` then the last close) and read that operation's path too.
+
+## A Projected Field's Offset Belongs To The Binary That Reads It
+- The executive published `KTHREAD.Win32Thread` at 0x250, the offset of an earlier win32k image, and bound `PsGetThreadWin32Thread` to a side cell. The pinned LiberNT win32k reads `[ETHREAD + 0x1c8]` itself (`IntSetTimer`, `NtUserPostThreadMessage`, the inlined current-thread form), so every window timer was created with a NULL owner and the first one to expire asserted in `ProcessTimers` (#392). The export binding hid the mismatch for every path that calls the kernel.
+- When the hosted image is re-pinned, re-derive every directly read Ps field from its disassembly (`mov reg, gs:[0x188]` and the loads after `PsLookupThreadByThreadId`), not from the header profile the projection was first written against. Record the RVA beside the constant and lock it with a test in the layout crate.
+- Keep one definition of each offset. A second private constant in the consumer is the copy that goes stale.

@@ -3690,15 +3690,13 @@ extern "win64" fn s_se_privilege_check(required: *const u8, _ctx: u64, access_mo
 /// thread object** (`PsSetThreadWin32Thread` = `InterlockedExchangePointer(&Thread->Tcb.Win32Thread,
 /// …)`, `ntoskrnl/ps/thread.c:909`) and which `PsGetCurrentThreadWin32Thread()` reads back.
 ///
-/// The MSVC win32k build **inlines that read**: `NtUserCallNoParam(NOPARAM_ROUTINE_DESTROY_CARET)`
-/// compiles to `call PsGetCurrentThread; mov rcx,[rax+0x250]; call co_IntDestroyCaret`
-/// (win32k RVA `0xd3a25`), and `co_IntDestroyCaret` immediately does `pti->MessageQueue` (+0x60).
-/// With the slot written ONLY to the executive's side cell, that inline read returned NULL and the
-/// hosted win32k took a `#PF` at `cr2 = 0x60` the moment the logon dialog tore down — the first
-/// thing the real `EndDialog(WLX_SAS_ACTION_LOGON)` path does after a SUCCESSFUL logon. Three other
-/// `[reg+0x250]` reads exist in the image and none of them stores, confirming the field is written
-/// by the kernel side alone.
-const KTHREAD_WIN32THREAD_OFF: u64 = 0x250;
+/// win32k also reads the field **without calling the kernel**: `IntSetTimer` takes a window
+/// timer's owner from `Window->head.pti->pEThread->Tcb.Win32Thread`, `NtUserPostThreadMessage`
+/// reads it from the thread `PsLookupThreadByThreadId` returned, and the caret path inlines
+/// `PsGetCurrentThread()->Tcb.Win32Thread`. The slot's offset is therefore the released binary's,
+/// owned by the Ps projection layout; a slot kept only in the executive's side cell, or published
+/// at another offset, leaves those reads NULL.
+const KTHREAD_WIN32THREAD_OFF: u64 = nt_kernel_abi::ps_hosted_x64::KTHREAD_WIN32_THREAD as u64;
 /// `KTHREAD::Teb` (ReactOS Win2003 x64 profile). `InitThreadCallback` uses `NtCurrentTeb()`, but
 /// other win32k paths also recover the TEB through the current thread object.
 const KTHREAD_TEB_OFF: u64 = 0xB0;
@@ -17795,8 +17793,8 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let t = current_w32thread();
     sync_threadinfo_process(t);
     // ★ Publish the dispatch THREADINFO into the CURRENT-THREAD OBJECT (`Thread->Tcb.Win32Thread`).
-    // `PsGetCurrentThreadWin32Thread()` is an EXPORT we bind, but the MSVC win32k build also inlines
-    // it as `PsGetCurrentThread(); mov rcx,[rax+0x250]` — and that inline read is the one
+    // `PsGetCurrentThreadWin32Thread()` is an EXPORT we bind, but win32k also inlines it as
+    // `PsGetCurrentThread()->Tcb.Win32Thread` — and that inline read is the one
     // `NtUserCallNoParam(NOPARAM_ROUTINE_DESTROY_CARET)` uses. Every dispatch (top-level AND nested,
     // which is where the logon-dialog teardown reaches it) must therefore see the same `t` through
     // the thread object as through the slot. Idempotent, and the only writer of this field.
@@ -17806,9 +17804,9 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     // member, `win32ss/user/ntuser/win32.h:59`). Real win32k sets it in `InitThreadCallback`
     // (`pti->pEThread = PsGetCurrentThread()`), and handlers walk BACK through it to the thread
     // object: `IntSetTimer` does `pTmr->pti = Window->head.pti->pEThread->Tcb.Win32Thread`
-    // (`win32ss/user/ntuser/timer.c:251`). With `pEThread` NULL that is a read of `[0 + 0x250]` —
-    // measured on winlogon's post-logon `SetTimer` (SSN 0x1017): `#PF cr2 = 0x250`, which WALLED and
-    // RETIRED the whole hosted win32k. Bind it to the same ETHREAD `PsGetCurrentThread` returns, so
+    // (`win32ss/user/ntuser/timer.c:251`). With `pEThread` NULL that is a read through a NULL
+    // thread object — measured on winlogon's post-logon `SetTimer` (SSN 0x1017) as a `#PF` that
+    // WALLED and RETIRED the whole hosted win32k. Bind it to the same ETHREAD `PsGetCurrentThread` returns, so
     // the round trip pti → pEThread → Tcb.Win32Thread closes back onto `t`. Only ever fills a NULL:
     // a `pEThread` win32k set itself is left alone.
     if read_volatile(t as *const u64) == 0 {
