@@ -859,3 +859,7 @@ diagnosis-free failure.
 - Before diagnosing which information class or option a backend rejects, check that the major reaches it at all. A status that matches the hypothesis (`NOT_SUPPORTED` versus `INVALID_DEVICE_REQUEST`) is the cheap discriminator; trace it.
 - A handle to the same file can be a different object kind on a different route. A service that resolves one kind (`OverlayFile`) must be checked against the kind the live route mints (`RoutedFile`) before a fix that depends on it is called complete.
 - A restored disk can already hold what a removed bootstrap used to write. Removing provisioning does not remove its output from a continued volume; check the restored state as well as the fresh one.
+
+## Follow A Stored Value To Its Reader
+- The mounted volume updated a synchronous File's position after every transfer and answered `FilePositionInformation` from it, but no READ or WRITE consumed it: the executive turned a missing ByteOffset into 0, so a sequential copy re-read offset 0 forever. A query that echoes a store proves nothing about the operation that should use it.
+- Before calling an information class served, name the operation that depends on it (`SetFilePointer` then `ReadFile`, `FileDispositionInformation` then the last close) and read that operation's path too.
