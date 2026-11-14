@@ -868,3 +868,13 @@ diagnosis-free failure.
 - The executive published `KTHREAD.Win32Thread` at 0x250, the offset of an earlier win32k image, and bound `PsGetThreadWin32Thread` to a side cell. The pinned LiberNT win32k reads `[ETHREAD + 0x1c8]` itself (`IntSetTimer`, `NtUserPostThreadMessage`, the inlined current-thread form), so every window timer was created with a NULL owner and the first one to expire asserted in `ProcessTimers` (#392). The export binding hid the mismatch for every path that calls the kernel.
 - When the hosted image is re-pinned, re-derive every directly read Ps field from its disassembly (`mov reg, gs:[0x188]` and the loads after `PsLookupThreadByThreadId`), not from the header profile the projection was first written against. Record the RVA beside the constant and lock it with a test in the layout crate.
 - Keep one definition of each offset. A second private constant in the consumer is the copy that goes stale.
+
+## A Running Provider Lane Cannot Be Handed Back
+- A lane that scheduler-yields is still executing and still holds the running token that
+  serializes the component's shared window and publication. Root can only receive on it again;
+  "return the job to the service loop" exists only for a lane stopped in a Call (captured wait,
+  service wait). Check whether the lane is blocked or executing before proposing a runner exit.
+- A provider primitive that waits for another owner must therefore issue a captured wait.
+  Yield-polling, and a fail-closed `park()`, look identical from root: a lane that never sends.
+  Make each such site name itself, because every capped trace will already be spent.
+
