@@ -4505,19 +4505,23 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
 
 /// Claim dirty state and publish the mounted-volume checkpoint at the original service boundary.
 fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
+    use crate::volume_checkpoint_deferral::{classify, Outcome};
     let checkpoint_status = match publish_required_dirty_volume(nt_handler) {
         Ok(status) => status,
         Err(status) => return status,
     };
-    if checkpoint_status == nt_fs::STATUS_SUCCESS {
-        if let Err(status) = fold_background_system_wal(nt_handler) {
-            return status;
+    match classify(checkpoint_status) {
+        Outcome::Settled => match fold_background_system_wal(nt_handler) {
+            Ok(()) => nt_fs::STATUS_SUCCESS,
+            Err(status) => status,
+        },
+        Outcome::Failed(status) => {
+            print_str(b"[writable-fs-snapshot] service-loop checkpoint status=0x");
+            print_hex(status);
+            print_str(b"\n");
+            report_service_finalize_failure(b"volume-checkpoint", status)
         }
     }
-    if checkpoint_status != nt_fs::STATUS_SUCCESS {
-        return report_service_finalize_failure(b"volume-checkpoint", checkpoint_status);
-    }
-    checkpoint_status
 }
 
 /// Preserve dirty-state and commit requirements until the volume snapshot is durable.
@@ -4543,11 +4547,7 @@ fn publish_required_dirty_volume(nt_handler: &mut ExecNtHandler) -> Result<u32, 
                 unsafe { crate::writable_fs::checkpoint_dirty_volume() }
             };
             checkpoint_status = checkpoint_result.err().unwrap_or(nt_fs::STATUS_SUCCESS);
-            if checkpoint_status != nt_fs::STATUS_SUCCESS {
-                print_str(b"[writable-fs-snapshot] service-loop checkpoint status=0x");
-                print_hex(checkpoint_status);
-                print_str(b"\n");
-            } else {
+            if checkpoint_status == nt_fs::STATUS_SUCCESS {
                 if checkpoint_result == Ok(true) {
                     let _ = unsafe { crate::writable_fs::compact_unreferenced_blobs() };
                 }
