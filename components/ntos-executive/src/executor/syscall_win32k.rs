@@ -440,9 +440,11 @@ pub(super) unsafe fn syscall_win32k_route(
     let mut open_dcw_stack_args = [0u64; 3];
     let mut open_dcw_stack_arg_count = 0usize;
     let mut open_dcw_dhpdev_copyout = (0u64, 0u64);
-    let mut build_hwnd_list_stack_args = [0u64; 3];
+    let mut build_hwnd_list_stack_args =
+        [0u64; nt_kernel_exec::user_window_list::BUILD_HWND_LIST_STACK_ARGUMENTS];
     let mut build_hwnd_list_stack_arg_count = 0usize;
-    let mut build_hwnd_list_copyout = (0u64, 0u64, 0u64, 0u64);
+    let mut build_hwnd_list_call: Option<nt_kernel_exec::user_window_list::BuildHwndListCall> =
+        None;
     let mut get_icon_info_stack_args = [0u64; 2];
     let mut get_icon_info_stack_arg_count = 0usize;
     let mut get_icon_info_probe_failed = false;
@@ -618,79 +620,59 @@ pub(super) unsafe fn syscall_win32k_route(
         } else {
             register_window_message_probe_failed = true;
         }
-    } else if lp.msg.m0 == 0x101b && sp != 0 {
+    } else if lp.msg.m0 == nt_kernel_exec::user_window_list::BUILD_HWND_LIST_SSN {
         // NtUserBuildHwndList writes both the needed count and the HWND array through
         // caller-owned user pointers. Isolated win32k cannot safely probe those VAs
         // directly, so stage the outputs in the shared ARG page and copy the real
-        // win32k result back after dispatch. ReactOS' win32k table exposes seven
-        // service arguments, while the Vista/Wine user32 path calls an eight-argument
-        // wrapper with an extra TRUE before dwThreadId; normalize that shape here.
-        let tail0 = client_read_u64_mapped(
-            pi as u64,
-            sp + 0x28,
-            scratch_base,
-        );
-        let tail1 = client_read_u64_mapped(
-            pi as u64,
-            sp + 0x30,
-            scratch_base,
-        );
-        let tail2 = client_read_u64_mapped(
-            pi as u64,
-            sp + 0x38,
-            scratch_base,
-        );
-        let tail3 = client_read_u64_mapped(
-            pi as u64,
-            sp + 0x40,
-            scratch_base,
-        );
-        if let Some(call) = nt_kernel_exec::user_window_list::BuildHwndListCall::capture(
-            a3,
-            [tail0, tail1, tail2, tail3],
-        ) {
-            let (thread_id, c_hwnd, client_list, client_needed, shape) =
-                (call.thread_id, call.capacity, call.list, call.needed, call.shape);
-            if client_needed != 0 {
+        // win32k result back after dispatch. The pinned service takes eight arguments;
+        // the four register arguments are forwarded as the caller passed them.
+        let tail = nt_kernel_exec::user_window_list::build_hwnd_list_tail_addresses(sp)
+            .and_then(|addresses| {
+                let tail = addresses.map(|va| {
+                    client_read_u64_mapped(pi as u64, va, scratch_base)
+                });
+                Some([tail[0]?, tail[1]?, tail[2]?, tail[3]?])
+            });
+        if let Some(tail) = tail {
+            let call = nt_kernel_exec::user_window_list::BuildHwndListCall::capture(
+                [a0, a1, a2, a3],
+                tail,
+            );
+            if call.needed != 0 {
                 let arg = win32k_subsystem::WIN32K_ARG_VADDR;
                 let staged_list = arg;
                 let staged_needed = arg + WIN32K_BUILD_HWND_LIST_COUNT_OFFSET;
-                let c_hwnd_forwarded = c_hwnd.min(WIN32K_BUILD_HWND_LIST_MAX_HANDLES);
                 core::ptr::write_bytes(
                     staged_list as *mut u8,
                     0,
                     WIN32K_BUILD_HWND_LIST_STAGE_BYTES,
                 );
-                d_a3 = thread_id;
-                build_hwnd_list_stack_args = [
-                    c_hwnd_forwarded,
-                    if client_list != 0 && c_hwnd_forwarded != 0 {
-                        staged_list
-                    } else {
-                        0
-                    },
+                build_hwnd_list_stack_args = call.staged_tail(
+                    staged_list,
                     staged_needed,
-                ];
+                    WIN32K_BUILD_HWND_LIST_MAX_HANDLES,
+                );
                 build_hwnd_list_stack_arg_count = build_hwnd_list_stack_args.len();
-                build_hwnd_list_copyout =
-                    (client_list, staged_list, client_needed, c_hwnd_forwarded);
+                build_hwnd_list_call = Some(call);
 
                 let n = BUILD_HWND_LIST_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
                 if n < 8 {
                     print_str(b"[w32marshal] NtUserBuildHwndList pi=");
                     print_u64(pi as u64);
-                    print_str(b" shape=");
-                    print_u64(shape);
+                    print_str(b" children=");
+                    print_u64(call.children as u64);
+                    print_str(b" non-immersive=");
+                    print_u64(call.non_immersive as u64);
                     print_str(b" tid=");
-                    print_u64(thread_id);
+                    print_u64(call.thread_id as u64);
                     print_str(b" c=");
-                    print_u64(c_hwnd);
+                    print_u64(call.capacity as u64);
                     print_str(b" forwarded=");
-                    print_u64(c_hwnd_forwarded);
+                    print_u64(build_hwnd_list_stack_args[1]);
                     print_str(b" list=0x");
-                    print_hex_u64(client_list);
+                    print_hex_u64(call.list);
                     print_str(b" needed=0x");
-                    print_hex_u64(client_needed);
+                    print_hex_u64(call.needed);
                     print_str(b"\n");
                 }
             }
@@ -3505,7 +3487,8 @@ pub(super) unsafe fn syscall_win32k_route(
         crate::observe_gdi_batch_before_dispatch(client, gdi_teb_alias);
         let open_dcw_staged_stack =
             lp.msg.m0 == 0x10de && open_dcw_stack_arg_count == open_dcw_stack_args.len();
-        let build_hwnd_list_staged_stack = lp.msg.m0 == 0x101b
+        let build_hwnd_list_staged_stack = lp.msg.m0
+            == nt_kernel_exec::user_window_list::BUILD_HWND_LIST_SSN
             && build_hwnd_list_stack_arg_count == build_hwnd_list_stack_args.len();
         let get_icon_info_staged_stack = lp.msg.m0 == 0x104e
             && get_icon_info_stack_arg_count == get_icon_info_stack_args.len();
@@ -3683,21 +3666,26 @@ pub(super) unsafe fn syscall_win32k_route(
                 r = (0xC000_0001, false);
             }
         }
-        if build_hwnd_list_staged_stack && r.1 {
-            let (client_list, staged_list, client_needed, c_hwnd_forwarded) =
-                build_hwnd_list_copyout;
-            let needed = core::ptr::read_unaligned(
-                (staged_list + WIN32K_BUILD_HWND_LIST_COUNT_OFFSET) as *const u32,
+        if let Some(call) = build_hwnd_list_call.filter(|_| build_hwnd_list_staged_stack && r.1) {
+            let (client_list, client_needed) = (call.list, call.needed);
+            let staged_list = win32k_subsystem::WIN32K_ARG_VADDR;
+            let copy_out = call.copy_out(
+                r.0 as u32,
+                core::ptr::read_unaligned(
+                    (staged_list + WIN32K_BUILD_HWND_LIST_COUNT_OFFSET) as *const u32,
+                ),
+                WIN32K_BUILD_HWND_LIST_MAX_HANDLES,
             );
-            let needed_ok = img_spawn::client_write_mapped(
-                pi as u64,
-                client_needed,
-                &needed.to_le_bytes(),
-                scratch_base,
-            );
-            let handles_to_copy = (needed as u64).min(c_hwnd_forwarded) as usize;
-            let handles_ok = client_list == 0
-                || handles_to_copy == 0
+            let handles_to_copy = copy_out.handles;
+            let needed_ok = copy_out.needed.is_none_or(|needed| {
+                img_spawn::client_write_mapped(
+                    pi as u64,
+                    client_needed,
+                    &needed.to_le_bytes(),
+                    scratch_base,
+                )
+            });
+            let handles_ok = handles_to_copy == 0
                 || img_spawn::client_copyout_mapped(
                     pi as u64,
                     client_list,
