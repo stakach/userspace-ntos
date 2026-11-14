@@ -6404,7 +6404,7 @@ impl ExecNtHandler {
         print_str(b"[cm-flush] boot hive checkpoint begin dirty-cells=");
         print_u64(dirty_cells as u64);
         print_str(b" heap-headroom=");
-        print_u64(crate::allocator::remaining() as u64);
+        print_u64(crate::allocator::obtainable() as u64);
         print_str(b" path=");
         print_ascii_str(file_path);
         print_str(b"\n");
@@ -6621,7 +6621,7 @@ impl ExecNtHandler {
         let required_headroom = image_len_hint
             .max(MIN_IMAGE_HINT)
             .saturating_add(min_post_checkpoint_headroom);
-        let headroom = crate::allocator::remaining();
+        let headroom = crate::allocator::obtainable();
         if headroom < required_headroom {
             REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             print_str(b"[cm-flush] boot hive checkpoint insufficient-headroom dirty-cells=");
@@ -6748,7 +6748,7 @@ impl ExecNtHandler {
         REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(total_dirty as u64, Ordering::Relaxed);
 
         loop {
-            let headroom = crate::allocator::remaining();
+            let headroom = crate::allocator::obtainable();
             let mut selected: Option<(usize, Candidate)> = None;
             for (index, candidate) in candidates[..candidate_len].iter().enumerate() {
                 let Some(candidate) = candidate else {
@@ -6785,7 +6785,7 @@ impl ExecNtHandler {
             print_str(b"[cm-flush] quiesce boot hive checkpoint deferred dirty-cells=");
             print_u64(remaining_dirty as u64);
             print_str(b" heap-headroom=");
-            print_u64(crate::allocator::remaining() as u64);
+            print_u64(crate::allocator::obtainable() as u64);
             print_str(b"\n");
         }
         nt_fs::STATUS_SUCCESS

@@ -23,6 +23,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::executor::TransientLane;
 
+#[path = "allocator_headroom.rs"]
+mod headroom;
 #[path = "allocator_oom_budget.rs"]
 mod oom_budget;
 #[path = "allocator_free_list.rs"]
@@ -921,10 +923,28 @@ pub fn mark() -> usize {
     unsafe { read_word(CTR) }
 }
 
-/// Bytes still available above the current bump mark.
+/// Mapped bytes above the current bump mark. The root heap maps more on demand, so this is
+/// not what an allocation can obtain; see [`obtainable`].
 pub fn remaining() -> usize {
     let _guard = HeapLockGuard::acquire();
-    durable_heap_capacity().saturating_sub(unsafe { read_word(CTR) })
+    durable_extent().committed_free()
+}
+
+/// Bytes an allocation above the bump mark can still obtain: mapped and free, plus the pages
+/// the root heap may still commit below its transient lane.
+pub fn obtainable() -> usize {
+    let _guard = HeapLockGuard::acquire();
+    durable_extent().obtainable()
+}
+
+/// Call with the heap lock held.
+fn durable_extent() -> headroom::DurableExtent {
+    headroom::DurableExtent {
+        bump_end: DATA + unsafe { read_word(CTR) },
+        committed_end: durable_heap_end(),
+        // Only the root heap has a transient lane, and only the root heap grows.
+        reservation_end: transient_heap_start(),
+    }
 }
 
 #[derive(Copy, Clone)]
