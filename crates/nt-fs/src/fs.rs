@@ -2338,6 +2338,24 @@ impl MemFs {
         STATUS_SUCCESS
     }
 
+    /// The node a rename to `target_path` would replace: a distinct entry already holding the
+    /// final name. `start` is the directory the path is parsed from, or the volume root.
+    fn rename_replace_target(
+        &self,
+        source_entry: u64,
+        start: Option<u64>,
+        target_path: &str,
+    ) -> Option<u64> {
+        let (parent_path, leaf) = Self::parent_and_leaf_relative(target_path)?;
+        let parent = match start {
+            Some(directory) => self.lookup_from(directory, parent_path)?,
+            None => self.lookup(parent_path)?,
+        };
+        self.child_long_entry(parent, leaf)
+            .filter(|entry| entry.id != source_entry)
+            .map(|entry| entry.node_id)
+    }
+
     fn rename_relative(
         &mut self,
         source: u64,
@@ -3748,6 +3766,14 @@ impl FileMetadata {
     }
 }
 
+/// Whether a rename may replace a target that still has open handles. FASTFAT and NTFS deny a
+/// caller that replacement; the filesystem's own image installation is not a caller rename.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum OpenReplaceTarget {
+    Deny,
+    Allow,
+}
+
 /// Canonical parse root for a file rename. This keeps process handles out of
 /// the filesystem API while preserving the three NT rename name forms.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -4269,6 +4295,7 @@ impl FileSystem {
         root: FileRenameRoot,
         target: &str,
         replace_if_exists: bool,
+        open_target: OpenReplaceTarget,
     ) -> u32 {
         let Some((source, source_entry)) = self
             .obj(handle)
@@ -4289,6 +4316,12 @@ impl FileSystem {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
         if self.wal_protected_target_name(&new_name) {
+            return STATUS_ACCESS_DENIED;
+        }
+        if replace_if_exists
+            && open_target == OpenReplaceTarget::Deny
+            && self.rename_replace_target_is_open(source_entry, root, target)
+        {
             return STATUS_ACCESS_DENIED;
         }
         let status = match root {
@@ -4361,9 +4394,44 @@ impl FileSystem {
         status
     }
 
-    /// Rename a live File using a canonical filesystem root and a UTF-16LE name.
+    /// A replace target counts as open while any handle to its node remains; a File that has
+    /// only its cleanup or in-flight I/O references left no longer holds the name.
+    fn rename_replace_target_is_open(
+        &self,
+        source_entry: u64,
+        root: FileRenameRoot,
+        target: &str,
+    ) -> bool {
+        let start = match root {
+            FileRenameRoot::SourceParent => {
+                match self.volume.entry_location(source_entry) {
+                    Some((parent, _, _)) => Some(parent),
+                    None => return false,
+                }
+            }
+            FileRenameRoot::VolumeRoot => None,
+            FileRenameRoot::Directory(directory) => match self.obj(directory) {
+                Some(object) => Some(object.node_id),
+                None => return false,
+            },
+        };
+        let target = match root {
+            FileRenameRoot::VolumeRoot => target.trim_start_matches('\\'),
+            _ => target,
+        };
+        self.volume
+            .rename_replace_target(source_entry, start, target)
+            .is_some_and(|node| {
+                self.handles
+                    .iter()
+                    .flatten()
+                    .any(|object| object.node_id == node && object.handle_references != 0)
+            })
+    }
+
+    /// Rename a live File for a caller, using a canonical filesystem root and a UTF-16LE name.
     /// Caller handles never enter this API; `Directory` is this filesystem's
-    /// retained File identity.
+    /// retained File identity. A replace target that is still open is denied.
     pub fn zw_rename_file(
         &mut self,
         handle: u64,
@@ -4375,7 +4443,7 @@ impl FileSystem {
             Ok(target) => normalize_separators(&target),
             Err(status) => return status,
         };
-        self.rename_file_decoded(handle, root, &target, replace_if_exists)
+        self.rename_file_decoded(handle, root, &target, replace_if_exists, OpenReplaceTarget::Deny)
     }
 
     fn link_file_decoded(
@@ -5242,6 +5310,9 @@ impl FileSystem {
                 }
                 status
             }
+            // The filesystem's own image installers (hive checkpoints) rename through this
+            // class and may replace a primary a reader still holds. Caller renames arrive
+            // through `zw_rename_file`, which denies an open replace target.
             FILE_RENAME_INFORMATION => {
                 let (replace_if_exists, root_directory, target) =
                     match Self::decode_rename_information(data) {
@@ -5255,6 +5326,7 @@ impl FileSystem {
                             FileRenameRoot::VolumeRoot,
                             &target,
                             replace_if_exists,
+                            OpenReplaceTarget::Allow,
                         )
                     } else if target.starts_with('\\') {
                         STATUS_NOT_SAME_DEVICE
@@ -5264,6 +5336,7 @@ impl FileSystem {
                             FileRenameRoot::SourceParent,
                             &target,
                             replace_if_exists,
+                            OpenReplaceTarget::Allow,
                         )
                     }
                 } else {
@@ -5272,6 +5345,7 @@ impl FileSystem {
                         FileRenameRoot::Directory(root_directory),
                         &target,
                         replace_if_exists,
+                        OpenReplaceTarget::Allow,
                     )
                 }
             }

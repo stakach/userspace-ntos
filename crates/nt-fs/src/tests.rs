@@ -4592,6 +4592,155 @@ fn existing_default_profile_hive_can_be_backed_up_before_retrying_save() {
     assert_eq!(fs.file_bytes(BACKUP), Some(&b"old regf image"[..]));
 }
 
+/// On a volume where nothing has published the default profile hive, setup's own `FILE_CREATE`
+/// succeeds and the image `NtSaveKey` writes through that File is a mountable hive.
+#[test]
+fn setup_creates_and_saves_the_default_profile_hive_on_a_volume_without_one() {
+    const SOURCE: &str = r"\??\C:\Users\Default\ntuser.dat";
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(r"\??\C:\Users\Default"));
+    let mut hive = nt_hive_core::Hive::new(HiveKind::Default);
+    hive.create_key(r"Control Panel\International");
+    let image = nt_hive_core::try_encode_image(&hive).expect("default-user hive image");
+
+    let save = fs.zw_create_file(
+        SOURCE,
+        FILE_WRITE_DATA | SYNCHRONIZE,
+        0,
+        FILE_SHARE_READ,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT,
+    );
+    assert_eq!((save.status, save.information), (STATUS_SUCCESS, FILE_CREATED));
+    // NtSaveKey: truncate, write the whole image at offset zero, then flush.
+    assert_eq!(
+        fs.zw_set_information_file(save.handle, FILE_END_OF_FILE_INFORMATION, &0u64.to_le_bytes()),
+        STATUS_SUCCESS
+    );
+    assert_eq!(fs.zw_write_file(save.handle, Some(0), &image), (STATUS_SUCCESS, image.len()));
+    assert_eq!(fs.zw_flush_buffers_file(save.handle), STATUS_SUCCESS);
+    fs.zw_close(save.handle);
+
+    let committed = fs.export_volume_snapshot().expect("durable profile source");
+    let fs = FileSystem::from_volume_snapshot(&committed).expect("next boot profile source");
+    let saved = fs.file_bytes(SOURCE).expect("saved default profile hive");
+    assert_eq!(saved, image.as_slice());
+    assert_eq!(nt_hive_core::image_len_if_valid(saved), Ok(image.len()));
+    assert_eq!(nt_hive_core::image_root_subkey_count_if_valid(saved), Ok(1));
+}
+
+/// `MoveFileExW` renames through the File it opened, to a full volume path. These are the
+/// statuses FASTFAT's `FileRenameInformation` returns for each shape of target.
+#[test]
+fn caller_rename_moves_one_entry_and_reports_fat_target_statuses() {
+    const OLD: &str = r"\??\C:\Users\Default\ntuser.dat";
+    const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    let utf16 = |text: &str| -> alloc::vec::Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    };
+    let mut fs = FileSystem::new(MemFs::new());
+    fs.provision_file_owned(OLD, b"old hive".to_vec()).expect("source hive");
+    assert!(fs.provision_directory(r"\??\C:\Users\Public"));
+    let open = |fs: &mut FileSystem, path: &str| {
+        let opened = fs.zw_create_file(path, DELETE | SYNCHRONIZE, 0, SHARE_ALL, FILE_OPEN,
+            FILE_OPEN_FOR_BACKUP_INTENT);
+        assert_eq!(opened.status, STATUS_SUCCESS, "{path}");
+        opened.handle
+    };
+
+    // Onto a sibling name nothing holds: the old name is gone and the bytes are intact.
+    let source = open(&mut fs, OLD);
+    assert_eq!(
+        fs.zw_rename_file(source, FileRenameRoot::VolumeRoot,
+            &utf16(r"\Users\Default\ntuser.bak"), true),
+        STATUS_SUCCESS
+    );
+    assert_eq!(fs.file_bytes(OLD), None);
+    assert_eq!(fs.file_bytes(r"\??\C:\Users\Default\ntuser.bak"), Some(&b"old hive"[..]));
+    assert_eq!(fs.zw_query_opened_name(source).as_deref(), Some(r"\Users\Default\ntuser.bak"));
+
+    // Onto an existing file: a collision without ReplaceIfExists, a replacement with it.
+    fs.provision_file_owned(OLD, b"new hive".to_vec()).expect("second hive");
+    assert_eq!(
+        fs.zw_rename_file(source, FileRenameRoot::VolumeRoot,
+            &utf16(r"\Users\Default\ntuser.dat"), false),
+        STATUS_OBJECT_NAME_COLLISION
+    );
+    assert_eq!(fs.file_bytes(OLD), Some(&b"new hive"[..]));
+    assert_eq!(fs.file_bytes(r"\??\C:\Users\Default\ntuser.bak"), Some(&b"old hive"[..]));
+
+    // A replace target that another File still has open is not replaced.
+    let reader = open(&mut fs, OLD);
+    assert_eq!(
+        fs.zw_rename_file(source, FileRenameRoot::VolumeRoot,
+            &utf16(r"\Users\Default\ntuser.dat"), true),
+        STATUS_ACCESS_DENIED
+    );
+    assert_eq!(fs.file_bytes(OLD), Some(&b"new hive"[..]));
+    assert_eq!(fs.file_bytes(r"\??\C:\Users\Default\ntuser.bak"), Some(&b"old hive"[..]));
+    fs.zw_close(reader);
+    assert_eq!(
+        fs.zw_rename_file(source, FileRenameRoot::VolumeRoot,
+            &utf16(r"\Users\Default\ntuser.dat"), true),
+        STATUS_SUCCESS
+    );
+    assert_eq!(fs.file_bytes(OLD), Some(&b"old hive"[..]));
+    assert_eq!(fs.file_bytes(r"\??\C:\Users\Default\ntuser.bak"), None);
+
+    // Across directories on the same volume; a missing target directory is a path error.
+    assert_eq!(
+        fs.zw_rename_file(source, FileRenameRoot::VolumeRoot,
+            &utf16(r"\Users\Public\ntuser.dat"), false),
+        STATUS_SUCCESS
+    );
+    assert_eq!(fs.file_bytes(OLD), None);
+    assert_eq!(fs.file_bytes(r"\??\C:\Users\Public\ntuser.dat"), Some(&b"old hive"[..]));
+    assert_eq!(
+        fs.zw_rename_file(source, FileRenameRoot::VolumeRoot,
+            &utf16(r"\Users\Missing\ntuser.dat"), true),
+        STATUS_OBJECT_PATH_NOT_FOUND
+    );
+    fs.zw_close(source);
+
+    // A directory moves with its children.
+    let directory = fs.zw_create_file(r"\??\C:\Users\Public", DELETE | SYNCHRONIZE, 0, SHARE_ALL,
+        FILE_OPEN, FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT);
+    assert_eq!(directory.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_rename_file(directory.handle, FileRenameRoot::VolumeRoot,
+            &utf16(r"\Users\Shared"), false),
+        STATUS_SUCCESS
+    );
+    fs.zw_close(directory.handle);
+    assert!(fs.query_attributes(r"\??\C:\Users\Public").is_none());
+    assert_eq!(fs.file_bytes(r"\??\C:\Users\Shared\ntuser.dat"), Some(&b"old hive"[..]));
+}
+
+/// Hive checkpoints install a new primary image by replace-rename while a reader may still hold
+/// the old one. That filesystem-internal installation is not a caller rename and must keep
+/// working after callers are denied an open replace target.
+#[test]
+fn internal_image_installation_still_replaces_a_primary_a_reader_holds() {
+    const IMAGE: &str = r"\??\C:\Windows\System32\config\SOFTWARE";
+    let mut fs = FileSystem::new(MemFs::new());
+    fs.provision_file_owned(IMAGE, b"old image".to_vec()).expect("primary image");
+    let reader = fs.zw_create_file(IMAGE, FILE_READ_DATA, 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN, FILE_NON_DIRECTORY_FILE);
+    assert_eq!(reader.status, STATUS_SUCCESS);
+    let staged = fs.zw_create_file(r"\??\C:\Windows\System32\config\SOFTWARE.TMP",
+        FILE_WRITE_DATA | SYNCHRONIZE, 0, 0, FILE_OVERWRITE_IF, 0);
+    assert_eq!(staged.status, STATUS_SUCCESS);
+    assert_eq!(fs.zw_write_file(staged.handle, Some(0), b"new image"), (STATUS_SUCCESS, 9));
+    assert_eq!(
+        fs.zw_set_information_file(staged.handle, FILE_RENAME_INFORMATION,
+            &rename_information(IMAGE, 0, true)),
+        STATUS_SUCCESS
+    );
+    fs.zw_close(staged.handle);
+    assert_eq!(fs.file_bytes(IMAGE), Some(&b"new image"[..]));
+    fs.zw_close(reader.handle);
+}
+
 /// Provisioning REPLACES an existing file's bytes exactly (no append, no stale tail), refuses a
 /// path that names a directory, and refuses a path off this volume. `file_bytes` misses honestly.
 #[test]

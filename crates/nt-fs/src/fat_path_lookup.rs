@@ -30,6 +30,14 @@ pub enum FatPathProgress { Pending, Found, NotFound }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FatPathError { Invalid, NoCapacity, WrongRequest, Corrupt }
 
+/// The directory holding a path's final component, known once the walk has entered it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FatPathContainer {
+    /// The final component is looked up directly in the walk's start directory.
+    Start,
+    Directory(FatDirectoryRecord),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase { Directory, Fat, Found, NotFound }
 
@@ -44,6 +52,8 @@ pub struct FatPathLookup {
     file_index: u32,
     decoder: FatDirectoryDecoder,
     visited: Vec<u32>,
+    /// The matched record of the directory currently being scanned; `None` in the start directory.
+    container: Option<FatDirectoryRecord>,
     found: Option<FatDirectoryRecord>,
     phase: Phase,
 }
@@ -86,6 +96,7 @@ impl FatPathLookup {
             file_index: 0,
             decoder: FatDirectoryDecoder::new(),
             visited,
+            container: None,
             found: None,
             phase: Phase::Directory,
         })
@@ -125,6 +136,14 @@ impl FatPathLookup {
         self.found.take()
     }
 
+    /// The directory that holds the final component. `None` until the walk has entered that
+    /// directory, and for good when an earlier component is missing or is not a directory, so a
+    /// missing final entry stays distinct from a missing parent.
+    pub fn final_container(&self) -> Option<FatPathContainer> {
+        if next_component(&self.path, self.component_end).is_some() { return None; }
+        Some(self.container.map_or(FatPathContainer::Start, FatPathContainer::Directory))
+    }
+
     fn feed_directory(&mut self, bytes: &[u8; 512]) -> Result<FatPathProgress, FatPathError> {
         let cluster_bytes = self.geometry.sectors_per_cluster.checked_mul(512).ok_or(FatPathError::Corrupt)?;
         for slot in bytes.chunks_exact(32) {
@@ -151,6 +170,7 @@ impl FatPathLookup {
                         }
                         self.component_start = start;
                         self.component_end = end;
+                        self.container = Some(record);
                         self.directory_cluster = record.first_cluster;
                         self.cluster = record.first_cluster;
                         self.sector_in_cluster = 0;
@@ -271,6 +291,49 @@ mod tests {
         let request = lookup.request().unwrap();
         assert_eq!(lookup.feed(request, &[0; 512]), Ok(FatPathProgress::NotFound));
         assert_eq!(lookup.request(), None);
+    }
+
+    #[test]
+    fn missing_final_entry_reports_the_directory_that_would_hold_it() {
+        let mut lookup = FatPathLookup::new(geometry(), 2, b"users\\default\\ntuser.bak").unwrap();
+        assert_eq!(lookup.final_container(), None, "the walk has not entered the parent yet");
+        let root = lookup.request().unwrap();
+        assert_eq!(lookup.feed(root, &entry(b"USERS      ", true, 3, 0)), Ok(FatPathProgress::Pending));
+        assert_eq!(lookup.final_container(), None);
+        let users = lookup.request().unwrap();
+        assert_eq!(lookup.feed(users, &entry(b"DEFAULT    ", true, 4, 0)), Ok(FatPathProgress::Pending));
+        let Some(FatPathContainer::Directory(parent)) = lookup.final_container() else {
+            panic!("the walk entered the directory holding the final component");
+        };
+        assert_eq!(parent.first_cluster, 4);
+        assert!(parent.metadata().is_directory);
+        assert_eq!(parent.metadata().file_id >> 32, 3, "parent identity names its own parent");
+        let default = lookup.request().unwrap();
+        assert_eq!(lookup.feed(default, &[0; 512]), Ok(FatPathProgress::NotFound));
+        assert_eq!(lookup.final_container(), Some(FatPathContainer::Directory(parent)),
+            "a missing final entry still names the directory that would hold it");
+    }
+
+    #[test]
+    fn missing_or_non_directory_parent_has_no_final_container() {
+        let mut missing = FatPathLookup::new(geometry(), 2, b"users\\default\\ntuser.bak").unwrap();
+        let root = missing.request().unwrap();
+        assert_eq!(missing.feed(root, &[0; 512]), Ok(FatPathProgress::NotFound));
+        assert_eq!(missing.final_container(), None);
+
+        let mut file = FatPathLookup::new(geometry(), 2, b"users\\ntuser.bak").unwrap();
+        let root = file.request().unwrap();
+        assert_eq!(file.feed(root, &entry(b"USERS      ", false, 3, 9)), Ok(FatPathProgress::NotFound));
+        assert_eq!(file.final_container(), None, "a file cannot hold the final component");
+    }
+
+    #[test]
+    fn single_component_is_held_by_the_start_directory() {
+        let mut lookup = FatPathLookup::new(geometry(), 2, b"bootstat.dat").unwrap();
+        assert_eq!(lookup.final_container(), Some(FatPathContainer::Start));
+        let root = lookup.request().unwrap();
+        assert_eq!(lookup.feed(root, &entry(b"BOOTSTATDAT", false, 5, 8)), Ok(FatPathProgress::Found));
+        assert_eq!(lookup.final_container(), Some(FatPathContainer::Start));
     }
 
     #[test]

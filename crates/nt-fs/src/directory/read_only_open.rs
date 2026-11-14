@@ -213,6 +213,26 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
         )
     }
 
+    /// Whether any handle still holds this installed file open, whatever access it was granted.
+    /// A rename may not replace such a file even when its sharing mode would admit another open.
+    pub fn has_open_handle(
+        &self,
+        volume_relative_path: &[u8],
+        metadata: crate::FileMetadata,
+    ) -> bool {
+        self.slots
+            .iter()
+            .filter(|slot| slot.occupied && slot.handle_references != 0)
+            .any(|slot| {
+                same_fat_file(
+                    &slot.open.metadata,
+                    slot.open.volume_relative_path(),
+                    &metadata,
+                    volume_relative_path,
+                )
+            })
+    }
+
     fn check_share_access(
         &self,
         volume_relative_path: &[u8],
@@ -862,6 +882,36 @@ mod tests {
             ),
             Err(STATUS_INSUFFICIENT_RESOURCES)
         );
+    }
+
+    #[test]
+    fn installed_file_counts_as_open_until_its_final_handle_is_released() {
+        const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+        let metadata = crate::FileMetadata {
+            file_id: 0xF7,
+            end_of_file: 16,
+            ..crate::FileMetadata::default()
+        };
+        let other = crate::FileMetadata { file_id: 0xF8, ..metadata };
+        let mut files = ReadOnlyFileOpenTable::<2>::new();
+        assert!(!files.has_open_handle(b"windows\\win.ini", metadata));
+        // An attribute-only open claims no sharing, yet it still holds the file open.
+        let open = files
+            .create(
+                9,
+                16,
+                b"windows\\win.ini",
+                FILE_READ_ATTRIBUTES,
+                crate::FILE_SHARE_READ | crate::FILE_SHARE_WRITE | crate::FILE_SHARE_DELETE,
+                0,
+                metadata,
+                crate::FatShortName::EMPTY,
+            )
+            .unwrap();
+        assert!(files.has_open_handle(b"WINDOWS\\WIN.INI", metadata));
+        assert!(!files.has_open_handle(b"windows\\system.ini", other));
+        files.release(open).unwrap();
+        assert!(!files.has_open_handle(b"windows\\win.ini", metadata));
     }
 
     #[test]

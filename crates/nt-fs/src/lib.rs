@@ -38,6 +38,7 @@ mod installation_root;
 mod layered_directory;
 mod layered_directory_open;
 mod layered_open;
+mod layered_rename;
 mod notify;
 mod partition;
 mod partition_layout;
@@ -96,6 +97,7 @@ pub use hive_provider::NtFileHiveIoProvider;
 pub use installation_root::*;
 pub use layered_directory::merge_layered_directory_entries;
 pub use layered_directory_open::{layered_directory_open_decision, LayeredDirectoryOpenDecision};
+pub use layered_rename::*;
 pub use layered_open::{
     join_layered_relative_name_into, LayeredOpenContextId, LayeredOpenRecord, LayeredOpenSource,
     LayeredOpenTable, LAYERED_OPEN_NAME_CAP,

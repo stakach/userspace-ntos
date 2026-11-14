@@ -263,6 +263,30 @@ impl<const SLOTS: usize> LayeredOpenTable<SLOTS> {
         Ok((context, self.get(context, canonical_file_id)?))
     }
 
+    /// Record the name a completed rename gave this exact open, so its later name queries
+    /// report where the File now lives. The source selected by CREATE is unchanged.
+    pub fn rename(
+        &mut self,
+        context: LayeredOpenContextId,
+        canonical_file_id: u64,
+        volume_relative_name: &[u16],
+    ) -> Result<(), u32> {
+        if volume_relative_name.len() > LAYERED_OPEN_NAME_CAP {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        let entry = self
+            .slot_mut(context, canonical_file_id)?
+            .entry
+            .as_mut()
+            .expect("validated occupied slot");
+        if entry.source.is_none() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        entry.name[..volume_relative_name.len()].copy_from_slice(volume_relative_name);
+        entry.name_len = volume_relative_name.len() as u16;
+        Ok(())
+    }
+
     pub fn release(
         &mut self,
         context: LayeredOpenContextId,
@@ -339,6 +363,28 @@ mod tests {
             },
             alternate_name: FatShortName::EMPTY,
         }
+    }
+
+    #[test]
+    fn rename_updates_only_the_exact_published_open() {
+        let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        let mut table = LayeredOpenTable::<4>::new();
+        let source = LayeredOpenSource::Overlay { file_id: 9 };
+        let renamed = table.insert(71, source, &wide("\\Users\\Default\\ntuser.dat")).unwrap();
+        let other = table.insert(72, source, &wide("\\Users\\Default\\ntuser.dat")).unwrap();
+        let pending = table.reserve(73, &wide("\\Users\\Default\\ntuser.new")).unwrap();
+
+        assert_eq!(table.rename(renamed, 72, &wide("\\x")), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.rename(pending, 73, &wide("\\x")), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(
+            table.rename(renamed, 71, &[0; LAYERED_OPEN_NAME_CAP + 1]),
+            Err(STATUS_OBJECT_NAME_INVALID)
+        );
+        assert_eq!(table.rename(renamed, 71, &wide("\\Users\\Default\\ntuser.bak")), Ok(()));
+        let record = table.get(renamed, 71).unwrap();
+        assert_eq!(record.name, &wide("\\Users\\Default\\ntuser.bak")[..]);
+        assert_eq!(record.source, source);
+        assert_eq!(table.get(other, 72).unwrap().name, &wide("\\Users\\Default\\ntuser.dat")[..]);
     }
 
     #[test]
