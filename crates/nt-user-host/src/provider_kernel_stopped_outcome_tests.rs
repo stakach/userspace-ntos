@@ -171,3 +171,28 @@ fn a_wait_resumed_job_reports_its_origin() {
     let _ticket = f.resume().unwrap();
     assert!(f.state().resumed_from_wait());
 }
+
+/// Issue #389: a Ps exit callout parked in a provider wait must not hold root. Its owner may
+/// need a hosted call or its own service terminal, which only the service loop dispatches.
+#[test]
+fn wait_captured_ps_retirement_stop_returns_root_to_the_service_loop() {
+    use crate::provider_kernel_wait::{KernelJobOrigin as Origin, KernelJobRunnerStep as Step};
+    let f = Fixture::new();
+    let stop = f.state().stopped_outcome().unwrap();
+    assert_eq!(stop, Stop::WaitCaptured(f.capture));
+    assert_eq!(stop.runner_step(Origin::PsRetirement), Step::ParkForServiceLoop);
+    // A synchronous executive job has no retirement owner to come back to.
+    assert_eq!(stop.runner_step(Origin::Executive), Step::WaitInRunner);
+}
+
+#[test]
+fn runner_step_keeps_every_other_stop_with_its_existing_owner() {
+    use crate::provider_kernel_wait::{KernelJobOrigin as Origin, KernelJobRunnerStep as Step};
+    for origin in [Origin::PsRetirement, Origin::Executive] {
+        assert_eq!(Stop::Returned(7).runner_step(origin), Step::Returned(7));
+        assert_eq!(Stop::SourceWorkYielded.runner_step(origin), Step::DriveSourceWork);
+        for stop in [Stop::Walled, Stop::CallbackSuspended, Stop::LpcWaitSuspended] {
+            assert_eq!(stop.runner_step(origin), Step::Unresumable, "{stop:?}");
+        }
+    }
+}

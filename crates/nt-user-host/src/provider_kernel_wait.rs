@@ -31,6 +31,48 @@ pub enum KernelProviderStoppedOutcome {
     SourceWorkYielded,
 }
 
+/// Who issued a kernel job, which decides who may hold root while it is stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelJobOrigin {
+    /// A synchronous executive caller with no later owner to come back for the result.
+    Executive,
+    /// Thread or process retirement, which is retried by its own owner until it completes.
+    PsRetirement,
+}
+
+/// What the runner that entered a job does with the job's observed stop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelJobRunnerStep {
+    Returned(u32),
+    /// Lend the publication, drive the job's own source terminal and continue once.
+    DriveSourceWork,
+    /// Keep the captured wait as an owned continuation and return root to the service loop.
+    /// The wait's owner may need a hosted call, which the runner never dispatches.
+    ParkForServiceLoop,
+    /// Stay in the runner until runtime readiness resumes the captured wait.
+    WaitInRunner,
+    /// Retained, never resumed by the runner.
+    Unresumable,
+}
+
+impl KernelProviderStoppedOutcome {
+    pub const fn runner_step(self, origin: KernelJobOrigin) -> KernelJobRunnerStep {
+        match (self, origin) {
+            (Self::Returned(status), _) => KernelJobRunnerStep::Returned(status),
+            (Self::SourceWorkYielded, _) => KernelJobRunnerStep::DriveSourceWork,
+            (Self::WaitCaptured(_), KernelJobOrigin::PsRetirement) => {
+                KernelJobRunnerStep::ParkForServiceLoop
+            }
+            (Self::WaitCaptured(_), KernelJobOrigin::Executive) => {
+                KernelJobRunnerStep::WaitInRunner
+            }
+            (Self::Walled | Self::CallbackSuspended | Self::LpcWaitSuspended, _) => {
+                KernelJobRunnerStep::Unresumable
+            }
+        }
+    }
+}
+
 /// The native recipient retains this state alongside its physical channel and pump result.
 #[derive(Debug)]
 pub struct KernelProviderWaitState {
