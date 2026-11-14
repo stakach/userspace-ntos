@@ -46,6 +46,9 @@ mod file_create;
 #[path = "delete_disposition.rs"]
 mod delete_disposition;
 
+#[path = "basic_information.rs"]
+mod basic_information;
+
 #[path = "file_object_information.rs"]
 mod file_object_information;
 pub use file_object_information::FileObjectInformation;
@@ -5162,57 +5165,7 @@ impl FileSystem {
                 self.obj_mut(handle).expect("validated local File body").mode_state = next;
                 STATUS_SUCCESS
             }
-            FILE_BASIC_INFORMATION => {
-                if data.len() < 40 {
-                    return STATUS_INFO_LENGTH_MISMATCH;
-                }
-                let creation_time = u64::from_le_bytes(data[0..8].try_into().unwrap());
-                let last_access_time = u64::from_le_bytes(data[8..16].try_into().unwrap());
-                let last_write_time = u64::from_le_bytes(data[16..24].try_into().unwrap());
-                let change_time = u64::from_le_bytes(data[24..32].try_into().unwrap());
-                let attributes = u32::from_le_bytes(data[32..36].try_into().unwrap());
-                let requested = attributes & FILE_ATTRIBUTE_SETTABLE;
-                let is_dir = self.volume.is_dir(node_id);
-                let now = self.volume.current_time_100ns;
-                if let Some(node) = self.volume.node_mut(node_id) {
-                    let mut changed = false;
-                    if creation_time != 0 {
-                        node.creation_time = creation_time;
-                        changed = true;
-                    }
-                    if last_access_time != 0 {
-                        node.last_access_time = last_access_time;
-                        changed = true;
-                    }
-                    if last_write_time != 0 {
-                        node.last_write_time = last_write_time;
-                        changed = true;
-                    }
-                    if change_time != 0 {
-                        node.change_time = change_time;
-                        changed = true;
-                    }
-                    if requested != 0 {
-                        node.attributes = if is_dir {
-                            requested | FILE_ATTRIBUTE_DIRECTORY
-                        } else {
-                            requested
-                        };
-                        changed = true;
-                    }
-                    if changed && change_time == 0 {
-                        node.change_time = now;
-                    }
-                }
-                self.report_handle_change(
-                    handle,
-                    crate::FILE_NOTIFY_CHANGE_ATTRIBUTES
-                        | crate::FILE_NOTIFY_CHANGE_CREATION
-                        | crate::FILE_NOTIFY_CHANGE_LAST_ACCESS
-                        | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
-                );
-                STATUS_SUCCESS
-            }
+            FILE_BASIC_INFORMATION => self.set_basic_information(handle, data),
             FILE_DISPOSITION_INFORMATION => {
                 if data.is_empty() {
                     return STATUS_INFO_LENGTH_MISMATCH;
