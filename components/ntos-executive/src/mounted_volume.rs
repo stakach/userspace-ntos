@@ -371,17 +371,7 @@ pub(crate) fn register_mounted_volume(
         &driver_path,
         &device_path,
         alloc::boxed::Box::new(backend),
-        &[
-            nt_io_abi::major::IRP_MJ_CREATE,
-            nt_io_abi::major::IRP_MJ_READ,
-            nt_io_abi::major::IRP_MJ_WRITE,
-            nt_io_abi::major::IRP_MJ_QUERY_INFORMATION,
-            nt_io_abi::major::IRP_MJ_QUERY_VOLUME_INFORMATION,
-            nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL,
-            nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL,
-            nt_io_abi::major::IRP_MJ_CLEANUP,
-            nt_io_abi::major::IRP_MJ_CLOSE,
-        ],
+        MountedVolumeBackend::MAJORS,
     ) {
         Ok(device_id) => device_id,
         Err(status) => {

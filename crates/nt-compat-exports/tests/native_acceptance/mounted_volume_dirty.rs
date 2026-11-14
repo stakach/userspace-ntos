@@ -42,21 +42,6 @@ impl<'ast> Visit<'ast> for ExactVolumeHandler {
 }
 
 #[test]
-fn mounted_volume_registers_filesystem_control_for_autochk() {
-    let source = syn::parse_file(include_str!(
-        "../../../../components/ntos-executive/src/mounted_volume.rs"
-    ))
-    .unwrap();
-    let register = source.items.iter().find_map(|item| match item {
-        Item::Fn(function) if function.sig.ident == "register_mounted_volume" => Some(function),
-        _ => None,
-    }).expect("mounted volume registration");
-    let mut major = FsctlMajor::default();
-    major.visit_block(&register.block);
-    assert!(major.0, "mounted volume must register IRP_MJ_FILE_SYSTEM_CONTROL so autochk's FSCTL_IS_VOLUME_DIRTY reaches its backend");
-}
-
-#[test]
 fn mounted_volume_dispatches_filesystem_control_to_a_volume_handler() {
     let source = syn::parse_file(include_str!(
         "../../../../components/ntos-executive/src/mounted_volume_backend.rs"

@@ -205,6 +205,9 @@ pub(crate) mod initial_thread_creation;
 #[path = "exec_file_flush.rs"]
 mod file_flush;
 
+#[path = "exec_save_key_file.rs"]
+mod save_key_file;
+
 #[path = "exec_user_hive_image.rs"]
 mod user_hive_image;
 
@@ -6011,8 +6014,8 @@ impl ExecNtHandler {
             return STATUS_PRIVILEGE_NOT_HELD;
         }
 
-        let file_id = match self.overlay_write_file_id_for(file_handle) {
-            Ok(file_id) => file_id,
+        let file = match self.save_key_file_for(file_handle) {
+            Ok(file) => file,
             Err(status) => {
                 if status == nt_fs::STATUS_INVALID_DEVICE_REQUEST {
                     NT_SAVE_KEY_INVALID_TARGET.fetch_add(1, Ordering::Relaxed);
@@ -6123,28 +6126,7 @@ impl ExecNtHandler {
         };
         let image_len = image.len();
 
-        let zero = 0u64.to_le_bytes();
-        let mut status = unsafe {
-            crate::writable_fs::set_information(file_id, nt_fs::FILE_END_OF_FILE_INFORMATION, &zero)
-        };
-        if status != nt_fs::STATUS_SUCCESS {
-            return status;
-        }
-        let (write_status, written) = unsafe { crate::writable_fs::write(file_id, Some(0), image) };
-        if write_status != nt_fs::STATUS_SUCCESS {
-            return write_status;
-        }
-        if written != image_len {
-            return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
-        }
-        let eof = (image_len as u64).to_le_bytes();
-        status = unsafe {
-            crate::writable_fs::set_information(file_id, nt_fs::FILE_END_OF_FILE_INFORMATION, &eof)
-        };
-        if status != nt_fs::STATUS_SUCCESS {
-            return status;
-        }
-        status = unsafe { crate::writable_fs::flush(file_id) };
+        let status = unsafe { Self::write_save_key_image(file, image) };
         if status == nt_fs::STATUS_SUCCESS {
             self.writable_fs_dirty = true;
             self.writable_fs_commit_required = true;
@@ -11230,43 +11212,6 @@ impl ExecNtHandler {
         match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
             Some(nt_process::HandleObject::OverlayFile(file_id)) => Some(file_id),
             _ => None,
-        }
-    }
-
-    /// Resolve a writable-overlay FILE_OBJECT for services that must write kernel-owned bytes to a
-    /// caller-opened file. Other file backends fail visibly until they expose the same write seam.
-    pub(crate) fn overlay_write_file_id_for(&self, handle: u64) -> Result<u64, u32> {
-        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
-        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
-        const FILE_WRITE_DATA: u32 = 0x0000_0002;
-        const GENERIC_WRITE: u32 = 0x4000_0000;
-        const GENERIC_ALL: u32 = 0x1000_0000;
-
-        if handle > u32::MAX as u64 {
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
-        let object = self
-            .pm
-            .lookup_handle(pid, handle as nt_process::Handle)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        let access = self
-            .pm
-            .handle_access(pid, handle as nt_process::Handle)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        if access & (FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL) == 0 {
-            return Err(STATUS_ACCESS_DENIED);
-        }
-        match object {
-            nt_process::HandleObject::OverlayFile(file_id) => Ok(file_id),
-            nt_process::HandleObject::File(_)
-            | nt_process::HandleObject::RoutedFile { .. }
-            | nt_process::HandleObject::DiskFile { .. }
-            | nt_process::HandleObject::Directory { .. } => {
-                Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
-            }
-            _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
         }
     }
 

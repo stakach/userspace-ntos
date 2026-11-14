@@ -553,12 +553,7 @@ impl MountedVolumeBackend {
                     nt_fs::FatPathError::NoCapacity => NtStatus::INSUFFICIENT_RESOURCES,
                     _ => NtStatus(nt_fs::STATUS_DATA_ERROR as i32),
                 };
-                self.create_completions.push(CompletedCreate {
-                    completion: DriverCompletion {
-                        irp_id: resolved.payload.irp, status, information: 0,
-                        file_context: None,
-                    }, owner: resolved.payload, published: false,
-                });
+                self.complete_create(resolved.payload, status, 0, None);
                 return 1;
             }
         };
@@ -667,18 +662,21 @@ impl MountedVolumeBackend {
             Ok(CreateDecision::Dispatch(DispatchOutcome::Pending)) => panic!("mounted CREATE decision cannot nest pending work"),
             Ok(CreateDecision::Prepare(_)) => unreachable!("prepared CREATE owner transferred"),
         };
-        self.create_completions.push(CompletedCreate {
-            completion: DriverCompletion {
-                irp_id: resolved.payload.irp, status, information, file_context,
-            }, owner: resolved.payload, published: false,
-        });
+        self.complete_create(resolved.payload, status, information, file_context);
         1
     }
 
     fn complete_failed_create(&mut self, owner: CapturedCreate, status: NtStatus) {
+        self.complete_create(owner, status, 0, None);
+    }
+
+    /// Queue a retained CREATE's terminal result. Every caller has reserved the completion slot.
+    fn complete_create(&mut self, owner: CapturedCreate, status: NtStatus, information: u64,
+        file_context: Option<u64>)
+    {
         self.create_completions.push(CompletedCreate {
-            completion: DriverCompletion { irp_id: owner.irp, status, information: 0,
-                file_context: None }, owner, published: false,
+            completion: DriverCompletion { irp_id: owner.irp, status, information, file_context },
+            owner, published: false,
         });
     }
 
@@ -738,12 +736,8 @@ impl MountedVolumeBackend {
                         .map(|source| source.first_cluster),
                     directory_query: nt_fs::DirectoryQueryState::default(),
                 });
-                self.create_completions.push(CompletedCreate {
-                    completion: DriverCompletion { irp_id: captured.owner.irp,
-                        status: NtStatus::SUCCESS, information,
-                        file_context: Some(context.raw()) },
-                    owner: captured.owner, published: false,
-                });
+                self.complete_create(captured.owner, NtStatus::SUCCESS, information,
+                    Some(context.raw()));
             }
             Err(status) => {
                 self.opens.cancel(context, file).expect("unpublished prepared CREATE context");
@@ -1671,6 +1665,23 @@ impl MountedVolumeBackend {
             file_context: None,
         })
     }
+}
+
+impl MountedVolumeBackend {
+    /// Every major `dispatch_irp` serves. The volume driver registers exactly this list: the I/O
+    /// Manager fails any other major with STATUS_INVALID_DEVICE_REQUEST before this backend
+    /// runs, whatever arm `dispatch_irp` has for it.
+    pub(crate) const MAJORS: &'static [u8] = &[
+        major::IRP_MJ_CREATE,
+        major::IRP_MJ_READ,
+        major::IRP_MJ_WRITE,
+        major::IRP_MJ_QUERY_INFORMATION,
+        major::IRP_MJ_QUERY_VOLUME_INFORMATION,
+        major::IRP_MJ_FILE_SYSTEM_CONTROL,
+        major::IRP_MJ_DIRECTORY_CONTROL,
+        major::IRP_MJ_CLEANUP,
+        major::IRP_MJ_CLOSE,
+    ];
 }
 
 impl DriverDispatchBackend for MountedVolumeBackend {
