@@ -2455,6 +2455,45 @@ fn reusable_snapshot_capture_keeps_exact_bytes_and_allocation_across_mutations()
     assert_eq!(capture.as_ptr(), address);
 }
 
+/// KVM run 43624972803: the retained capture held 4,521,970 bytes of capacity when the volume
+/// outgrew it at first logon, and the amortized reservation took 9,043,940 bytes of durable
+/// heap, twice the old capacity, for an image barely larger than before.
+#[test]
+fn a_capture_that_outgrows_its_allocation_does_not_double_it() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let file = fs.zw_create_file(
+        r"\??\C:\hive.dat",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+    let megabyte = alloc::vec![0x5au8; 1 << 20];
+    assert_eq!(fs.zw_write_file(file.handle, None, &megabyte).0, STATUS_SUCCESS);
+    let mut capture = alloc::vec::Vec::new();
+    fs.export_volume_snapshot_into(&mut capture).unwrap();
+    let before = capture.capacity();
+    assert!(before >= 1 << 20 && before < (1 << 20) + (1 << 18), "capacity={before}");
+    assert!(before <= capture.len() + capture.len() / 8);
+
+    // The volume grows by a little more than the capture's slack.
+    assert_eq!(
+        fs.zw_write_file(file.handle, Some(1 << 20), &megabyte[..1 << 18]).0,
+        STATUS_SUCCESS
+    );
+    fs.export_volume_snapshot_into(&mut capture).unwrap();
+    assert_eq!(capture, fs.export_volume_snapshot().unwrap());
+    let image = capture.len();
+    assert!(image > before);
+    assert!(
+        capture.capacity() <= image + image / 8,
+        "capacity={} for an image of {image} bytes (was {before})",
+        capture.capacity()
+    );
+}
+
 #[test]
 fn memfs_snapshot_preserves_deleted_file_id_high_water() {
     let mut fs = FileSystem::new(MemFs::new());

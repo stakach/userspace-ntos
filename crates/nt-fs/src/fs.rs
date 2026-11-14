@@ -837,8 +837,18 @@ impl MemFs {
             .checked_add(payload_len)
             .ok_or(MemFsSnapshotError::InvalidRecord)?;
         out.clear();
-        out.try_reserve(total_len)
-            .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
+        if out.capacity() < total_len {
+            // The capture is empty, so release it before reserving: the old block can then
+            // serve the request, and the two never coexist. An amortized reservation would
+            // double an allocation the size of the whole volume. An eighth of slack lets the
+            // volume grow for a while before the capture has to move again.
+            *out = Vec::new();
+            let with_slack = total_len.saturating_add(total_len / 8);
+            if out.try_reserve_exact(with_slack).is_err() {
+                out.try_reserve_exact(total_len)
+                    .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
+            }
+        }
         out.resize(MEMFS_SNAPSHOT_HEADER_LEN, 0);
         self.write_snapshot_record("", root, false, FileShortName::EMPTY, out)?;
         let mut written_records = 1u32;
