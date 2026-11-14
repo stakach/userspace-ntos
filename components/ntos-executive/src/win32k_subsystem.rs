@@ -3697,32 +3697,22 @@ extern "win64" fn s_se_privilege_check(required: *const u8, _ctx: u64, access_mo
 /// owned by the Ps projection layout; a slot kept only in the executive's side cell, or published
 /// at another offset, leaves those reads NULL.
 const KTHREAD_WIN32THREAD_OFF: u64 = nt_kernel_abi::ps_hosted_x64::KTHREAD_WIN32_THREAD as u64;
-/// `KTHREAD::Teb` (ReactOS Win2003 x64 profile). `InitThreadCallback` uses `NtCurrentTeb()`, but
-/// other win32k paths also recover the TEB through the current thread object.
-const KTHREAD_TEB_OFF: u64 = 0xB0;
-/// `KTHREAD::Process` (embedded `KPROCESS`) points at the owning process body.
-const KTHREAD_PROCESS_OFF: u64 = 0x200;
-/// `ETHREAD::Cid` in the staged ReactOS x64 win32k image. The checked build reads
-/// `Thread->Cid.UniqueThread` at +0x380 in `InitThreadCallback`'s failure trace path.
-const ETHREAD_CID_OFF: u64 = 0x378;
-const ETHREAD_CID_UNIQUE_PROCESS_OFF: u64 = ETHREAD_CID_OFF;
-const ETHREAD_CID_UNIQUE_THREAD_OFF: u64 = ETHREAD_CID_OFF + 8;
-/// `ETHREAD::ThreadsProcess`, the field ReactOS `InitThreadCallback` reads before attaching a GUI
-/// thread to its process `PROCESSINFO`. Disassembly of this win32k build loads it from +0x3d8.
-const ETHREAD_THREADS_PROCESS_OFF: u64 = 0x3D8;
+const KTHREAD_TEB_OFF: u64 = nt_kernel_abi::ps_hosted_x64::KTHREAD_TEB as u64;
+const KTHREAD_PROCESS_OFF: u64 = nt_kernel_abi::ps_hosted_x64::KTHREAD_PROCESS as u64;
+const ETHREAD_CID_UNIQUE_PROCESS_OFF: u64 =
+    nt_kernel_abi::ps_hosted_x64::ETHREAD_CLIENT_ID_PROCESS as u64;
+const ETHREAD_CID_UNIQUE_THREAD_OFF: u64 =
+    nt_kernel_abi::ps_hosted_x64::ETHREAD_CLIENT_ID_THREAD as u64;
+const ETHREAD_THREADS_PROCESS_OFF: u64 =
+    nt_kernel_abi::ps_hosted_x64::ETHREAD_THREADS_PROCESS as u64;
 const TEB_SELF_OFF: u64 = 0x30;
 const TEB_CLIENT_ID_PROCESS_OFF: u64 = 0x40;
 const TEB_CLIENT_ID_THREAD_OFF: u64 = 0x48;
 const TEB_PROCESS_ENVIRONMENT_BLOCK_OFF: u64 = 0x60;
 const PS_W32_THREAD_CALLOUT_INITIALIZE: u64 = 0;
-/// ReactOS Win2003 x64 `EPROCESS` offsets used by win32k's process/thread callouts.
-const EPROCESS_UNIQUE_PROCESS_ID_OFF: u64 = 0xD0;
-const EPROCESS_WIN32PROCESS_OFF: u64 = 0x1D8;
-#[allow(dead_code)]
-const EPROCESS_SECTION_BASE_ADDRESS_OFF: u64 = 0x1F0;
-const EPROCESS_WIN32_WINDOW_STATION_OFF: u64 = 0x208;
-#[allow(dead_code)]
-const EPROCESS_SESSION_OFF: u64 = 0x258;
+const EPROCESS_WIN32PROCESS_OFF: u64 = nt_kernel_abi::ps_hosted_x64::EPROCESS_WIN32_PROCESS as u64;
+const EPROCESS_WIN32_WINDOW_STATION_OFF: u64 =
+    nt_kernel_abi::ps_hosted_x64::EPROCESS_WIN32_WINDOW_STATION as u64;
 
 /// `PEPROCESS IoGetCurrentProcess()` / `PsGetCurrentProcess()` reads the selected KPCR context,
 /// including the initialization caller which has no GUI runtime record.

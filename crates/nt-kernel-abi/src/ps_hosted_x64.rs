@@ -21,6 +21,8 @@ pub const KTHREAD_BYTES: usize = 0x328;
 
 pub const EPROCESS_UNIQUE_PROCESS_ID: usize = 0xd0;
 pub const EPROCESS_WIN32_PROCESS: usize = 0x1d8;
+/// The handle `PsSetProcessWindowStation` stores and `PsGetProcessWin32WindowStation` returns.
+pub const EPROCESS_WIN32_WINDOW_STATION: usize = 0x208;
 /// Address returned by PsGetProcessImageFileName for this NT layout.
 pub const EPROCESS_IMAGE_FILE_NAME: usize = 0x260;
 pub const EPROCESS_THREAD_LIST_HEAD: usize = 0x288;
