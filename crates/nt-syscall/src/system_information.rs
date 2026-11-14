@@ -4,6 +4,9 @@ use crate::{STATUS_ACCESS_VIOLATION, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID
 
 pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 
+mod records;
+pub use records::*;
+
 pub const SYSTEM_BASIC_INFORMATION_CLASS: u32 = 0;
 pub const SYSTEM_PROCESSOR_INFORMATION_CLASS: u32 = 1;
 pub const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
@@ -30,7 +33,9 @@ pub const fn supports_query_output(class: u32) -> bool {
     matches!(class,
         SYSTEM_BASIC_INFORMATION_CLASS | SYSTEM_PROCESSOR_INFORMATION_CLASS
         | SYSTEM_TIME_OF_DAY_INFORMATION_CLASS | SYSTEM_MODULE_INFORMATION_CLASS
-        | SYSTEM_FLAGS_INFORMATION_CLASS | SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS)
+        | SYSTEM_FLAGS_INFORMATION_CLASS | SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS
+        | SYSTEM_PERFORMANCE_INFORMATION_CLASS | SYSTEM_TIME_ADJUSTMENT_INFORMATION_CLASS
+        | SYSTEM_KERNEL_DEBUGGER_INFORMATION_CLASS | SYSTEM_RANGE_START_INFORMATION_CLASS)
 }
 
 #[cfg(test)]
@@ -90,7 +95,9 @@ impl QueryOutputPages {
         class: u32, buffer: u64, length: u64, return_length: u64, user_limit: u64,
     ) -> Result<Self, u32> {
         if !supports_query_output(class) { return Err(STATUS_INVALID_INFO_CLASS); }
-        if length != 0 && buffer & 3 != 0 { return Err(STATUS_DATATYPE_MISALIGNMENT); }
+        if length != 0 && buffer & (query_output_alignment(class) - 1) != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
+        }
         let end = if length == 0 { buffer } else {
             buffer.checked_add(length).filter(|end| *end <= user_limit)
                 .ok_or(STATUS_ACCESS_VIOLATION)?
@@ -470,6 +477,10 @@ pub enum SystemInformationKind {
     TimeOfDay,
     Flags,
     CurrentTimeZone,
+    Performance,
+    TimeAdjustment,
+    KernelDebugger,
+    RangeStart,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -568,11 +579,37 @@ pub fn query_plan(class: u32, buffer_length: usize) -> Result<QueryPlan, QueryEr
                 return_length: SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE as u32,
             })
         }
+        // The remaining classes take a fixed record: either exactly, or as a prefix of a larger
+        // buffer. ReactOS reports the required size on a mismatch only for some of them.
+        SYSTEM_PERFORMANCE_INFORMATION_CLASS => fixed_record_plan(
+            SystemInformationKind::Performance, SYSTEM_PERFORMANCE_INFORMATION_SIZE,
+            buffer_length >= SYSTEM_PERFORMANCE_INFORMATION_SIZE, true),
+        SYSTEM_TIME_ADJUSTMENT_INFORMATION_CLASS => fixed_record_plan(
+            SystemInformationKind::TimeAdjustment, SYSTEM_QUERY_TIME_ADJUST_INFORMATION_SIZE,
+            buffer_length == SYSTEM_QUERY_TIME_ADJUST_INFORMATION_SIZE, true),
+        SYSTEM_KERNEL_DEBUGGER_INFORMATION_CLASS => fixed_record_plan(
+            SystemInformationKind::KernelDebugger, SYSTEM_KERNEL_DEBUGGER_INFORMATION_SIZE,
+            buffer_length >= SYSTEM_KERNEL_DEBUGGER_INFORMATION_SIZE, false),
+        SYSTEM_RANGE_START_INFORMATION_CLASS => fixed_record_plan(
+            SystemInformationKind::RangeStart, SYSTEM_RANGE_START_INFORMATION_SIZE,
+            buffer_length == SYSTEM_RANGE_START_INFORMATION_SIZE, false),
         _ => Err(QueryError {
             status: STATUS_INVALID_INFO_CLASS,
             return_length: 0,
         }),
     }
+}
+
+fn fixed_record_plan(
+    kind: SystemInformationKind, size: usize, length_accepted: bool, mismatch_reports_size: bool,
+) -> Result<QueryPlan, QueryError> {
+    if !length_accepted {
+        return Err(QueryError {
+            status: STATUS_INFO_LENGTH_MISMATCH,
+            return_length: if mismatch_reports_size { size as u32 } else { 0 },
+        });
+    }
+    Ok(QueryPlan { kind, copy_length: size, return_length: size as u32 })
 }
 
 /// Validate class 44's set length and return the prefix consumed by the kernel.

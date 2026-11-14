@@ -372,7 +372,7 @@ const STATUS_DEVICE_DATA_ERROR: u32 = 0xC000_009C;
 const STATUS_UNHANDLED_EXCEPTION: u32 = 0xC000_0144;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
 const STATUS_IO_DEVICE_ERROR: u32 = 0xC000_0185;
-pub(crate) const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
+pub(crate) use nt_syscall::system_information::HIGHEST_USER_ADDRESS;
 const NT_CREATE_THREAD_CLIENT_ID_ARG: usize = 4;
 const NT_CREATE_THREAD_CONTEXT_ARG: usize = 5;
 const NT_CREATE_THREAD_INITIAL_TEB_ARG: usize = 6;
@@ -3279,6 +3279,9 @@ fn is_dynamic_hive_selector(sel: u32) -> bool {
     HIVE_SEL_DYNAMIC.iter().any(|candidate| *candidate == sel)
 }
 
+/// The clock interval reported as `KeMaximumIncrement`, in 100 ns units.
+const SYSTEM_TIME_INCREMENT_100NS: u32 = 10_000;
+
 pub(crate) fn native_basic_system_information(
 ) -> nt_syscall::system_information::SystemBasicInformation {
     let processors = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u8;
@@ -3288,7 +3291,7 @@ pub(crate) fn native_basic_system_information(
         (1u64 << processors) - 1
     };
     nt_syscall::system_information::SystemBasicInformation {
-        timer_resolution_100ns: 10_000,
+        timer_resolution_100ns: SYSTEM_TIME_INCREMENT_100NS,
         page_size: 0x1000,
         number_of_physical_pages: SYSTEM_PHYSICAL_PAGES
             .load(Ordering::Relaxed)
@@ -3301,7 +3304,7 @@ pub(crate) fn native_basic_system_information(
             .min(u32::MAX as u64) as u32,
         allocation_granularity: 0x1_0000,
         minimum_user_mode_address: 0x1_0000,
-        maximum_user_mode_address: 0x0000_07ff_fffe_ffff,
+        maximum_user_mode_address: HIGHEST_USER_ADDRESS,
         active_processors_affinity_mask: affinity,
         number_of_processors: processors,
     }
@@ -34978,11 +34981,13 @@ impl ExecNtHandler {
             // layer supplies the live machine/time facts and performs user-buffer probing/copyout.
             NativeService::NtQuerySystemInformation => unsafe {
                 use nt_syscall::system_information::{
-                    encode_system_module_information, query_plan, supports_query_output,
-                    system_module_information_required_length, SystemFlagsInformation,
-                    SystemInformationKind, SystemTimeOfDayInformation,
+                    encode_system_module_information, query_output_alignment, query_plan,
+                    supports_query_output, system_module_information_required_length,
+                    SystemFlagsInformation, SystemInformationKind,
+                    SystemKernelDebuggerInformation, SystemPerformanceInformation,
+                    SystemTimeAdjustmentInformation, SystemTimeOfDayInformation,
                     RTL_PROCESS_MODULES_HEADER_SIZE, STATUS_DATATYPE_MISALIGNMENT,
-                    SYSTEM_MODULE_INFORMATION_CLASS,
+                    SYSTEM_MODULE_INFORMATION_CLASS, SYSTEM_RANGE_START,
                 };
 
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -34996,7 +35001,7 @@ impl ExecNtHandler {
                 if !supports_query_output(class) {
                     return STATUS_INVALID_INFO_CLASS;
                 }
-                if len != 0 && buf & 3 != 0 {
+                if len != 0 && buf & (query_output_alignment(class) - 1) != 0 {
                     return STATUS_DATATYPE_MISALIGNMENT;
                 }
                 if len != 0 && !self.probe_user_output(buf, len) {
@@ -35091,6 +35096,41 @@ impl ExecNtHandler {
                     SystemInformationKind::CurrentTimeZone => {
                         let output = self.time_zone_information.encode();
                         self.xas_try_write_buf(buf, &output)
+                    }
+                    // Available memory is what the boot Untyped can still back; commitment is
+                    // the private charge of every hosted process. No paging file exists, so the
+                    // commit limit is physical memory.
+                    SystemInformationKind::Performance => {
+                        let output = SystemPerformanceInformation::from_memory(
+                            crate::root_untyped_free_bytes(),
+                            self.process_commit.total_bytes(),
+                            self.process_commit.peak_total_bytes(),
+                            SYSTEM_PHYSICAL_PAGES.load(Ordering::Relaxed),
+                        )
+                        .encode();
+                        self.xas_try_write_buf(buf, &output)
+                    }
+                    // The clock interval is fixed and nothing adjusts the time of day.
+                    SystemInformationKind::TimeAdjustment => {
+                        let output = SystemTimeAdjustmentInformation {
+                            time_adjustment_100ns: SYSTEM_TIME_INCREMENT_100NS,
+                            time_increment_100ns: SYSTEM_TIME_INCREMENT_100NS,
+                            adjustment_disabled: true,
+                        }
+                        .encode();
+                        self.xas_try_write_buf(buf, &output)
+                    }
+                    SystemInformationKind::KernelDebugger => {
+                        let connected = crate::kernel_debugger_connected();
+                        let output = SystemKernelDebuggerInformation {
+                            enabled: connected,
+                            not_present: !connected,
+                        }
+                        .encode();
+                        self.xas_try_write_buf(buf, &output)
+                    }
+                    SystemInformationKind::RangeStart => {
+                        self.xas_try_write_buf(buf, &SYSTEM_RANGE_START.to_le_bytes())
                     }
                 };
                 if wrote {

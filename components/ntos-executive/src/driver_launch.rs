@@ -270,6 +270,12 @@ mod hosted_driver_apc_region;
 mod hosted_start_io;
 #[path = "hosted_kd_debug.rs"]
 mod hosted_kd_debug;
+
+/// Whether a kernel-debug transport is attached; the one fact behind `KdDebuggerNotPresent` and
+/// `SystemKernelDebuggerInformation`.
+pub(crate) fn kernel_debugger_connected() -> bool {
+    hosted_kd_debug::kernel_debugger_connected()
+}
 #[path = "hosted_synchronous_fsd_request.rs"]
 mod hosted_synchronous_fsd_request;
 #[path = "hosted_partition_table.rs"]

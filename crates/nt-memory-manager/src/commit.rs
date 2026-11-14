@@ -46,12 +46,14 @@ struct ProcessCommitRecord {
 #[derive(Default)]
 pub struct ProcessCommitLedger {
     records: Vec<ProcessCommitRecord>,
+    peak_total_bytes: u64,
 }
 
 impl ProcessCommitLedger {
     pub const fn new() -> Self {
         Self {
             records: Vec::new(),
+            peak_total_bytes: 0,
         }
     }
 
@@ -95,6 +97,7 @@ impl ProcessCommitLedger {
                 limit_bytes,
             },
         });
+        self.note_total();
         Ok(())
     }
 
@@ -190,7 +193,9 @@ impl ProcessCommitLedger {
         }
         accounting.current_bytes = plan.next_bytes;
         accounting.peak_bytes = accounting.peak_bytes.max(plan.next_bytes);
-        Ok(*accounting)
+        let accounting = *accounting;
+        self.note_total();
+        Ok(accounting)
     }
 
     pub fn release(
@@ -230,5 +235,21 @@ impl ProcessCommitLedger {
 
     pub fn owner_count(&self) -> usize {
         self.records.len()
+    }
+
+    /// Private commitment charged across every registered owner.
+    pub fn total_bytes(&self) -> u64 {
+        self.records.iter().fold(0u64, |total, record| {
+            total.saturating_add(record.accounting.current_bytes)
+        })
+    }
+
+    /// Highest value `total_bytes` has reached.
+    pub fn peak_total_bytes(&self) -> u64 {
+        self.peak_total_bytes
+    }
+
+    fn note_total(&mut self) {
+        self.peak_total_bytes = self.peak_total_bytes.max(self.total_bytes());
     }
 }

@@ -231,3 +231,18 @@ fn partial_view_offset() {
     cache.cc_flush_cache(None, None);
     assert_eq!(&cache.backing().bytes[..], b"HELLOworld");
 }
+
+#[test]
+fn process_commit_ledger_reports_the_system_total_and_its_peak() {
+    let mut ledger = ProcessCommitLedger::new();
+    assert_eq!((ledger.total_bytes(), ledger.peak_total_bytes()), (0, 0));
+    ledger.register(1, 0x3000).unwrap();
+    ledger.register(2, 0x1000).unwrap();
+    let plan = ledger.prepare_charge(2, 0x4000).unwrap();
+    assert_eq!((ledger.total_bytes(), ledger.peak_total_bytes()), (0x4000, 0x4000));
+    ledger.commit_charge(plan).unwrap();
+    assert_eq!((ledger.total_bytes(), ledger.peak_total_bytes()), (0x8000, 0x8000));
+    ledger.release(2, 0x2000).unwrap();
+    ledger.unregister(1).unwrap();
+    assert_eq!((ledger.total_bytes(), ledger.peak_total_bytes()), (0x3000, 0x8000));
+}
