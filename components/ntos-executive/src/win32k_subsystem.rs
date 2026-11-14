@@ -17850,7 +17850,12 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let result = if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT {
         dispatch_gdi_batch_flush_callout(client_pi, client_teb)
     } else if ssn == SSN_WIN32_JOB_USER_HANDLE {
-        dispatch_win32_job_user_handle(a0, a1, a2 != 0, a3 as u32)
+        dispatch_win32_job_user_handle(
+            a0,
+            a1,
+            nt_kernel_exec::service_arg::bool32(a2),
+            a3 as u32,
+        )
     } else if ssn == SSN_NT_USER_VALIDATE_HANDLE_SECURE {
         dispatch_validate_user_handle_secure(a0)
     } else if let Some(result) = dispatch_job_scoped_broadcast(ssn, a0, a1, a2, a3) {
@@ -18471,7 +18476,8 @@ unsafe fn dispatch_job_scoped_broadcast(
     }
 
     let result_info = current_request_argument(4)?;
-    let fnid = current_request_argument(5)?;
+    // `DWORD dwType`.
+    let fnid = u64::from(nt_kernel_exec::service_arg::ulong(current_request_argument(5)?));
     let ansi = current_request_argument(6)?;
     if fnid == FNID_BROADCASTSYSTEMMESSAGE {
         return Some(dispatch_broadcast_system_message(
@@ -18539,10 +18545,12 @@ unsafe fn enforce_job_handle_target_policy(ssn: u64, a0: u64, a2: u64) -> Option
         return None;
     }
     if ssn == SSN_NT_USER_SET_WINDOWS_HOOK_EX {
-        let target_process = if a2 == 0 {
+        // `DWORD ThreadId`.
+        let thread_id = u64::from(nt_kernel_exec::service_arg::ulong(a2));
+        let target_process = if thread_id == 0 {
             None
         } else {
-            thread_context_index_for_tid(a2).and_then(|index| {
+            thread_context_index_for_tid(thread_id).and_then(|index| {
                 let process_index = usize::try_from(thread_ctx_pi(index)).ok()?;
                 let process = process_ctx_w32process(process_index);
                 (process != 0).then_some(process)
@@ -18555,8 +18563,11 @@ unsafe fn enforce_job_handle_target_policy(ssn: u64, a0: u64, a2: u64) -> Option
         return None;
     }
     if ssn == SSN_NT_USER_SET_WIN_EVENT_HOOK {
-        let target_pid = current_request_argument(5).unwrap_or(0);
-        let target_tid = current_request_argument(6).unwrap_or(0);
+        // `DWORD idProcess, DWORD idThread`.
+        let target_pid =
+            u64::from(nt_kernel_exec::service_arg::ulong(current_request_argument(5).unwrap_or(0)));
+        let target_tid =
+            u64::from(nt_kernel_exec::service_arg::ulong(current_request_argument(6).unwrap_or(0)));
         let target_from_pid = (target_pid != 0).then(|| {
             process_context_index_for_pid(target_pid)
                 .map(|index| process_ctx_w32process(index))
@@ -18864,7 +18875,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     }
     let ret = call(handler, args.as_ptr(), nargs);
     if ssn == SSN_NT_USER_SET_WINDOW_LONG_PTR
-        && a1 < 64
+        && nt_kernel_exec::service_arg::ulong(a1) < 64
         && WIN32K_WINDOW_EXTRA_PROVIDER_TRACES.fetch_add(1, Ordering::Relaxed) < 256
     {
         print_str(b"[win32k-window-extra] provider pi/dispatch/hwnd/index/value/previous=");

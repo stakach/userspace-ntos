@@ -56,6 +56,7 @@ pub mod rtl_bitmap;
 pub mod rtl_time;
 mod runtime;
 mod semaphore;
+pub mod service_arg;
 pub mod session_section;
 pub mod single_list;
 pub mod slist;

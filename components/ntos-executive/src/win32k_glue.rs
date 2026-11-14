@@ -8017,7 +8017,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     }
     // Reject before attachment or shared request writes, not only at later lane acquisition.
     if ssn == nt_user_callback::NTUSER_SET_WINDOW_LONG_PTR_SSN
-        && a1 < 64
+        && nt_kernel_exec::service_arg::ulong(a1) < 64
         && WIN32K_WINDOW_EXTRA_INGRESS_TRACES.fetch_add(1, Ordering::Relaxed) < 256
     {
         print_str(b"[win32k-window-extra] ingress pi/tid/hwnd/index/value=");

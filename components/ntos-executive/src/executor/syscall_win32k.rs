@@ -293,6 +293,13 @@ pub(super) unsafe fn syscall_win32k_route(
     // dispatch with the ARG-frame pointer, then copy win32k's out-params back to the same
     // caller process.
     let has_buf = lp.msg.m0 == win32k_subsystem::SSN_NT_USER_INITIALIZE; // 0x10FA = NtUserProcessConnect
+    // The arguments later consumers of this dispatch decide on. NtUserProcessConnect's third
+    // argument is `ULONG Size`, used as a byte length when the reply is copied back.
+    let completion_args = if has_buf {
+        [a0, a1, u64::from(nt_kernel_exec::service_arg::ulong(a2)), a3]
+    } else {
+        [a0, a1, a2, a3]
+    };
     let current_pid = nt_handler.pm_pid_for_pi(pi);
     let mut d_a0 = if has_buf
         && (a0 == 0xFFFF_FFFF_FFFF_FFFF
@@ -309,8 +316,9 @@ pub(super) unsafe fn syscall_win32k_route(
     let mut userconnect_capture_status = 0u32;
     let (mut d_a1, blen) = if has_buf {
         let arg = win32k_subsystem::WIN32K_ARG_VADDR;
-        let n = if a2 <= win32k_subsystem::WIN32K_ARG_GENERAL_BYTES {
-            a2
+        let size = completion_args[2];
+        let n = if size <= win32k_subsystem::WIN32K_ARG_GENERAL_BYTES {
+            size
         } else {
             userconnect_capture_status = nt_process::STATUS_INVALID_PARAMETER;
             0
@@ -1912,7 +1920,11 @@ pub(super) unsafe fn syscall_win32k_route(
         if let (Some(result_info), Some(dw_type), Some(ansi)) =
             (result_info, dw_type, ansi)
         {
-            if matches!(dw_type, FNID_DEFWINDOWPROC | FNID_SENDMESSAGE) {
+            // `DWORD dwType` occupies the low half of its stack slot.
+            if matches!(
+                u64::from(nt_kernel_exec::service_arg::ulong(dw_type)),
+                FNID_DEFWINDOWPROC | FNID_SENDMESSAGE
+            ) {
                 let staged_result = if result_info == 0 {
                     0
                 } else {
@@ -2704,7 +2716,7 @@ pub(super) unsafe fn syscall_win32k_route(
                 }
             }
         }
-    } else if lp.msg.m0 == 0x1041 && a0 == 0x14 {
+    } else if lp.msg.m0 == 0x1041 && nt_kernel_exec::service_arg::ulong(a0) == 0x14 {
         // SystemParametersInfoW(SPI_SETDESKWALLPAPER) passes a user-mode UNICODE_STRING
         // descriptor, and that descriptor's Buffer is another user pointer. Capture the graph
         // at the executive boundary before isolated win32k's SpiSetWallpaper probes it.
@@ -3593,7 +3605,7 @@ pub(super) unsafe fn syscall_win32k_route(
             d_a3,
             dispatch_sp,
             dispatch_stack_args,
-            [a0, a1, a2, a3],
+            completion_args,
             message_output_stage.or(paint_output_stage),
             paint_output_claim,
             client,
@@ -3639,7 +3651,10 @@ pub(super) unsafe fn syscall_win32k_route(
                 scratch_base,
             );
             if let (Some(string), Some(count)) = (string, count) {
-                winlogon_credential_observe_text_out(string, count);
+                winlogon_credential_observe_text_out(
+                    string,
+                    u64::from(nt_kernel_exec::service_arg::ulong(count)),
+                );
             }
         }
         if open_dcw_staged_stack && r.1 && r.0 != 0 {
@@ -3932,7 +3947,7 @@ pub(super) unsafe fn syscall_win32k_route(
             observe_completed_gdi_batch_flush(&mut nt_handler, client.logical_caller,
                 inline_batch_records);
             observe_completed_desktop_dispatch(&mut nt_handler, client.logical_caller,
-                lp.msg.m0, [a0, a1, a2, a3], r.0, dispatch_return);
+                lp.msg.m0, completion_args, r.0, dispatch_return);
         }
         if observed_explorer_gui_client && r.1 && r.0 != 0 {
             match lp.msg.m0 {
@@ -4383,24 +4398,30 @@ pub(super) unsafe fn syscall_win32k_route(
             }
         }
     }
+    // NtUserRegisterClassExWOW returns `RTL_ATOM` (USHORT); the rest of rax is undefined.
+    let registered_atom = nt_kernel_exec::service_arg::ushort(st);
     if ok && !sc.redirected_user_callback && userinit_gui_client {
         if lp.msg.m0 == 0x103d && st != 0 {
             nt_handler.record_userinit_global_cursor_hit(st as u32);
         }
         if lp.msg.m0 == 0x10b4 && builtin_class_attempt {
-            if st != 0 {
+            if registered_atom != 0 {
                 if let Some((fn_id, _)) = builtin_class_args {
-                    nt_handler.record_userinit_builtin_class_hit(fn_id, st as u16);
+                    nt_handler.record_userinit_builtin_class_hit(fn_id, registered_atom);
                 }
             } else {
                 nt_handler.record_userinit_builtin_class_miss();
             }
         }
     }
-    if ok && !sc.redirected_user_callback && lp.msg.m0 == 0x10b4 && st != 0 && !svc_noninteractive
+    if ok
+        && !sc.redirected_user_callback
+        && lp.msg.m0 == 0x10b4
+        && registered_atom != 0
+        && !svc_noninteractive
     {
         if let Some(name) = registered_class_atom_name.as_ref() {
-            nt_handler.observe_class_atom_name(st as u16, name.as_slice());
+            nt_handler.observe_class_atom_name(registered_atom, name.as_slice());
         }
     }
     if ok
@@ -4424,9 +4445,9 @@ pub(super) unsafe fn syscall_win32k_route(
         } else if lp.msg.m0 == 0x1283 && st != 0 {
             nt_handler.promote_global_cursor(a0 as u32);
         }
-        if lp.msg.m0 == 0x10b4 && st != 0 {
+        if lp.msg.m0 == 0x10b4 && registered_atom != 0 {
             if let Some(key) = builtin_class_key.as_ref() {
-                nt_handler.observe_builtin_class_atom(key, st as u16);
+                nt_handler.observe_builtin_class_atom(key, registered_atom);
             }
         }
     }
@@ -4494,7 +4515,7 @@ pub(super) unsafe fn syscall_win32k_route(
         sc.result = st; // pointer-width NtUser/NtGdi return value back to the caller
         if winlogon_gui_client && lp.msg.m0 == 0x1077 && st != 0 {
             observe_winlogon_completed_dispatch(
-                win32k_glue::CompletedWin32kDispatch::new(lp.msg.m0, [a0, a1, a2, a3], sp, st),
+                win32k_glue::CompletedWin32kDispatch::new(lp.msg.m0, completion_args, sp, st),
                 scratch_base,
             );
         }
