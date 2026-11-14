@@ -348,6 +348,11 @@ impl ExecNtHandler {
         }
         let hive_sel = self.hive_mounts[index].sel;
         let dirty = hive.dirty_count();
+        if self.mutable_hives.has_retained_publication(hive_sel) {
+            // An edit of this hive is between its preparation and its publication. It pins the
+            // hive, so the mount cannot be released under it: in flight, not a refusal.
+            return STATUS_DEVICE_BUSY;
+        }
         let status = self.sync_mutable_hive(hive_sel, dirty, 0);
         if status != nt_fs::STATUS_SUCCESS {
             self.writable_fs_dirty = true;
@@ -423,6 +428,11 @@ impl ExecNtHandler {
                 Publication::Durable { settled } => {
                     if settled {
                         self.writable_fs_commit_required = false;
+                    } else {
+                        // A later checkpoint is in flight, possibly begun by this attempt.
+                        // The service boundary owns its publication.
+                        self.writable_fs_dirty = true;
+                        self.writable_fs_commit_required = true;
                     }
                     return nt_fs::STATUS_SUCCESS;
                 }
