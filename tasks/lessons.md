@@ -853,3 +853,9 @@ diagnosis-free failure.
 - Do not key the receipt by instance or by thread without checking who else can acknowledge in between. Other provider threads and callbacks nested in the first acknowledgement can complete any number of other operations before the repeat arrives.
 - Reserve the receipt where the operation is admitted. An allocation refused there fails one request; refused at the acknowledgement it leaves a provider that has already freed its memory with nothing to do but bugcheck.
 - A failing allocation's `scope=` names the syscall that was running, not the owner of the memory. Match the size to a doubling series and a workload counter before choosing a fix.
+
+## A Dispatch Arm Is Not Live Until Its Major Is Registered
+- A kernel-registered backend receives only the majors its driver registered; the I/O Manager fails every other major with `STATUS_INVALID_DEVICE_REQUEST` before the backend runs. The mounted volume dispatched SET_INFORMATION and FLUSH_BUFFERS for months without registering either, and a source-text test of the two `match` arms reported the path as working. Keep the served majors in one list next to the dispatch, and prove a new arm through the device stack (the per-boot volume probe), not by its text.
+- Before diagnosing which information class or option a backend rejects, check that the major reaches it at all. A status that matches the hypothesis (`NOT_SUPPORTED` versus `INVALID_DEVICE_REQUEST`) is the cheap discriminator; trace it.
+- A handle to the same file can be a different object kind on a different route. A service that resolves one kind (`OverlayFile`) must be checked against the kind the live route mints (`RoutedFile`) before a fix that depends on it is called complete.
+- A restored disk can already hold what a removed bootstrap used to write. Removing provisioning does not remove its output from a continued volume; check the restored state as well as the fresh one.
