@@ -325,6 +325,13 @@ impl FileSystem {
                 };
             }
         }
+        if let Err(status) = self.check_create_delete_state(&plan, options) {
+            return CreateResult {
+                status,
+                handle: INVALID_HANDLE,
+                information: 0,
+            };
+        }
         let (node_id, entry_id, information) = self.volume.apply_create(plan);
         if handle == self.handles.len() {
             self.handles.push(None);
@@ -344,7 +351,8 @@ impl FileSystem {
             serialization: nt_io_completion::FileIoSerialization::new(),
             cleanup_reference_held: false,
             cleanup_error: None,
-            delete_pending: options & FILE_DELETE_ON_CLOSE != 0,
+            delete_pending: false,
+            delete_on_close: options & FILE_DELETE_ON_CLOSE != 0,
             query: DirectoryQueryState::new(),
         });
         let notify = match information {

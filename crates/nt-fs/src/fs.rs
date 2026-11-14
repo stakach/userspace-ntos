@@ -43,6 +43,9 @@ mod optional_file;
 #[path = "file_create.rs"]
 mod file_create;
 
+#[path = "delete_disposition.rs"]
+mod delete_disposition;
+
 #[path = "file_object_information.rs"]
 mod file_object_information;
 pub use file_object_information::FileObjectInformation;
@@ -3570,8 +3573,10 @@ struct FileObject {
     /// The final handle transfers its reference here until cleanup effects have committed.
     cleanup_reference_held: bool,
     cleanup_error: Option<u32>,
-    /// `FCB->DeletePending` — set by `FileDispositionInformation`, actioned by final-handle cleanup.
+    /// DeletePending of the opened entry, mirrored on every File open on it.
     delete_pending: bool,
+    /// `FILE_DELETE_ON_CLOSE`: this File marks its entry DeletePending when its last handle closes.
+    delete_on_close: bool,
     /// Per-`FILE_OBJECT` directory-enumeration cursor (spec §17): `NtQueryDirectoryFile` resumes
     /// from it, `RestartScan` rewinds it. Shared by handles duplicated from this file object.
     query: DirectoryQueryState,
@@ -5212,33 +5217,18 @@ impl FileSystem {
                 if data.is_empty() {
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
-                let delete = data[0] != 0;
-                if delete {
-                    let status = self.volume.can_mark_delete_pending(node_id, false);
-                    if status != STATUS_SUCCESS {
-                        return status;
-                    }
-                }
-                self.obj_mut(handle).unwrap().delete_pending = delete;
-                STATUS_SUCCESS
+                self.set_delete_disposition(handle, data[0] != 0, false)
             }
             FILE_DISPOSITION_INFORMATION_EX => {
                 let flags = match Self::decode_disposition_ex_flags(data) {
                     Ok(flags) => flags,
                     Err(status) => return status,
                 };
-                let delete = flags & FILE_DISPOSITION_DELETE != 0;
-                if delete {
-                    let status = self.volume.can_mark_delete_pending(
-                        node_id,
-                        flags & FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE != 0,
-                    );
-                    if status != STATUS_SUCCESS {
-                        return status;
-                    }
-                }
-                self.obj_mut(handle).unwrap().delete_pending = delete;
-                STATUS_SUCCESS
+                self.set_delete_disposition(
+                    handle,
+                    flags & FILE_DISPOSITION_DELETE != 0,
+                    flags & FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE != 0,
+                )
             }
             FILE_POSITION_INFORMATION => {
                 if data.len() < 8 {
@@ -5542,7 +5532,7 @@ impl FileSystem {
         let node = self.volume.node(node_id).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
         if node.is_dir || node.file_id != file_id || node.link_count != 1
             || self.handles.iter().flatten()
-                .any(|object| object.node_id == node_id && object.delete_pending)
+                .any(|object| object.node_id == node_id && object.requests_delete())
         {
             return Err(STATUS_ACCESS_DENIED);
         }

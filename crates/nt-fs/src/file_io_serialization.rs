@@ -299,16 +299,18 @@ impl FileSystem {
         }
         let object = self.handles[index].as_ref().unwrap();
         let entry_id = object.entry_id;
-        if object.delete_pending && self.wal_protected_subtree(object.node_id) {
+        if object.requests_delete() && self.wal_protected_subtree(object.node_id) {
             return Err(STATUS_ACCESS_DENIED);
         }
+        let delete_due = self.delete_due_at_cleanup(index);
+        let object = self.handles[index].as_ref().unwrap();
         let node = self.volume.node(object.node_id).ok_or(STATUS_DATA_ERROR)?;
         let filter = if node.is_dir {
             crate::FILE_NOTIFY_CHANGE_DIR_NAME
         } else {
             crate::FILE_NOTIFY_CHANGE_FILE_NAME
         };
-        let deleted_name = if object.delete_pending
+        let deleted_name = if delete_due
             && entry_id != 0
             && self.checked_object_entry(object)?.is_some()
         {
