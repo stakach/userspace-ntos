@@ -21,6 +21,55 @@ pub const fn resume_yield_caps(
     }
 }
 
+/// How a provider parked in `KeUserModeCallback` is being entered again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallbackResumeOrigin {
+    /// The client's NtCallbackReturn. `enclosing_callback` says the client is still inside an
+    /// outer callback, so the resumed dispatch is itself nested in that callback.
+    Return { enclosing_callback: bool },
+    /// The callback is being cancelled or failed and its provider unwound. The client will not
+    /// run again, so no receive boundary can be left at the root for it.
+    Unwind,
+}
+
+/// The typed receive boundaries a callback resume may yield through. A returned callback is
+/// an ordinary resumed provider and keeps the authority of its nesting; an unwind has none.
+pub const fn callback_resume_yield_caps(
+    origin: CallbackResumeOrigin,
+    has_logical_caller: bool,
+) -> ResumeYieldCaps {
+    match origin {
+        CallbackResumeOrigin::Return { enclosing_callback } => {
+            resume_yield_caps(enclosing_callback, has_logical_caller)
+        }
+        CallbackResumeOrigin::Unwind => ResumeYieldCaps {
+            hosted_receive: false,
+            nested_service_wait: false,
+        },
+    }
+}
+
+/// The yield a callback-return resume came back with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallbackReturnYield {
+    Receive,
+    ServiceWait,
+}
+
+/// Whether the callback-return consumer may transfer the completed callback into that yield.
+/// A service wait is owned at any depth: only the completed callback's token is transferred
+/// and every enclosing callback keeps its own. Receive ownership exists only for an outermost
+/// dispatch, which is why a nested resume is never granted it.
+pub const fn callback_return_yield_is_owned(
+    yielded: CallbackReturnYield,
+    enclosing_callback: bool,
+) -> bool {
+    match yielded {
+        CallbackReturnYield::ServiceWait => true,
+        CallbackReturnYield::Receive => !enclosing_callback,
+    }
+}
+
 /// A refused root receive has either a certified pre-native owner conflict or an
 /// uncertain native effect. Only the former may give the exact child another turn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

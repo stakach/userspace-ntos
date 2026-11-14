@@ -724,3 +724,77 @@ fn kernel_service_park_does_not_lift_another_lanes_unsettled_return() {
     lanes.suspend_running(hosted_lane, binding(2).reply_object, 42).unwrap();
     assert!(lanes.fresh_dispatch_busy());
 }
+
+/// Issue #390: a nested callback returns and its provider parks in its own service Call while
+/// the client is still inside an enclosing callback. The completed callback's token becomes
+/// the service-wait frame; the enclosing callback's token is never touched. The frame is
+/// entered exactly once, and its terminal hands the lane back to the enclosing callback.
+#[test]
+fn nested_callback_return_service_wait_resumes_once_and_keeps_the_enclosing_callback() {
+    const ENCLOSING: u64 = 10;
+    const COMPLETED: u64 = 20;
+    const SERVICE: u64 = 41;
+    let mut lanes = Lanes::new(1, 4);
+    let lane = lanes.allocate(binding(1)).unwrap();
+    let reply = binding(1).reply_object;
+    lanes.begin_dispatch(lane, reply).unwrap();
+    let dispatch = lanes.active_dispatch_identity(lane).unwrap().unwrap();
+    // Outer dispatch -> enclosing callback -> nested syscall -> nested callback returns ->
+    // the nested syscall's provider parks in its service Call.
+    lanes.suspend_running(lane, reply, ENCLOSING).unwrap();
+    lanes.resume_external(lane, reply, ENCLOSING).unwrap();
+    lanes.suspend_running(lane, reply, COMPLETED).unwrap();
+    lanes.resume_external(lane, reply, COMPLETED).unwrap();
+    lanes.suspend_running(lane, reply, SERVICE).unwrap();
+    assert_eq!(lanes.external_depth(lane), Ok(3));
+
+    let key = SuspensionKey::service_wait(SERVICE);
+    // The enclosing token is not the completed callback and cannot be transferred.
+    assert_eq!(
+        lanes.transfer_callback_to_service_wait_external_owned(
+            lane, reply, dispatch, ENCLOSING, SERVICE, key, 1, owner(1), 100,
+        ),
+        Err((LaneError::InvalidPhase, 100)),
+    );
+    assert_eq!(lanes.external_depth(lane), Ok(3));
+    lanes
+        .transfer_callback_to_service_wait_external_owned(
+            lane, reply, dispatch, COMPLETED, SERVICE, key, 1, owner(1), 100,
+        )
+        .unwrap();
+    assert_eq!(lanes.external_depth(lane), Ok(2));
+    assert_eq!(lanes.external_top(lane), Ok(Some(SERVICE)));
+    assert_eq!(lanes.frame(lane, key).unwrap().unwrap().phase, SuspensionPhase::Waiting);
+    // Parked and owned: the source terminal's fresh dispatch is not fenced.
+    assert!(!lanes.fresh_dispatch_busy());
+
+    // The terminal was acknowledged and the service Reply ACKed: the token is retired and
+    // only the typed continuation remains, above the untouched enclosing callback.
+    lanes.resume_external(lane, reply, SERVICE).unwrap();
+    lanes
+        .retire_service_wait_external_running(lane, reply, dispatch, SERVICE, key, owner(1))
+        .unwrap();
+    assert_eq!(lanes.external_top(lane), Ok(Some(ENCLOSING)));
+    assert_eq!(lanes.external_depth(lane), Ok(1));
+
+    lanes.select(key, 7).unwrap();
+    lanes.begin_resume(lane, reply, key).unwrap();
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Running));
+    // Exactly once: the entered frame cannot be selected or entered again.
+    assert!(lanes.select(key, 7).is_err());
+    assert!(lanes.begin_resume(lane, reply, key).is_err());
+
+    let identity = lanes
+        .retain_terminal_running(lane, reply, key, owner(1), 1000)
+        .unwrap();
+    // The enclosing callback cannot run until the nested syscall's terminal has retired.
+    assert_eq!(lanes.external_top(lane), Ok(Some(ENCLOSING)));
+    assert!(lanes.resume_external(lane, reply, ENCLOSING).is_err());
+    ack_all(&mut lanes, identity);
+    lanes.finish_terminal(identity, reply, Ok(())).unwrap().unwrap();
+    // The nested syscall returned; the lane belongs to the enclosing callback again.
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Suspended));
+    assert_eq!(lanes.external_top(lane), Ok(Some(ENCLOSING)));
+    assert!(lanes.is_dispatch_identity_active(dispatch));
+    lanes.resume_external(lane, reply, ENCLOSING).unwrap();
+}

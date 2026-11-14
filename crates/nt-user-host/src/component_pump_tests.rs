@@ -22,6 +22,57 @@ fn resumed_provider_preserves_the_yield_authority_of_its_callback_origin() {
     }
 }
 
+/// Issue #390: a provider resumed by NtCallbackReturn while the client is still inside an
+/// enclosing callback must be able to leave its own inline source work at the root, exactly
+/// as a syscall made inside that callback and a wait-resumed nested dispatch already can.
+#[test]
+fn nested_callback_return_resume_may_yield_its_own_service_wait() {
+    let nested = callback_resume_yield_caps(
+        CallbackResumeOrigin::Return { enclosing_callback: true }, true,
+    );
+    assert!(nested.nested_service_wait, "a nested return must not be confined in its pump");
+    // Receive ownership belongs only to an outermost hosted dispatch; it stays refused.
+    assert!(!nested.hosted_receive);
+    assert_eq!(nested, resume_yield_caps(true, true));
+}
+
+#[test]
+fn outermost_callback_return_resume_keeps_its_receive_and_service_yield() {
+    let outermost = callback_resume_yield_caps(
+        CallbackResumeOrigin::Return { enclosing_callback: false }, true,
+    );
+    assert!(outermost.hosted_receive);
+    assert!(!outermost.nested_service_wait);
+    assert_eq!(outermost, resume_yield_caps(false, true));
+}
+
+/// Unsupported origins are refused explicitly: a cancelled callback is unwound for a client
+/// that cannot run again, and a resume without a logical caller has no Reply owner to park.
+#[test]
+fn unwound_or_ownerless_callback_resume_is_refused_every_yield() {
+    const NONE: ResumeYieldCaps = ResumeYieldCaps { hosted_receive: false, nested_service_wait: false };
+    for has_logical_caller in [false, true] {
+        assert_eq!(callback_resume_yield_caps(CallbackResumeOrigin::Unwind, has_logical_caller), NONE);
+    }
+    for enclosing_callback in [false, true] {
+        assert_eq!(
+            callback_resume_yield_caps(CallbackResumeOrigin::Return { enclosing_callback }, false),
+            NONE,
+        );
+    }
+}
+
+/// What the callback-return consumer may do with the yield its resumed pump came back with.
+#[test]
+fn callback_return_yield_ownership_is_exact_per_kind_and_depth() {
+    use CallbackReturnYield::{Receive, ServiceWait};
+    for enclosing_callback in [false, true] {
+        assert!(callback_return_yield_is_owned(ServiceWait, enclosing_callback));
+    }
+    assert!(callback_return_yield_is_owned(Receive, false));
+    assert!(!callback_return_yield_is_owned(Receive, true));
+}
+
 #[test]
 fn busy_idle_receive_after_child_scheduler_yield_keeps_the_running_reply_and_continuation() {
     // The child receive returned a scheduler yield with a new physical Reply. The root loop
