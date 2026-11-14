@@ -30,11 +30,13 @@ unsafe fn trace_confined_service_wait(ch: &PumpChannel, route: PeerRoute) {
     };
     let sample = CONFINED_SERVICE_WAIT_TRACE_N.fetch_add(1, Ordering::Relaxed) + 1;
     if sample > 8 && !sample.is_power_of_two() { return; }
-    crate::print_str(b"[pump-service-wait-confined] sample/lane/lane-gen/epoch/reply/token/client-pi/kernel-caller/receive-yield-cap/nested-service-yield-cap/source-ready=");
+    let [dispatch_id, ssn, callback_depth] = crate::win32k_glue::confined_pump_dispatch_trace();
+    crate::print_str(b"[pump-service-wait-confined] sample/lane/lane-gen/epoch/reply/token/client-pi/kernel-caller/receive-yield-cap/nested-service-yield-cap/source-ready/dispatch/ssn/callback-depth=");
     for value in [sample, u64::from(dispatch.lane().index), dispatch.lane().generation,
         dispatch.epoch(), reply, token, ch.client_pi, u64::from(ch.kernel_caller.is_some()),
         u64::from(ch.caps.hosted_receive_yield), u64::from(ch.caps.nested_service_wait_yield),
-        u64::from(crate::driver_launch::nested_win32k_source_work_ready())] {
+        u64::from(crate::driver_launch::nested_win32k_source_work_ready()),
+        dispatch_id, ssn, callback_depth] {
         crate::print_str(b"/");
         crate::print_hex_u64(value);
     }

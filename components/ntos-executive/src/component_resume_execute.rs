@@ -238,7 +238,16 @@ pub(crate) unsafe fn run_hosted(
         PendingComponentDispatch::RootMaintenance(_) => return None,
         PendingComponentDispatch::NestedRestore(_) => return None,
         PendingComponentDispatch::ServiceWait(pending) => {
-            match win32k_glue::resume_suspended_service_wait_component(pending) {
+            let traced = pending.snapshot.callback_token.map(|token| {
+                (pending.snapshot.dispatch, pending.snapshot.client, pending.yielded.token, token)
+            });
+            let resumed = win32k_glue::resume_suspended_service_wait_component(pending);
+            if let Some((dispatch, client, service_token, callback_token)) = traced {
+                win32k_glue::trace_callback_service_wait_resumed(
+                    dispatch, client, service_token, callback_token, &resumed,
+                );
+            }
+            match resumed {
                 win32k_glue::ServiceWaitPumpCompletion::Restored(completion) => match completion {
                     win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => {
                         crate::spawn_hosts::shared_ingress::owner::runtime::nested::trace_deferred_resume_owner(

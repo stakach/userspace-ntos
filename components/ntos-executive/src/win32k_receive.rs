@@ -1282,6 +1282,45 @@ pub(crate) unsafe fn resume_suspended_receive_component(
 
 /// Continue a root-parked win32k syscall after its exact external service Reply and lane
 /// transition have been acknowledged. The saved request is never sent a second time.
+static CALLBACK_SERVICE_WAIT_RESUME_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded evidence of how a service wait that carries a callback token left its one resume.
+/// Outcome: 1 completed, 2 provider wait, 3 LPC wait, 4 callback, 5 service wait again,
+/// 6 receive, 7 refused or retained, 8 failed, 9 nested source deferred.
+pub(crate) unsafe fn trace_callback_service_wait_resumed(
+    dispatch: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+    service_token: u64,
+    callback_token: u64,
+    completion: &ServiceWaitPumpCompletion,
+) {
+    use ProviderWaitPumpCompletion as Provider;
+    let sample = CALLBACK_SERVICE_WAIT_RESUME_TRACES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample > 32 && !sample.is_power_of_two() { return; }
+    let outcome = match completion {
+        ServiceWaitPumpCompletion::Restored(Provider::Completed(_)) => 1,
+        ServiceWaitPumpCompletion::Restored(Provider::Reparked(_)) => 2,
+        ServiceWaitPumpCompletion::Restored(Provider::LpcReparked(_)) => 3,
+        ServiceWaitPumpCompletion::Restored(Provider::UserCallbackSuspended) => 4,
+        ServiceWaitPumpCompletion::ServiceReparked(_)
+        | ServiceWaitPumpCompletion::Restored(Provider::ServiceReparked(_)) => 5,
+        ServiceWaitPumpCompletion::ReceiveReparked(_)
+        | ServiceWaitPumpCompletion::Restored(Provider::ReceiveReparked(_)) => 6,
+        ServiceWaitPumpCompletion::CaptureRefused(..)
+        | ServiceWaitPumpCompletion::Restored(Provider::CaptureRefused(..))
+        | ServiceWaitPumpCompletion::Restored(Provider::RetainedFailure(..)) => 7,
+        ServiceWaitPumpCompletion::Restored(Provider::Failed(_)) => 8,
+        ServiceWaitPumpCompletion::Restored(Provider::NestedSourceDeferred) => 9,
+    };
+    print_str(b"[callback-return-service-wait] stage=resumed sample/dispatch/ssn/pi/tid/lane/service-token/callback-token/outcome=");
+    for value in [sample, dispatch.dispatch_id, dispatch.ssn, client.pi as u64, client.tid,
+        u64::from(dispatch.lane.index), service_token, callback_token, outcome] {
+        print_str(b"/");
+        crate::print_hex_u64(value);
+    }
+    print_str(b"\n");
+}
+
 pub(crate) unsafe fn resume_suspended_service_wait_component(
     pending: PendingServiceWaitDispatch,
 ) -> ServiceWaitPumpCompletion {

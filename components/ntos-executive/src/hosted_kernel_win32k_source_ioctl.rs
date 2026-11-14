@@ -1043,7 +1043,10 @@ impl Work {
         if !self.terminal_traced {
             if let Some(address) = transport.packet_address() {
                 self.terminal_traced = true;
-                if TERMINAL_OWNER_TRACES.fetch_add(1, Ordering::Relaxed) < 128 {
+                // The first 128 terminals, then power-of-two samples: a late stall must
+                // still be able to name its IOCTL after an early burst.
+                let sample = TERMINAL_OWNER_TRACES.fetch_add(1, Ordering::Relaxed) + 1;
+                if sample <= 128 || sample.is_power_of_two() {
                     let owner = self.route.identity();
                     print_str(b"[source-ioctl-terminal-owner] packet/nonce/token/source/ticket/gen/code/route-domain/route-gen/executor/lane/lane-gen/epoch/reply/pending/reply-entered/status/info=");
                     for value in [address, self.nonce, self.token, self.source_address,

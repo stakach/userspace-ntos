@@ -23,6 +23,7 @@ pub(crate) use receive::{prepare_receive_yield, prepare_root_ingress_yield, prep
     root_ingress_unwind_continuation_is_current,
     resume_suspended_receive_component, receive_continuation_is_current,
     resume_suspended_service_wait_component, service_wait_continuation_is_current,
+    trace_callback_service_wait_resumed,
     trace_receive_phase, ReceiveFaultCapture, ReceivePumpCompletion, ServiceWaitPumpCompletion,
     RootMaintenancePumpCompletion, RootMaintenancePumpReturn,
     resume_suspended_root_maintenance_component,
@@ -4806,11 +4807,41 @@ unsafe fn flush_returned_user_callback_gdi_batch(
     reassert_top_client_callback_window(&identity);
 }
 
+static CALLBACK_RETURN_SERVICE_WAIT_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded evidence that a callback-return resume left its own service Call at the root.
+unsafe fn trace_callback_return_service_wait(
+    dispatch: UserCallbackDispatchContext,
+    client: Win32kClientContext,
+    yielded: ServiceWaitYield,
+    completed_token: u64,
+    enclosing_callback: bool,
+) {
+    let sample = CALLBACK_RETURN_SERVICE_WAIT_TRACES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample > 32 && !sample.is_power_of_two() { return; }
+    print_str(b"[callback-return-service-wait] stage=yielded sample/dispatch/ssn/pi/tid/lane/service-token/completed-callback-token/enclosing-callback/depth=");
+    for value in [sample, dispatch.dispatch_id, dispatch.ssn, client.pi as u64, client.tid,
+        u64::from(dispatch.lane.index), yielded.token, completed_token,
+        u64::from(enclosing_callback),
+        (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len() as u64] {
+        print_str(b"/");
+        print_hex_u64(value);
+    }
+    print_str(b"\n");
+}
+
+/// The dispatch a confined pump is executing and how deep its client's callbacks are.
+pub(crate) unsafe fn confined_pump_dispatch_trace() -> [u64; 3] {
+    let dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    [dispatch.dispatch_id, dispatch.ssn,
+        (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len() as u64]
+}
+
 unsafe fn resume_suspended_user_callback_component(
     request: nt_user_callback::CallbackHeader,
     client: crate::spawn_hosts::UserCallbackClient,
     callback_token: u64,
-    allow_receive_yield: bool,
+    origin: nt_user_host::component_pump::CallbackResumeOrigin,
     claim: CallbackResumeClaim,
 ) -> crate::spawn_hosts::PumpResult {
     if client.pi != request.client_pi
@@ -4839,8 +4870,13 @@ unsafe fn resume_suspended_user_callback_component(
     ) else {
         panic!("callback execution lane is absent from the physical catalog");
     };
-    channel.caps.hosted_receive_yield = allow_receive_yield
-        && channel.logical_caller.is_some();
+    // A returned callback is an ordinary resumed provider: it keeps the yield authority of
+    // its nesting, like a provider- or LPC-wait resume. An unwind is granted none.
+    let yield_caps = nt_user_host::component_pump::callback_resume_yield_caps(
+        origin, channel.logical_caller.is_some(),
+    );
+    channel.caps.hosted_receive_yield = yield_caps.hosted_receive;
+    channel.caps.nested_service_wait_yield = yield_caps.nested_service_wait;
     if !crate::service_sec_image::component_external_resume_ready(lane, callback_token)
         || !select_win32k_client_window(win32k_client_context_from_callback_client(client))
     {
@@ -5494,7 +5530,8 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
             dispatch_context,
         );
         let result = resume_suspended_user_callback_component(
-            request, client, callback_token, false, claim,
+            request, client, callback_token,
+            nt_user_host::component_pump::CallbackResumeOrigin::Unwind, claim,
         );
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -5726,7 +5763,8 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             dispatch_context,
         );
         let component = resume_suspended_user_callback_component(
-            request, client, popped.external_token(), false, claim,
+            request, client, popped.external_token(),
+            nt_user_host::component_pump::CallbackResumeOrigin::Unwind, claim,
         );
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -6130,11 +6168,12 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         dispatch_context,
     );
     let completed_context = win32k_client_context_from_callback_client(completed_client);
-    let allow_receive_yield = (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE))
+    let enclosing_callback = (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE))
         .top_for(&identity)
-        .is_none();
+        .is_some();
     let component = resume_suspended_user_callback_component(
-        request, completed_client, completed_frame.external_token(), allow_receive_yield, claim,
+        request, completed_client, completed_frame.external_token(),
+        nt_user_host::component_pump::CallbackResumeOrigin::Return { enclosing_callback }, claim,
     );
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -6192,7 +6231,12 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             .copy_from_slice(&completed_frame.arg_snapshot()[..arg_snapshot_len as usize]);
     }
     if let Some(yielded) = component.receive_yield() {
-        assert!(!nested_user_callback, "nested callback cannot yield Receive ownership");
+        assert!(
+            nt_user_host::component_pump::callback_return_yield_is_owned(
+                nt_user_host::component_pump::CallbackReturnYield::Receive, nested_user_callback,
+            ),
+            "nested callback cannot yield Receive ownership",
+        );
         let Some(channel) = core::ptr::replace(
             core::ptr::addr_of_mut!(USER_CALLBACK_YIELDED_CHANNEL), None,
         ) else {
@@ -6222,7 +6266,15 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         });
     }
     if let Some(yielded) = component.service_wait_yield {
-        assert!(!nested_user_callback, "nested callback cannot yield service-wait ownership");
+        // Owned at any depth: only this completed callback's token is transferred into the
+        // service wait. An enclosing callback keeps its own token, Reply and publication.
+        debug_assert!(nt_user_host::component_pump::callback_return_yield_is_owned(
+            nt_user_host::component_pump::CallbackReturnYield::ServiceWait, nested_user_callback,
+        ));
+        trace_callback_return_service_wait(
+            dispatch_context, completed_context, yielded, completed_frame.external_token(),
+            nested_user_callback,
+        );
         let Some(channel) = core::ptr::replace(
             core::ptr::addr_of_mut!(USER_CALLBACK_YIELDED_CHANNEL), None,
         ) else {
