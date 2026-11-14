@@ -3364,9 +3364,12 @@ pub unsafe extern "system" fn rtl_create_security_descriptor(
 }
 
 /// `RtlSetDaclSecurityDescriptor(PSECURITY_DESCRIPTOR, BOOLEAN DaclPresent, PACL, BOOLEAN Defaulted)`.
+/// Ported from `references/reactos/sdk/lib/rtl/sd.c:303`: absolute descriptors only (a
+/// self-relative one is `STATUS_INVALID_SECURITY_DESCR`); removing the DACL clears only
+/// `SE_DACL_PRESENT`.
 ///
 /// # Safety
-/// `sd` a valid writable absolute `SECURITY_DESCRIPTOR`.
+/// `sd` a valid writable `SECURITY_DESCRIPTOR`.
 #[export_name = "RtlSetDaclSecurityDescriptor"]
 pub unsafe extern "system" fn rtl_set_dacl_security_descriptor(
     sd: *mut c_void,
@@ -3377,25 +3380,24 @@ pub unsafe extern "system" fn rtl_set_dacl_security_descriptor(
     if sd.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // Control bits: SE_DACL_PRESENT=0x0004, SE_DACL_DEFAULTED=0x0008 (offset 0x02, u16).
-    // Dacl pointer at offset 0x20 (absolute x64 SD). Set per the args.
-    // SAFETY: sd is a valid writable absolute SECURITY_DESCRIPTOR per the contract.
-    unsafe {
-        let control = (sd as *mut u8).add(0x02) as *mut u16;
-        if dacl_present != 0 {
-            *control |= 0x0004;
-            if dacl_defaulted != 0 {
-                *control |= 0x0008;
-            } else {
-                *control &= !0x0008;
-            }
-            *((sd as *mut u8).add(0x20) as *mut u64) = dacl as u64;
-        } else {
-            *control &= !(0x0004 | 0x0008);
-            *((sd as *mut u8).add(0x20) as *mut u64) = 0;
-        }
+    // SAFETY: every descriptor form starts with Revision, Sbz1 and Control.
+    let prefix = unsafe { core::slice::from_raw_parts(sd as *const u8, 4) };
+    let length = match nt_security::raw_rtl::descriptor_header_length(prefix) {
+        Ok(length) => length,
+        Err(status) => return status,
+    };
+    // SAFETY: the caller's descriptor is at least the header its own Control word selects; a
+    // self-relative header is rejected by the setter before any pointer field is addressed.
+    let header = unsafe { core::slice::from_raw_parts_mut(sd as *mut u8, length) };
+    match nt_security::raw_rtl::set_absolute_dacl(
+        header,
+        dacl_present != 0,
+        dacl as u64,
+        dacl_defaulted != 0,
+    ) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(status) => status,
     }
-    STATUS_SUCCESS
 }
 
 /// `RtlCreateAcl(PACL, ULONG AclLength, ULONG AclRevision) -> NTSTATUS`.
@@ -6269,11 +6271,12 @@ pub unsafe extern "system" fn rtl_free_sid(sid: *mut c_void) -> *mut c_void {
 
 /// `RtlGetDaclSecurityDescriptor(PSECURITY_DESCRIPTOR, PBOOLEAN DaclPresent, PACL* Dacl,
 /// PBOOLEAN DaclDefaulted) -> NTSTATUS`. Ported from `references/reactos/sdk/lib/rtl/sd.c:199`.
-/// Absolute (non-self-relative) SD only — the form csrsrv builds via
-/// RtlCreateSecurityDescriptor + RtlSetDaclSecurityDescriptor (Dacl at offset 0x20 is a POINTER).
+/// Both descriptor forms: an absolute one (RtlCreateSecurityDescriptor) holds the DACL pointer, a
+/// self-relative one (anything NtQuerySecurityObject returns) holds its offset from the
+/// descriptor base. `Dacl` and `DaclDefaulted` are written only when a DACL is present.
 ///
 /// # Safety
-/// `sd` a valid absolute `SECURITY_DESCRIPTOR`; the out-pointers valid + writable.
+/// `sd` a valid `SECURITY_DESCRIPTOR`; the out-pointers valid + writable.
 #[export_name = "RtlGetDaclSecurityDescriptor"]
 pub unsafe extern "system" fn rtl_get_dacl_security_descriptor(
     sd: *const c_void,
@@ -6284,24 +6287,33 @@ pub unsafe extern "system" fn rtl_get_dacl_security_descriptor(
     if sd.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: sd is a valid absolute SD; out-pointers writable per the contract.
+    // SAFETY: every descriptor form starts with Revision, Sbz1 and Control.
+    let prefix = unsafe { core::slice::from_raw_parts(sd as *const u8, 4) };
+    let length = match nt_security::raw_rtl::descriptor_header_length(prefix) {
+        Ok(length) => length,
+        Err(status) => return status,
+    };
+    // SAFETY: the caller's descriptor is at least the header its own Control word selects.
+    let header = unsafe { core::slice::from_raw_parts(sd as *const u8, length) };
+    let view = match nt_security::raw_rtl::descriptor_acl(
+        header,
+        sd as u64,
+        nt_security::raw_rtl::DescriptorAcl::Dacl,
+    ) {
+        Ok(view) => view,
+        Err(status) => return status,
+    };
+    // SAFETY: the out-pointers are writable per the contract.
     unsafe {
-        // Revision @0, Control @0x02 (u16). SECURITY_DESCRIPTOR_REVISION = 1.
-        if *(sd as *const u8) != rtl::security::SECURITY_DESCRIPTOR_REVISION {
-            return 0xC000_0002; // STATUS_UNKNOWN_REVISION
-        }
-        let control = *((sd as *const u8).add(0x02) as *const u16);
-        let present = (control & 0x0004) == 0x0004; // SE_DACL_PRESENT
         if !dacl_present.is_null() {
-            *dacl_present = present as u8;
+            *dacl_present = view.present as u8;
         }
-        if present {
-            // Dacl pointer @0x20 (absolute SD x64).
+        if view.present {
             if !dacl.is_null() {
-                *dacl = *((sd as *const u8).add(0x20) as *const *mut c_void);
+                *dacl = view.address as *mut c_void;
             }
             if !dacl_defaulted.is_null() {
-                *dacl_defaulted = ((control & 0x0008) == 0x0008) as u8; // SE_DACL_DEFAULTED
+                *dacl_defaulted = view.defaulted as u8;
             }
         }
     }
