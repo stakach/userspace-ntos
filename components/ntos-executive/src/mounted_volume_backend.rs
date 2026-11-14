@@ -1349,11 +1349,11 @@ impl MountedVolumeBackend {
             open.current_offset,
         )?
         .value();
-        let offset = u32::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
         let eof = metadata.end_of_file.min(u32::MAX as u64) as u32;
-        if offset >= eof {
+        // A position past the end, however far, reads nothing.
+        let Some(offset) = u32::try_from(offset).ok().filter(|offset| *offset < eof) else {
             return Err(NtStatus::END_OF_FILE);
-        }
+        };
         let expected = (parameters.length as usize).min((eof - offset) as usize);
         let physical_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
             .ok_or(NtStatus::DEVICE_NOT_READY)?;

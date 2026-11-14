@@ -122,10 +122,7 @@ impl MountedVolumeBackend {
     ) -> Result<DispatchOutcome, NtStatus> {
         let class = parameters.info_class;
         let length = parameters.length as usize;
-        if parameters.target_file.is_some()
-            || !matches!(parameters.control, nt_io_manager::SetInformationControl::None)
-            || length > ctx.system_buffer.len()
-        {
+        if length > ctx.system_buffer.len() {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         let payload = &ctx.system_buffer[..length];
@@ -153,6 +150,12 @@ impl MountedVolumeBackend {
             payload,
         )
         .map_err(status)?;
+        // Only rename, link and move-cluster name a target; none of them is decided here.
+        if parameters.target_file.is_some()
+            || !matches!(parameters.control, nt_io_manager::SetInformationControl::None)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let result = match action {
             nt_fs::LayeredSetInformationAction::Writable => {
                 let nt_fs::LayeredOpenSource::Overlay { file_id: overlay_file } = source else {
