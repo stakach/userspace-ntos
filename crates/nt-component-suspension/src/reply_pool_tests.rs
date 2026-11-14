@@ -562,3 +562,77 @@ fn acknowledged_reply_is_not_recycled_while_still_canonical() {
     assert_eq!(returned.reply(), 40);
     assert!(pool.is_empty());
 }
+
+/// A provider calling back into a dependent asks for the dependent's retained Call. Every way
+/// that request can be refused must stay distinguishable to the adapter that reports it.
+#[test]
+fn nested_dependent_admission_refusals_name_their_invariant() {
+    use crate::{AdmissionRefusal, LaneError, RetainedDispatchError, RetainedWorkError};
+    let (mut lanes, mut peers, provider, mut owner, _) = setup_shared();
+    let (dependent_lane, mut registration) = lanes.allocate_shared_staged(
+        &mut peers, 1, 2, LaneBinding { executor_id: 11, receive_endpoint: 20, reply_object: 31 },
+    ).unwrap();
+    let dependent = peers.publish_lane(&mut registration, 1, 2, &lanes).unwrap();
+    lanes.begin_startup(dependent_lane, 31, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
+    lanes.complete_startup(dependent_lane, 31,
+        |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)).unwrap();
+    let mut pool = IngressReplyPool::new(20, 3).unwrap();
+    for reply in [41, 42] {
+        pool.insert(ComponentIngress::new(20, reply).unwrap(), &owner, &lanes, free).ok().unwrap();
+    }
+    let observe = |old: u64| move |_: u64, reply: u64| Ok::<_, u8>(if reply == old {
+        ReplyBindingObservation::Free
+    } else {
+        ReplyBindingObservation::BoundToTarget
+    });
+
+    // The dependent has not parked a Call on the shared endpoint.
+    let refused = pool.admit(&mut owner, dependent, &mut lanes, &peers, 1, 2, observe(31))
+        .unwrap_err();
+    assert_eq!(refused, ReplyAdmissionError::Store(RetainedWorkError::NotFound));
+    assert_eq!(refused.refusal(), AdmissionRefusal::NoRetainedCall);
+
+    call(&mut owner, &lanes);
+    pool.retain(&mut owner, &lanes, &mut peers, provider.badge(), free, bound).unwrap();
+    let provider_dispatch = pool.admit(&mut owner, provider, &mut lanes, &peers, 1, 2, observe(30))
+        .unwrap();
+    owner.begin_receive_for_owner(&lanes, IngressExecutionOwner::Dispatch(provider_dispatch))
+        .unwrap();
+
+    // The shared receive is still reserved for the running provider.
+    let refused = pool.admit(&mut owner, dependent, &mut lanes, &peers, 1, 2, observe(31))
+        .unwrap_err();
+    assert_eq!(refused.refusal(), AdmissionRefusal::ReceiveInProgress);
+
+    owner.capture(456).unwrap();
+    owner.resolve(IngressReceiveDisposition::Call).unwrap();
+    pool.retain(&mut owner, &lanes, &mut peers, dependent.badge(), free, bound).unwrap();
+
+    // The provider was not parked, so the single execution token is still its own.
+    let refused = pool.admit(&mut owner, dependent, &mut lanes, &peers, 1, 2, observe(31))
+        .unwrap_err();
+    assert_eq!(refused, ReplyAdmissionError::Dispatch(RetainedDispatchError::Lane(LaneError::Busy)));
+    assert_eq!(refused.refusal(), AdmissionRefusal::ExecutionBusy);
+    // A refusal leaves the dependent's Call retained and its canonical Reply in place.
+    assert_eq!(owner.next_unadmitted(dependent).map(|(_, message)| *message), Some(456));
+    assert_eq!(lanes.binding(dependent_lane).unwrap().reply_object, 31);
+    assert_eq!(lanes.active_dispatch_identity(dependent_lane), Ok(None));
+
+    for (error, class, name) in [
+        (ReplyAdmissionError::<u8>::Pool(ReplyPoolError::NoCapacity),
+            AdmissionRefusal::ReplacementPoolFull, "replacement-pool-full"),
+        (ReplyAdmissionError::Pool(ReplyPoolError::ReplyInUse),
+            AdmissionRefusal::ReplyAliased, "reply-aliased"),
+        (ReplyAdmissionError::Dispatch(RetainedDispatchError::Lane(LaneError::InvalidPhase)),
+            AdmissionRefusal::LaneNotIdle, "lane-not-idle"),
+        (ReplyAdmissionError::Dispatch(RetainedDispatchError::OldReplyNotFree),
+            AdmissionRefusal::CanonicalReplyNotFree, "canonical-reply-not-free"),
+        (ReplyAdmissionError::Dispatch(RetainedDispatchError::BindingMismatch),
+            AdmissionRefusal::CallNotBoundToExecutor, "call-not-bound-to-executor"),
+        (ReplyAdmissionError::Dispatch(RetainedDispatchError::Query(7)),
+            AdmissionRefusal::BindingQueryFailed, "binding-query-failed"),
+    ] {
+        assert_eq!(error.refusal(), class);
+        assert_eq!(class.name(), name);
+    }
+}

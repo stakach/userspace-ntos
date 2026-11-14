@@ -2321,6 +2321,9 @@ pub(crate) struct PumpResult {
     pub nested_restore_quarantined: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
     /// The exact exception walk lease is retained with this receive half across parent restore.
     pub nested_restore_seh_retained: bool,
+    /// The adapter refused this dispatch before the component was entered: no request was
+    /// delivered, so the target keeps its retained Call and remains dispatchable.
+    pub refused_before_entry: bool,
     /// Wall diagnostics (only meaningful when `!completed`).
     pub wall_ip: u64,
     pub wall_addr: u64,
@@ -2373,6 +2376,7 @@ impl PumpResult {
             nested_child_work: None,
             nested_restore_quarantined: None,
             nested_restore_seh_retained: false,
+            refused_before_entry: true,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -6460,6 +6464,7 @@ unsafe fn pump_result_from_outcome(
         nested_child_work: outcome.nested_child_work,
         nested_restore_quarantined: outcome.nested_restore_quarantined,
         nested_restore_seh_retained: outcome.nested_restore_seh_retained,
+        refused_before_entry: false,
         wall_ip: outcome.wall_ip,
         wall_addr: outcome.wall_addr,
         wall_label: outcome.wall_label,

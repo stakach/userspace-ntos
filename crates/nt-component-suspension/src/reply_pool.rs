@@ -3,6 +3,8 @@
 use alloc::vec::Vec;
 mod external;
 mod initial;
+mod refusal;
+pub use refusal::AdmissionRefusal;
 use core::convert::Infallible;
 
 use crate::peer_registry::PeerRoute;

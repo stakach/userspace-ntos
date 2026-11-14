@@ -867,9 +867,25 @@ pub(crate) unsafe fn ready_worker(
 }
 
 pub(crate) unsafe fn admit(route: PeerRoute) -> Result<LaneDispatchIdentity, Error> {
+    admit_named(route).map_err(|_| Error::Admission)
+}
+
+/// `admit`, keeping which invariant refused. `None` means the route's caller did not resolve to
+/// its retained physical executor, so the ledger was never consulted. A refusal has no effects.
+pub(crate) unsafe fn admit_named(
+    route: PeerRoute,
+) -> Result<LaneDispatchIdentity, Option<nt_component_suspension::AdmissionRefusal>> {
     owner()
         .admit(lanes(), route, |route| resolve(route, false))
-        .map_err(|_| Error::Admission)
+        .map_err(|error| match error {
+            super::super::ReceiveError::Admit(error) => Some(error.refusal()),
+            _ => None,
+        })
+}
+
+/// Read-only: the lane holding the execution token, for a refusal receipt.
+pub(crate) unsafe fn running_lane() -> Option<nt_component_suspension::LaneHandle> {
+    lanes().running()
 }
 
 /// Scheduling hint only; `admit` still owns the final physical Reply check.

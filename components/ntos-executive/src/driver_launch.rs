@@ -34187,6 +34187,11 @@ unsafe fn dispatch_hosted_component_target(
 unsafe fn finish_hosted_component_target(
     instance_index: usize, shared: u64, pr: crate::spawn_hosts::PumpResult,
 ) -> Result<u64, HostedComponentDispatchError> {
+    if pr.refused_before_entry {
+        // The target never ran this request, so it is neither faulted nor answered for: the
+        // caller receives the refusal itself.
+        return Err(HostedComponentDispatchError::Status(pr.status));
+    }
     if !pr.completed {
         register_instance_ready(instance_index, false);
         return Err(HostedComponentDispatchError::Wall(pr));

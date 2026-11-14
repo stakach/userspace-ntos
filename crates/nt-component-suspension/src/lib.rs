@@ -85,7 +85,7 @@ mod reply_pool;
 mod root_reply_replacement;
 mod ingress_resources;
 pub use ingress_resources::{IngressResources, IngressResourceKind, IngressResourcePhase, IngressResourceRecord, IngressResourceError};
-pub use reply_pool::{IngressReplyPool, ReplyAdmissionError, ReplyPoolError};
+pub use reply_pool::{AdmissionRefusal, IngressReplyPool, ReplyAdmissionError, ReplyPoolError};
 pub use root_reply_replacement::{
     RootReplyIdentity, RootReplyReplacementError, RootReplyReplacementLease,
     RootReplySpareLease,

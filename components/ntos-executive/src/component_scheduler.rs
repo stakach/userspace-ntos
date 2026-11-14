@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[path = "hosted_pump_refusal.rs"]
+mod refusal;
+
 static YIELDS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
@@ -351,16 +354,31 @@ unsafe fn hosted_component_pump_inner(
     let mut channel = *channel;
     let mut timeline = observed_owner.map(|owner|
         scsi_srb_pump_owner::ScsiSrbPumpTimeline::new(owner, crate::disk_census_ticks()));
-    let route = runtime::channel_route(&channel).expect("physical hosted ingress identity");
+    let Ok(route) = runtime::channel_route(&channel) else {
+        return refusal::refuse(refusal::Invariant::PhysicalIngressIdentity, &channel, None);
+    };
     let mut parent = if channel.initial == crate::spawn_hosts::InitialAction::ReplyRequest {
         crate::driver_launch::trace_port_connect_handoff_probe(20, &channel, 0);
-        let parent = runtime::nested::park_current().expect("retain nested hosted parent");
+        // Every check up to admission is free of effects on the target: a refusal leaves its
+        // retained Call, canonical Reply and request page exactly as they were.
+        let Some(route) = route else {
+            return refusal::refuse(refusal::Invariant::EnrolledSource, &channel, None);
+        };
+        let Ok(parent) = runtime::nested::park_current() else {
+            return refusal::refuse(refusal::Invariant::NestedParentPark, &channel, None);
+        };
         crate::driver_launch::trace_port_connect_handoff_probe(21, &channel, u64::from(parent.is_some()));
-        let route = route.expect("hosted dispatch requires enrolled source");
         crate::driver_launch::trace_port_connect_handoff_probe(22, &channel, route.endpoint());
-        runtime::admit(route).expect("admit exact hosted dispatch Call");
+        if let Err(refused) = runtime::admit_named(route) {
+            return refusal::refuse(
+                refusal::Invariant::DispatchAdmission(refused), &channel, parent);
+        }
         crate::driver_launch::trace_port_connect_handoff_probe(23, &channel, route.endpoint());
-        channel.reply_cap = runtime::current_reply(route).expect("admitted canonical Reply");
+        let Ok(reply) = runtime::current_reply(route) else {
+            return refusal::refuse(
+                refusal::Invariant::AdmittedCanonicalReply, &channel, parent);
+        };
+        channel.reply_cap = reply;
         crate::driver_launch::trace_port_connect_handoff_probe(24, &channel, channel.reply_cap);
         crate::driver_launch::trace_port_connect_pump_boundary(
             0, &channel, channel.reply_cap, 0,
@@ -374,12 +392,20 @@ unsafe fn hosted_component_pump_inner(
             crate::disk_census_ticks());
     }
     let channel = &mut channel;
-    let _registry_caller = caller.map(|caller| {
-        crate::provider_registry_caller::Scope::enter(channel, caller)
-            .expect("root-issued provider registry caller must match the executing job")
-    });
-    crate::driver_launch::driver_thread_projection::enter(channel, caller)
-        .expect("driver execution requires its exact retained thread projection");
+    // From here the dispatch is admitted but the component has not been entered. A refusal
+    // leaves that dispatch fenced on its lane; its request is never published or replayed.
+    let _registry_caller = match caller {
+        Some(caller) => match crate::provider_registry_caller::Scope::enter(channel, caller) {
+            Ok(scope) => Some(scope),
+            Err(_) => {
+                return refusal::refuse(refusal::Invariant::RegistryCaller, channel, parent);
+            }
+        },
+        None => None,
+    };
+    if crate::driver_launch::driver_thread_projection::enter(channel, caller).is_err() {
+        return refusal::refuse(refusal::Invariant::ThreadProjection, channel, parent);
+    }
     let scope = ComponentSchedulerScope::enter();
     let startup_ordinal =
         crate::driver_launch::hosted_source_completion_lane::startup_expected(channel)
@@ -426,16 +452,32 @@ unsafe fn hosted_component_pump_inner(
         if route.is_some() {
             let _ = handoff_exact_component_once(channel.tcb);
         }
+        // The component has been entered. A lost Reply or receive continuation cannot be
+        // repaired here: stop pumping and keep the result uncertain, never completed.
         if let Some(route) = route {
-            channel.reply_cap = runtime::current_reply(route).expect("retained canonical Reply");
+            let Ok(reply) = runtime::current_reply(route) else {
+                refusal::retain_uncertain(
+                    refusal::Invariant::YieldedCanonicalReply, channel, &mut result,
+                    parent.is_some());
+                break;
+            };
+            channel.reply_cap = reply;
         }
         if let Some(timeline) = timeline.as_mut() {
             timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::ReceiveContinuation,
                 crate::disk_census_ticks());
         }
-        result = crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
+        result = match crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
             channel, &result)
-            .expect("hosted IRQ yield must retain its exact receive continuation");
+        {
+            Ok(continued) => continued,
+            Err(_) => {
+                refusal::retain_uncertain(
+                    refusal::Invariant::YieldedReceiveContinuation, channel, &mut result,
+                    parent.is_some());
+                break;
+            }
+        };
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 4, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 4, Some(&result));
     }
@@ -510,8 +552,11 @@ unsafe fn hosted_component_pump_inner(
         }
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 5, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 5, Some(&result));
-        authenticate_component_completion(channel, &result)
-            .expect("authenticate hosted final completion Call");
+        if authenticate_component_completion(channel, &result).is_err() {
+            refusal::retain_uncertain(
+                refusal::Invariant::CompletionAuthentication, channel, &mut result,
+                parent.is_some());
+        }
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 6, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 6, Some(&result));
     }
