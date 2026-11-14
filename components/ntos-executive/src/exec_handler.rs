@@ -28281,6 +28281,23 @@ impl ExecNtHandler {
         ))
     }
 
+    /// `ByteOffset` of a hosted READ or WRITE. A registered kernel filesystem keeps its Files'
+    /// positions, so a synchronous transfer without a ByteOffset names the file pointer for it
+    /// to resolve; any other driver receives the captured value unchanged.
+    fn hosted_transfer_byte_offset(
+        &self,
+        route: HostedFileRoute,
+        captured_offset: Option<i64>,
+        offset_value: u64,
+        synchronous: bool,
+    ) -> u64 {
+        if driver_launch::require_registered_kernel_filesystem_device(route.device_id).is_ok() {
+            nt_io_manager::file_pointer_irp_byte_offset(captured_offset, synchronous)
+        } else {
+            offset_value
+        }
+    }
+
     unsafe fn dispatch_hosted_file_set_information_for(
         &mut self,
         route: HostedFileRoute,
@@ -41136,7 +41153,10 @@ impl ExecNtHandler {
                                             nt_io_manager::ReadWriteParameters {
                                                 length: len as u32,
                                                 key: key_value,
-                                                offset: offset_value,
+                                                offset: self.hosted_transfer_byte_offset(
+                                                    route, captured_offset, offset_value,
+                                                    synchronous,
+                                                ),
                                             },
                                             &payload,
                                             &mut output,
@@ -41736,7 +41756,10 @@ impl ExecNtHandler {
                                             nt_io_manager::ReadWriteParameters {
                                                 length: len as u32,
                                                 key: key_value,
-                                                offset: offset_value,
+                                                offset: self.hosted_transfer_byte_offset(
+                                                    route, captured_offset, offset_value,
+                                                    synchronous,
+                                                ),
                                             },
                                             &[],
                                             &mut output,

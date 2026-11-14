@@ -1339,8 +1339,17 @@ impl MountedVolumeBackend {
             return Err(NtStatus::INVALID_HANDLE);
         };
         let installed_open = binding.installed_open.ok_or(NtStatus::INVALID_HANDLE)?;
-        let offset = u32::try_from(parameters.offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
-        self.shares.get(installed_open).map_err(status)?;
+        let open = self.shares.get(installed_open).map_err(status)?;
+        // A synchronous File read without a ByteOffset continues at the position its open keeps.
+        let offset = nt_io_manager::resolve_regular_file_read_offset(
+            Some(parameters.offset as i64),
+            open.create_options
+                & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                != 0,
+            open.current_offset,
+        )?
+        .value();
+        let offset = u32::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
         let eof = metadata.end_of_file.min(u32::MAX as u64) as u32;
         if offset >= eof {
             return Err(NtStatus::END_OF_FILE);

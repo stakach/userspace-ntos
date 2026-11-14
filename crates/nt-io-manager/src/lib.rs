@@ -299,7 +299,8 @@ pub use quota::{
     QueryQuotaParameters, QuotaValidationError, SetQuotaParameters,
 };
 pub use read_write::{
-    resolve_regular_file_read_offset, resolve_regular_file_write_offset, ResolvedFileOffset,
+    file_pointer_irp_byte_offset, resolve_regular_file_read_offset,
+    resolve_regular_file_write_offset, ResolvedFileOffset,
     FILE_USE_FILE_POINTER_POSITION, FILE_WRITE_TO_END_OF_FILE,
 };
 pub use retained_completion::{

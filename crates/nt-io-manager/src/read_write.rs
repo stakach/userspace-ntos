@@ -79,6 +79,18 @@ pub fn resolve_regular_file_read_offset(
     }
 }
 
+/// The `ByteOffset` a READ or WRITE IRP carries to a filesystem that keeps its Files' positions.
+/// A synchronous File transferred without a ByteOffset is read or written at its file pointer,
+/// which only that filesystem knows: it receives `FILE_USE_FILE_POINTER_POSITION` and resolves
+/// it. An asynchronous File has no file pointer to name.
+pub fn file_pointer_irp_byte_offset(byte_offset: Option<i64>, synchronous: bool) -> u64 {
+    match byte_offset {
+        Some(value) => value as u64,
+        None if synchronous => FILE_USE_FILE_POINTER_POSITION as u64,
+        None => 0,
+    }
+}
+
 /// Resolve `NtWriteFile.ByteOffset` for a regular local file. Append-only access overrides the
 /// caller's captured offset value for buffered I/O. Asynchronous files still require a pointer.
 pub fn resolve_regular_file_write_offset(
@@ -642,6 +654,30 @@ mod offset_tests {
             resolve_regular_file_write_offset(Some(-3), true, 10, 20, false),
             Err(NtStatus::INVALID_PARAMETER)
         );
+    }
+
+    #[test]
+    fn a_synchronous_transfer_without_an_offset_names_the_file_pointer() {
+        let carried = file_pointer_irp_byte_offset(None, true);
+        // The filesystem resolves what it was handed against the position it keeps.
+        assert_eq!(
+            resolve_regular_file_read_offset(Some(carried as i64), true, 4096),
+            Ok(ResolvedFileOffset::Current(4096))
+        );
+        assert_eq!(
+            resolve_regular_file_write_offset(Some(carried as i64), true, 4096, 8192, false),
+            Ok(ResolvedFileOffset::Current(4096))
+        );
+        // An explicit offset is carried as given, including the caller's own sentinels.
+        for explicit in [0, 7, FILE_WRITE_TO_END_OF_FILE, FILE_USE_FILE_POINTER_POSITION] {
+            for synchronous in [false, true] {
+                assert_eq!(
+                    file_pointer_irp_byte_offset(Some(explicit), synchronous),
+                    explicit as u64
+                );
+            }
+        }
+        assert_eq!(file_pointer_irp_byte_offset(None, false), 0);
     }
 
     #[test]
