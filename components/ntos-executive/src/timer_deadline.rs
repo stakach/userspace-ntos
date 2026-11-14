@@ -113,6 +113,7 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             registry_mutation_work::next_deadline(),
             DELAY_TIMER_SOURCE_REGISTRY_MUTATION,
         ),
+        (mutable_hive_mutation_work::next_deadline(), DELAY_TIMER_SOURCE_MUTABLE_HIVE_WORK),
         (section_metadata_work::next_deadline(), DELAY_TIMER_SOURCE_SECTION_METADATA),
         (process_image_snapshot_work::next_deadline(),
             DELAY_TIMER_SOURCE_PROCESS_IMAGE_SNAPSHOT),

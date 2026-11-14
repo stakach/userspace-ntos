@@ -196,9 +196,18 @@ unsafe fn wake_settled_header_recheck_owner() {
     }
 }
 
+/// Native requests reserve owners have completed. Read through [`completed_requests`].
+static COMPLETED_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// Any change proves some reserve owner advanced.
+pub(super) fn completed_requests() -> u64 {
+    COMPLETED_REQUESTS.load(Ordering::Relaxed)
+}
+
 pub(crate) unsafe fn complete_native_snapshot_io(
     claim: SnapshotClaim, result: Result<&[u8], nt_status::NtStatus>,
 ) -> Result<SnapshotCompletion, u32> {
+    COMPLETED_REQUESTS.fetch_add(1, Ordering::Relaxed);
     match claim.owner {
         SnapshotOwnerToken::Hive(ticket) => super::hive_wal::complete_native_hive_io(ticket, result),
         SnapshotOwnerToken::Mutation { work_id, request } =>

@@ -134,6 +134,7 @@ pub(super) unsafe fn checkpoint_dirty_native() -> Result<bool, u32> {
     }
     let id = snapshot_storage::begin_wal_continuation_recheck()?;
     WRITABLE_FS_SNAPSHOT_DIRTY.store(false, Ordering::Release);
+    super::note_checkpoint_begun();
     *slot = Some(Work::Rechecking { id });
     Err(snapshot_storage::BUSY)
 }
@@ -263,6 +264,7 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
         return Ok(SnapshotCompletion::Failed(block(status)));
     }
     drop(lease);
+    super::note_checkpoint_published();
     *slot = Some(Work::Done { generation, bytes });
     Ok(SnapshotCompletion::Settled)
 }

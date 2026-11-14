@@ -174,11 +174,11 @@ fn primary_sequence(fs: &nt_fs::FileSystem, log_path: &str) -> Result<u64, u32> 
     Err(nt_fs::STATUS_DATA_ERROR)
 }
 
-/// Match an acknowledged hive edit to the exact live sidecar before shutdown claims that the
-/// paired volume WAL covers it. The baseline advances only after the WAL marker and both anchor
-/// acknowledgements; the semantic scan rejects torn or skipped records even if the file length
-/// and live sequence happen to match.
-pub(crate) unsafe fn verify_published_hive_log_tail(
+/// The sidecar the last acknowledged edit left is the live one and ends at the hive's live
+/// sequence. The baseline advances only after the WAL marker and both anchor acknowledgements,
+/// so a hive whose live sequence is the baseline's has no edit that is not durable. Reads no
+/// file bytes: a flush can ask this on every call.
+pub(super) unsafe fn verify_acknowledged_hive_log(
     log_path: &str,
     live_sequence: u64,
 ) -> Result<(), u32> {
@@ -191,6 +191,19 @@ pub(crate) unsafe fn verify_published_hive_log_tail(
     {
         return Err(nt_fs::STATUS_DATA_ERROR);
     }
+    Ok(())
+}
+
+/// Match an acknowledged hive edit to the exact live sidecar before shutdown claims that the
+/// paired volume WAL covers it. The baseline advances only after the WAL marker and both anchor
+/// acknowledgements; the semantic scan rejects torn or skipped records even if the file length
+/// and live sequence happen to match.
+pub(crate) unsafe fn verify_published_hive_log_tail(
+    log_path: &str,
+    live_sequence: u64,
+) -> Result<(), u32> {
+    verify_acknowledged_hive_log(log_path, live_sequence)?;
+    let fs = writable_fs()?;
     let primary = primary_sequence(fs, log_path)?;
     let sidecar = fs.try_file_bytes_owned(log_path)?
         .ok_or(nt_fs::STATUS_DATA_ERROR)?;

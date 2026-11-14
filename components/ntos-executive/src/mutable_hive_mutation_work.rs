@@ -1,4 +1,5 @@
-//! Ordered hosted hive edits across the native WAL and paired anchor.
+//! Ordered hosted hive edits across the native WAL and paired anchor, and the hosted registry
+//! requests that wait here for their data to become durable.
 
 use crate::*;
 use alloc::string::String;
@@ -12,11 +13,15 @@ use nt_process::RegistryKeyHandlePublication;
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 use nt_thread_start::amd64_context::UserApcContinuation;
 use crate::exec_handler::registry_admission::HostedRegistryPublication;
+use crate::exec_handler::registry_durability::DurableRegistryRequest;
+use crate::volume_checkpoint_deferral::{CallerStep, Deferral, Outcome, STATUS_DEVICE_BUSY};
 
 const STATUS_INVALID_HANDLE: u32 = nt_fs::STATUS_INVALID_HANDLE;
 
 enum Phase {
     Prepare, Begin, Poll, Publish, Install, PublishChild, OpenExistingChild,
+    /// A durability request whose last attempt was in flight.
+    Durable,
     ReadyReply, ReplyEntered, ReplySent,
     RevokeReply, RetypeReply, ReconcileRuntime,
 }
@@ -63,6 +68,11 @@ enum Completion {
         backup: bool,
         published: bool,
     },
+    /// `NtFlushKey`, `NtSaveKey*` or `NtUnloadKey*` kept until its data is durable.
+    Durable {
+        request: DurableRegistryRequest,
+        deferral: Deferral<writable_fs::ReserveProgress>,
+    },
 }
 
 struct HostedCaller {
@@ -99,6 +109,11 @@ static PENDING: AtomicU64 = AtomicU64::new(0);
 static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 static TRANSFERRED: AtomicBool = AtomicBool::new(false);
+static DURABLE_TRACED: AtomicU64 = AtomicU64::new(0);
+/// Durability requests traced when they park and when they complete.
+const DURABLE_TRACE_LIMIT: u64 = 32;
+/// A durability request edits no hive, so it has no place in a hive's edit order.
+const NO_HIVE: u32 = u32::MAX;
 const RETRY_DELAY: u64 = 10_000_000;
 const POLL_DELAY: u64 = 100_000;
 
@@ -255,6 +270,121 @@ unsafe fn submit_hosted_existing_edit(
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
     assert!(!TRANSFERRED.swap(true, Ordering::AcqRel));
     Ok(())
+}
+
+/// Keep a hosted caller whose durability request is in flight. The request, the caller and its
+/// Reply move together; a refusal returns the request untouched and leaves the Reply current.
+pub(crate) unsafe fn submit_hosted_durability(
+    handler: &mut ExecNtHandler, request: DurableRegistryRequest,
+) -> Result<(), (u32, DurableRegistryRequest)> {
+    let _durable = allocator::enter_durable();
+    let admission = (|| {
+        let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(STATUS_INVALID_HANDLE)?;
+        let logical = handler.capture_provider_logical_caller(
+            handler.pi, handler.current_tid, handler.current_badge, tcb,
+        ).ok_or(STATUS_INVALID_HANDLE)?;
+        if u64::from(logical.thread().thread_id()) != handler.current_tid {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let park = root_reply_park::RootReplyPark::prepare().ok_or(0xC000_009Au32)?;
+        let rows = &mut *core::ptr::addr_of_mut!(WORK);
+        let index = rows.iter().enumerate().find_map(|(index, row)|
+            (row.is_none() && EXECUTING_INDEX.load(Ordering::Relaxed) != index as u64)
+                .then_some(index));
+        if index.is_none() { rows.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
+        let requestor = handler.pm.capture_native_handle_caller(
+            logical.thread(), nt_types::AccessMode::KernelMode)?;
+        let mut reference = handler.pm.reference_native_requestor(requestor)?;
+        let order = match reserve_order() {
+            Ok(order) => order,
+            Err(status) => {
+                reference.release(&mut handler.pm).expect("unsubmitted durability caller");
+                return Err(status);
+            }
+        };
+        Ok((park, index, logical, reference, order))
+    })();
+    let (park, index, logical, reference, order) = match admission {
+        Ok(admission) => admission,
+        Err(status) => return Err((status, request)),
+    };
+    // The attempt that brought the request here opens its wait.
+    let mut deferral = Deferral::new();
+    let _ = deferral.observe(STATUS_DEVICE_BUSY, writable_fs::reserve_progress,
+        monotonic_time_100ns);
+    if DURABLE_TRACED.load(Ordering::Relaxed) < DURABLE_TRACE_LIMIT {
+        print_str(b"[cm-durable] waiting request=");
+        print_str(request.name());
+        print_str(b" tid=");
+        print_u64(handler.current_tid);
+        print_str(b"\n");
+    }
+    let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    assert_ne!(reply, 0);
+    let work = Work {
+        order, hive: NO_HIVE, log_path: String::new(),
+        pending: None, prepared: None, journal_id: None, receipt: None, installation: None,
+        caller: HostedCaller {
+            pi: handler.pi,
+            tid: handler.current_tid, badge: handler.current_badge, reply, logical, reference,
+            completion: Some(Completion::Durable { request, deferral }),
+            _continuation: if handler.current_native_call_transport {
+                UserApcContinuation::NativeCall
+            } else {
+                UserApcContinuation::Fault {
+                    resume_ip: handler.current_resume_ip,
+                    resume_sp: handler.current_sp,
+                    resume_flags: handler.current_flags,
+                }
+            },
+        },
+        phase: Phase::Durable, status: 0, cancelled: false,
+    };
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
+    park.commit();
+    PENDING.fetch_add(1, Ordering::Release);
+    NEXT.store(monotonic_time_100ns(), Ordering::Release);
+    assert!(!TRANSFERRED.swap(true, Ordering::AcqRel));
+    Ok(())
+}
+
+/// Attempt a kept durability request again. `Some(status)` completes its caller.
+unsafe fn advance_durable(handler: &mut ExecNtHandler, caller: &mut HostedCaller) -> Option<u32> {
+    let Some(Completion::Durable { request, deferral }) = caller.completion.as_mut()
+        else { unreachable!("retained durability request") };
+    let status = handler.attempt_durable_registry_request(request);
+    let outcome = deferral.observe(status, writable_fs::reserve_progress, monotonic_time_100ns);
+    let CallerStep::Complete(status) = outcome.caller_step() else { return None; };
+    if DURABLE_TRACED.fetch_add(1, Ordering::Relaxed) < DURABLE_TRACE_LIMIT {
+        print_str(b"[cm-durable] ");
+        let (deferrals, waited) = match outcome {
+            Outcome::Settled { deferrals, waited_100ns, .. } => {
+                print_str(b"durable");
+                (deferrals, waited_100ns)
+            }
+            Outcome::Stalled { deferrals, stalled_100ns, .. } => {
+                print_str(b"stalled");
+                (deferrals, stalled_100ns)
+            }
+            _ => {
+                print_str(b"refused");
+                (0, 0)
+            }
+        };
+        print_str(b" request=");
+        print_str(request.name());
+        print_str(b" tid=");
+        print_u64(caller.tid);
+        print_str(b" deferrals=");
+        print_u64(deferrals);
+        print_str(b" waited-100ns=");
+        print_u64(waited);
+        print_str(b" status=0x");
+        print_hex(status);
+        print_str(b"\n");
+    }
+    Some(status)
 }
 
 /// The caller's reserved output, exact parent reference, subject and Reply move together.
@@ -425,6 +555,8 @@ fn release_completion(handler: &mut ExecNtHandler, caller: &mut HostedCaller) {
             }
             release_key_owner(handler, parent_owner);
         }
+        Completion::Durable { request, .. } =>
+            handler.release_durable_registry_request(request),
     }
 }
 
@@ -610,6 +742,15 @@ unsafe fn advance(
             }
             work.phase = Phase::ReadyReply;
         }
+        Phase::Durable => {
+            if work.cancelled {
+                work.status = 0xC000_0120;
+                work.phase = Phase::ReadyReply;
+            } else if let Some(status) = advance_durable(handler, &mut work.caller) {
+                work.status = status;
+                work.phase = Phase::ReadyReply;
+            }
+        }
         Phase::ReadyReply => {
             if work.cancelled {
                 work.phase = Phase::RevokeReply;
@@ -695,6 +836,8 @@ pub(crate) unsafe fn redrive(
             }, Ordering::Release);
             match advance(handler, queue, &mut work, earlier_unpublished) {
                 Ok(true) => { completed = true; break; },
+                // Still in flight: one attempt per turn.
+                Ok(false) if matches!(work.phase, Phase::Durable) => break,
                 Ok(false) => {},
                 Err(_) => { failed = true; break; },
             }

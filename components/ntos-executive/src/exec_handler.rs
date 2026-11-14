@@ -6061,13 +6061,16 @@ impl ExecNtHandler {
         let image_len = image.len();
 
         let status = unsafe { Self::write_save_key_image(file, image) };
-        if status == nt_fs::STATUS_SUCCESS {
-            self.writable_fs_dirty = true;
-            self.writable_fs_commit_required = true;
-            NT_SAVE_KEY_ROOT_SAVED.fetch_add(1, Ordering::Relaxed);
-            NT_SAVE_KEY_BYTES.store(image_len as u64, Ordering::Relaxed);
+        if status != nt_fs::STATUS_SUCCESS {
+            return status;
         }
-        status
+        self.writable_fs_dirty = true;
+        self.writable_fs_commit_required = true;
+        NT_SAVE_KEY_ROOT_SAVED.fetch_add(1, Ordering::Relaxed);
+        NT_SAVE_KEY_BYTES.store(image_len as u64, Ordering::Relaxed);
+        // `HvWriteHive` ends in the file flush (cmlib `hivewrt.c:408`): the save returns once
+        // the volume snapshot holding the image has published.
+        unsafe { self.complete_saved_key() }
     }
 
     fn boot_mutable_hive_checkpoint_path(hive_sel: u32) -> Option<&'static str> {
@@ -6395,11 +6398,6 @@ impl ExecNtHandler {
         if dirty_cells == 0 {
             return nt_fs::STATUS_SUCCESS;
         }
-        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
-            if let Err(status) = unsafe { crate::writable_fs::fold_system_wal_if_dirty() } {
-                return status;
-            }
-        }
         let Some(file_path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
             return STATUS_INVALID_HANDLE;
         };
@@ -6650,11 +6648,6 @@ impl ExecNtHandler {
         if system_status != nt_fs::STATUS_SUCCESS {
             return system_status;
         }
-        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
-            if let Err(status) = unsafe { crate::writable_fs::fold_system_wal_if_dirty() } {
-                return status;
-            }
-        }
         let mut total_dirty = 0usize;
         for hive_sel in [
             HIVE_SEL_SOFTWARE,
@@ -6667,11 +6660,7 @@ impl ExecNtHandler {
                 .hive(hive_sel)
                 .map_or(0, |hive| hive.dirty_count());
             total_dirty = total_dirty.saturating_add(dirty);
-            let status = self.checkpoint_non_system_boot_mutable_hive_preserving_headroom(
-                hive_sel,
-                dirty,
-                min_post_checkpoint_headroom,
-            );
+            let status = self.sync_mutable_hive(hive_sel, dirty, min_post_checkpoint_headroom);
             if status != nt_fs::STATUS_SUCCESS {
                 return status;
             }
@@ -6683,7 +6672,7 @@ impl ExecNtHandler {
                 .hive(hive_sel)
                 .map_or(0, |hive| hive.dirty_count());
             total_dirty = total_dirty.saturating_add(dirty);
-            let status = self.checkpoint_dynamic_mutable_hive(hive_sel, dirty);
+            let status = self.sync_mutable_hive(hive_sel, dirty, min_post_checkpoint_headroom);
             if status != nt_fs::STATUS_SUCCESS {
                 return status;
             }
@@ -6891,11 +6880,6 @@ impl ExecNtHandler {
         }
         if dirty_cells == 0 {
             return nt_fs::STATUS_SUCCESS;
-        }
-        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
-            if let Err(status) = unsafe { crate::writable_fs::fold_system_wal_if_dirty() } {
-                return status;
-            }
         }
         let Some(file_path) = self
             .hive_mounts
@@ -33936,8 +33920,7 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let scope = self.registry_flush_scope(key);
-                self.flush_registry_scope(scope)
+                unsafe { self.nt_flush_key(key) }
             }
             // Save an exact key or subtree to the caller-opened file. SYSTEM handles export from
             // their CM lease; local mutable hives retain the same native entry points.

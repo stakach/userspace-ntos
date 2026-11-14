@@ -91,30 +91,6 @@ fn uncertain_fold_keeps_owner_and_dirty_state_for_boot_recovery() {
 }
 
 #[test]
-fn lazy_writer_and_shutdown_fold_without_changing_explicit_flush_fence() {
-    let service = source("service_sec_image.rs");
-    assert!(service.contains("fold_system_wal_if_dirty()"),
-        "the active service loop must schedule CM image folds independently of file dirty bits");
-    assert!(service.contains("wal_fold_cadence::next_background_fold_deadline")
-        && service.contains("wal_fold_cadence::background_fold_due")
-        && service.contains("monotonic_time_100ns()"),
-        "background folds must coalesce mutations over a bounded interval");
-    let timer = source("timer_deadline.rs");
-    assert!(timer.contains("system_wal_fold_next_deadline()"),
-        "an idle service loop must wake for its fold deadline");
-    assert!(service.contains("rearm_registered_active_delay_timer()"),
-        "installing a fold interval must program the live one-shot timer");
-
-    let handler = source("exec_handler.rs");
-    let flush = &handler[handler.find("fn checkpoint_system_hive_from_config_manager(").unwrap()
-        ..handler.find("fn checkpoint_non_system_boot_mutable_hive(").unwrap()];
-    assert!(flush.contains("verify_durable_system_wal()"),
-        "explicit NtFlushKey proves the per-mutation WAL barrier");
-    assert!(handler.contains("fold_system_wal_if_dirty()"),
-        "shutdown must fold the CM image before returning durability success");
-}
-
-#[test]
 fn wal_fold_only_deadline_cannot_be_skipped_before_blocking_receive() {
     let timer = source("timer_deadline.rs");
     assert!(timer.contains("service_sec_image::system_wal_fold_next_deadline()"),

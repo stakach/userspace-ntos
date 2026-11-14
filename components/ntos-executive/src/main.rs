@@ -3139,6 +3139,9 @@ const DELAY_TIMER_SOURCE_NATIVE_FILE_TARGET_OPEN: u64 = 43;
 const DELAY_TIMER_SOURCE_NATIVE_DIRECTORY_EFFECT: u64 = 44;
 const DELAY_TIMER_SOURCE_ROOT_QUEUED_CALLBACK_RETRY: u64 = 45;
 const DELAY_TIMER_SOURCE_QUEUED_WORK_RECEIVE_POLL: u64 = 46;
+/// Parked hive edits and durability requests are attempted again at their poll deadline even
+/// when the completion that satisfies them was consumed by another owner's service turn.
+const DELAY_TIMER_SOURCE_MUTABLE_HIVE_WORK: u64 = 47;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;

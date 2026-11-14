@@ -356,6 +356,10 @@ pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORE_GENERATION: AtomicU64 = AtomicU64
 pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_EMPTY_MOUNTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_COMMITS: AtomicU64 = AtomicU64::new(0);
+/// Volume checkpoints begun: each cleared the dirty bit and captures the volume afterwards.
+static WRITABLE_FS_CHECKPOINTS_BEGUN: AtomicU64 = AtomicU64::new(0);
+/// The `WRITABLE_FS_CHECKPOINTS_BEGUN` count of the latest checkpoint to publish.
+static WRITABLE_FS_CHECKPOINT_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -713,6 +717,23 @@ unsafe fn checkpoint_volume_snapshot(
 /// lease excludes a mutation still crossing those barriers. NtFlushKey needs this durability
 /// fence even when no full snapshot fold is due.
 pub(crate) unsafe fn verify_durable_system_wal() -> Result<(), u32> {
+    with_durable_wal_fence(|| Ok(()))
+}
+
+/// Prove one mounted hive's acknowledged edits are durable. The other mutable hives journal
+/// through the same volume WAL as SYSTEM, so the proof is that WAL's fence plus the hive's own
+/// sidecar ending at its live sequence. A v2 hive has no other flush: its primary image may
+/// lag, and full-image compaction is refused on this format.
+pub(crate) unsafe fn verify_durable_hive_wal(log_path: &str, live_sequence: u64) -> Result<(), u32> {
+    with_durable_wal_fence(|| hive_wal::verify_acknowledged_hive_log(log_path, live_sequence))
+}
+
+/// Run `proof` under the reserve lease once the volume WAL's paired prefix is proven. A proof
+/// failure reports its status without blocking the mount.
+unsafe fn with_durable_wal_fence<F>(proof: F) -> Result<(), u32>
+where
+    F: FnOnce() -> Result<(), u32>,
+{
     let native = crate::fs_loader::exec_fs_mount_identity()
         .and_then(crate::fs_loader::exec_block_route_kind)
         == Some(nt_fs::BlockSourceKind::Native);
@@ -737,7 +758,8 @@ pub(crate) unsafe fn verify_durable_system_wal() -> Result<(), u32> {
         // mutation/boot publication contract. No later writer may guess the WAL prefix.
         WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
         status
-    })
+    })?;
+    proof()
 }
 
 fn report_quiesce_proof_failure(stage: &[u8], status: u32) -> u32 {
@@ -819,6 +841,36 @@ pub(crate) fn checkpoint_progress() -> CheckpointProgress {
     unsafe { native_checkpoint::progress() }
 }
 
+/// Progress of whichever owner holds the snapshot reserve: the checkpoint's own, and every
+/// native request any reserve owner (checkpoint, fold, hive journal) has completed.
+pub(crate) type ReserveProgress = (CheckpointProgress, u64);
+
+/// Read-only, like [`checkpoint_progress`].
+pub(crate) fn reserve_progress() -> ReserveProgress {
+    (checkpoint_progress(), native_snapshot_io::completed_requests())
+}
+
+/// `(begun, published)`: checkpoints begun so far, and the begun count of the latest one to
+/// publish. A checkpoint captures the volume after it begins, so bytes written when `begun`
+/// was `n` are durable once `published` exceeds `n`.
+pub(crate) fn checkpoint_epochs() -> (u64, u64) {
+    (
+        WRITABLE_FS_CHECKPOINTS_BEGUN.load(Ordering::Acquire),
+        WRITABLE_FS_CHECKPOINT_PUBLISHED.load(Ordering::Acquire),
+    )
+}
+
+/// A checkpoint cleared the dirty bit and will capture the volume.
+fn note_checkpoint_begun() {
+    WRITABLE_FS_CHECKPOINTS_BEGUN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The one checkpoint in flight published. Only one runs at a time, so it is the latest begun.
+fn note_checkpoint_published() {
+    WRITABLE_FS_CHECKPOINT_PUBLISHED
+        .store(WRITABLE_FS_CHECKPOINTS_BEGUN.load(Ordering::Acquire), Ordering::Release);
+}
+
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
 /// `Ok(false)` means the volume was already clean.
 pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
@@ -837,6 +889,7 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
     if !WRITABLE_FS_SNAPSHOT_DIRTY.swap(false, Ordering::AcqRel) {
         return Ok(false);
     }
+    note_checkpoint_begun();
     let (wal_manifest, authority) = if wal_format {
         match snapshot_storage::take_wal_continuation(&mut dev) {
             Ok((token, pair, manifest)) => (Some(manifest), Some((token, pair))),
@@ -904,6 +957,7 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
                     return Err(status);
                 }
             }
+            note_checkpoint_published();
             WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);

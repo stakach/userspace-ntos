@@ -1,9 +1,14 @@
-//! Registry requests that NT completes only once a hive is durable: `NtFlushKey` and
-//! `NtUnloadKey*`.
+//! Registry requests that NT completes only once their data is durable: `NtFlushKey`
+//! (`CmFlushKey` → `HvSyncHive`), `NtSaveKey*` (`HvWriteHive` ends in the file flush) and
+//! `NtUnloadKey*` (`CmUnloadKey` flushes before it unlinks).
 //!
-//! Each request is resolved once, against the caller's handles and memory, into a form that
-//! names kernel state only. The durable step then runs on that form.
+//! Each request is resolved once, against the caller's handles and memory, into a
+//! [`DurableRegistryRequest`] that names kernel state only. One attempt either completes it or
+//! reports `STATUS_DEVICE_BUSY`: the volume checkpoint or another reserve owner is in flight.
+//! That answer never reaches the caller. The request is parked with the caller's Reply and
+//! attempted again at later service turns (`mutable_hive_mutation_work`).
 use super::*;
+use crate::volume_checkpoint_deferral::{Publication, PublicationTarget, STATUS_DEVICE_BUSY};
 
 /// What one `NtFlushKey` makes durable (`CmFlushKey`, ReactOS `ntoskrnl/config/cmapi.c:1938`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +29,39 @@ pub(crate) struct UnloadTarget {
     pub(crate) canon: alloc::string::String,
     /// The Event to signal once the hive is detached, leased by the caller of the resolution.
     pub(crate) event_index: Option<usize>,
+}
+
+enum DurableKind {
+    Flush(FlushScope),
+    /// The image is written and its File flushed; the volume snapshot holding it is owed.
+    Save,
+    Unload {
+        target: UnloadTarget,
+        /// Keeps `target.event_index` valid until the request is released.
+        event: Option<nt_io_manager::FileTransferEvent>,
+    },
+}
+
+/// A resolved request and the publication it waits for. It can be attempted any number of
+/// times; [`ExecNtHandler::release_durable_registry_request`] ends it.
+pub(crate) struct DurableRegistryRequest {
+    kind: DurableKind,
+    /// Set by the first attempt to reach the volume, after the request's bytes were written.
+    publication: Option<PublicationTarget>,
+}
+
+impl DurableRegistryRequest {
+    fn new(kind: DurableKind) -> Self {
+        Self { kind, publication: None }
+    }
+
+    pub(crate) fn name(&self) -> &'static [u8] {
+        match self.kind {
+            DurableKind::Flush(_) => b"flush-key",
+            DurableKind::Save => b"save-key",
+            DurableKind::Unload { .. } => b"unload-key",
+        }
+    }
 }
 
 impl ExecNtHandler {
@@ -48,10 +86,10 @@ impl ExecNtHandler {
     }
 
     /// Make everything in `scope` durable. A key in ReactOS' volatile master hive drives
-    /// `CmpDoFlushAll(FALSE)`; keys in mounted mutable hives checkpoint through the writable
-    /// filesystem. Dynamic `NtLoadKey` profile hives write back to their source file, while
-    /// boot-mounted hives write full images or committed journal sidecars under
-    /// `system32\config`.
+    /// `CmpDoFlushAll(FALSE)` over SYSTEM and every mounted mutable hive. On the WAL volume
+    /// format each hive is proven durable in place and nothing is written; a WAL fold stays
+    /// with the service loop. On the legacy format dynamic `NtLoadKey` profile hives write back
+    /// to their source file and boot-mounted hives write full images under `system32\config`.
     pub(super) fn flush_registry_scope(&mut self, scope: FlushScope) -> u32 {
         match scope {
             FlushScope::Nothing => nt_fs::STATUS_SUCCESS,
@@ -68,15 +106,127 @@ impl ExecNtHandler {
                     .hive(hive_sel)
                     .map_or(0, |hive| hive.dirty_count());
                 REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(dirty as u64, Ordering::Relaxed);
-                if is_dynamic_hive_selector(hive_sel) {
-                    self.checkpoint_dynamic_mutable_hive(hive_sel, dirty)
-                } else {
-                    self.checkpoint_non_system_boot_mutable_hive_preserving_headroom(
-                        hive_sel,
-                        dirty,
-                        BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM,
-                    )
-                }
+                self.sync_mutable_hive(hive_sel, dirty, BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM)
+            }
+        }
+    }
+
+    /// `HvSyncHive` for one mounted mutable hive other than SYSTEM.
+    ///
+    /// On the WAL volume format every acknowledged edit is already durable in the hive's
+    /// sidecar, so the flush proves that under the reserve. The primary image may lag; a
+    /// full-image checkpoint is refused on that format and is never attempted. The legacy
+    /// format writes the image.
+    pub(super) fn sync_mutable_hive(
+        &mut self,
+        hive_sel: u32,
+        dirty_cells: usize,
+        min_post_checkpoint_headroom: usize,
+    ) -> u32 {
+        if self.mutable_hives.hive(hive_sel)
+            .is_some_and(|hive| hive.retained_value_journal().is_some())
+        {
+            return STATUS_UNSUCCESSFUL;
+        }
+        if dirty_cells == 0 {
+            return nt_fs::STATUS_SUCCESS;
+        }
+        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
+            return self.verify_durable_v2_mutable_hive(hive_sel);
+        }
+        if is_dynamic_hive_selector(hive_sel) {
+            self.checkpoint_dynamic_mutable_hive(hive_sel, dirty_cells)
+        } else {
+            self.checkpoint_non_system_boot_mutable_hive_preserving_headroom(
+                hive_sel,
+                dirty_cells,
+                min_post_checkpoint_headroom,
+            )
+        }
+    }
+
+    fn verify_durable_v2_mutable_hive(&self, hive_sel: u32) -> u32 {
+        let Some(hive) = self.mutable_hives.hive(hive_sel) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let Some(mut log_path) = self.mutable_hive_checkpoint_path_owned(hive_sel) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if log_path.try_reserve(4).is_err() {
+            return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
+        }
+        log_path.push_str(".LOG");
+        let status = unsafe { crate::writable_fs::verify_durable_hive_wal(&log_path, hive.sequence) }
+            .err()
+            .unwrap_or(nt_fs::STATUS_SUCCESS);
+        if status != nt_fs::STATUS_SUCCESS && status != STATUS_DEVICE_BUSY {
+            print_str(b"[cm-flush] hive WAL proof failed status=0x");
+            print_hex(status);
+            print_str(b" sequence=");
+            print_u64(hive.sequence);
+            print_str(b" path=");
+            print_ascii_str(&log_path);
+            print_str(b"\n");
+        }
+        status
+    }
+
+    /// `NtFlushKey` on the key the caller named.
+    pub(super) unsafe fn nt_flush_key(&mut self, key: KeyRef) -> u32 {
+        let scope = self.registry_flush_scope(key);
+        self.complete_or_park_durable_registry_request(DurableRegistryRequest::new(
+            DurableKind::Flush(scope),
+        ))
+    }
+
+    /// The tail of a successful `NtSaveKey*`: the image is in its File, and the caller is kept
+    /// until the volume snapshot holding it has published.
+    pub(super) unsafe fn complete_saved_key(&mut self) -> u32 {
+        self.complete_or_park_durable_registry_request(DurableRegistryRequest::new(
+            DurableKind::Save,
+        ))
+    }
+
+    /// Attempt `request` once. `STATUS_DEVICE_BUSY` means in flight: nothing was consumed and
+    /// the same request can be attempted again.
+    pub(crate) fn attempt_durable_registry_request(
+        &mut self,
+        request: &mut DurableRegistryRequest,
+    ) -> u32 {
+        let DurableRegistryRequest { kind, publication } = request;
+        match kind {
+            DurableKind::Flush(scope) => self.flush_registry_scope(*scope),
+            DurableKind::Save => self.publish_volume_for_caller(publication, b"NtSaveKey"),
+            DurableKind::Unload { target, .. } => {
+                self.unload_mounted_hive(&target.canon, target.event_index, publication)
+            }
+        }
+    }
+
+    /// End a request, whatever its outcome: release what its resolution leased.
+    pub(crate) fn release_durable_registry_request(&mut self, request: DurableRegistryRequest) {
+        if let DurableKind::Unload { event: Some(event), .. } = request.kind {
+            self.release_transfer_event(event);
+        }
+    }
+
+    /// Complete `request` now, or park the caller until it can complete. Returns the syscall
+    /// status: `STATUS_PENDING` once the caller's Reply belongs to the parked request.
+    unsafe fn complete_or_park_durable_registry_request(
+        &mut self,
+        mut request: DurableRegistryRequest,
+    ) -> u32 {
+        let status = self.attempt_durable_registry_request(&mut request);
+        if status != STATUS_DEVICE_BUSY {
+            self.release_durable_registry_request(request);
+            return status;
+        }
+        match crate::mutable_hive_mutation_work::submit_hosted_durability(self, request) {
+            Ok(()) => 0x103,
+            // The caller cannot be kept, so it cannot be told its data is durable.
+            Err((status, request)) => {
+                self.release_durable_registry_request(request);
+                status
             }
         }
     }
@@ -84,16 +234,24 @@ impl ExecNtHandler {
     /// `NtUnloadKey*` — ReactOS `ntoskrnl/config/ntapi.c:1796` (`NtUnloadKey2`) plus the event
     /// form: resolve the hive, make it durable, detach it, and release the Event lease the
     /// resolution took, on every exit.
-    pub(super) unsafe fn nt_unload_key(&mut self, target_oa: u64, flags: u32, event: u64) -> u32 {
-        let mut event_lease = None;
-        let status = match self.resolve_unload_key(target_oa, flags, event, &mut event_lease) {
-            Ok(target) => self.unload_mounted_hive(&target.canon, target.event_index),
-            Err(status) => status,
-        };
-        if let Some(event) = event_lease {
-            self.release_transfer_event(event);
+    pub(super) unsafe fn nt_unload_key(
+        &mut self,
+        target_oa: u64,
+        flags: u32,
+        event_handle: u64,
+    ) -> u32 {
+        let mut event = None;
+        match self.resolve_unload_key(target_oa, flags, event_handle, &mut event) {
+            Ok(target) => self.complete_or_park_durable_registry_request(
+                DurableRegistryRequest::new(DurableKind::Unload { target, event }),
+            ),
+            Err(status) => {
+                if let Some(event) = event {
+                    self.release_transfer_event(event);
+                }
+                status
+            }
         }
-        status
     }
 
     /// Validate an `NtUnloadKey*` and name the mount it addresses.
@@ -162,7 +320,12 @@ impl ExecNtHandler {
     /// through the mount would keep answering at the same path and the "unload" would be
     /// cosmetic. `CmUnloadKey` flushes the hive first (`cmapi.c:2271`), so nothing is released
     /// until the hive and the volume holding it are durable.
-    pub(crate) fn unload_mounted_hive(&mut self, canon: &str, event_index: Option<usize>) -> u32 {
+    fn unload_mounted_hive(
+        &mut self,
+        canon: &str,
+        event_index: Option<usize>,
+        publication: &mut Option<PublicationTarget>,
+    ) -> u32 {
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
         let Some(index) = self.hive_mounts.iter().position(|m| m.canon == canon) else {
@@ -185,18 +348,22 @@ impl ExecNtHandler {
         }
         let hive_sel = self.hive_mounts[index].sel;
         let dirty = hive.dirty_count();
-        let status = self.checkpoint_dynamic_mutable_hive(hive_sel, dirty);
+        let status = self.sync_mutable_hive(hive_sel, dirty, 0);
         if status != nt_fs::STATUS_SUCCESS {
             self.writable_fs_dirty = true;
             self.writable_fs_commit_required = true;
-            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            if status != STATUS_DEVICE_BUSY {
+                NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            }
             return status;
         }
-        // `try_flush` checkpoints the image and log, but an earlier failed volume snapshot can
-        // still own dirty bytes. Never release the dynamic mount or slot on that refusal.
-        let status = self.publish_volume_for_caller(b"NtUnloadKey");
+        // The hive is durable, but an earlier volume snapshot can still own dirty bytes of its
+        // file. Never release the dynamic mount or slot before that snapshot has published.
+        let status = self.publish_volume_for_caller(publication, b"NtUnloadKey");
         if status != nt_fs::STATUS_SUCCESS {
-            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            if status != STATUS_DEVICE_BUSY {
+                NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            }
             return status;
         }
         let mount = self.hive_mounts.remove(index);
@@ -228,23 +395,52 @@ impl ExecNtHandler {
         0
     }
 
-    /// Publish the volume snapshot a completed registry write is part of. A refusal keeps the
-    /// durable requirement owed to the next service boundary.
-    fn publish_volume_for_caller(&mut self, reason: &[u8]) -> u32 {
-        let commit_result = {
-            let _transient = crate::allocator::enter_transient();
-            let _alloc_ctx = crate::allocator::enter_context(
-                crate::allocator::ALLOC_CTX_WRITABLE_SNAPSHOT,
-            );
-            unsafe { crate::writable_fs::checkpoint_dirty_volume() }
-        };
-        if let Err(status) = commit_result {
-            self.writable_fs_dirty = true;
-            self.writable_fs_commit_required = true;
-            return status;
+    /// Publish the volume snapshot a completed registry write is part of, for a caller that
+    /// is kept until it has published. `publication` is fixed by the first attempt: only a
+    /// checkpoint begun after it can hold the caller's bytes. `STATUS_DEVICE_BUSY` means that
+    /// checkpoint is in flight; a refusal keeps the requirement owed to the service boundary.
+    fn publish_volume_for_caller(
+        &mut self,
+        publication: &mut Option<PublicationTarget>,
+        reason: &[u8],
+    ) -> u32 {
+        let target = *publication.get_or_insert_with(|| {
+            PublicationTarget::after(crate::writable_fs::checkpoint_epochs().0)
+        });
+        // A second attempt follows only a consumed publication that predates the target.
+        for _ in 0..2 {
+            let attempt = {
+                let _transient = crate::allocator::enter_transient();
+                let _alloc_ctx = crate::allocator::enter_context(
+                    crate::allocator::ALLOC_CTX_WRITABLE_SNAPSHOT,
+                );
+                unsafe { crate::writable_fs::checkpoint_dirty_volume() }
+            };
+            if attempt.is_ok() {
+                self.complete_committed_mutable_hive_journal_snapshot(reason);
+            }
+            match target.classify(attempt, crate::writable_fs::checkpoint_epochs().1) {
+                Publication::Durable { settled } => {
+                    if settled {
+                        self.writable_fs_commit_required = false;
+                    }
+                    return nt_fs::STATUS_SUCCESS;
+                }
+                Publication::Again => {}
+                Publication::InFlight => {
+                    self.writable_fs_dirty = true;
+                    self.writable_fs_commit_required = true;
+                    return STATUS_DEVICE_BUSY;
+                }
+                Publication::Failed(status) => {
+                    self.writable_fs_dirty = true;
+                    self.writable_fs_commit_required = true;
+                    return status;
+                }
+            }
         }
-        self.complete_committed_mutable_hive_journal_snapshot(reason);
-        self.writable_fs_commit_required = false;
-        nt_fs::STATUS_SUCCESS
+        self.writable_fs_dirty = true;
+        self.writable_fs_commit_required = true;
+        STATUS_DEVICE_BUSY
     }
 }
