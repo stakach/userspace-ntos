@@ -20604,9 +20604,15 @@ impl ExecNtHandler {
         if let Some(old) = old {
             let _ = self.token_store.release(old);
         }
-        if self.pi_for_pid(target) == Some(5) {
-            USERINIT_PRIMARY_TOKEN_ASSIGNED.fetch_add(1, Ordering::Relaxed);
-        }
+        // Rare (once per CreateProcessAsUser) and the first evidence that a process left the
+        // creator's token, so every assignment is traced by its real identity.
+        print_str(b"[process-token] primary token assigned pid=");
+        print_u64(target as u64);
+        print_str(b" pi=");
+        print_u64(self.pi_for_pid(target).map_or(u64::MAX, |pi| pi as u64));
+        print_str(b" token=");
+        print_u64(token.raw() as u64);
+        print_str(b"\n");
         0
     }
 

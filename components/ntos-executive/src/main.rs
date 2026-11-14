@@ -4496,7 +4496,6 @@ fn userinit_image_pipeline_spec(passed: &mut u64, report: &DesktopAcceptanceRepo
     let creates = USERINIT_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
     let fully_published = userinit.is_some_and(|receipt| receipt.fully_published);
     let main_thread_published = userinit.is_some_and(|receipt| receipt.main.is_some());
-    let token_assigned = USERINIT_PRIMARY_TOKEN_ASSIGNED.load(Ordering::Relaxed);
     let shell_attempts = USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
     let explorer_attempts = USERINIT_EXPLORER_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
     let wallpaper_spi_captures = USERINIT_WALLPAPER_SPI_CAPTURES.load(Ordering::Relaxed);
@@ -4521,8 +4520,6 @@ fn userinit_image_pipeline_spec(passed: &mut u64, report: &DesktopAcceptanceRepo
     print_u64(userinit.is_some_and(|receipt| receipt.retired) as u64);
     print_str(b" main-thread-runtime-ok=");
     print_u64(main_thread_published as u64);
-    print_str(b" primary-token-assignments=");
-    print_u64(token_assigned);
     print_str(b" shell-image-attempts=");
     print_u64(shell_attempts);
     print_str(b" explorer-attempts=");
@@ -23168,7 +23165,6 @@ pub(crate) static USERINIT_IMAGE_OPEN_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_IMAGE_SECTIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_IMAGE_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_CREATE_PROCESS_REQUESTS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_PRIMARY_TOKEN_ASSIGNED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_IMAGE_OPEN_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_IMAGE_SECTIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_IMAGE_QUERIES: AtomicU64 = AtomicU64::new(0);
