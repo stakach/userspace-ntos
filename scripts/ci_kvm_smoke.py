@@ -26,6 +26,7 @@ CPU_SAMPLES = ROOT / "native-kvm-cpu-samples.jsonl"
 BLOCKSTATS = ROOT / "native-kvm-blockstats.jsonl"
 STOPPED_MARKER = ROOT / "native-kvm-qemu-stopped"
 STATIONARY_MARKER = ROOT / "native-kvm-stationary.txt"
+POST_SETUP_IDLE_MARKER = ROOT / "native-kvm-post-setup-idle.txt"
 
 # Fixed 60-second QMP samples repeatedly hit the same clock-publication RIP,
 # while the guest's own cycle counter showed that path used only a few seconds.
@@ -56,6 +57,17 @@ SETUP_PHASE_COMPLETE = re.compile(
 )
 DRIVER_START_COMPLETE = re.compile(
     rb"\[driver-launch\] demand StartDevice service=([^ ]+) devnode=(.+) status=0x0*0\s*$"
+)
+SETUP_PROCESS_START = re.compile(
+    rb"\[pm-dynamic\] allocated hosted process pi=([0-9]+) pid=([0-9]+) parent=[0-9]+ "
+    rb"image=setup\.exe "
+)
+PROCESS_EXIT = re.compile(
+    rb"\[process-terminal-committed\] pi=([0-9]+) pid=([0-9]+) generation=[0-9]+ "
+    rb"exit-status=0x([0-9a-fA-F]{8}) "
+)
+USER_HIVE_LOADED = re.compile(
+    rb"\[cm-load\] NtLoadKey MOUNTED \\Registry\\User\\(S-1-5-21-[0-9-]+) "
 )
 SPEC_PASS = re.compile(rb" {0,2}PASS ([A-Za-z0-9_]+)")
 DIRECTORY_PUBLISH_REPLY = re.compile(
@@ -228,6 +240,31 @@ class BootProgressWatchdog:
             return None
         return (f"no boot milestone or bounded disk work for {now - self.last_progress:.0f}s; "
                 f"last={self.last_milestone}, bootdisk_bytes={self.disk_bytes}")
+
+
+def post_setup_idle_evidence(serial):
+    """Describe proof that setup finished and a user logged on, or return None.
+
+    setup.exe exits 0 on its failure path too, so its exit alone proves nothing. Winlogon
+    only logs a user on once setup is no longer in progress; a user hive loaded after the
+    last setup.exe exited 0 is the evidence that the disk holds a completed installation.
+    """
+    starts = list(SETUP_PROCESS_START.finditer(serial))
+    if not starts:
+        return None
+    start = starts[-1]
+    exited = None
+    for match in PROCESS_EXIT.finditer(serial, start.end()):
+        if match.group(1, 2) == start.group(1, 2):
+            exited = match
+            break
+    if exited is None or int(exited.group(3), 16) != 0:
+        return None
+    hive = USER_HIVE_LOADED.search(serial, exited.end())
+    if hive is None:
+        return None
+    return (f"setup.exe pid={start.group(2).decode()} exited 0; "
+            f"user hive {hive.group(1).decode()} loaded afterwards")
 
 
 def refresh_idle_progress(watchdog, now, read_blockstats):
@@ -776,6 +813,7 @@ def main():
     BLOCKSTATS.unlink(missing_ok=True)
     STOPPED_MARKER.unlink(missing_ok=True)
     STATIONARY_MARKER.unlink(missing_ok=True)
+    POST_SETUP_IDLE_MARKER.unlink(missing_ok=True)
     command = [
         "./scripts/run_specs.sh",
         "-qmp",
@@ -975,6 +1013,12 @@ def main():
     if terminal_reason:
         raise SystemExit(f"guest terminal {terminal_reason}; inspect native-kvm-smoke.log")
     if stationary_reason:
+        # Still a failed boot: the guest stopped making progress. The marker only lets the
+        # workflow keep this stopped disk so later boots need not replay setup.
+        evidence = post_setup_idle_evidence(LOG.read_bytes())
+        if evidence:
+            POST_SETUP_IDLE_MARKER.write_text(evidence + "\n")
+            print(f"Post-setup idle stop: {evidence}", flush=True)
         raise SystemExit(f"guest stationary: {stationary_reason}; inspect native-kvm-stationary.txt")
     if "boot: reading Simpleboot memory map" not in output:
         raise SystemExit("guest startup marker absent; inspect native-kvm-smoke.log")

@@ -23,6 +23,11 @@ OUT = ROOT / "native-kvm-continuation-out"
 IN = ROOT / "native-kvm-continuation-in"
 RECEIPT = ROOT / "native-kvm-continuation-receipt.json"
 ROLLBACK_MARKER = ROOT / "native-kvm-continuation-rolled-back"
+POST_SETUP_IDLE_MARKER = ROOT / "native-kvm-post-setup-idle.txt"
+# How the source boot ended, and the only run conclusion each kind of disk may come from.
+# A post-setup-idle disk comes from a boot the runner failed as stationary after setup
+# completed and a user logged on; every other failed boot is rolled back, never published.
+STOP_CONCLUSIONS = {"bounded": "success", "post-setup-idle": "failure"}
 MIGRATION_CANDIDATE = DISK.with_name("disk.migration-candidate.img")
 WORKFLOW = ".github/workflows/native-kvm-smoke.yml"
 MAX_DISK_BYTES = 2 * 1024**3
@@ -140,15 +145,28 @@ def api_run(run_id: int, attempt: int, token: str, repo: str) -> dict:
         return json.load(response)
 
 
+def verify_conclusion(run: dict) -> None:
+    if run.get("conclusion") not in STOP_CONCLUSIONS.values():
+        raise ContinuationError("source run conclusion mismatch")
+
+
+def verify_stop(run: dict, manifest: dict) -> None:
+    """A disk is usable only from the run conclusion its recorded stop kind allows."""
+    stop = manifest.get("stop", "bounded")
+    if STOP_CONCLUSIONS.get(stop) != run.get("conclusion"):
+        raise ContinuationError("source disk stop kind does not match its run conclusion")
+
+
 def verify_run(run: dict, run_id: int, attempt: int, current: dict) -> None:
     expected = {
         "id": run_id, "run_attempt": attempt, "status": "completed",
-        "conclusion": "success", "event": "workflow_dispatch",
+        "event": "workflow_dispatch",
         "head_sha": current["head_sha"],
     }
     for key, value in expected.items():
         if run.get(key) != value:
             raise ContinuationError(f"source run {key} mismatch")
+    verify_conclusion(run)
     if (run.get("repository") or {}).get("full_name") != current["repo"] \
         or (run.get("head_repository") or {}).get("full_name") != current["repo"]:
         raise ContinuationError("source run belongs to another repository")
@@ -198,11 +216,12 @@ def source_is_ancestor(source_head: str, target_head: str) -> bool:
 def verify_migration_run(run: dict, run_id: int, attempt: int, current: dict) -> None:
     expected = {
         "id": run_id, "run_attempt": attempt, "status": "completed",
-        "conclusion": "success", "event": "workflow_dispatch",
+        "event": "workflow_dispatch",
     }
     for key, value in expected.items():
         if run.get(key) != value:
             raise ContinuationError(f"source run {key} mismatch")
+    verify_conclusion(run)
     source_head = run.get("head_sha")
     if not isinstance(source_head, str) or source_head == current["head_sha"] \
             or not source_is_ancestor(source_head, current["head_sha"]):
@@ -402,8 +421,17 @@ def patch_migration_esp(candidate: Path, source: Path, current: dict) -> dict:
     return changes
 
 
-def publish(boot_runs: int, boot_seconds: int) -> None:
+def publish(boot_runs: int, boot_seconds: int, stop: str = "bounded") -> None:
     stopped()
+    evidence = None
+    if stop == "post-setup-idle":
+        try:
+            require_regular(POST_SETUP_IDLE_MARKER, 4096)
+        except (OSError, ContinuationError) as error:
+            raise ContinuationError("post-setup idle evidence marker absent") from error
+        evidence = POST_SETUP_IDLE_MARKER.read_text().strip()
+        if not evidence:
+            raise ContinuationError("post-setup idle evidence marker is empty")
     build = expected_build_after_boot()
     final_hash_path = ROOT / f"native-kvm-image-after-boot{boot_runs}.sha256"
     recorded = final_hash_path.read_text().split()[0]
@@ -422,10 +450,12 @@ def publish(boot_runs: int, boot_seconds: int) -> None:
             "source_ref": build.pop("ref"), "source_repo": build.pop("repo"),
             "workflow": WORKFLOW, **build,
             "disk_sha256": final, "qemu_stopped": True,
-            "boot_runs": boot_runs, "boot_seconds": boot_seconds,
+            "boot_runs": boot_runs, "boot_seconds": boot_seconds, "stop": stop,
             "qemu_version": subprocess.check_output(
                 ["qemu-system-x86_64", "--version"], text=True).splitlines()[0],
         }
+        if evidence:
+            manifest["post_setup_idle_evidence"] = evidence
         manifest["generated_hive_sha256"] = digest(ROOT / "rust-micro/.tmp/hive.dat")
         if RECEIPT.exists():
             manifest["disk_origin"] = read_json_receipt()
@@ -464,10 +494,12 @@ def expected_build_after_boot() -> dict:
 
 def restore(run_id: int, attempt: int, token: str) -> None:
     current = expected_build()
-    verify_run(api_run(run_id, attempt, token, current["repo"]), run_id, attempt, current)
+    run = api_run(run_id, attempt, token, current["repo"])
+    verify_run(run, run_id, attempt, current)
     if not stat.S_ISDIR(IN.lstat().st_mode):
         raise ContinuationError("continuation input is not a real directory")
     manifest = read_manifest(IN / "manifest.json")
+    verify_stop(run, manifest)
     verify_manifest(manifest, run_id, attempt, current)
     incoming = IN / "disk.img"
     if require_regular(incoming, MAX_DISK_BYTES) != current["disk_size_bytes"]:
@@ -498,6 +530,7 @@ def migrate(run_id: int, attempt: int, token: str) -> None:
     if not stat.S_ISDIR(IN.lstat().st_mode):
         raise ContinuationError("migration input is not a real directory")
     manifest = read_manifest(IN / "manifest.json")
+    verify_stop(run, manifest)
     verify_migration_manifest(manifest, run_id, attempt, current, run)
     incoming = IN / "disk.img"
     if require_regular(incoming, MAX_DISK_BYTES) != current["disk_size_bytes"]:
@@ -579,6 +612,7 @@ def main() -> None:
     publish_command = subcommands.add_parser("publish")
     publish_command.add_argument("--boot-runs", type=int, choices=(1, 2), required=True)
     publish_command.add_argument("--boot-seconds", type=int, required=True)
+    publish_command.add_argument("--stop", choices=sorted(STOP_CONCLUSIONS), default="bounded")
     restore_command = subcommands.add_parser("restore")
     restore_command.add_argument("--run-id", type=int, required=True)
     restore_command.add_argument("--attempt", type=int, required=True)
@@ -612,7 +646,7 @@ def main() -> None:
     elif args.command == "publish":
         if not 1 <= args.boot_seconds <= 3600:
             parser.error("boot seconds must be within the bounded QEMU runtime")
-        publish(args.boot_runs, args.boot_seconds)
+        publish(args.boot_runs, args.boot_seconds, args.stop)
     else:
         rollback()
 

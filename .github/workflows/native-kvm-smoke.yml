@@ -14,7 +14,7 @@ on:
         default: '1'
         options: ['1', '2']
       resume_run_id:
-        description: Exact successful KVM workflow run whose writable disk should continue (blank builds fresh)
+        description: Exact KVM workflow run whose published writable disk should continue (blank builds fresh)
         type: string
         default: ''
       resume_run_attempt:
@@ -22,7 +22,7 @@ on:
         type: string
         default: ''
       migrate_run_id:
-        description: Prior successful KVM run whose installed writable disk receives this commit's boot code
+        description: Prior KVM run whose published installed writable disk receives this commit's boot code
         type: string
         default: ''
       migrate_run_attempt:
@@ -225,6 +225,7 @@ jobs:
           MIGRATE_RUN_ATTEMPT: ${{ inputs.migrate_run_attempt }}
         run: python3 scripts/ci_kvm_disk_continuation.py migrate --run-id "$MIGRATE_RUN_ID" --attempt "$MIGRATE_RUN_ATTEMPT"
       - name: Run bounded KVM startup and capture QMP framebuffer
+        id: boot
         env:
           QEMU_ACCEL: kvm
           QEMU_DISPLAY: none
@@ -256,14 +257,23 @@ jobs:
             sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot2.sha256
             if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi
           fi
+      # A disk is published from a boot that ran its whole bound, or from a single boot the
+      # runner failed as stationary after setup completed and a user logged on (the runner
+      # writes the evidence marker). The job stays failed in the second case; the manifest
+      # records which kind of stop produced the disk and later runs check it.
       - name: Prepare full stopped writable disk for an exact later run
-        if: success()
+        id: publish-disk
+        if: >-
+          always() && (steps.boot.outcome == 'success' ||
+          (steps.boot.outcome == 'failure' && (inputs.boot_runs || '1') == '1' &&
+          hashFiles('native-kvm-post-setup-idle.txt') != ''))
         run: |
           python3 scripts/ci_kvm_disk_continuation.py publish \
             --boot-runs "${{ inputs.boot_runs || '1' }}" \
-            --boot-seconds "${{ inputs.boot_seconds || '300' }}"
+            --boot-seconds "${{ inputs.boot_seconds || '300' }}" \
+            --stop "${{ steps.boot.outcome == 'success' && 'bounded' || 'post-setup-idle' }}"
       - name: Upload full writable disk continuation
-        if: success()
+        if: always() && steps.publish-disk.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: native-kvm-continuation-${{ github.run_id }}-${{ github.run_attempt }}
@@ -272,7 +282,7 @@ jobs:
           retention-days: 7
           if-no-files-found: error
       - name: Roll back the generated disk after a failed continuation or migration
-        if: failure() && (steps.resume-disk.outcome == 'success' || steps.migrate-disk.outcome == 'success')
+        if: failure() && steps.publish-disk.outcome != 'success' && (steps.resume-disk.outcome == 'success' || steps.migrate-disk.outcome == 'success')
         run: python3 scripts/ci_kvm_disk_continuation.py rollback
       - name: Upload native build and startup evidence
         if: always()
@@ -298,6 +308,7 @@ jobs:
             native-kvm-blockstats-boot1.jsonl
             native-kvm-stationary.txt
             native-kvm-stationary-boot1.txt
+            native-kvm-post-setup-idle.txt
             native-kvm-image.sha256
             native-kvm-image-after-boot1.sha256
             native-kvm-image-after-boot2.sha256

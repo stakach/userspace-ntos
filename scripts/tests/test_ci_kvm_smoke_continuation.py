@@ -165,6 +165,66 @@ class ContinuationTests(unittest.TestCase):
         self.assertEqual(published["source_run_attempt"], 2)
         self.assertTrue(published["qemu_stopped"])
 
+    def publish_stop(self, stop):
+        self.paths["DISK"].write_bytes(self.advanced)
+        (self.root / "native-kvm-image-after-boot1.sha256").write_text(
+            f"{sha(self.advanced)}  disk.img\n")
+        self.enterContext(patch.object(disk, "ROOT", self.root))
+        with patch.object(disk, "stopped"), \
+             patch.object(disk, "expected_build_after_boot", return_value=self.current.copy()), \
+             patch.object(disk.subprocess, "check_output", return_value="QEMU 9.0\n"), \
+             patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2"}):
+            disk.publish(1, 3600, stop)
+
+    def test_publish_records_how_the_boot_stopped(self):
+        self.publish_stop("bounded")
+        published = json.loads((self.paths["OUT"] / "manifest.json").read_text())
+        self.assertEqual(published["stop"], "bounded")
+
+    def test_post_setup_idle_publish_needs_the_runner_evidence_marker(self):
+        marker = self.root / "post-setup-idle.txt"
+        self.enterContext(patch.object(disk, "POST_SETUP_IDLE_MARKER", marker))
+        with self.assertRaises(disk.ContinuationError):
+            self.publish_stop("post-setup-idle")
+        self.assertFalse(self.paths["OUT"].exists())
+        marker.write_text("setup.exe pid=360 exited 0; user hive loaded\n")
+        self.publish_stop("post-setup-idle")
+        published = json.loads((self.paths["OUT"] / "manifest.json").read_text())
+        self.assertEqual(published["stop"], "post-setup-idle")
+        self.assertIn("pid=360", published["post_setup_idle_evidence"])
+
+    def test_failed_source_run_is_accepted_only_with_a_post_setup_idle_disk(self):
+        self.run["conclusion"] = "failure"
+        for stop in (None, "bounded"):
+            with self.subTest(stop=stop):
+                manifest = dict(self.manifest)
+                if stop:
+                    manifest["stop"] = stop
+                self.paths["IN"].joinpath("manifest.json").write_text(json.dumps(manifest))
+                with self.assertRaises(disk.ContinuationError):
+                    self.restore()
+                self.assertEqual(self.paths["DISK"].read_bytes(), self.baseline)
+        manifest = dict(self.manifest, stop="post-setup-idle")
+        self.paths["IN"].joinpath("manifest.json").write_text(json.dumps(manifest))
+        self.restore()
+        self.assertEqual(self.paths["DISK"].read_bytes(), self.advanced)
+
+    def test_successful_source_run_refuses_a_post_setup_idle_disk(self):
+        manifest = dict(self.manifest, stop="post-setup-idle")
+        self.paths["IN"].joinpath("manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaises(disk.ContinuationError):
+            self.restore()
+        self.assertEqual(self.paths["DISK"].read_bytes(), self.baseline)
+
+    def test_cancelled_source_run_is_never_accepted(self):
+        self.run["conclusion"] = "cancelled"
+        manifest = dict(self.manifest, stop="post-setup-idle")
+        self.paths["IN"].joinpath("manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaises(disk.ContinuationError):
+            self.restore()
+        with self.assertRaises(disk.ContinuationError):
+            disk.verify_migration_run(self.run, 101, 2, self.current)
+
     def test_publish_carries_migration_origin_in_disk_artifact(self):
         origin = {
             "mode": "migration", "source_run_id": 101,
