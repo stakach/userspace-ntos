@@ -5,6 +5,14 @@ use crate::{AccessToken, TokenGroup, TokenStatistics};
 pub const TOKEN_STATISTICS_LENGTH: usize = 0x38;
 pub const TOKEN_GROUPS_AND_PRIVILEGES_LENGTH: usize = 0x38;
 
+/// Whether `NtQueryInformationToken` serves `class`. This is the NT 5.2 table (ReactOS
+/// `SeTokenInformationClass`): `TokenSessionReference` (14) and `TokenAuditPolicy` (16) are
+/// set-only, and no class above `TokenOrigin` (17) exists. The kernel rejects an unserved class
+/// before it looks at the handle.
+pub const fn token_information_class_is_queryable(class: u32) -> bool {
+    matches!(class, 1..=13 | 15 | 17)
+}
+
 /// Result of sizing and optionally writing one native token-information buffer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TokenInformationEncoding {
@@ -319,4 +327,17 @@ fn write_sid_and_attributes(
         .ok_or(InvalidTokenSid)?;
     *sid_cursor += written;
     Ok(())
+}
+
+#[cfg(test)]
+mod class_tests {
+    use super::token_information_class_is_queryable;
+
+    #[test]
+    fn only_the_nt5_query_classes_are_served() {
+        let served: alloc::vec::Vec<u32> =
+            (0..64).filter(|class| token_information_class_is_queryable(*class)).collect();
+        assert_eq!(served, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 17]);
+        assert!(!token_information_class_is_queryable(u32::MAX));
+    }
 }

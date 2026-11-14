@@ -136,7 +136,8 @@ pub use token_filter::{
 pub use token_info::{
     encode_token_default_dacl, encode_token_group_entries, encode_token_groups,
     encode_token_groups_and_privileges, encode_token_owner, encode_token_restricted_sids,
-    encode_token_statistics, InvalidTokenSid, TokenInformationEncoding, SID_AND_ATTRIBUTES_LENGTH,
+    encode_token_statistics, token_information_class_is_queryable, InvalidTokenSid,
+    TokenInformationEncoding, SID_AND_ATTRIBUTES_LENGTH,
     TOKEN_GROUPS_AND_PRIVILEGES_LENGTH, TOKEN_STATISTICS_LENGTH,
 };
 pub use token_set::{

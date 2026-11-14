@@ -38542,6 +38542,11 @@ impl ExecNtHandler {
                 let buf = args[2];
                 let len = nt_ulong_arg(args[3]) as usize;
                 let retlen_ptr = args[4];
+                // The class is validated before the buffers and the handle (ReactOS
+                // `DefaultQueryInfoBufferCheck` runs ahead of `ObReferenceObjectByHandle`).
+                if !nt_security::token_information_class_is_queryable(class) {
+                    return STATUS_INVALID_INFO_CLASS;
+                }
                 if retlen_ptr == 0 || !self.probe_user_output(retlen_ptr, 4) {
                     return STATUS_ACCESS_VIOLATION;
                 }
