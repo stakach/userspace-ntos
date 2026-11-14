@@ -300,6 +300,8 @@ mod thread_stack_exit;
 mod profile_boot_wal;
 #[path = "exec_registry_admission.rs"]
 pub(crate) mod registry_admission;
+#[path = "exec_registry_durability.rs"]
+pub(crate) mod registry_durability;
 #[path = "exec_registry_value_mutation.rs"]
 mod registry_value_mutation;
 #[path = "exec_registry_set_value.rs"]
@@ -7391,155 +7393,6 @@ impl ExecNtHandler {
             Ok(()) => 0,
             Err(status) => status.raw() as u32,
         }
-    }
-
-    /// Run `nt_unload_key_ex` and release the Event lease it took, on every exit.
-    unsafe fn nt_unload_key(&mut self, target_oa: u64, flags: u32, event: u64) -> u32 {
-        let mut event_lease = None;
-        let status = self.nt_unload_key_ex(target_oa, flags, event, &mut event_lease);
-        if let Some(event) = event_lease {
-            self.release_transfer_event(event);
-        }
-        status
-    }
-
-    /// `NtUnloadKey*` — ReactOS `ntoskrnl/config/ntapi.c:1796` (`NtUnloadKey2`) plus the event
-    /// form. Detach a hive `NtLoadKey*` mounted: the mount goes, its backing slot is released, and
-    /// the write overlay's keys under that path are detached too — otherwise the writes made
-    /// through the mount would keep answering at the same path and the "unload" would be cosmetic.
-    ///
-    /// # Safety
-    /// Reads the caller's OBJECT_ATTRIBUTES through the bounds-checked cross-AS reader.
-    ///
-    /// The optional Event is leased into `event_lease` when its handle is resolved; the caller
-    /// releases it after this returns (`nt_unload_key`).
-    unsafe fn nt_unload_key_ex(
-        &mut self,
-        target_oa: u64,
-        flags: u32,
-        event: u64,
-        event_lease: &mut Option<nt_io_manager::FileTransferEvent>,
-    ) -> u32 {
-        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
-        const REG_FORCE_UNLOAD: u32 = 0x0000_0001;
-        NT_UNLOAD_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
-        if flags != 0 && flags != REG_FORCE_UNLOAD {
-            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return STATUS_INVALID_PARAMETER;
-        }
-        if !self.current_token_has_privilege(nt_security::SE_RESTORE) {
-            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return STATUS_PRIVILEGE_NOT_HELD;
-        }
-        // The unload commits the hive volume before it signals, and that can run other work.
-        // The lease keeps the caller's Event, and so its index, until the signal.
-        let event_index = if event != 0 {
-            match self.lease_event_for_operation(event, EVENT_MODIFY_STATE) {
-                Ok(event) => {
-                    *event_lease = Some(event);
-                    Some(event.native_identity as usize)
-                }
-                Err(status) => {
-                    NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
-                    return status;
-                }
-            }
-        } else {
-            None
-        };
-        let oa = target_oa;
-        let mut rd = [0u8; 8];
-        if oa == 0 || !self.xas_read(oa + 8, &mut rd) {
-            return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-        }
-        let root_dir = u64::from_le_bytes(rd);
-        let root_target = if root_dir == 0 {
-            None
-        } else {
-            match self.resolve_registry_key(root_dir, 0) {
-                Ok(target) => Some(target),
-                Err(status) => return status,
-            }
-        };
-        let name = self.effective_objattr_name("", oa);
-        let Some(full) = self.user_namespace_target(root_target, &name) else {
-            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return STATUS_INVALID_PARAMETER;
-        };
-        let canon = nt_hive_core::canon_path(&full);
-        let Some(index) = self.hive_mounts.iter().position(|m| m.canon == canon) else {
-            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
-        if !self.hive_mounts[index].dynamic {
-            // `.Default` is mounted by the boot, not by a caller: refusing to unload it is the
-            // same refusal NT makes for a hive it did not load on request.
-            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return STATUS_INVALID_PARAMETER;
-        }
-        let Some(hive) = self.mutable_hives.hive(self.hive_mounts[index].sel) else {
-            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return STATUS_INVALID_HANDLE;
-        };
-        if hive.retained_value_journal().is_some() {
-            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return STATUS_UNSUCCESSFUL;
-        }
-        let hive_sel = self.hive_mounts[index].sel;
-        let dirty = hive.dirty_count();
-        let status = self.checkpoint_dynamic_mutable_hive(hive_sel, dirty);
-        if status != nt_fs::STATUS_SUCCESS {
-            self.writable_fs_dirty = true;
-            self.writable_fs_commit_required = true;
-            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return status;
-        }
-        // `try_flush` checkpoints the image and log, but an earlier failed volume snapshot can
-        // still own dirty bytes. Never release the dynamic mount or slot on that refusal.
-        let commit_result = {
-            let _transient = crate::allocator::enter_transient();
-            let _alloc_ctx = crate::allocator::enter_context(
-                crate::allocator::ALLOC_CTX_WRITABLE_SNAPSHOT,
-            );
-            crate::writable_fs::checkpoint_dirty_volume()
-        };
-        if let Err(status) = commit_result {
-            self.writable_fs_dirty = true;
-            self.writable_fs_commit_required = true;
-            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return status;
-        }
-        self.complete_committed_mutable_hive_journal_snapshot(b"NtUnloadKey");
-        self.writable_fs_commit_required = false;
-        let mount = self.hive_mounts.remove(index);
-        let _ = self.mutable_hives.unmount(&mount.mount);
-        let mut mutable_handles_invalidated = 0usize;
-        for entry in self.mutable_key_handles.iter_mut() {
-            if entry.as_ref().is_some_and(|key| key.hive == mount.sel) {
-                *entry = None;
-                mutable_handles_invalidated += 1;
-            }
-        }
-        let overlay_detached = self.overlay.detach_subtree(&canon);
-        NT_UNLOAD_KEY_DETACHED.fetch_add(1, Ordering::Relaxed);
-        if let Some(index) = event_index {
-            let status = self.signal_event_index(index);
-            if status != 0 {
-                return status;
-            }
-        }
-        print_str(b"[cm-load] NtUnloadKey DETACHED ");
-        print_ascii_str(&mount.mount);
-        print_str(b" overlay-keys=");
-        print_u64(overlay_detached as u64);
-        print_str(b" mutable-handles=");
-        print_u64(mutable_handles_invalidated as u64);
-        print_str(b" mounts-left=");
-        print_u64(self.hive_mounts.len() as u64);
-        print_str(b"\n");
-        0
     }
 
     fn registry_overlay_index(&self, target: KeyRef) -> Option<usize> {
@@ -34077,59 +33930,14 @@ impl ExecNtHandler {
             NativeService::NtSetValueKey => unsafe { self.nt_set_value_key_admitted(args) },
             // `NtFlushKey(IN HANDLE KeyHandle)` — `references/reactos/ntoskrnl/config/ntapi.c:1085`.
             // NT references the key object by handle with no access mask, rejects deleted KCBs, then
-            // calls `CmFlushKey(kcb, FALSE)`. A key in ReactOS' volatile master hive drives
-            // `CmpDoFlushAll(FALSE)`; keys in mounted mutable hives checkpoint through the writable
-            // filesystem. Dynamic `NtLoadKey` profile hives write back to their source file, while
-            // boot-mounted hives write full images or committed journal sidecars under
-            // `system32\config`.
+            // calls `CmFlushKey(kcb, FALSE)`.
             NativeService::NtFlushKey => {
                 let key = match self.resolve_registry_key(args[0], 0) {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                REG_FLUSH_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
-                if let Some(index) = overlay_key_idx(key) {
-                    if self.overlay.is_volatile(index).unwrap_or(false) {
-                        REG_FLUSH_KEY_VOLATILE.fetch_add(1, Ordering::Relaxed);
-                        let status = self.flush_all_mutable_hives_preserving_headroom(
-                            BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM,
-                        );
-                        if status != nt_fs::STATUS_SUCCESS {
-                            return status;
-                        }
-                    }
-                } else if self.cm_system_key_target(key).is_some() {
-                    REG_FLUSH_KEY_MUTABLE.fetch_add(1, Ordering::Relaxed);
-                    REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(0, Ordering::Relaxed);
-                    let status = self.checkpoint_system_hive_from_config_manager();
-                    if status != nt_fs::STATUS_SUCCESS {
-                        return status;
-                    }
-                } else if let Some(mutable_key) = self.mutable_registry_key(key) {
-                    REG_FLUSH_KEY_MUTABLE.fetch_add(1, Ordering::Relaxed);
-                    let dirty = self
-                        .mutable_hives
-                        .hive(mutable_key.hive)
-                        .map_or(0, |hive| hive.dirty_count());
-                    REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(dirty as u64, Ordering::Relaxed);
-                    if is_dynamic_hive_selector(mutable_key.hive) {
-                        let status = self.checkpoint_dynamic_mutable_hive(mutable_key.hive, dirty);
-                        if status != nt_fs::STATUS_SUCCESS {
-                            return status;
-                        }
-                    } else {
-                        let status = self
-                            .checkpoint_non_system_boot_mutable_hive_preserving_headroom(
-                                mutable_key.hive,
-                                dirty,
-                                BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM,
-                            );
-                        if status != nt_fs::STATUS_SUCCESS {
-                            return status;
-                        }
-                    }
-                }
-                0
+                let scope = self.registry_flush_scope(key);
+                self.flush_registry_scope(scope)
             }
             // Save an exact key or subtree to the caller-opened file. SYSTEM handles export from
             // their CM lease; local mutable hives retain the same native entry points.

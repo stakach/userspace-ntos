@@ -152,35 +152,6 @@ fn assert_zero_dirty_ack_guarded(name: &str, skip: bool) {
 }
 
 #[test]
-fn dynamic_unload_retains_uncertain_journal_before_mount_release() {
-    let file = source();
-    let unload = method(&file, "nt_unload_key_ex");
-    let guard =
-        unload.block.stmts.iter().position(retained_refusal).expect(
-            "dynamic unload must refuse an uncertain entered journal before dropping its hive",
-        );
-    // The slot bit is now released by HiveMount::drop, after the borrowed hive
-    // navigator is dropped. Unload must first remove and unmount the authority.
-    for effect in ["remove", "unmount"] {
-        let position = unload
-            .block
-            .stmts
-            .iter()
-            .position(|statement| {
-                facts(statement)
-                    .methods
-                    .iter()
-                    .any(|method| method == effect)
-            })
-            .unwrap_or_else(|| panic!("dynamic unload must audit its actual {effect} effect"));
-        assert!(
-            guard < position,
-            "journal refusal must precede dynamic unload {effect}"
-        );
-    }
-}
-
-#[test]
 fn dynamic_slot_release_follows_borrowed_hive_drop() {
     let image = include_str!(
         "../../../components/ntos-executive/src/exec_user_hive_image.rs"

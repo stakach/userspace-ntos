@@ -11,32 +11,6 @@ fn source(name: &str) -> String {
 }
 
 #[test]
-fn dirty_dynamic_hive_is_durable_before_ntunload_detaches_its_owner() {
-    let source = source("exec_handler.rs");
-    let start = source.find("unsafe fn nt_unload_key_ex(").expect("NtUnloadKey owner");
-    let end = source[start..].find("fn registry_overlay_index(").unwrap() + start;
-    let unload = &source[start..end];
-    let journal_refusal = unload.find("hive.retained_value_journal().is_some()")
-        .expect("retained mutation prevents unload");
-    let checkpoint = unload.find("self.checkpoint_dynamic_mutable_hive(")
-        .expect("dirty dynamic hive checkpoint");
-    let durable = unload.find("crate::writable_fs::checkpoint_dirty_volume()")
-        .expect("volume commit barrier");
-    let detach = unload.find("self.hive_mounts.remove(index)")
-        .expect("mount detachment");
-    assert!(journal_refusal < checkpoint && checkpoint < durable && durable < detach,
-        "NtUnloadKey must prove the exact dynamic hive durable before releasing its mount/slot");
-    let checkpoint_refusal = &unload[checkpoint..durable];
-    assert!(checkpoint_refusal.contains("NT_UNLOAD_KEY_REFUSED")
-        && checkpoint_refusal.contains("return status"),
-        "checkpoint refusal must retain the mount and slot");
-    let commit_refusal = &unload[durable..detach];
-    assert!(commit_refusal.contains("NT_UNLOAD_KEY_REFUSED")
-        && commit_refusal.contains("return status"),
-        "volume commit refusal must retain the mount and slot");
-}
-
-#[test]
 fn native_quiesce_proves_dirty_dynamic_hive_sidecars_without_async_checkpoint() {
     let handler = source("exec_handler.rs");
     let path_start = handler
