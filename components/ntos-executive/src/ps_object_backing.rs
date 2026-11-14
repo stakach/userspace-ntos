@@ -354,6 +354,38 @@ fn set_thread_device_to_verify_unlocked(
     lifetime: ThreadLifetime,
     device: u64,
 ) -> Result<(), u32> {
+    let fields = live_thread_fields(arena, pm, ethread, lifetime)?;
+    let body = unsafe { core::slice::from_raw_parts_mut(ethread as *mut u8, abi::ETHREAD_BODY_BYTES) };
+    abi::set_thread_device_to_verify(body, fields, GuestAddr(device)).map_err(|_| INVALID)
+}
+
+/// Publish the Process Manager's suspend count in the thread's body, where the hosted win32k
+/// reads `Tcb.SuspendCount` itself. A thread whose body is not published yet has nothing to
+/// update: its body takes the count when it is initialized or activated.
+pub(super) fn project_thread_suspend_count(
+    pm: &ProcessManager,
+    lifetime: ThreadLifetime,
+) -> Result<(), u32> {
+    let _borrow = Borrow::acquire()?;
+    let arena = unsafe { &mut *core::ptr::addr_of_mut!(ARENA) }.as_mut().ok_or(INVALID)?;
+    arena.validate(pm)?;
+    let tid = lifetime.thread_id();
+    let Some(ethread) = pm.thread_kernel_object(tid) else {
+        return Ok(());
+    };
+    let count = pm.thread(tid).ok_or(INVALID)?.suspend_count;
+    let fields = live_thread_fields(arena, pm, ethread, lifetime)?;
+    let body = unsafe { core::slice::from_raw_parts_mut(ethread as *mut u8, abi::ETHREAD_BODY_BYTES) };
+    abi::set_thread_suspend_count(body, fields, count).map_err(|_| INVALID)
+}
+
+/// The identity fields of an exact published thread body the executive may write through.
+fn live_thread_fields(
+    arena: &Arena,
+    pm: &ProcessManager,
+    ethread: u64,
+    lifetime: ThreadLifetime,
+) -> Result<abi::ThreadInitialization, u32> {
     let tid = lifetime.thread_id();
     if !pm.validate_thread_lifetime(lifetime)
         || pm.thread_kernel_object(tid) != Some(ethread)
@@ -374,6 +406,7 @@ fn set_thread_device_to_verify_unlocked(
             thread_id: u64::from(tid),
             teb: GuestAddr(0),
             system_thread: true,
+            suspend_count: pm.thread(tid).ok_or(INVALID)?.suspend_count,
         }
     } else {
         let index = arena.existing(BodyId::Thread(tid)).ok_or(INVALID)?;
@@ -394,8 +427,7 @@ fn set_thread_device_to_verify_unlocked(
         }
         fields
     };
-    let body = unsafe { core::slice::from_raw_parts_mut(ethread as *mut u8, abi::ETHREAD_BODY_BYTES) };
-    abi::set_thread_device_to_verify(body, fields, GuestAddr(device)).map_err(|_| INVALID)
+    Ok(fields)
 }
 
 /// Clear only fields owned by the retiring exact physical registration. An old
@@ -714,6 +746,7 @@ pub(super) unsafe fn prepare_process(
         return Err(INVALID);
     }
     let peb = pm.query_process_basic(pid, u64::MAX)?.peb_base_address;
+    let section_base_address = pm.process_image_base(pid).ok_or(INVALID)?;
     let image_file_name = pm.kernel_process_export_state(pid)
         .and_then(|state| state.eprocess_image_file_name())
         .ok_or(INVALID)?;
@@ -725,6 +758,7 @@ pub(super) unsafe fn prepare_process(
                 process_id: u64::from(pid),
                 peb: GuestAddr(peb),
                 image_file_name,
+                section_base_address: GuestAddr(section_base_address),
             })
         },
         scratch_base,
@@ -765,7 +799,8 @@ pub(super) unsafe fn prepare_thread(
         process.descriptor().address
     };
     let thread = pm.thread(lifetime.thread_id()).ok_or(INVALID)?;
-    let (teb, system_thread) = (thread.teb_base, thread.is_system_thread);
+    let (teb, system_thread, suspend_count) =
+        (thread.teb_base, thread.is_system_thread, thread.suspend_count);
     arena.prepare(
         BodyId::Thread(lifetime.thread_id()),
         |address| Initialization::Thread {
@@ -777,6 +812,7 @@ pub(super) unsafe fn prepare_thread(
                 thread_id: u64::from(lifetime.thread_id()),
                 teb: GuestAddr(teb),
                 system_thread,
+                suspend_count,
             },
         },
         scratch_base,

@@ -15,7 +15,7 @@ impl Worker {
         for (offset, value) in [
             (abi::ETHREAD_CLIENT_ID_PROCESS, 36u64),
             (abi::ETHREAD_CLIENT_ID_THREAD, 40),
-            (abi::ETHREAD_THREADS_PROCESS, 0x1000),
+            (abi::KTHREAD_PROCESS, 0x1000),
             (abi::KTHREAD_TEB, 0x8000),
         ] {
             worker.0[offset..offset + 8].copy_from_slice(&value.to_le_bytes());

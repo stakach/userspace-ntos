@@ -27,7 +27,7 @@ pub(super) unsafe fn validate_ps_provider_execution_thread(
     }
     let process_id = field_address(ethread, abi::ETHREAD_CLIENT_ID_PROCESS)?;
     let thread_id = field_address(ethread, abi::ETHREAD_CLIENT_ID_THREAD)?;
-    let process_body = field_address(ethread, abi::ETHREAD_THREADS_PROCESS)?;
+    let process_body = field_address(ethread, abi::KTHREAD_PROCESS)?;
     if core::ptr::read_volatile(ethread as *const u8) != 6
         || core::ptr::read_volatile(process_id as *const u64) != pid
         || core::ptr::read_volatile(thread_id as *const u64) != tid

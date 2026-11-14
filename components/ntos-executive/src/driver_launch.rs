@@ -18644,7 +18644,7 @@ extern "win64" fn s_current_thread() -> u64 {
 extern "win64" fn s_io_thread_to_process(thread: u64) -> u64 {
     unsafe {
         read_unaligned(
-            (thread + nt_kernel_abi::ps_hosted_x64::ETHREAD_THREADS_PROCESS as u64) as *const u64,
+            (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_PROCESS as u64) as *const u64,
         )
     }
 }

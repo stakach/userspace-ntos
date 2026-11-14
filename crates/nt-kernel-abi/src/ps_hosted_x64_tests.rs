@@ -6,6 +6,7 @@ fn process() -> ProcessInitialization {
         process_id: 4,
         peb: GuestAddr::NULL,
         image_file_name: [0; 16],
+        section_base_address: GuestAddr::NULL,
     }
 }
 
@@ -17,6 +18,7 @@ fn thread() -> ThreadInitialization {
         thread_id: 16,
         teb: GuestAddr::NULL,
         system_thread: true,
+        suspend_count: 0,
     }
 }
 
@@ -26,8 +28,8 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
 
 #[test]
 fn verify_device_updates_only_the_exact_live_ethread_projection() {
-    // ReactOS ETHREAD.DeviceToVerify precedes ThreadsProcess on this AMD64 projection.
-    assert_eq!(ETHREAD_DEVICE_TO_VERIFY, 0x3d0);
+    // `IoSetDeviceToVerify` in the pinned ntoskrnl.exe stores at [ETHREAD + 0x558].
+    assert_eq!(ETHREAD_DEVICE_TO_VERIFY, 0x558);
     let init = thread();
     let mut bytes = [0; ETHREAD_BODY_BYTES];
     initialize_thread(&mut bytes, init).unwrap();
@@ -115,8 +117,8 @@ fn released_libernt_win32k_reads_the_thread_win32_slot_at_0x1c8() {
 }
 
 #[test]
-fn apc_state_index_has_reactos_x64_offset_and_survives_activation_refresh() {
-    assert_eq!(KTHREAD_APC_STATE_INDEX, 0x1e4);
+fn apc_state_index_has_the_pinned_offset_and_survives_activation_refresh() {
+    assert_eq!(KTHREAD_APC_STATE_INDEX, 0x24a);
     let init = thread();
     let mut bytes = [0; ETHREAD_BODY_BYTES];
     initialize_thread(&mut bytes, init).unwrap();
@@ -127,7 +129,7 @@ fn apc_state_index_has_reactos_x64_offset_and_survives_activation_refresh() {
 }
 
 #[test]
-fn activation_refresh_preserves_all_bytes_except_teb_and_system_thread_bit() {
+fn activation_refresh_changes_only_teb_system_thread_bit_and_suspend_count() {
     let init = thread();
     let mut bytes = [0xa5; ETHREAD_BODY_BYTES + 16];
     initialize_thread(&mut bytes, init).unwrap();
@@ -137,17 +139,19 @@ fn activation_refresh_preserves_all_bytes_except_teb_and_system_thread_bit() {
     }
     bytes[KTHREAD_PREVIOUS_MODE] = 1;
     expected_u64(&mut bytes, KTHREAD_WIN32_THREAD, 0x50_0000);
-    expected_u64(&mut bytes, ETHREAD_THREAD_NAME, 0x60_0000);
+    expected_u64(&mut bytes, ETHREAD_BODY_BYTES - 8, 0x60_0000);
     let old_flags = 0xabcd_ffffu32;
     bytes[ETHREAD_CROSS_THREAD_FLAGS..ETHREAD_CROSS_THREAD_FLAGS + 4]
         .copy_from_slice(&old_flags.to_le_bytes());
     let mut expected = bytes;
     expected_u64(&mut expected, KTHREAD_TEB, 0x70_0000);
+    expected[KTHREAD_SUSPEND_COUNT] = 1;
     expected[ETHREAD_CROSS_THREAD_FLAGS..ETHREAD_CROSS_THREAD_FLAGS + 4]
         .copy_from_slice(&(old_flags & !ETHREAD_SYSTEM_THREAD).to_le_bytes());
     let fields = ThreadInitialization {
         teb: GuestAddr(0x70_0000),
         system_thread: false,
+        suspend_count: 1,
         ..init
     };
     let before_validation = bytes;
@@ -167,6 +171,7 @@ fn activation_refresh_preserves_all_bytes_except_teb_and_system_thread_bit() {
     )
     .unwrap();
     expected_u64(&mut expected, KTHREAD_TEB, 0);
+    expected[KTHREAD_SUSPEND_COUNT] = 0;
     expected[ETHREAD_CROSS_THREAD_FLAGS..ETHREAD_CROSS_THREAD_FLAGS + 4]
         .copy_from_slice(&old_flags.to_le_bytes());
     assert_eq!(bytes, expected);
@@ -185,7 +190,6 @@ fn activation_refresh_rejects_wrong_stored_identity_before_writes() {
         ETHREAD_CLIENT_ID_PROCESS,
         ETHREAD_CLIENT_ID_THREAD,
         KTHREAD_PROCESS,
-        ETHREAD_THREADS_PROCESS,
         KTHREAD_APC_STATE_PROCESS,
         KTHREAD_APC_STATE_POINTERS,
         KTHREAD_APC_STATE_POINTERS + 8,
@@ -336,12 +340,12 @@ fn system_process_has_real_identity_and_no_synthetic_user_storage() {
     initialize_process(&mut bytes, init).unwrap();
     let mut expected = [0; EPROCESS_BODY_BYTES];
     expected[0] = 3;
-    expected[2] = 0x2c;
-    for offset in [0x08, 0x18, 0x50, 0x70, 0x288] {
+    expected[2] = 0x72;
+    for offset in [0x08, 0x18, 0x30, 0x68, 0x370] {
         expected_u64(&mut expected, offset, init.body.0 + offset as u64);
         expected_u64(&mut expected, offset + 8, init.body.0 + offset as u64);
     }
-    expected_u64(&mut expected, 0xd0, 4);
+    expected_u64(&mut expected, 0x1d0, 4);
     assert_eq!(&bytes[..EPROCESS_BODY_BYTES], expected);
     assert_eq!(&bytes[EPROCESS_BODY_BYTES..], [0xa5; 8]);
     assert_eq!(u64_at(&bytes, EPROCESS_PEB), 0);
@@ -355,7 +359,9 @@ fn process_image_file_name_is_stable_inside_its_exact_eprocess_body() {
     init.image_file_name[..13].copy_from_slice(b"Explorer.EXE\0");
     let mut bytes = [0xa5; EPROCESS_BODY_BYTES + 8];
     initialize_process(&mut bytes, init).unwrap();
-    assert_eq!(&bytes[0x260..0x270], &init.image_file_name);
+    assert_eq!(&bytes[0x338..0x347], &init.image_file_name[..15]);
+    // The sixteenth byte is `PriorityClass`, not part of the name.
+    assert_eq!(bytes[0x347], 0);
     assert_eq!(&bytes[EPROCESS_BODY_BYTES..], [0xa5; 8]);
 }
 
@@ -366,35 +372,38 @@ fn system_thread_has_real_cid_process_links_and_cross_thread_flag() {
     initialize_thread(&mut bytes, init).unwrap();
     let mut expected = [0; ETHREAD_BODY_BYTES];
     expected[0] = 6;
-    expected[KTHREAD_ENABLE_STACK_SWAP] = 1;
-    for offset in [0x08, 0x18, 0x48, 0x58, 0x330, 0x348, 0x368, 0x3b8] {
+    expected[KTHREAD_THREAD_FLAGS] = 0x40;
+    for offset in [0x08, 0x98, 0xa8, 0x308, 0x4c8, 0x4d8, 0x4f8, 0x540] {
         expected_u64(&mut expected, offset, init.body.0 + offset as u64);
         expected_u64(&mut expected, offset + 8, init.body.0 + offset as u64);
     }
-    for offset in [0x68, 0x200, 0x3d8] {
+    for offset in [0xb8, 0x220] {
         expected_u64(&mut expected, offset, init.process_body.0);
     }
-    expected_u64(&mut expected, 0x210, init.body.0 + 0x48);
-    expected_u64(&mut expected, 0x218, init.body.0 + 0x220);
-    expected_u64(&mut expected, 0x378, 4);
-    expected_u64(&mut expected, 0x380, 16);
-    expected[0x41c] = 0x10;
+    expected_u64(&mut expected, 0x4a0, init.body.0 + 0x98);
+    expected_u64(&mut expected, 0x4a8, init.body.0 + 0x258);
+    expected_u64(&mut expected, 0x508, 4);
+    expected_u64(&mut expected, 0x510, 16);
+    expected[0x5a0] = 0x10;
     assert_eq!(&bytes[..ETHREAD_BODY_BYTES], expected);
     assert_eq!(&bytes[ETHREAD_BODY_BYTES..], [0xa5; 8]);
     assert_eq!(u64_at(&bytes, KTHREAD_TEB), 0);
     assert_eq!(u64_at(&bytes, KTHREAD_WIN32_THREAD), 0);
     assert_eq!(bytes[KTHREAD_PREVIOUS_MODE], 0);
-    assert_eq!(ETHREAD_THREAD_NAME + 8, ETHREAD_BODY_BYTES);
 }
 
 #[test]
 fn thread_execution_state_uses_exact_x64_fields_and_preserves_neighbors() {
-    assert_eq!(KTHREAD_ENABLE_STACK_SWAP, 0x94);
+    // `KeSetKernelStackSwapEnable` in the pinned ntoskrnl.exe exchanges bit 6 of [KTHREAD + 0x78].
+    assert_eq!((KTHREAD_THREAD_FLAGS, KTHREAD_ENABLE_STACK_SWAP), (0x78, 0x40));
     let mut bytes = [0; ETHREAD_BODY_BYTES];
     initialize_thread(&mut bytes, thread()).unwrap();
+    bytes[KTHREAD_THREAD_FLAGS..KTHREAD_THREAD_FLAGS + 4]
+        .copy_from_slice(&(0xa5a5_a500u32 | KTHREAD_ENABLE_STACK_SWAP).to_le_bytes());
     assert_eq!(thread_previous_mode(&bytes), Ok(ThreadPreviousMode::KernelMode));
     let before = bytes;
     assert_eq!(exchange_thread_stack_swap_enable(&mut bytes, false), Ok(true));
+    assert_eq!(bytes[KTHREAD_THREAD_FLAGS..KTHREAD_THREAD_FLAGS + 4], 0xa5a5_a500u32.to_le_bytes());
     assert_eq!(exchange_thread_stack_swap_enable(&mut bytes, false), Ok(false));
     assert_eq!(exchange_thread_stack_swap_enable(&mut bytes, true), Ok(false));
     assert_eq!(bytes, before);
@@ -411,19 +420,92 @@ fn invalid_execution_state_and_short_projections_refuse_mutation() {
     let mut bytes = [0; ETHREAD_BODY_BYTES];
     initialize_thread(&mut bytes, thread()).unwrap();
     bytes[KTHREAD_PREVIOUS_MODE] = 2;
-    bytes[KTHREAD_ENABLE_STACK_SWAP] = 2;
     let before = bytes;
     assert_eq!(thread_previous_mode(&bytes), Err(ProjectionError::InvalidPreviousMode));
     assert_eq!(exchange_thread_previous_mode(&mut bytes, ThreadPreviousMode::KernelMode),
         Err(ProjectionError::InvalidPreviousMode));
-    assert_eq!(exchange_thread_stack_swap_enable(&mut bytes, true),
-        Err(ProjectionError::InvalidBoolean));
     assert_eq!(bytes, before);
     assert_eq!(exchange_thread_previous_mode(&mut bytes[..KTHREAD_PREVIOUS_MODE],
         ThreadPreviousMode::UserMode), Err(ProjectionError::BufferTooSmall));
-    assert_eq!(exchange_thread_stack_swap_enable(&mut bytes[..KTHREAD_ENABLE_STACK_SWAP], false),
+    assert_eq!(exchange_thread_stack_swap_enable(&mut bytes[..KTHREAD_THREAD_FLAGS + 3], false),
         Err(ProjectionError::BufferTooSmall));
     assert_eq!(bytes, before);
+}
+
+/// win32k.sys tests `pti->pEThread->Tcb.SuspendCount` (a CHAR at +0x284) for its hung-window
+/// decision (`msgqueue.c:2307`, image RVAs 0x856E6 and 0x861B1).
+#[test]
+fn suspend_count_is_published_in_the_exact_live_body_only() {
+    let init = thread();
+    let mut bytes = [0xa5; ETHREAD_BODY_BYTES + 8];
+    initialize_thread(&mut bytes, ThreadInitialization { suspend_count: 1, ..init }).unwrap();
+    assert_eq!(bytes[KTHREAD_SUSPEND_COUNT], 1);
+    let mut expected = bytes;
+    set_thread_suspend_count(&mut bytes, init, 2).unwrap();
+    expected[0x284] = 2;
+    assert_eq!(bytes, expected);
+    set_thread_suspend_count(&mut bytes, init, 0).unwrap();
+    expected[0x284] = 0;
+    assert_eq!(bytes, expected);
+
+    assert_eq!(
+        set_thread_suspend_count(&mut bytes, init, MAXIMUM_SUSPEND_COUNT + 1),
+        Err(ProjectionError::InvalidSuspendCount)
+    );
+    let other = ThreadInitialization { thread_id: init.thread_id + 4, ..init };
+    assert_eq!(
+        set_thread_suspend_count(&mut bytes, other, 1),
+        Err(ProjectionError::IdentityMismatch)
+    );
+    assert_eq!(bytes, expected);
+}
+
+/// The window station win32k assigns with `PsSetProcessWindowStation` is read back by
+/// `UserGetShellWindow` and `NtUserSetShellWindowEx` from [EPROCESS + 0x2c8] directly (image
+/// RVAs 0xAF43E and 0xAF567); `IntIsGuiImage` reads the section base at +0x2b0 (RVA 0x242B3).
+#[test]
+fn process_fields_win32k_reads_directly_are_inside_the_body_and_distinct() {
+    let mut init = process();
+    init.peb = GuestAddr(0x30_0000);
+    init.section_base_address = GuestAddr(0x1_4000_0000);
+    let mut bytes = [0xa5; EPROCESS_BODY_BYTES];
+    initialize_process(&mut bytes, init).unwrap();
+    assert_eq!(u64_at(&bytes, 0x2b0), 0x1_4000_0000);
+    assert_eq!(u64_at(&bytes, 0x2c8), 0);
+    assert_eq!(u64_at(&bytes, 0x298), 0);
+    assert_eq!(u64_at(&bytes, 0x2e0), 0x30_0000);
+}
+
+#[test]
+fn pinned_fields_fit_their_bodies_without_overlapping() {
+    assert_eq!((KPROCESS_BYTES, EPROCESS_BYTES), (0x1c8, 0x840));
+    assert_eq!((KTHREAD_BYTES, ETHREAD_BODY_BYTES), (0x4c0, 0x6c0));
+    assert!(EPROCESS_BYTES <= EPROCESS_BODY_BYTES);
+    for (index, field) in PINNED_LAYOUT.iter().enumerate() {
+        let (thread_object, limit) = match field.object {
+            "KPROCESS" => (false, KPROCESS_BYTES),
+            "EPROCESS" => (false, EPROCESS_BYTES),
+            "KTHREAD" => (true, KTHREAD_BYTES),
+            "ETHREAD" => (true, ETHREAD_BODY_BYTES),
+            other => panic!("unknown object {other}"),
+        };
+        assert!(field.pinned + field.bytes <= limit, "{}.{}", field.object, field.name);
+        for other in &PINNED_LAYOUT[index + 1..] {
+            let same_body = thread_object == matches!(other.object, "KTHREAD" | "ETHREAD");
+            // `SuspendCount` lives in the tail of `SavedApcState`'s fill bytes by declaration.
+            let declared_overlay = matches!(
+                (field.name, other.name),
+                ("SavedApcState", "SuspendCount") | ("ApcState.ApcListHead", "ApcState.Process")
+            );
+            assert!(
+                !same_body
+                    || declared_overlay
+                    || field.pinned + field.bytes <= other.pinned
+                    || other.pinned + other.bytes <= field.pinned,
+                "{}.{} overlaps {}.{}", field.object, field.name, other.object, other.name
+            );
+        }
+    }
 }
 
 #[test]
@@ -602,6 +684,19 @@ fn self_relative_list_addresses_do_not_wrap_near_address_space_end() {
     init.body = GuestAddr(u64::MAX - ETHREAD_BODY_BYTES as u64 - 7);
     let mut bytes = [0; ETHREAD_BODY_BYTES];
     initialize_thread(&mut bytes, init).unwrap();
-    assert_eq!(u64_at(&bytes, 0x3b8), init.body.0 + 0x3b8);
-    assert_eq!(u64_at(&bytes, 0x218), init.body.0 + 0x220);
+    assert_eq!(u64_at(&bytes, 0x540), init.body.0 + 0x540);
+    assert_eq!(u64_at(&bytes, 0x4a8), init.body.0 + 0x258);
+}
+
+/// Every projected field sits where the pinned LiberNT release (8e478a22) keeps it. The offsets
+/// are those of its AMD64 headers and of the accessors in its ntoskrnl.exe; the hosted
+/// win32k.sys reads several of them itself, without calling an accessor.
+#[test]
+fn projected_fields_follow_the_pinned_libernt_layout() {
+    for field in PINNED_LAYOUT {
+        assert_eq!(
+            field.projected, field.pinned,
+            "{}.{} ({})", field.object, field.name, field.header
+        );
+    }
 }

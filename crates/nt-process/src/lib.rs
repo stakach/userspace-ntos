@@ -2407,6 +2407,12 @@ impl ProcessManager {
             process.kernel_process_object.is_none() || process.kernel_process_object == Some(eprocess))
     }
 
+    /// `EPROCESS.SectionBaseAddress` as recorded by [`Self::set_image_base`]; zero for a process
+    /// with no image section, such as System.
+    pub fn process_image_base(&self, pid: ProcessId) -> Option<u64> {
+        self.processes.get(&pid).map(|process| process.image_base)
+    }
+
     /// Read back the parked `EPROCESS` body pointer.
     pub fn process_kernel_object(&self, pid: ProcessId) -> Option<u64> {
         self.processes

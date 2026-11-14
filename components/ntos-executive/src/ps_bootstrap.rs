@@ -60,6 +60,7 @@ unsafe fn publish_initial_objects(
             process_id: u64::from(identity.process_id()),
             peb: GuestAddr(0),
             image_file_name,
+            section_base_address: GuestAddr(0),
         },
     )
     .map_err(|_| 0xc000_000du32)?;
@@ -72,6 +73,7 @@ unsafe fn publish_initial_objects(
             thread_id: u64::from(identity.thread_id()),
             teb: GuestAddr(0),
             system_thread: true,
+            suspend_count: 0,
         },
     )
     .map_err(|_| 0xc000_000du32)?;

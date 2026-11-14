@@ -70,6 +70,9 @@ pub(crate) unsafe fn commit_thread_activation(
     }
     // Both owners remain exclusively borrowed. No allocation, syscall or provider byte write can
     // invalidate the preflight between PM generation publication and these bounded field writes.
+    // The activation commit has reset or set the count (a reused thread starts unsuspended
+    // unless it was created suspended); the body follows the Process Manager.
+    fields.suspend_count = pm.thread(plan.thread_id()).map_or(0, |thread| thread.suspend_count);
     abi::refresh_thread_activation(bytes, fields).expect("exclusive prevalidated ETHREAD refresh");
     row.current_thread_lifetime = pm.thread_lifetime(plan.thread_id());
     row.phase = BodyPhase::Published;

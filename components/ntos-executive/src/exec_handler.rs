@@ -8853,6 +8853,10 @@ impl ExecNtHandler {
         self.pm.publish_initial_thread_runtime(
             lifetime, mapped.entry, teb, mapped.create_time_100ns,
         )?;
+        // `EPROCESS.SectionBaseAddress`: the base this process's image section is mapped at.
+        if !self.pm.set_image_base(process.pid, spawn.layout.base()) {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
         let scratch = crate::executor::local().scratch_base.load(Ordering::Relaxed);
         let process_body = unsafe {
             crate::ps_object_backing::prepare_process(&self.pm, process.pid, scratch)?

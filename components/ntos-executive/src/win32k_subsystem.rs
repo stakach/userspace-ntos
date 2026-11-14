@@ -3703,8 +3703,6 @@ const ETHREAD_CID_UNIQUE_PROCESS_OFF: u64 =
     nt_kernel_abi::ps_hosted_x64::ETHREAD_CLIENT_ID_PROCESS as u64;
 const ETHREAD_CID_UNIQUE_THREAD_OFF: u64 =
     nt_kernel_abi::ps_hosted_x64::ETHREAD_CLIENT_ID_THREAD as u64;
-const ETHREAD_THREADS_PROCESS_OFF: u64 =
-    nt_kernel_abi::ps_hosted_x64::ETHREAD_THREADS_PROCESS as u64;
 const TEB_SELF_OFF: u64 = 0x30;
 const TEB_CLIENT_ID_PROCESS_OFF: u64 = 0x40;
 const TEB_CLIENT_ID_THREAD_OFF: u64 = 0x48;
@@ -3802,7 +3800,7 @@ extern "win64" fn s_ps_get_thread_process_id(thread: u64) -> u64 {
 
 /// `PEPROCESS PsGetThreadProcess(PETHREAD Thread)` reads the referenced native thread's owner.
 extern "win64" fn s_ps_get_thread_process(thread: u64) -> u64 {
-    unsafe { read_volatile((thread + ETHREAD_THREADS_PROCESS_OFF) as *const u64) }
+    unsafe { read_volatile((thread + KTHREAD_PROCESS_OFF) as *const u64) }
 }
 
 unsafe fn win32k_ps_broker_call(op: u64, object: u64, value: u64) -> (i32, u64, u64, u64) {
@@ -12278,10 +12276,6 @@ unsafe fn prepare_ethread_for_win32k_callout(thread_index: usize, teb: u64) {
         process_id,
     );
     write_volatile((ethread + ETHREAD_CID_UNIQUE_THREAD_OFF) as *mut u64, tid);
-    write_volatile(
-        (ethread + ETHREAD_THREADS_PROCESS_OFF) as *mut u64,
-        eprocess,
-    );
 }
 
 unsafe fn publish_selected_context(process_index: usize, thread_index: usize) {

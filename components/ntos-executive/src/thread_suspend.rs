@@ -361,6 +361,21 @@ unsafe fn finish_control(
     if owner.execution_state() == ThreadExecutionState::Running {
         *slot = None;
     }
+    // The count is committed; the thread body follows it. A body that cannot be written leaves
+    // win32k's hung-window test reading the previous count, so name the thread.
+    if result.rejection.is_none() {
+        if let Err(status) =
+            crate::ps_object_backing::project_thread_suspend_count(&handler.pm, lifetime)
+        {
+            crate::print_str(b"[thread-suspend] suspend count not published tid=");
+            crate::print_u64(u64::from(tid));
+            crate::print_str(b" count=");
+            crate::print_u64(u64::from(result.count));
+            crate::print_str(b" status=0x");
+            crate::print_hex(status);
+            crate::print_str(b"\n");
+        }
+    }
     match result.rejection {
         Some(status) => Err(status),
         None => Ok(result.previous_count),
