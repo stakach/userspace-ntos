@@ -75645,6 +75645,15 @@ pub(crate) fn hosted_file_route(file_id: u64) -> Option<(u64, u64)> {
     Some((file.device_id.raw(), file.driver_context.unwrap_or(0)))
 }
 
+/// Diagnostic spelling of a canonical File's name; nothing is printed for an absent File.
+pub(crate) fn print_hosted_file_name(file_id: u64) {
+    if let Some(file) = io_manager_mut().file(FileId(file_id)) {
+        for unit in file.file_name.as_units().iter().take(120) {
+            debug_put_char(u8::try_from(*unit).ok().filter(u8::is_ascii_graphic).unwrap_or(b'?'));
+        }
+    }
+}
+
 pub(crate) fn hosted_file_exists(file_id: u64) -> bool {
     io_manager_mut().file(FileId(file_id)).is_some()
 }

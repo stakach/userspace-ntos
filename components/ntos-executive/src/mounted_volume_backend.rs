@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use nt_io_abi::major;
 use nt_io_manager::{
     DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend, IoParameters, IrpId,
-    IrpProjection,
+    IrpProjection, StackFlags,
 };
 use nt_status::NtStatus;
 
@@ -37,6 +37,10 @@ const RESIDENT_BUSY: NtStatus = NtStatus(0x8000_0011u32 as i32);
 static CREATE_DECISION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CREATE_BUSY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+#[path = "mounted_rename.rs"]
+mod mounted_rename;
+use mounted_rename::{RenameTarget, TargetDirectory};
+
 struct CompletedCreate {
     owner: CapturedCreate,
     completion: DriverCompletion,
@@ -49,6 +53,8 @@ pub(crate) struct CapturedCreate {
     name: Vec<u16>,
     relative: Vec<u8>,
     parameters: nt_io_manager::CreateParameters,
+    /// `SL_OPEN_TARGET_DIRECTORY`: open the directory that holds `relative`'s final component.
+    target_directory: bool,
 }
 
 pub(crate) type MountedCreateQueue = Rc<RefCell<CreateLookupQueue<CapturedCreate>>>;
@@ -59,6 +65,7 @@ struct OverlayCreateSpec {
     copy_action: Option<nt_fs::InstalledFileOpenAction>,
     materialize_parent: bool,
     is_directory: bool,
+    target: Option<TargetDirectory>,
 }
 
 enum CreateDecision {
@@ -129,6 +136,11 @@ struct MountedBinding {
     create_options: u32,
     installed_directory_cluster: Option<u32>,
     directory_query: nt_fs::DirectoryQueryState,
+    /// An installed entry also exists under this open's name. The writable entry shadows it, so
+    /// moving the name away would let the installed entry reappear.
+    shadows_installed: bool,
+    /// Set on the parent File of an `SL_OPEN_TARGET_DIRECTORY` CREATE.
+    rename_target: Option<RenameTarget>,
 }
 
 pub(crate) struct MountedVolumeBackend {
@@ -218,6 +230,23 @@ impl MountedVolumeBackend {
     }
 
     fn create(&mut self, irp: &IrpProjection) -> Result<DispatchOutcome, NtStatus> {
+        let outcome = self.create_irp(irp);
+        // A pending CREATE is traced where its retained owner completes.
+        let terminal = match &outcome {
+            Ok(DispatchOutcome::Completed { status, information, .. }) => Some((*status, *information)),
+            Ok(DispatchOutcome::Failed { status }) | Err(status) => Some((*status, 0)),
+            Ok(DispatchOutcome::Pending) => None,
+        };
+        if let (Some((status, information)), Some(name), IoParameters::Create(parameters)) =
+            (terminal, irp.file_name.as_ref(), &irp.parameters)
+        {
+            mounted_rename::trace_profile_hive_create(name.as_units(), parameters,
+                irp.flags.contains(StackFlags::OPEN_TARGET_DIRECTORY), status, information);
+        }
+        outcome
+    }
+
+    fn create_irp(&mut self, irp: &IrpProjection) -> Result<DispatchOutcome, NtStatus> {
         let Some(file_id) = irp.file_id else {
             return Err(NtStatus::INVALID_PARAMETER);
         };
@@ -227,6 +256,7 @@ impl MountedVolumeBackend {
         let IoParameters::Create(parameters) = &irp.parameters else {
             return Err(NtStatus::INVALID_PARAMETER);
         };
+        let target_directory = irp.flags.contains(StackFlags::OPEN_TARGET_DIRECTORY);
         if parameters.ea_length != 0
             || parameters.create_options.bits() & nt_fs::FILE_OPEN_BY_FILE_ID != 0
         {
@@ -269,6 +299,10 @@ impl MountedVolumeBackend {
         // It has no component whose spelling could be folded; a single '\\' names the root
         // directory and continues through ordinary path lookup below.
         if units.is_empty() && parameters.related_file.is_none() {
+            // The volume itself has no directory that holds it.
+            if target_directory {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
             return self.create_volume(file_id.raw(), units, parameters);
         }
         if irp.create_case_sensitive {
@@ -286,6 +320,10 @@ impl MountedVolumeBackend {
                 .ok_or(NtStatus::OBJECT_NAME_INVALID)?
         };
         let relative = &relative[..length];
+        if target_directory {
+            // Neither does the root directory.
+            nt_fs::rename_target_parent(relative).map_err(status)?;
+        }
 
         let physical_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
             .ok_or(NtStatus::DEVICE_NOT_READY)?;
@@ -300,7 +338,8 @@ impl MountedVolumeBackend {
             owned_relative.try_reserve_exact(relative.len()).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
             owned_relative.extend_from_slice(relative);
             let owner = CapturedCreate { irp: irp.irp_id, file: file_id,
-                name: owned_name, relative: owned_relative, parameters: *parameters };
+                name: owned_name, relative: owned_relative, parameters: *parameters,
+                target_directory };
             if journal_owned && route_kind == nt_fs::BlockSourceKind::Boot {
                 self.pending_creates.borrow_mut().capture_deferred_boot(
                     irp.irp_id.raw(), physical_mount.value(), owner)
@@ -323,7 +362,14 @@ impl MountedVolumeBackend {
             return Ok(DispatchOutcome::Pending);
         }
         let installed = unsafe { fat_open_path_metadata_from(&self.fs, self.fs.root_cl, relative) };
-        match self.create_decided(file_id.raw(), units, relative, installed, parameters, false)? {
+        let decision = if target_directory {
+            let installed_parent = self.boot_installed_parent(relative)?;
+            self.create_target_directory(file_id.raw(), units, relative, installed_parent,
+                installed, parameters, false)?
+        } else {
+            self.create_decided(file_id.raw(), units, relative, installed, parameters, false)?
+        };
+        match decision {
             CreateDecision::Dispatch(outcome) => Ok(outcome),
             CreateDecision::Prepare(_) => unreachable!("Boot CREATE does not prepare native I/O"),
         }
@@ -366,6 +412,8 @@ impl MountedVolumeBackend {
             create_options: options,
             installed_directory_cluster: None,
             directory_query: nt_fs::DirectoryQueryState::default(),
+            shadows_installed: false,
+            rename_target: None,
         });
         Ok(DispatchOutcome::Completed {
             status: NtStatus::SUCCESS,
@@ -558,8 +606,22 @@ impl MountedVolumeBackend {
             }
         };
         let owner = &resolved.payload;
-        let outcome = self.create_decided(owner.file.raw(), &owner.name, &owner.relative,
-            installed, &owner.parameters, !deferred_boot);
+        let outcome = if owner.target_directory {
+            let installed_parent = if deferred_boot {
+                self.boot_installed_parent(&owner.relative)
+            } else {
+                Ok(resolved.final_container().map(|container| match container {
+                    nt_fs::FatPathContainer::Start => crate::fs_loader::fat_root_metadata(&self.fs),
+                    nt_fs::FatPathContainer::Directory(record) => FatOpenMetadata::from_record(record),
+                }))
+            };
+            installed_parent.and_then(|installed_parent| self.create_target_directory(
+                owner.file.raw(), &owner.name, &owner.relative, installed_parent, installed,
+                &owner.parameters, !deferred_boot))
+        } else {
+            self.create_decided(owner.file.raw(), &owner.name, &owner.relative,
+                installed, &owner.parameters, !deferred_boot)
+        };
         if let Ok(CreateDecision::Prepare(spec)) = &outcome {
                 let mut spec = *spec;
                 let mut parent_len = spec.materialize_parent.then(||
@@ -674,6 +736,8 @@ impl MountedVolumeBackend {
     fn complete_create(&mut self, owner: CapturedCreate, status: NtStatus, information: u64,
         file_context: Option<u64>)
     {
+        mounted_rename::trace_profile_hive_create(&owner.name, &owner.parameters,
+            owner.target_directory, status, information);
         self.create_completions.push(CompletedCreate {
             completion: DriverCompletion { irp_id: owner.irp, status, information, file_context },
             owner, published: false,
@@ -720,6 +784,8 @@ impl MountedVolumeBackend {
         };
         match terminal {
             Ok((overlay_file, information)) => {
+                let information = captured.spec.target
+                    .map_or(information, |target| u64::from(target.information));
                 self.opens.finish(context, file,
                     nt_fs::LayeredOpenSource::Overlay { file_id: overlay_file })
                     .expect("exact prepared CREATE context");
@@ -735,6 +801,8 @@ impl MountedVolumeBackend {
                         .filter(|source| captured.spec.is_directory && source.metadata.is_directory)
                         .map(|source| source.first_cluster),
                     directory_query: nt_fs::DirectoryQueryState::default(),
+                    shadows_installed: captured.spec.installed.is_some(),
+                    rename_target: captured.spec.target.map(TargetDirectory::rename_target),
                 });
                 self.complete_create(captured.owner, NtStatus::SUCCESS, information,
                     Some(context.raw()));
@@ -752,8 +820,14 @@ impl MountedVolumeBackend {
         -> Result<(u64, u64), NtStatus>
     {
         let owner = &captured.owner;
-        let relative = &owner.relative;
         let spec = captured.spec;
+        // A target-directory CREATE opens the existing directory that holds its name.
+        let (relative, disposition, options) = match spec.target {
+            Some(target) => (&owner.relative[..target.parent_len], nt_fs::FILE_OPEN,
+                owner.parameters.create_options.bits() | nt_fs::FILE_DIRECTORY_FILE),
+            None => (&owner.relative[..], owner.parameters.create_disposition,
+                owner.parameters.create_options.bits()),
+        };
         if let Some(source) = spec.installed {
             if spec.is_directory {
                 self.directories.check_share(relative, source.metadata,
@@ -786,8 +860,7 @@ impl MountedVolumeBackend {
         let (status, opened, information) = unsafe {
             crate::writable_fs::create_prepared_overlay_relative_if_mounted(relative, parent,
                 import, parameters.desired_access.bits(), parameters.file_attributes,
-                parameters.share_access.bits(), parameters.create_disposition,
-                parameters.create_options.bits())
+                parameters.share_access.bits(), disposition, options)
         };
         if status != nt_fs::STATUS_SUCCESS { return Err(NtStatus(status as i32)); }
         Ok((opened.expect("successful prepared CREATE owns File"), information))
@@ -954,6 +1027,8 @@ impl MountedVolumeBackend {
             create_options: options,
             installed_directory_cluster: Some(installed.first_cluster),
             directory_query: nt_fs::DirectoryQueryState::default(),
+            shadows_installed: true,
+            rename_target: None,
         });
         Ok(DispatchOutcome::Completed {
             status: NtStatus::SUCCESS,
@@ -1022,6 +1097,8 @@ impl MountedVolumeBackend {
             create_options: options,
             installed_directory_cluster: None,
             directory_query: nt_fs::DirectoryQueryState::default(),
+            shadows_installed: true,
+            rename_target: None,
         });
         Ok(DispatchOutcome::Completed {
             status: NtStatus::SUCCESS,
@@ -1046,7 +1123,7 @@ impl MountedVolumeBackend {
         // must not enter lower FAT or snapshot I/O while the I/O Manager is borrowed.
         if resident_only {
             return Ok(CreateDecision::Prepare(OverlayCreateSpec { installed, copy_action,
-                materialize_parent, is_directory }));
+                materialize_parent, is_directory, target: None }));
         }
         let context = self.reserve_open_context(file_id, units)?;
         let access = parameters.desired_access.bits();
@@ -1142,6 +1219,8 @@ impl MountedVolumeBackend {
                 .filter(|source| is_directory && source.metadata.is_directory)
                 .map(|source| source.first_cluster),
             directory_query: nt_fs::DirectoryQueryState::default(),
+            shadows_installed: installed.is_some(),
+            rename_target: None,
         });
         Ok(CreateDecision::Dispatch(DispatchOutcome::Completed {
             status: NtStatus::SUCCESS,
@@ -1579,6 +1658,9 @@ impl MountedVolumeBackend {
         let IoParameters::SetInformation(parameters) = irp.parameters else {
             return Err(NtStatus::INVALID_PARAMETER);
         };
+        if parameters.info_class == nt_fs::FILE_RENAME_INFORMATION {
+            return self.rename(irp, context, binding, parameters);
+        }
         // EventLog clears a corrupt log with FileEndOfFileInformation. Other classes need
         // their own target-File and access contracts before they can be routed here.
         if parameters.info_class != nt_fs::FILE_END_OF_FILE_INFORMATION {

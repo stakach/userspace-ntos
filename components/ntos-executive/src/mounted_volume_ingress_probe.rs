@@ -346,6 +346,99 @@ pub(crate) unsafe fn run_directory(device_id: u64) -> bool {
     tested && released && !crate::driver_launch::hosted_file_exists(file)
 }
 
+/// Rename the open overlay probe File the way the I/O Manager does for `MoveFileExW`: open the
+/// directory that holds the new name with `SL_OPEN_TARGET_DIRECTORY`, then send the source File
+/// `FileRenameInformation` naming that target File. The source is delete-on-close, so the
+/// renamed entry leaves with it.
+unsafe fn rename_overlay_file(
+    device_id: u64,
+    file: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> bool {
+    const OLD_RELATIVE: &[u8] = b"ntos-mount-probe.tmp";
+    const NEW_RELATIVE: &[u8] = b"ntos-mount-probe.bak";
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    let name = UnicodeString::from_str("ntos-mount-probe.bak");
+    let access = nt_types::AccessMask::from_bits_retain(FILE_WRITE_DATA)
+        | nt_types::AccessMask::SYNCHRONIZE;
+    let share = nt_io_manager::ShareAccess::READ | nt_io_manager::ShareAccess::WRITE;
+    let options = nt_io_manager::CreateOptions::OPEN_FOR_BACKUP_INTENT;
+    let target = match crate::driver_launch::allocate_hosted_file(
+        device_id,
+        access.bits(),
+        share.bits(),
+        options.bits(),
+        name.as_units(),
+    ) {
+        Ok(target) => target,
+        Err(_) => return false,
+    };
+    let renamed = (|| -> Result<bool, u32> {
+        let mut input = Vec::new();
+        input
+            .try_reserve_exact(name.as_units().len() * 2)
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32)?;
+        for unit in name.as_units() {
+            input.extend_from_slice(&unit.to_le_bytes());
+        }
+        let (status, information, pending, context) =
+            crate::driver_launch::dispatch_hosted_target_directory_create_irp_result_exact(
+                target,
+                caller,
+                CreateParameters {
+                    desired_access: access,
+                    share_access: share,
+                    create_options: options,
+                    create_disposition: nt_fs::FILE_OPEN,
+                    ..CreateParameters::default()
+                },
+                &input,
+            )?;
+        // A missing final component is reported, never failed. A leftover from an interrupted
+        // earlier probe is reported as existing and replaced below.
+        if status != 0
+            || pending.is_some()
+            || context.is_none()
+            || !matches!(information as u32, nt_fs::FILE_EXISTS | nt_fs::FILE_DOES_NOT_EXIST)
+        {
+            return Ok(false);
+        }
+        // x64 FILE_RENAME_INFORMATION: ReplaceIfExists, RootDirectory, FileNameLength, FileName.
+        let mut rename = Vec::new();
+        rename
+            .try_reserve_exact(20 + input.len())
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32)?;
+        rename.resize(20, 0);
+        rename[0] = 1;
+        rename[16..20].copy_from_slice(&(input.len() as u32).to_le_bytes());
+        rename.extend_from_slice(&input);
+        let (status, _, pending, _) =
+            crate::driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
+                file,
+                caller,
+                nt_io_manager::SetInformationParameters {
+                    info_class: nt_fs::FILE_RENAME_INFORMATION,
+                    length: rename.len() as u32,
+                    target_file: Some(nt_io_manager::FileId(target)),
+                    control: nt_io_manager::SetInformationControl::ReplaceIfExists(true),
+                },
+                &rename,
+            )?;
+        if status != 0 || pending.is_some() {
+            return Ok(false);
+        }
+        Ok(matches!(crate::writable_fs::query_metadata_relative(OLD_RELATIVE), Ok(None))
+            && matches!(
+                crate::writable_fs::query_metadata_relative(NEW_RELATIVE),
+                Ok(Some(metadata)) if !metadata.is_directory && metadata.end_of_file == 7
+            ))
+    })()
+    .unwrap_or(false);
+    // The target File is the I/O Manager's own: retire it whatever the rename returned.
+    let retired = retire_probe_file(target, false);
+    renamed && retired
+}
+
 pub(crate) unsafe fn run_overlay(device_id: u64) -> bool {
     let caller = crate::initial_system_driver_caller();
     let name = UnicodeString::from_str("ntos-mount-probe.tmp");
@@ -490,7 +583,7 @@ pub(crate) unsafe fn run_overlay(device_id: u64) -> bool {
         if status != 0 || pending.is_some() {
             return Ok(false);
         }
-        Ok(true)
+        Ok(rename_overlay_file(device_id, file, caller))
     })()
     .unwrap_or(false);
     let released = crate::driver_launch::release_hosted_file(file).is_ok();

@@ -23,6 +23,14 @@ pub(crate) struct ResolvedCreate<P> {
     lookup: Option<FatPathLookup>,
 }
 
+impl<P> ResolvedCreate<P> {
+    /// The installed directory that holds the looked-up name's final component, from the walk
+    /// this CREATE retained. `None` when that directory is absent, or no walk was needed.
+    pub fn final_container(&self) -> Option<nt_fs::FatPathContainer> {
+        self.lookup.as_ref().and_then(FatPathLookup::final_container)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CreateLookupAttribution {
     pub copied_cache_completions: u64,
@@ -291,6 +299,37 @@ mod tests {
         let resolved = queue.take_resolved().unwrap();
         assert_eq!((resolved.irp, resolved.mount, resolved.payload), (7, 3, 41));
         assert_eq!(resolved.result, Ok(CreateLookupFound::Path(None)));
+    }
+
+    #[test]
+    fn resolved_lookup_keeps_the_directory_of_a_missing_final_component_across_retry() {
+        let mut queue = CreateLookupQueue::new();
+        queue.capture(9, 3, 43, lookup()).unwrap();
+        let root = queue.claim_next().unwrap();
+        let mut sector = [0u8; 512];
+        sector[..11].copy_from_slice(b"WINDOWS    ");
+        sector[11] = 0x10;
+        sector[26..28].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(queue.complete(root, Ok(&sector)), Ok(FatPathProgress::Pending));
+        let windows = queue.claim_next().unwrap();
+        assert_eq!(queue.complete(windows, Ok(&[0; 512])), Ok(FatPathProgress::NotFound));
+        let resolved = queue.take_resolved().unwrap();
+        assert_eq!(resolved.result, Ok(CreateLookupFound::Path(None)));
+        let Some(nt_fs::FatPathContainer::Directory(parent)) = resolved.final_container() else {
+            panic!("missing system32 is still held by the installed windows directory");
+        };
+        assert_eq!(parent.first_cluster, 3);
+        queue.restore_resolved(resolved).unwrap();
+        assert_eq!(queue.take_resolved().unwrap().final_container(),
+            Some(nt_fs::FatPathContainer::Directory(parent)));
+
+        // A missing parent has no container; neither does a CREATE that needed no walk.
+        queue.capture(10, 3, 44, lookup()).unwrap();
+        let root = queue.claim_next().unwrap();
+        assert_eq!(queue.complete(root, Ok(&[0; 512])), Ok(FatPathProgress::NotFound));
+        assert_eq!(queue.take_resolved().unwrap().final_container(), None);
+        queue.capture_resolved_root(11, 3, 45).unwrap();
+        assert_eq!(queue.take_resolved().unwrap().final_container(), None);
     }
 
     #[test]
