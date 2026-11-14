@@ -42,6 +42,7 @@ mod mounted_rename;
 use mounted_rename::{RenameTarget, TargetDirectory};
 #[path = "mounted_set_information.rs"]
 mod mounted_set_information;
+use mounted_set_information::InformationRefusals;
 
 struct CompletedCreate {
     owner: CapturedCreate,
@@ -157,6 +158,7 @@ pub(crate) struct MountedVolumeBackend {
     create_completions: Vec<CompletedCreate>,
     pending_directories: MountedDirectoryQueue,
     directory_completions: Vec<CompletedDirectory>,
+    information_refusals: InformationRefusals,
 }
 
 impl MountedVolumeBackend {
@@ -175,6 +177,7 @@ impl MountedVolumeBackend {
             create_completions: Vec::new(),
             pending_directories,
             directory_completions: Vec::new(),
+            information_refusals: InformationRefusals::default(),
         }
     }
 
@@ -1751,7 +1754,11 @@ impl DriverDispatchBackend for MountedVolumeBackend {
             major::IRP_MJ_WRITE => self.write(ctx, irp),
             major::IRP_MJ_FLUSH_BUFFERS => self.flush(irp),
             major::IRP_MJ_SET_INFORMATION => self.set_information(ctx, irp),
-            major::IRP_MJ_QUERY_INFORMATION => self.query(ctx, irp),
+            major::IRP_MJ_QUERY_INFORMATION => {
+                let outcome = self.query(ctx, irp);
+                self.note_query_refusal(irp, &outcome);
+                outcome
+            }
             major::IRP_MJ_QUERY_VOLUME_INFORMATION => self.query_volume_information(ctx, irp),
             major::IRP_MJ_FILE_SYSTEM_CONTROL => self.filesystem_control(ctx, irp),
             major::IRP_MJ_DIRECTORY_CONTROL => self.query_directory(ctx, irp),

@@ -54,7 +54,7 @@ fn is_profile_hive_name(name: &[u16]) -> bool {
         })
 }
 
-fn print_name(name: &[u16]) {
+pub(super) fn print_name(name: &[u16]) {
     for unit in name.iter().take(120) {
         crate::debug_put_char(u8::try_from(*unit).ok().filter(u8::is_ascii_graphic).unwrap_or(b'?'));
     }

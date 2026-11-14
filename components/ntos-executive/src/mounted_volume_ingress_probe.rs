@@ -439,6 +439,98 @@ unsafe fn rename_overlay_file(
     renamed && retired
 }
 
+unsafe fn set_file_information(
+    file: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    info_class: u32,
+    payload: &[u8],
+) -> Result<bool, u32> {
+    let (status, _, pending, _) =
+        crate::driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
+            file,
+            caller,
+            nt_io_manager::SetInformationParameters {
+                info_class,
+                length: payload.len() as u32,
+                target_file: None,
+                control: nt_io_manager::SetInformationControl::None,
+            },
+            payload,
+        )?;
+    Ok(status == 0 && pending.is_none())
+}
+
+unsafe fn query_file_information(
+    file: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    info_class: u32,
+    output: &mut [u8],
+) -> Result<bool, u32> {
+    let (status, information, pending, _) =
+        crate::driver_launch::dispatch_hosted_file_irp_result_exact(
+            file,
+            major::IRP_MJ_QUERY_INFORMATION as u64,
+            info_class as u64,
+            caller,
+            &[],
+            output,
+            0,
+        )?;
+    Ok(status == 0 && pending.is_none() && information == output.len() as u64)
+}
+
+/// The classes `CopyFileW`, `SetFileAttributesW`, `SetFilePointer` and `DeleteFileW` set must
+/// reach the opened File through the device stack and read back from it: position, a
+/// timestamp and attributes, and a delete disposition that any handle can withdraw.
+unsafe fn set_and_read_back_file_information(
+    file: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> Result<bool, u32> {
+    const LAST_WRITE_TIME: u64 = 0x01DA_0000_0000_0000;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x02;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+    let mut position = [0u8; 8];
+    if !set_file_information(file, caller, nt_fs::FILE_POSITION_INFORMATION, &3u64.to_le_bytes())?
+        || !query_file_information(file, caller, nt_fs::FILE_POSITION_INFORMATION, &mut position)?
+        || u64::from_le_bytes(position) != 3
+    {
+        return Ok(false);
+    }
+
+    // Zero times stay as they are; NORMAL beside another attribute means nothing.
+    let mut basic = [0u8; 40];
+    basic[16..24].copy_from_slice(&LAST_WRITE_TIME.to_le_bytes());
+    basic[32..36].copy_from_slice(&(FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NORMAL).to_le_bytes());
+    let mut stored = [0u8; 40];
+    if !set_file_information(file, caller, nt_fs::FILE_BASIC_INFORMATION, &basic)?
+        || !query_file_information(file, caller, nt_fs::FILE_BASIC_INFORMATION, &mut stored)?
+        || u64::from_le_bytes(stored[16..24].try_into().unwrap()) != LAST_WRITE_TIME
+        || u32::from_le_bytes(stored[32..36].try_into().unwrap()) != FILE_ATTRIBUTE_HIDDEN
+    {
+        return Ok(false);
+    }
+
+    let mut standard = [0u8; 24];
+    for delete in [true, false] {
+        if !set_file_information(
+            file,
+            caller,
+            nt_fs::FILE_DISPOSITION_INFORMATION,
+            &[delete as u8],
+        )? || !query_file_information(
+            file,
+            caller,
+            nt_fs::FILE_STANDARD_INFORMATION,
+            &mut standard,
+        )? || standard[20] != delete as u8
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) unsafe fn run_overlay(device_id: u64) -> bool {
     let caller = crate::initial_system_driver_caller();
     let name = UnicodeString::from_str("ntos-mount-probe.tmp");
@@ -583,6 +675,9 @@ pub(crate) unsafe fn run_overlay(device_id: u64) -> bool {
         if status != 0 || pending.is_some() {
             return Ok(false);
         }
+        if !set_and_read_back_file_information(file, caller)? {
+            return Ok(false);
+        }
         Ok(rename_overlay_file(device_id, file, caller))
     })()
     .unwrap_or(false);
@@ -593,7 +688,15 @@ pub(crate) unsafe fn run_overlay(device_id: u64) -> bool {
             break;
         }
     }
-    tested && released && !crate::driver_launch::hosted_file_exists(file)
+    // The File was opened delete-on-close and this was its only handle: its entry, under the
+    // name the rename gave it, left the namespace with it.
+    tested
+        && released
+        && !crate::driver_launch::hosted_file_exists(file)
+        && matches!(
+            crate::writable_fs::query_metadata_relative(b"ntos-mount-probe.bak"),
+            Ok(None)
+        )
 }
 
 pub(crate) unsafe fn run_copy_up(device_id: u64) -> bool {
