@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 
 pub mod hard_error;
 pub mod copy_preflight;
+pub mod input_pagein;
 pub mod system_information;
 
 // NTSTATUS (spec §18)

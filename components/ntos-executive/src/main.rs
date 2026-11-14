@@ -24105,6 +24105,9 @@ struct ExecNtHandler {
     current_server_client_pid: u32,
     /// Promoted acquisition whose retained route replaces process-handle lookup on retry.
     active_synchronous_file_retry: Option<nt_io_manager::SynchronousFileIngress>,
+    /// Routed image page whose provider bytes this dispatch's copy needed and could not wait
+    /// for. The NT reply tail may park the caller on it and reissue the call.
+    routed_input_pagein: Option<nt_syscall::input_pagein::DeferredInputPage>,
     // Checked-copy pumps broker work, not top-level syscall ingress; these owners remain scoped
     // to this dispatch until handoff transfers them into the exact waiter or pending File row.
     current_file_transfer_parameters: Option<nt_io_manager::FileTransferParameters>,

@@ -4358,6 +4358,7 @@ impl ExecNtHandler {
         write_field!(current_user_memory, SyscallUserMemory::CurrentProcess);
         write_field!(current_server_client_pid, 0);
         write_field!(active_synchronous_file_retry, None);
+        write_field!(routed_input_pagein, None);
         write_field!(current_file_transfer_parameters, None);
         write_field!(current_file_transfer_event, None);
         write_field!(current_synchronous_file, None);

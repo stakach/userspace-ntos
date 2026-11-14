@@ -1288,6 +1288,54 @@ pub(super) unsafe fn syscall_tail(
     let inspect_component_lpc_after_reply =
         (&*core::ptr::addr_of!(LPC_COMPONENT_WAITS))
             .requires_post_reply_inspection(nt_handler.lpc_reply_published);
+    // A failed input capture named a routed image page whose bytes the provider could not
+    // supply inline. Every other consequence of the dispatch has been settled above, so the
+    // only thing left is the status reply: park the caller on the owned page-in instead and
+    // let the transport reissue the call once the page is mapped.
+    let plain_status_reply = !redirected_user_control && reply_main != 0
+        && native_load_reply_status.is_none() && live_action_reply.is_none()
+        && start_device_reply.is_none() && !inspect_component_lpc_after_reply;
+    if let nt_syscall::input_pagein::InputPageInSettlement::PageInAndRetry(input) =
+        nt_syscall::input_pagein::settle_input_pagein(
+            sc.input_pagein.take(), nt_handler.current_tid, sc.result as u32,
+            plain_status_reply)
+    {
+        let retry = if native_call_transport {
+            Some(nt_syscall_abi::SyscallRetryReply::native_call([0; 5]))
+        } else {
+            let mut instruction = [0u8; 2];
+            resume_ip.checked_sub(2)
+                .filter(|ip| nt_handler.xas_read(*ip, &mut instruction))
+                .and_then(|_| nt_syscall_abi::unknown_syscall_retry_ip(resume_ip, instruction))
+                .map(|retry_ip| {
+                    let registers = call.syscall_reply_context.regs;
+                    // RAX as the caller issued it, before external-number normalisation.
+                    nt_syscall_abi::SyscallRetryReply::unknown_syscall(
+                        registers[0], registers, retry_ip, sp, flags)
+                })
+        };
+        if retry.is_some_and(|retry| crate::native_image_pagein_work::submit_syscall_retry(
+            &mut nt_handler, input, retry, sc.result as u32))
+        {
+            thread_wait_state_park_badge_waiting(&mut nt_handler, lp.msg.badge);
+            {
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                crate::native_image_pagein_work::redrive(&mut nt_handler, lp.dispatcher);
+            }
+            let _ = finalize_service_loop_state(&mut nt_handler);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
+            let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
+            )?;
+            lp.msg.badge = nb;
+            lp.msg.mi = nmi;
+            lp.msg.m0 = nm0;
+            lp.msg.m1 = nm1;
+            lp.msg.m2 = nm2;
+            lp.msg.m3 = nm3;
+            return ControlFlow::Break(Turn::Next);
+        }
+    }
     // Ordinary completion changes only RAX. Provider reentry can legitimately install
     // newer target registers while this syscall is serviced; never replay ingress state.
     // A committed callback redirect already owns the full canonical context and must

@@ -1177,6 +1177,8 @@ pub(super) unsafe fn syscall_nt_route(
     {
         delay_timer_rearm(&*delay_queue, &nt_handler);
     }
+    // Only this route's handlers return NTSTATUS; a win32k result is never reinterpreted.
+    sc.input_pagein = nt_handler.routed_input_pagein.take();
     sc.park_lpc_receive = nt_handler.lpc_receive_park.take();
     sc.park_lpc_connect = nt_handler.lpc_connect_park.take();
     sc.park_lpc_request = nt_handler.lpc_request_park.take();

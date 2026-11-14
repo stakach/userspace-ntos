@@ -38,6 +38,8 @@ pub(super) struct SyscallOutcome {
     pub(super) component_suspension_admitted_dispatch_id: u64,
     pub(super) current_apc_handoff: Option<nt_user_host::current_apc::CurrentApcIdentity>,
     pub(super) redirected_context_continue: bool,
+    /// Routed image page a failed input capture of this NT dispatch needed.
+    pub(super) input_pagein: Option<nt_syscall::input_pagein::DeferredInputPage>,
     pub(super) active_callback_bad_resume: bool,
     // Checkpoint B: -1 = no wait-park; >=0 = NtWaitForSingleObject asked to park this caller on
     // the encoded WaitObject in nt_handler.wait_park_event after dispatch.
@@ -95,6 +97,7 @@ impl SyscallOutcome {
             component_suspension_admitted_dispatch_id: 0,
             current_apc_handoff: None,
             redirected_context_continue: false,
+            input_pagein: None,
             active_callback_bad_resume: false,
             park_wait_event: -1,
             park_wait_event_identity: 0,
@@ -763,6 +766,7 @@ pub(super) unsafe fn syscall(
     nt_handler.current_flags = flags;
     nt_handler.current_service_number = lp.msg.m0 as u32;
     nt_handler.current_native_call_transport = native_call_transport;
+    nt_handler.routed_input_pagein = None;
     nt_handler.current_user_memory = SyscallUserMemory::CurrentProcess;
     nt_handler.current_server_client_pid =
         nt_handler.hosted_thread_lpc_client_process(lp.msg.badge);

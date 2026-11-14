@@ -765,7 +765,22 @@ unsafe fn service_page_residency(
         }
         return Ok(ImageCopyAdmission::NeedsRoutedPageIn);
     }
-    let source_frame = ensure_source_page(handler, view, rva)?;
+    let source_frame = match ensure_source_page(handler, view, rva) {
+        Ok(frame) => frame,
+        Err(status) => {
+            if routed_source && observation == ImageFaultObservation::CopyAccess {
+                // The provider could not supply these bytes inline. Name the page so the
+                // syscall tail can wait for it on the owned page-in worker.
+                handler.routed_input_pagein = Some(nt_syscall::input_pagein::DeferredInputPage {
+                    caller_thread: handler.current_tid,
+                    process_index: view.pi,
+                    page,
+                    write: access == FaultAccess::Write,
+                });
+            }
+            return Err(status);
+        }
+    };
     if fault_plan.copy_on_write {
         let target = ViewPage {
             view,

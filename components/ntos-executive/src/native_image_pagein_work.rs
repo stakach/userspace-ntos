@@ -60,6 +60,14 @@ enum Purpose {
         irp_id: u64,
         token: u64,
     },
+    /// A returned NT dispatch whose input capture needed this page. This row owns the caller's
+    /// Reply: a mapped page reissues the call, a failed page-in returns `status`, the
+    /// handler's own result.
+    SyscallRetry {
+        caller_pi: usize,
+        retry: nt_syscall_abi::SyscallRetryReply,
+        status: u32,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +125,7 @@ static mut EXECUTING_PROBE: Option<(nt_hosted_runtime::SpanOwner, u64,
 static NEXT: AtomicU64 = AtomicU64::new(0);
 static ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 static UNREADY_FAULT_TRACE: AtomicU64 = AtomicU64::new(0);
+static SYSCALL_RETRY_TRACE: AtomicU64 = AtomicU64::new(0);
 
 fn has_source_producer(area: ImageAreaId, rva: u32) -> bool {
     unsafe {
@@ -172,12 +181,13 @@ unsafe fn prepare_page(
         && decision == RoutedSourceReadDecision::Ready
     { return Ok(None); }
     if matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. } | Purpose::VmCopy { .. }
-        | Purpose::RoutedFileModeInput { .. })
+        | Purpose::RoutedFileModeInput { .. } | Purpose::SyscallRetry { .. })
         && (source_ready
             || crate::native_image_residency::has_private_page(view, page))
     { return Ok(None); }
     if existing && !parked && matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. }
-        | Purpose::VmCopy { .. } | Purpose::RoutedFileModeInput { .. })
+        | Purpose::VmCopy { .. } | Purpose::RoutedFileModeInput { .. }
+        | Purpose::SyscallRetry { .. })
         && !producer
     {
         // A retained synchronous source initializer has no asynchronous producer here.
@@ -200,7 +210,8 @@ unsafe fn prepare_page(
     let tid = handler.current_tid;
     let tcb = handler.hosted_thread_tcb(tid).ok_or(INVALID)?;
     let caller_pi = match purpose {
-        Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
+        Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. }
+        | Purpose::SyscallRetry { caller_pi, .. } => caller_pi,
         _ => pi,
     };
     let logical = handler.capture_provider_logical_caller(
@@ -325,6 +336,36 @@ pub(crate) unsafe fn submit_syscall_copy(
         else { return Ok(false); };
     install_work(work, false)?;
     Ok(true)
+}
+
+/// Park a returned NT dispatch on the routed image page its input capture needed. Returns
+/// false, with the Reply untouched, when no owned page-in can make that capture succeed; the
+/// caller then replies the handler's status as before.
+pub(crate) unsafe fn submit_syscall_retry(
+    handler: &mut ExecNtHandler, input: nt_syscall::input_pagein::DeferredInputPage,
+    retry: nt_syscall_abi::SyscallRetryReply, status: u32,
+) -> bool {
+    let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let access = if input.write { FaultAccess::Write } else { FaultAccess::Read };
+    let purpose = Purpose::SyscallRetry { caller_pi: handler.pi, retry, status };
+    let parked = match prepare_page(handler, input.process_index, input.page, access,
+        ImageFaultObservation::CopyAccess, purpose, reply, false)
+    {
+        Ok(Some(work)) => install_work(work, false).is_ok(),
+        Ok(None) | Err(_) => false,
+    };
+    let sequence = SYSCALL_RETRY_TRACE.fetch_add(1, Ordering::Relaxed);
+    if sequence < 32 || sequence.is_power_of_two() {
+        let mut record = nt_printf::record::RecordBuffer::<256>::new();
+        let _ = writeln!(record,
+            "[syscall-input-pagein] #{} parked={} caller_pi={} tid={} ssn=0x{:x} target_pi={} page=0x{:x} write={} status=0x{:x}",
+            sequence, parked, handler.pi, handler.current_tid, handler.current_service_number,
+            input.process_index, input.page, input.write, status);
+        sel4_rt::print_record(if record.overflowed() {
+            b"[syscall-input-pagein] trace truncated\n"
+        } else { record.bytes() });
+    }
+    parked
 }
 
 /// The VM-lock coordinator owns the parked syscall Reply; this row owns only
@@ -494,7 +535,9 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
             Err(capture) => {
                 work.capture = Some(capture);
                 work.failure = Some(RESOURCES);
-                work.phase = if matches!(work.purpose, Purpose::SyscallCopy(_)) {
+                work.phase = if matches!(work.purpose,
+                    Purpose::SyscallCopy(_) | Purpose::SyscallRetry { .. })
+                {
                     Phase::ReadyError
                 } else { Phase::Cancel };
                 return;
@@ -518,8 +561,8 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
             }
             (Err(status), _) => {
                 work.failure = Some(status);
-                work.phase = if !cancelled
-                    && matches!(work.purpose, Purpose::SyscallCopy(_))
+                work.phase = if !cancelled && matches!(work.purpose,
+                    Purpose::SyscallCopy(_) | Purpose::SyscallRetry { .. })
                 { Phase::ReadyError } else { Phase::Cancel };
             }
             _ => work.phase = Phase::Cancel,
@@ -719,11 +762,13 @@ unsafe fn advance(
                 handler, work.view, work.rva, bytes,
             ) {
                 work.failure = Some(status);
-                work.phase = if matches!(work.purpose, Purpose::Fault) {
-                    Phase::Cancel
-                } else {
+                work.phase = match work.purpose {
+                    Purpose::Fault => Phase::Cancel,
+                    // The Reply is this row's alone; returning the handler's status replays
+                    // nothing, whatever state the source owner was left in.
+                    Purpose::SyscallRetry { .. } => Phase::ReplyReady,
                     // The source owner can be retained or quarantined after a physical effect.
-                    Phase::Indeterminate
+                    _ => Phase::Indeterminate,
                 };
                 return false;
             }
@@ -742,9 +787,11 @@ unsafe fn advance(
                 Ok(Some(())) if valid(handler, work) => {}
                 other => {
                     work.failure = Some(other.err().unwrap_or(INVALID));
-                    work.phase = if matches!(work.purpose, Purpose::Fault) {
-                        Phase::Cancel
-                    } else { Phase::Indeterminate };
+                    work.phase = match work.purpose {
+                        Purpose::Fault => Phase::Cancel,
+                        Purpose::SyscallRetry { .. } => Phase::ReplyReady,
+                        _ => Phase::Indeterminate,
+                    };
                     return false;
                 }
             }
@@ -825,7 +872,8 @@ unsafe fn advance(
                     Purpose::RoutedFileModeInput { identity, irp_id, token } =>
                         crate::service_sec_image::file_mode_input_page_completed(
                             identity, irp_id, token, work.pi, work.page, 0),
-                    Purpose::Fault | Purpose::SyscallCopy(_) => unreachable!(),
+                    Purpose::Fault | Purpose::SyscallCopy(_)
+                    | Purpose::SyscallRetry { .. } => unreachable!(),
                 };
                 if completed {
                     return true;
@@ -834,6 +882,10 @@ unsafe fn advance(
                 return false;
             }
             let sent = match work.purpose {
+                Purpose::SyscallRetry { retry, status, .. } => match work.failure {
+                    None => reply_parked_syscall_retry(work.reply, &retry),
+                    Some(_) => reply_parked_syscall(work.reply, u64::from(status)),
+                },
                 Purpose::Fault => client_reply_on(work.reply, 0, 0, 0, 0, 0),
                 Purpose::SyscallCopy(_) => {
                     let status = work.progress.reply_status()
@@ -852,6 +904,11 @@ unsafe fn advance(
         }
         Phase::ReadyError => {
             if cancelled { work.phase = Phase::Cancel; return false; }
+            if matches!(work.purpose, Purpose::SyscallRetry { .. }) {
+                // `failure` selects the handler's status over the retry envelope.
+                work.phase = Phase::ReplyReady;
+                return false;
+            }
             if !work.progress.fail_before_dispatch(COPY_FAULT) {
                 work.phase = Phase::Indeterminate;
                 return false;
@@ -889,7 +946,8 @@ unsafe fn advance(
                     Purpose::RoutedFileModeInput { identity, irp_id, token } =>
                         crate::service_sec_image::file_mode_input_page_completed(
                             identity, irp_id, token, work.pi, work.page, status),
-                    Purpose::Fault | Purpose::SyscallCopy(_) => unreachable!(),
+                    Purpose::Fault | Purpose::SyscallCopy(_)
+                    | Purpose::SyscallRetry { .. } => unreachable!(),
                 };
                 if completed {
                     return true;
@@ -963,6 +1021,7 @@ pub(crate) unsafe fn redrive(
             Purpose::VmCopy { caller_pi, service_number, .. } =>
                 (caller_pi, 0, 0, 0, false, service_number),
             Purpose::RoutedFileModeInput { .. } => (work.pi, 0, 0, 0, false, 0),
+            Purpose::SyscallRetry { caller_pi, .. } => (caller_pi, 0, 0, 0, false, 0),
         };
         EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);
         let is_fault = matches!(work.purpose, Purpose::Fault);
