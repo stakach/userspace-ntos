@@ -269,3 +269,95 @@ fn root_directory_has_checked_metadata_and_no_alternate_name() {
     assert_eq!(fs.query_opened_name(root.handle).unwrap(), "\\");
     assert_eq!(fs.query_short_name(root.handle), Ok(FileShortName::EMPTY));
 }
+
+/// What the mounted volume answers for a File it created, extended and renamed in the writable
+/// layer: every query class `CopyFileW`, `DeleteFileW`, `GetFileInformationByHandle` and the
+/// shell read must describe the File as it now is.
+#[test]
+fn query_classes_describe_a_file_created_extended_and_renamed() {
+    let (mut fs, handle) = open_file(0);
+    assert_eq!(fs.zw_write_file(handle, None, b"0123456789"), (STATUS_SUCCESS, 10));
+    assert_eq!(
+        fs.zw_set_information_file(handle, FILE_END_OF_FILE_INFORMATION, &5000u64.to_le_bytes()),
+        STATUS_SUCCESS
+    );
+    fs.set_current_time_100ns(700);
+    assert_eq!(
+        fs.zw_rename_file(
+            handle,
+            FileRenameRoot::VolumeRoot,
+            &wide_bytes(r"\Dir\Renamed.dat"),
+            false,
+        ),
+        STATUS_SUCCESS
+    );
+    let info = fs.query_file_object_information(handle).unwrap();
+    let name: Vec<u16> = fs.query_opened_name(handle).unwrap().encode_utf16().collect();
+    assert_eq!(String::from_utf16(&name).unwrap(), r"\Dir\Renamed.dat");
+    let mut query = info.metadata.query_metadata();
+    query.current_byte_offset = info.current_offset;
+    let u32_at = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let u64_at = |bytes: &[u8], at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+
+    let mut basic = [0u8; 40];
+    assert_eq!(crate::encode_query_information(FILE_BASIC_INFORMATION, query, &mut basic), Ok(40));
+    assert_eq!(u64_at(&basic, 0), 100, "creation time is the create's");
+    assert!(u64_at(&basic, 16) >= 100, "last write time is set");
+    assert_eq!(u32_at(&basic, 32), FILE_ATTRIBUTE_ARCHIVE);
+
+    let mut standard = [0u8; 24];
+    assert_eq!(
+        crate::encode_query_information(crate::FILE_STANDARD_INFORMATION, query, &mut standard),
+        Ok(24)
+    );
+    let allocation = u64_at(&standard, 0);
+    assert!(allocation >= 5000);
+    assert_eq!(u64_at(&standard, 8), 5000);
+    assert_eq!(u32_at(&standard, 16), 1, "one link");
+    assert_eq!(&standard[20..22], &[0, 0], "neither delete-pending nor a directory");
+
+    let mut network = [0u8; 56];
+    assert_eq!(
+        crate::encode_query_information(crate::FILE_NETWORK_OPEN_INFORMATION, query, &mut network),
+        Ok(56)
+    );
+    assert_eq!(&network[..32], &basic[..32]);
+    assert_eq!(u64_at(&network, 32), allocation);
+    assert_eq!(u64_at(&network, 40), 5000);
+    assert_eq!(u32_at(&network, 48), FILE_ATTRIBUTE_ARCHIVE);
+
+    let mut tag = [0u8; 8];
+    assert_eq!(
+        crate::encode_query_information(crate::FILE_ATTRIBUTE_TAG_INFORMATION, query, &mut tag),
+        Ok(8)
+    );
+    assert_eq!((u32_at(&tag, 0), u32_at(&tag, 4)), (FILE_ATTRIBUTE_ARCHIVE, 0));
+
+    let mut internal = [0u8; 8];
+    assert_eq!(
+        crate::encode_query_information(crate::FILE_INTERNAL_INFORMATION, query, &mut internal),
+        Ok(8)
+    );
+    assert_eq!(u64::from_le_bytes(internal), info.metadata.file_id);
+    assert_ne!(info.metadata.file_id, 0);
+
+    let mut named = [0u8; 4 + 64];
+    let result =
+        crate::encode_named_query_information(crate::FILE_NAME_INFORMATION, query, &name, &mut named)
+            .unwrap();
+    assert_eq!(result.status, STATUS_SUCCESS);
+    assert_eq!(result.information, 4 + name.len() * 2);
+    assert_eq!(u32_at(&named, 0) as usize, name.len() * 2);
+    assert_eq!(&named[4..4 + name.len() * 2], &wide_bytes(r"\Dir\Renamed.dat")[..]);
+
+    let mut all = [0u8; 100 + 64];
+    let result =
+        crate::encode_named_query_information(crate::FILE_ALL_INFORMATION, query, &name, &mut all).unwrap();
+    assert_eq!(result.status, STATUS_SUCCESS);
+    assert_eq!(result.information, 100 + name.len() * 2);
+    assert_eq!(&all[..36], &basic[..36]);
+    assert_eq!(&all[40..64], &standard[..]);
+    assert_eq!(&all[64..72], &internal[..]);
+    assert_eq!(u32_at(&all, 96) as usize, name.len() * 2);
+    assert_eq!(&all[100..100 + name.len() * 2], &wide_bytes(r"\Dir\Renamed.dat")[..]);
+}

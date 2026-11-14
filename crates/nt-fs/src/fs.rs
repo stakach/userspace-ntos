@@ -48,6 +48,7 @@ mod delete_disposition;
 
 #[path = "basic_information.rs"]
 mod basic_information;
+pub(crate) use basic_information::BasicInformationChange;
 
 #[path = "file_object_information.rs"]
 mod file_object_information;

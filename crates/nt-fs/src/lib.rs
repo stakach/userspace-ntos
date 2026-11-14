@@ -39,6 +39,7 @@ mod layered_directory;
 mod layered_directory_open;
 mod layered_open;
 mod layered_rename;
+mod layered_set_information;
 mod notify;
 mod partition;
 mod partition_layout;
@@ -81,6 +82,7 @@ pub use mounted_installed_read::{ReadCompletions, ReadError, ReadSectorClaim};
 pub use file_backing::FileBacking;
 pub use file_mode::FileModeState;
 pub use flush::file_flush_access_allowed;
+pub(crate) use fs::BasicInformationChange;
 pub use fs::{
     installed_file_open_action, layered_file_open_decision,
     parse_file_basic_information_attributes,
@@ -98,6 +100,7 @@ pub use installation_root::*;
 pub use layered_directory::merge_layered_directory_entries;
 pub use layered_directory_open::{layered_directory_open_decision, LayeredDirectoryOpenDecision};
 pub use layered_rename::*;
+pub use layered_set_information::*;
 pub use layered_open::{
     join_layered_relative_name_into, LayeredOpenContextId, LayeredOpenRecord, LayeredOpenSource,
     LayeredOpenTable, LAYERED_OPEN_NAME_CAP,
