@@ -120,8 +120,15 @@ impl WorkerLaneLayout {
     }
 }
 
-pub const HOSTED_WORKER_LAYOUT: WorkerLaneLayout =
-    WorkerLaneLayout::new(24, 32, 5, 2, 0x0000_0104_0000_0000, 0x4_0000);
+/// The process and lane counts and the mirror band come from the executive's address plan.
+pub const HOSTED_WORKER_LAYOUT: WorkerLaneLayout = WorkerLaneLayout::new(
+    nt_executive_layout::HOSTED_PROCESS_LIMIT,
+    nt_executive_layout::WORKER_LANES_PER_PROCESS,
+    5,
+    2,
+    nt_executive_layout::root::WORKER_MIRRORS.base,
+    nt_executive_layout::WORKER_MIRROR_STRIDE,
+);
 
 #[cfg(test)]
 mod tests {
@@ -147,7 +154,7 @@ mod tests {
         assert_ne!(layout.mirror_base(9, 16), layout.mirror_base(9, 15));
         assert_ne!(layout.mirror_base(9, 16), layout.mirror_base(10, 16));
         assert_eq!(layout.decode_aux_index(layout.aux_capacity()), None);
-        assert_eq!(layout.aux_index(24, 0), None);
-        assert_eq!(layout.aux_index(9, 32), None);
+        assert_eq!(layout.aux_index(layout.processes(), 0), None);
+        assert_eq!(layout.aux_index(9, layout.slots()), None);
     }
 }

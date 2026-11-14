@@ -6,8 +6,8 @@ use nt_pnp_context::{
 };
 
 const HOSTED_RESOURCE_WINDOW_STRIDE: u64 = 0x20_0000;
-const HOSTED_RESOURCE_COMPONENT_VA_BASE: u64 = 0x0000_0100_1600_0000;
-const HOSTED_RESOURCE_COMPONENT_VA_LIMIT: u64 = crate::allocator::HEAP_BASE as u64;
+const HOSTED_RESOURCE_COMPONENT_VA_BASE: u64 = nt_executive_layout::component::RESOURCE_WINDOWS.base;
+const HOSTED_RESOURCE_COMPONENT_VA_LIMIT: u64 = nt_executive_layout::component::RESOURCE_WINDOWS.end();
 
 const _: () = assert!(HOSTED_RESOURCE_COMPONENT_VA_BASE & 0x1F_FFFF == 0);
 const _: () = assert!(HOSTED_RESOURCE_COMPONENT_VA_BASE < HOSTED_RESOURCE_COMPONENT_VA_LIMIT);

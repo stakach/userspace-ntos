@@ -18,7 +18,8 @@ const _: () = assert!(
     COMPONENT_SNAPSHOT_LIMIT - COMPONENT_SNAPSHOT_VA == EXEC_SCRATCH_LIMIT - EXEC_SCRATCH_VA
 );
 const _: () = assert!(EXEC_SCRATCH_VA > super::FSD_EXEC_LIMIT);
-const _: () = assert!(EXEC_SCRATCH_LIMIT <= 0x0000_0101_6000_0000);
+const _: () = assert!(nt_executive_layout::root::DIAGNOSTIC_ALIASES
+    .contains(EXEC_SCRATCH_VA, EXEC_SCRATCH_LIMIT - EXEC_SCRATCH_VA));
 static SCRATCH_IN_USE: AtomicBool = AtomicBool::new(false);
 
 /// Validate the actual component mapping before any driver code runs. The view retains no image

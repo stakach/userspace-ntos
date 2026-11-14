@@ -1779,8 +1779,8 @@ pub(crate) unsafe fn fat32_mount_isolated_storage_host(
 /// (into the executive's own VSpace) on demand, one file at a time. Replaces the ~15 fixed staging
 /// buffers with a single bump-allocated arena. Each loaded PE's bytes persist here for the run so the
 /// demand-fault router can fill hosted-process pages from them (same lifetime as the old buffers).
-pub const POOL_VADDR: u64 = 0x0000_0100_1500_0000;
-pub const POOL_PTS: u64 = 24; // 48 MiB (24 * 2 MiB) — headroom for the whole stack + P5 binaries
+pub const POOL_VADDR: u64 = nt_executive_layout::root::FILE_POOL.base;
+pub const POOL_PTS: u64 = nt_executive_layout::root::FILE_POOL.len / nt_executive_layout::TABLE_SPAN; // 48 MiB (24 * 2 MiB) — headroom for the whole stack + P5 binaries
 pub(crate) static POOL_NEXT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static POOL_INITED: AtomicU64 = AtomicU64::new(0);
 /// The file pool is bump-only and never resets or frees allocations in this executive lifetime.

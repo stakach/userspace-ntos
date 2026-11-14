@@ -242,6 +242,7 @@ dependencies = [
  "nt-dma-manager",
  "nt-driver-runtime",
  "nt-exe-image",
+ "nt-executive-layout",
  "nt-fs",
  "nt-hosted-runtime",
  "nt-io-manager",
@@ -376,6 +377,13 @@ name = "nt-exe-image"
 version = "0.1.0"
 dependencies = [
  "nt-memory-manager",
+]
+
+[[package]]
+name = "nt-executive-layout"
+version = "0.1.0"
+dependencies = [
+ "nt-exe-image",
 ]
 
 [[package]]
@@ -841,6 +849,7 @@ dependencies = [
  "nt-component-suspension",
  "nt-config-manager",
  "nt-delay-execution",
+ "nt-executive-layout",
  "nt-fs",
  "nt-io-completion",
  "nt-kernel-exec",

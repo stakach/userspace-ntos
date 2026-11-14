@@ -1,0 +1,16 @@
+[package]
+name = "nt-executive-layout"
+description = "The executive's virtual address plan: the bands of the root VSpace and of the VSpaces of spawned executive-image components, as one table whose disjointness is checked at compile time and by host tests. no_std, no alloc, no dependencies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+nt-exe-image = { path = "../nt-exe-image" }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

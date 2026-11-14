@@ -381,6 +381,8 @@ pub const CSRSS_STACK_MIRROR_VA: u64 = 0x0000_0100_1069_0000;
 /// clear of the fixed NLS/CSR/stack mappings below it. Leaf page tables are installed on demand.
 pub const SMSS_ALLOC_VA: u64 = 0x0000_0100_3000_0000;
 pub const PRIVATE_VM_LIMIT: u64 = 0x0000_0100_4000_0000;
+// The same address bounds the root bands numbered alongside hosted private memory.
+const _: () = assert!(PRIVATE_VM_LIMIT == nt_executive_layout::PRIVATE_VM_LIMIT);
 /// The executive's mirror of the first window of smss's heap (SMSS_ALLOC_VA). A userspace broker
 /// can't walk smss's page tables, so `smss_copyin` reads syscall pointer args (e.g. a loader-built
 /// registry key path) from the same frames it mapped, through this parallel mapping. Own PT.
@@ -423,7 +425,7 @@ pub const USERINIT_HEAP_MIRROR_VA: u64 = 0x0000_0100_14A0_0000;
 /// `\SystemRoot\explorer.exe` (root of the ReactOS tree, not System32). Its scratch window is the
 /// next 64 MiB demand-fill lane after userinit; mirrors start immediately after it.
 pub const EXPLORER_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 6 * DEMAND_SCRATCH_WINDOW;
-pub const EXPLORER_STACK_MIRROR_VA: u64 = EXPLORER_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW;
+pub const EXPLORER_STACK_MIRROR_VA: u64 = nt_executive_layout::root::SHELL_MIRRORS.base;
 pub const EXPLORER_ENV_SCRATCH_VA: u64 = EXPLORER_STACK_MIRROR_VA + 0x10_0000;
 pub const EXPLORER_HEAP_MIRROR_VA: u64 = EXPLORER_STACK_MIRROR_VA + 0x20_0000;
 const _: () = {
@@ -436,7 +438,7 @@ const _: () = {
     assert!(EXPLORER_STACK_MIRROR_VA & 0x1f_ffff == 0);
     assert!(EXPLORER_ENV_SCRATCH_VA >= EXPLORER_STACK_MIRROR_VA + STACK_FRAMES * 0x1000);
     assert!(EXPLORER_ENV_SCRATCH_VA + 0x9000 <= EXPLORER_HEAP_MIRROR_VA);
-    assert!(EXPLORER_HEAP_MIRROR_VA + 0x20_0000 <= PRIVATE_VM_LIMIT);
+    assert!(EXPLORER_HEAP_MIRROR_VA + 0x20_0000 <= nt_executive_layout::root::SHELL_MIRRORS.end());
 };
 // Common bootstrap layout for the first ordinary hosted worker in a process. Each process has its
 // own VSpace, so CSR, SCM, LSA, and generic workers may reuse these numeric addresses safely.
@@ -581,7 +583,7 @@ pub const TP_WORKER_SLOT1_EXEC_BASE: u64 = 0x0000_0100_13C0_0000;
 /// densely-packed `(pi, slot)` regions in a dedicated executive-only high band. Legacy slots for
 /// `pi < TP_WORKER_PI_COUNT` retain their established addresses.
 pub const TP_WORKER_AUX_EXEC_BASE: u64 = TP_WORKER_LAYOUT.base();
-pub const TP_WORKER_AUX_EXEC_LIMIT: u64 = 0x0000_0105_0000_0000;
+pub const TP_WORKER_AUX_EXEC_LIMIT: u64 = nt_executive_layout::root::WORKER_MIRRORS.end();
 
 #[inline]
 pub const fn tp_worker_aux_index(pi: usize, slot: usize) -> usize {
@@ -1269,8 +1271,8 @@ const NT_HIVE_IMAGE_MAGIC_LE: u64 = 0x3145_5649_4854_4E55; // "UNTHIVE1"
 pub const SSN_NT_ALLOCATE_LOCALLY_UNIQUE_ID: u64 = 15;
 /// Dedicated executive-only window for the small PE loader selftest. It must not
 /// alias the shared service rings or any hosted process scratch mapping.
-pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_4800_0000;
-pub const PE_SCRATCH_BYTES: u64 = 0x20_0000;
+pub const PE_SCRATCH_VADDR: u64 = nt_executive_layout::root::PE_SCRATCH.base;
+pub const PE_SCRATCH_BYTES: u64 = nt_executive_layout::root::PE_SCRATCH.len;
 const _: () = assert!(PE_SCRATCH_VADDR >= PRIVATE_VM_LIMIT);
 const _: () = assert!(PE_SCRATCH_VADDR + PE_SCRATCH_BYTES <= driver_launch::FSD_EXEC_BASE);
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
@@ -1370,14 +1372,15 @@ pub const CSRSS_BADGE: u64 = 2;
 // (0x400_0000 = 16384 pages, well above FAULT_CAP) in the free high VA region past all other
 // executive mappings (POOL_VADDR 0x1500, SRVBUF 0x1400, win32k pools 0x0A00 — all far below
 // 0x2000). Their page tables are mapped per-window at spawn (see `map_demand_scratch_pts`).
-pub const DEMAND_SCRATCH_WINDOW: u64 = 0x0400_0000; // 64 MiB per process
+pub const DEMAND_SCRATCH_WINDOW: u64 = nt_executive_layout::DEMAND_SCRATCH_WINDOW; // 64 MiB per process
                                                     // The static-process lanes begin exactly after the executive's runtime-mapped heap and the 7 ×
                                                     // 64 MiB windows remain below PRIVATE_VM_LIMIT. `ensure_executive_paging` builds every missing
                                                     // paging level, so this layout does not depend on boot-image page tables.
-pub const SMSS_SCRATCH_BASE: u64 =
-    allocator::HEAP_BASE as u64 + allocator::ROOT_HEAP_RESERVATION_FRAMES * 0x1000;
+pub const SMSS_SCRATCH_BASE: u64 = nt_executive_layout::root::STATIC_SCRATCH.base;
 const _: () = assert!(SMSS_SCRATCH_BASE & 0x1f_ffff == 0);
-const _: () = assert!(SMSS_SCRATCH_BASE == 0x0000_0100_2380_0000);
+const _: () = assert!(
+    EXPLORER_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW == nt_executive_layout::root::STATIC_SCRATCH.end()
+);
 /// csrss's demand-fault scratch window (own 64 MiB, PTs mapped at spawn).
 pub const CSRSS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW;
 /// Fault-endpoint badge for the THIRD hosted process (winlogon). Distinct from smss (0) + csrss (2).
@@ -1403,7 +1406,8 @@ pub const USERINIT_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 5 * DEMAND_SCRATCH_WI
 /// still guards `pi < MAX_PI` so exhaustion is explicit instead of corrupting neighbouring mechanism
 /// state. Moving past this boot-image-fitting table budget needs map-backed/reclaimable process
 /// runtime state, not more hardcoded image identities.
-pub const HOSTED_PROCESS_RUNTIME_PI_LIMIT: usize = 24;
+pub const HOSTED_PROCESS_RUNTIME_PI_LIMIT: usize = nt_executive_layout::HOSTED_PROCESS_LIMIT;
+const _: () = assert!(nt_executive_layout::STATIC_PROCESS_COUNT == nt_exe_image::DYNAMIC_PROCESS_FIRST_PI);
 pub const MAX_PI: usize = HOSTED_PROCESS_RUNTIME_PI_LIMIT;
 const _: () = assert!(MAX_PI <= nt_exe_image::DYNAMIC_PROCESS_PI_LIMIT);
 /// Ordered image-open/section/spawn records are handle-lifetime records, not process slots. A

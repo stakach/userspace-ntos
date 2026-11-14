@@ -38,19 +38,13 @@ mod walk_observation;
 use walk_observation::WalkCounter;
 pub use walk_observation::WalkSample;
 
-/// Heap base of every VSpace that runs the executive image: the root and each spawned
-/// component. One address serves both because the allocator's metadata words are addressed
-/// absolutely from it by code the VSpaces share, and nothing outside the heap tells that code
-/// which VSpace it is running in. How much is reserved above it is a separate concern per kind
-/// of VSpace: [`ROOT_HEAP_RESERVATION_FRAMES`] and [`COMPONENT_HEAP_MAX_FRAMES`].
-pub const HEAP_BASE: usize = 0x0000_0100_1e00_0000;
-/// The root executive's VA reservation in 4 KiB frames, including its transient lane. Physical
-/// pages beyond the initial commitment are retyped and mapped only when allocations need them.
-pub const ROOT_HEAP_RESERVATION_FRAMES: u64 = 22528;
-/// The largest heap a spawned component may declare. A component's VSpace keeps this band
-/// above [`HEAP_BASE`] clear of its other regions; it maps a separately declared subset,
+/// Heap base of every VSpace that runs the executive image; see [`nt_executive_layout::HEAP_BASE`].
+pub const HEAP_BASE: usize = nt_executive_layout::HEAP_BASE as usize;
+/// The root executive's VA reservation in 4 KiB frames, including its transient lane.
+pub const ROOT_HEAP_RESERVATION_FRAMES: u64 = nt_executive_layout::ROOT_HEAP_RESERVATION_FRAMES;
+/// The largest heap a spawned component may declare. It maps a separately declared subset,
 /// ordinarily [`DEFAULT_SERVICE_HEAP_FRAMES`].
-pub const COMPONENT_HEAP_MAX_FRAMES: u64 = 22528;
+pub const COMPONENT_HEAP_MAX_FRAMES: u64 = nt_executive_layout::COMPONENT_HEAP_MAX_FRAMES;
 /// Frames committed before the root executive starts serving requests. Further durable pages are
 /// mapped only as allocations require them; isolated services still use their declared profiles.
 pub const EXECUTIVE_INITIAL_HEAP_FRAMES: u64 = 8192;

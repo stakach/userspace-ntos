@@ -3,8 +3,9 @@
 use super::*;
 use nt_io_manager::hosted_dma_alias::{AliasArena, AliasBacking, AliasError, AliasGraph};
 
-const BASE: u64 = 0x0000_0106_0000_0000;
-const LIMIT: u64 = BASE + 0x1000_0000; // 256 MiB of virtual slots per isolated driver.
+// 256 MiB of virtual slots per isolated driver.
+const BASE: u64 = nt_executive_layout::root::DMA_GRAPH_SLOTS.base;
+const LIMIT: u64 = nt_executive_layout::root::DMA_GRAPH_SLOTS.end();
 const PAGE: u64 = 0x1000;
 const SLOT: u64 = 0x100;
 const SG_BYTES: u64 = 0x28;

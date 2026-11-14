@@ -12,8 +12,8 @@ use nt_memory_manager::provider_large_arena::{
 
 use super::*;
 
-pub(super) const BASE: u64 = 0x0000_0100_4000_0000;
-pub(super) const BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const BASE: u64 = nt_executive_layout::root::PROVIDER_LARGE_POOL.base;
+pub(super) const BYTES: u64 = nt_executive_layout::root::PROVIDER_LARGE_POOL.len;
 const _: () = assert!(BASE >= crate::PRIVATE_VM_LIMIT);
 const _: () = assert!(BASE + BYTES <= WIN32K_BULK_ARENA_VADDR);
 

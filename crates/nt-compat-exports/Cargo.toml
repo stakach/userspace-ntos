@@ -22,6 +22,7 @@ nt-types = { path = "../nt-types" }
 nt-user-host = { path = "../nt-user-host" }
 nt-memory-manager = { path = "../nt-memory-manager" }
 nt-exe-image = { path = "../nt-exe-image" }
+nt-executive-layout = { path = "../nt-executive-layout" }
 nt-pe-loader = { path = "../nt-pe-loader" }
 nt-object-manager = { path = "../nt-object-manager" }
 nt-kernel-abi = { path = "../nt-kernel-abi" }

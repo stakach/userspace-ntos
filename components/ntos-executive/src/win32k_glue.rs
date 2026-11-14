@@ -182,8 +182,8 @@ pub(crate) enum Win32kBootstrapStartup {
     Failed,
 }
 
-const WIN32K_STACK_ALIAS_BASE: u64 = 0x0000_0100_4820_0000;
-const WIN32K_STACK_ALIAS_END: u64 = 0x0000_0100_48A0_0000;
+const WIN32K_STACK_ALIAS_BASE: u64 = nt_executive_layout::root::WIN32K_STACK_ALIASES.base;
+const WIN32K_STACK_ALIAS_END: u64 = nt_executive_layout::root::WIN32K_STACK_ALIASES.end();
 const WIN32K_STACK_ALIAS_STRIDE: u64 = 0x20_000;
 const _: () = assert!(
     crate::PE_SCRATCH_VADDR + crate::PE_SCRATCH_BYTES <= WIN32K_STACK_ALIAS_BASE

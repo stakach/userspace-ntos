@@ -12,6 +12,7 @@ const _: () = assert!(ROOT_ALIAS_VA & 0xfff == 0);
 // FSD instance windows end before FSD_EXEC_LIMIT; the KUSER scratch uses the
 // first page at the limit. The next named scratch arena starts at 0x10151000000.
 const _: () = assert!(ROOT_ALIAS_VA + 0x1000 <= 0x0000_0101_5100_0000);
+const _: () = assert!(nt_executive_layout::root::DIAGNOSTIC_ALIASES.contains(ROOT_ALIAS_VA, 0x1000));
 
 static FRAME: AtomicU64 = AtomicU64::new(0);
 static FAILED_FRAME_SLOT: AtomicU64 = AtomicU64::new(0);

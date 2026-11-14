@@ -799,7 +799,7 @@ const FSD_IRQ_LANE_ARENA_OFFSET: u64 = 0x0004_3000;
 const FSD_IRQ_LANE_SHARED_OFFSET: u64 = 0x0006_5000;
 const FSD_IRQ_LANE_ARG_OFFSET: u64 = FSD_IRQ_LANE_SHARED_OFFSET + FSD_SHARED_FRAMES * 0x1000;
 const FSD_IRQ_LANE_COMPONENT_SLOT: usize = 0;
-const FSD_WORKER_EXEC_ALIAS_BASE: u64 = 0x0000_0102_0000_0000;
+const FSD_WORKER_EXEC_ALIAS_BASE: u64 = nt_executive_layout::root::DRIVER_WORKER_ALIASES.base;
 const HOSTED_DRIVER_WAIT_OBJECT_MAX: u32 = 64;
 const _: () = assert!(FSD_WORKER_VADDR > crate::WORK_CLUSTER_BASE + 0x20_0000);
 const _: () = assert!(FSD_WORKER_VADDR & (FSD_WORKER_STRIDE - 1) == 0);
@@ -960,8 +960,8 @@ const _: () = assert!(FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000 <= FSD_STACK_VAD
 // The PE is RELOCATED for its EXECUTION VA (`FSD_CODE_VA`, same across instances) via `load_pe_into`'s
 // `run_va` — decoupled from the executive load VA — so instance N runs correctly at `FSD_CODE_VA` in
 // its own VSpace while the executive loaded its bytes at a distinct window.
-pub const FSD_EXEC_BASE: u64 = 0x0000_0100_5000_0000;
-pub const FSD_EXEC_LIMIT: u64 = 0x0000_0101_5000_0000;
+pub const FSD_EXEC_BASE: u64 = nt_executive_layout::root::DRIVER_HOST_VIEWS.base;
+pub const FSD_EXEC_LIMIT: u64 = nt_executive_layout::root::DRIVER_HOST_VIEWS.end();
 const HOSTED_KUSER_SCRATCH_VA: u64 = FSD_EXEC_LIMIT;
 static HOSTED_KUSER_FRAME: AtomicU64 = AtomicU64::new(0);
 static HOSTED_KUSER_SCRATCH_CAP: AtomicU64 = AtomicU64::new(0);

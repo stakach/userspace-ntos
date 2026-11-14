@@ -643,8 +643,8 @@ pub const WIN32K_REGISTRY_FRAMES: u64 = 16;
 pub const WIN32K_REGISTRY_BYTES: usize = (WIN32K_REGISTRY_FRAMES as usize) * 0x1000;
 /// Shared, demand-mapped provider arguments. Virtual leases in this band are independent of
 /// the fixed bootstrap ARG window and retain their physical pages for the session lifetime.
-pub const WIN32K_BULK_ARENA_VADDR: u64 = 0x0000_0100_4400_0000;
-pub const WIN32K_BULK_ARENA_BYTES: u64 = 64 * 1024 * 1024;
+pub const WIN32K_BULK_ARENA_VADDR: u64 = nt_executive_layout::root::PROVIDER_BULK_ARENA.base;
+pub const WIN32K_BULK_ARENA_BYTES: u64 = nt_executive_layout::root::PROVIDER_BULK_ARENA.len;
 const _: () = assert!(crate::PRIVATE_VM_LIMIT <= WIN32K_BULK_ARENA_VADDR);
 const _: () = assert!(
     WIN32K_BULK_ARENA_VADDR + WIN32K_BULK_ARENA_BYTES <= crate::PE_SCRATCH_VADDR
