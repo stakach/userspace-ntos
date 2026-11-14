@@ -26,6 +26,7 @@ const STATUS_PENDING: i32 = 0x0000_0103;
 const MAX_OWNERS: usize = 64;
 
 static NEXT_INVOCATION: AtomicU64 = AtomicU64::new(1);
+static UNSUPPORTED_SHAPE_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut OWNERS: Vec<OwnedReceive> = Vec::new();
 static mut NEXT_OWNER: usize = 0;
 
@@ -183,6 +184,20 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
         |address, len| (*handler_ptr).probe_user_output(address, len),
     )?;
     if captured.timeout.is_some() || captured.receive.is_none() {
+        // A send or reply with no receive half (CSRSS's death-message reply reports this
+        // status) and a bounded wait are not implemented. Record which shape arrived.
+        let sequence = UNSUPPORTED_SHAPE_TRACE.fetch_add(1, Ordering::Relaxed);
+        if sequence < 8 || sequence.is_power_of_two() {
+            print_str(b"[native-alpc-send-unsupported] #"); print_u64(sequence);
+            print_str(b" pi="); print_u64(pi as u64);
+            print_str(b" tid="); print_u64(thread);
+            print_str(b" flags=0x"); print_hex(captured.flags);
+            print_str(b" send-bytes=");
+            print_u64(captured.send_message.as_ref().map_or(0, |message| message.len() as u64));
+            print_str(b" receive="); print_u64(captured.receive.is_some() as u64);
+            print_str(b" timeout="); print_u64(captured.timeout.is_some() as u64);
+            print_str(b"\n");
+        }
         return Err(STATUS_NOT_SUPPORTED);
     }
     let target_capacity = captured.receive.as_ref().ok_or(STATUS_NOT_SUPPORTED)?.capacity;
