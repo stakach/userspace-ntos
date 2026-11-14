@@ -7582,9 +7582,21 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
             | win32k_subsystem::PS_WIN32_PROVIDER_PROCESS_EXIT
     ) {
         use crate::service_sec_image::kernel_provider_activation::{
-            capture_ps_retirement_job, run_kernel_job, KernelJobResult,
+            capture_ps_retirement_job, retain_ps_callout, run_kernel_job, settle_ps_callout,
+            KernelJobResult, KernelJobRun, PsCalloutState,
         };
         let _durable = crate::allocator::enter_durable();
+        // A retried retirement finds the callout it already issued. Only that callout's real
+        // return completes it; a parked one is never issued a second time.
+        if let Some(logical) = client.logical_caller {
+            match settle_ps_callout(command, logical) {
+                PsCalloutState::Absent => {}
+                PsCalloutState::Pending => {
+                    return (u64::from(nt_process::STATUS_PENDING), false).into();
+                }
+                PsCalloutState::Returned(status) => return (u64::from(status), true).into(),
+            }
+        }
         let result = KernelJobResult::new();
         let native = crate::initial_system_driver_caller();
         let mut entered = false;
@@ -7596,7 +7608,13 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
             let caller = capture_ps_retirement_job(
                 &channel, lane, native, &result, client,
             )?;
-            run_kernel_job(caller, &result, publication)
+            let run = run_kernel_job(caller, &result, publication)?;
+            if let (KernelJobRun::Parked, Some(logical)) = (&run, client.logical_caller) {
+                // The job left root parked in a provider wait. Its retirement comes back
+                // for this exact result slot once runtime readiness has resumed it.
+                retain_ps_callout(caller, command, logical, result.share());
+            }
+            Ok(run.outcome())
         };
         let Some(dispatch_id) = next_win32k_dispatch_id() else {
             return (0xC000_009Au64, false).into();
@@ -7750,7 +7768,7 @@ unsafe fn win32k_dispatch_kernel_job_observed(
         channel.client_generation = 0;
         channel.caps.provider_wait = true;
         let caller = capture_kernel_job(&channel, lane, native, &result)?;
-        run_kernel_job(caller, &result, publication)
+        run_kernel_job(caller, &result, publication).map(|run| run.outcome())
     };
     let Some(dispatch_id) = next_win32k_dispatch_id() else {
         return (0xC000_009Au64, false).into();

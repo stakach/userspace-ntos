@@ -18,6 +18,28 @@ static ACTIVE_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static HOOK_NESTED_RETURN_PROBES: AtomicU64 = AtomicU64::new(0);
 static NESTED_REGISTRY_WAKE_GAP_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static INLINE_SOURCE_WORK_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static CONFINED_SERVICE_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
+/// Observation only: this pump's provider is parked in its own service Call, the pump took no
+/// yield, and its inline child pass could not progress. Root stays in this receive until
+/// that service settles, so name the dispatch and the yield capabilities it was entered with.
+unsafe fn trace_confined_service_wait(ch: &PumpChannel, route: PeerRoute) {
+    let Ok(dispatch) = runtime::dispatch(route) else { return };
+    let Ok(Some((reply, token))) = runtime::parked_service_wait_identity(route, dispatch) else {
+        return;
+    };
+    let sample = CONFINED_SERVICE_WAIT_TRACE_N.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample > 8 && !sample.is_power_of_two() { return; }
+    crate::print_str(b"[pump-service-wait-confined] sample/lane/lane-gen/epoch/reply/token/client-pi/kernel-caller/receive-yield-cap/nested-service-yield-cap/source-ready=");
+    for value in [sample, u64::from(dispatch.lane().index), dispatch.lane().generation,
+        dispatch.epoch(), reply, token, ch.client_pi, u64::from(ch.kernel_caller.is_some()),
+        u64::from(ch.caps.hosted_receive_yield), u64::from(ch.caps.nested_service_wait_yield),
+        u64::from(crate::driver_launch::nested_win32k_source_work_ready())] {
+        crate::print_str(b"/");
+        crate::print_hex_u64(value);
+    }
+    crate::print_str(b"\n");
+}
 
 /// Observation only: a nested physical Receive bypasses the root's outer
 /// preflight, so retain evidence if a live registry retry is not covered.
@@ -1054,6 +1076,9 @@ pub(super) unsafe fn receive(
                 return nested_restore_refusal(ticket);
             }
             if source_sample { crate::print_str(b"[inline-source-work] stage=restored\n"); }
+            if !progressed && ticket.is_none() {
+                trace_confined_service_wait(ch, route);
+            }
             trace_hook_nested_receive(43, ch, u64::from(parent.is_some()));
             crate::driver_launch::trace_port_connect_outer_probe(43, ch, u64::from(progressed));
             if progressed { continue; }

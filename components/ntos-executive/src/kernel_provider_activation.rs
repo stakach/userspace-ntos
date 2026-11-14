@@ -13,6 +13,10 @@ mod bootstrap;
 mod event;
 #[path = "kernel_provider_resume.rs"]
 pub(super) mod resume;
+#[path = "kernel_provider_ps_callout.rs"]
+mod ps_callout;
+pub(crate) use ps_callout::{redrive as redrive_ps_callouts, retain as retain_ps_callout,
+    settle as settle_ps_callout, PsCalloutState};
 #[path = "kernel_provider_source_work.rs"]
 mod source_work;
 pub(crate) use source_work::source_work_yield;
@@ -52,6 +56,33 @@ impl KernelJobResult {
         let value = self.0.load(Ordering::Acquire);
         (value >> 32 == 1).then_some(value as u32)
     }
+
+    /// A second handle on the same slot, for the owner that outlives the initiating stack.
+    pub(crate) fn share(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+/// How the runner left one entered kernel job.
+#[must_use = "a parked job must be retained for its retirement"]
+pub(crate) enum KernelJobRun {
+    Returned(u32),
+    /// Retained by its activation and never resumed by this caller.
+    Incomplete(u32),
+    /// Parked in a published provider wait. Runtime readiness resumes it from the service
+    /// loop; the initiating retirement comes back for the result.
+    Parked,
+}
+
+impl KernelJobRun {
+    /// The dispatcher's `(value, completed)` shape. A parked job is pending, not complete.
+    pub(crate) fn outcome(&self) -> (u64, bool) {
+        match *self {
+            Self::Returned(status) => (u64::from(status), true),
+            Self::Incomplete(status) => (u64::from(status), false),
+            Self::Parked => (u64::from(nt_process::STATUS_PENDING), false),
+        }
+    }
 }
 
 /// Capture a fresh Running job from a real canonical caller, never from a previous bootstrap
@@ -83,15 +114,24 @@ pub(crate) unsafe fn capture_kernel_job(
 
 /// Run the issued request once. Runtime readiness owns every selected resume thereafter, and
 /// this runner owns a stop on the job's own inline source terminal: it lends the publication,
-/// drives that terminal, and continues the same receive half once. A stop that cannot be
-/// resumed is returned as incomplete, leaving both the activation and caller roots held.
+/// drives that terminal, and continues the same receive half once. A Ps retirement job parked
+/// in a provider wait is returned to the service loop as `Parked`: the wait's owner may need a
+/// hosted call, which this runner never dispatches. A stop that cannot be resumed is returned
+/// as incomplete, leaving both the activation and caller roots held.
 pub(crate) unsafe fn run_kernel_job(
     caller: KernelProviderCaller,
     result: &KernelJobResult,
     publication: win32k_glue::KernelJobPublication,
-) -> Result<(u64, bool), u32> {
+) -> Result<KernelJobRun, u32> {
     use nt_user_host::provider_kernel_pump::KernelSourceTerminal;
-    use nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome as Stop;
+    use nt_user_host::provider_kernel_wait::{
+        KernelJobOrigin, KernelJobRunnerStep, KernelProviderStoppedOutcome as Stop,
+    };
+    let origin = if (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?.ps_retirement().is_some() {
+        KernelJobOrigin::PsRetirement
+    } else {
+        KernelJobOrigin::Executive
+    };
     let outcome = run_issued_kernel_job(caller).map_err(|status| {
         source_work::trace_stop(caller, b"entry", status);
         status
@@ -99,10 +139,10 @@ pub(crate) unsafe fn run_kernel_job(
     if let Some(receipt) = outcome.receipt {
         deliver_driver_entry_completion(receipt)?;
     }
-    if let Some(status) = result.returned() { return Ok((u64::from(status), true)); }
+    if let Some(status) = result.returned() { return Ok(KernelJobRun::Returned(status)); }
     if !matches!(outcome.stop, Stop::WaitCaptured(_) | Stop::SourceWorkYielded) {
         source_work::trace_stop(caller, b"initial-stop", nt_process::STATUS_UNSUCCESSFUL);
-        return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+        return Ok(KernelJobRun::Incomplete(nt_process::STATUS_UNSUCCESSFUL));
     }
     let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler.is_null() {
@@ -111,6 +151,12 @@ pub(crate) unsafe fn run_kernel_job(
     }
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
     use spawn_hosts::shared_ingress::owner::runtime as ingress;
+    if outcome.stop.runner_step(origin) == KernelJobRunnerStep::ParkForServiceLoop {
+        // Publish the captured wait now, as the runner's first pass used to: the lane leaves
+        // Running, so the wait's owner and every other provider dispatch can execute.
+        publish_runtime_waits(&mut *handler);
+        return Ok(KernelJobRun::Parked);
+    }
     // Present only while this job has lent its publication to its own source terminal. The
     // page is copied before any other owner below can publish over it.
     let mut parked = match outcome.stop {
@@ -118,32 +164,44 @@ pub(crate) unsafe fn run_kernel_job(
             Ok(owner) => Some(owner),
             Err(status) => {
                 source_work::trace_stop(caller, b"park-refused", status);
-                return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+                return Ok(KernelJobRun::Incomplete(nt_process::STATUS_UNSUCCESSFUL));
             }
         },
         _ => None,
     };
     let mut parked_passes = 0u64;
+    let mut heartbeat = ps_callout::RunnerHeartbeat::new();
     loop {
         // Every call below ends its handler/activation borrow before entering a native provider.
         component_resume::run_outer(handler);
         redrive_ready_completions();
-        if let Some(status) = result.returned() { return Ok((u64::from(status), true)); }
+        if let Some(status) = result.returned() { return Ok(KernelJobRun::Returned(status)); }
         let stop = (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?.stopped_outcome()
             .map_err(|status| {
                 source_work::trace_stop(caller, b"unobserved-stop", status);
                 status
             })?;
-        if matches!(stop, Stop::Walled | Stop::CallbackSuspended | Stop::LpcWaitSuspended) {
-            source_work::trace_stop(caller, b"stop", nt_process::STATUS_UNSUCCESSFUL);
-            return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+        match stop.runner_step(origin) {
+            KernelJobRunnerStep::Unresumable => {
+                source_work::trace_stop(caller, b"stop", nt_process::STATUS_UNSUCCESSFUL);
+                return Ok(KernelJobRun::Incomplete(nt_process::STATUS_UNSUCCESSFUL));
+            }
+            // A wait captured after this runner continued the job's source work.
+            KernelJobRunnerStep::ParkForServiceLoop => {
+                publish_runtime_waits(&mut *handler);
+                return Ok(KernelJobRun::Parked);
+            }
+            KernelJobRunnerStep::Returned(_)
+            | KernelJobRunnerStep::DriveSourceWork
+            | KernelJobRunnerStep::WaitInRunner => {}
         }
+        heartbeat.report(caller, stop);
         if matches!(stop, Stop::SourceWorkYielded) {
             // Only this runner parks the stop it observed; any other source-work stop has no
             // lent publication and keeps the existing incomplete outcome.
             let Some(owner) = parked.take() else {
                 source_work::trace_stop(caller, b"unparked-source-work", nt_process::STATUS_UNSUCCESSFUL);
-                return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+                return Ok(KernelJobRun::Incomplete(nt_process::STATUS_UNSUCCESSFUL));
             };
             match owner.terminal() {
                 KernelSourceTerminal::Acknowledged => {
@@ -153,12 +211,18 @@ pub(crate) unsafe fn run_kernel_job(
                             source_work::trace_stop(caller, b"resume", status);
                             status
                         })?;
+                    if resumed.stop.runner_step(origin) == KernelJobRunnerStep::ParkForServiceLoop {
+                        // Leave before any other owner can resume this wait under the
+                        // runner: only the service loop runs the job without a publication.
+                        publish_runtime_waits(&mut *handler);
+                        return Ok(KernelJobRun::Parked);
+                    }
                     if matches!(resumed.stop, Stop::SourceWorkYielded) {
                         match source_work::park(caller, publication) {
                             Ok(owner) => parked = Some(owner),
                             Err(status) => {
                                 source_work::trace_stop(caller, b"park-refused", status);
-                                return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+                                return Ok(KernelJobRun::Incomplete(nt_process::STATUS_UNSUCCESSFUL));
                             }
                         }
                     }
@@ -169,7 +233,7 @@ pub(crate) unsafe fn run_kernel_job(
                 }
                 KernelSourceTerminal::Indeterminate => {
                     source_work::trace_stop(caller, b"terminal-indeterminate", nt_process::STATUS_UNSUCCESSFUL);
-                    return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+                    return Ok(KernelJobRun::Incomplete(nt_process::STATUS_UNSUCCESSFUL));
                 }
                 KernelSourceTerminal::Unacknowledged => {
                     parked_passes += 1;
@@ -193,7 +257,7 @@ pub(crate) unsafe fn run_kernel_job(
         // receiver with a fresh Free Reply. Never receive on or retransmit the parked job.
         component_resume::run_outer(handler);
         redrive_ready_completions();
-        if let Some(status) = result.returned() { return Ok((u64::from(status), true)); }
+        if let Some(status) = result.returned() { return Ok(KernelJobRun::Returned(status)); }
         match component_resume::prepare_receive(&mut *handler) {
             component_resume::ReceivePreparation::Ready => {}
             component_resume::ReceivePreparation::PendingDelivery => {
@@ -208,11 +272,12 @@ pub(crate) unsafe fn run_kernel_job(
                 // Another delivery owns the gate. Keep the activation and
                 // original caller held; a receive here could sleep forever.
                 source_work::trace_stop(caller, b"pending-delivery", nt_process::STATUS_PENDING);
-                return Ok((u64::from(nt_process::STATUS_PENDING), false));
+                return Ok(KernelJobRun::Incomplete(nt_process::STATUS_PENDING));
             }
         }
         let arrival = ingress::receive(nt_component_suspension::IngressExecutionOwner::Idle, 1, true)
             .map_err(|_| nt_process::STATUS_UNSUCCESSFUL)?;
+        heartbeat.arrived(&arrival);
         if let ingress::Arrival::Notification(message) = arrival {
             spawn_hosts::pump_handle_executive_event_badge(message.badge());
         }

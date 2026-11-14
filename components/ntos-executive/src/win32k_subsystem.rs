@@ -11859,6 +11859,50 @@ extern "win64" fn s_ex_delete_resource_lite(resource: u64) -> i32 {
     }
 }
 
+static RESOURCE_QUEUE_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded evidence of who holds a contended resource and which lane queued behind it. The
+/// first thirty-two waits are reported, then power-of-two samples. Read-only.
+unsafe fn trace_resource_queue(
+    resource: u64,
+    waiter: u64,
+    mode: nt_kernel_exec::executive_sync::ResourceMode,
+) {
+    let sample = RESOURCE_QUEUE_TRACES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample > 32 && !sample.is_power_of_two() {
+        return;
+    }
+    let ids = current_lane_ids();
+    let image_rva = resource.checked_sub(WIN32K_CODE_VA).filter(|rva| *rva < 1 << 28).unwrap_or(0);
+    let snapshot = executive_resources_mut().ownership_snapshot(resource);
+    print_str(b"[win32k-resource-owner] sample/resource/image-rva/waiter/waiter-pi/waiter-tid/requested-exclusive/held-exclusive/owners=");
+    for value in [
+        sample, resource, image_rva, waiter,
+        ids.client_pi.load(Ordering::Relaxed), ids.thread_id.load(Ordering::Relaxed),
+        u64::from(mode == nt_kernel_exec::executive_sync::ResourceMode::Exclusive),
+        snapshot.as_ref().map_or(u64::MAX, |snapshot| u64::from(snapshot.exclusive)),
+        snapshot.as_ref().map_or(0, |snapshot| snapshot.owner_count as u64),
+    ] {
+        print_str(b"/");
+        print_hex_u64(value);
+    }
+    if let Some(snapshot) = snapshot {
+        for (owner, recursion) in snapshot.owners.iter().take(snapshot.owner_count.min(4)) {
+            let context = thread_context_index_for_ethread(*owner);
+            print_str(b" owner/recursion/pi/tid=");
+            for value in [
+                *owner, *recursion as u64,
+                context.map_or(u64::MAX, |index| thread_ctx_pi(index)),
+                context.map_or(u64::MAX, |index| thread_ctx_tid(index)),
+            ] {
+                print_str(b"/");
+                print_hex_u64(value);
+            }
+        }
+    }
+    print_str(b"\n");
+}
+
 fn acquire_resource_lite(
     resource: u64,
     wait: bool,
@@ -11889,6 +11933,7 @@ fn acquire_resource_lite(
                     print_str(b" event=");
                     print_win32k_hex64(event_body);
                     print_str(b"\n");
+                    unsafe { trace_resource_queue(resource, thread, mode) };
                     let status = unsafe {
                         provider_wait_rendezvous(
                             &[event_body], nt_provider_wait::ProviderWaitType::Any, 0, 0, 0,

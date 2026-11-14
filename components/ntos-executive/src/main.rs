@@ -19047,6 +19047,10 @@ unsafe fn release_hosted_thread_win32_context(
             flags,
             client,
         );
+        if !completed && status as u32 == nt_process::STATUS_PENDING {
+            // Parked in a provider wait and retained for this retirement; not a failure.
+            return false;
+        }
         if !completed || status as u32 != 0 {
             print_str(b"[ps-win32-exit] thread callout failed tid=");
             print_u64(tid);
@@ -19076,6 +19080,9 @@ unsafe fn release_hosted_thread_win32_context(
             0,
             client,
         );
+        if !completed && status as u32 == nt_process::STATUS_PENDING {
+            return false;
+        }
         if !completed || status as u32 != 0 {
             print_str(b"[ps-win32-exit] process callout failed pid=");
             print_u64(u64::from(pid));

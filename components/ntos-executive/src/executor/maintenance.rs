@@ -717,6 +717,9 @@ pub(super) unsafe fn maintain(
         crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, &mut *delay_queue);
         crate::object_wait_reply::redrive(&mut nt_handler);
         crate::object_wait_reply::redrive_terminated_runtimes(&mut nt_handler, &mut *delay_queue);
+        crate::service_sec_image::kernel_provider_activation::redrive_ps_callouts(
+            &mut nt_handler, &mut *delay_queue,
+        );
         inline_file_retirement::redrive(&mut nt_handler);
         // A provider may clear the shared publication fence in this pass. Retry the
         // exact parked first-thread Reply after settlement, before receiving again.
