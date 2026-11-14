@@ -1828,6 +1828,9 @@ impl PendingFileIoTable {
 #[path = "pending_io/local_output.rs"]
 mod local_output;
 
+#[path = "pending_io/process_cancel.rs"]
+mod process_cancel;
+
 #[path = "pending_io/identity.rs"]
 mod identity;
 

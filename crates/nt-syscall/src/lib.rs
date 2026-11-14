@@ -315,6 +315,10 @@ pub enum NativeService {
     /// `ExAllocateLocallyUniqueId` (`ntoskrnl/ex/uuid.c:335`) — the monotonic LUID allocator every
     /// logon session identity comes from (`AllocateLocallyUniqueId` in msgina's `MyLogonUser`).
     NtAllocateLocallyUniqueId,
+    /// Cancel the calling process's requests on one File, from any thread, without waiting.
+    NtCancelIoFileEx,
+    /// Query Power Manager state (`SystemPowerCapabilities`, `SystemBatteryState`).
+    NtPowerInformation,
 }
 
 impl NativeService {
@@ -528,6 +532,8 @@ impl NativeService {
             NtRequestWakeupLatency => "NtRequestWakeupLatency",
             NtSetDefaultHardErrorPort => "NtSetDefaultHardErrorPort",
             NtAllocateLocallyUniqueId => "NtAllocateLocallyUniqueId",
+            NtCancelIoFileEx => "NtCancelIoFileEx",
+            NtPowerInformation => "NtPowerInformation",
             NtImpersonateClientOfPort => "NtImpersonateClientOfPort",
         }
     }
@@ -749,6 +755,8 @@ impl NativeService {
         NativeService::NtAccessCheckByTypeResultListAndAuditAlarmByHandle,
         NativeService::NtGetCurrentProcessorNumber,
         NativeService::NtGetCurrentProcessorNumberEx,
+        NativeService::NtCancelIoFileEx,
+        NativeService::NtPowerInformation,
     ];
 }
 

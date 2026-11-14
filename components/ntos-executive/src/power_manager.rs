@@ -86,3 +86,12 @@ pub(crate) unsafe fn remove_process_wakeup_latency(process_id: u64) -> bool {
         .as_mut()
         .is_some_and(|manager| manager.remove_process_wakeup_latency(process_id))
 }
+
+/// Encode one admitted `NtPowerInformation` level from Power Manager state and return its length.
+/// `None` means the level's state belongs to a provider this manager cannot query.
+pub(crate) unsafe fn power_information(
+    query: nt_power_manager::information::PowerInformationQuery,
+    output: &mut [u8; nt_power_manager::information::SYSTEM_POWER_CAPABILITIES_SIZE],
+) -> Option<usize> {
+    manager_mut().power_information(query, output)
+}

@@ -26429,6 +26429,8 @@ fn build_nt_table() -> NativeServiceTable {
             ),
             (NativeService::NtGetCurrentProcessorNumber, 0x446),
             (NativeService::NtGetCurrentProcessorNumberEx, 0x447),
+            (NativeService::NtCancelIoFileEx, 0x300),
+            (NativeService::NtPowerInformation, 139),
             (
                 NativeService::NtOpenEventPair,
                 SSN_NT_OPEN_EVENT_PAIR as u32,

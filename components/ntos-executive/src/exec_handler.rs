@@ -293,6 +293,12 @@ mod virtual_memory_query;
 #[path = "exec_virtual_memory_flush.rs"]
 mod virtual_memory_flush;
 
+#[path = "exec_file_cancel_ex.rs"]
+mod file_cancel_ex;
+
+#[path = "exec_power_information.rs"]
+mod power_information;
+
 #[path = "exec_virtual_memory_commit.rs"]
 mod virtual_memory_commit;
 
@@ -40744,6 +40750,11 @@ impl ExecNtHandler {
             // their own IOSBs/events/file objects with STATUS_CANCELLED; this syscall's IOSB reports
             // the cancel request itself as STATUS_SUCCESS, matching ReactOS IoMgr.
             NativeService::NtCancelIoFile => unsafe { self.nt_cancel_io_file_service(args) },
+            // NtCancelIoFileEx(FileHandle[R10], *IoRequestToCancel[RDX], *IoStatusBlock[R8]).
+            NativeService::NtCancelIoFileEx => unsafe { self.nt_cancel_io_file_ex_service(args) },
+            // NtPowerInformation(Level[R10], *Input[RDX], InputLength[R8], *Output[R9],
+            // OutputLength[arg5]=args[4]).
+            NativeService::NtPowerInformation => unsafe { self.nt_power_information(args) },
             NativeService::NtNotifyChangeDirectoryFile => unsafe {
                 self.nt_notify_change_directory_file_service(args)
             },

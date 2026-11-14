@@ -9,6 +9,7 @@
 
 extern crate alloc;
 
+pub mod information;
 pub mod pofx;
 
 use alloc::vec::Vec;
