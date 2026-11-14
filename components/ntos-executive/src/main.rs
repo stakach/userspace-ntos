@@ -16758,6 +16758,19 @@ unsafe fn reply_parked_syscall(
     client_reply_on(reply_cptr, 1, status, 0, 0, 0)
 }
 
+/// Make the parked caller enter the executive again. The retained Reply is consumed exactly as
+/// by a status reply; only the envelope differs.
+unsafe fn reply_parked_syscall_retry(
+    reply_cptr: u64,
+    retry: &nt_syscall_abi::SyscallRetryReply,
+) -> bool {
+    let words = retry.words();
+    for index in 4..retry.length() {
+        set_reply_mr(index, words[index]);
+    }
+    client_reply_on(reply_cptr, retry.length() as u64, words[0], words[1], words[2], words[3])
+}
+
 #[inline]
 fn fallback_monotonic_time_100ns() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() / 10 }

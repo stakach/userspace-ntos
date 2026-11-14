@@ -127,15 +127,13 @@ impl ExecNtHandler {
         // frame matters only if this acquisition actually needs to park.
         let retry_ip = if waiter.native_call_transport {
             Ok(0)
-        } else if let Some(ip) = waiter.resume_ip.checked_sub(2) {
-            let mut syscall = [0u8; 2];
-            if self.xas_read(ip, &mut syscall) && syscall == [0x0f, 0x05] {
-                Ok(ip)
-            } else {
-                Err(STATUS_ACCESS_VIOLATION)
-            }
         } else {
-            Err(STATUS_ACCESS_VIOLATION)
+            let mut instruction = [0u8; 2];
+            waiter.resume_ip.checked_sub(2)
+                .filter(|ip| self.xas_read(*ip, &mut instruction))
+                .and_then(|_| nt_syscall_abi::unknown_syscall_retry_ip(
+                    waiter.resume_ip, instruction))
+                .ok_or(STATUS_ACCESS_VIOLATION)
         };
         if self.owned_file_io_mode(wait_route).map(|mode| mode.is_synchronous()) != Ok(mode.is_synchronous()) {
             assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))

@@ -32,33 +32,16 @@ fn report_failure(waiter: SynchronousFileWaiter, status: u32) {
 }
 
 unsafe fn send(waiter: SynchronousFileWaiter) -> bool {
-    if waiter.native_call_transport {
-        set_reply_mr(4, waiter.reply_mrs[4]);
-        set_reply_mr(5, waiter.reply_mrs[5]);
-        client_reply_on(
-            waiter.reply_cap,
-            6,
-            nt_syscall_abi::NT_NATIVE_RETRY_REPLY,
-            waiter.reply_mrs[1],
-            waiter.reply_mrs[2],
-            waiter.reply_mrs[3],
-        )
+    let mrs = waiter.reply_mrs;
+    let retry = if waiter.native_call_transport {
+        nt_syscall_abi::SyscallRetryReply::native_call([mrs[1], mrs[2], mrs[3], mrs[4], mrs[5]])
     } else {
-        for index in 4..15 {
-            set_reply_mr(index, waiter.reply_mrs[index]);
-        }
-        set_reply_mr(15, waiter.retry_ip);
-        set_reply_mr(16, waiter.resume_sp);
-        set_reply_mr(17, waiter.resume_flags);
-        client_reply_on(
-            waiter.reply_cap,
-            18,
-            u64::from(waiter.service_number),
-            waiter.reply_mrs[1],
-            waiter.reply_mrs[2],
-            waiter.reply_mrs[3],
+        nt_syscall_abi::SyscallRetryReply::unknown_syscall(
+            u64::from(waiter.service_number), mrs,
+            waiter.retry_ip, waiter.resume_sp, waiter.resume_flags,
         )
-    }
+    };
+    reply_parked_syscall_retry(waiter.reply_cap, &retry)
 }
 
 unsafe fn retire_reply(nt_handler: &mut ExecNtHandler, identity: SynchronousFileRetryIdentity) {

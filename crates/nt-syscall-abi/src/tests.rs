@@ -479,6 +479,33 @@ fn native_retry_reply_cannot_alias_an_ntstatus() {
 }
 
 #[test]
+fn native_retry_reply_is_the_exact_six_word_envelope_the_stub_reissues_on() {
+    let reply = SyscallRetryReply::native_call([0x11, 0x22, 0x33, 0x44, 0x55]);
+    assert_eq!(reply.length(), 6);
+    assert_eq!(reply.words()[..6],
+        [NT_NATIVE_RETRY_REPLY, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    assert!(reply.words()[6..].iter().all(|word| *word == 0));
+}
+
+#[test]
+fn unknown_syscall_retry_reply_restores_the_frame_at_the_syscall_instruction() {
+    let registers: [u64; 18] = core::array::from_fn(|index| 0xA000 + index as u64);
+    let reply = SyscallRetryReply::unknown_syscall(0x11c, registers, 0x7ff0_1000, 0x20_0000, 0x246);
+    assert_eq!(reply.length(), 18);
+    let words = reply.words();
+    assert_eq!(words[0], 0x11c, "RAX carries the service number again");
+    assert_eq!(words[1..15], registers[1..15]);
+    assert_eq!(words[15..], [0x7ff0_1000, 0x20_0000, 0x246]);
+}
+
+#[test]
+fn unknown_syscall_retry_ip_requires_the_syscall_instruction() {
+    assert_eq!(unknown_syscall_retry_ip(0x1002, [0x0f, 0x05]), Some(0x1000));
+    assert_eq!(unknown_syscall_retry_ip(0x1002, [0xcd, 0x2e]), None);
+    assert_eq!(unknown_syscall_retry_ip(1, [0x0f, 0x05]), None);
+}
+
+#[test]
 fn parked_unknown_syscall_retains_only_resume_metadata() {
     let parked = ParkedSyscallReply::unknown_syscall(0xaaaa, 0xbbbb, 0xcccc);
     assert_eq!(parked.resume_ip(), 0xaaaa);

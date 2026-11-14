@@ -219,6 +219,68 @@ impl NativeSyscallRequest {
 /// reissued with the restored request MRs. It is deliberately outside the 32-bit NTSTATUS domain.
 pub const NT_NATIVE_RETRY_REPLY: u64 = 0x4E54_5254_5259_0001;
 
+/// Words in a hosted x86-64 UnknownSyscall reply: RAX, RBX, RCX, RDX, RSI, RDI, RBP, R8-R15,
+/// then the instruction pointer, stack pointer and flags.
+pub const UNKNOWN_SYSCALL_REPLY_WORDS: usize = 18;
+
+/// The reply that makes a parked syscall enter the executive again instead of returning a
+/// status. Nothing has been captured from the first entry: the caller restages its arguments.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SyscallRetryReply {
+    length: usize,
+    words: [u64; UNKNOWN_SYSCALL_REPLY_WORDS],
+}
+
+impl SyscallRetryReply {
+    /// Native seL4-Call transport: the exact six-word envelope led by
+    /// [`NT_NATIVE_RETRY_REPLY`]. The stub restages every argument from its own stack vector,
+    /// so `request` is not authoritative.
+    pub const fn native_call(request: [u64; 5]) -> Self {
+        let mut words = [0; UNKNOWN_SYSCALL_REPLY_WORDS];
+        words[0] = NT_NATIVE_RETRY_REPLY;
+        let mut index = 0;
+        while index < request.len() {
+            words[index + 1] = request[index];
+            index += 1;
+        }
+        Self { length: 6, words }
+    }
+
+    /// UnknownSyscall transport: restore the entry registers with RAX holding the service
+    /// number and resume at the `syscall` instruction itself.
+    pub const fn unknown_syscall(
+        service_number: u64,
+        registers: [u64; UNKNOWN_SYSCALL_REPLY_WORDS],
+        retry_ip: u64,
+        resume_sp: u64,
+        resume_flags: u64,
+    ) -> Self {
+        let mut words = registers;
+        words[0] = service_number;
+        words[15] = retry_ip;
+        words[16] = resume_sp;
+        words[17] = resume_flags;
+        Self { length: UNKNOWN_SYSCALL_REPLY_WORDS, words }
+    }
+
+    pub const fn length(&self) -> usize {
+        self.length
+    }
+
+    pub const fn words(&self) -> &[u64; UNKNOWN_SYSCALL_REPLY_WORDS] {
+        &self.words
+    }
+}
+
+/// Address of the two-byte `syscall` instruction that returned to `resume_ip`, given the bytes
+/// read from just before it. Any other instruction cannot be reissued by rewinding.
+pub const fn unknown_syscall_retry_ip(resume_ip: u64, instruction: [u8; 2]) -> Option<u64> {
+    if instruction[0] != 0x0f || instruction[1] != 0x05 {
+        return None;
+    }
+    resume_ip.checked_sub(2)
+}
+
 /// Resume coordinates retained for deferred syscall and callback handling.
 ///
 /// These coordinates are metadata, not a register restore image. Ordinary completion sends only
