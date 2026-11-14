@@ -293,15 +293,64 @@ struct HostedHeapArena {
     backing: nt_provider_wait::ProviderAllocationIdentity,
 }
 
+/// A provider lane that cannot continue safely stops here for good. It keeps yielding rather
+/// than returning, so the root that runs it sees only a lane that never sends again. The site
+/// names itself, bounded, so that state is attributable from the log.
+#[track_caller]
+fn park() -> ! {
+    static PARKS: AtomicU64 = AtomicU64::new(0);
+    if PARKS.fetch_add(1, Ordering::Relaxed) < 16 {
+        let site = core::panic::Location::caller();
+        print_str(b"[win32k-park] lane stopped at ");
+        print_str(site.file().as_bytes());
+        print_str(b":");
+        print_u64(u64::from(site.line()));
+        print_str(b"\n");
+    }
+    crate::park()
+}
+
+/// One contended acquire of a provider-internal lock. Its holder is a lane inside a short
+/// critical section, so the waiter only gives up the processor until the holder has run. A
+/// waiter that is still polling after 2^16 yields names its lock: the holder is then a lane
+/// that cannot run, and nothing else in the log would say which lock that is.
+struct LockPoll {
+    lock: &'static [u8],
+    yields: u64,
+}
+
+impl LockPoll {
+    const fn new(lock: &'static [u8]) -> Self {
+        Self { lock, yields: 0 }
+    }
+
+    fn yield_once(&mut self) {
+        static REPORTS: AtomicU64 = AtomicU64::new(0);
+        self.yields += 1;
+        if self.yields >= 1 << 16
+            && self.yields.is_power_of_two()
+            && REPORTS.fetch_add(1, Ordering::Relaxed) < 64
+        {
+            print_str(b"[win32k-lock-poll] lock=");
+            print_str(self.lock);
+            print_str(b" yields=");
+            print_u64(self.yields);
+            print_str(b"\n");
+        }
+        crate::yield_now();
+    }
+}
+
 struct ProviderMetadataGuard;
 
 impl ProviderMetadataGuard {
     fn acquire() -> Self {
+        let mut poll = LockPoll::new(b"provider-metadata");
         while PROVIDER_METADATA_BUSY
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            crate::yield_now();
+            poll.yield_once();
         }
         Self
     }
@@ -519,6 +568,17 @@ const _: () = assert!(
         && WIN32K_PROVIDER_WAIT_VADDR + WIN32K_PROVIDER_WAIT_FRAMES * 0x1000
             <= WIN32K_SHARED_VADDR
 );
+
+/// Record on this lane's own page which wait it issued, for root's census.
+unsafe fn stamp_provider_lane(
+    page: *mut nt_provider_wait::ProviderWaitSharedPage,
+    phase: nt_provider_wait::ProviderLaneStampPhase,
+    primitive: nt_provider_wait::ProviderWaitPrimitive,
+    wait_id: u64,
+) {
+    let stamp = core::ptr::addr_of_mut!((*page).stamp);
+    write_volatile(stamp, read_volatile(stamp).next(phase, primitive, wait_id));
+}
 
 fn provider_wait_page_for_current_lane() -> *mut nt_provider_wait::ProviderWaitSharedPage {
     let ordinal = WIN32K_PHYSICAL_KPCR_LAYOUT.ordinal(current_kpcr_va())
@@ -1803,8 +1863,9 @@ unsafe fn cursor_alias_lock() -> Option<CursorAliasLockGuard> {
     let magic = &*((WIN32K_CURSOR_ALIAS_VADDR + shared_pool::MAGIC_OFFSET) as *const AtomicU64);
     if magic.load(Ordering::Acquire) != shared_pool::MAGIC { return None; }
     let lock = &*((WIN32K_CURSOR_ALIAS_VADDR + shared_pool::LOCK_OFFSET) as *const AtomicU64);
+    let mut poll = LockPoll::new(b"cursor-alias-pool");
     while lock.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        crate::yield_now();
+        poll.yield_once();
     }
     Some(CursorAliasLockGuard)
 }
@@ -1880,11 +1941,12 @@ unsafe fn provider_pool_lock() -> Option<ProviderPoolLockGuard> {
         return None;
     }
     let lock = &*((WIN32K_POOL_VADDR + shared_pool::LOCK_OFFSET) as *const AtomicU64);
+    let mut poll = LockPoll::new(b"provider-pool");
     while lock
         .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        crate::yield_now();
+        poll.yield_once();
     }
     Some(ProviderPoolLockGuard)
 }
@@ -1904,6 +1966,7 @@ unsafe fn provider_metadata_pool_lock() -> Option<(ProviderMetadataGuard, Provid
         return None;
     }
     let lock = &*((WIN32K_POOL_VADDR + shared_pool::LOCK_OFFSET) as *const AtomicU64);
+    let mut poll = LockPoll::new(b"provider-pool-under-metadata");
     loop {
         let metadata = ProviderMetadataGuard::acquire();
         if lock
@@ -1913,7 +1976,7 @@ unsafe fn provider_metadata_pool_lock() -> Option<(ProviderMetadataGuard, Provid
             return Some((metadata, ProviderPoolLockGuard));
         }
         drop(metadata);
-        crate::yield_now();
+        poll.yield_once();
     }
 }
 
@@ -6173,6 +6236,7 @@ extern "win64" fn s_ke_wait_for_single_object(
 ) -> i32 {
     unsafe {
         provider_wait_rendezvous(
+            nt_provider_wait::ProviderWaitPrimitive::WaitForSingleObject,
             core::slice::from_ref(&event),
             nt_provider_wait::ProviderWaitType::Any,
             wait_mode,
@@ -6574,6 +6638,7 @@ unsafe fn provider_wait_timeout(
 }
 
 unsafe fn provider_wait_rendezvous(
+    primitive: nt_provider_wait::ProviderWaitPrimitive,
     bodies: &[u64],
     wait_type: nt_provider_wait::ProviderWaitType,
     wait_mode: i8,
@@ -6660,6 +6725,8 @@ unsafe fn provider_wait_rendezvous(
         owner.dispatch_id,
         bodies.len() as u64,
     );
+    stamp_provider_lane(
+        page, nt_provider_wait::ProviderLaneStampPhase::Submitted, primitive, wait_id);
     let mut outgoing = W32_PROVIDER_WAIT_LABEL << 12;
     loop {
         let (reply_info, tag, _, _, _) =
@@ -6675,6 +6742,8 @@ unsafe fn provider_wait_rendezvous(
                     trace_provider_wait_component(b"invalid-result", wait_id, result.wait_id, tag);
                     park();
                 };
+                stamp_provider_lane(
+                    page, nt_provider_wait::ProviderLaneStampPhase::Resumed, primitive, wait_id);
                 if !wait_context.restore() {
                     park();
                 }
@@ -6705,6 +6774,9 @@ unsafe fn provider_wait_rendezvous(
                 }
                 write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut u64, info);
                 write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
+                // The nested dispatch may have waited itself; this lane parks in its own again.
+                stamp_provider_lane(
+                    page, nt_provider_wait::ProviderLaneStampPhase::Submitted, primitive, wait_id);
                 outgoing = W32_DISPATCH_LABEL << 12;
             }
             _ => {
@@ -6740,6 +6812,7 @@ extern "win64" fn s_ke_wait_for_multiple_objects(
     }
     let status = unsafe {
         provider_wait_rendezvous(
+            nt_provider_wait::ProviderWaitPrimitive::WaitForMultipleObjects,
             &bodies[..count as usize],
             wait_type,
             wait_mode,
@@ -6789,10 +6862,65 @@ extern "win64" fn s_rtl_nt_status_to_dos_error(status: u32) -> u32 {
     nt_compat_exports::rtl::nt_status_to_dos_error(status)
 }
 
-extern "win64" fn s_ke_delay_execution_thread(_wait_mode: u32, _alertable: u8, interval: *const i64) -> i32 {
-    assert!(!interval.is_null(), "KeDelayExecutionThread null interval");
-    let interval = unsafe { read_unaligned(interval) };
-    if interval <= 0 {
+/// Whether this lane can issue a blocking dispatcher wait right now: it executes in an
+/// activation that has a wait owner and whose IRQL admits the wait. Read-only.
+unsafe fn provider_timed_wait_available() -> bool {
+    let Some(activation) = active_provider_stack_event_activation() else {
+        return false;
+    };
+    let _metadata = ProviderMetadataGuard::acquire();
+    (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
+        .as_ref()
+        .is_some_and(|catalog| {
+            matches!(catalog.owner(activation), Ok(Some(_)))
+                && matches!(
+                    catalog.can_wait(
+                        activation, nt_provider_wait::ProviderWaitTimeoutKind::Relative),
+                    Ok(true)
+                )
+        })
+}
+
+/// Wait for `interval` on no object through this lane's wait rendezvous. The rendezvous
+/// needs a dispatcher body, so the delay owns one on its stack that nothing can signal: only
+/// the interval, an alert or a user APC ends the wait.
+unsafe fn provider_delay_wait(wait_mode: i8, alertable: u8, interval: i64) -> i32 {
+    let mut event = [0u64; 3];
+    let body = event.as_mut_ptr() as u64;
+    // Unlike KeInitializeEvent, a delay has a status: a refused publication is returned.
+    if let Err(status) = initialize_provider_local_event(
+        body, nt_provider_wait::ProviderEventKind::Synchronization, false,
+    ) {
+        return status as i32;
+    }
+    let status = provider_wait_rendezvous(
+        nt_provider_wait::ProviderWaitPrimitive::DelayExecutionThread,
+        core::slice::from_ref(&body),
+        nt_provider_wait::ProviderWaitType::Any,
+        wait_mode,
+        alertable,
+        // The interval the delay was planned for, not a second read of the caller's cell.
+        core::ptr::addr_of!(interval) as u64,
+    );
+    if !retire_existing_provider_local_event(body) {
+        park();
+    }
+    if status < 0 {
+        // The rendezvous was available and still refused the wait. The caller gets the real
+        // status, not an interval that never elapsed.
+        static REFUSALS: AtomicU64 = AtomicU64::new(0);
+        if REFUSALS.fetch_add(1, Ordering::Relaxed) < 8 {
+            print_str(b"[win32k-delay] timed wait refused status=0x");
+            print_hex(status as u32);
+            print_str(b"\n");
+        }
+    }
+    status
+}
+
+/// The delay of a lane with no wait rendezvous, which has nobody to hand the interval to.
+fn provider_delay_without_rendezvous(interval: i64) -> i32 {
+    if interval < 0 {
         // The win32k provider can wait while the executive's HPET clock and
         // dispatch timer are serviced in a different lane. Its calibrated TSC
         // is an independent monotonic source for a finite relative delay.
@@ -6811,6 +6939,26 @@ extern "win64" fn s_ke_delay_execution_thread(_wait_mode: u32, _alertable: u8, i
         crate::yield_now();
     }
     0 // STATUS_SUCCESS after the full relative or absolute deadline elapsed.
+}
+
+/// `NTSTATUS KeDelayExecutionThread(KPROCESSOR_MODE WaitMode, BOOLEAN Alertable,
+/// PLARGE_INTEGER Interval)`. A delay is a dispatcher wait with no object: the lane leaves
+/// the processor in one captured timed wait, so root is told what it waits for and every
+/// other owner can run until the interval expires.
+extern "win64" fn s_ke_delay_execution_thread(wait_mode: u32, alertable: u8, interval: *const i64) -> i32 {
+    assert!(!interval.is_null(), "KeDelayExecutionThread null interval");
+    let requested = unsafe { read_unaligned(interval) };
+    let timed_wait = (requested != 0 && unsafe { provider_timed_wait_available() }).then_some(
+        |interval| unsafe {
+            provider_delay_wait(wait_mode as i8, u8::from(alertable != 0), interval)
+        },
+    );
+    nt_kernel_exec::delay_execution::delay_execution_thread(
+        requested,
+        timed_wait,
+        crate::yield_now,
+        provider_delay_without_rendezvous,
+    )
 }
 
 extern "win64" fn s_rtl_unicode_to_multibyte_n(
@@ -11922,6 +12070,7 @@ fn acquire_resource_lite(
                     unsafe { trace_resource_queue(resource, thread, mode) };
                     let status = unsafe {
                         provider_wait_rendezvous(
+                            nt_provider_wait::ProviderWaitPrimitive::AcquireResource,
                             &[event_body], nt_provider_wait::ProviderWaitType::Any, 0, 0, 0,
                         )
                     };

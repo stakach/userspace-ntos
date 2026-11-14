@@ -17,6 +17,7 @@ pub mod cache_invalidation;
 pub mod apc_state;
 mod cyclic_ids;
 pub mod dbg;
+pub mod delay_execution;
 mod dispatcher_wait;
 mod event_signal;
 mod dpc;

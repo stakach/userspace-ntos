@@ -322,6 +322,8 @@ pub struct ProviderWaitSharedPage {
     pub request: ProviderWaitRequest,
     pub result: ProviderWaitResult,
     pub kernel_activation: KernelProviderActivationDescriptor,
+    /// Where this lane last blocked. Written by the lane, copied by root's census.
+    pub stamp: crate::ProviderLaneStamp,
 }
 
 impl ProviderWaitSharedPage {
@@ -331,6 +333,7 @@ impl ProviderWaitSharedPage {
             request: ProviderWaitRequest::empty(),
             result: ProviderWaitResult::EMPTY,
             kernel_activation: KernelProviderActivationDescriptor::EMPTY,
+            stamp: crate::ProviderLaneStamp::EMPTY,
         }
     }
 }

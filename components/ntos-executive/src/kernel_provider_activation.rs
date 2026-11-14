@@ -650,13 +650,23 @@ unsafe fn validate_driver_entry_execution(
 
 /// Both initial entry and selected waits retain the same channel and bank through IRQ work.
 /// Receiving after a yield must never retransmit the initial request or a wait-result reply.
+///
+/// The lane keeps executing across a scheduler yield and still holds the running token, so
+/// root has no owner to hand it to and receives on it again. A provider that needs another
+/// lane or a hosted call must therefore leave through a captured wait; one that yields here
+/// without sending anything is reported, because nothing else can see it.
 unsafe fn receive_driver_entry_yields(
     scope: &driver_launch::ComponentSchedulerScope,
     caller: KernelProviderCaller,
     capture: Option<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture>,
     mut result: spawn_hosts::PumpResult,
 ) -> Result<spawn_hosts::PumpResult, u32> {
+    let mut watch =
+        nt_user_host::provider_kernel_yield::KernelJobYieldWatch::new(monotonic_time_100ns());
     while result.scheduler_yielded {
+        if let Some(report) = watch.observe(monotonic_time_100ns(), result.provider_messages) {
+            ps_callout::trace_silent_yields(caller, capture, report);
+        }
         let (receiving, mut receive_attempt, previous) = with_provider_process_manager(|pm| {
             let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
             activations.validate(

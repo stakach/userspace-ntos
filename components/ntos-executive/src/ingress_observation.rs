@@ -135,6 +135,31 @@ fn append_wait_latency_census(record: &mut nt_printf::record::RecordBuffer<4096>
     });
 }
 
+/// Where a provider lane is executing and where it last blocked. Read-only evidence.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LaneExecutionEvidence {
+    pub stamp: nt_provider_wait::ProviderLaneStamp,
+    pub regs_valid: bool,
+    pub rip: u64,
+    pub rsp: u64,
+}
+
+/// Copy the lane's own stamp and its executor's saved user context. The register read uses
+/// root's IPC buffer, so the message it holds is restored before returning.
+pub(crate) unsafe fn lane_execution_evidence(
+    lane: nt_component_suspension::LaneHandle,
+    executor: u64,
+) -> LaneExecutionEvidence {
+    let stamp = crate::win32k_glue::provider_wait_page_for_lane(lane)
+        .map_or(nt_provider_wait::ProviderLaneStamp::EMPTY, |page| {
+            core::ptr::read_volatile(core::ptr::addr_of!((*page).stamp))
+        });
+    let _message = crate::ipc_message::SavedMessageBuffer::capture();
+    let mut regs = [0u64; 20];
+    let regs_valid = crate::win32k_glue::tcb_read_regs20_checked(executor, &mut regs);
+    LaneExecutionEvidence { stamp, regs_valid, rip: regs[0], rsp: regs[1] }
+}
+
 pub(crate) fn print_hold_snapshot(now: u64) {
     use core::fmt::Write;
     unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::trace_ifeo_miss_census(); }
@@ -154,6 +179,18 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     let mut record = nt_printf::record::RecordBuffer::<4096>::new();
     let _ = writeln!(record, "[ingress-hold] t_ms={} running={:?} oldest={:?} logical={:?}",
         now / 10_000, snapshot.running, snapshot.oldest, logical);
+    // A lane that holds root without talking to it names itself here: where it last blocked
+    // and where it is executing now.
+    if let Some((running, binding)) = snapshot.running
+        .and_then(|running| running.binding.map(|binding| (running, binding)))
+    {
+        let lane = unsafe { lane_execution_evidence(running.lane, binding.executor_id) };
+        let _ = writeln!(record,
+            "[ingress-hold-lane] t_ms={} lane={}/{} last-wait={} primitive={} wait-id={:#x} sequence={} regs-valid={} rip={:#x} rsp={:#x}",
+            now / 10_000, running.lane.index, running.lane.generation,
+            lane.stamp.phase_name(), lane.stamp.primitive_name(), lane.stamp.wait_id,
+            lane.stamp.sequence, u8::from(lane.regs_valid), lane.rip, lane.rsp);
+    }
     let _ = writeln!(record, "[ingress-gate] t_ms={} {:?}", now / 10_000, gate);
     let registry = unsafe { crate::registry_mutation_work::census_snapshot() };
     let _ = writeln!(record, "[registry-work] t_ms={} {:?}", now / 10_000, registry);

@@ -2031,6 +2031,8 @@ struct PumpLoopOutcome {
     wall_flags: u64,
     wall_exception: u64,
     wall_code: u64,
+    /// Messages from the component that this loop handled.
+    provider_messages: u64,
     accounting: nt_user_host::component_pump::ComponentPumpAccounting,
 }
 
@@ -2067,6 +2069,7 @@ impl PumpLoopOutcome {
             wall_flags: 0,
             wall_exception: 0,
             wall_code: 0,
+            provider_messages: 0,
             accounting: nt_user_host::component_pump::ComponentPumpAccounting::new(false),
         }
     }
@@ -2327,6 +2330,10 @@ pub(crate) struct PumpResult {
     pub wall_code: u64,
     pub faults: u64,
     pub demand: u64,
+    /// Messages from the component (service Calls and faults) handled by the pump segment that
+    /// produced this result. A scheduler yield with none is a provider that ran without
+    /// reaching root at all.
+    pub provider_messages: u64,
     accounting: nt_user_host::component_pump::ComponentPumpAccounting,
 }
 
@@ -2374,6 +2381,7 @@ impl PumpResult {
             wall_code: 0,
             faults: 0,
             demand: 0,
+            provider_messages: 0,
             accounting: nt_user_host::component_pump::ComponentPumpAccounting::new(false),
         }
     }
@@ -3249,6 +3257,7 @@ unsafe fn component_pump_loop(
             outcome.scheduler_yielded = true;
             break;
         }
+        outcome.provider_messages += 1;
         let label = msg.label();
         let _file_cycle = file_pump_diagnostic::MessageCycle::enter(ch, label);
         crate::driver_launch::trace_port_connect_worker_message(
@@ -6459,6 +6468,7 @@ unsafe fn pump_result_from_outcome(
         wall_code: outcome.wall_code,
         faults: outcome.accounting.faults(),
         demand: outcome.accounting.demand(),
+        provider_messages: outcome.provider_messages,
         accounting: outcome.accounting,
     }
 }

@@ -201,6 +201,66 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_e
     }
 }
 
+/// Root is receiving again on a job whose provider keeps yielding the processor without
+/// sending anything. The lane still holds the running token, so root cannot leave it; this
+/// names the job, how long it has been silent, where its lane last blocked and where it is
+/// executing. Read-only.
+pub(super) unsafe fn trace_silent_yields(
+    caller: KernelProviderCaller,
+    resumed: Option<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture>,
+    report: nt_user_host::provider_kernel_yield::SilentYieldReport,
+) {
+    // Its own budget, so neither this line nor a parked callout's heartbeat can hide the other.
+    static SAMPLES: AtomicU64 = AtomicU64::new(0);
+    let sample = SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample > 8 && !sample.is_power_of_two() {
+        return;
+    }
+    let recipient = (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller).ok();
+    let target = recipient.and_then(KernelJobRecipient::ps_retirement);
+    let purpose: &[u8] = if target.is_some() {
+        b"ps-retirement"
+    } else if recipient.is_some_and(KernelJobRecipient::is_driver_entry) {
+        b"driver-entry"
+    } else {
+        b"executive"
+    };
+    let lane = caller.dispatch().lane();
+    // Only an exact bound executor is sampled; an unbound lane reports no evidence.
+    let evidence = match (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) {
+        Ok(binding) if binding.executor_id != 0 => {
+            crate::ingress_observation::lane_execution_evidence(lane, binding.executor_id)
+        }
+        _ => crate::ingress_observation::LaneExecutionEvidence {
+            stamp: nt_provider_wait::ProviderLaneStamp::EMPTY,
+            regs_valid: false,
+            rip: 0,
+            rsp: 0,
+        },
+    };
+    print_str(b"[kernel-job-wait] stage=yield-runner purpose=");
+    print_str(purpose);
+    print_str(if resumed.is_some() { b" entry=wait-resume" } else { b" entry=initial" });
+    print_str(b" last-wait=");
+    print_str(evidence.stamp.phase_name().as_bytes());
+    print_str(b" primitive=");
+    print_str(evidence.stamp.primitive_name().as_bytes());
+    print_str(b" dispatch/lane/lane-phase/resumed-wait-id/yields/silent-yields/silent-ms/ps-pi/ps-tid/last-wait-id/stamp-sequence/regs-valid/lane-rip/lane-rsp=");
+    for value in [
+        caller.owner().dispatch_id, u64::from(lane.index), lane_phase(caller),
+        resumed.map_or(0, |capture| capture.key().id), report.yields, report.silent_yields,
+        report.silent_100ns / 10_000,
+        target.map_or(0, |(pi, _)| u64::from(pi)),
+        target.map_or(0, |(_, target)| u64::from(target.thread().thread_id())),
+        evidence.stamp.wait_id, evidence.stamp.sequence,
+        u64::from(evidence.regs_valid), evidence.rip, evidence.rsp,
+    ] {
+        print_str(b"/");
+        print_hex_u64(value);
+    }
+    print_str(b"\n");
+}
+
 /// Heartbeat of the runner's remaining nested wait loop: what stopped the job, which arrivals
 /// the loop has seen and whether timer delivery is still alive.
 pub(super) struct RunnerHeartbeat {

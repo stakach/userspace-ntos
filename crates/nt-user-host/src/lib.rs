@@ -73,6 +73,7 @@ pub mod provider_ps_retirement;
 pub mod provider_ps_callout;
 pub mod provider_kernel_pump;
 pub mod provider_kernel_wait;
+pub mod provider_kernel_yield;
 pub mod provider_local_event_request;
 pub mod component_pump;
 pub mod native_caller_subject;
