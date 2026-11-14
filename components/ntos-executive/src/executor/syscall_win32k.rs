@@ -645,20 +645,12 @@ pub(super) unsafe fn syscall_win32k_route(
             sp + 0x40,
             scratch_base,
         );
-        if let (Some(tail0), Some(tail1), Some(tail2)) = (tail0, tail1, tail2) {
-            let eight_arg_shape = tail3.is_some_and(|needed| {
-                a3 <= 1
-                    && tail1 != 0
-                    && tail1 <= 0x0001_0000
-                    && tail2 >= 0x0001_0000
-                    && needed >= 0x0001_0000
-            });
+        if let Some(call) = nt_kernel_exec::user_window_list::BuildHwndListCall::capture(
+            a3,
+            [tail0, tail1, tail2, tail3],
+        ) {
             let (thread_id, c_hwnd, client_list, client_needed, shape) =
-                if eight_arg_shape {
-                    (tail0, tail1, tail2, tail3.unwrap_or(0), 8u64)
-                } else {
-                    (a3, tail0, tail1, tail2, 7u64)
-                };
+                (call.thread_id, call.capacity, call.list, call.needed, call.shape);
             if client_needed != 0 {
                 let arg = win32k_subsystem::WIN32K_ARG_VADDR;
                 let staged_list = arg;

@@ -66,6 +66,7 @@ pub mod timezone;
 pub mod user_class;
 pub mod user_cursor;
 pub mod user_string;
+pub mod user_window_list;
 pub mod uuid_v1;
 pub mod win32k_lane_context;
 mod work_item;
