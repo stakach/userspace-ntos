@@ -440,7 +440,57 @@ pub(crate) unsafe fn run_overlay(device_id: u64) -> bool {
                 &[],
                 &mut read,
             )?;
-        Ok(status == 0 && pending.is_none() && information == bytes.len() as u64 && read == *bytes)
+        if status != 0 || pending.is_some() || information != bytes.len() as u64 || read != *bytes {
+            return Ok(false);
+        }
+        // SET_INFORMATION and FLUSH_BUFFERS must reach the opened File too: truncate it through
+        // the device stack, read the new size back, and flush.
+        let end_of_file = 7u64.to_le_bytes();
+        let (status, _, pending, _) =
+            crate::driver_launch::dispatch_hosted_file_set_information_irp_result_exact(
+                file,
+                caller,
+                nt_io_manager::SetInformationParameters {
+                    info_class: nt_fs::FILE_END_OF_FILE_INFORMATION,
+                    length: end_of_file.len() as u32,
+                    target_file: None,
+                    control: nt_io_manager::SetInformationControl::None,
+                },
+                &end_of_file,
+            )?;
+        if status != 0 || pending.is_some() {
+            return Ok(false);
+        }
+        let (status, information, pending, _) =
+            crate::driver_launch::dispatch_hosted_file_irp_result_exact(
+                file,
+                major::IRP_MJ_QUERY_INFORMATION as u64,
+                nt_fs::FILE_STANDARD_INFORMATION as u64,
+                caller,
+                &[],
+                &mut standard,
+                0,
+            )?;
+        if status != 0
+            || information != standard.len() as u64
+            || pending.is_some()
+            || u64::from_le_bytes(standard[8..16].try_into().unwrap()) != 7
+        {
+            return Ok(false);
+        }
+        let (status, _, pending, _) = crate::driver_launch::dispatch_hosted_file_irp_result_exact(
+            file,
+            major::IRP_MJ_FLUSH_BUFFERS as u64,
+            0,
+            caller,
+            &[],
+            &mut [],
+            0,
+        )?;
+        if status != 0 || pending.is_some() {
+            return Ok(false);
+        }
+        Ok(true)
     })()
     .unwrap_or(false);
     let released = crate::driver_launch::release_hosted_file(file).is_ok();

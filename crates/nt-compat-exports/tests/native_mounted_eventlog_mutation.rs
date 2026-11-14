@@ -16,6 +16,44 @@ fn method_body(name: &str) -> &str {
     tail.split_once("\n    fn ").map_or(tail, |(body, _)| body)
 }
 
+/// A dispatch arm is dead unless the volume driver registers its major: the I/O Manager fails
+/// an unregistered major with STATUS_INVALID_DEVICE_REQUEST before the backend runs. Boot119's
+/// flush and EOF arms were added without their majors and never ran.
+#[test]
+fn every_major_the_mounted_backend_dispatches_is_registered() {
+    fn majors(text: &str) -> std::collections::BTreeSet<&str> {
+        text.split("major::")
+            .skip(1)
+            .map(|tail| {
+                let end = tail
+                    .find(|byte: char| !(byte.is_ascii_alphanumeric() || byte == '_'))
+                    .unwrap_or(tail.len());
+                &tail[..end]
+            })
+            .collect()
+    }
+    let dispatch = BACKEND
+        .split_once("fn dispatch_irp(")
+        .expect("mounted FSD dispatch")
+        .1
+        .split_once("fn cancel_irp(")
+        .expect("bounded dispatch")
+        .0;
+    let registered = BACKEND
+        .split_once("const MAJORS: &'static [u8] = &[")
+        .expect("the backend names the majors it serves")
+        .1
+        .split_once("];")
+        .expect("bounded major list")
+        .0;
+    assert_eq!(majors(dispatch), majors(registered));
+    assert!(
+        include_str!("../../../components/ntos-executive/src/mounted_volume.rs")
+            .contains("MountedVolumeBackend::MAJORS,"),
+        "the volume driver must register the backend's own list"
+    );
+}
+
 #[test]
 fn mounted_eventlog_flush_and_eof_set_route_to_open_file() {
     let dispatch = BACKEND

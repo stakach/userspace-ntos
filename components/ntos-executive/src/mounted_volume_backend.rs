@@ -1675,6 +1675,8 @@ impl MountedVolumeBackend {
         major::IRP_MJ_CREATE,
         major::IRP_MJ_READ,
         major::IRP_MJ_WRITE,
+        major::IRP_MJ_FLUSH_BUFFERS,
+        major::IRP_MJ_SET_INFORMATION,
         major::IRP_MJ_QUERY_INFORMATION,
         major::IRP_MJ_QUERY_VOLUME_INFORMATION,
         major::IRP_MJ_FILE_SYSTEM_CONTROL,
