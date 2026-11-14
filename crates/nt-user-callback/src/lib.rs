@@ -158,10 +158,27 @@ impl Default for CallbackFrame {
 
 pub const STATUS_PENDING: i32 = 0x0000_0103;
 
+/// Entries in the pinned LiberNT `apfnDispatch` table (`win32ss/include/u32cb.h`).
+pub const USER32_CALLBACK_COUNT: u32 = 21;
 /// ReactOS `USER32_CALLBACK_CLIENTTHREADSTARTUP` / `apfnDispatch[7]`.
 pub const USER32_CALLBACK_CLIENTTHREADSTARTUP: u32 = 7;
 /// ReactOS `USER32_CALLBACK_WINDOWPROC` / `apfnDispatch[0]`.
 pub const USER32_CALLBACK_WINDOWPROC: u32 = 0;
+pub const USER32_CALLBACK_SENDASYNCPROC: u32 = 1;
+pub const USER32_CALLBACK_LOADSYSMENUTEMPLATE: u32 = 2;
+pub const USER32_CALLBACK_HOOKPROC: u32 = 4;
+pub const USER32_CALLBACK_EVENTPROC: u32 = 5;
+pub const USER32_CALLBACK_LOADMENU: u32 = 6;
+pub const USER32_CALLBACK_CLIENTLOADLIBRARY: u32 = 8;
+pub const USER32_CALLBACK_COPYIMAGE: u32 = 10;
+pub const USER32_CALLBACK_DELIVERUSERAPC: u32 = 12;
+pub const USER32_CALLBACK_DDEPOST: u32 = 13;
+pub const USER32_CALLBACK_DDEGET: u32 = 14;
+/// `co_UserCBClientPrinterThunk` sizes its result from the caller's `OutSize`, which the
+/// callback bridge does not carry; it has no contract and is refused.
+pub const USER32_CALLBACK_UMPD: u32 = 17;
+pub const USER32_CALLBACK_IMMPROCESSKEY: u32 = 18;
+pub const USER32_CALLBACK_MONITORENUMPROC: u32 = 20;
 /// ReactOS `USER32_CALLBACK_LOADDEFAULTCURSORS` / `apfnDispatch[3]`.
 pub const USER32_CALLBACK_LOADDEFAULTCURSORS: u32 = 3;
 /// ReactOS `USER32_CALLBACK_SETWNDICONS` / `apfnDispatch[11]`.
@@ -185,12 +202,76 @@ pub enum UserCallbackContract {
         input_length: u32,
         result_length: u32,
     },
+    /// A fixed header followed by caller-sized data, answered by a fixed-size result.
+    Variable {
+        minimum_input_length: u32,
+        result_length: u32,
+    },
+    /// The handler returns its whole argument block, possibly modified. It may also return the
+    /// block with a failure status, or nothing at all.
+    Echo {
+        minimum_input_length: u32,
+    },
 }
 
 impl UserCallbackContract {
     pub const fn for_api(api_index: u32) -> Option<Self> {
         match api_index {
             USER32_CALLBACK_WINDOWPROC => Some(Self::WindowProc),
+            // SENDASYNCPROC_CALLBACK_ARGUMENTS; the handler returns no data.
+            USER32_CALLBACK_SENDASYNCPROC => Some(Self::Fixed {
+                input_length: 0x28,
+                result_length: 0,
+            }),
+            // No arguments; the handler returns an LRESULT (the menu handle).
+            USER32_CALLBACK_LOADSYSMENUTEMPLATE => Some(Self::Fixed {
+                input_length: 0,
+                result_length: 8,
+            }),
+            // HOOKPROC_CALLBACK_ARGUMENTS, then the hook's lParam data at a self-relative offset.
+            USER32_CALLBACK_HOOKPROC => Some(Self::Echo {
+                minimum_input_length: 0x448,
+            }),
+            // EVENTPROC_CALLBACK_ARGUMENTS; events are notifications without a result.
+            USER32_CALLBACK_EVENTPROC => Some(Self::Fixed {
+                input_length: 0x40,
+                result_length: 0,
+            }),
+            // LOADMENU_CALLBACK_ARGUMENTS (0x18 with its one-character name), the rest of the
+            // name and a terminator; the handler returns the HMENU.
+            USER32_CALLBACK_LOADMENU => Some(Self::Variable {
+                minimum_input_length: 0x18 + 2,
+                result_length: 8,
+            }),
+            // CLIENT_LOAD_LIBRARY_ARGUMENTS and its two optional strings, addressed by offsets
+            // the handler rebases; the handler returns `sizeof(HINSTANCE)` bytes.
+            USER32_CALLBACK_CLIENTLOADLIBRARY => Some(Self::Variable {
+                minimum_input_length: 0x28,
+                result_length: 8,
+            }),
+            // COPYIMAGE_CALLBACK_ARGUMENTS; the handler returns the copied image's HANDLE.
+            USER32_CALLBACK_COPYIMAGE => Some(Self::Fixed {
+                input_length: 0x18,
+                result_length: 8,
+            }),
+            USER32_CALLBACK_DELIVERUSERAPC => Some(Self::Fixed {
+                input_length: 0,
+                result_length: 0,
+            }),
+            // DDEPOSTGET_CALLBACK_ARGUMENTS; DDEGET appends the message data.
+            USER32_CALLBACK_DDEPOST | USER32_CALLBACK_DDEGET => Some(Self::Echo {
+                minimum_input_length: 0x50,
+            }),
+            // IMMPROCESSKEY_CALLBACK_ARGUMENTS; the handler returns a DWORD.
+            USER32_CALLBACK_IMMPROCESSKEY => Some(Self::Fixed {
+                input_length: 0x28,
+                result_length: 4,
+            }),
+            // MONITORENUMPROC_CALLBACK_ARGUMENTS; the handler returns the BOOL to continue.
+            USER32_CALLBACK_MONITORENUMPROC => Some(Self::Fixed {
+                input_length: 0x30,
+                result_length: 4,
+            }),
             USER32_CALLBACK_CLIENTTHREADSTARTUP => Some(Self::Fixed {
                 input_length: 0,
                 result_length: 0,
@@ -248,6 +329,21 @@ impl UserCallbackContract {
                     && output_capacity >= result_length
                     && payload_reference_offset == NO_PAYLOAD_REFERENCE
             }
+            Self::Variable {
+                minimum_input_length,
+                result_length,
+            } => {
+                input_length >= minimum_input_length
+                    && output_capacity >= result_length
+                    && payload_reference_offset == NO_PAYLOAD_REFERENCE
+            }
+            Self::Echo {
+                minimum_input_length,
+            } => {
+                input_length >= minimum_input_length
+                    && output_capacity >= input_length
+                    && payload_reference_offset == NO_PAYLOAD_REFERENCE
+            }
         }
     }
 
@@ -257,14 +353,24 @@ impl UserCallbackContract {
         result_length: u32,
         callback_status: i32,
     ) -> bool {
-        if callback_status < 0 && !matches!(self, Self::CharsetInfo) {
-            return result_length == 0;
+        if callback_status < 0 {
+            match self {
+                // User32 returns the original argument even when the lookup fails.
+                Self::CharsetInfo => {}
+                // A failed handler returns either nothing or its argument block.
+                Self::Echo { .. } if result_length != 0 => {}
+                _ => return result_length == 0,
+            }
         }
         match self {
-            Self::WindowProc => result_length == input_length,
+            Self::WindowProc | Self::Echo { .. } => result_length == input_length,
             Self::Lpk => result_length == 4,
             Self::CharsetInfo => result_length == 36,
             Self::Fixed {
+                result_length: expected,
+                ..
+            }
+            | Self::Variable {
                 result_length: expected,
                 ..
             } => result_length == expected,
@@ -288,6 +394,15 @@ impl UserCallbackContract {
                 result_length,
             } if input_length == expected_input => Some(result_length),
             Self::Fixed { .. } => None,
+            Self::Variable {
+                minimum_input_length,
+                result_length,
+            } if input_length >= minimum_input_length => Some(result_length),
+            Self::Variable { .. } => None,
+            Self::Echo {
+                minimum_input_length,
+            } if input_length >= minimum_input_length => Some(input_length),
+            Self::Echo { .. } => None,
         }
     }
 
@@ -3321,7 +3436,7 @@ mod tests {
         assert!(!api16.accepts_lpk_layout(0x48, 0x38, 7));
         assert_eq!(api16.minimum_result_capacity(0x48), Some(4));
         assert!(api16.accepts_result(0x48, 4, 0));
-        assert_eq!(UserCallbackContract::for_api(4), None);
+        assert_eq!(UserCallbackContract::for_api(USER32_CALLBACK_UMPD), None);
     }
 
     #[test]

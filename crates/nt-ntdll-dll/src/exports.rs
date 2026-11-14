@@ -23410,6 +23410,10 @@ pub unsafe extern "system" fn ki_user_exception_dispatcher(
 ) {
 }
 
+/// Entries in the pinned LiberNT `apfnDispatch` table; `nt-user-callback` holds the same count
+/// for the executive, which this separately built crate cannot link.
+const USER32_CALLBACK_COUNT: u32 = 21;
+
 /// `KiUserCallbackDispatcher` — the x64 user-mode entry for a kernel `KeUserModeCallback`.
 ///
 /// ReactOS enters this symbol with `RSP` pointing at a 16-byte-aligned `UCALLOUT_FRAME`, not with
@@ -23418,7 +23422,7 @@ pub unsafe extern "system" fn ki_user_exception_dispatcher(
 /// `NTSTATUS NTAPI thunk(PVOID, ULONG)`, then terminates the callback through SSN 22. The first four
 /// qwords of the frame are the callback thunk's Windows-x64 home space.
 ///
-/// This project hosts ReactOS user32, whose `USER32_CALLBACK_COUNT` is 20. Rejecting larger indices
+/// This project hosts LiberNT user32, whose `USER32_CALLBACK_COUNT` is 21. Rejecting larger indices
 /// before touching the table makes the Phase-1 entry bounded; a null/misaligned table, null routine,
 /// null non-empty input, or overflowing input range is returned as `STATUS_INVALID_PARAMETER` via
 /// `NtCallbackReturn`. Phase 1 deliberately does not fabricate or seed a callback table: user32's
@@ -23446,9 +23450,10 @@ pub unsafe extern "C" fn ki_user_callback_dispatcher() -> ! {
         "add rax, r11",
         "jc 3f",
         "1:",
-        // ReactOS USER32_CALLBACK_COUNT = 20 (win32ss/include/u32cb.h).
+        // LiberNT USER32_CALLBACK_COUNT = 21 (win32ss/include/u32cb.h); index 20 is
+        // USER32_CALLBACK_MONITORENUMPROC.
         "mov r8d, [rsp + 0x2c]",
-        "cmp r8d, 20",
+        "cmp r8d, {callback_count}",
         "jae 3f",
         // NtCurrentPeb() = gs:[0x60], PEB.KernelCallbackTable = +0x58 on amd64.
         "mov rax, gs:[0x60]",
@@ -23482,6 +23487,7 @@ pub unsafe extern "C" fn ki_user_callback_dispatcher() -> ! {
         "mov ecx, eax",
         "call {raise_status}",
         "int3",
+        callback_count = const USER32_CALLBACK_COUNT,
         callback_return = sym nt_ntdll::trap_stubs::nt_callback_return,
         raise_status = sym rtl_raise_status,
     );
