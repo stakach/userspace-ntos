@@ -205,6 +205,9 @@ pub(crate) mod initial_thread_creation;
 #[path = "exec_file_flush.rs"]
 mod file_flush;
 
+#[path = "exec_file_security.rs"]
+mod file_security;
+
 #[path = "exec_save_key_file.rs"]
 mod save_key_file;
 
@@ -37881,6 +37884,33 @@ impl ExecNtHandler {
                     }
                     return 0;
                 }
+                if let Some(driver_status) = self.file_security_driver_status(
+                    args[0],
+                    required_access,
+                    major::IRP_MJ_QUERY_SECURITY,
+                ) {
+                    let descriptor = match nt_security::file_query_security_descriptor(
+                        driver_status,
+                        security_information,
+                    ) {
+                        Ok(descriptor) => descriptor,
+                        Err(status) => return status,
+                    };
+                    if args[4] == 0
+                        || !self.xas_write_u32(args[4], descriptor.len().min(u32::MAX as usize) as u32)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if args[2] == 0 || buffer_length < descriptor.len() {
+                        return STATUS_BUFFER_TOO_SMALL;
+                    }
+                    if !self.probe_user_output(args[2], descriptor.len())
+                        || !self.xas_try_write_buf(args[2], &descriptor)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    return 0;
+                }
                 let native_handle_object = self.pm_pid_for_pi(self.pi).and_then(|pid| {
                     (args[0] <= u32::MAX as u64)
                         .then(|| self.pm.lookup_handle(pid, args[0] as nt_process::Handle))
@@ -38120,6 +38150,21 @@ impl ExecNtHandler {
                         Ok(()) => 0,
                         Err(status) => status,
                     };
+                }
+                if let Some(driver_status) = self.file_security_driver_status(
+                    args[0],
+                    required_access,
+                    major::IRP_MJ_SET_SECURITY,
+                ) {
+                    // The descriptor is captured before the driver's answer matters, as the
+                    // syscall captures it before building the IRP.
+                    let memory = ExecClientMemory { handler: self };
+                    if let Err(status) =
+                        nt_security::capture_security_descriptor_bytes(&memory, args[2])
+                    {
+                        return status;
+                    }
+                    return nt_security::file_set_security_status(driver_status);
                 }
                 let native_handle_object = self.pm_pid_for_pi(self.pi).and_then(|pid| {
                     (args[0] <= u32::MAX as u64)

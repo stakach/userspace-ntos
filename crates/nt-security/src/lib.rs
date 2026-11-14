@@ -22,6 +22,7 @@ mod native_sd;
 mod object_security;
 mod object_creation_grant;
 mod directory_security;
+mod file_object_security;
 mod port;
 pub mod raw_rtl;
 mod section_security;
@@ -35,6 +36,7 @@ mod token_filter;
 mod token_info;
 mod token_set;
 
+pub use file_object_security::{file_query_security_descriptor, file_set_security_status};
 pub use access::{
     access_check, access_check_by_type, check_token_privileges, map_token_access, privilege_check,
     validate_object_type_list, AccessCheckResult, AccessMask, Ace, AceType, Acl, GenericMapping,
