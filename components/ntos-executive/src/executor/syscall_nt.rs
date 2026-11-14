@@ -1073,7 +1073,7 @@ pub(super) unsafe fn syscall_nt_route(
         print_str(b"[heap] executive bump high-water=");
         print_u64(heap_watermark as u64);
         print_str(b" cap=");
-        print_u64(allocator::HEAP_FRAMES * 0x1000);
+        print_u64(allocator::ROOT_HEAP_RESERVATION_FRAMES * 0x1000);
         print_str(b"\n");
     }
     // Thread creation is a cross-subsystem transaction. Mechanism admission, MM/Ps

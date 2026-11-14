@@ -384,7 +384,7 @@ fn component_allocator_heap_frames(d: &ComponentDescriptor) -> u64 {
         );
         frames = region.count;
     }
-    assert!(frames <= allocator::HEAP_FRAMES);
+    assert!(frames <= allocator::COMPONENT_HEAP_MAX_FRAMES);
     assert_eq!(d.map_heap_pt, frames != 0);
     frames
 }
@@ -834,7 +834,7 @@ unsafe fn spawn_component_inner(d: &ComponentDescriptor, resume: bool) -> Spawne
     for (index, region) in d.regions.iter().enumerate() {
         if let FrameSource::DemandZeroed { initial_frames } = region.source {
             assert_eq!(region.base_va, allocator::HEAP_BASE as u64);
-            assert!(initial_frames != 0 && initial_frames <= region.count && region.count <= allocator::HEAP_FRAMES);
+            assert!(initial_frames != 0 && initial_frames <= region.count && region.count <= allocator::COMPONENT_HEAP_MAX_FRAMES);
             assert_eq!(region.pts, 0, "heap page tables belong to the generic skeleton");
             assert!(matches!(region.rights, Rights::Uniform(rights) if rights == RW_NX));
             let end = region.base_va.checked_add(region.count.checked_mul(0x1000).expect("heap extent")).expect("heap end");

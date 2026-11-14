@@ -319,7 +319,7 @@ pub const CM_REP_VADDR: u64 = 0x0000_0100_1057_0000;
 /// CM atomically owns the encoded SYSTEM image, decoded hive, semantic indexes, and runtime
 /// transaction snapshots. Other isolated services retain the default 512 KiB profile.
 pub const CONFIG_MANAGER_SERVICE_HEAP_FRAMES: u64 = 4096;
-const _: () = assert!(CONFIG_MANAGER_SERVICE_HEAP_FRAMES <= allocator::HEAP_FRAMES);
+const _: () = assert!(CONFIG_MANAGER_SERVICE_HEAP_FRAMES <= allocator::COMPONENT_HEAP_MAX_FRAMES);
 // A THIRD ring set — the executive's side of the I/O Manager service.
 pub const IO_SUB_VADDR: u64 = 0x0000_0100_1058_0000;
 pub const IO_COMP_VADDR: u64 = 0x0000_0100_1059_0000;
@@ -1374,7 +1374,8 @@ pub const DEMAND_SCRATCH_WINDOW: u64 = 0x0400_0000; // 64 MiB per process
                                                     // The static-process lanes begin exactly after the executive's runtime-mapped heap and the 7 ×
                                                     // 64 MiB windows remain below PRIVATE_VM_LIMIT. `ensure_executive_paging` builds every missing
                                                     // paging level, so this layout does not depend on boot-image page tables.
-pub const SMSS_SCRATCH_BASE: u64 = allocator::HEAP_BASE as u64 + allocator::HEAP_FRAMES * 0x1000;
+pub const SMSS_SCRATCH_BASE: u64 =
+    allocator::HEAP_BASE as u64 + allocator::ROOT_HEAP_RESERVATION_FRAMES * 0x1000;
 const _: () = assert!(SMSS_SCRATCH_BASE & 0x1f_ffff == 0);
 const _: () = assert!(SMSS_SCRATCH_BASE == 0x0000_0100_2380_0000);
 /// csrss's demand-fault scratch window (own 64 MiB, PTs mapped at spawn).
@@ -5285,7 +5286,7 @@ fn root_cap_ownership_spec(passed: &mut u64) {
     let delete_refusals = ROOT_SLOT_PIN_DELETE_REFUSALS.load(Ordering::Relaxed);
     let unmap_refusals = ROOT_SLOT_PIN_UNMAP_REFUSALS.load(Ordering::Relaxed);
     let move_refusals = ROOT_SLOT_PIN_MOVE_REFUSALS.load(Ordering::Relaxed);
-    let required_heap_pts = allocator::HEAP_FRAMES.div_ceil(512);
+    let required_heap_pts = allocator::ROOT_HEAP_RESERVATION_FRAMES.div_ceil(512);
     let mapped_heap_frames = allocator::root_heap_committed_frames()
         + allocator::EXECUTIVE_TRANSIENT_HEAP_FRAMES;
     print_str(b"[cap-owner] pinned-root-slots=");
@@ -15001,7 +15002,7 @@ unsafe fn map_own_heap_frames(first: u64, count: u64) -> bool {
 
 /// Map initial durable pages and the fixed transient lane without committing the intervening VA.
 unsafe fn map_own_heap() {
-    map_heap_pts(CAP_INIT_THREAD_VSPACE, allocator::HEAP_FRAMES);
+    map_heap_pts(CAP_INIT_THREAD_VSPACE, allocator::ROOT_HEAP_RESERVATION_FRAMES);
     if !map_own_heap_frames(0, allocator::EXECUTIVE_INITIAL_HEAP_FRAMES) {
         panic!("required executive heap cap run allocation failed");
     }
@@ -15046,7 +15047,7 @@ pub(crate) unsafe fn grow_own_heap(requested_end: usize) -> bool {
 /// Build a spawned service's VSpace: image RO+X, private heap, private stack, and
 /// the four shared SURT frames at the shared vaddrs.
 unsafe fn build_service_vspace(sub: u64, comp: u64, req: u64, rep: u64, heap_frames: u64) -> u64 {
-    assert!(heap_frames != 0 && heap_frames <= allocator::HEAP_FRAMES);
+    assert!(heap_frames != 0 && heap_frames <= allocator::COMPONENT_HEAP_MAX_FRAMES);
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
@@ -15101,7 +15102,7 @@ struct ServiceLaunchContext(u64);
 impl ServiceLaunchContext {
     fn issue(heap_frames: u64) -> Option<Self> {
         if heap_frames == 0
-            || heap_frames > allocator::HEAP_FRAMES
+            || heap_frames > allocator::COMPONENT_HEAP_MAX_FRAMES
             || heap_frames > SERVICE_LAUNCH_HEAP_MASK
         {
             return None;
@@ -15120,7 +15121,7 @@ impl ServiceLaunchContext {
         let context = Self(raw);
         if context.incarnation() == 0
             || context.heap_frames() == 0
-            || context.heap_frames() > allocator::HEAP_FRAMES
+            || context.heap_frames() > allocator::COMPONENT_HEAP_MAX_FRAMES
         {
             return None;
         }
@@ -32468,7 +32469,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 regions[n] = Region {
                     source: FrameSource::DemandZeroed { initial_frames: allocator::DEFAULT_SERVICE_HEAP_FRAMES },
                     base_va: allocator::HEAP_BASE as u64,
-                    count: allocator::HEAP_FRAMES,
+                    count: allocator::COMPONENT_HEAP_MAX_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: 0,
                 };

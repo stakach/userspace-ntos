@@ -38,15 +38,19 @@ mod walk_observation;
 use walk_observation::WalkCounter;
 pub use walk_observation::WalkSample;
 
-/// The component-local heap VA. The root reserves an 88 MiB band before the scratch
-/// base; its lower 32 MiB is mapped initially and later durable pages are committed on demand.
-/// This band is above the executive image and worker mirrors. Isolated components have separate
-/// VSpaces and retain their declared heap profiles at the same VA.
+/// Heap base of every VSpace that runs the executive image: the root and each spawned
+/// component. One address serves both because the allocator's metadata words are addressed
+/// absolutely from it by code the VSpaces share, and nothing outside the heap tells that code
+/// which VSpace it is running in. How much is reserved above it is a separate concern per kind
+/// of VSpace: [`ROOT_HEAP_RESERVATION_FRAMES`] and [`COMPONENT_HEAP_MAX_FRAMES`].
 pub const HEAP_BASE: usize = 0x0000_0100_1e00_0000;
-/// Maximum VA reservation in 4 KiB frames, including the root transient lane. Physical pages
-/// beyond the initial root commitment are retyped and mapped only when allocations need them.
-/// Spawned services map a separately declared subset, ordinarily [`DEFAULT_SERVICE_HEAP_FRAMES`].
-pub const HEAP_FRAMES: u64 = 22528;
+/// The root executive's VA reservation in 4 KiB frames, including its transient lane. Physical
+/// pages beyond the initial commitment are retyped and mapped only when allocations need them.
+pub const ROOT_HEAP_RESERVATION_FRAMES: u64 = 22528;
+/// The largest heap a spawned component may declare. A component's VSpace keeps this band
+/// above [`HEAP_BASE`] clear of its other regions; it maps a separately declared subset,
+/// ordinarily [`DEFAULT_SERVICE_HEAP_FRAMES`].
+pub const COMPONENT_HEAP_MAX_FRAMES: u64 = 22528;
 /// Frames committed before the root executive starts serving requests. Further durable pages are
 /// mapped only as allocations require them; isolated services still use their declared profiles.
 pub const EXECUTIVE_INITIAL_HEAP_FRAMES: u64 = 8192;
@@ -54,14 +58,16 @@ pub const EXECUTIVE_INITIAL_HEAP_FRAMES: u64 = 8192;
 /// declare a larger profile at spawn time instead of charging every component for that capacity.
 pub const DEFAULT_SERVICE_HEAP_FRAMES: u64 = 128;
 
-const HEAP_SIZE: usize = (HEAP_FRAMES as usize) * 0x1000;
+const ROOT_HEAP_SIZE: usize = (ROOT_HEAP_RESERVATION_FRAMES as usize) * 0x1000;
+const COMPONENT_HEAP_MAX_SIZE: usize = (COMPONENT_HEAP_MAX_FRAMES as usize) * 0x1000;
 /// Root-executive-only transient lane. It shares the existing heap mapping but grows downward from
 /// its top, so dispatch-local buffers can never fragment durable objects growing upward below it.
 /// Spawned components retain their complete declared heap as durable storage.
 pub const EXECUTIVE_TRANSIENT_HEAP_FRAMES: u64 = 1024;
 const EXECUTIVE_TRANSIENT_HEAP_SIZE: usize = (EXECUTIVE_TRANSIENT_HEAP_FRAMES as usize) * 0x1000;
-const _: () = assert!(EXECUTIVE_TRANSIENT_HEAP_FRAMES < HEAP_FRAMES);
-pub const EXECUTIVE_DURABLE_HEAP_FRAMES: u64 = HEAP_FRAMES - EXECUTIVE_TRANSIENT_HEAP_FRAMES;
+const _: () = assert!(EXECUTIVE_TRANSIENT_HEAP_FRAMES < ROOT_HEAP_RESERVATION_FRAMES);
+pub const EXECUTIVE_DURABLE_HEAP_FRAMES: u64 =
+    ROOT_HEAP_RESERVATION_FRAMES - EXECUTIVE_TRANSIENT_HEAP_FRAMES;
 const _: () = assert!(EXECUTIVE_INITIAL_HEAP_FRAMES < EXECUTIVE_DURABLE_HEAP_FRAMES);
 const CTR: usize = HEAP_BASE; // 8-byte bump offset, in the RW heap
 const FREE_HEAD: usize = HEAP_BASE + 8; // 8-byte address of the first free-list node
@@ -534,7 +540,7 @@ unsafe fn write_word(addr: usize, value: usize) {
 ///
 /// This must be the first operation performed by a spawned executive-image component. A zero
 /// frame count is valid for components that never map or use the global heap. The initial
-/// executive does not call this function and therefore retains [`HEAP_FRAMES`].
+/// executive does not call this function and therefore retains [`ROOT_HEAP_RESERVATION_FRAMES`].
 pub unsafe fn initialize_mapped_heap(frames: u64) -> bool {
     unsafe { initialize_heap_limit(frames) }
 }
@@ -543,7 +549,7 @@ unsafe fn initialize_heap_limit(frames: u64) -> bool {
     if frames == 0 {
         return true;
     }
-    if frames > HEAP_FRAMES
+    if frames > COMPONENT_HEAP_MAX_FRAMES
         || unsafe { read_word(CTR) } != 0
         || unsafe { read_word(FREE_HEAD) } != 0
     {
@@ -616,9 +622,9 @@ pub(crate) fn root_commit_floor(current_frames: u64, requested_end: usize) -> Op
 fn heap_size() -> usize {
     let configured = unsafe { read_word(COMPONENT_HEAP_LIMIT_BYTES) };
     if configured == 0 {
-        HEAP_SIZE
+        ROOT_HEAP_SIZE
     } else {
-        configured.min(HEAP_SIZE)
+        configured.min(COMPONENT_HEAP_MAX_SIZE)
     }
 }
 

@@ -24,7 +24,7 @@ pub(crate) unsafe fn stage(primary: u64, pml4: u64, bank: u16, region: &spawn_ho
     let spawn_hosts::FrameSource::DemandZeroed { initial_frames } = region.source else { return; };
     let _durable = allocator::enter_durable();
     assert_eq!(region.base_va, allocator::HEAP_BASE as u64);
-    assert!(region.count <= allocator::HEAP_FRAMES);
+    assert!(region.count <= allocator::COMPONENT_HEAP_MAX_FRAMES);
     assert!(matches!(region.rights, spawn_hosts::Rights::Uniform(rights) if rights == RW_NX));
     let reservation = HeapReservation::new(region.base_va, initial_frames, region.count, true)
         .expect("valid component heap reservation");
@@ -95,7 +95,7 @@ pub(crate) unsafe fn bank_released(bank: u16) {
 /// Some(false) refuses every unauthorized heap-band fault rather than generic zero-filling it.
 pub(crate) unsafe fn service_fault(channel: &spawn_hosts::PumpChannel, address: u64, fsr: u64) -> Option<bool> {
     let base = allocator::HEAP_BASE as u64;
-    if address < base || address >= base + allocator::HEAP_FRAMES * 0x1000 { return None; }
+    if address < base || address >= base + allocator::COMPONENT_HEAP_MAX_FRAMES * 0x1000 { return None; }
     let Some(heap) = (&mut *core::ptr::addr_of_mut!(HEAPS)).iter_mut()
         .find(|heap| heap.pml4 == channel.pml4 && heap.bank == channel.root_image_map_owner)
         else { return Some(false); };
