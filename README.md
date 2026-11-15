@@ -2,7 +2,7 @@
 
 `userspace-ntos` reimplements the Windows NT kernel personality in Rust user-space services on the [rust-micro](https://github.com/stakach/rust-micro) seL4 microkernel. Focused crates implement NT object, process, memory, I/O, registry, and graphics contracts. The matching source-built `ntdll.dll` connects hosted applications to those services.
 
-The hosted filesystem comes from a [pinned LiberNT AMD64 installed release](rust-micro/vendor/libernt/manifest.txt). Image generation verifies the downloaded archive and disk image, preserves LiberNT's released drivers including `acpi.sys`, and stages this repository's `ntdll.dll` at `Windows/system32/ntdll.dll`. The published release binaries are not edited. The build verifies that our DLL covers every named export of the pinned LiberNT DLL; live API behavior still requires boot validation.
+The hosted filesystem comes from a [pinned LiberNT AMD64 installed release](rust-micro/vendor/libernt/manifest.txt). Image generation verifies the downloaded archive and disk image, preserves LiberNT's released drivers including `acpi.sys`, and stages this repository's `ntdll.dll` at `Windows/system32/ntdll.dll`. The published release binaries are not edited. The build verifies that our DLL covers every named export of the pinned LiberNT DLL, and compiles the release's own api-set contract table (read from its `ntdll.dll`) into ours; live API behavior still requires boot validation.
 
 ## Build and run
 

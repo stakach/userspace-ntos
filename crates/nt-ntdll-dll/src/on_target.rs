@@ -35,6 +35,9 @@ mod csr_connect;
 #[path = "on_target_runtime_loader_trace.rs"]
 mod runtime_loader_trace;
 #[cfg(target_arch = "x86_64")]
+#[path = "on_target_name_redirection.rs"]
+mod name_redirection;
+#[cfg(target_arch = "x86_64")]
 pub use csr_connect::csr_client_connect_to_server;
 
 use core::{
@@ -745,15 +748,15 @@ unsafe fn attach_dfs(
         let (idir_rva, _sz) = data_directory(base, 1);
         if idir_rva != 0 {
             let mut desc = base + idir_rva as u64;
+            let mut descriptor = 0usize;
             loop {
                 let name_rva = rd32(desc, 12);
                 let ft = rd32(desc, 16);
                 if name_rva == 0 && ft == 0 {
                     break;
                 }
-                let mut nb = [0u8; 32];
-                let bn = import_desc_basename(base, name_rva, &mut nb);
-                let dep = (*table).find(&nb[..bn]);
+                let dep = import_dependency_base(&*table, base, descriptor, name_rva);
+                descriptor += 1;
                 if dep >= 0x1_0000 && dep != base {
                     let status = attach_dfs(
                         table,
@@ -1519,16 +1522,42 @@ const MODULE_TABLE_CAP: usize = 256;
 #[cfg(target_arch = "x86_64")]
 const MODULE_GRAPH_DEPTH_LIMIT: usize = 64;
 const _: () = assert!(MODULE_GRAPH_DEPTH_LIMIT <= MODULE_TABLE_CAP);
+#[cfg(target_arch = "x86_64")]
+use nt_ntdll::loader::file_name_redirection::LoadName;
+#[cfg(target_arch = "x86_64")]
+const MODULE_KEY_CAP: usize = nt_ntdll::loader::file_name_redirection::KEY_CAPACITY;
+#[cfg(target_arch = "x86_64")]
+const MODULE_PATH_CAP: usize = nt_ntdll::loader::file_name_redirection::OPEN_CAPACITY;
+const _: () = assert!(MODULE_KEY_CAP <= u8::MAX as usize && MODULE_PATH_CAP <= u8::MAX as usize);
 
-/// A loaded dependent module: its lowercased base name (`.dll` optional, ≤ 31 bytes) + mapped base.
-/// The image we started snapping from (the EXE, `image_base`) is seeded as entry 0; ntdll as entry 1.
+/// An import descriptor that file-name redirection bound to a module other than the first one
+/// with the imported base name. Recorded when the import is snapped, because the activation
+/// context that redirected it is not the one active when the edge is walked again.
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone)]
+struct RedirectedImport {
+    importer: u64,
+    descriptor: u16,
+    dependency: u64,
+}
+#[cfg(target_arch = "x86_64")]
+const REDIRECTED_IMPORT_CAP: usize = 256;
+
+/// A loaded dependent module: its lowercased base name (`.dll` stripped), the path it was loaded
+/// from when that is not System32, and its mapped base.
 #[cfg(target_arch = "x86_64")]
 #[derive(Copy, Clone)]
 struct LoadedMod {
     /// Lowercased base name bytes (no path, no NUL) — e.g. `b"csrsrv"` / `b"ntdll"`.
-    name: [u8; 32],
+    name: [u8; MODULE_KEY_CAP],
     /// Byte length of `name`.
     nlen: u8,
+    /// Lowercased DOS path of an image an activation context redirected outside System32 (a
+    /// WinSxS assembly's DLL). Empty for every System32 image. Two modules may share `name` when
+    /// their paths differ.
+    path: [u8; MODULE_PATH_CAP],
+    /// Byte length of `path`.
+    plen: u8,
     /// The module's mapped base VA (0 = empty slot).
     base: u64,
     /// Process-attach lifecycle persisted across static initialization and runtime LdrLoadDll calls.
@@ -1550,8 +1579,10 @@ struct LoadedMod {
 impl LoadedMod {
     const fn empty() -> Self {
         Self {
-            name: [0u8; 32],
+            name: [0u8; MODULE_KEY_CAP],
             nlen: 0,
+            path: [0u8; MODULE_PATH_CAP],
+            plen: 0,
             base: 0,
             attached: false,
             attaching: false,
@@ -1570,6 +1601,8 @@ impl LoadedMod {
 struct ModuleTable {
     mods: [LoadedMod; MODULE_TABLE_CAP],
     count: usize,
+    redirected_imports: [RedirectedImport; REDIRECTED_IMPORT_CAP],
+    redirected_import_count: usize,
     attach_order: nt_ntdll::loader::lifecycle::AttachLedger<MODULE_TABLE_CAP>,
 }
 
@@ -1579,6 +1612,12 @@ impl ModuleTable {
         Self {
             mods: [const { LoadedMod::empty() }; MODULE_TABLE_CAP],
             count: 0,
+            redirected_imports: [RedirectedImport {
+                importer: 0,
+                descriptor: 0,
+                dependency: 0,
+            }; REDIRECTED_IMPORT_CAP],
+            redirected_import_count: 0,
             attach_order: nt_ntdll::loader::lifecycle::AttachLedger::new(),
         }
     }
@@ -1875,30 +1914,103 @@ unsafe fn initialize_process_static_tls(exe_base: u64, table: *const ModuleTable
 
 #[cfg(target_arch = "x86_64")]
 impl ModuleTable {
-    /// Insert `(name, base)` (name already lowercased, no `.dll` suffix). Ignores overflow + dups.
+    /// Insert a System32 module `(name, base)` (name already lowercased, no `.dll` suffix).
+    /// Ignores overflow + dups.
     fn insert(&mut self, name: &[u8], base: u64) {
         if self.find_any(name) != 0 {
             return; // already present
         }
-        if self.count >= MODULE_TABLE_CAP {
+        self.push(name, &[], base);
+    }
+
+    /// Insert the image `name` was resolved to. Ignores overflow + dups.
+    fn insert_load(&mut self, name: &LoadName, base: u64) {
+        if self.find_any_load(name) != 0 {
+            return; // already present
+        }
+        self.push(name.key(), name.module_path(), base);
+    }
+
+    fn push(&mut self, name: &[u8], path: &[u8], base: u64) {
+        if self.count >= MODULE_TABLE_CAP
+            || name.len() > MODULE_KEY_CAP
+            || path.len() > MODULE_PATH_CAP
+        {
             return;
         }
-        let mut m = LoadedMod {
-            name: [0u8; 32],
-            nlen: 0,
-            base,
-            attached: false,
-            attaching: false,
-            imports_ready: false,
-            imports_in_progress: false,
-            imports_failed: false,
-            attach_failed: false,
-        };
-        let n = name.len().min(32);
-        m.name[..n].copy_from_slice(&name[..n]);
-        m.nlen = n as u8;
+        let mut m = LoadedMod::empty();
+        m.base = base;
+        m.name[..name.len()].copy_from_slice(name);
+        m.nlen = name.len() as u8;
+        m.path[..path.len()].copy_from_slice(path);
+        m.plen = path.len() as u8;
         self.mods[self.count] = m;
         self.count += 1;
+    }
+
+    /// Find the loaded module `name` refers to after file-name redirection (0 if absent):
+    /// `LdrpCheckForLoadedDll` matches a redirected name by path and any other by base name.
+    fn find_load(&self, name: &LoadName) -> u64 {
+        for m in &self.mods[..self.count] {
+            if (!m.imports_failed || m.imports_in_progress)
+                && name.is_loaded_module(&m.name[..m.nlen as usize], &m.path[..m.plen as usize])
+            {
+                return m.base;
+            }
+        }
+        0
+    }
+
+    fn find_any_load(&self, name: &LoadName) -> u64 {
+        for m in &self.mods[..self.count] {
+            if name.is_loaded_module(&m.name[..m.nlen as usize], &m.path[..m.plen as usize]) {
+                return m.base;
+            }
+        }
+        0
+    }
+
+    /// The redirected path `base` was loaded from; empty for a System32 image.
+    fn path_for_base(&self, base: u64) -> &[u8] {
+        match self.index_by_base(base) {
+            Some(index) => &self.mods[index].path[..self.mods[index].plen as usize],
+            None => &[],
+        }
+    }
+
+    /// Remember that `importer`'s import descriptor `descriptor` is bound to `dependency`.
+    fn record_redirected_import(&mut self, importer: u64, descriptor: usize, dependency: u64) -> bool {
+        let Ok(descriptor) = u16::try_from(descriptor) else {
+            return false;
+        };
+        let recorded = &mut self.redirected_imports[..self.redirected_import_count];
+        if let Some(entry) = recorded
+            .iter_mut()
+            .find(|entry| entry.importer == importer && entry.descriptor == descriptor)
+        {
+            entry.dependency = dependency;
+            return true;
+        }
+        if self.redirected_import_count == REDIRECTED_IMPORT_CAP {
+            return false;
+        }
+        self.redirected_imports[self.redirected_import_count] = RedirectedImport {
+            importer,
+            descriptor,
+            dependency,
+        };
+        self.redirected_import_count += 1;
+        true
+    }
+
+    fn redirected_import(&self, importer: u64, descriptor: usize) -> Option<u64> {
+        if self.redirected_import_count == 0 {
+            return None;
+        }
+        self.redirected_imports[..self.redirected_import_count]
+            .iter()
+            .find(|entry| entry.importer == importer && entry.descriptor as usize == descriptor)
+            .map(|entry| entry.dependency)
     }
 
     /// Find a loaded module by lowercased base name; returns its base (0 if absent).
@@ -1980,6 +2092,15 @@ impl ModuleTable {
         }
         self.count -= 1;
         self.mods[self.count] = LoadedMod::empty();
+        let mut kept = 0;
+        for index in 0..self.redirected_import_count {
+            let entry = self.redirected_imports[index];
+            if entry.importer != base && entry.dependency != base {
+                self.redirected_imports[kept] = entry;
+                kept += 1;
+            }
+        }
+        self.redirected_import_count = kept;
         true
     }
 }
@@ -2123,33 +2244,38 @@ pub unsafe fn seh_lookup_function(pc: u64) -> Option<(u64, u32, u32, u32)> {
     }
 }
 
-/// Lowercase an import descriptor's DLL name into `out` and STRIP a trailing `.dll`; returns the
-/// base-name length written. (e.g. `"CSRSRV.dll"` → `b"csrsrv"`, len 6.)
+/// The DLL an import descriptor names, as written in the image (before file-name redirection).
 ///
 /// # Safety
-/// `base + name_rva` must be a mapped NUL-terminated ASCII string.
+/// `base` is a mapped PE image and `name_rva` one of its import descriptors' `Name` fields.
 #[cfg(target_arch = "x86_64")]
-unsafe fn import_desc_basename(base: u64, name_rva: u32, out: &mut [u8; 32]) -> usize {
-    let mut raw = [0u8; 64];
+unsafe fn import_load_name(base: u64, name_rva: u32) -> Result<LoadName, u32> {
+    let mut raw = [0u8; MODULE_PATH_CAP + 1];
     // SAFETY: caller contract.
     let n = unsafe { read_cstr(base, name_rva, &mut raw) };
-    let mut n = n.min(32 + 4); // room to strip ".dll"
-                               // Strip a trailing ".dll" (case-insensitive).
-    if n >= 4 {
-        let tail = &raw[n - 4..n];
-        if tail[0] == b'.'
-            && tail[1].to_ascii_lowercase() == b'd'
-            && tail[2].to_ascii_lowercase() == b'l'
-            && tail[3].to_ascii_lowercase() == b'l'
-        {
-            n -= 4;
-        }
+    LoadName::from_requested(raw[..n].iter().map(|&byte| u16::from(byte)))
+}
+
+/// The loaded module `importer`'s import descriptor number `descriptor` is bound to (0 if none):
+/// the binding file-name redirection made when the import was snapped, or else the first module
+/// with the imported base name.
+///
+/// # Safety
+/// As [`import_load_name`].
+#[cfg(target_arch = "x86_64")]
+unsafe fn import_dependency_base(
+    table: &ModuleTable,
+    importer: u64,
+    descriptor: usize,
+    name_rva: u32,
+) -> u64 {
+    if let Some(dependency) = table.redirected_import(importer, descriptor) {
+        return dependency;
     }
-    let n = n.min(32);
-    for i in 0..n {
-        out[i] = raw[i].to_ascii_lowercase();
+    match unsafe { import_load_name(importer, name_rva) } {
+        Ok(name) => table.find(name.key()),
+        Err(_) => 0,
     }
-    n
 }
 
 /// Snap ONE import descriptor's thunks against `dep_base`'s export directory (direct in-process IAT
@@ -2361,28 +2487,27 @@ unsafe fn resolve_export_addr(
             return 0;
         }
 
-        // Lowercase the target module base name (strip a trailing ".dll" if present — forwarders
-        // usually omit it, e.g. "ntdll", but be defensive).
-        let mut tmod = [0u8; 32];
-        let mut tlen = 0usize;
-        for &b in mod_part.iter().take(32) {
-            tmod[tlen] = b.to_ascii_lowercase();
-            tlen += 1;
-        }
-        if tlen >= 4 {
-            let tail = &tmod[tlen - 4..tlen];
-            if tail == b".dll" {
-                tlen -= 4;
+        // The forwarder's target module goes through the same file-name redirection as any other
+        // load (LdrpSnapThunk -> LdrpApplyFileNameRedirection), so it may name an api-set contract.
+        let mut target = match LoadName::from_requested(mod_part.iter().map(|&b| u16::from(b))) {
+            Ok(target) => target,
+            Err(status) => {
+                *load_status = status;
+                return 0;
             }
+        };
+        let status = name_redirection::apply(&mut target);
+        if status != 0 {
+            *load_status = status;
+            return 0;
         }
-        let tmod_lc = &tmod[..tlen];
 
         // Find the forwarder-target module (load it if not already mapped — as LdrpSnapThunk does).
-        let mut tbase = (&*table).find(tmod_lc);
+        let mut tbase = (&*table).find_load(&target);
         if tbase == 0 {
             let mut sink = SnapResult::default();
             let loaded = load_and_snap_dependency(
-                tmod_lc,
+                &target,
                 (&*table).find(b"ntdll"),
                 table,
                 &mut sink,
@@ -2614,26 +2739,31 @@ impl Drop for ImportReferenceLedgerBox {
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn load_and_snap_dependency(
-    name_lc: &[u8],
+    name: &LoadName,
     ntdll_base: u64,
     table: *mut ModuleTable,
     out: &mut SnapResult,
     depth: u32,
     expansion: &mut nt_ntdll::loader::reference_graph::ReferenceExpansion<MODULE_TABLE_CAP>,
 ) -> DependencySnap {
-    let existing = unsafe { (&*table).find(name_lc) };
+    let existing = unsafe { (&*table).find_load(name) };
     if existing != 0 {
         return DependencySnap {
             base: existing,
             increment_existing_reference: true,
         };
     }
-    let retained = unsafe { (&*table).find_any(name_lc) };
+    let retained = unsafe { (&*table).find_any_load(name) };
     let base = if retained != 0 {
         retained
     } else {
-        let loaded = unsafe { load_dependent_dll(name_lc) };
+        let loaded = unsafe { load_dependent_dll(name.open_name()) };
         if loaded == 0 {
+            name_redirection::report_load_failure(
+                name.open_name(),
+                name.open_name(),
+                nt_ntdll::loader::resolve::STATUS_DLL_NOT_FOUND,
+            );
             if out.status == 0 {
                 out.status = nt_ntdll::loader::resolve::STATUS_DLL_NOT_FOUND;
             }
@@ -2642,10 +2772,10 @@ unsafe fn load_and_snap_dependency(
                 increment_existing_reference: false,
             };
         }
-        unsafe { (&mut *table).insert(name_lc, loaded) };
+        unsafe { (&mut *table).insert_load(name, loaded) };
         loaded
     };
-    let status = unsafe { add_runtime_ldr_module(base, name_lc) };
+    let status = unsafe { add_runtime_ldr_module(base, name.key()) };
     if status != 0 {
         if out.status == 0 {
             out.status = status;
@@ -2930,6 +3060,27 @@ pub unsafe fn ldrp_drive(image_base: u64, ntdll_base: u64, startup_reserved: u64
             core::hint::unreachable_unchecked()
         },
     };
+    // (2) BUILD `PEB->Ldr` (PEB+0x18) — the three circularly-linked LDR_DATA_TABLE_ENTRY lists —
+    // with the EXE (list entry 0) and ntdll, and create the process activation context from the
+    // EXE's manifest. Real ntdll's LdrpInitializeProcess does both before it walks the EXE's
+    // imports: the walk consults that context, so an import of a side-by-side assembly's DLL
+    // (`comctl32.dll` under a Common-Controls 6.0 dependency) loads the WinSxS copy. Every
+    // dependency the walk maps is linked into the lists as it loads. Hosted code (kernel32's
+    // GetModuleFileNameW / LdrGetDllHandle, WinDbg) walks them.
+    // SAFETY: single-threaded loader; MODULE_TABLE holds mapped images; the process heap is installed.
+    let ldr_status = unsafe {
+        let table = core::ptr::addr_of_mut!(MODULE_TABLE);
+        (&mut *table).insert(b"ntdll", ntdll_base);
+        (&mut *table).set_imports_ready(ntdll_base);
+        build_peb_ldr(table, image_base)
+    };
+    if ldr_status != 0 {
+        drop(_loader_lock);
+        unsafe {
+            crate::exports::rtl_raise_status(ldr_status);
+            core::hint::unreachable_unchecked()
+        }
+    }
     // Snap the executable's imports and recursively load its dependencies.
     // SAFETY: on-target mapped-image walk + IAT write + dependent-DLL load syscalls.
     let out = unsafe { snap_all_imports(image_base, ntdll_base) };
@@ -2937,21 +3088,6 @@ pub unsafe fn ldrp_drive(image_base: u64, ntdll_base: u64, startup_reserved: u64
         drop(_loader_lock);
         unsafe {
             crate::exports::rtl_raise_status(out.status);
-            core::hint::unreachable_unchecked()
-        }
-    }
-    // (2.5) BUILD `PEB->Ldr` (PEB+0x18) — the three circularly-linked LDR_DATA_TABLE_ENTRY lists,
-    // one entry per loaded module (the EXE + ntdll + every cascaded/delay DLL now in MODULE_TABLE).
-    // Real ntdll's LdrpInitializeProcess builds this BEFORE running init routines, and hosted code
-    // (kernel32's GetModuleFileNameW / LdrGetDllHandle, WinDbg) walks it. Without it, `Peb->Ldr` is
-    // NULL → GetModuleFileNameW(NULL)'s `[Peb->Ldr]+0x10` InLoadOrder walk derefs NULL+0x10 (the
-    // kernel32+0xff13 wall). `image_base` (the EXE) is recorded as list entry 0.
-    // SAFETY: single-threaded loader; MODULE_TABLE holds mapped images; the process heap is installed.
-    let ldr_status = unsafe { build_peb_ldr(core::ptr::addr_of!(MODULE_TABLE), image_base) };
-    if ldr_status != 0 {
-        drop(_loader_lock);
-        unsafe {
-            crate::exports::rtl_raise_status(ldr_status);
             core::hint::unreachable_unchecked()
         }
     }
@@ -3089,6 +3225,7 @@ unsafe fn snap_module(
         if idir_rva != 0 {
             touch_rva_range(image_base, idir_rva, idir_sz as u64);
             let mut desc = image_base + idir_rva as u64;
+            let mut descriptor = 0usize;
             loop {
                 touch_range(desc, 20);
                 let oft = rd32(desc, 0); // OriginalFirstThunk (ILT) RVA
@@ -3100,17 +3237,41 @@ unsafe fn snap_module(
                 let ilt_rva = if oft != 0 { oft } else { ft };
 
                 // Resolve this dependency's base: ntdll / an already-loaded module / load it now.
-                let mut base = [0u8; 32];
-                let bn = import_desc_basename(image_base, name_rva, &mut base);
-                let dep_name = &base[..bn];
-                let mut dep_base = (&*table).find(dep_name);
+                // The name first goes through file-name redirection under this module's
+                // activation context (LdrpLoadImportModule), so an api-set contract names its
+                // host and a side-by-side assembly's DLL names its WinSxS copy.
+                let imported = import_load_name(image_base, name_rva);
+                let dep_name = imported.and_then(|mut name| match name_redirection::apply(&mut name) {
+                    0 => Ok(name),
+                    status => Err(status),
+                });
+                let dep_name = match dep_name {
+                    Ok(name) => name,
+                    Err(status) => {
+                        if let Ok(imported) = imported {
+                            name_redirection::report_load_failure(
+                                imported.open_name(),
+                                imported.open_name(),
+                                status,
+                            );
+                        }
+                        core::ptr::write_unaligned(
+                            (image_base + ft as u64) as *mut u64,
+                            nt_ntdll::loader::resolve::BAD_IAT_VALUE,
+                        );
+                        out.missing += 1;
+                        out.status = status;
+                        return;
+                    }
+                };
+                let mut dep_base = (&*table).find_load(&dep_name);
                 let mut edge = DependencySnap {
                     base: dep_base,
                     increment_existing_reference: dep_base != 0,
                 };
                 if dep_base == 0 {
                     edge = load_and_snap_dependency(
-                        dep_name,
+                        &dep_name,
                         ntdll_base,
                         table,
                         out,
@@ -3119,6 +3280,15 @@ unsafe fn snap_module(
                     );
                     dep_base = edge.base;
                     if out.status != 0 {
+                        if let Ok(imported) = imported {
+                            if imported.open_name() != dep_name.open_name() {
+                                name_redirection::report_load_failure(
+                                    imported.open_name(),
+                                    dep_name.open_name(),
+                                    out.status,
+                                );
+                            }
+                        }
                         core::ptr::write_unaligned(
                             (image_base + ft as u64) as *mut u64,
                             nt_ntdll::loader::resolve::BAD_IAT_VALUE,
@@ -3127,6 +3297,21 @@ unsafe fn snap_module(
                         return;
                     }
                 }
+                // Remember a binding the base name alone would not reproduce (a second module
+                // with the same base name was loaded first).
+                if dep_base != 0
+                    && (&*table).find(dep_name.key()) != dep_base
+                    && !(&mut *table).record_redirected_import(image_base, descriptor, dep_base)
+                {
+                    core::ptr::write_unaligned(
+                        (image_base + ft as u64) as *mut u64,
+                        nt_ntdll::loader::resolve::BAD_IAT_VALUE,
+                    );
+                    out.missing += 1;
+                    out.status = STATUS_NO_MEMORY as u32;
+                    return;
+                }
+                descriptor += 1;
                 if dep_base != 0 {
                     snap_descriptor_against(
                         image_base, ilt_rva, ft, dep_base, table, out, expansion,
@@ -3427,8 +3612,20 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
             }
         }
         const SYSTEM32_PREFIX: &[u8] = b"\\SystemRoot\\System32\\";
+        // An image that file-name redirection loaded from outside System32 (a WinSxS assembly's
+        // DLL) is published under that path: it is the module's identity for a later redirected
+        // lookup, and a second module may carry the same base name.
+        let mut redirected_path = [0u8; MODULE_PATH_CAP];
+        let redirected_len = {
+            let path = (&*core::ptr::addr_of!(MODULE_TABLE)).path_for_base(base);
+            redirected_path[..path.len()].copy_from_slice(path);
+            path.len()
+        };
+        let redirected_path = &redirected_path[..redirected_len];
         let full_units = if image_path_units != 0 {
             image_path_units
+        } else if !redirected_path.is_empty() {
+            redirected_path.len()
         } else {
             SYSTEM32_PREFIX.len() + nchars
         };
@@ -3443,6 +3640,10 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
                 fullbuf as *mut u16,
                 image_path_units,
             );
+        } else if !redirected_path.is_empty() {
+            for (offset, &unit) in redirected_path.iter().enumerate() {
+                core::ptr::write_unaligned((fullbuf as *mut u16).add(offset), unit as u16);
+            }
         } else {
             let mut offset = 0usize;
             for &unit in SYSTEM32_PREFIX.iter().chain(name_lc).chain(b".dll") {
@@ -3471,6 +3672,10 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
             1
         };
         core::ptr::write_unaligned((entry + 0x6C) as *mut u16, load_count);
+        if !redirected_path.is_empty() {
+            const LDRP_REDIRECTED: u32 = 0x1000_0000;
+            core::ptr::write_unaligned((entry + 0x68) as *mut u32, LDRP_REDIRECTED);
+        }
         entry
     }
 }
@@ -3596,8 +3801,9 @@ unsafe fn build_peb_ldr(table: *const ModuleTable, exe_base: u64) -> u32 {
             core::ptr::write_volatile((peb + 0x18) as *mut u64, ldr_va);
         }
 
-        // Static imports were snapped before the Ldr region existed. Materialize their inherited
-        // activation-context ownership now, before any TLS callback or DllMain can run.
+        // Give the entries that exist now (the EXE and ntdll) their activation-context slots,
+        // then create the process context from the EXE's manifest. Modules loaded later inherit
+        // or probe their own in `add_runtime_ldr_module`.
         {
             let mut entries = [0u64; LDR_MAX_ENTRIES];
             let count = {
@@ -3748,92 +3954,27 @@ unsafe fn set_ldr_process_attached(base: u64, attached: bool) {
 // walker, over the process-wide MODULE_TABLE.
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(target_arch = "x86_64")]
-struct DllLoadName {
-    key: [u8; 32],
-    key_len: usize,
-    open: [u8; 160],
-    open_len: usize,
-}
-
-#[cfg(target_arch = "x86_64")]
-impl DllLoadName {
-    const fn new() -> Self {
-        Self {
-            key: [0; 32],
-            key_len: 0,
-            open: [0; 160],
-            open_len: 0,
-        }
-    }
-
-    fn key(&self) -> &[u8] {
-        &self.key[..self.key_len]
-    }
-
-    fn open_name(&self) -> &[u8] {
-        &self.open[..self.open_len]
-    }
-}
-
-/// Read a `UNICODE_STRING`'s wide `Buffer` into both loader identities:
-/// - `key`: lowercased basename with a trailing `.dll` stripped, used by MODULE_TABLE/PEB->Ldr.
-/// - `open`: lowercased object name preserving caller-supplied paths, used for NtOpenFile.
-///
-/// Returns `false` on a null/empty string or a name too large for the fixed loader buffers.
+/// Read a `UNICODE_STRING`'s wide `Buffer` as the loader's name for a DLL: lowercased, with the
+/// caller's path kept for the file open and the base name (trailing `.dll` stripped) as the
+/// MODULE_TABLE/PEB->Ldr key.
 ///
 /// # Safety
 /// `us` a valid `UNICODE_STRING*` (Length @0 u16, Buffer @8 ptr).
 #[cfg(target_arch = "x86_64")]
-unsafe fn unicode_dll_load_name(us: *const c_void, out: &mut DllLoadName) -> bool {
+unsafe fn unicode_load_name(us: *const c_void) -> Result<LoadName, u32> {
     if us.is_null() {
-        return false;
+        return Err(0xC000_000D); // STATUS_INVALID_PARAMETER
     }
     // SAFETY: us is a valid UNICODE_STRING per the contract.
     unsafe {
         let length = core::ptr::read_unaligned(us as *const u16) as usize; // Length (bytes)
         let buffer = core::ptr::read_unaligned((us as *const u8).add(8) as *const u64); // Buffer
         if buffer == 0 || length == 0 {
-            return false;
+            return Err(0xC000_000D);
         }
-        let nchars = length / 2;
-        let mut start = 0usize;
-        for i in 0..nchars {
-            let c = core::ptr::read_unaligned((buffer as *const u16).add(i));
-            if c == b'\\' as u16 || c == b'/' as u16 {
-                start = i + 1;
-            }
-            if c > 0x7f || out.open_len >= out.open.len() {
-                return false;
-            }
-            let mut byte = (c as u8).to_ascii_lowercase();
-            if byte == b'/' {
-                byte = b'\\';
-            }
-            out.open[out.open_len] = byte;
-            out.open_len += 1;
-        }
-        for i in start..nchars {
-            let c = core::ptr::read_unaligned((buffer as *const u16).add(i)) as u32;
-            if c > 0x7f {
-                return false;
-            }
-            if out.key_len >= out.key.len() {
-                return false;
-            }
-            out.key[out.key_len] = (c as u8).to_ascii_lowercase();
-            out.key_len += 1;
-        }
-        // Strip a trailing ".dll".
-        if out.key_len >= 4
-            && out.key[out.key_len - 4] == b'.'
-            && out.key[out.key_len - 3] == b'd'
-            && out.key[out.key_len - 2] == b'l'
-            && out.key[out.key_len - 1] == b'l'
-        {
-            out.key_len -= 4;
-        }
-        out.key_len != 0 && out.open_len != 0
+        LoadName::from_requested(
+            (0..length / 2).map(|i| core::ptr::read_unaligned((buffer as *const u16).add(i))),
+        )
     }
 }
 
@@ -3844,13 +3985,22 @@ unsafe fn unicode_dll_load_name(us: *const c_void, out: &mut DllLoadName) -> boo
 /// On-target; `dll_name` a valid `UNICODE_STRING*`; `base_addr` writable.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void) -> u32 {
-    let mut name = DllLoadName::new();
     // SAFETY: dll_name a valid UNICODE_STRING per the contract.
-    if !unsafe { unicode_dll_load_name(dll_name, &mut name) } {
-        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    let requested = match unsafe { unicode_load_name(dll_name) } {
+        Ok(requested) => requested,
+        Err(status) => return status,
+    };
+    let mut trace = runtime_loader_trace::RuntimeLoadTrace::begin(requested.open_name());
+    // LdrLoadDll -> LdrpApplyFileNameRedirection: an api-set contract or a side-by-side
+    // redirection decides which image the name loads before any loaded module is matched.
+    let mut name = requested;
+    let mut status = unsafe { name_redirection::apply(&mut name) };
+    if status == 0 {
+        status = unsafe { ldr_load_dll_inner(&name, base_addr, &mut trace) };
     }
-    let mut trace = runtime_loader_trace::RuntimeLoadTrace::begin(name.open_name());
-    let status = unsafe { ldr_load_dll_inner(&name, base_addr, &mut trace) };
+    if (status as i32) < 0 {
+        name_redirection::report_load_failure(requested.open_name(), name.open_name(), status);
+    }
     trace.finish(status);
     status
 }
@@ -3861,7 +4011,7 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
 /// `base_addr` is writable when non-null and `name` came from a valid UNICODE_STRING.
 #[cfg(target_arch = "x86_64")]
 unsafe fn ldr_load_dll_inner(
-    name: &DllLoadName,
+    name: &LoadName,
     base_addr: *mut *mut c_void,
     trace: &mut runtime_loader_trace::RuntimeLoadTrace,
 ) -> u32 {
@@ -3871,8 +4021,8 @@ unsafe fn ldr_load_dll_inner(
     unsafe {
         let table_ptr = core::ptr::addr_of_mut!(MODULE_TABLE);
         // Already loaded? Return its base.
-        let existing = (&*table_ptr).find(dep);
-        let retained = (&*table_ptr).find_any(dep);
+        let existing = (&*table_ptr).find_load(name);
+        let retained = (&*table_ptr).find_any_load(name);
         let mut newly_loaded = existing == 0;
         let mut reference_added = false;
         let base = if existing != 0 {
@@ -3900,7 +4050,7 @@ unsafe fn ldr_load_dll_inner(
                 if loaded == 0 {
                     return 0xC000_0135; // STATUS_DLL_NOT_FOUND
                 }
-                (&mut *table_ptr).insert(dep, loaded);
+                (&mut *table_ptr).insert_load(name, loaded);
                 loaded
             };
             {
@@ -4199,9 +4349,9 @@ impl nt_ntdll::loader::reference_graph::ReferenceGraph for NativeReferenceGraph 
         if name_rva == 0 || first_thunk == 0 {
             return Ok(None);
         }
-        let mut name = [0u8; 32];
-        let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
-        Ok(Some(unsafe { (&*self.table).find(&name[..length]) }))
+        Ok(Some(unsafe {
+            import_dependency_base(&*self.table, base, ordinal, name_rva)
+        }))
     }
 }
 
@@ -4230,16 +4380,20 @@ unsafe fn collect_reference_releases(
 /// On-target; `dll_name` a valid `UNICODE_STRING*`; `dll_handle` writable.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn ldr_get_dll_handle(dll_name: *const c_void, dll_handle: *mut *mut c_void) -> u32 {
-    let mut name = DllLoadName::new();
     // SAFETY: dll_name a valid UNICODE_STRING per the contract.
-    if !unsafe { unicode_dll_load_name(dll_name, &mut name) } {
-        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    let mut name = match unsafe { unicode_load_name(dll_name) } {
+        Ok(name) => name,
+        Err(status) => return status,
+    };
+    // LdrGetDllHandleEx -> LdrpApplyFileNameRedirection.
+    let status = unsafe { name_redirection::apply(&mut name) };
+    if status != 0 {
+        return status;
     }
-    let dep = name.key();
     // SAFETY: single-threaded loader table read.
     let base = unsafe {
         let table = &*core::ptr::addr_of!(MODULE_TABLE);
-        table.find(dep)
+        table.find_load(&name)
     };
     if base == 0 {
         return 0xC000_0135; // STATUS_DLL_NOT_FOUND
@@ -4367,17 +4521,51 @@ pub unsafe fn ldr_get_procedure_address(
         }
     };
     if addr == 0 {
-        return if name.is_null() {
+        let status = if name.is_null() {
             nt_ntdll::loader::resolve::STATUS_ORDINAL_NOT_FOUND
         } else {
             nt_ntdll::loader::resolve::STATUS_ENTRYPOINT_NOT_FOUND
         };
+        unsafe { report_procedure_miss(base, name, ordinal, status) };
+        return status;
     }
     if !address.is_null() {
         // SAFETY: address writable per the contract.
         unsafe { core::ptr::write_unaligned(address, addr as *mut c_void) };
     }
     0
+}
+
+/// Name the module and export of a failed `LdrGetProcedureAddress` in the debug log.
+///
+/// # Safety
+/// As [`ldr_get_procedure_address`].
+#[cfg(target_arch = "x86_64")]
+unsafe fn report_procedure_miss(base: u64, name: *const c_void, ordinal: u32, status: u32) {
+    let table = unsafe { &*core::ptr::addr_of!(MODULE_TABLE) };
+    let module = match table.index_by_base(base) {
+        Some(index) => &table.mods[index].name[..table.mods[index].nlen as usize],
+        None if base == unsafe { EXE_BASE } => &b"<image>"[..],
+        None => &b"<unlisted>"[..],
+    };
+    let mut export = [0u8; 96];
+    let mut export_len = 0;
+    if !name.is_null() {
+        let length = unsafe { core::ptr::read_unaligned(name as *const u16) } as usize;
+        let buffer = unsafe { core::ptr::read_unaligned((name as *const u8).add(8) as *const u64) };
+        if buffer != 0 {
+            export_len = length.min(export.len());
+            unsafe {
+                core::ptr::copy_nonoverlapping(buffer as *const u8, export.as_mut_ptr(), export_len)
+            };
+        }
+    }
+    name_redirection::report_procedure_miss(
+        module,
+        (!name.is_null()).then_some(&export[..export_len]),
+        ordinal,
+        status,
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5779,6 +5967,8 @@ static mut WORK_POOL_FLEET: nt_rtl_work_item::WorkerFleet = nt_rtl_work_item::Wo
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn reset_process_runtime_state_for_new_process() {
     runtime_loader_trace::reset();
+    name_redirection::reset();
+    crate::exports::reset_activation_section_lookup_failures();
     unsafe {
         CSR_API_PORT = 0;
         CSR_PORT_HEAP = 0;

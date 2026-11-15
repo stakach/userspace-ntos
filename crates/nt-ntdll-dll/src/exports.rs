@@ -12410,7 +12410,7 @@ unsafe fn copy_validated_unicode_string(string: PCUnicodeString) -> Result<Vec<u
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn isolation_system_root() -> Vec<u16> {
+pub(crate) unsafe fn isolation_system_root() -> Vec<u16> {
     let root = (KUSER_SHARED_DATA_VA + 0x30) as *const u16;
     let mut length = 0usize;
     while length < 260 && unsafe { core::ptr::read_unaligned(root.add(length)) } != 0 {
@@ -14895,6 +14895,71 @@ pub unsafe extern "system" fn rtl_get_active_activation_context(
 /// Args per the RtlFindActivationContextSectionString ABI.
 #[export_name = "RtlFindActivationContextSectionString"]
 pub unsafe extern "system" fn rtl_find_activation_context_section_string(
+    flags: u32,
+    ext_guid: *const c_void,
+    section_id: u32,
+    string_to_find: *const c_void,
+    returned_data: *mut c_void,
+) -> NtStatus {
+    let status = unsafe {
+        find_activation_context_section_string(
+            flags,
+            ext_guid,
+            section_id,
+            string_to_find,
+            returned_data,
+        )
+    };
+    // A key that is simply not redirected is the ordinary answer. Any other failure changes
+    // what the caller does next, so name the section and key once.
+    #[cfg(target_arch = "x86_64")]
+    if (status as i32) < 0 && status != STATUS_SXS_KEY_NOT_FOUND {
+        let key = if status == STATUS_INVALID_PARAMETER || string_to_find.is_null() {
+            &[][..]
+        } else {
+            unsafe {
+                let key = string_to_find as *const u8;
+                core::slice::from_raw_parts(
+                    core::ptr::read_unaligned(key.add(8) as *const *const u16),
+                    core::ptr::read_unaligned(key as *const u16) as usize / 2,
+                )
+            }
+        };
+        report_activation_section_lookup_failure(section_id, key, status);
+    }
+    status
+}
+
+#[cfg(target_arch = "x86_64")]
+static ACTIVATION_SECTION_LOOKUP_FAILURES: nt_ntdll::loader::failure_trace::FailureLedger<16> =
+    nt_ntdll::loader::failure_trace::FailureLedger::new();
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn reset_activation_section_lookup_failures() {
+    ACTIVATION_SECTION_LOOKUP_FAILURES.reset();
+}
+
+#[cfg(target_arch = "x86_64")]
+fn report_activation_section_lookup_failure(section_id: u32, key: &[u16], status: NtStatus) {
+    use nt_ntdll::loader::failure_trace::{failure_hash, record_section_lookup_failure};
+    let mut key_bytes = [0u8; 96];
+    let mut key_len = 0;
+    for &unit in key.iter().take(key_bytes.len() / 2) {
+        key_bytes[key_len..key_len + 2].copy_from_slice(&unit.to_le_bytes());
+        key_len += 2;
+    }
+    let hash = failure_hash(&[
+        &section_id.to_le_bytes(),
+        &key_bytes[..key_len],
+        &status.to_le_bytes(),
+    ]);
+    if ACTIVATION_SECTION_LOOKUP_FAILURES.admit(hash) {
+        let record = record_section_lookup_failure(section_id, key, status);
+        unsafe { crate::dbg_print_bytes(record.bytes().as_ptr(), record.bytes().len()) };
+    }
+}
+
+unsafe fn find_activation_context_section_string(
     flags: u32,
     _ext_guid: *const c_void,
     section_id: u32,
