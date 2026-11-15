@@ -222,6 +222,9 @@ impl ExecNtHandler {
                     if result.status == 0 {
                         Ok(())
                     } else {
+                        self.trace_access_denied(crate::access_denial_trace::DeniedObject::Directory,
+                            path.iter().map(|&byte| u16::from(byte)),
+                            DIRECTORY_TRAVERSE_ACCESS, result.granted_access, result.status);
                         Err(result.status)
                     }
                 };
@@ -276,6 +279,9 @@ impl ExecNtHandler {
                 )?;
                 record_access(&access);
                 if access.status != 0 {
+                    self.trace_access_denied(crate::access_denial_trace::DeniedObject::Section,
+                        leaf.iter().map(|&byte| u16::from(byte)),
+                        desired_access, access.granted_access, access.status);
                     return Err(access.status);
                 }
                 let table = unsafe { &mut *self.loop_ctx.ok_or(0xC000_00A3u32)?.generic_sections };
@@ -309,6 +315,10 @@ impl ExecNtHandler {
                         )?;
                         record_access(&access);
                         if access.status != 0 {
+                            self.trace_access_denied(crate::access_denial_trace::DeniedObject::Directory,
+                                leaf.iter().map(|&byte| u16::from(byte)),
+                                DIRECTORY_CREATE_OBJECT_ACCESS, access.granted_access,
+                                access.status);
                             return Err(access.status);
                         }
                         Some(descriptor)
@@ -482,6 +492,9 @@ impl ExecNtHandler {
         )?;
         record_access(&access);
         if access.status != 0 {
+            self.trace_access_denied(crate::access_denial_trace::DeniedObject::Section,
+                admission.leaf.iter().map(|&byte| u16::from(byte)),
+                admission.requested_access, access.granted_access, access.status);
             return Err(access.status);
         }
         let table = unsafe { &mut *self.loop_ctx.ok_or(0xC000_00A3u32)?.generic_sections };

@@ -362,6 +362,12 @@ impl Default for TokenSource {
     }
 }
 
+/// `S-1-16-<RID>` mandatory integrity levels.
+pub const SECURITY_MANDATORY_UNTRUSTED_RID: u32 = 0;
+pub const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
+pub const SECURITY_MANDATORY_HIGH_RID: u32 = 0x3000;
+pub const SECURITY_MANDATORY_SYSTEM_RID: u32 = 0x4000;
+
 /// An access token — the subject's security identity (spec §7.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessToken {
@@ -374,7 +380,7 @@ pub struct AccessToken {
     pub user_attributes: u32,
     pub groups: Vec<TokenGroup>,
     /// Authenticated mandatory integrity RID (`S-1-16-<RID>`). `None` is unknown and must
-    /// never be elevated to SYSTEM by an object access adapter.
+    /// never be elevated by an object access adapter; see [`AccessToken::mandatory_level`].
     pub integrity_level: Option<u32>,
     /// Restricting SIDs. A non-empty set makes access checks perform the native second DACL pass.
     pub restricted_sids: Vec<TokenGroup>,
@@ -645,6 +651,12 @@ impl AccessToken {
             index += 1;
         }
         summary
+    }
+
+    /// The level a mandatory-label comparison uses. A token carrying no integrity SID is
+    /// Untrusted: it dominates an Untrusted label and nothing above it.
+    pub fn mandatory_level(&self) -> u32 {
+        self.integrity_level.unwrap_or(SECURITY_MANDATORY_UNTRUSTED_RID)
     }
 
     /// The ReactOS `LocalSystem` primary token, including its exact initial privilege states.

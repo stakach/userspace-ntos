@@ -286,6 +286,8 @@ impl ExecNtHandler {
                 )?;
                 access_audit(&result);
                 if result.status != 0 {
+                    self.trace_access_denied(crate::access_denial_trace::DeniedObject::Directory, path.iter().map(|&byte| u16::from(byte)),
+                        DIRECTORY_TRAVERSE_ACCESS, result.granted_access, result.status);
                     Err(result.status)
                 } else {
                     Ok(())
@@ -317,6 +319,8 @@ impl ExecNtHandler {
                 )?;
                 access_audit(&result);
                 if result.status != 0 {
+                    self.trace_access_denied(crate::access_denial_trace::DeniedObject::Directory, path.iter().map(|&byte| u16::from(byte)),
+                        desired_access, result.granted_access, result.status);
                     return Err(result.status);
                 }
                 (
@@ -338,6 +342,9 @@ impl ExecNtHandler {
                 )?;
                 access_audit(&result);
                 if result.status != 0 {
+                    self.trace_access_denied(crate::access_denial_trace::DeniedObject::Directory, path.iter().map(|&byte| u16::from(byte)),
+                        DIRECTORY_CREATE_SUBDIRECTORY_ACCESS, result.granted_access,
+                        result.status);
                     return Err(result.status);
                 }
                 let mut audit = nt_security::SecurityAssignmentAudit::default();

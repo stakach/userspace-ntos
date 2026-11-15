@@ -40,6 +40,7 @@ mod native_alpc_create;
 mod native_alpc_create_work;
 mod native_alpc_close_work;
 mod native_alpc_port_security;
+mod access_denial_trace;
 mod native_alpc_connect_accept_work;
 mod native_alpc_send_receive_work;
 mod native_srm_command_work;
@@ -24389,6 +24390,8 @@ struct ExecNtHandler {
     /// Native TCB priority effects and their PM plan remain owned until exact acknowledgment.
     priority_transition_owner: Option<native_thread_priority::NativePriorityOwner>,
     native_alpc_secured_ports: native_alpc_port_security::SecuredPortRegistry,
+    /// Reported access-check refusals; diagnostics only.
+    access_denials: access_denial_trace::AccessDenialTrace,
     desktop_observations: DesktopObservations,
     /// Session-scoped win32k state observed from provider-owned objects and reused only through
     /// explicit session/runtime lookup.

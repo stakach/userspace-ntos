@@ -4478,6 +4478,7 @@ impl ExecNtHandler {
         write_field!(priority_transition_owner, None);
         write_field!(native_alpc_secured_ports,
             native_alpc_port_security::SecuredPortRegistry::new());
+        write_field!(access_denials, crate::access_denial_trace::AccessDenialTrace::new());
         write_field!(desktop_observations, DesktopObservations::new());
         write_field!(win32k_session, Win32kSessionRuntime::reset());
         write_field!(token_store, token_store);
@@ -22341,7 +22342,22 @@ impl ExecNtHandler {
             // `insert_owned_token_handle` already released the token on every failure path.
             return status;
         }
-        SE_CREATE_TOKEN_MINTED.fetch_add(1, Ordering::Relaxed);
+        if SE_CREATE_TOKEN_MINTED.fetch_add(1, Ordering::Relaxed) < 16 {
+            if let Some(stored) = self.token_store.get(token) {
+                print_str(b"[se-token] identity id=");
+                print_u64(token.raw() as u64);
+                print_str(b" user=");
+                print_str(stored.user.to_sddl().as_bytes());
+                print_str(b" integrity=0x");
+                print_hex(stored.integrity_level.unwrap_or(u32::MAX));
+                print_str(b" groups=");
+                for group in &stored.groups {
+                    print_str(group.sid.to_sddl().as_bytes());
+                    print_str(if group.is_enabled() { b"+ " } else { b"- " });
+                }
+                print_str(b"\n");
+            }
+        }
         if SE_CREATE_TOKEN_PI.load(Ordering::Relaxed) == u64::MAX {
             // Read the shape back OUT OF THE STORE, not out of the captured value, so the recorded
             // evidence is what the token object actually holds.

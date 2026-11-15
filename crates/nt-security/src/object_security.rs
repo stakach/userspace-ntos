@@ -70,10 +70,7 @@ pub(crate) fn authorize_directory(
     let mut denied_rights = 0;
     if let Some(label) = label {
         let (token, _) = subject.effective_token();
-        let Some(level) = token.integrity_level else {
-            return Ok(denied());
-        };
-        if level < label.level {
+        if token.mandatory_level() < label.level {
             use crate::access::{DELETE, READ_CONTROL, WRITE_DAC, WRITE_OWNER};
             // DIRECTORY_QUERY/TRAVERSE are read; CREATE_OBJECT/CREATE_SUBDIRECTORY are write.
             // Traversal is also the directory execute right. Standard write rights are subject

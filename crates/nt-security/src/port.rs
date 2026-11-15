@@ -34,14 +34,9 @@ pub fn authorize_port_connect(
     }
     if let Some(label) = label {
         let (token, _) = subject.effective_token();
-        let Some(level) = token.integrity_level else {
-            result.status = STATUS_ACCESS_DENIED;
-            result.granted_access = 0;
-            return Ok(result);
-        };
         // A Port connect grants the PORT_CONNECT bit under both GenericRead
         // and GenericWrite. Only those mandatory policies restrict this right.
-        if level < label.level && label.policy & 0x3 != 0 {
+        if token.mandatory_level() < label.level && label.policy & 0x3 != 0 {
             result.status = STATUS_ACCESS_DENIED;
             result.granted_access = 0;
         }

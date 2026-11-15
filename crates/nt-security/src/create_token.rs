@@ -378,6 +378,19 @@ pub fn group_from_attributes(sid: Sid, attributes: u32) -> TokenGroup {
     )
 }
 
+/// The integrity level `SepCreateToken` gives a token whose creator supplied no
+/// `SE_GROUP_INTEGRITY` group (`ntoskrnl/se/tokenlif.c`): System for LocalSystem, High for any
+/// membership in Administrators whatever its attributes, Medium for everyone else.
+fn created_token_integrity(user: &Sid, groups: &[TokenGroup]) -> u32 {
+    if *user == Sid::local_system() {
+        crate::token::SECURITY_MANDATORY_SYSTEM_RID
+    } else if groups.iter().any(|group| group.sid == Sid::administrators()) {
+        crate::token::SECURITY_MANDATORY_HIGH_RID
+    } else {
+        crate::token::SECURITY_MANDATORY_MEDIUM_RID
+    }
+}
+
 /// Translate one captured `LUID_AND_ATTRIBUTES` privilege entry into a [`TokenPrivilege`].
 pub fn privilege_from_attributes(luid: Luid, attributes: u32) -> TokenPrivilege {
     TokenPrivilege {
@@ -455,6 +468,8 @@ pub fn capture_token(
         }
         integrity_level = group.sid.sub_authorities.first().copied();
     }
+    let integrity_level =
+        Some(integrity_level.unwrap_or_else(|| created_token_integrity(&user, &groups)));
 
     // TOKEN_PRIVILEGES — the count, then that many LUID_AND_ATTRIBUTES.
     let requested_privilege_count = read_u32(memory, args.token_privileges)?;

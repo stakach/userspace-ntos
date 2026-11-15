@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod access;
+mod access_denial_ledger;
 mod client_security;
 pub mod create_token;
 mod job_token;
@@ -36,6 +37,7 @@ mod token_filter;
 mod token_info;
 mod token_set;
 
+pub use access_denial_ledger::{AccessDenialKey, AccessDenialLedger, AccessDenialReport};
 pub use file_object_security::{file_query_security_descriptor, file_set_security_status};
 pub use access::{
     access_check, access_check_by_type, check_token_privileges, map_token_access, privilege_check,

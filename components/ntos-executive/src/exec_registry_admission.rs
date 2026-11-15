@@ -350,6 +350,13 @@ impl ExecNtHandler {
         self.resolve_key(path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
     }
 
+    fn trace_key_access_denied(&self, state: &HostedRegistryPublication, status: u32) {
+        if status == nt_security::STATUS_ACCESS_DENIED {
+            self.trace_access_denied(crate::access_denial_trace::DeniedObject::Key,
+                state.path.encode_utf16(), state.desired, 0, status);
+        }
+    }
+
     fn registry_open_grant(
         &self,
         state: &HostedRegistryPublication,
@@ -538,6 +545,7 @@ impl ExecNtHandler {
                 crate::registry_security_audit::admission_error(
                     b"open", &state.path, status, self.pi, self.current_tid,
                 );
+                self.trace_key_access_denied(&state, status);
                 self.abort_hosted_registry_publication(&mut state);
                 self.observe_install_pipe_enum_open(self.pi, &state.path, status);
                 status
@@ -767,6 +775,7 @@ impl ExecNtHandler {
                     crate::registry_security_audit::admission_error(
                         b"create-submit", &state.path, status, self.pi, self.current_tid,
                     );
+                    self.trace_key_access_denied(&state, status);
                     if let Some(target) = owner.abort(&mut self.pm).expect("unsubmitted parent") {
                         self.release_registry_key_target(target);
                     }
@@ -809,6 +818,7 @@ impl ExecNtHandler {
                 crate::registry_security_audit::admission_error(
                     b"create", &state.path, status, self.pi, self.current_tid,
                 );
+                self.trace_key_access_denied(&state, status);
                 self.abort_hosted_registry_publication(&mut state);
                 status
             }

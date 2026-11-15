@@ -360,7 +360,12 @@ pub(crate) unsafe fn begin_connect(handler: &mut ExecNtHandler,
                 nt_security::ProcessorMode::UserMode));
         subject.release(&mut handler.token_store)?;
         let decision = decision?;
-        if !decision.granted() { return Err(decision.status); }
+        if !decision.granted() {
+            handler.trace_access_denied(crate::access_denial_trace::DeniedObject::Port,
+                captured.name.iter().copied(), nt_security::PORT_CONNECT,
+                decision.granted_access, decision.status);
+            return Err(decision.status);
+        }
         Some(listen)
     } else { None };
     let registered = SRM_COMMAND_PORT_OBJECT_HANDLE.load(Ordering::Relaxed);
