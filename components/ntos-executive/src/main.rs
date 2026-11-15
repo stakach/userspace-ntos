@@ -153,6 +153,7 @@ mod mounted_system_image_read;
 mod hosted_routed_section_capture;
 mod routed_section_io;
 mod section_metadata_work;
+mod process_creation_trace;
 mod process_image_snapshot_work;
 mod hosted_spawn_uncertainty;
 mod section_pagein_work;
@@ -23983,6 +23984,8 @@ struct ExecNtHandler {
     /// does) and the per-user hives `NtLoadKey` mounts at run time. The vector owns its run-time path
     /// and hive allocations directly.
     pub(crate) hive_mounts: alloc::vec::Vec<HiveMount>,
+    /// The process-creation failures already reported this boot.
+    process_creation_failures: nt_syscall_abi::process_creation_trace::FailureTrace,
     /// Owned mutable authority for non-SYSTEM boot hives and dynamic user hives. Isolated CM owns
     /// SYSTEM exclusively. Mounted-hive create/open handles use `mutable_key_handles` so later
     /// writes land in this authority without path shadowing through `RegistryOverlay`.

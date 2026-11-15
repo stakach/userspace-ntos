@@ -1033,6 +1033,7 @@ pub(super) unsafe fn syscall_nt_route(
     if durable_status != nt_fs::STATUS_SUCCESS {
         sc.result = durable_status as u64;
     }
+    nt_handler.trace_process_creation_failure(lp.msg.m0, sc.result, pi, current_tid, &argv[..n]);
     // PROFILE FRONTIER (batch 58): once winlogon has resolved the profiles root, trace
     // every NATIVE syscall of its that FAILS, with the SSN and the NTSTATUS. `userenv`
     // only ever prints `GetLastError()`, and several distinct NTSTATUSes collapse onto

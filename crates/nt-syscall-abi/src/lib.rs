@@ -32,6 +32,7 @@
 #![no_std]
 
 pub mod native_context;
+pub mod process_creation_trace;
 pub use native_context::NT_NATIVE_CONTEXT_SYSCALL_LABEL;
 
 /// A single `Nt*` service's ABI entry: its canonical export name and its SSN.

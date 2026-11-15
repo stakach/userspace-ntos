@@ -4296,6 +4296,10 @@ impl ExecNtHandler {
         write_field!(sam_hive, sam_hive);
         write_field!(software_hive, software_hive);
         write_field!(hive_mounts, hive_mounts);
+        write_field!(
+            process_creation_failures,
+            nt_syscall_abi::process_creation_trace::FailureTrace::new()
+        );
         write_field!(mutable_hives, mutable_hives);
         write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
         write_field!(mutable_hive_journal_pending_records, 0);

@@ -469,6 +469,8 @@ unsafe fn advance(
         }
         Phase::ReadyReply => {
             trace_image_not_supported(work, b"reply", work.status);
+            handler.trace_process_creation_failure(
+                u64::from(work.service_number), u64::from(work.status), work.pi, work.tid, &[]);
             if work.cancelled {
                 if work.published_handle.is_some() {
                     // The child and its caller-visible output are already committed.

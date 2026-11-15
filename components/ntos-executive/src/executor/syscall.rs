@@ -822,6 +822,7 @@ pub(super) unsafe fn syscall(
         // SSNs absent from the registered native table are complete dispatcher decisions:
         // the NT syscall layer rejects them instead of treating them as missing kernel code.
         sc.result = nt_syscall::STATUS_INVALID_SYSTEM_SERVICE as u64;
+        nt_handler.trace_process_creation_failure(lp.msg.m0, sc.result, pi, current_tid, &[]);
     }
     return loop_syscall_tail::syscall_tail(lp, ev, &call, &mut sc);
 }
