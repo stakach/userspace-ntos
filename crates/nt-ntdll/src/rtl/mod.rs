@@ -45,6 +45,7 @@ pub mod network;
 pub mod path;
 pub mod pe_manifest;
 pub mod pe_resource;
+pub mod resource_module;
 pub mod prefix;
 pub mod privilege;
 pub mod process_launch;

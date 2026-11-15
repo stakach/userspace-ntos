@@ -10293,7 +10293,25 @@ static LDR_LOAD_AS_DATA_TABLE: [LdrLoadAsDataTableRecord; LDR_LOAD_AS_DATA_TABLE
 
 #[inline]
 fn ldr_untag_resource_module(module: *mut c_void) -> *mut c_void {
-    ((module as usize) & !0x3usize) as *mut c_void
+    nt_ntdll::rtl::resource_module::ResourceModule::from_handle(module as usize).base as *mut c_void
+}
+
+/// The resource directory of a module handle and its size. A handle tagged as a data file
+/// (`LOAD_LIBRARY_AS_DATAFILE`) is a flat mapping of the file, so the directory RVA is
+/// translated through the section table instead of being added to the base.
+///
+/// # Safety
+/// `module` is a module handle whose headers are mapped.
+unsafe fn ldr_resource_directory(module: *mut c_void, size: &mut u32) -> *mut c_void {
+    let module = nt_ntdll::rtl::resource_module::ResourceModule::from_handle(module as usize);
+    unsafe {
+        rtl_image_directory_entry_to_data(
+            module.base as *mut c_void,
+            module.mapped_as_image as u8,
+            2, // IMAGE_DIRECTORY_ENTRY_RESOURCE
+            size,
+        )
+    }
 }
 
 unsafe fn copy_wide_name_to_heap(name: *const u16) -> *mut u16 {
@@ -10691,6 +10709,7 @@ unsafe fn ldr_resource_root(
     resource_directory: *mut *mut c_void,
     out_headers: *mut *mut c_void,
 ) -> NtStatus {
+    let tagged_handle = dll_handle;
     let dll_handle = ldr_untag_resource_module(dll_handle);
     if dll_handle.is_null() {
         return STATUS_RESOURCE_DATA_NOT_FOUND;
@@ -10706,7 +10725,7 @@ unsafe fn ldr_resource_root(
         }
 
         let mut size = 0u32;
-        let root = rtl_image_directory_entry_to_data(dll_handle, 1, 2, &mut size);
+        let root = ldr_resource_directory(tagged_handle, &mut size);
         if root.is_null() || (size as usize) < rtl::pe_resource::DIR_SIZE {
             if !resource_directory.is_null() {
                 core::ptr::write_unaligned(resource_directory, core::ptr::null_mut());
@@ -10733,15 +10752,15 @@ unsafe fn ldr_find_resource_impl(
     out: *mut *mut c_void,
     want_dir: bool,
 ) -> NtStatus {
+    let tagged_handle = dll_handle;
     let dll_handle = ldr_untag_resource_module(dll_handle);
     if dll_handle.is_null() || resource_info.is_null() {
         return STATUS_RESOURCE_DATA_NOT_FOUND;
     }
-    // SAFETY: on-target — resolve the resource directory of the mapped image.
+    // SAFETY: on-target — resolve the resource directory of the mapped image or data file.
     unsafe {
         let mut size: u32 = 0;
-        // IMAGE_DIRECTORY_ENTRY_RESOURCE = 2. MappedAsImage = TRUE.
-        let root = rtl_image_directory_entry_to_data(dll_handle, 1, 2, &mut size);
+        let root = ldr_resource_directory(tagged_handle, &mut size);
         if root.is_null() || (size as usize) < rtl::pe_resource::DIR_SIZE {
             return STATUS_RESOURCE_DATA_NOT_FOUND;
         }
@@ -11139,6 +11158,7 @@ pub unsafe extern "system" fn ldr_enum_resources(
     };
     unsafe { *resource_count = 0 };
 
+    let tagged_image_base = image_base;
     let image_base = ldr_untag_resource_module(image_base);
     if image_base.is_null() {
         return STATUS_RESOURCE_DATA_NOT_FOUND;
@@ -11146,7 +11166,7 @@ pub unsafe extern "system" fn ldr_enum_resources(
 
     unsafe {
         let mut section_size = 0u32;
-        let root = rtl_image_directory_entry_to_data(image_base, 1, 2, &mut section_size);
+        let root = ldr_resource_directory(tagged_image_base, &mut section_size);
         if root.is_null() || (section_size as usize) < rtl::pe_resource::DIR_SIZE {
             return STATUS_RESOURCE_DATA_NOT_FOUND;
         }
@@ -11268,8 +11288,9 @@ pub unsafe extern "system" fn ldr_enum_resources(
 
 /// `LdrAccessResource(PVOID DllHandle, PIMAGE_RESOURCE_DATA_ENTRY ResourceDataEntry, PVOID* Address,
 /// PULONG Size) -> NTSTATUS` — map a located `IMAGE_RESOURCE_DATA_ENTRY` to its data VA + size.
-/// `entry->OffsetToData` is an image RVA (base + RVA for a mapped-as-image module), `entry->Size` the
-/// byte length (faithful to `LdrpAccessResource`).
+/// `entry->OffsetToData` is an image RVA: base + RVA for a mapped-as-image module, and the RVA's
+/// file offset for a module loaded as a data file. `entry->Size` is the byte length (faithful to
+/// `LdrpAccessResource`).
 ///
 /// # Safety
 /// `dll_handle` a mapped module; `resource_data_entry` a located data entry; `address`/`size` null or
@@ -11281,7 +11302,8 @@ pub unsafe extern "system" fn ldr_access_resource(
     address: *mut *mut c_void,
     size: *mut u32,
 ) -> NtStatus {
-    let dll_handle = ldr_untag_resource_module(dll_handle);
+    let module = nt_ntdll::rtl::resource_module::ResourceModule::from_handle(dll_handle as usize);
+    let dll_handle = module.base as *mut c_void;
     unsafe {
         if !address.is_null() {
             core::ptr::write_unaligned(address, core::ptr::null_mut());
@@ -11307,11 +11329,12 @@ pub unsafe extern "system" fn ldr_access_resource(
         if magic != IMAGE_OPTIONAL_HEADER32_MAGIC && magic != IMAGE_OPTIONAL_HEADER64_MAGIC {
             return STATUS_INVALID_IMAGE_FORMAT;
         }
-        let image_size = core::ptr::read_unaligned(optional_header.add(56) as *const u32);
-        if !nt_ntdll::rtl::image::image_span_is_valid(image_size, rva, sz) {
-            return STATUS_INVALID_IMAGE_FORMAT;
-        }
-        let Some(resource_address) = (dll_handle as usize).checked_add(rva as usize) else {
+        let headers_size = core::ptr::read_unaligned(optional_header.add(60) as *const u32);
+        let headers = core::slice::from_raw_parts(dll_handle as *const u8, headers_size as usize);
+        let Some(resource_address) = module
+            .span_offset(headers, rva, sz)
+            .and_then(|offset| module.base.checked_add(offset))
+        else {
             return STATUS_INVALID_IMAGE_FORMAT;
         };
         if !address.is_null() {
