@@ -93,8 +93,9 @@ mod locale_file_mapping_tests {
         mappings: Vec<u64>,
         closed: Vec<u64>,
         unmapped: Vec<u64>,
-        opened_path: Option<&'static str>,
+        opened_path: Option<alloc::string::String>,
         fail_section: bool,
+        missing_file: bool,
     }
 
     impl Fake {
@@ -110,7 +111,18 @@ mod locale_file_mapping_tests {
                 unmapped: Vec::new(),
                 opened_path: None,
                 fail_section: false,
+                missing_file: false,
             }
+        }
+
+        /// The 26-byte header of an installed `c_<id>.nls` single-byte code page file.
+        fn code_page(id: u16) -> Self {
+            let mut fake = Self::valid();
+            fake.bytes = vec![0u8; 66082];
+            for (index, word) in [13u16, id, 1, 63, 63, 63, 63].iter().enumerate() {
+                fake.bytes[index * 2..index * 2 + 2].copy_from_slice(&word.to_le_bytes());
+            }
+            fake
         }
 
         fn valid_sortdefault() -> Self {
@@ -125,9 +137,9 @@ mod locale_file_mapping_tests {
 
     impl NlsFileMappingOps for Fake {
         fn system_lcid(&mut self) -> Result<u32, u32> { Ok(0x409) }
-        fn open_file(&mut self, path: &'static str) -> Result<u64, u32> {
-            self.opened_path = Some(path);
-            Ok(11)
+        fn open_file(&mut self, path: &str) -> Result<u64, u32> {
+            self.opened_path = Some(path.into());
+            if self.missing_file { Err(0xc000_0034) } else { Ok(11) }
         }
         fn create_readonly_section(&mut self, file: u64) -> Result<u64, u32> {
             assert_eq!(file, 11);
@@ -152,7 +164,7 @@ mod locale_file_mapping_tests {
         let mut fake = Fake::valid();
         let first = initialize_nls_files(&mut fake).unwrap();
         let second = initialize_nls_files(&mut fake).unwrap();
-        assert_eq!(fake.opened_path, Some("\\SystemRoot\\System32\\locale.nls"));
+        assert_eq!(fake.opened_path.as_deref(), Some("\\SystemRoot\\System32\\locale.nls"));
         assert_ne!(first.address, second.address);
         assert_eq!(first.lcid, 0x409);
         assert_eq!(first.size, fake.bytes.len() as u64);
@@ -178,7 +190,10 @@ mod locale_file_mapping_tests {
         let mut fake = Fake::valid_sortdefault();
         let first = get_nls_section_ptr(&mut fake, 9, 0).unwrap();
         let second = get_nls_section_ptr(&mut fake, 9, 0).unwrap();
-        assert_eq!(fake.opened_path, Some("\\SystemRoot\\System32\\sortdefault.nls"));
+        assert_eq!(
+            fake.opened_path.as_deref(),
+            Some("\\SystemRoot\\System32\\sortdefault.nls")
+        );
         assert_ne!(first.address, second.address);
         assert_eq!(first.size, fake.bytes.len() as u64);
         assert_eq!(fake.closed, vec![11, 22, 11, 22]);
@@ -195,5 +210,67 @@ mod locale_file_mapping_tests {
         assert_eq!(get_nls_section_ptr(&mut fake, 9, 0), Err(0xc000_007b));
         assert_eq!(fake.unmapped, fake.mappings);
         assert_eq!(fake.closed, vec![11, 22]);
+    }
+
+    #[test]
+    fn code_page_section_maps_the_installed_code_page_file() {
+        // kernelbase `get_codepage_table(20127)` for msvcrt's C-locale `_setmbcp`.
+        let mut fake = Fake::code_page(20127);
+        let view = get_nls_section_ptr(&mut fake, 11, 20127).unwrap();
+        assert_eq!(
+            fake.opened_path.as_deref(),
+            Some("\\SystemRoot\\System32\\c_20127.nls")
+        );
+        assert_eq!(view.size, 66082);
+        assert_eq!(fake.closed, vec![11, 22]);
+        assert!(fake.unmapped.is_empty());
+
+        let mut fake = Fake::code_page(437);
+        get_nls_section_ptr(&mut fake, 11, 437).unwrap();
+        assert_eq!(fake.opened_path.as_deref(), Some("\\SystemRoot\\System32\\c_437.nls"));
+        let mut fake = Fake::code_page(37);
+        get_nls_section_ptr(&mut fake, 11, 37).unwrap();
+        assert_eq!(fake.opened_path.as_deref(), Some("\\SystemRoot\\System32\\c_037.nls"));
+    }
+
+    #[test]
+    fn code_page_section_reports_a_missing_or_foreign_file() {
+        let mut fake = Fake::code_page(20127);
+        fake.missing_file = true;
+        assert_eq!(get_nls_section_ptr(&mut fake, 11, 20127), Err(0xc000_0034));
+        assert!(fake.closed.is_empty() && fake.mappings.is_empty());
+
+        // A file whose header names another code page is not published.
+        let mut fake = Fake::code_page(1252);
+        assert_eq!(get_nls_section_ptr(&mut fake, 11, 20127), Err(0xc000_007b));
+        assert_eq!(fake.unmapped, fake.mappings);
+        // No code page file can carry an identifier wider than its 16-bit header field.
+        let mut fake = Fake::code_page(1252);
+        assert_eq!(get_nls_section_ptr(&mut fake, 11, 0x1_04e4), Err(0xc000_0034));
+        assert!(fake.opened_path.is_none());
+    }
+
+    #[test]
+    fn case_map_and_normalization_sections_map_their_installed_files() {
+        for (section_type, id, file) in [
+            (10, 0, "l_intl.nls"),
+            (12, 1, "normnfc.nls"),
+            (12, 2, "normnfd.nls"),
+            (12, 5, "normnfkc.nls"),
+            (12, 6, "normnfkd.nls"),
+            (12, 13, "normidna.nls"),
+        ] {
+            let mut fake = Fake::valid();
+            get_nls_section_ptr(&mut fake, section_type, id).unwrap();
+            assert_eq!(
+                fake.opened_path,
+                Some(alloc::format!("\\SystemRoot\\System32\\{file}"))
+            );
+            assert_eq!(fake.closed, vec![11, 22]);
+        }
+        let mut fake = Fake::valid();
+        assert_eq!(get_nls_section_ptr(&mut fake, 10, 1), Err(0xc000_0001));
+        assert_eq!(get_nls_section_ptr(&mut fake, 12, 3), Err(0xc000_0034));
+        assert!(fake.opened_path.is_none());
     }
 }

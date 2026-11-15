@@ -25,7 +25,7 @@ pub struct NlsSectionMapping {
 
 pub trait NlsFileMappingOps {
     fn system_lcid(&mut self) -> Result<u32, u32>;
-    fn open_file(&mut self, path: &'static str) -> Result<u64, u32>;
+    fn open_file(&mut self, path: &str) -> Result<u64, u32>;
     fn create_readonly_section(&mut self, file: u64) -> Result<u64, u32>;
     fn map_readonly_section(&mut self, section: u64) -> Result<(u64, u64), u32>;
     fn mapped_bytes(&self, address: u64, size: u64) -> Option<&[u8]>;
@@ -60,9 +60,9 @@ fn valid_sortdefault_mapping(bytes: &[u8]) -> bool {
 
 fn map_checked_file(
     ops: &mut impl NlsFileMappingOps,
-    path: &'static str,
+    path: &str,
     minimum_size: u64,
-    valid_bytes: fn(&[u8]) -> bool,
+    valid_bytes: impl Fn(&[u8]) -> bool,
 ) -> Result<NlsSectionMapping, u32> {
     let file = ops.open_file(path)?;
     let section = match ops.create_readonly_section(file) {
@@ -97,17 +97,64 @@ pub fn initialize_nls_files(ops: &mut impl NlsFileMappingOps) -> Result<NlsFileM
     Ok(NlsFileMapping { address: view.address, lcid, size: view.size })
 }
 
-/// Map the installed sort-default NLS data for the kernelbase type-9 request.
-/// Unsupported section types fail before any file or section effect.
+/// `NLS_SECTION_*` section types (`winternl.h`).
+const NLS_SECTION_SORTKEYS: u32 = 9;
+const NLS_SECTION_CASEMAP: u32 = 10;
+const NLS_SECTION_CODEPAGE: u32 = 11;
+const NLS_SECTION_NORMALIZE: u32 = 12;
+const STATUS_UNSUCCESSFUL: u32 = 0xc000_0001;
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xc000_0034;
+
+/// A single- or double-byte code page file starts with a 13-word header whose second word is
+/// the code page it describes (`NLS_FILE_HEADER`, read by `RtlInitCodePageTable`).
+fn valid_code_page_mapping(bytes: &[u8], code_page: u16) -> bool {
+    bytes.len() >= 26
+        && u16::from_le_bytes([bytes[0], bytes[1]]) == 13
+        && u16::from_le_bytes([bytes[2], bytes[3]]) == code_page
+}
+
+/// Map the installed NLS data file behind one `NtGetNlsSectionPtr` request, as Wine's ntdll
+/// does (`dlls/ntdll/unix/env.c`): the sort keys, the case map, a code page (`c_<id>.nls`) or
+/// a normalization form. An unsupported request fails before any file or section effect.
 pub fn get_nls_section_ptr(
     ops: &mut impl NlsFileMappingOps,
     section_type: u32,
     id: u32,
 ) -> Result<NlsSectionMapping, u32> {
-    if section_type != 9 || id != 0 {
-        return Err(STATUS_INVALID_PARAMETER_1);
+    use core::fmt::Write;
+    let mut path = nt_printf::record::RecordBuffer::<64>::new();
+    path.push_bytes(b"\\SystemRoot\\System32\\");
+    let mut code_page = None;
+    match section_type {
+        NLS_SECTION_SORTKEYS if id == 0 => {
+            return map_checked_file(ops, SORTDEFAULT_NLS_PATH, 16, valid_sortdefault_mapping);
+        }
+        NLS_SECTION_SORTKEYS => return Err(STATUS_INVALID_PARAMETER_1),
+        NLS_SECTION_CASEMAP if id == 0 => {
+            path.push_bytes(b"l_intl.nls");
+        }
+        NLS_SECTION_CASEMAP => return Err(STATUS_UNSUCCESSFUL),
+        NLS_SECTION_CODEPAGE => {
+            // The file header holds the code page in 16 bits; a wider identifier names no file.
+            code_page = Some(u16::try_from(id).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?);
+            let _ = core::write!(&mut path, "c_{id:03}.nls");
+        }
+        NLS_SECTION_NORMALIZE => {
+            path.push_bytes(match id {
+                1 => b"normnfc.nls",   // NormalizationC
+                2 => b"normnfd.nls",   // NormalizationD
+                5 => b"normnfkc.nls",  // NormalizationKC
+                6 => b"normnfkd.nls",  // NormalizationKD
+                13 => b"normidna.nls", // IDNA
+                _ => return Err(STATUS_OBJECT_NAME_NOT_FOUND),
+            });
+        }
+        _ => return Err(STATUS_INVALID_PARAMETER_1),
     }
-    map_checked_file(ops, SORTDEFAULT_NLS_PATH, 16, valid_sortdefault_mapping)
+    let path = core::str::from_utf8(path.bytes()).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+    map_checked_file(ops, path, 16, |bytes| {
+        code_page.is_none_or(|code_page| valid_code_page_mapping(bytes, code_page))
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -123,7 +170,7 @@ impl NlsFileMappingOps for NativeNlsOps {
         if (status as i32) < 0 { Err(status) } else { Ok(lcid) }
     }
 
-    fn open_file(&mut self, path: &'static str) -> Result<u64, u32> {
+    fn open_file(&mut self, path: &str) -> Result<u64, u32> {
         use nt_ntdll_layout::{ObjectAttributes, UnicodeString};
         let mut name = [0u16; 64];
         if path.len() >= name.len() || !path.is_ascii() {
@@ -239,7 +286,7 @@ pub unsafe fn initialize_native(address: u64, lcid: u64, size: u64) -> u64 {
     0
 }
 
-/// The exported `NtGetNlsSectionPtr` user-mode wrapper for the installed sort-default file.
+/// The exported `NtGetNlsSectionPtr` user-mode wrapper over the installed NLS data files.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn get_section_native(
     section_type: u64,
