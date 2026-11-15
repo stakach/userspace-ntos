@@ -7249,7 +7249,25 @@ pub(crate) unsafe fn service_win32k_mm_secure_request(
             handler
                 .service_win32k_secure_virtual_memory(pi, address_or_handle, size, protection)
                 .map(|handle| (0, handle))
-                .unwrap_or_else(|status| (status as i32, 0))
+                .unwrap_or_else(|status| {
+                    // win32k's EngSecureMem reports a refusal as NULL and its callers fail
+                    // without a message; name the range here.
+                    static REFUSALS_TRACED: AtomicU64 = AtomicU64::new(0);
+                    if REFUSALS_TRACED.fetch_add(1, Ordering::Relaxed) < 16 {
+                        print_str(b"[win32k-secure-refused] pi=");
+                        print_u64(pi as u64);
+                        print_str(b" address=0x");
+                        print_hex_u64(address_or_handle);
+                        print_str(b" size=0x");
+                        print_hex_u64(size);
+                        print_str(b" protect=0x");
+                        print_hex(protection);
+                        print_str(b" status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                    }
+                    (status as i32, 0)
+                })
         }
         crate::win32k_subsystem::W32_MM_SECURE_OP_UNSECURE => {
             if size != 0 || protection != 0 {
