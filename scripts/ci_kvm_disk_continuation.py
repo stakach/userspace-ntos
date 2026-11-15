@@ -204,13 +204,26 @@ def verify_manifest(value: dict, run_id: int, attempt: int, current: dict) -> No
         raise ContinuationError("source QEMU stop receipt absent")
 
 
-def source_is_ancestor(source_head: str, target_head: str) -> bool:
+def source_is_ancestor(source_head: str, target_head: str, cwd: Path = ROOT) -> bool:
     if not COMMIT.fullmatch(source_head) or not COMMIT.fullmatch(target_head):
         return False
     return subprocess.run(
         ["git", "merge-base", "--is-ancestor", source_head, target_head],
-        cwd=ROOT, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=cwd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     ).returncode == 0
+
+
+def migration_submodule_is_compatible(source_sha: object, current_sha: str) -> bool:
+    """The kernel submodule may advance between source and target, never diverge.
+
+    Migration replaces the kernel and boot payload on the ESP with this build's, and the
+    disk length and ESP geometry are checked separately, so a source built from an earlier
+    ancestor of the current kernel commit is migratable like an earlier parent commit is.
+    """
+    if not isinstance(source_sha, str):
+        return False
+    return source_sha == current_sha or source_is_ancestor(
+        source_sha, current_sha, cwd=ROOT / "rust-micro")
 
 
 def verify_migration_run(run: dict, run_id: int, attempt: int, current: dict) -> None:
@@ -249,11 +262,13 @@ def verify_migration_manifest(value: dict, run_id: int, attempt: int,
         "source_repo": current["repo"], "workflow": WORKFLOW,
     }
     expected.update({key: current[key] for key in (
-        "submodule_sha", "libernt_manifest_sha256", "disk_size_bytes", "image_profile",
+        "libernt_manifest_sha256", "disk_size_bytes", "image_profile",
     )})
     for key, target in expected.items():
         if value.get(key) != target:
             raise ContinuationError(f"migration {key} differs from source or current build")
+    if not migration_submodule_is_compatible(value.get("submodule_sha"), current["submodule_sha"]):
+        raise ContinuationError("migration submodule_sha is not this build's or an ancestor of it")
     for key in ("disk_sha256", "base_disk_sha256", "kernel_sha256",
                 "rootserver_sha256", "ntdll_sha256"):
         if not isinstance(value.get(key), str) or not SHA256.fullmatch(value[key]):
@@ -561,6 +576,7 @@ def migrate(run_id: int, attempt: int, token: str) -> None:
             "libernt_manifest_sha256": current["libernt_manifest_sha256"],
             "generated_hive_sha256": digest(ROOT / "rust-micro/.tmp/hive.dat"),
             "submodule_sha": current["submodule_sha"],
+            "source_submodule_sha": manifest["submodule_sha"],
             "image_profile": current["image_profile"],
             "esp_file_changes": changes,
         }

@@ -275,6 +275,27 @@ class ContinuationTests(unittest.TestCase):
             disk.verify_migration_manifest(self.manifest, 101, 2, self.current, self.run)
         self.assertEqual(self.paths["DISK"].read_bytes(), self.baseline)
 
+    def test_migration_accepts_an_ancestor_kernel_submodule_only(self):
+        self.run["head_sha"] = "9" * 40
+        self.manifest["source_head_sha"] = "9" * 40
+        self.manifest["submodule_sha"] = "7" * 40
+        calls = []
+
+        def ancestry(source, target, cwd=disk.ROOT):
+            calls.append((source, target, cwd))
+            return self.submodule_ancestor
+
+        with patch.object(disk, "source_is_ancestor", side_effect=ancestry):
+            self.submodule_ancestor = True
+            disk.verify_migration_manifest(self.manifest, 101, 2, self.current, self.run)
+            self.assertEqual(calls[-1], ("7" * 40, "b" * 40, disk.ROOT / "rust-micro"))
+            self.submodule_ancestor = False
+            with self.assertRaises(disk.ContinuationError):
+                disk.verify_migration_manifest(self.manifest, 101, 2, self.current, self.run)
+            self.manifest["submodule_sha"] = None
+            with self.assertRaises(disk.ContinuationError):
+                disk.verify_migration_manifest(self.manifest, 101, 2, self.current, self.run)
+
     def test_migration_rejects_unrelated_head_release_or_layout(self):
         prior = "1" * 40
         self.run["head_sha"] = prior
