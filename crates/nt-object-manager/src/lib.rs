@@ -22,6 +22,7 @@ mod namespace_bootstrap_tests;
 pub use namespace::{session_namespace_ownership, FilePathTarget, SessionNamespaceOwnership};
 pub mod directory;
 pub mod hosted_dynamic_type;
+pub mod name_query;
 pub mod object_security;
 pub mod object_type;
 pub mod slot_ledger;

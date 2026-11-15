@@ -17693,9 +17693,9 @@ impl ExecNtHandler {
         const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
         const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
         const OBJECT_BASIC_INFORMATION_SIZE: usize = 56;
-        const OBJECT_NAME_INFORMATION_SIZE: usize = 16;
         const OBJECT_TYPE_INFORMATION_SIZE: usize = 104;
         const OBJECT_HANDLE_FLAG_INFORMATION_SIZE: usize = 2;
+        use nt_object_manager::name_query;
 
         let handle = args.first().copied().unwrap_or(0);
         let class = nt_ulong_arg(args.get(1).copied().unwrap_or(u64::MAX));
@@ -17745,11 +17745,8 @@ impl ExecNtHandler {
                     .map(|index| self.query_object_namespace_path(index, &mut name_ascii))
                     .unwrap_or(0);
                 let type_info_len = (OBJECT_TYPE_INFORMATION_SIZE + type_name.len() * 2 + 2) as u32;
-                let name_info_len = if name_len == 0 {
-                    OBJECT_NAME_INFORMATION_SIZE as u32
-                } else {
-                    (OBJECT_NAME_INFORMATION_SIZE + name_len * 2 + 2) as u32
-                };
+                let name_info_len =
+                    name_query::object_name_information_bytes(&name_ascii[..name_len]) as u32;
                 if self
                     .write_query_object_return_length(
                         memory,
@@ -17783,12 +17780,12 @@ impl ExecNtHandler {
                     .query_object_namespace_index(object, namespace_index)
                     .map(|index| self.query_object_namespace_path(index, &mut name_ascii))
                     .unwrap_or(0);
-                let name_bytes = name_len * 2;
-                let needed = if name_len == 0 {
-                    OBJECT_NAME_INFORMATION_SIZE
-                } else {
-                    OBJECT_NAME_INFORMATION_SIZE + name_bytes + 2
+                let name = match name_query::header_object_name(type_name, &name_ascii[..name_len])
+                {
+                    Ok(name) => name,
+                    Err(status) => return status.raw() as u32,
                 };
+                let needed = name_query::object_name_information_bytes(name);
                 if self
                     .write_query_object_return_length(
                         memory,
@@ -17802,15 +17799,11 @@ impl ExecNtHandler {
                 if length < needed || !self.user_memory_probe_output(memory, information, needed) {
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
-                let mut output = [0u8; OBJECT_NAME_INFORMATION_SIZE + 256 * 2 + 2];
-                if name_len != 0 {
-                    output[0..2].copy_from_slice(&(name_bytes as u16).to_le_bytes());
-                    output[2..4].copy_from_slice(&((name_bytes + 2) as u16).to_le_bytes());
-                    output[8..16].copy_from_slice(&(information + 16).to_le_bytes());
-                    Self::write_ascii_utf16le(
-                        &name_ascii[..name_len],
-                        &mut output[OBJECT_NAME_INFORMATION_SIZE..],
-                    );
+                let mut output = [0u8; name_query::OBJECT_NAME_INFORMATION_BYTES + 256 * 2 + 2];
+                if name_query::write_object_name_information(name, information, &mut output)
+                    != Some(needed)
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
                 }
                 if self.user_memory_write(memory, information, &output[..needed]) {
                     0
