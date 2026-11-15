@@ -878,3 +878,17 @@ diagnosis-free failure.
   Yield-polling, and a fail-closed `park()`, look identical from root: a lane that never sends.
   Make each such site name itself, because every capped trace will already be spent.
 
+## A Dispatch Needs A Handoff Before It May Suspend
+- The root flushed a returned callback's GDI batch as its own win32k dispatch, from inside
+  `NtCallbackReturn`. That path has no handoff, so when the flush issued a service wait its
+  yield record stayed in the pending set. Winlogon stalled there in one boot; in the next, an
+  unrelated process's first GUI syscall found the record beside its own user callback and the
+  executive panicked (#398).
+- Work NT does on the calling thread inside a continuation (`KeGdiFlushUserBatch` in
+  `KeUserModeCallback`) belongs in the provider continuation, on its lane. A second
+  root-issued dispatch for it has no owner for a wait.
+- Before issuing a win32k dispatch from the root, name the code that admits its suspension.
+  A pending record is the publishing dispatch's; a handoff admits only its own and fences any
+  other. Read the pending-record set as owned state, not as "whatever the last pump left".
+- Check the earlier boots for the same marker before blaming the newest commit: the stalled
+  boot printed the same `callback-return flush suspended` line three commits earlier.

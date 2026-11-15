@@ -726,6 +726,49 @@ pub(crate) enum LpcWaitPumpCompletion {
     Failed(i32),
 }
 
+/// What the returned pump left for its handoff, named by the dispatch that published it.
+pub(crate) unsafe fn pending_yield_observation(
+    current_dispatch: Option<u64>,
+    callback_suspended: bool,
+) -> nt_user_host::yield_handoff::HandoffObservation {
+    use nt_user_host::yield_handoff::{HandoffObservation, YieldKind};
+    let mut observation = HandoffObservation::new(current_dispatch, callback_suspended);
+    if let Some(pending) = &*core::ptr::addr_of!(RECEIVE_PENDING_DISPATCH) {
+        observation = observation.with(YieldKind::Receive, pending.snapshot.dispatch.dispatch_id);
+    }
+    if let Some(pending) = &*core::ptr::addr_of!(SERVICE_WAIT_PENDING_DISPATCH) {
+        observation =
+            observation.with(YieldKind::ServiceWait, pending.snapshot.dispatch.dispatch_id);
+    }
+    if PROVIDER_WAIT_LAST_PUMP_SUSPENDED.load(Ordering::Acquire) != 0 {
+        if let Some(pending) = &*core::ptr::addr_of!(PROVIDER_WAIT_PENDING_DISPATCH) {
+            observation = observation.with(YieldKind::ProviderWait, pending.dispatch.dispatch_id);
+        }
+    }
+    if LPC_WAIT_LAST_PUMP_SUSPENDED.load(Ordering::Acquire) != 0 {
+        if let Some(pending) = &*core::ptr::addr_of!(LPC_WAIT_PENDING_DISPATCH) {
+            observation = observation.with(YieldKind::LpcWait, pending.dispatch.dispatch_id);
+        }
+    }
+    observation
+}
+
+/// Take a record out of the pending set without admitting it, naming the client it carried.
+/// Its lane keeps the Call and Reply it yielded with; nothing here resumes or answers them.
+pub(crate) unsafe fn fence_pending_yield(
+    kind: nt_user_host::yield_handoff::YieldKind,
+) -> Option<Win32kClientContext> {
+    use nt_user_host::yield_handoff::YieldKind;
+    match kind {
+        YieldKind::Receive => take_pending_receive_dispatch().map(|pending| pending.snapshot.client),
+        YieldKind::ServiceWait => {
+            take_pending_service_wait_dispatch().map(|pending| pending.snapshot.client)
+        }
+        YieldKind::ProviderWait => take_pending_provider_wait_dispatch().map(|pending| pending.client),
+        YieldKind::LpcWait => take_pending_lpc_wait_dispatch().map(|pending| pending.client),
+    }
+}
+
 pub(crate) unsafe fn take_pending_provider_wait_dispatch() -> Option<PendingProviderWaitDispatch> {
     if PROVIDER_WAIT_LAST_PUMP_SUSPENDED.swap(0, Ordering::AcqRel) == 0 {
         return None;

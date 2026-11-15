@@ -4084,9 +4084,20 @@ pub(super) unsafe fn syscall_win32k_route(
         }
         r
     };
-    let handoff = admit_pending_win32k_dispatch(
-        &mut nt_handler, HostedContinuationDestination::Win32k,
+    let mut handoff = admit_pending_win32k_dispatch(
+        &mut nt_handler, HostedContinuationDestination::Win32k, Some(dispatch_id),
     );
+    if handoff.fenced {
+        // This dispatch has neither a result nor an admitted continuation. Its caller's
+        // Reply leaves the root slot unanswered and the turn ends like a park; every other
+        // process keeps being served.
+        if fence_win32k_handoff_caller(b"win32k-syscall", pi, current_tid, lp.msg.m0) {
+            drop(bulk_stage.take());
+            handoff.parked = true;
+        } else {
+            handoff.retained_failure = true;
+        }
+    }
     if handoff.retained_failure {
         // A yielded pump has already transferred its pending snapshot. Preserve
         // both Replies and the durable owner; ordinary syscall output is forbidden.

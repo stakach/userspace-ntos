@@ -48,49 +48,6 @@ fn resumed_waits_restore_the_nested_service_yield_before_entering_the_pump() {
 }
 
 #[test]
-fn nested_service_wait_keeps_callback_and_root_reply_owned() {
-    let finish = GLUE
-        .split("if let Some(yielded) = pr.service_wait_yield {")
-        .last()
-        .unwrap()
-        .split("if let Some(yielded) = pr.maintenance_yield")
-        .next()
-        .unwrap();
-    assert!(finish.contains("callback_token: outer_callback.map(|(_, token)| token)"));
-    let nested = GLUE
-        .split("if nested_user_callback {")
-        .last()
-        .unwrap()
-        .split("if registered_client")
-        .next()
-        .unwrap();
-    assert!(nested.contains("pr.service_wait_yield.is_some()"));
-    let admission = SERVICE
-        .split("unsafe fn service_wait_admit_current(")
-        .nth(1)
-        .unwrap()
-        .split("unsafe fn ")
-        .next()
-        .unwrap();
-    assert!(admission.contains("NestedWaitTransfer::InCallback"));
-    assert!(admission.contains("service_wait_admit_with_transfer"));
-    assert!(admission.contains("reply_park.try_commit()"));
-    let handoff = SERVICE
-        .split("} else if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {")
-        .nth(1)
-        .unwrap()
-        .split("} else if let Some(pending)")
-        .next()
-        .unwrap();
-    assert!(handoff.contains("restore_pending_service_wait_dispatch(pending)"));
-    let indeterminate = handoff.split("RetainedWaitAdmission::Indeterminate =>")
-        .nth(1).expect("physical uncertainty has its own retained branch")
-        .split("\n        }").next().unwrap();
-    assert!(indeterminate.contains("retained_failure = true"),
-        "an uncertain service wait must retain its caller Reply");
-}
-
-#[test]
 fn parked_service_token_does_not_hide_its_callback_origin() {
     let admission = SERVICE
         .split("unsafe fn service_wait_admit_with_transfer(")

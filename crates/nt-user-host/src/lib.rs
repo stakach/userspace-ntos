@@ -76,6 +76,10 @@ pub mod provider_kernel_wait;
 pub mod provider_kernel_yield;
 pub mod provider_local_event_request;
 pub mod component_pump;
+pub mod yield_handoff;
+#[cfg(test)]
+#[path = "yield_handoff_tests.rs"]
+mod yield_handoff_tests;
 pub mod native_caller_subject;
 pub mod win32k_subject_lease;
 pub mod win32k_object_security;

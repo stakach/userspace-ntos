@@ -2,6 +2,8 @@
 
 mod message_output;
 mod dispatch_return;
+mod gdi_batch_flush;
+pub use gdi_batch_flush::{CallbackFlushLedger, DispatchFlushScope, GdiBatchFlushReceipt};
 mod private_arg_stage;
 mod shared_page_lease;
 pub use private_arg_stage::{ArgStageError, DirtyArgSpan, PrivateArgStage};
@@ -2550,7 +2552,7 @@ fn checked_payload_length(length: usize) -> Result<(), ValidationError> {
 // rest of the caller's TEB.
 //
 // The layout constants and the record WALK live here — pure, host-tested — so the executive's
-// `ke_gdi_flush_user_batch` is a thin reader over the client's TEB alias.
+// `observe_gdi_batch_before_dispatch` is a thin reader over the client's TEB alias.
 
 /// `GDIBATCHBUFSIZE` — `sizeof(GDI_TEB_BATCH.Buffer)` (310 `ULONG`s).
 pub const GDI_BATCH_BUF_SIZE: u32 = 0x4D8;

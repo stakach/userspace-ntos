@@ -49,6 +49,31 @@ pub const fn callback_resume_yield_caps(
     }
 }
 
+/// Whether the provider flushes the client's GDI batch as it resumes from the callback.
+///
+/// NT's `KeUserModeCallback` calls `KeGdiFlushUserBatch` on the returning thread, inside the
+/// continuation that issued the callback. The flush is therefore work of the resumed
+/// dispatch on its own lane, and a wait it issues is an ordinary wait of that dispatch. A
+/// separate flush dispatch issued by the root has no handoff of its own, so a suspension
+/// there has no owner. An unwound callback has no client left to flush for.
+pub const fn callback_resume_flushes_gdi_batch(origin: CallbackResumeOrigin) -> bool {
+    matches!(origin, CallbackResumeOrigin::Return { .. })
+}
+
+/// The word the root publishes as it resumes a provider from a callback. The provider flushes
+/// only when the word names the callback it issued, so a resume that is answered in place, or
+/// a word left by a resume that never entered the provider, cannot start a flush.
+pub const fn callback_resume_flush_word(
+    origin: CallbackResumeOrigin,
+    dispatch_id: u64,
+    callback_id: u32,
+) -> u64 {
+    if !callback_resume_flushes_gdi_batch(origin) || callback_id == 0 {
+        return 0;
+    }
+    ((callback_id as u64) << 32) | (dispatch_id & 0xFFFF_FFFF)
+}
+
 /// The yield a callback-return resume came back with.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallbackReturnYield {

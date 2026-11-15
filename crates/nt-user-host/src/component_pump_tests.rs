@@ -348,3 +348,26 @@ fn only_suspension_can_supply_resume_accounting() {
         assert_eq!(accounting, finished);
     }
 }
+
+/// Issue #398: the callback-return GDI flush belongs to the resumed provider continuation.
+#[test]
+fn only_a_returned_callback_flushes_the_client_gdi_batch_on_resume() {
+    for enclosing_callback in [false, true] {
+        assert!(callback_resume_flushes_gdi_batch(
+            CallbackResumeOrigin::Return { enclosing_callback },
+        ));
+    }
+    assert!(!callback_resume_flushes_gdi_batch(CallbackResumeOrigin::Unwind));
+}
+
+#[test]
+fn the_resume_flush_word_names_one_returned_callback() {
+    let returned = CallbackResumeOrigin::Return { enclosing_callback: false };
+    let word = callback_resume_flush_word(returned, 3171, 2);
+    assert_ne!(word, 0);
+    assert_ne!(word, callback_resume_flush_word(returned, 3171, 3));
+    assert_ne!(word, callback_resume_flush_word(returned, 3172, 2));
+    assert_eq!(callback_resume_flush_word(CallbackResumeOrigin::Unwind, 3171, 2), 0);
+    // No callback has id zero, so an unpublished word never matches one.
+    assert_eq!(callback_resume_flush_word(returned, 3171, 0), 0);
+}

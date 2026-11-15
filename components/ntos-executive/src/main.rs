@@ -10539,9 +10539,8 @@ pub(crate) use nt_user_callback::{
 pub(crate) static GDI_BATCH_FLUSHES: AtomicU64 = AtomicU64::new(0);
 /// Batch records handed to win32k's registered `BatchFlushRoutine`.
 pub(crate) static GDI_BATCH_RECORDS_FLUSHED: AtomicU64 = AtomicU64::new(0);
-/// Completed calls to the registered win32k batch flush routine that failed.
+/// Calls to the registered win32k batch flush routine that left their batch unconsumed.
 pub(crate) static GDI_BATCH_FLUSH_FAILURES: AtomicU64 = AtomicU64::new(0);
-static GDI_CALLBACK_BATCH_SUSPENSIONS: AtomicU64 = AtomicU64::new(0);
 /// High-water `GdiTebBatch.Offset` ever OBSERVED at a win32k system call. With the kernel step in
 /// place this must stay `<= GDI_BATCH_BUF_SIZE`; without it, it grew past the TEB's second page.
 pub(crate) static GDI_BATCH_MAX_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -10593,69 +10592,6 @@ pub(crate) unsafe fn observe_gdi_batch_before_dispatch(
         }
     });
     count
-}
-
-/// A user callback can batch more drawing before `NtCallbackReturn` resumes win32k. Keep its
-/// established callback-return ordering until that continuation has a same-lane prelude owner.
-pub(crate) unsafe fn ke_gdi_flush_user_batch(
-    client: win32k_glue::Win32kClientContext,
-    teb_alias: u64,
-) {
-    let count = observe_gdi_batch_before_dispatch(client, teb_alias);
-    if count == 0 {
-        return;
-    }
-    let original_caller = client.logical_caller;
-    let win32k_glue::Win32kDispatchOutcome::Known { value: status, completed } =
-        win32k_glue::win32k_flush_user_gdi_batch(client);
-    if completed && status as u32 == 0 {
-        GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
-        GDI_BATCH_RECORDS_FLUSHED.fetch_add(u64::from(count), Ordering::Relaxed);
-        if let Some(caller) = original_caller {
-            service_sec_image::service_observe_desktop_gui_for(
-                caller, desktop_observation::DesktopGuiFact::BatchFlush, 1,
-            );
-            service_sec_image::service_observe_desktop_gui_for(
-                caller, desktop_observation::DesktopGuiFact::BatchRecords, u64::from(count),
-            );
-            if hosted_process_runtime_for_pi(caller.pi())
-                .is_some_and(|runtime| {
-                    runtime.observation_role == nt_exe_image::HostedProcessRole::InteractiveShell
-                        && caller.process().generation
-                            == nt_user_host::process_identity::ProcessGeneration::Hosted(
-                                runtime.generation,
-                            )
-                })
-            {
-                if EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed) == 0 {
-                    note_boot_progress(BootProgress::ExplorerGdiBatchObserved);
-                }
-                EXPLORER_GDI_BATCH_RECORDS.fetch_add(u64::from(count), Ordering::Relaxed);
-            }
-        }
-    } else if !completed && status as u32 == nt_user_callback::STATUS_PENDING as u32 {
-        let suspensions = GDI_CALLBACK_BATCH_SUSPENSIONS.fetch_add(1, Ordering::Relaxed);
-        if suspensions < 8 {
-            print_str(b"[gdi-batch] callback-return flush suspended pi=");
-            print_u64(client.pi as u64);
-            print_str(b" tid=");
-            print_u64(client.tid);
-            print_str(b" status=0x");
-            print_hex(status as u32);
-            print_str(b"\n");
-        }
-    } else {
-        let failures = GDI_BATCH_FLUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
-        if failures < 8 {
-            print_str(b"[gdi-batch] callback-return flush failed pi=");
-            print_u64(client.pi as u64);
-            print_str(b" tid=");
-            print_u64(client.tid);
-            print_str(b" status=0x");
-            print_hex(status as u32);
-            print_str(b"\n");
-        }
-    }
 }
 
 /// Observe the real client's descriptor without repairing it or attributing the writer.

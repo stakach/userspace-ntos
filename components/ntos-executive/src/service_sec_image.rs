@@ -2505,12 +2505,87 @@ struct PendingWin32kHandoff {
     parked: bool,
     maintenance_ticket: Option<root_maintenance_owner::RootMaintenanceTicket>,
     retained_failure: bool,
+    /// A handoff invariant was violated for the dispatch being handed off. It has neither a
+    /// result nor an admitted continuation; its caller's Reply must be fenced, not answered.
+    fenced: bool,
 }
 
 fn trace_win32k_handoff_refusal(stage: &[u8]) {
     print_str(b"[win32k-handoff-refusal] stage=");
     print_str(stage);
     print_str(b"\n");
+}
+
+const WIN32K_HANDOFF_FENCE_CAP: usize = 16;
+static WIN32K_HANDOFF_FENCE_RECEIPTS: AtomicU64 = AtomicU64::new(0);
+static mut WIN32K_HANDOFF_FENCED_REPLIES: [u64; WIN32K_HANDOFF_FENCE_CAP] =
+    [0; WIN32K_HANDOFF_FENCE_CAP];
+
+/// A bounded receipt for one fenced yield record or dispatch: which invariant, which record
+/// kind, the dispatch that published it and the dispatch whose handoff found it.
+fn trace_win32k_handoff_fence(
+    invariant: &[u8],
+    kind: &[u8],
+    owner_dispatch: u64,
+    current_dispatch: Option<u64>,
+    owner: Option<win32k_glue::Win32kClientContext>,
+) {
+    if WIN32K_HANDOFF_FENCE_RECEIPTS.fetch_add(1, Ordering::Relaxed)
+        >= WIN32K_HANDOFF_FENCE_CAP as u64
+    {
+        return;
+    }
+    print_str(b"[win32k-handoff-fence] invariant=");
+    print_str(invariant);
+    print_str(b" kind=");
+    print_str(kind);
+    print_str(b" owner-dispatch=");
+    print_u64(owner_dispatch);
+    print_str(b" current-dispatch=");
+    match current_dispatch {
+        Some(dispatch) => print_u64(dispatch),
+        None => print_str(b"unnamed"),
+    }
+    print_str(b" owner-pi/tid=");
+    print_u64(owner.map_or(0, |client| u64::from(client.pi)));
+    print_str(b"/");
+    print_u64(owner.map_or(0, |client| client.tid));
+    print_str(b"\n");
+}
+
+/// Fence the caller of a dispatch whose handoff violated an invariant. Its Reply leaves the
+/// root slot and is recorded here, so it is never answered with a result the dispatch did not
+/// produce and never reused for another receive. `false` means the Reply is still in the slot.
+pub(crate) unsafe fn fence_win32k_handoff_caller(
+    reason: &[u8],
+    pi: usize,
+    tid: u64,
+    ssn: u64,
+) -> bool {
+    let fenced = &mut *core::ptr::addr_of_mut!(WIN32K_HANDOFF_FENCED_REPLIES);
+    let Some(slot) = fenced.iter().position(|reply| *reply == 0) else {
+        trace_win32k_handoff_refusal(b"fence-capacity");
+        return false;
+    };
+    let Some(reply) = steal_main_reply() else {
+        trace_win32k_handoff_refusal(b"fence-reply-rotation");
+        return false;
+    };
+    fenced[slot] = reply;
+    print_str(b"[win32k-handoff-fence] caller fenced reason=");
+    print_str(reason);
+    print_str(b" pi/tid=");
+    print_u64(pi as u64);
+    print_str(b"/");
+    print_u64(tid);
+    print_str(b" ssn=0x");
+    print_hex_u64(ssn);
+    print_str(b" reply=0x");
+    print_hex_u64(reply);
+    print_str(b" slot=");
+    print_u64(slot as u64);
+    print_str(b"\n");
+    true
 }
 
 /// The physical nested parent already owns its Reply. Retain the independent root Call before
@@ -2705,6 +2780,7 @@ pub(crate) unsafe fn reply_retained_initial_creation(reply_cap: u64, status: u32
 unsafe fn admit_pending_win32k_dispatch(
     handler: &mut ExecNtHandler,
     destination: HostedContinuationDestination,
+    current_dispatch: Option<u64>,
 ) -> PendingWin32kHandoff {
     let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
     let mut admitted_dispatch_id = 0;
@@ -2716,7 +2792,7 @@ unsafe fn admit_pending_win32k_dispatch(
             trace_win32k_handoff_refusal(b"nested-restore-callback-suspended");
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         }
         match admit_pending_nested_restore_dispatch(destination) {
@@ -2728,7 +2804,7 @@ unsafe fn admit_pending_win32k_dispatch(
         }
         return PendingWin32kHandoff {
             callback_suspended, admitted_dispatch_id, parked,
-            maintenance_ticket, retained_failure,
+            maintenance_ticket, retained_failure, fenced: false,
         };
     }
     if win32k_glue::pending_root_ingress_dispatch_is_some() {
@@ -2742,7 +2818,7 @@ unsafe fn admit_pending_win32k_dispatch(
         trace_win32k_handoff_refusal(b"root-ingress-unimplemented");
         return PendingWin32kHandoff {
             callback_suspended, admitted_dispatch_id, parked,
-            maintenance_ticket, retained_failure: true,
+            maintenance_ticket, retained_failure: true, fenced: false,
         };
     }
     if win32k_glue::pending_root_maintenance_dispatch_is_some() {
@@ -2751,33 +2827,33 @@ unsafe fn admit_pending_win32k_dispatch(
         if destination != HostedContinuationDestination::Win32k || callback_suspended {
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         }
         let root_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
         if root_reply == 0 {
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         }
         let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         };
         let Some(reservation) = root_maintenance_owner::reserve_capacity() else {
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         };
         let Some(pending) = win32k_glue::take_pending_root_maintenance_dispatch() else {
             root_maintenance_owner::cancel_reservation(reservation);
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         };
         trace_cursor_lookup_owner("handoff-kind:maintenance", pending.snapshot.client,
@@ -2792,7 +2868,7 @@ unsafe fn admit_pending_win32k_dispatch(
                 root_maintenance_owner::cancel_reservation(reservation);
                 return PendingWin32kHandoff {
                     callback_suspended, admitted_dispatch_id, parked,
-                    maintenance_ticket, retained_failure: true,
+                    maintenance_ticket, retained_failure: true, fenced: false,
                 };
             }
         };
@@ -2828,13 +2904,13 @@ unsafe fn admit_pending_win32k_dispatch(
         if !exact {
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         }
         let Ok(return_target) = HostedReturnTarget::new(root_reply, None) else {
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         };
         let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
@@ -2845,7 +2921,7 @@ unsafe fn admit_pending_win32k_dispatch(
         if !root_maintenance_owner::store_continuation(ticket, continuation) {
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         }
         let acquired = root_maintenance_owner::with_physical(ticket, |physical| physical.acquire())
@@ -2853,7 +2929,7 @@ unsafe fn admit_pending_win32k_dispatch(
         if !acquired {
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         }
         let key = nt_component_suspension::SuspensionKey::root_maintenance(yielded.dispatch.epoch());
@@ -2861,7 +2937,7 @@ unsafe fn admit_pending_win32k_dispatch(
         let Some(continuation) = root_maintenance_owner::take_continuation(ticket) else {
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         };
         let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
@@ -2872,74 +2948,119 @@ unsafe fn admit_pending_win32k_dispatch(
             let _ = root_maintenance_owner::restore_continuation(ticket, continuation);
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         }
         if !root_maintenance_owner::mark_admitted(ticket, key) {
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         }
         if reply_park.try_commit().is_err() {
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
-                maintenance_ticket, retained_failure: true,
+                maintenance_ticket, retained_failure: true, fenced: false,
             };
         }
         parked = true;
         return PendingWin32kHandoff {
             callback_suspended, admitted_dispatch_id, parked,
-            maintenance_ticket, retained_failure,
+            maintenance_ticket, retained_failure, fenced: false,
         };
     }
-    if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
-        trace_cursor_lookup_owner("handoff-kind:receive", pending.snapshot.client,
-            pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
-            Some(pending.snapshot.dispatch.lane), true, true, false);
-        admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
-        parked = receive_admit_current(pending, destination);
-        assert!(parked, "Receive retains parked parent and original client Reply");
-    } else if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
-        trace_cursor_lookup_owner("handoff-kind:service-wait", pending.snapshot.client,
-            pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
-            Some(pending.snapshot.dispatch.lane), true, true, false);
-        admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
-        match service_wait_admit_current(pending, destination) {
-            RetainedWaitAdmission::Accepted => parked = true,
-            RetainedWaitAdmission::RefusedNoEffect => {
-                let restored = win32k_glue::restore_pending_service_wait_dispatch(pending);
-                trace_win32k_handoff_refusal(if restored {
-                    b"service-wait-refused-restored"
-                } else { b"service-wait-refused-restore-failed" });
-                retained_failure = true;
-            }
-            RetainedWaitAdmission::Indeterminate => {
-                trace_win32k_handoff_refusal(b"service-wait-indeterminate");
-                retained_failure = true;
+    // One native yield carries one suspension, and it belongs to the dispatch that just ran.
+    // Every pending record is admitted here or fenced; none outlives the handoff that saw it.
+    use nt_user_host::yield_handoff::YieldKind;
+    let plan = nt_user_host::yield_handoff::plan(
+        win32k_glue::pending_yield_observation(current_dispatch, callback_suspended),
+    );
+    for fenced in plan.fenced() {
+        let client = win32k_glue::fence_pending_yield(fenced.record.kind);
+        trace_win32k_handoff_fence(
+            fenced.violation.name().as_bytes(), fenced.record.kind.name().as_bytes(),
+            fenced.record.dispatch_id, current_dispatch, client,
+        );
+    }
+    if plan.current_fenced {
+        return PendingWin32kHandoff {
+            callback_suspended: false, admitted_dispatch_id, parked,
+            maintenance_ticket, retained_failure, fenced: true,
+        };
+    }
+    let mut refused_admission = None;
+    match plan.admit {
+        Some(YieldKind::Receive) => {
+            if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
+                trace_cursor_lookup_owner("handoff-kind:receive", pending.snapshot.client,
+                    pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
+                    Some(pending.snapshot.dispatch.lane), true, true, false);
+                admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
+                parked = receive_admit_current(pending, destination);
+                if !parked { refused_admission = Some(pending.snapshot.client); }
             }
         }
-    } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
-        trace_cursor_lookup_owner("handoff-kind:provider-wait", pending.client,
-            pending.dispatch.ssn, pending.dispatch.dispatch_id,
-            Some(pending.dispatch.lane), true, true, false);
-        admitted_dispatch_id = pending.dispatch.dispatch_id;
-        parked = provider_wait_admit_current(handler, pending, None, destination)
-            == RetainedWaitAdmission::Accepted;
-        assert!(parked, "provider wait could not reserve its native continuation");
-    } else if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
-        trace_cursor_lookup_owner("handoff-kind:lpc-wait", pending.client,
-            pending.dispatch.ssn, pending.dispatch.dispatch_id,
-            Some(pending.dispatch.lane), true, true, false);
-        admitted_dispatch_id = pending.dispatch.dispatch_id;
-        parked = lpc_wait_admit_current(handler, pending, None, destination)
-            == RetainedWaitAdmission::Accepted;
-        assert!(parked, "LPC wait could not reserve its native continuation");
+        Some(YieldKind::ServiceWait) => {
+            if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
+                trace_cursor_lookup_owner("handoff-kind:service-wait", pending.snapshot.client,
+                    pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
+                    Some(pending.snapshot.dispatch.lane), true, true, false);
+                admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
+                match service_wait_admit_current(pending, destination) {
+                    RetainedWaitAdmission::Accepted => parked = true,
+                    RetainedWaitAdmission::RefusedNoEffect => {
+                        let restored = win32k_glue::restore_pending_service_wait_dispatch(pending);
+                        trace_win32k_handoff_refusal(if restored {
+                            b"service-wait-refused-restored"
+                        } else { b"service-wait-refused-restore-failed" });
+                        retained_failure = true;
+                    }
+                    RetainedWaitAdmission::Indeterminate => {
+                        trace_win32k_handoff_refusal(b"service-wait-indeterminate");
+                        retained_failure = true;
+                    }
+                }
+            }
+        }
+        Some(YieldKind::ProviderWait) => {
+            if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
+                trace_cursor_lookup_owner("handoff-kind:provider-wait", pending.client,
+                    pending.dispatch.ssn, pending.dispatch.dispatch_id,
+                    Some(pending.dispatch.lane), true, true, false);
+                admitted_dispatch_id = pending.dispatch.dispatch_id;
+                parked = provider_wait_admit_current(handler, pending, None, destination)
+                    == RetainedWaitAdmission::Accepted;
+                if !parked { refused_admission = Some(pending.client); }
+            }
+        }
+        Some(YieldKind::LpcWait) => {
+            if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
+                trace_cursor_lookup_owner("handoff-kind:lpc-wait", pending.client,
+                    pending.dispatch.ssn, pending.dispatch.dispatch_id,
+                    Some(pending.dispatch.lane), true, true, false);
+                admitted_dispatch_id = pending.dispatch.dispatch_id;
+                parked = lpc_wait_admit_current(handler, pending, None, destination)
+                    == RetainedWaitAdmission::Accepted;
+                if !parked { refused_admission = Some(pending.client); }
+            }
+        }
+        None => {}
     }
-    assert!(!callback_suspended || !parked, "callback and provider wait cannot share one native yield");
+    if let (Some(kind), Some(client)) = (plan.admit, refused_admission) {
+        // The record has left the pending set and its continuation was not reserved. The
+        // dispatch keeps the lane and Reply it yielded with; it is not answered or replayed.
+        trace_win32k_handoff_fence(
+            b"yield-admission", kind.name().as_bytes(), admitted_dispatch_id,
+            current_dispatch, Some(client),
+        );
+        return PendingWin32kHandoff {
+            callback_suspended: false, admitted_dispatch_id: 0, parked: false,
+            maintenance_ticket, retained_failure, fenced: true,
+        };
+    }
     PendingWin32kHandoff {
-        callback_suspended, admitted_dispatch_id, parked,
-        maintenance_ticket, retained_failure,
+        callback_suspended: plan.callback, admitted_dispatch_id, parked,
+        maintenance_ticket, retained_failure, fenced: false,
     }
 }
 
@@ -3404,8 +3525,11 @@ unsafe fn process_completed_user_callback_outer_dispatch(
 fn observe_completed_gdi_batch_flush(
     nt_handler: &mut ExecNtHandler,
     original_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
-    records: u64,
+    receipt: u64,
 ) {
+    let receipt = nt_user_callback::GdiBatchFlushReceipt::unpack(receipt);
+    GDI_BATCH_FLUSH_FAILURES.fetch_add(u64::from(receipt.failed_flushes), Ordering::Relaxed);
+    let records = u64::from(receipt.records);
     if records == 0 { return; }
     let Some(caller) = original_caller else { return; };
     GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);

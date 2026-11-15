@@ -538,14 +538,37 @@ pub(super) unsafe fn syscall_nt_route(
                 assert_eq!(res.status, nt_user_callback::STATUS_PENDING as u32);
                 assert_eq!(nt_handler.out_writes_n, 0,
                     "suspended initial creation cannot publish output before provider return");
-                let handoff = admit_pending_win32k_dispatch(
+                let mut handoff = admit_pending_win32k_dispatch(
                     &mut nt_handler,
                     HostedContinuationDestination::InitialThread(
                         nt_user_host::process_create_callout::InitialThreadReplyOrigin::new(
                             caller.expect("suspended initial creation has exact caller"), target,
                         ).expect("foreign initial Reply requires distinct valid owners"),
                     ),
+                    None,
                 );
+                // A callout that suspended must leave exactly one admitted wait. A user
+                // callback here would need the creating caller's Reply moved into the target,
+                // and a callout with no owner has nothing to resume it: neither is answered.
+                let unowned: Option<&[u8]> = if handoff.retained_failure {
+                    None
+                } else if handoff.fenced {
+                    Some(b"initial-callout-handoff")
+                } else if handoff.callback_suspended {
+                    Some(b"initial-callout-user-callback")
+                } else if !handoff.parked {
+                    Some(b"initial-callout-yield-owner")
+                } else {
+                    None
+                };
+                if let Some(reason) = unowned {
+                    if fence_win32k_handoff_caller(reason, pi, current_tid, lp.msg.m0) {
+                        handoff.callback_suspended = false;
+                        handoff.parked = true;
+                    } else {
+                        handoff.retained_failure = true;
+                    }
+                }
                 if handoff.retained_failure {
                     // The pending win32k snapshot and original Reply remain owned.
                     // Never turn this refusal into a process-creation reply.
@@ -558,10 +581,6 @@ pub(super) unsafe fn syscall_nt_route(
                     lp.exit.record(b"win32k-initial-dispatch-retained");
                     return ControlFlow::Break(Turn::Exit);
                 }
-                assert!(handoff.parked || handoff.callback_suspended,
-                    "suspended process callout lost its native yield owner");
-                assert!(!handoff.callback_suspended,
-                    "initial process callout user callback requires retained source Reply transfer");
                 sc.component_suspension_admitted_dispatch_id = handoff.admitted_dispatch_id;
                 sc.component_suspension_park_request = handoff.parked;
                 sc.redirected_user_callback = handoff.parked;

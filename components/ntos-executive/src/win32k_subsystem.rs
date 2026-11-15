@@ -770,6 +770,9 @@ pub const SH_REQ_PROCESS_ID: u64 = 0x138; // in: routed caller's real Process Ma
 pub const SH_REQ_NESTED_CALLBACK: u64 = 0x140; // in: dispatch is nested inside a parked user callback
 pub const SH_REQ_CLIENT_PI: u64 = 0x148; // in: executive hosted-process index for this dispatch
 pub const SH_REQ_CLIENT_TEB: u64 = 0x150; // in: routed caller's current-thread TEB user VA
+pub const SH_REQ_CALLBACK_RETURNED: u64 = 0x158; // in: `callback_resume_flush_word` of the callback this resume returns from, or 0
+const _: () = assert!(SH_REQ_CLIENT_TEB + 8 <= SH_REQ_CALLBACK_RETURNED);
+const _: () = assert!(SH_REQ_CALLBACK_RETURNED + 8 <= SH_REQ_CALLER_SP);
 pub const SH_REQ_CALLER_SP: u64 = 0x160; // in: real syscall-entry RSP when tail args live on the client stack
 pub const SH_REQ_THREAD_ID: u64 = 0x168; // in: routed caller's real Process Manager tid (u64)
 pub const SH_REQ_EPROCESS: u64 = 0x170; // in: Process Manager's parked EPROCESS body, or 0
@@ -787,7 +790,7 @@ pub const SH_REQ_TOKEN_USER_SID_PTR: u64 = 0x1C8; // in: component VA of native 
 pub const WIN32K_TOKEN_USER_SID_MAX: usize = 68; // SID header + 15 sub-authorities
 pub const SH_REQ_GENERATION: u64 = 0x1F8; // in: exact hosted-process identity generation
 pub const SH_DISPATCH_RETURN: u64 = 0x1D0; // out: correlated operation provenance, kind committed last
-pub const SH_REQ_BATCH_RECORDS: u64 = 0x1F0; // out: real batch records flushed by this completed dispatch
+pub const SH_REQ_BATCH_RECORDS: u64 = 0x1F0; // out: packed `GdiBatchFlushReceipt` of this completed dispatch
 const _: () = assert!(SH_REQ_TOKEN_USER_SID_PTR + 8 <= SH_DISPATCH_RETURN);
 const _: () = assert!(SH_DISPATCH_RETURN + 32 <= SH_REQ_BATCH_RECORDS);
 const _: () = assert!(SH_REQ_BATCH_RECORDS + 8 <= SH_REQ_GENERATION);
@@ -1329,10 +1332,6 @@ const GDI_OBJECT_TYPE_BRUSH: u32 = 0x0010_0000;
 /// longer relies on the single per-TCB `reply_to`, so a nested faulting SSN can't orphan an outer
 /// caller's reply.
 pub const SSN_TEST_FAULT: u64 = 0x1FFE;
-/// Private executive selector for ReactOS' registered `WIN32_CALLOUTS_FPNS.BatchFlushRoutine`.
-/// Real NT calls this through `KeGdiFlushUserBatch` before every win32k syscall when
-/// `TEB.GdiBatchCount != 0`; it is not an SSDT service.
-pub const SSN_GDI_BATCH_FLUSH_CALLOUT: u64 = 0x1FFD;
 /// Private executive selector for the provider registered in
 /// `WIN32_CALLOUTS_FPNS.JobCallout`.
 pub const SSN_WIN32_JOB_CALLOUT: u64 = 0x1FFC;
@@ -11013,6 +11012,16 @@ use nt_kernel_exec::win32k_lane_context::LaneCurrentIds;
 static WIN32K_LANE_CURRENT_IDS: [LaneCurrentIds; WIN32K_LANE_CAPACITY + 1] =
     [const { LaneCurrentIds::new(MAX_PI as u64) }; WIN32K_LANE_CAPACITY + 1];
 
+static WIN32K_LANE_CALLBACK_FLUSHES:
+    [nt_user_callback::CallbackFlushLedger; WIN32K_LANE_CAPACITY + 1] =
+    [const { nt_user_callback::CallbackFlushLedger::new() }; WIN32K_LANE_CAPACITY + 1];
+
+fn current_lane_callback_flushes() -> &'static nt_user_callback::CallbackFlushLedger {
+    let ordinal = WIN32K_PHYSICAL_KPCR_LAYOUT.ordinal(current_kpcr_va())
+        .expect("current physical win32k KPCR must be registered");
+    &WIN32K_LANE_CALLBACK_FLUSHES[ordinal]
+}
+
 fn current_lane_ids() -> &'static LaneCurrentIds {
     let kpcr = current_kpcr_va();
     let ordinal = WIN32K_PHYSICAL_KPCR_LAYOUT.ordinal(kpcr)
@@ -15620,12 +15629,24 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         // a completion the executive has not asked for: the phase slip is UNREPRESENTABLE, at any
         // depth. Nesting is bounded only by this component's own C stack.
         let mut out = W32_USER_CALLBACK_LABEL << 12;
+        let client_returned;
         loop {
             // The reply's message label is always 0 (`spawn_hosts::REQUEST_TAG_LEN`); the request
             // TAG rides in MR0.
             let (_label, tag, _, _, _) = crate::driver_launch::call_on(out);
             match tag {
                 W32_USER_CALLBACK_RESUME_LABEL => {
+                    // Consume the word with this resume: it names one returned callback.
+                    let returned_word = (WIN32K_SHARED_VADDR + SH_REQ_CALLBACK_RETURNED) as *mut u64;
+                    let returned = read_volatile(returned_word);
+                    write_volatile(returned_word, 0);
+                    client_returned = returned != 0
+                        && returned == nt_user_host::component_pump::callback_resume_flush_word(
+                            nt_user_host::component_pump::CallbackResumeOrigin::Return {
+                                enclosing_callback: false,
+                            },
+                            request.dispatch_id, request.callback_id,
+                        );
                     if !restore_user_callback_execution_context(callback_request_context, true) {
                         return 0xC000_000Du32 as i32;
                     }
@@ -15662,6 +15683,11 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         if !restore_user_callback_execution_context(callback_request_context, false) {
             return 0xC000_000Du32 as i32;
         }
+        if client_returned
+            && !flush_returned_callback_gdi_batch(callback_request_context, frame, request, reply)
+        {
+            return 0xC000_000Du32 as i32;
+        }
 
         let buf = core::ptr::addr_of!((*frame).payload) as u64;
         if !out_buf.is_null() {
@@ -15672,6 +15698,74 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         }
         reply.status
     }
+}
+
+static WIN32K_CALLBACK_FLUSH_FAILURE_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// `KeUserModeCallback` flushes the returning thread's GDI batch before its caller continues
+/// (`KeGdiFlushUserBatch` after `KiCallUserMode`). The flush runs here, in the continuation
+/// that issued the callback and on its lane, so a wait it issues is a wait of this dispatch.
+///
+/// The callback's reply lives in the shared frame that every wait and nested dispatch on this
+/// lane reuses, and win32k reads it only after this returns. The reply is therefore kept
+/// across the flush and put back before the caller sees it.
+unsafe fn flush_returned_callback_gdi_batch(
+    context: Win32kCallbackRequestContext,
+    frame: *mut nt_user_callback::CallbackFrame,
+    request: nt_user_callback::CallbackHeader,
+    reply: nt_user_callback::CallbackHeader,
+) -> bool {
+    let client_teb = context.client_teb;
+    if !crate::GDI_USER_BATCH_FLUSH || client_teb == 0 {
+        return true;
+    }
+    let count_field = (client_teb + nt_user_callback::TEB_GDI_BATCH_COUNT) as *const u32;
+    let count = read_volatile(count_field);
+    if count == 0 {
+        return true;
+    }
+    let retained = (request.output_capacity as usize).min(nt_user_callback::CALLBACK_PAYLOAD_MAX);
+    let mut payload = [0u8; nt_user_callback::CALLBACK_PAYLOAD_MAX];
+    let shared_payload = core::ptr::addr_of_mut!((*frame).payload) as *mut u8;
+    core::ptr::copy_nonoverlapping(shared_payload, payload.as_mut_ptr(), retained);
+
+    let status = {
+        let _kernel_mode = thread_execution::PreviousModeScope::enter(
+            nt_kernel_abi::ps_hosted_x64::ThreadPreviousMode::KernelMode,
+        );
+        // The flush routine reads the batch through the current thread's TEB.
+        write_volatile((current_kpcr_va() + 0x30) as *mut u64, client_teb);
+        dispatch_gdi_batch_flush_callout(u64::from(context.pi), client_teb)
+    };
+    // Reselect the caller's execution context, including the TEB the dispatch runs under.
+    if !restore_user_callback_execution_context(context, false) {
+        return false;
+    }
+    core::ptr::copy_nonoverlapping(payload.as_ptr(), shared_payload, retained);
+    write_volatile(core::ptr::addr_of_mut!((*frame).header), reply);
+
+    let remaining = read_volatile(count_field);
+    let offset = read_volatile(
+        (client_teb + nt_user_callback::TEB_GDI_TEB_BATCH_OFFSET) as *const u32,
+    );
+    let consumed = status == 0 && remaining == 0 && offset == 0;
+    current_lane_callback_flushes().credit(count, consumed);
+    if !consumed && WIN32K_CALLBACK_FLUSH_FAILURE_TRACES.fetch_add(1, Ordering::Relaxed) < 8 {
+        print_str(b"[gdi-batch] callback-return flush failed pi/tid=");
+        print_u64(u64::from(context.pi));
+        print_str(b"/");
+        print_u64(context.tid);
+        print_str(b" status=0x");
+        print_hex(status as u32);
+        print_str(b" records/remaining/offset=");
+        print_u64(u64::from(count));
+        print_str(b"/");
+        print_u64(u64::from(remaining));
+        print_str(b"/");
+        print_u64(u64::from(offset));
+        print_str(b"\n");
+    }
+    true
 }
 
 // Historical pre-Phase-2A shortcut retained outside every build only as nearby bring-up context.
@@ -17948,8 +18042,8 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     // KiSystemCallHandler flushes the current user's GDI batch before calling the requested
     // win32k SSDT entry. Both effects belong to one physical dispatch so a callback, fault, or
     // service wait retains the original syscall and Reply rather than an independent flush call.
-    let mut flushed_records = 0u64;
-    if user_origin && ssn != SSN_GDI_BATCH_FLUSH_CALLOUT && crate::GDI_USER_BATCH_FLUSH {
+    let mut flushed_records = 0u32;
+    if user_origin && crate::GDI_USER_BATCH_FLUSH {
         let count = read_volatile(
             (client_teb + nt_user_callback::TEB_GDI_BATCH_COUNT) as *const u32,
         );
@@ -17976,13 +18070,14 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
                 let status = 0xC000_0206u32 as u64;
                 return (status as u32 as i32, status);
             }
-            flushed_records = u64::from(count);
+            flushed_records = count;
         }
     }
+    // Callbacks this dispatch issues flush the client's batch as they return; those flushes
+    // are reported with this dispatch, not with a dispatch nested inside one of them.
+    let callback_flushes = current_lane_callback_flushes().enter_dispatch();
     let paint_window_valid = paint_stage_valid && resolve_window_handle(a0) != 0;
-    let result = if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT {
-        dispatch_gdi_batch_flush_callout(client_pi, client_teb)
-    } else if ssn == SSN_WIN32_JOB_USER_HANDLE {
+    let result = if ssn == SSN_WIN32_JOB_USER_HANDLE {
         dispatch_win32_job_user_handle(
             a0,
             a1,
@@ -18065,7 +18160,9 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     // slot while this stack is suspended; this final write restores the exact parent's receipt.
     write_volatile(
         (WIN32K_SHARED_VADDR + SH_REQ_BATCH_RECORDS) as *mut u64,
-        flushed_records,
+        nt_user_callback::GdiBatchFlushReceipt { records: flushed_records, failed_flushes: 0 }
+            .merged(callback_flushes.receipt())
+            .pack(),
     );
     (result as u32 as i32, result)
 }

@@ -36,6 +36,7 @@ pub(crate) use pending_dispatch::{
     select_and_restore_shared_resume_snapshot,
     restore_shared_resume_snapshot_effect, SharedResumeRestoreEffect, SharedResumeSnapshot,
     take_pending_lpc_wait_dispatch, take_pending_provider_wait_dispatch,
+    pending_yield_observation, fence_pending_yield,
     restore_pending_lpc_wait_dispatch, restore_pending_provider_wait_dispatch,
     LpcWaitPumpCompletion,
     PendingLpcWaitDispatch, PendingProviderWaitDispatch, ProviderWaitPumpCompletion,
@@ -4788,23 +4789,16 @@ fn callback_client_from_frame(
     Some(client)
 }
 
-unsafe fn flush_returned_user_callback_gdi_batch(
-    request: nt_user_callback::CallbackHeader,
-    client: crate::spawn_hosts::UserCallbackClient,
-) {
+/// Read the batch a returned callback left in its TEB before the provider consumes it.
+/// The flush itself is the resumed continuation's work, on its own lane.
+unsafe fn observe_returned_user_callback_gdi_batch(client: crate::spawn_hosts::UserCallbackClient) {
     let Some(teb_alias) = client_callback_teb_alias(client) else {
         return;
     };
-    crate::ke_gdi_flush_user_batch(
+    crate::observe_gdi_batch_before_dispatch(
         win32k_client_context_from_callback_client(client),
         teb_alias,
     );
-    let identity = nt_user_callback::ClientThreadIdentity::new(
-        request.client_pi,
-        request.client_tid,
-        request.client_badge,
-    );
-    reassert_top_client_callback_window(&identity);
 }
 
 static CALLBACK_RETURN_SERVICE_WAIT_TRACES: AtomicU64 = AtomicU64::new(0);
@@ -4916,6 +4910,12 @@ unsafe fn resume_suspended_user_callback_component(
             0xC000_000Du32 as i32, 0,
         );
     }
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_CALLBACK_RETURNED) as *mut u64,
+        nt_user_host::component_pump::callback_resume_flush_word(
+            origin, request.dispatch_id, request.callback_id,
+        ),
+    );
     let mut pr = crate::spawn_hosts::component_pump_resume_user_callback(&channel);
     if pr.provider_wait_capture_refusal.is_some() {
         let _ = retain_callback_resume_refusal(claim, channel, pr);
@@ -6077,13 +6077,13 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         print_hex(callback_status as u32);
         print_str(b"\n");
     }
-    // ReactOS flushes the caller's deferred GDI batch after `KiCallUserMode` returns from a
-    // `KeUserModeCallback`, before the suspended win32k continuation runs again. Normal win32k
-    // syscalls already do this at syscall entry; callbacks need the same kernel-owned boundary so
-    // user32/GDI work performed inside WndProc cannot keep stale records across chained callbacks.
-    flush_returned_user_callback_gdi_batch(request, completed_client);
-    // Nested GDI work may have changed runtime admission. Keep the active frame
-    // and its parked continuation if the retained caller can no longer resume.
+    // `KeUserModeCallback` flushes the caller's deferred GDI batch after `KiCallUserMode`
+    // returns, on the returning thread. The provider does that as its continuation resumes
+    // (`flush_returned_callback_gdi_batch`), so a wait the flush issues is a wait of this
+    // dispatch on its own lane. The root only reads the batch here, before it is consumed.
+    observe_returned_user_callback_gdi_batch(completed_client);
+    reassert_top_client_callback_window(&identity);
+    // Keep the active frame and its parked continuation if the retained caller cannot resume.
     let frame_still_current = {
         let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
         active.top_for(&identity).copied() == Some(active_frame)
@@ -6105,9 +6105,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         return None;
     }
     let claim = reserve_callback_resume(active_frame)?;
-    // The flush can itself enter win32k, and win32k reuses the same shared callback page for every
-    // nested dispatch. Re-publish the reply after the flush so the parked `KeUserModeCallback`
-    // continuation consumes the result for THIS callback, not the last nested dispatch's header.
+    // win32k reuses the same shared callback page for every nested dispatch. Publish the reply
+    // last so the parked `KeUserModeCallback` continuation consumes the result for THIS
+    // callback, not the last nested dispatch's header.
     if !publish_callback_reply(
         request,
         completed_client,
@@ -7531,25 +7531,6 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     )
 }
 
-pub(crate) unsafe fn win32k_flush_user_gdi_batch(client: Win32kClientContext) -> Win32kDispatchOutcome {
-    const STATUS_INVALID_PARAMETER: u64 = 0xC000_000Du32 as u64;
-
-    if client.pi == 0 || client.teb == 0 {
-        return Win32kDispatchOutcome::Known { value: STATUS_INVALID_PARAMETER, completed: true };
-    }
-
-    win32k_dispatch_wide(
-        win32k_subsystem::SSN_GDI_BATCH_FLUSH_CALLOUT,
-        0,
-        0,
-        0,
-        0,
-        0,
-        &[],
-        client,
-    )
-}
-
 pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     ssn: u64,
     a0: u64,
@@ -7606,8 +7587,9 @@ fn capture_win32k_dispatch_return(
     receipt?.authenticate(dispatch_id, ssn, result, completed).ok()
 }
 
-/// The provider writes this count immediately before the same physical dispatch completes.
-/// The authenticated return receipt supplies its exact dispatch id, SSN, and result.
+/// The provider writes this packed `GdiBatchFlushReceipt` immediately before the same physical
+/// dispatch completes. The authenticated return receipt supplies its exact dispatch id, SSN,
+/// and result.
 pub(crate) unsafe fn completed_gdi_batch_records(
     returned: Option<nt_user_callback::DispatchReturn>,
     result: u64,
