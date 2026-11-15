@@ -1070,13 +1070,6 @@ pub fn mark() -> usize {
     unsafe { read_word(CTR) }
 }
 
-/// Mapped bytes above the current bump mark. The root heap maps more on demand, so this is
-/// not what an allocation can obtain; see [`obtainable`].
-pub fn remaining() -> usize {
-    let _guard = HeapLockGuard::acquire();
-    durable_extent().committed_free()
-}
-
 /// Bytes an allocation above the bump mark can still obtain: mapped and free, plus the pages
 /// the root heap may still commit below its transient lane and Untyped memory can still back.
 pub fn obtainable() -> usize {

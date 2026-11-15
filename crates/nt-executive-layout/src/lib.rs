@@ -31,8 +31,9 @@ const GIB: u64 = 1 << 30;
 pub const HEAP_BASE: u64 = 0x0000_0100_1e00_0000;
 /// The root executive's heap reservation in 4 KiB frames, including its transient lane.
 /// Physical pages beyond the initial commitment are mapped only when allocations need them;
-/// the leaf page tables for the whole reservation are built at boot.
-pub const ROOT_HEAP_RESERVATION_FRAMES: u64 = 22528;
+/// the leaf page tables for the whole reservation are built at boot, one 4 KiB table per
+/// 2 MiB. 256 MiB is three times the 84 MiB of durable heap the first logon filled.
+pub const ROOT_HEAP_RESERVATION_FRAMES: u64 = 65536;
 /// The largest heap a spawned component may declare. A component's VSpace keeps this band
 /// above [`HEAP_BASE`] clear of its other regions.
 pub const COMPONENT_HEAP_MAX_FRAMES: u64 = 22528;
@@ -71,15 +72,6 @@ pub mod root {
     /// The root heap: durable pages committed on demand, then the transient lane at its top.
     pub const HEAP: Region =
         Region::new("root heap", HEAP_BASE, ROOT_HEAP_RESERVATION_FRAMES * PAGE);
-    /// One [`DEMAND_SCRATCH_WINDOW`] per static process, indexed by process index.
-    pub const STATIC_SCRATCH: Region = Region::new(
-        "static process scratch windows",
-        HEAP.end(),
-        STATIC_PROCESS_COUNT as u64 * DEMAND_SCRATCH_WINDOW,
-    );
-    /// Stack, environment and heap mirrors of the last static process.
-    pub const SHELL_MIRRORS: Region =
-        Region::new("shell process mirrors", STATIC_SCRATCH.end(), 4 * MIB);
     /// Demand-mapped large allocations of the win32k provider.
     pub const PROVIDER_LARGE_POOL: Region =
         Region::new("provider large pool", PRIVATE_VM_LIMIT, 64 * MIB);
@@ -114,6 +106,16 @@ pub mod root {
     /// Mirrors of hosted worker lanes outside the legacy slots.
     pub const WORKER_MIRRORS: Region =
         Region::new("worker lane mirrors", 0x0000_0104_0000_0000, 4 * GIB);
+    /// One [`DEMAND_SCRATCH_WINDOW`] per static process, indexed by process index. The windows
+    /// have no fixed relation to the heap; they followed it until it needed their addresses.
+    pub const STATIC_SCRATCH: Region = Region::new(
+        "static process scratch windows",
+        WORKER_MIRRORS.end(),
+        STATIC_PROCESS_COUNT as u64 * DEMAND_SCRATCH_WINDOW,
+    );
+    /// Stack, environment and heap mirrors of the last static process.
+    pub const SHELL_MIRRORS: Region =
+        Region::new("shell process mirrors", STATIC_SCRATCH.end(), 4 * MIB);
     /// Virtual slots of owned scatter-gather graphs. They are mapped in driver-host VSpaces;
     /// the root keeps the same band clear.
     pub const DMA_GRAPH_SLOTS: Region =
@@ -124,8 +126,6 @@ pub mod root {
         FIXED_LOW,
         FILE_POOL,
         HEAP,
-        STATIC_SCRATCH,
-        SHELL_MIRRORS,
         PROVIDER_LARGE_POOL,
         PROVIDER_BULK_ARENA,
         PE_SCRATCH,
@@ -136,6 +136,8 @@ pub mod root {
         DRIVER_WORKER_ALIASES,
         CONTIGUOUS_RAM_APERTURE,
         WORKER_MIRRORS,
+        STATIC_SCRATCH,
+        SHELL_MIRRORS,
         DMA_GRAPH_SLOTS,
     ];
 

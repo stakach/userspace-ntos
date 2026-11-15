@@ -1373,9 +1373,8 @@ pub const CSRSS_BADGE: u64 = 2;
 // executive mappings (POOL_VADDR 0x1500, SRVBUF 0x1400, win32k pools 0x0A00 — all far below
 // 0x2000). Their page tables are mapped per-window at spawn (see `map_demand_scratch_pts`).
 pub const DEMAND_SCRATCH_WINDOW: u64 = nt_executive_layout::DEMAND_SCRATCH_WINDOW; // 64 MiB per process
-                                                    // The static-process lanes begin exactly after the executive's runtime-mapped heap and the 7 ×
-                                                    // 64 MiB windows remain below PRIVATE_VM_LIMIT. `ensure_executive_paging` builds every missing
-                                                    // paging level, so this layout does not depend on boot-image page tables.
+// The static-process windows sit in their own band above the worker mirrors.
+// `ensure_executive_paging` builds every missing paging level when a window is first mapped.
 pub const SMSS_SCRATCH_BASE: u64 = nt_executive_layout::root::STATIC_SCRATCH.base;
 const _: () = assert!(SMSS_SCRATCH_BASE & 0x1f_ffff == 0);
 const _: () = assert!(
@@ -5379,7 +5378,9 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
     let untyped_used = UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed);
     let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
     let untyped_free = untyped_total.saturating_sub(untyped_used);
-    let executive_heap_remaining = allocator::remaining();
+    // The root heap commits pages as allocations need them, so what it has mapped above the
+    // bump mark says little; what it can still obtain is the bound.
+    let executive_heap_remaining = allocator::obtainable();
     let slots_total =
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_available = root_slot_available_count();

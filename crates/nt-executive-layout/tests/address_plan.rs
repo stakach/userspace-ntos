@@ -54,9 +54,7 @@ fn every_root_band_is_where_the_plan_says() {
     let plan: &[(&Region, u64, u64)] = &[
         (&root::FIXED_LOW, 0x0100_0000_0000, 0x0100_1500_0000),
         (&root::FILE_POOL, 0x0100_1500_0000, 0x0100_1800_0000),
-        (&root::HEAP, 0x0100_1e00_0000, 0x0100_2380_0000),
-        (&root::STATIC_SCRATCH, 0x0100_2380_0000, 0x0100_3f80_0000),
-        (&root::SHELL_MIRRORS, 0x0100_3f80_0000, 0x0100_3fc0_0000),
+        (&root::HEAP, 0x0100_1e00_0000, 0x0100_2e00_0000),
         (&root::PROVIDER_LARGE_POOL, 0x0100_4000_0000, 0x0100_4400_0000),
         (&root::PROVIDER_BULK_ARENA, 0x0100_4400_0000, 0x0100_4800_0000),
         (&root::PE_SCRATCH, 0x0100_4800_0000, 0x0100_4820_0000),
@@ -67,6 +65,8 @@ fn every_root_band_is_where_the_plan_says() {
         (&root::DRIVER_WORKER_ALIASES, 0x0102_0000_0000, 0x0103_0000_0000),
         (&root::CONTIGUOUS_RAM_APERTURE, 0x0103_0000_0000, 0x0103_2000_0000),
         (&root::WORKER_MIRRORS, 0x0104_0000_0000, 0x0105_0000_0000),
+        (&root::STATIC_SCRATCH, 0x0105_0000_0000, 0x0105_1c00_0000),
+        (&root::SHELL_MIRRORS, 0x0105_1c00_0000, 0x0105_1c40_0000),
         (&root::DMA_GRAPH_SLOTS, 0x0106_0000_0000, 0x0106_1000_0000),
     ];
     assert_eq!(plan.len(), root::REGIONS.len(), "a band is missing from the plan");
@@ -97,6 +97,8 @@ fn the_root_and_component_heaps_share_a_base_and_nothing_else() {
     assert_eq!(component::HEAP.base, HEAP_BASE);
     assert_eq!(root::HEAP.frames(), ROOT_HEAP_RESERVATION_FRAMES);
     assert_eq!(component::HEAP.frames(), COMPONENT_HEAP_MAX_FRAMES);
+    assert_eq!(ROOT_HEAP_RESERVATION_FRAMES * PAGE, 256 << 20);
+    assert_eq!(COMPONENT_HEAP_MAX_FRAMES * PAGE, 88 << 20);
     // The root builds one leaf page table per 2 MiB of its reservation at boot.
     assert_eq!(root::HEAP.base % TABLE_SPAN, 0);
     assert_eq!(root::HEAP.len % TABLE_SPAN, 0);
@@ -148,8 +150,8 @@ fn every_process_slot_has_a_badge() {
 /// Bands numbered below the private-memory limit stay below it; root-only bands start at it.
 #[test]
 fn the_private_memory_limit_separates_the_two_groups() {
-    assert!(root::SHELL_MIRRORS.end() <= PRIVATE_VM_LIMIT);
     assert!(root::HEAP.end() <= PRIVATE_VM_LIMIT);
+    assert!(root::STATIC_SCRATCH.base >= PRIVATE_VM_LIMIT);
     assert_eq!(root::PROVIDER_LARGE_POOL.base, PRIVATE_VM_LIMIT);
     assert!(component::SECTION_VIEWS.end() <= PRIVATE_VM_LIMIT);
 }
