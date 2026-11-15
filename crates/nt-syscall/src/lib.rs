@@ -319,6 +319,10 @@ pub enum NativeService {
     NtCancelIoFileEx,
     /// Query Power Manager state (`SystemPowerCapabilities`, `SystemBatteryState`).
     NtPowerInformation,
+    /// Post a change-notification request on an open registry key.
+    NtNotifyChangeKey,
+    /// `NtNotifyChangeKey` with an optional second key in another hive.
+    NtNotifyChangeMultipleKeys,
 }
 
 impl NativeService {
@@ -534,6 +538,8 @@ impl NativeService {
             NtAllocateLocallyUniqueId => "NtAllocateLocallyUniqueId",
             NtCancelIoFileEx => "NtCancelIoFileEx",
             NtPowerInformation => "NtPowerInformation",
+            NtNotifyChangeKey => "NtNotifyChangeKey",
+            NtNotifyChangeMultipleKeys => "NtNotifyChangeMultipleKeys",
             NtImpersonateClientOfPort => "NtImpersonateClientOfPort",
         }
     }
@@ -757,6 +763,8 @@ impl NativeService {
         NativeService::NtGetCurrentProcessorNumberEx,
         NativeService::NtCancelIoFileEx,
         NativeService::NtPowerInformation,
+        NativeService::NtNotifyChangeKey,
+        NativeService::NtNotifyChangeMultipleKeys,
     ];
 }
 

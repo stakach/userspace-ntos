@@ -148,7 +148,7 @@ pub(crate) unsafe fn set_value(
         DriverRegistryHandleTarget::System { .. } => {
             unreachable!("SYSTEM value SET requires retained mutation work")
         }
-        DriverRegistryHandleTarget::Generic { key, .. } => {
+        DriverRegistryHandleTarget::Generic { key, path } => {
             crate::config_manager_runtime_key_operation(
                 key,
                 nt_config_abi::runtime_key_op::SET_VALUE,
@@ -156,8 +156,12 @@ pub(crate) unsafe fn set_value(
                 name,
                 ty,
                 data,
-            )
-            .map(|_| ())
+            )?;
+            // The value is stored; a missing handler only means no session can be waiting.
+            if let Ok(handler) = driver_registry_live_handler() {
+                handler.registry_key_values_changed(path.as_str());
+            }
+            Ok(())
         }
     }
 }
@@ -178,7 +182,7 @@ pub(crate) unsafe fn delete_value(
         DriverRegistryHandleTarget::System { .. } => {
             unreachable!("SYSTEM value DELETE requires retained mutation work")
         }
-        DriverRegistryHandleTarget::Generic { key, .. } => {
+        DriverRegistryHandleTarget::Generic { key, path } => {
             crate::config_manager_runtime_key_operation(
                 key,
                 nt_config_abi::runtime_key_op::DELETE_VALUE,
@@ -186,8 +190,12 @@ pub(crate) unsafe fn delete_value(
                 name,
                 0,
                 &[],
-            )
-            .map(|_| ())
+            )?;
+            // The value is stored; a missing handler only means no session can be waiting.
+            if let Ok(handler) = driver_registry_live_handler() {
+                handler.registry_key_values_changed(path.as_str());
+            }
+            Ok(())
         }
     }
 }

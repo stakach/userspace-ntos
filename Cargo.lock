@@ -290,6 +290,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nt-config-notify"
+version = "0.1.0"
+
+[[package]]
 name = "nt-config-server"
 version = "0.1.0"
 dependencies = [

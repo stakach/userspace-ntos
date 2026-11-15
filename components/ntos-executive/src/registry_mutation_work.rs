@@ -39,6 +39,92 @@ enum HostedCompletion {
     SystemLocale { lease: SystemHiveKeyLease, physical_path: String, locale_id: u32 },
 }
 
+/// What a committed SYSTEM mutation changed, named by the affected key's physical path.
+#[derive(Clone, Copy)]
+enum CommittedChange {
+    Values,
+    Security,
+    KeyDeleted,
+    KeyCreated,
+}
+
+fn joined_key(parent: &str, leaf: &str) -> Option<String> {
+    let mut path = String::new();
+    path.try_reserve(parent.len() + 1 + leaf.len()).ok()?;
+    path.push_str(parent);
+    path.push('\\');
+    path.push_str(leaf);
+    Some(path)
+}
+
+fn owned_key(path: &str) -> Option<String> {
+    let mut owned = String::new();
+    owned.try_reserve(path.len()).ok()?;
+    owned.push_str(path);
+    Some(owned)
+}
+
+/// The change a caller's mutation makes once its COMMIT is durable. A provider's created key
+/// is reported when its publication OPEN names it.
+fn committed_change(caller: &Caller) -> Option<(String, CommittedChange)> {
+    match caller {
+        Caller::Hosted(HostedCaller { completion, .. }) => match completion {
+            HostedCompletion::Create { parent_target, leaf, .. } =>
+                Some((joined_key(&parent_target.physical_path, leaf)?, CommittedChange::KeyCreated)),
+            HostedCompletion::Existing { target, kind, .. } => Some((
+                owned_key(&target.physical_path)?,
+                match kind {
+                    ExistingMutationKind::SetValue | ExistingMutationKind::DeleteValue =>
+                        CommittedChange::Values,
+                    ExistingMutationKind::SetSecurity => CommittedChange::Security,
+                    ExistingMutationKind::DeleteKey => CommittedChange::KeyDeleted,
+                },
+            )),
+            HostedCompletion::SystemLocale { physical_path, .. } =>
+                Some((owned_key(physical_path)?, CommittedChange::Values)),
+        },
+        Caller::Provider(caller) => caller.committed_change(),
+    }
+}
+
+unsafe fn report_committed(handler: &mut ExecNtHandler, path: &str, change: CommittedChange) {
+    match change {
+        CommittedChange::Values => handler.registry_key_values_changed(path),
+        CommittedChange::Security => handler.registry_key_security_changed(path),
+        CommittedChange::KeyDeleted => handler.registry_key_deleted(path),
+        CommittedChange::KeyCreated => handler.registry_subkey_created(path),
+    }
+}
+
+/// Report now when a handler is present; otherwise keep the change for the next hosted redrive.
+unsafe fn note_committed(context: &mut HostedContext<'_>, change: Option<(String, CommittedChange)>) {
+    let Some((path, change)) = change else { return; };
+    match context.as_mut() {
+        Some((handler, _)) => report_committed(handler, &path, change),
+        None => {
+            let queue = &mut *core::ptr::addr_of_mut!(COMMITTED_CHANGES);
+            if queue.try_reserve(1).is_ok() {
+                queue.push((path, change));
+                COMMITTED_CHANGES_READY.store(true, Ordering::Release);
+                NEXT.store(monotonic_time_100ns(), Ordering::Release);
+            }
+        }
+    }
+}
+
+unsafe fn report_queued_committed(handler: &mut ExecNtHandler) {
+    if !COMMITTED_CHANGES_READY.swap(false, Ordering::AcqRel) { return; }
+    let queued = {
+        let _durable = allocator::enter_durable();
+        core::mem::take(&mut *core::ptr::addr_of_mut!(COMMITTED_CHANGES))
+    };
+    for (path, change) in &queued {
+        report_committed(handler, path, *change);
+    }
+    let _durable = allocator::enter_durable();
+    drop(queued);
+}
+
 #[derive(Clone, Copy)]
 enum ExistingMutationKind {
     SetValue,
@@ -574,6 +660,10 @@ fn next_work_id() -> u64 {
     id
 }
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// SYSTEM changes committed by a provider pump, which has no handler to report them to the
+/// registry notify sessions. The next hosted redrive reports them in commit order.
+static mut COMMITTED_CHANGES: Vec<(String, CommittedChange)> = Vec::new();
+static COMMITTED_CHANGES_READY: AtomicBool = AtomicBool::new(false);
 static PENDING: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_LOCALE_PENDING: AtomicU64 = AtomicU64::new(0);
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -1372,7 +1462,8 @@ fn has_matching(predicate: impl Fn(ProviderLogicalCaller) -> bool) -> bool {
 }
 
 pub(crate) fn next_deadline() -> Option<u64> {
-    let work = (PENDING.load(Ordering::Acquire) != 0).then(|| NEXT.load(Ordering::Acquire));
+    let work = (PENDING.load(Ordering::Acquire) != 0
+        || COMMITTED_CHANGES_READY.load(Ordering::Acquire)).then(|| NEXT.load(Ordering::Acquire));
     let service = unsafe {
         spawn_hosts::shared_ingress::owner::runtime::retained_service_resume_next_deadline()
     };
@@ -1389,6 +1480,7 @@ pub(crate) fn wake_due(now: u64) -> u64 {
 
 /// Top-level only. The selected owner is moved, never borrowed, across component IPC.
 pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_execution::Queue) {
+    report_queued_committed(handler);
     redrive_inner(Some((handler, queue)), None);
 }
 
@@ -1739,6 +1831,7 @@ unsafe fn advance(
                 _ => { CM_RUNTIME_SYSTEM_CREATE_KEYS.fetch_add(1, Ordering::Relaxed); }
             }
             LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(outcome.generation, Ordering::AcqRel);
+            note_committed(context, committed_change(&work.caller));
             if outcome.has_pending_device_action {
                 if !CONFIG_DEVICE_ACTION_PENDING.swap(true, Ordering::AcqRel) {
                     config_manager_request_device_action_wake();
@@ -1784,7 +1877,10 @@ unsafe fn advance(
                     let _ = config_manager_retire_system_hive_key(opened.lease);
                     Err(work.status)
                 }
-                Ok(opened) => match registry_key_targets::install_system(CmSystemKeyTarget {
+                Ok(opened) => { if matches!(&work.caller, Caller::Provider(_)) {
+                    note_committed(context,
+                        owned_key(&opened.physical_path).map(|path| (path, CommittedChange::KeyCreated)));
+                } match registry_key_targets::install_system(CmSystemKeyTarget {
                     lease: opened.lease,
                     physical_path: nt_hive_core::canon_path(&opened.physical_path),
                 }) {
@@ -1797,7 +1893,7 @@ unsafe fn advance(
                         let _ = config_manager_retire_system_hive_key(opened.lease);
                         Err(status)
                     }
-                },
+                } },
                 Err(status) => Err(status as u32),
             };
             work.status = result.err().unwrap_or(0);

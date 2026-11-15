@@ -1,0 +1,13 @@
+[package]
+name = "nt-config-notify"
+description = "Registry change notification: per-key-body notify blocks, their posted requests and the matching of a committed change against them (NT cmnotify.c). no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -22,6 +22,8 @@ enum Phase {
     Prepare, Begin, Poll, Publish, Install, PublishChild, OpenExistingChild,
     /// A durability request whose last attempt was in flight.
     Durable,
+    /// A synchronous `NtNotifyChangeKey` caller whose request has not completed.
+    Notify,
     ReadyReply, ReplyEntered, ReplySent,
     RevokeReply, RetypeReply, ReconcileRuntime,
 }
@@ -73,6 +75,8 @@ enum Completion {
         request: DurableRegistryRequest,
         deferral: Deferral<writable_fs::ReserveProgress>,
     },
+    /// A synchronous `NtNotifyChangeKey` kept until its posted request completes.
+    ChangeNotify { post: nt_config_notify::PostId },
 }
 
 struct HostedCaller {
@@ -86,9 +90,17 @@ struct HostedCaller {
     _continuation: UserApcContinuation,
 }
 
+/// What a published edit of an existing key changed, for registry change notification.
+#[derive(Clone, Copy)]
+enum Reported {
+    Values(CellId),
+    Security(CellId),
+}
+
 struct Work {
     order: u64,
     hive: u32,
+    reported: Option<Reported>,
     log_path: String,
     pending: Option<Pending>,
     prepared: Option<Prepared>,
@@ -110,6 +122,10 @@ static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 static TRANSFERRED: AtomicBool = AtomicBool::new(false);
 static DURABLE_TRACED: AtomicU64 = AtomicU64::new(0);
+/// Rows parked in `Phase::Notify`. They wait for a registry change, not for time, so they
+/// arm no deadline until `NOTIFY_READY` says one of them has a status to collect.
+static NOTIFY_WAITING: AtomicU64 = AtomicU64::new(0);
+static NOTIFY_READY: AtomicBool = AtomicBool::new(false);
 /// Durability requests traced when they park and when they complete.
 const DURABLE_TRACE_LIMIT: u64 = 32;
 /// A durability request edits no hive, so it has no place in a hive's edit order.
@@ -243,7 +259,7 @@ unsafe fn submit_hosted_existing_edit(
     let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(reply, 0);
     let work = Work {
-        order, hive: key.hive, log_path,
+        order, hive: key.hive, reported: None, log_path,
         pending: Some(pending),
         prepared: None, journal_id: None, receipt: None,
         installation: None,
@@ -322,7 +338,7 @@ pub(crate) unsafe fn submit_hosted_durability(
     let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(reply, 0);
     let work = Work {
-        order, hive: NO_HIVE, log_path: String::new(),
+        order, hive: NO_HIVE, reported: None, log_path: String::new(),
         pending: None, prepared: None, journal_id: None, receipt: None, installation: None,
         caller: HostedCaller {
             pi: handler.pi,
@@ -347,6 +363,70 @@ pub(crate) unsafe fn submit_hosted_durability(
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
     assert!(!TRANSFERRED.swap(true, Ordering::AcqRel));
     Ok(())
+}
+
+/// Keep a synchronous `NtNotifyChangeKey` caller until its posted request completes. The caller
+/// and its Reply move here together; a refusal leaves the Reply current and the request posted.
+pub(crate) unsafe fn submit_hosted_change_notify(
+    handler: &mut ExecNtHandler, post: nt_config_notify::PostId,
+) -> Result<(), u32> {
+    let _durable = allocator::enter_durable();
+    let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(STATUS_INVALID_HANDLE)?;
+    let logical = handler.capture_provider_logical_caller(
+        handler.pi, handler.current_tid, handler.current_badge, tcb,
+    ).ok_or(STATUS_INVALID_HANDLE)?;
+    if u64::from(logical.thread().thread_id()) != handler.current_tid {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    let park = root_reply_park::RootReplyPark::prepare().ok_or(0xC000_009Au32)?;
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    let index = rows.iter().enumerate().find_map(|(index, row)|
+        (row.is_none() && EXECUTING_INDEX.load(Ordering::Relaxed) != index as u64)
+            .then_some(index));
+    if index.is_none() { rows.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
+    let requestor = handler.pm.capture_native_handle_caller(
+        logical.thread(), nt_types::AccessMode::KernelMode)?;
+    let mut reference = handler.pm.reference_native_requestor(requestor)?;
+    let order = match reserve_order() {
+        Ok(order) => order,
+        Err(status) => {
+            reference.release(&mut handler.pm).expect("unsubmitted notify caller");
+            return Err(status);
+        }
+    };
+    let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    assert_ne!(reply, 0);
+    let work = Work {
+        order, hive: NO_HIVE, reported: None, log_path: String::new(),
+        pending: None, prepared: None, journal_id: None, receipt: None, installation: None,
+        caller: HostedCaller {
+            pi: handler.pi,
+            tid: handler.current_tid, badge: handler.current_badge, reply, logical, reference,
+            completion: Some(Completion::ChangeNotify { post }),
+            _continuation: if handler.current_native_call_transport {
+                UserApcContinuation::NativeCall
+            } else {
+                UserApcContinuation::Fault {
+                    resume_ip: handler.current_resume_ip,
+                    resume_sp: handler.current_sp,
+                    resume_flags: handler.current_flags,
+                }
+            },
+        },
+        phase: Phase::Notify, status: 0, cancelled: false,
+    };
+    match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
+    park.commit();
+    NOTIFY_WAITING.fetch_add(1, Ordering::Release);
+    PENDING.fetch_add(1, Ordering::Release);
+    assert!(!TRANSFERRED.swap(true, Ordering::AcqRel));
+    Ok(())
+}
+
+/// A parked `NtNotifyChangeKey` caller has a status to collect, or is gone.
+pub(crate) fn wake_change_notify() {
+    NOTIFY_READY.store(true, Ordering::Release);
+    NEXT.store(monotonic_time_100ns(), Ordering::Release);
 }
 
 /// Attempt a kept durability request again. `Some(status)` completes its caller.
@@ -447,7 +527,7 @@ pub(crate) unsafe fn submit_hosted_create_child(
     let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(reply, 0);
     let work = Work {
-        order, hive: parent_key.hive, log_path,
+        order, hive: parent_key.hive, reported: None, log_path,
         pending: Some(Pending::Child { parent: parent_key.key, path: relative,
             name: leaf, class, descriptor }),
         prepared: None,
@@ -482,7 +562,9 @@ pub(crate) unsafe fn submit_hosted_create_child(
 
 pub(crate) fn take_transferred() -> bool { TRANSFERRED.swap(false, Ordering::AcqRel) }
 pub(crate) fn next_deadline() -> Option<u64> {
-    (PENDING.load(Ordering::Acquire) != 0).then(|| NEXT.load(Ordering::Acquire))
+    let pending = PENDING.load(Ordering::Acquire);
+    (pending > NOTIFY_WAITING.load(Ordering::Acquire) || NOTIFY_READY.load(Ordering::Acquire))
+        .then(|| NEXT.load(Ordering::Acquire))
 }
 pub(crate) fn has_thread(tid: u64) -> bool {
     EXECUTING_TID.load(Ordering::Acquire) == tid || unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten()
@@ -557,6 +639,7 @@ fn release_completion(handler: &mut ExecNtHandler, caller: &mut HostedCaller) {
         }
         Completion::Durable { request, .. } =>
             handler.release_durable_registry_request(request),
+        Completion::ChangeNotify { post } => handler.abandon_registry_notify_wait(post),
     }
 }
 
@@ -574,6 +657,11 @@ unsafe fn advance(
             } else if !earlier_unpublished
                 && !handler.mutable_hives.has_retained_publication(work.hive) {
                 let pending = work.pending.take().expect("unprepared mutable edit");
+                work.reported = match &pending {
+                    Pending::Value { key, .. } => Some(Reported::Values(*key)),
+                    Pending::Security { key, .. } => Some(Reported::Security(*key)),
+                    Pending::Child { .. } => None,
+                };
                 let prepared = match pending {
                     Pending::Value { key, path, name, value_type, data } =>
                         handler.mutable_hives.prepare_owned_set_value(
@@ -678,6 +766,16 @@ unsafe fn advance(
                     work.caller.completion.as_mut() else { unreachable!("child completion") };
                 *destination = Some(child);
             }
+            // The edit is now what every reader of the hive sees.
+            match (child, work.reported.take()) {
+                (Some(child), _) => handler.mutable_registry_subkey_created(
+                    ResolvedHiveKey { hive: work.hive, key: child }),
+                (None, Some(Reported::Values(key))) => handler
+                    .mutable_registry_key_values_changed(ResolvedHiveKey { hive: work.hive, key }),
+                (None, Some(Reported::Security(key))) => handler
+                    .mutable_registry_key_security_changed(ResolvedHiveKey { hive: work.hive, key }),
+                (None, None) => {}
+            }
             work.installation = Some((continuation, pair));
             work.phase = Phase::Install;
         }
@@ -751,6 +849,22 @@ unsafe fn advance(
                 work.phase = Phase::ReadyReply;
             }
         }
+        Phase::Notify => {
+            let Some(Completion::ChangeNotify { post }) = work.caller.completion.as_ref()
+                else { unreachable!("retained change-notify request") };
+            let post = *post;
+            if work.cancelled {
+                // The request must not complete into a caller that is gone.
+                handler.abandon_registry_notify_wait(post);
+                work.status = 0xC000_0120;
+            } else if let Some(status) = handler.take_registry_notify_wait_status(post) {
+                work.status = status;
+            } else {
+                return Ok(false);
+            }
+            NOTIFY_WAITING.fetch_sub(1, Ordering::Release);
+            work.phase = Phase::ReadyReply;
+        }
         Phase::ReadyReply => {
             if work.cancelled {
                 work.phase = Phase::RevokeReply;
@@ -819,6 +933,7 @@ pub(crate) unsafe fn redrive(
     if PENDING.load(Ordering::Acquire) == 0
         || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
         || ACTIVE.swap(true, Ordering::AcqRel) { return; }
+    NOTIFY_READY.store(false, Ordering::Release);
     let mut failed = false;
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     for index in 0..rows.len() {
@@ -837,7 +952,7 @@ pub(crate) unsafe fn redrive(
             match advance(handler, queue, &mut work, earlier_unpublished) {
                 Ok(true) => { completed = true; break; },
                 // Still in flight: one attempt per turn.
-                Ok(false) if matches!(work.phase, Phase::Durable) => break,
+                Ok(false) if matches!(work.phase, Phase::Durable | Phase::Notify) => break,
                 Ok(false) => {},
                 Err(_) => { failed = true; break; },
             }

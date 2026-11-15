@@ -12,16 +12,20 @@ impl ExecNtHandler {
     ) -> u32 {
         let _durable = allocator::enter_durable();
         if let Some(path) = self.cm_runtime_key_target(key) {
-            return crate::config_manager_runtime_key_operation(
+            return match crate::config_manager_runtime_key_operation(
                 path.key,
                 nt_config_abi::runtime_key_op::SET_VALUE,
                 0,
                 name,
                 value_type,
                 data,
-            )
-            .err()
-            .map_or(0, |status| status as u32);
+            ) {
+                Ok(_) => {
+                    self.registry_key_values_changed(&path.path);
+                    0
+                }
+                Err(status) => status as u32,
+            };
         }
         if self.cm_system_key_target(key).is_some() {
             unreachable!("SYSTEM value SET requires retained mutation work");
@@ -31,6 +35,7 @@ impl ExecNtHandler {
                 .overlay
                 .set_value_from_slice(index, name.into(), value_type, data)
             {
+                self.registry_target_values_changed(key);
                 0
             } else {
                 STATUS_INVALID_HANDLE
@@ -51,16 +56,20 @@ impl ExecNtHandler {
     pub(crate) unsafe fn registry_target_delete_value(&mut self, key: KeyRef, name: &str) -> u32 {
         let _durable = allocator::enter_durable();
         if let Some(path) = self.cm_runtime_key_target(key) {
-            return crate::config_manager_runtime_key_operation(
+            return match crate::config_manager_runtime_key_operation(
                 path.key,
                 nt_config_abi::runtime_key_op::DELETE_VALUE,
                 0,
                 name,
                 0,
                 &[],
-            )
-            .err()
-            .map_or(0, |status| status as u32);
+            ) {
+                Ok(_) => {
+                    self.registry_key_values_changed(&path.path);
+                    0
+                }
+                Err(status) => status as u32,
+            };
         }
         if self.cm_system_key_target(key).is_some() {
             unreachable!("SYSTEM value DELETE requires retained mutation work");
@@ -70,6 +79,7 @@ impl ExecNtHandler {
                 return STATUS_INVALID_HANDLE;
             }
             return if self.overlay.delete_value(index, name) {
+                self.registry_target_values_changed(key);
                 0
             } else {
                 STATUS_OBJECT_NAME_NOT_FOUND

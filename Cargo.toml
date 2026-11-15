@@ -58,6 +58,7 @@ members = [
     "crates/nt-wdf-dma",
     "crates/nt-config-manager",
     "crates/nt-config-client",
+    "crates/nt-config-notify",
     "crates/nt-config-server",
     "crates/nt-config-abi",
     "crates/nt-config-store",

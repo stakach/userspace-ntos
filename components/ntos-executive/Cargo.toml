@@ -61,6 +61,7 @@ nt-config-abi = { path = "../../crates/nt-config-abi" }
 nt-config-manager = { path = "../../crates/nt-config-manager" }
 nt-config-server = { path = "../../crates/nt-config-server" }
 nt-config-client = { path = "../../crates/nt-config-client" }
+nt-config-notify = { path = "../../crates/nt-config-notify" }
 nt-io-abi = { path = "../../crates/nt-io-abi" }
 nt-io-manager = { path = "../../crates/nt-io-manager", features = ["object-manager"] }
 nt-io-server = { path = "../../crates/nt-io-server", features = ["object-manager"] }

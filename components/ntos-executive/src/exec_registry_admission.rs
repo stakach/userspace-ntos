@@ -879,10 +879,24 @@ impl ExecNtHandler {
             class.map(Into::into),
             descriptor.to_vec(),
         )?;
+        unsafe { self.registry_subkey_created(path) };
         Ok((OVERLAY_KEY_TAG | index as u32, true))
     }
 
     pub(crate) fn journal_create_secured_mutable_subkey(
+        &mut self,
+        parent: ResolvedHiveKey,
+        name: &str,
+        class: Option<&str>,
+        descriptor: &[u8],
+    ) -> Result<ResolvedHiveKey, u32> {
+        let child =
+            self.journal_create_secured_mutable_subkey_unreported(parent, name, class, descriptor)?;
+        self.mutable_registry_subkey_created(child);
+        Ok(child)
+    }
+
+    fn journal_create_secured_mutable_subkey_unreported(
         &mut self,
         parent: ResolvedHiveKey,
         name: &str,

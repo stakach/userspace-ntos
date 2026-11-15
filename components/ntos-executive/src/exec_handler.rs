@@ -299,6 +299,9 @@ mod file_cancel_ex;
 #[path = "exec_power_information.rs"]
 mod power_information;
 
+#[path = "exec_registry_change_notify.rs"]
+pub(crate) mod registry_change_notify;
+
 #[path = "exec_virtual_memory_commit.rs"]
 mod virtual_memory_commit;
 
@@ -4360,6 +4363,10 @@ impl ExecNtHandler {
         write_field!(readonly_file_opens, ExecReadOnlyFileOpens::reset());
         write_field!(byte_range_locks, nt_fs::ByteRangeLockTable::new());
         write_field!(
+            registry_change_notifications,
+            registry_change_notify::RegistryChangeNotifications::new()
+        );
+        write_field!(
             readonly_directory_notifications,
             nt_fs::DirectoryNotifyTable::new()
         );
@@ -5636,10 +5643,13 @@ impl ExecNtHandler {
                 .map_err(Self::mutable_hive_journal_status)?;
         }
         self.note_mutable_hive_journal_record(key.hive);
+        self.mutable_registry_key_values_changed(key);
         Ok(())
     }
 
     fn journal_delete_mutable_key(&mut self, key: ResolvedHiveKey) -> Result<(), u32> {
+        // The name is gone once the key is.
+        let deleted = self.mutable_key_path(key);
         let relative = self
             .mutable_key_relative_path(key)
             .ok_or(STATUS_INVALID_HANDLE)?;
@@ -5662,6 +5672,9 @@ impl ExecNtHandler {
                 .map_err(Self::mutable_hive_journal_status)?;
         }
         self.note_mutable_hive_journal_record(key.hive);
+        if let Some(deleted) = deleted {
+            unsafe { self.registry_key_deleted(&deleted) };
+        }
         Ok(())
     }
 
@@ -5699,6 +5712,16 @@ impl ExecNtHandler {
     }
 
     fn journal_set_mutable_key_security_descriptor(
+        &mut self,
+        key: ResolvedHiveKey,
+        descriptor: &[u8],
+    ) -> Result<(), u32> {
+        self.journal_set_mutable_key_security_descriptor_unreported(key, descriptor)?;
+        self.mutable_registry_key_security_changed(key);
+        Ok(())
+    }
+
+    fn journal_set_mutable_key_security_descriptor_unreported(
         &mut self,
         key: ResolvedHiveKey,
         descriptor: &[u8],
@@ -7220,6 +7243,9 @@ impl ExecNtHandler {
             dynamic: true,
         });
         claim.publish();
+        // The hive's root is a new subkey of its mount point (CmpLinkHiveToMaster).
+        let mounted = self.hive_mounts[self.hive_mounts.len() - 1].canon.clone();
+        unsafe { self.registry_subkey_created(&mounted) };
         NT_LOAD_KEY_MOUNTED.fetch_add(1, Ordering::Relaxed);
         NT_LOAD_KEY_HIVE_BYTES.store(len as u64, Ordering::Relaxed);
         NT_LOAD_KEY_ROOT_SUBKEYS.store(root_subkeys, Ordering::Relaxed);
@@ -7567,12 +7593,15 @@ impl ExecNtHandler {
         // CM identity even if an overlay for the same path appears after the handle was opened.
         if let Some(index) = overlay_key_idx(target) {
             if self.overlay.set_key_security_descriptor(index, descriptor) {
+                self.registry_target_security_changed(target);
                 return Ok(());
             }
             return Err(STATUS_INVALID_HANDLE);
         }
         if let Some(path) = self.cm_runtime_key_target(target) {
-            return unsafe { crate::config_manager_runtime_key_operation(path.key, nt_config_abi::runtime_key_op::SET_SECURITY, 0, "", 0, descriptor) }.map(|_| ()).map_err(|status| status as u32);
+            unsafe { crate::config_manager_runtime_key_operation(path.key, nt_config_abi::runtime_key_op::SET_SECURITY, 0, "", 0, descriptor) }.map_err(|status| status as u32)?;
+            unsafe { self.registry_key_security_changed(&path.path) };
+            return Ok(());
         }
         if let Some(key) = self.mutable_key_handle(target) {
             if key.hive == HIVE_SEL_SYSTEM {
@@ -9631,6 +9660,8 @@ impl ExecNtHandler {
         &mut self,
         tid: u64,
     ) -> Option<HostedThreadRuntime> {
+        // CmNotifyRunDown: a thread's posted registry notify requests end with it.
+        unsafe { self.registry_notify_thread_exited(tid) };
         if unsafe {
             let waiters = &*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS);
             // Converted teardown retains references and pool ownership independently. Active
@@ -21101,6 +21132,9 @@ impl ExecNtHandler {
         match self.pm.take_handle_for_close(pid, handle) {
             Ok(object) => {
                 unsafe { driver_launch::driver_registry_value_transfers::cancel_closed_handle(pid, handle); }
+                if matches!(object, nt_process::HandleObject::RegistryKey(_)) {
+                    unsafe { self.registry_notify_handle_closed(pid, handle as u64) };
+                }
                 self.release_handle_object(object);
                 if lifecycle_executor.is_some() {
                     driver_launch::pump_hosted_file_lifecycle();
@@ -21213,6 +21247,9 @@ impl ExecNtHandler {
                 closed.handle(),
             );
         }
+        if matches!(closed.object(), nt_process::HandleObject::RegistryKey(_)) {
+            unsafe { self.registry_notify_handle_closed(closed.table_owner(), closed.handle() as u64) };
+        }
         let dynamic_closed = if let nt_process::HandleObject::DynamicObject { body, generation } = closed.object() {
             unsafe { driver_launch::hosted_driver_dynamic_delete::close_native_handle(
                 &self.pm, closed.table_owner(), closed.handle(), body, generation,
@@ -21292,6 +21329,7 @@ impl ExecNtHandler {
             }
         }
         unsafe { driver_launch::driver_registry_value_transfers::cancel_process(pid); }
+        unsafe { self.registry_notify_process_closed(pid) };
         while let Some(object) = self.pm.take_any_handle(pid) {
             self.release_handle_object(object);
             PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
@@ -34038,6 +34076,7 @@ impl ExecNtHandler {
                     if self.overlay.detach_subtree(&path) == 0 {
                         return 0xC000_0034;
                     }
+                    unsafe { self.registry_key_deleted(&path) };
                     return 0;
                 }
                 let key_path = self.registry_target_path(key);
@@ -40785,6 +40824,10 @@ impl ExecNtHandler {
             NativeService::NtCancelIoFile => unsafe { self.nt_cancel_io_file_service(args) },
             // NtCancelIoFileEx(FileHandle[R10], *IoRequestToCancel[RDX], *IoStatusBlock[R8]).
             NativeService::NtCancelIoFileEx => unsafe { self.nt_cancel_io_file_ex_service(args) },
+            NativeService::NtNotifyChangeKey => unsafe { self.nt_notify_change_key_service(args) },
+            NativeService::NtNotifyChangeMultipleKeys => unsafe {
+                self.nt_notify_change_multiple_keys_service(args)
+            },
             // NtPowerInformation(Level[R10], *Input[RDX], InputLength[R8], *Output[R9],
             // OutputLength[arg5]=args[4]).
             NativeService::NtPowerInformation => unsafe { self.nt_power_information(args) },

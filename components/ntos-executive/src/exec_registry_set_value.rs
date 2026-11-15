@@ -9,6 +9,18 @@ impl ExecNtHandler {
         value_type: nt_hive_core::RegistryValueType,
         data: &[u8],
     ) -> Result<(), u32> {
+        self.journal_set_mutable_value_unreported(key, name, value_type, data)?;
+        self.mutable_registry_key_values_changed(key);
+        Ok(())
+    }
+
+    fn journal_set_mutable_value_unreported(
+        &mut self,
+        key: ResolvedHiveKey,
+        name: &str,
+        value_type: nt_hive_core::RegistryValueType,
+        data: &[u8],
+    ) -> Result<(), u32> {
         let _durable = allocator::enter_durable();
         if matches!(unsafe { crate::fs_loader::exec_fs_mount_identity() }
             .and_then(crate::fs_loader::exec_block_route_kind),

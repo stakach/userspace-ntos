@@ -24141,6 +24141,9 @@ struct ExecNtHandler {
     /// Filesystem-owned byte ranges for local FAT and MemFs FILE_OBJECTs. Provider-backed Files
     /// keep their lock state in the receiving FSD through `IRP_MJ_LOCK_CONTROL`.
     byte_range_locks: nt_fs::ByteRangeLockTable<u64>,
+    /// Registry notify sessions and their posted `NtNotifyChangeKey` requests.
+    registry_change_notifications:
+        crate::exec_handler::registry_change_notify::RegistryChangeNotifications,
     /// One-shot directory watches for the read-only FAT owner. Writable MemFs notifications remain
     /// inside its `nt-fs::FileSystem`; provider-backed watches remain inside the receiving FSD.
     readonly_directory_notifications: nt_fs::DirectoryNotifyTable<u64>,
@@ -26449,6 +26452,8 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtGetCurrentProcessorNumberEx, 0x447),
             (NativeService::NtCancelIoFileEx, 0x300),
             (NativeService::NtPowerInformation, 139),
+            (NativeService::NtNotifyChangeKey, 117),
+            (NativeService::NtNotifyChangeMultipleKeys, 0x455),
             (
                 NativeService::NtOpenEventPair,
                 SSN_NT_OPEN_EVENT_PAIR as u32,

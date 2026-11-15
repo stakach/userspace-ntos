@@ -381,6 +381,8 @@ impl ExecNtHandler {
             }
         }
         let overlay_detached = self.overlay.detach_subtree(canon);
+        // NtUnloadKey: sessions on the hive's keys end with it.
+        unsafe { self.registry_hive_unloaded(canon) };
         NT_UNLOAD_KEY_DETACHED.fetch_add(1, Ordering::Relaxed);
         if let Some(index) = event_index {
             let status = self.signal_event_index(index);

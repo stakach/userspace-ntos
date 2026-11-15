@@ -148,6 +148,20 @@ pub(super) struct ProviderCaller {
 }
 
 
+impl ProviderCaller {
+    /// The change this provider's mutation of an existing key makes once committed.
+    pub(super) fn committed_change(&self) -> Option<(String, CommittedChange)> {
+        match &self.admission {
+            ProviderAdmission::Existing(existing) =>
+                Some((owned_key(&existing.physical_path)?, CommittedChange::Values)),
+            // A created key is named by its publication OPEN. An interface registration
+            // commits a group of keys and values, some of which may already exist; which of
+            // them changed is not known here, so nothing is reported for it.
+            ProviderAdmission::Create(_) | ProviderAdmission::InterfaceRegister(_) => None,
+        }
+    }
+}
+
 pub(crate) unsafe fn submit_provider(
     channel: &spawn_hosts::PumpChannel,
     admission: DeferredRegistryCreate,
