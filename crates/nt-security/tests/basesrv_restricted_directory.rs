@@ -224,3 +224,51 @@ fn directory_mandatory_policy_honors_equal_higher_inherit_only_and_unknown_integ
     ).unwrap();
     assert_eq!((kernel.status, kernel.granted_access), (0, 0x8));
 }
+
+/// A kernel-mode driver creates `\BaseNamedObjects` before BASESRV runs, so it carries the SYSTEM
+/// default DACL. BASESRV's `OBJ_OPENIF` create returns `STATUS_OBJECT_NAME_EXISTS` and it then
+/// replaces the DACL and label with `NtSetSecurityObject(DACL | LABEL)`
+/// (`subsystems/win/basesrv/init.c`). Only after that may an interactive user create objects.
+#[test]
+fn basesrv_resecures_a_bno_directory_a_kernel_creator_made_first() {
+    const DACL_AND_LABEL: u32 = 0x4 | 0x10;
+    const KERNEL32_BNO_ACCESS: u32 = 0xf;
+    let system = AccessToken::system();
+    let root = assign_object_directory_root_security(
+        &subject(&system),
+        &mut SecurityAssignmentAudit::default(),
+    )
+    .unwrap();
+    let kernel_created = assign_directory_security(
+        &subject(&system), None, Some(&root), ProcessorMode::KernelMode,
+        &mut SecurityAssignmentAudit::default(),
+    )
+    .unwrap();
+    let mut user = AccessToken::user(41);
+    user.integrity_level = Some(0x2000);
+    let before = authorize_directory_open(
+        &subject(&user), &kernel_created, KERNEL32_BNO_ACCESS, ProcessorMode::UserMode,
+    )
+    .unwrap();
+    assert_eq!(before.status, nt_security::STATUS_ACCESS_DENIED);
+
+    let resecured = nt_security::set_security_descriptor_bytes(
+        &kernel_created,
+        DACL_AND_LABEL,
+        &captured_labeled_absolute_descriptor(basesrv_dacl(0x2)),
+    )
+    .unwrap();
+    let after = authorize_directory_open(
+        &subject(&user), &resecured, KERNEL32_BNO_ACCESS, ProcessorMode::UserMode,
+    )
+    .unwrap();
+    assert_eq!((after.status, after.granted_access), (0, KERNEL32_BNO_ACCESS));
+
+    // The Low label came across with the DACL: an Untrusted subject still cannot write up.
+    user.integrity_level = Some(0);
+    let untrusted = authorize_directory_open(
+        &subject(&user), &resecured, 0x4, ProcessorMode::UserMode,
+    )
+    .unwrap();
+    assert_eq!(untrusted.status, nt_security::STATUS_ACCESS_DENIED);
+}

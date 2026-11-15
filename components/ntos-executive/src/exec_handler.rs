@@ -38224,12 +38224,24 @@ impl ExecNtHandler {
                         Ok(descriptor) => descriptor,
                         Err(status) => return status,
                     };
-                    return match self.set_directory_object_security(
+                    let status = match self.set_directory_object_security(
                         caller, args[0], required_access, security_information, &modification,
                     ) {
                         Ok(()) => 0,
                         Err(status) => status,
                     };
+                    // Rare (BASESRV re-securing a directory another creator made first), and
+                    // the later access of every user process depends on it.
+                    print_str(b"[directory-security] set pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" handle=0x");
+                    print_hex(args[0] as u32);
+                    print_str(b" information=0x");
+                    print_hex(security_information);
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                    return status;
                 }
                 if let Some(driver_status) = self.file_security_driver_status(
                     args[0],

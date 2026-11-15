@@ -4811,15 +4811,14 @@ extern "win64" fn s_ob_reference_object_by_pointer(
     object_type: u64,
     access_mode: u8,
 ) -> i32 {
-    const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
+    // `ObReferenceObjectByPointer` performs no access check: `DesiredAccess` is unused and only
+    // the object type is validated (`ntoskrnl/ob/obref.c`).
+    let _ = desired_access;
     if object == 0 {
         return STATUS_INVALID_HANDLE_I32;
     }
     if access_mode > 1 {
         return STATUS_INVALID_PARAMETER_I32;
-    }
-    if access_mode != 0 && desired_access != 0 {
-        return STATUS_ACCESS_DENIED;
     }
 
     let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
