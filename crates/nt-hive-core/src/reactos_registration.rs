@@ -624,9 +624,13 @@ pub const REACTOS_EXPLORER_SHELL_COM_REGISTRATION_SCRIPTS: &[ReactOsComClassRegi
     },
     ReactOsComClassRegistrationScript {
         clsid: CLSID_REBAR_BAND_SITE,
-        module: "browseui.dll",
-        source_path: "references/reactos/dll/win32/browseui/res/rebarbandsite.rgs",
-        rgs: include_str!("../../../references/reactos/dll/win32/browseui/res/rebarbandsite.rgs"),
+        // `syssetup.inf` `[OleControlDlls]` registers shell32.dll after the other module that
+        // carries this class (browseui.dll in ReactOS, explorerframe.dll in LiberNT), and both
+        // scripts are `ForceRemove`, so the installed value names shell32.dll. LiberNT's
+        // browseui.dll is a forwarder stub with no `DllGetClassObject`.
+        module: "shell32.dll",
+        source_path: "references/reactos/dll/win32/shell32/res/rgs/rebarbandsite.rgs",
+        rgs: include_str!("../../../references/reactos/dll/win32/shell32/res/rgs/rebarbandsite.rgs"),
         mask_bit: REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE,
     },
 ];
@@ -2341,7 +2345,7 @@ mod tests {
             "",
         );
         assert_eq!(ty, RegistryValueType::Sz as u32);
-        assert_eq!(data, utf16le_sz("browseui.dll"));
+        assert_eq!(data, utf16le_sz("shell32.dll"));
 
         let (ty, data) = value_bytes(
             &overlay,
@@ -2349,7 +2353,7 @@ mod tests {
             "",
         );
         assert_eq!(ty, RegistryValueType::Sz as u32);
-        assert_eq!(data, utf16le_sz("Shell Rebar BandSite"));
+        assert_eq!(data, utf16le_sz("Shell Rebar Band Site"));
 
         let (ty, data) = value_bytes(
             &overlay,
