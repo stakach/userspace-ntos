@@ -90,6 +90,61 @@ pub fn write_file_object_name(
     Ok(required)
 }
 
+/// What a File `ObjectNameInformation` query answers: the status, how many bytes of the
+/// formatted record to copy to the caller, and the `ReturnLength` to report, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileObjectNameAnswer {
+    pub status: u32,
+    pub copy: usize,
+    pub return_length: Option<u32>,
+}
+
+/// `IopQueryNameFile`: name a File by its Device's name followed by the filesystem's
+/// `FileNameInformation`. `query_status` and `query_information` are the terminal result of
+/// that query and `file_information` its output. `output` is scratch as large as the caller's
+/// buffer (`length` bytes, capped at the largest record); `output_address` is where the caller
+/// will see it.
+pub fn answer_file_object_name(
+    device_name: &[u16],
+    query_status: u32,
+    file_information: &[u8],
+    query_information: u64,
+    output_address: u64,
+    length: u32,
+    output: &mut [u8],
+) -> FileObjectNameAnswer {
+    const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+    const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+    const STATUS_DATA_ERROR: u32 = 0xC000_003E;
+    const STATUS_NAME_TOO_LONG: u32 = 0xC000_0106;
+    let refused = |status| FileObjectNameAnswer { status, copy: 0, return_length: None };
+    let file_name = match query_status {
+        0 => match file_name_information_units(file_information, query_information) {
+            Ok(name) => name,
+            Err(_) => return refused(STATUS_DATA_ERROR),
+        },
+        // The device has no filesystem name to add: invalid parameter, invalid device
+        // request, not implemented, invalid information class.
+        0xC000_000D | 0xC000_0010 | 0xC000_0002 | 0xC000_0003 => &[][..],
+        status => return refused(status),
+    };
+    let capacity = output.len().min(length as usize);
+    match write_file_object_name(device_name, file_name, output_address, &mut output[..capacity]) {
+        Ok(used) => FileObjectNameAnswer { status: 0, copy: used, return_length: Some(used as u32) },
+        Err(FileObjectNameError::BufferTooSmall { required }) => FileObjectNameAnswer {
+            status: if (length as usize) < OBJECT_NAME_INFORMATION_HEADER_BYTES {
+                STATUS_INFO_LENGTH_MISMATCH
+            } else {
+                STATUS_BUFFER_OVERFLOW
+            },
+            copy: 0,
+            return_length: Some(required as u32),
+        },
+        Err(FileObjectNameError::NameTooLong) => refused(STATUS_NAME_TOO_LONG),
+        Err(_) => refused(STATUS_DATA_ERROR),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +242,69 @@ mod tests {
         let used = write_file_object_name(&[], &[], 0x2000, &mut output).unwrap();
         assert_eq!(used, 16);
         assert_eq!(output[..16], [0; 16]);
+    }
+
+    fn file_information(path: &str) -> Vec<u8> {
+        let suffix = le(&wide(path));
+        let mut info = Vec::from((suffix.len() as u32).to_le_bytes());
+        info.extend_from_slice(&suffix);
+        info
+    }
+
+    #[test]
+    fn answer_is_the_record_and_its_exact_length() {
+        let info = file_information("\\Windows\\explorer.exe");
+        let mut output = [0xa5u8; 256];
+        let answer = answer_file_object_name(
+            &wide("\\Device\\HarddiskVolume1"), 0, &info, info.len() as u64, 0x2000, 256,
+            &mut output,
+        );
+        let expected = 16 + ("\\Device\\HarddiskVolume1\\Windows\\explorer.exe".len() + 1) * 2;
+        assert_eq!(
+            answer,
+            FileObjectNameAnswer { status: 0, copy: expected, return_length: Some(expected as u32) }
+        );
+        assert_eq!(u64::from_le_bytes(output[8..16].try_into().unwrap()), 0x2010);
+    }
+
+    #[test]
+    fn answer_reports_the_full_size_when_the_buffer_is_short() {
+        let info = file_information("\\a");
+        let device = wide("\\Device\\X");
+        let required = (16 + (9 + 2 + 1) * 2) as u32;
+        let mut output = [0u8; 20];
+        assert_eq!(
+            answer_file_object_name(&device, 0, &info, info.len() as u64, 0x2000, 20, &mut output),
+            FileObjectNameAnswer { status: 0x8000_0005, copy: 0, return_length: Some(required) }
+        );
+        // Below the header the query is a length mismatch.
+        assert_eq!(
+            answer_file_object_name(&device, 0, &info, info.len() as u64, 0x2000, 8, &mut output[..8]),
+            FileObjectNameAnswer { status: 0xC000_0004, copy: 0, return_length: Some(required) }
+        );
+    }
+
+    #[test]
+    fn a_device_that_serves_no_file_name_is_named_by_the_device_alone() {
+        let device = wide("\\Device\\Null");
+        for refusal in [0xC000_000Du32, 0xC000_0010, 0xC000_0002, 0xC000_0003] {
+            let mut output = [0u8; 64];
+            let answer = answer_file_object_name(&device, refusal, &[], 0, 0x2000, 64, &mut output);
+            assert_eq!(answer.status, 0);
+            assert_eq!(answer.copy, 16 + (12 + 1) * 2);
+        }
+    }
+
+    #[test]
+    fn a_failed_file_name_query_is_the_answer_and_names_nothing() {
+        let mut output = [0xa5u8; 64];
+        assert_eq!(
+            answer_file_object_name(&wide("\\Device\\X"), 0xC000_0120, &[], 0, 0x2000, 64, &mut output),
+            FileObjectNameAnswer { status: 0xC000_0120, copy: 0, return_length: None }
+        );
+        // Success with malformed information is not a name either.
+        let answer =
+            answer_file_object_name(&wide("\\Device\\X"), 0, &[9, 0, 0, 0, 1], 5, 0x2000, 64, &mut output);
+        assert_eq!((answer.status, answer.copy), (0xC000_003E, 0));
     }
 }

@@ -98,6 +98,18 @@ pub struct PendingFileAttributeQuery {
     pub inline_terminal: Option<(u32, u64)>,
 }
 
+/// A File `ObjectNameInformation` query whose FileNameInformation IRP pended. The caller wants
+/// an OBJECT_NAME_INFORMATION (device name, then the filesystem's name), so the delivery owner
+/// formats the answer itself and then settles the row as [`PendingFileIoOperation::OwnedInline`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingObjectNameQuery {
+    /// The caller's `ObjectInformation` buffer and its length.
+    pub information_va: u64,
+    pub length: u32,
+    /// The caller's optional `ReturnLength`.
+    pub return_length_va: u64,
+}
+
 /// Terminal state for one local-filesystem byte-range lock wait. Provider-backed locks retain a
 /// canonical IRP and use [`PendingFileIoOperation::Transfer`]; this variant lets the same delivery
 /// owner publish local FSD completions without pretending that an executive IRP exists.
@@ -163,6 +175,7 @@ pub enum PendingFileIoOperation {
     Create(PendingFileCreate),
     SetFileName(PendingSetFileNameOperation),
     AttributeQuery(PendingFileAttributeQuery),
+    ObjectNameQuery(PendingObjectNameQuery),
     LocalByteLock(PendingLocalByteLock),
     LocalDirectoryNotify(PendingLocalDirectoryNotify),
     OwnedInline(PendingOwnedInline),
@@ -766,6 +779,15 @@ impl PendingFileIoTable {
                     && pending.iosb_va != 0
                     && !pending.publish_iocp
             }
+            PendingFileIoOperation::ObjectNameQuery(_) => {
+                pending.major == nt_io_abi::major::IRP_MJ_QUERY_INFORMATION
+                    && pending.output_va == 0
+                    && pending.output_len == 0
+                    && pending.iosb_va == 0
+                    && pending.apc_routine == 0
+                    && !pending.publish_iocp
+                    && pending.event_obj_idx == u64::MAX
+            }
             PendingFileIoOperation::OwnedInline(operation) => {
                 !crate::is_create_major(pending.major)
                     && operation.status != nt_status::NtStatus::PENDING.raw() as u32
@@ -1159,6 +1181,25 @@ impl PendingFileIoTable {
         { return None; }
         pending.irp_id = new_irp_id;
         pending.major = nt_io_abi::major::IRP_MJ_QUERY_INFORMATION;
+        Some(())
+    }
+
+    /// The delivery owner formatted (or refused) a pended File name query and acknowledged its
+    /// IRP: the row keeps the reply and the File reference and now carries `status` itself.
+    pub fn complete_object_name_query_exact(
+        &mut self, identity: PendingFileIoIdentity, irp_id: u64, status: u32,
+    ) -> Option<()> {
+        let pending = self.get_exact(identity)?;
+        if pending.irp_id != irp_id
+            || !matches!(pending.operation, PendingFileIoOperation::ObjectNameQuery(_))
+            || pending.delivery_state != 0
+            || status == nt_status::NtStatus::PENDING.raw() as u32
+            || self.apc_owned_slot(identity.slot)
+        {
+            return None;
+        }
+        let row = self.slots[identity.slot].as_mut()?;
+        row.operation = PendingFileIoOperation::OwnedInline(PendingOwnedInline { status, information: 0 });
         Some(())
     }
 
@@ -1860,6 +1901,10 @@ mod reservation_tests;
 #[cfg(test)]
 #[path = "pending_io/abandonment_tests.rs"]
 mod abandonment_tests;
+
+#[cfg(test)]
+#[path = "pending_io/object_name_query_tests.rs"]
+mod object_name_query_tests;
 
 #[cfg(test)]
 fn test_busy(file_id: u64, tid: u64) -> PendingFileBusy {

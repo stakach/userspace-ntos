@@ -45,10 +45,13 @@ impl ExecNtHandler {
             let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(value_type) else {
                 return STATUS_INVALID_PARAMETER;
             };
-            return self
-                .journal_set_mutable_value(key, name, value_type, data)
-                .err()
-                .unwrap_or(0);
+            return match self.journal_set_mutable_value(key, name, value_type, data) {
+                Ok(()) => {
+                    self.mutable_registry_key_values_changed(key);
+                    0
+                }
+                Err(status) => status,
+            };
         }
         STATUS_ACCESS_DENIED
     }

@@ -15601,6 +15601,61 @@ unsafe fn pending_file_io_redrive_pass(
             }
         }
         let mut backend_ack_required = completed.is_some();
+        if let nt_io_manager::PendingFileIoOperation::ObjectNameQuery(query) = pending.operation {
+            // A File name query the driver pended. Its output is the filesystem's
+            // FileNameInformation, not the caller's record: format the answer here, then keep
+            // only its status on the row. Every step before the settlement can be repeated.
+            let file_id = hosted_file_id.expect("File name query lost its File");
+            let completion = completed.expect("File name query lost its exact completion");
+            let scratch = nt_io_manager::file_object_name::FILE_OBJECT_NAME_SCRATCH_BYTES;
+            let wanted = if (completion.status as i32) >= 0 {
+                usize::try_from(completion.information).map_or(scratch, |used| used.min(scratch))
+            } else {
+                0
+            };
+            let mut file_information = alloc::vec::Vec::new();
+            let mut failed = file_information.try_reserve_exact(wanted).is_err();
+            if !failed {
+                file_information.resize(wanted, 0u8);
+                let mut copied = 0usize;
+                while copied < wanted {
+                    match driver_launch::copy_completed_irp_output_exact(
+                        pending.irp_id, copied as u64, &mut file_information[copied..],
+                    ) {
+                        Ok(count) if count != 0 => copied += count,
+                        _ => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if failed {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            let status = if pending.consumer_abandoned {
+                nt_status::NtStatus::CANCELLED.raw() as u32
+            } else {
+                nt_handler.publish_file_object_name(
+                    file_id, None, completion.status as u32, &file_information,
+                    completion.information, query.information_va, query.length,
+                    query.return_length_va,
+                )
+            };
+            if driver_launch::acknowledge_completed_irp(pending.irp_id).is_err() {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .complete_object_name_query_exact(identity, pending.irp_id, status)
+                .expect("File name query lost its retained owner");
+            FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+            restore_file_io_mirrors!();
+            continue;
+        }
         if let nt_io_manager::PendingFileIoOperation::AttributeQuery(operation) = pending.operation {
             if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
                 let create = completed.expect("attribute CREATE lost its exact completion");
@@ -16461,6 +16516,11 @@ unsafe fn pending_file_io_redrive_pass(
                 nt_handler.release_file_reference(finished.route.hosted_file_id().expect("provider rename lost its File route"));
             }
             nt_io_manager::PendingFileIoOperation::AttributeQuery(_) => {}
+            // Settlement turns the row into an owned inline result, which releases its File
+            // reference before retiring. A row that retires unsettled still holds it.
+            nt_io_manager::PendingFileIoOperation::ObjectNameQuery(_) => {
+                nt_handler.release_file_reference(finished.route.hosted_file_id().expect("File name query lost its File route"));
+            }
             nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
             | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_)
             | nt_io_manager::PendingFileIoOperation::OwnedInline(_)

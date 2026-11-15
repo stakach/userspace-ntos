@@ -302,6 +302,9 @@ mod power_information;
 #[path = "exec_registry_change_notify.rs"]
 pub(crate) mod registry_change_notify;
 
+#[path = "exec_object_name_query.rs"]
+mod object_name_query;
+
 #[path = "exec_virtual_memory_commit.rs"]
 mod virtual_memory_commit;
 
@@ -807,6 +810,7 @@ impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalNonSystemSetupSeedTarge
             .journal_set_mutable_value(key, name, value_type, &data)
         {
             Ok(()) => {
+                self.handler.mutable_registry_key_values_changed(key);
                 self.changed_values = self.changed_values.saturating_add(1);
                 true
             }
@@ -7717,6 +7721,7 @@ impl ExecNtHandler {
         {
             return false;
         }
+        self.mutable_registry_key_values_changed(key);
         true
     }
 
@@ -17379,6 +17384,14 @@ impl ExecNtHandler {
         if let nt_process::HandleObject::Job(id) = object {
             return self.job_namespace_index(id);
         }
+        if let nt_process::HandleObject::Section(section) = object {
+            // A named Section's directory entry carries the Section's identity.
+            return self.obj_ns.iter().position(|entry| {
+                entry.is_live()
+                    && entry.kind == OBJ_KIND_SECTION
+                    && entry.payload == u64::from(section)
+            });
+        }
         if let nt_process::HandleObject::Event(id) = object {
             let id = nt_kernel_exec::EventObjectId(id);
             let index = usize::try_from(self.event_objects.snapshot(id).ok()?.native_identity).ok()?;
@@ -17737,6 +17750,13 @@ impl ExecNtHandler {
         if return_length != 0 && !self.user_memory_probe_output(memory, return_length, 4) {
             return STATUS_ACCESS_VIOLATION;
         }
+        if class == 1 && self.active_synchronous_file_retry.is_some() {
+            // A File name query that waited for a busy synchronous File is re-issued under its
+            // retained File; its handle may be gone and is not looked up again.
+            return self.query_file_object_name(
+                handle, information, length.min(u32::MAX as usize) as u32, return_length,
+            );
+        }
         if class == 3 {
             let Some(needed) = Self::query_object_all_types_size() else {
                 return STATUS_INFO_LENGTH_MISMATCH;
@@ -17776,8 +17796,7 @@ impl ExecNtHandler {
                     .map(|index| self.query_object_namespace_path(index, &mut name_ascii))
                     .unwrap_or(0);
                 let type_info_len = (OBJECT_TYPE_INFORMATION_SIZE + type_name.len() * 2 + 2) as u32;
-                let name_info_len =
-                    name_query::object_name_information_bytes(&name_ascii[..name_len]) as u32;
+                let name_info_len = name_query::basic_name_info_size(&name_ascii[..name_len]);
                 if self
                     .write_query_object_return_length(
                         memory,
@@ -17811,6 +17830,17 @@ impl ExecNtHandler {
                     .query_object_namespace_index(object, namespace_index)
                     .map(|index| self.query_object_namespace_path(index, &mut name_ascii))
                     .unwrap_or(0);
+                // A File and a Key are named by their type's QueryName procedure.
+                if let nt_process::HandleObject::RoutedFile { .. } = object {
+                    return self.query_file_object_name(
+                        handle, information, length.min(u32::MAX as usize) as u32, return_length,
+                    );
+                }
+                if let nt_process::HandleObject::RegistryKey(target) = object {
+                    return self.query_key_object_name(
+                        target, information, length.min(u32::MAX as usize) as u32, return_length,
+                    );
+                }
                 let name = match name_query::header_object_name(type_name, &name_ascii[..name_len])
                 {
                     Ok(name) => name,

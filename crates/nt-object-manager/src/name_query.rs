@@ -21,6 +21,42 @@ pub fn header_object_name<'a>(
     Ok(namespace_path)
 }
 
+/// `OBJECT_BASIC_INFORMATION.NameInfoSize` (`ObpQueryNameInfoSize`): what the object header's
+/// name needs, and zero for an object the header does not name. A File or a Key has no header
+/// name; its `ObjectNameInformation` comes from its type's QueryName procedure.
+pub fn basic_name_info_size(header_name: &[u8]) -> u32 {
+    if header_name.is_empty() {
+        0
+    } else {
+        object_name_information_bytes(header_name) as u32
+    }
+}
+
+/// The name `CmpQueryKeyName` reports for a key whose canonical (case-folded) path is
+/// `canonical`. The namespace's own components are spelled as the Configuration Manager
+/// creates them, `\REGISTRY\MACHINE` and `\REGISTRY\USER`; `None` for a path outside
+/// `\REGISTRY`.
+pub fn key_object_name(canonical: &str) -> Option<alloc::string::String> {
+    let mut components = canonical.split('\\').filter(|component| !component.is_empty());
+    if !components.next()?.eq_ignore_ascii_case("registry") {
+        return None;
+    }
+    let mut name = alloc::string::String::new();
+    name.try_reserve(canonical.len() + 1).ok()?;
+    name.push_str("\\REGISTRY");
+    for (depth, component) in components.enumerate() {
+        name.push('\\');
+        if depth == 0 && component.eq_ignore_ascii_case("machine") {
+            name.push_str("MACHINE");
+        } else if depth == 0 && component.eq_ignore_ascii_case("user") {
+            name.push_str("USER");
+        } else {
+            name.push_str(component);
+        }
+    }
+    Some(name)
+}
+
 /// Size of the record for `name`: an unnamed object is the bare header, a named one adds the
 /// NUL-terminated UTF-16 name.
 pub fn object_name_information_bytes(name: &[u8]) -> usize {
@@ -58,6 +94,33 @@ pub fn write_object_name_information(
         unit.copy_from_slice(&u16::from(byte).to_le_bytes());
     }
     Some(used)
+}
+
+/// The whole record for a name that need not be ASCII, as the caller will see it at
+/// `information`. `None` when the name does not fit a `UNICODE_STRING` or memory is short.
+pub fn encode_object_name_information(name: &str, information: u64) -> Option<alloc::vec::Vec<u8>> {
+    let mut record = alloc::vec::Vec::new();
+    if name.is_empty() {
+        record.try_reserve_exact(OBJECT_NAME_INFORMATION_BYTES).ok()?;
+        record.resize(OBJECT_NAME_INFORMATION_BYTES, 0);
+        return Some(record);
+    }
+    let units = name.encode_utf16().count();
+    let name_bytes = u16::try_from(units.checked_mul(2)?).ok()?;
+    let maximum = name_bytes.checked_add(2)?;
+    let buffer = information.checked_add(OBJECT_NAME_INFORMATION_BYTES as u64)?;
+    record
+        .try_reserve_exact(OBJECT_NAME_INFORMATION_BYTES + usize::from(maximum))
+        .ok()?;
+    record.extend_from_slice(&name_bytes.to_le_bytes());
+    record.extend_from_slice(&maximum.to_le_bytes());
+    record.extend_from_slice(&[0; 4]);
+    record.extend_from_slice(&buffer.to_le_bytes());
+    for unit in name.encode_utf16() {
+        record.extend_from_slice(&unit.to_le_bytes());
+    }
+    record.extend_from_slice(&[0, 0]);
+    Some(record)
 }
 
 #[cfg(test)]
@@ -104,6 +167,53 @@ mod tests {
             header_object_name(b"File", b"\\Device\\x"),
             Err(NtStatus::NOT_SUPPORTED)
         );
+    }
+
+    #[test]
+    fn basic_information_sizes_only_a_header_name() {
+        assert_eq!(basic_name_info_size(b""), 0);
+        assert_eq!(basic_name_info_size(b"\\BaseNamedObjects\\x"), 16 + 19 * 2 + 2);
+    }
+
+    #[test]
+    fn key_is_named_by_its_full_registry_path() {
+        assert_eq!(
+            key_object_name("\\registry\\machine\\software\\classes").as_deref(),
+            Some("\\REGISTRY\\MACHINE\\software\\classes")
+        );
+        assert_eq!(
+            key_object_name("\\registry\\user\\s-1-5-18").as_deref(),
+            Some("\\REGISTRY\\USER\\s-1-5-18")
+        );
+        assert_eq!(key_object_name("\\Registry\\Machine").as_deref(), Some("\\REGISTRY\\MACHINE"));
+        assert_eq!(key_object_name("\\registry").as_deref(), Some("\\REGISTRY"));
+        // A hive mounted under another root keeps the name it was linked at.
+        assert_eq!(
+            key_object_name("\\registry\\a\\b").as_deref(),
+            Some("\\REGISTRY\\a\\b")
+        );
+        assert_eq!(key_object_name("\\registryx\\machine"), None);
+        assert_eq!(key_object_name("\\device\\x"), None);
+        assert_eq!(key_object_name(""), None);
+    }
+
+    #[test]
+    fn a_name_outside_ascii_is_encoded_as_utf16() {
+        let record = encode_object_name_information("\\REGISTRY\\USER\\\u{e9}t\u{e9}", 0x9000).unwrap();
+        let units = 15 + 3;
+        assert_eq!(record.len(), 16 + units * 2 + 2);
+        assert_eq!(u16::from_le_bytes([record[0], record[1]]) as usize, units * 2);
+        assert_eq!(u16::from_le_bytes([record[2], record[3]]) as usize, units * 2 + 2);
+        assert_eq!(u64::from_le_bytes(record[8..16].try_into().unwrap()), 0x9010);
+        assert_eq!(&record[16 + 15 * 2..16 + 16 * 2], &0xe9u16.to_le_bytes());
+        assert_eq!(&record[record.len() - 2..], &[0, 0]);
+        // The same bytes as the ASCII encoder where both apply.
+        let mut ascii = [0u8; 64];
+        let used = write_object_name_information(b"\\a\\b", 0x9000, &mut ascii).unwrap();
+        assert_eq!(encode_object_name_information("\\a\\b", 0x9000).unwrap(), &ascii[..used]);
+        assert_eq!(encode_object_name_information("", 0x9000).unwrap(), [0u8; 16]);
+        let long: alloc::string::String = core::iter::repeat('x').take(0x8000).collect();
+        assert_eq!(encode_object_name_information(&long, 0x9000), None);
     }
 
     #[test]

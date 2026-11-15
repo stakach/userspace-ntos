@@ -892,3 +892,11 @@ diagnosis-free failure.
   other. Read the pending-record set as owned state, not as "whatever the last pump left".
 - Check the earlier boots for the same marker before blaming the newest commit: the stalled
   boot printed the same `callback-return flush suspended` line three commits earlier.
+
+## Read A Test Run By Its Failure Lines
+- `grep failed` over cargo test output matches the `0 failed` in every passing summary, and a
+  `head` then hides the real `... FAILED` lines behind them. Three source-text tests failed
+  locally, were read as green, and went red on `main` (#405). Select `\.\.\. FAILED`,
+  `^error: test failed` and `could not compile`, and require the count to be zero.
+- Before wrapping or renaming a function, search `crates/nt-compat-exports/tests` for its name;
+  a test that parses it by name keeps passing only while the body stays under that name.
