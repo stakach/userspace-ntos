@@ -115,6 +115,14 @@ unsafe fn retain_failure(index: usize, phase: Phase) {
     }
 }
 
+/// The generation an acquired lease is validated against. An OPEN answered while a COMMIT's
+/// durable marker is still being written carries the generation CM already published.
+fn opened_read_generation(attempt: &nt_config_client::SystemHiveKeyOpenAttempt) -> u64 {
+    config_manager_system_read_generation(
+        attempt.known_lease().map_or(0, |lease| lease.opened_generation),
+    )
+}
+
 pub(crate) unsafe fn open(path: &str) -> Result<OpenedSystemHiveKey, i32> {
     open_target(path, None)
 }
@@ -156,8 +164,8 @@ pub(crate) unsafe fn resume_publication_open(
     if !row(index).attempt.as_ref().unwrap().is_acknowledged() {
         exchange(index, SystemHiveKeyOpenOperation::Acknowledge)?;
     }
-    let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     let attempt = row(index).attempt.as_mut().expect("publication OPEN");
+    let generation = opened_read_generation(attempt);
     let result = (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
         .take_validated(attempt, generation);
     match result {
@@ -202,6 +210,7 @@ unsafe fn open_target(
     let result = (|| {
         resolve_open(index)?;
         let attempt = row(index).attempt.as_mut().unwrap();
+        let generation = opened_read_generation(attempt);
         (&mut *core::ptr::addr_of_mut!(ATTEMPTS)).take_validated(attempt, generation)
     })();
     match result {

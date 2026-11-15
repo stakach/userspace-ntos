@@ -15868,6 +15868,45 @@ pub(crate) fn config_manager_channel_idle() -> bool {
 }
 static mut LIVE_CONFIG_MANAGER_SYSTEM_MOUNT: Option<nt_config_client::SystemHiveMount> = None;
 static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Generation of the latest SYSTEM COMMIT issued to CM. CM publishes it before the commit
+/// marker that advances `LIVE_CONFIG_MANAGER_SYSTEM_GENERATION` is durable.
+static LIVE_CONFIG_MANAGER_SYSTEM_COMMIT_ENTERED_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn config_manager_note_system_commit_entered(next_generation: u64) {
+    LIVE_CONFIG_MANAGER_SYSTEM_COMMIT_ENTERED_GENERATION.store(next_generation, Ordering::Release);
+}
+
+fn config_manager_system_generation_view() -> nt_config_client::SystemGenerationView {
+    nt_config_client::SystemGenerationView::new(
+        LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire),
+        LIVE_CONFIG_MANAGER_SYSTEM_COMMIT_ENTERED_GENERATION.load(Ordering::Acquire),
+    )
+}
+
+/// Whether a SYSTEM read that CM answered at `observed` belongs to the live mount history.
+fn config_manager_system_read_admitted(observed: u64) -> bool {
+    config_manager_system_read_generation(observed) == observed
+}
+
+/// The generation to validate a SYSTEM read against; see `SystemGenerationView`.
+pub(crate) fn config_manager_system_read_generation(observed: u64) -> u64 {
+    static READS_AHEAD_OF_DURABLE: AtomicU64 = AtomicU64::new(0);
+    let durable = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let admitted = config_manager_system_generation_view().read_generation(observed);
+    if admitted != durable {
+        let count = READS_AHEAD_OF_DURABLE.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 8 || count.is_power_of_two() {
+            print_str(b"[cm-read-ahead] n/observed/durable=");
+            print_u64(count);
+            print_str(b"/");
+            print_u64(observed);
+            print_str(b"/");
+            print_u64(durable);
+            print_str(b"\n");
+        }
+    }
+    admitted
+}
 static CONFIG_DEVICE_ACTION_PENDING: AtomicBool = AtomicBool::new(false);
 static CONFIG_DEVICE_ACTION_WAKE_REQUESTED: AtomicBool = AtomicBool::new(false);
 const CONFIG_STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
@@ -15878,6 +15917,7 @@ unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static
     CM_CHANNEL_REQUEST_PENDING.store(false, Ordering::Release);
     LIVE_CONFIG_MANAGER_SYSTEM_MOUNT = None;
     LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(0, Ordering::Release);
+    LIVE_CONFIG_MANAGER_SYSTEM_COMMIT_ENTERED_GENERATION.store(0, Ordering::Release);
     CONFIG_CLIENT_PTR = client as *mut _;
 }
 
@@ -16204,7 +16244,7 @@ pub(crate) unsafe fn config_manager_query_system_hive_key(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     let snapshot = client.query_system_hive_key(path)?;
-    if snapshot.mount_generation != expected_generation {
+    if !config_manager_system_read_admitted(snapshot.mount_generation) {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     Ok(snapshot)
@@ -16245,7 +16285,7 @@ pub(crate) unsafe fn config_manager_resolve_system_hive_path(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     let resolved = client.resolve_system_hive_path(path)?;
-    if resolved.mount_generation != expected_generation {
+    if !config_manager_system_read_admitted(resolved.mount_generation) {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     Ok(resolved)
@@ -16288,7 +16328,7 @@ pub(crate) unsafe fn config_manager_query_leased_system_hive_key_information(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     let information = client.query_leased_system_hive_key_information(lease)?;
-    if information.mount_generation != expected_generation {
+    if !config_manager_system_read_admitted(information.mount_generation) {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     Ok(information)
@@ -16305,7 +16345,7 @@ pub(crate) unsafe fn config_manager_export_leased_system_hive(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     let exported = client.export_leased_system_hive(lease)?;
-    if exported.mount_generation != expected_generation {
+    if !config_manager_system_read_admitted(exported.mount_generation) {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     Ok(exported)
@@ -16323,7 +16363,7 @@ pub(crate) unsafe fn config_manager_query_leased_system_hive_value(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     let value = client.query_leased_system_hive_value(lease, name)?;
-    if value.mount_generation != expected_generation {
+    if !config_manager_system_read_admitted(value.mount_generation) {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     Ok(value)
@@ -16341,7 +16381,7 @@ pub(crate) unsafe fn config_manager_enumerate_leased_system_hive_subkey(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     let subkey = client.enumerate_leased_system_hive_subkey(lease, index)?;
-    if subkey.mount_generation != expected_generation {
+    if !config_manager_system_read_admitted(subkey.mount_generation) {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     Ok(subkey)
@@ -16359,7 +16399,7 @@ pub(crate) unsafe fn config_manager_enumerate_leased_system_hive_value(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     let value = client.enumerate_leased_system_hive_value(lease, index)?;
-    if value.mount_generation != expected_generation {
+    if !config_manager_system_read_admitted(value.mount_generation) {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     Ok(value)
@@ -22523,6 +22563,7 @@ fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
         LIVE_CONFIG_MANAGER_SYSTEM_MOUNT = None;
     }
     LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(0, Ordering::Release);
+    LIVE_CONFIG_MANAGER_SYSTEM_COMMIT_ENTERED_GENERATION.store(0, Ordering::Release);
     {
         let _transient = allocator::enter_transient();
         if let Some(image) = unsafe { boot_system_hive_image_bytes() } {

@@ -25,6 +25,9 @@ pub(crate) unsafe fn prepare(
 pub(crate) unsafe fn commit(
     prepared: &PreparedSystemHiveMutation,
 ) -> Result<SystemHiveMutationCommitReceipt, i32> {
+    // Recorded before the IPC: a lost COMMIT reply may already have published CM, and readers
+    // run before this writer's durable marker advances the durable generation.
+    crate::config_manager_note_system_commit_entered(prepared.next_generation());
     CONFIG_CLIENT_PTR
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?

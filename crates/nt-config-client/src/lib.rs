@@ -33,6 +33,8 @@ pub use filter_policy::{DeviceFilterPolicySnapshot, UpperFilterLaunchPlanSnapsho
 mod runtime_key;
 mod system_mount;
 pub use system_mount::{SystemHiveMount, SystemHiveMountState};
+mod system_generation;
+pub use system_generation::SystemGenerationView;
 mod retained_snapshot;
 pub use retained_snapshot::{
     CmSnapshotAttempt, CmSnapshotAttempts, CmSnapshotExchange, CmSnapshotOperation,
