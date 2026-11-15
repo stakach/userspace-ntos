@@ -115,13 +115,23 @@ pub mod root {
     pub const DMA_GRAPH_SLOTS: Region =
         Region::new("DMA graph slots", 0x0000_0106_0000_0000, 256 * MIB);
 
-    /// One [`DYNAMIC_RUNTIME_STRIDE`] per dynamically admitted process. It is the highest band,
-    /// so the process limit can rise to the badge limit without moving it again.
+    /// One [`DYNAMIC_RUNTIME_STRIDE`] per dynamically admitted process. Nothing follows it
+    /// below [`DISPLAY_WINDOW`], so the process limit can rise to the badge limit in place.
     pub const DYNAMIC_RUNTIME: Region = Region::new(
         "dynamic process runtime windows",
         0x0000_0107_0000_0000,
         (HOSTED_PROCESS_LIMIT - STATIC_PROCESS_COUNT) as u64 * DYNAMIC_RUNTIME_STRIDE,
     );
+
+    /// The root's window onto the display adapter's memory BAR, in a PML4 branch of its own.
+    pub const DISPLAY_WINDOW: Region =
+        Region::new("display BAR window", 0x0000_0200_0000_0000, 512 * GIB);
+    /// Leased spans for retained device and firmware memory.
+    pub const DEVICE_MAPPINGS: Region =
+        Region::new("device mappings", 0x0000_4000_0000_0000, 4 * GIB);
+    /// Process and thread object bodies, in a PML4 branch of their own.
+    pub const PS_OBJECTS: Region =
+        Region::new("process and thread objects", 0x0000_4080_0000_0000, 512 * GIB);
 
     /// Every band of the root VSpace, in ascending order.
     pub const REGIONS: &[Region] = &[
@@ -141,10 +151,17 @@ pub mod root {
         SHELL_MIRRORS,
         DMA_GRAPH_SLOTS,
         DYNAMIC_RUNTIME,
+        DISPLAY_WINDOW,
+        DEVICE_MAPPINGS,
+        PS_OBJECTS,
     ];
 
     const _: () = assert!(is_ascending(REGIONS));
     const _: () = assert!(HEAP.base % TABLE_SPAN == 0 && HEAP.len % TABLE_SPAN == 0);
+    // The heap's page tables are built at boot into the page directory the image already has;
+    // the root does not build another directory before its heap exists.
+    const _: () = assert!(HEAP.base / GIB == FIXED_LOW.base / GIB);
+    const _: () = assert!((HEAP.end() - 1) / GIB == FIXED_LOW.base / GIB);
     const _: () = assert!(STATIC_SCRATCH.base % TABLE_SPAN == 0);
     const _: () = assert!(DYNAMIC_RUNTIME.base % TABLE_SPAN == 0);
     const _: () = assert!(HOSTED_PROCESS_LIMIT > STATIC_PROCESS_COUNT);

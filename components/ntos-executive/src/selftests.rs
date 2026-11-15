@@ -11,8 +11,8 @@ use crate::*;
 /// Returns a bitmask of proven properties (all set = 0b11_1111 = the mechanism works). This is the
 /// reclamation MECHANISM the coordinator asked to prove before (optionally) applying it live.
 ///
-/// `RECLAIM_VA`: an unused page of smss's demand-fill scratch window (`SMSS_SCRATCH_BASE`, 16 PTs =
-/// 8192 pages, mapped into the executive's OWN VSpace); smss faulted ~136 pages (offsets < 0x9_0000),
+/// `RECLAIM_VA`: an unused page of smss's demand-fill scratch window (`SMSS_SCRATCH_BASE`, 32 PTs,
+/// mapped into the executive's OWN VSpace); smss faulted ~136 pages (offsets < 0x9_0000),
 /// so page 3000 (offset 0xBB8_000) is free + its PT exists → a safe, isolated frame-map/unmap target.
 pub(crate) unsafe fn reclaim_mechanism_selftest() -> u64 {
     const RECLAIM_VA: u64 = SMSS_SCRATCH_BASE + 3000 * 0x1000;

@@ -8,8 +8,8 @@ use nt_memory_manager::owned_paging_structure::{
     OwnedPagingStructure, PagingStructureError, PagingStructureIo, PagingStructurePhase,
 };
 
-pub(crate) const PS_OBJECT_ARENA_BASE: u64 = 0x0000_4080_0000_0000;
-pub(crate) const PS_OBJECT_ARENA_LIMIT: u64 = 0x0000_4100_0000_0000;
+pub(crate) const PS_OBJECT_ARENA_BASE: u64 = nt_executive_layout::root::PS_OBJECTS.base;
+pub(crate) const PS_OBJECT_ARENA_LIMIT: u64 = nt_executive_layout::root::PS_OBJECTS.end();
 const PAGE_BYTES: u64 = 0x1000;
 const PML4_BRANCH_BYTES: u64 = 1 << 39;
 

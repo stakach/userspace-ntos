@@ -9,8 +9,8 @@ use nt_pnp_context::{
 };
 
 const EXECUTIVE_DEVICE_MAPPING_STRIDE: u64 = 0x20_0000;
-const EXECUTIVE_DEVICE_MAPPING_BASE: u64 = 0x0000_4000_0000_0000;
-const EXECUTIVE_DEVICE_MAPPING_LIMIT: u64 = 0x0000_4001_0000_0000;
+const EXECUTIVE_DEVICE_MAPPING_BASE: u64 = nt_executive_layout::root::DEVICE_MAPPINGS.base;
+const EXECUTIVE_DEVICE_MAPPING_LIMIT: u64 = nt_executive_layout::root::DEVICE_MAPPINGS.end();
 
 const _: () = {
     assert!(EXECUTIVE_DEVICE_MAPPING_BASE > crate::driver_launch::FSD_EXEC_LIMIT);

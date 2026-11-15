@@ -27,6 +27,7 @@ const STATUS_SUCCESS: i32 = 0;
 const _: () = assert!(APERTURE_BASE >= FSD_WORKER_EXEC_ALIAS_BASE + 0x8000_0000);
 const _: () = assert!(APERTURE_BASE >= FSD_EXEC_LIMIT);
 const _: () = assert!(APERTURE_END == nt_executive_layout::root::CONTIGUOUS_RAM_APERTURE.end());
+const _: () = assert!(APERTURE_END < nt_executive_layout::root::DISPLAY_WINDOW.base);
 
 struct Allocation {
     slot: usize,

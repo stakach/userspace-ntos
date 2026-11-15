@@ -68,6 +68,9 @@ fn every_root_band_is_where_the_plan_says() {
         (&root::SHELL_MIRRORS, 0x0105_1c00_0000, 0x0105_1c40_0000),
         (&root::DMA_GRAPH_SLOTS, 0x0106_0000_0000, 0x0106_1000_0000),
         (&root::DYNAMIC_RUNTIME, 0x0107_0000_0000, 0x0107_c800_0000),
+        (&root::DISPLAY_WINDOW, 0x0200_0000_0000, 0x0280_0000_0000),
+        (&root::DEVICE_MAPPINGS, 0x4000_0000_0000, 0x4001_0000_0000),
+        (&root::PS_OBJECTS, 0x4080_0000_0000, 0x4100_0000_0000),
     ];
     assert_eq!(plan.len(), root::REGIONS.len(), "a band is missing from the plan");
     for ((region, base, end), listed) in plan.iter().zip(root::REGIONS) {
@@ -126,13 +129,12 @@ fn every_dynamic_process_has_a_whole_runtime_window() {
     assert!(DYNAMIC_RUNTIME_STRIDE >= DEMAND_SCRATCH_WINDOW + 4 * 0x10_0000);
     assert_eq!(root::DYNAMIC_RUNTIME.base % TABLE_SPAN, 0);
     assert_eq!(DYNAMIC_RUNTIME_STRIDE % TABLE_SPAN, 0);
-    // The band is last, so the badge limit is the only bound on raising the process limit.
-    assert_eq!(root::REGIONS.last(), Some(&root::DYNAMIC_RUNTIME));
+    // Raising the process limit to the badge limit keeps the band below its neighbour.
     let at_badge_limit = (nt_exe_image::DYNAMIC_PROCESS_PI_LIMIT - STATIC_PROCESS_COUNT) as u64;
-    assert!(root::DYNAMIC_RUNTIME
-        .base
-        .checked_add(at_badge_limit * DYNAMIC_RUNTIME_STRIDE)
-        .is_some_and(|end| end <= 0x0000_8000_0000_0000));
+    assert!(
+        root::DYNAMIC_RUNTIME.base + at_badge_limit * DYNAMIC_RUNTIME_STRIDE
+            <= root::DISPLAY_WINDOW.base
+    );
 }
 
 #[test]
@@ -153,6 +155,15 @@ fn every_process_slot_has_a_badge() {
     for pi in STATIC_PROCESS_COUNT..HOSTED_PROCESS_LIMIT {
         assert!(nt_exe_image::dynamic_top_badge_for_pi(pi).is_some(), "pi {pi} has no badge");
     }
+}
+
+/// The root builds its heap's page tables before it can build a page directory, so the heap
+/// stays inside the 1 GiB the image's directory covers.
+#[test]
+fn the_root_heap_stays_under_the_image_page_directory() {
+    const GIB: u64 = 1 << 30;
+    assert_eq!(root::HEAP.base / GIB, root::FIXED_LOW.base / GIB);
+    assert_eq!((root::HEAP.end() - 1) / GIB, root::FIXED_LOW.base / GIB);
 }
 
 /// Bands numbered below the private-memory limit stay below it; root-only bands start at it.

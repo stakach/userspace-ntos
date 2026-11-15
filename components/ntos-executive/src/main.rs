@@ -1369,9 +1369,8 @@ pub const CSRSS_BADGE: u64 = 2;
 // single 8-PT span 0x1100..0x1200 with ~512-page inter-process spacing — too tight now that the
 // BATCH bulk-fill lets a process (lsass) page in its full LSA-init DLL tree (thousands of pages;
 // each fill takes a UNIQUE monotonic scratch slot). Each process now gets its OWN 64 MiB window
-// (0x400_0000 = 16384 pages, well above FAULT_CAP) in the free high VA region past all other
-// executive mappings (POOL_VADDR 0x1500, SRVBUF 0x1400, win32k pools 0x0A00 — all far below
-// 0x2000). Their page tables are mapped per-window at spawn (see `map_demand_scratch_pts`).
+// (0x400_0000 = 16384 pages, well above FAULT_CAP). Their page tables are mapped per-window at
+// spawn (see `map_demand_scratch_pts`).
 pub const DEMAND_SCRATCH_WINDOW: u64 = nt_executive_layout::DEMAND_SCRATCH_WINDOW; // 64 MiB per process
 // The static-process windows sit in their own band above the worker mirrors.
 // `ensure_executive_paging` builds every missing paging level when a window is first mapped.
@@ -27977,7 +27976,7 @@ static ACTIVE_FB_SIZE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// and Explorer readback compare against it without mutating the framebuffer under observation.
 const FB_DESKTOP_BG: u32 = 0x003a_6ea5;
 /// The executive's Phase-0a display BAR window. Readback begins at `FB_SCANOUT_BAR_OFFSET`.
-const FB_VADDR: u64 = 0x0000_0200_0000_0000;
+const FB_VADDR: u64 = nt_executive_layout::root::DISPLAY_WINDOW.base;
 
 pub(crate) fn publish_active_framebuffer_mode(mode: nt_video_miniport::VideoModeSpec) -> bool {
     let Some(size_bytes) = mode.framebuffer_bytes() else {
@@ -30550,20 +30549,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 USERINIT_STACK_MIRROR_VA,
                 CAP_INIT_THREAD_VSPACE,
             );
-            let explorer_mirror_pt = alloc_slot();
-            let _ = untyped_retype(
-                CAP_INIT_UNTYPED,
-                OBJ_X86_PAGE_TABLE,
-                PAGING_BITS,
-                1,
-                explorer_mirror_pt,
-            );
-            let _ = paging_struct_map(
-                explorer_mirror_pt,
-                LBL_X86_PAGE_TABLE_MAP,
-                EXPLORER_STACK_MIRROR_VA,
-                CAP_INIT_THREAD_VSPACE,
-            );
+            // explorer's mirrors sit in a band of their own, whose page directory nothing has
+            // built yet; a bare page-table map there would be refused.
+            assert!(ensure_executive_paging(EXPLORER_STACK_MIRROR_VA));
             let fb_start = alloc_frame_run(FILEBUF_FRAMES);
             for i in 0..FILEBUF_FRAMES {
                 let _ = page_map(

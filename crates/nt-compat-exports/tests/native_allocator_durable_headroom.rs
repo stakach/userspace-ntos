@@ -8,7 +8,8 @@ use allocator_headroom::DurableExtent;
 const PAGE: usize = 0x1000;
 /// Allocator metadata ahead of the first allocation (`allocator::DATA - HEAP_BASE`).
 const METADATA: usize = 152;
-/// `EXECUTIVE_DURABLE_HEAP_FRAMES`: the root reservation less its transient lane.
+/// `EXECUTIVE_DURABLE_HEAP_FRAMES` in the logged runs: the 88 MiB root reservation of the time
+/// less its transient lane.
 const RESERVATION: usize = 21504 * PAGE;
 /// `BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM`.
 const PRESERVE: usize = 0x18_0000;
