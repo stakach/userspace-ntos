@@ -20290,15 +20290,15 @@ fn is_virtual_registry_key(kr: KeyRef) -> bool {
 /// boot and has no runtime executive navigator. A borrowed `KeyRef` is a cell offset in one of the
 /// remaining REGF mounts, with its top nibble selecting the hive. Real cell offsets are far below
 /// 0x2000_0000, and the tags stay below `OVERLAY_KEY_TAG` so `is_virtual_registry_key` is unchanged.
-/// ★ WIDENED `0xE000_0000` -> `0xF000_0000` (batch 62). The mask must leave room for the hives
-/// mounted at RUN time by `NtLoadKey` as well as the reserved boot selectors, and every selector has
-/// to stay strictly below [`OVERLAY_KEY_TAG`] (`0x8000_0000`) so `is_virtual_registry_key` is
-/// unchanged. Four tags of 3 bits gave exactly four mounts; four bits gives EIGHT (`0x0`-`0x7`),
-/// with the established selector values preserved and the odd ones available to the
-/// `\Registry\User` namespace. A widened mask is safe because a real cell offset is bounded by the
-/// hive's file size and the largest hive on the image is 471040 B — three orders of magnitude
-/// below the smallest tag.
-pub(crate) const HIVE_SEL_MASK: u32 = 0xF000_0000;
+/// The selector is the top five bits. Every selector has to stay strictly below
+/// [`MUTABLE_KEY_TAG`] (`0x7000_0000`) so `is_virtual_registry_key` is unchanged, which leaves
+/// fourteen values: the five boot selectors keep their established values (multiples of
+/// `0x1000_0000`) and the rest are available to the hives `NtLoadKey` mounts at run time. A cell
+/// offset is bounded by the hive's file size, so a borrowed hive may be at most
+/// [`HIVE_CELL_LIMIT`] bytes; the largest hive on the image is 471040 B.
+pub(crate) const HIVE_SEL_MASK: u32 = 0xF800_0000;
+/// One past the largest cell offset a borrowed `KeyRef` can carry beside its selector.
+pub(crate) const HIVE_CELL_LIMIT: u32 = !HIVE_SEL_MASK + 1;
 /// Reserved selector 0 for classifying and rejecting stale borrowed SYSTEM identities. Live SYSTEM
 /// handles use `CM_SYSTEM_KEY_TAG` leases instead.
 pub(crate) const HIVE_SEL_SYSTEM: u32 = 0x0000_0000;
@@ -20316,9 +20316,39 @@ pub(crate) const HIVE_SEL_SAM: u32 = 0x6000_0000;
 /// boot mounts — a dynamic mount differs only in WHEN it is created and in carrying its NT mount
 /// path at run time; every consumer (`base_hive`, `resolve_key`, `registry_target_path`,
 /// `open_key_from`) treats it identically.
-pub(crate) const HIVE_SEL_DYNAMIC: [u32; 2] = [0x3000_0000, 0x5000_0000];
-const _: () =
-    assert!(HIVE_SEL_DYNAMIC[0] < OVERLAY_KEY_TAG && HIVE_SEL_DYNAMIC[1] < OVERLAY_KEY_TAG);
+///
+/// The interactive user's hive and the service accounts' (`LocalService`, `NetworkService`) are
+/// loaded at the same time, each for as long as a process of that account runs.
+pub(crate) const HIVE_SEL_DYNAMIC: [u32; 6] = [
+    0x3000_0000, 0x5000_0000, 0x1800_0000, 0x2800_0000, 0x3800_0000, 0x4800_0000,
+];
+const _: () = {
+    const BOOT: [u32; 5] = [
+        HIVE_SEL_SYSTEM, HIVE_SEL_USER_DEFAULT, HIVE_SEL_SOFTWARE, HIVE_SEL_SECURITY, HIVE_SEL_SAM,
+    ];
+    let mut i = 0;
+    while i < HIVE_SEL_DYNAMIC.len() {
+        let sel = HIVE_SEL_DYNAMIC[i];
+        // A whole selector, below every virtual key tag, and nobody else's.
+        assert!(sel & !HIVE_SEL_MASK == 0 && sel < MUTABLE_KEY_TAG);
+        let mut j = 0;
+        while j < BOOT.len() {
+            assert!(sel != BOOT[j]);
+            j += 1;
+        }
+        j = 0;
+        while j < i {
+            assert!(sel != HIVE_SEL_DYNAMIC[j]);
+            j += 1;
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j < BOOT.len() {
+        assert!(BOOT[j] & !HIVE_SEL_MASK == 0);
+        j += 1;
+    }
+};
 const _: () =
     assert!(HIVE_SEL_SAM < MUTABLE_KEY_TAG && MUTABLE_KEY_TAG + MUTABLE_KEY_MAX <= OVERLAY_KEY_TAG);
 const _: () = assert!(MUTABLE_KEY_TAG + MUTABLE_KEY_MAX <= CM_SYSTEM_KEY_TAG);

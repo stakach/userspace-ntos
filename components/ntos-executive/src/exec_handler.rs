@@ -7047,11 +7047,14 @@ impl ExecNtHandler {
         let file16 = self.read_objattr_name_pe(source_oa);
         let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
         let mut relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
-        let Some(relative_len) = crate::writable_fs::writable_path_into(
+        // Any file on the mounted volume can back a hive: where a profile lives is the caller's
+        // choice (`ProfileList\<sid>\ProfileImagePath`), not this service's.
+        let Some(relative_len) = crate::writable_fs::volume_path_into(
             &file16,
             &mut folded,
             &mut relative,
         ) else {
+            print_str(b"[cm-load] NtLoadKey: source is not a file on the mounted volume\n");
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
         let relative = &relative[..relative_len];
@@ -7081,6 +7084,11 @@ impl ExecNtHandler {
             }
         };
         let len = image.len();
+        if len as u64 >= u64::from(HIVE_CELL_LIMIT) {
+            // A borrowed key names a cell by its offset beside the hive selector.
+            print_str(b"[cm-load] NtLoadKey REFUSED: hive larger than a key reference can address\n");
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
         // SAFETY: this executive owns the chosen slot until the mount is dropped.
         let claim = user_hive_image::Claim::new(slot, image);
         let bytes = claim.bytes();

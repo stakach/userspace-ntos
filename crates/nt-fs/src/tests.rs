@@ -3168,6 +3168,35 @@ fn file_basic_information_parser_requires_the_complete_fixed_record() {
     );
 }
 
+/// `NtLoadKey` reads a hive from wherever its caller says the profile lives. The service
+/// accounts' `ProfileImagePath` is under `%SystemRoot%\ServiceProfiles`, outside every subtree the
+/// writable mount owns by prefix, so the hive source is classified as a file on the volume.
+#[test]
+fn a_hive_source_is_any_file_on_the_volume_not_only_a_prefix_owned_one() {
+    const PREFIXES: &[&[u8]] = &[b"users", b"windows\\system32\\config", b"windows\\bootstat.dat"];
+    for (path, relative) in [
+        (
+            r"\??\C:\Windows\ServiceProfiles\NetworkService\ntuser.dat",
+            &b"windows\\serviceprofiles\\networkservice\\ntuser.dat"[..],
+        ),
+        (
+            r"\??\C:\Windows\ServiceProfiles\LocalService\ntuser.dat",
+            &b"windows\\serviceprofiles\\localservice\\ntuser.dat"[..],
+        ),
+    ] {
+        assert!(writable_mount_relative(&wide(path), b"windows", PREFIXES).is_none());
+        assert_eq!(nt_path_to_volume_relative(&wide(path), b"windows").as_deref(), Some(relative));
+    }
+    // The interactive user's hive is on the volume under either classification.
+    let user = wide(r"\??\C:\Users\User\ntuser.dat");
+    assert_eq!(
+        nt_path_to_volume_relative(&user, b"windows"),
+        writable_mount_relative(&user, b"windows", PREFIXES)
+    );
+    // A name that is not a file on the volume is still no hive source.
+    assert!(nt_path_to_volume_relative(&wide(r"\Device\NamedPipe\ntuser.dat"), b"windows").is_none());
+}
+
 #[test]
 fn writable_mount_covers_a_prefix_subtree_only() {
     const PREFIXES: &[&[u8]] = &[b"profiles"];
