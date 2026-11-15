@@ -44,7 +44,7 @@ pub const STATIC_PROCESS_COUNT: usize = 7;
 /// Hosted process slots, static and dynamic. Each dynamic slot owns
 /// [`DYNAMIC_RUNTIME_STRIDE`] of [`root::DYNAMIC_RUNTIME`], and every slot owns
 /// [`WORKER_LANES_PER_PROCESS`] lanes of [`root::WORKER_MIRRORS`].
-pub const HOSTED_PROCESS_LIMIT: usize = 24;
+pub const HOSTED_PROCESS_LIMIT: usize = 32;
 /// Thread lanes per hosted process.
 pub const WORKER_LANES_PER_PROCESS: usize = 32;
 /// Executive-side mirror window of one worker lane.
@@ -91,12 +91,6 @@ pub mod root {
     /// snapshots.
     pub const DIAGNOSTIC_ALIASES: Region =
         Region::new("diagnostic aliases", DRIVER_HOST_VIEWS.end(), 32 * MIB);
-    /// One [`DYNAMIC_RUNTIME_STRIDE`] per dynamically admitted process.
-    pub const DYNAMIC_RUNTIME: Region = Region::new(
-        "dynamic process runtime windows",
-        0x0000_0101_6000_0000,
-        (HOSTED_PROCESS_LIMIT - STATIC_PROCESS_COUNT) as u64 * DYNAMIC_RUNTIME_STRIDE,
-    );
     /// Root aliases of hosted driver worker lanes.
     pub const DRIVER_WORKER_ALIASES: Region =
         Region::new("driver worker aliases", 0x0000_0102_0000_0000, 4 * GIB);
@@ -121,6 +115,14 @@ pub mod root {
     pub const DMA_GRAPH_SLOTS: Region =
         Region::new("DMA graph slots", 0x0000_0106_0000_0000, 256 * MIB);
 
+    /// One [`DYNAMIC_RUNTIME_STRIDE`] per dynamically admitted process. It is the highest band,
+    /// so the process limit can rise to the badge limit without moving it again.
+    pub const DYNAMIC_RUNTIME: Region = Region::new(
+        "dynamic process runtime windows",
+        0x0000_0107_0000_0000,
+        (HOSTED_PROCESS_LIMIT - STATIC_PROCESS_COUNT) as u64 * DYNAMIC_RUNTIME_STRIDE,
+    );
+
     /// Every band of the root VSpace, in ascending order.
     pub const REGIONS: &[Region] = &[
         FIXED_LOW,
@@ -132,13 +134,13 @@ pub mod root {
         WIN32K_STACK_ALIASES,
         DRIVER_HOST_VIEWS,
         DIAGNOSTIC_ALIASES,
-        DYNAMIC_RUNTIME,
         DRIVER_WORKER_ALIASES,
         CONTIGUOUS_RAM_APERTURE,
         WORKER_MIRRORS,
         STATIC_SCRATCH,
         SHELL_MIRRORS,
         DMA_GRAPH_SLOTS,
+        DYNAMIC_RUNTIME,
     ];
 
     const _: () = assert!(is_ascending(REGIONS));

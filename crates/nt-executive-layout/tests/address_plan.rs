@@ -61,13 +61,13 @@ fn every_root_band_is_where_the_plan_says() {
         (&root::WIN32K_STACK_ALIASES, 0x0100_4820_0000, 0x0100_48a0_0000),
         (&root::DRIVER_HOST_VIEWS, 0x0100_5000_0000, 0x0101_5000_0000),
         (&root::DIAGNOSTIC_ALIASES, 0x0101_5000_0000, 0x0101_5200_0000),
-        (&root::DYNAMIC_RUNTIME, 0x0101_6000_0000, 0x0101_e800_0000),
         (&root::DRIVER_WORKER_ALIASES, 0x0102_0000_0000, 0x0103_0000_0000),
         (&root::CONTIGUOUS_RAM_APERTURE, 0x0103_0000_0000, 0x0103_2000_0000),
         (&root::WORKER_MIRRORS, 0x0104_0000_0000, 0x0105_0000_0000),
         (&root::STATIC_SCRATCH, 0x0105_0000_0000, 0x0105_1c00_0000),
         (&root::SHELL_MIRRORS, 0x0105_1c00_0000, 0x0105_1c40_0000),
         (&root::DMA_GRAPH_SLOTS, 0x0106_0000_0000, 0x0106_1000_0000),
+        (&root::DYNAMIC_RUNTIME, 0x0107_0000_0000, 0x0107_c800_0000),
     ];
     assert_eq!(plan.len(), root::REGIONS.len(), "a band is missing from the plan");
     for ((region, base, end), listed) in plan.iter().zip(root::REGIONS) {
@@ -126,6 +126,13 @@ fn every_dynamic_process_has_a_whole_runtime_window() {
     assert!(DYNAMIC_RUNTIME_STRIDE >= DEMAND_SCRATCH_WINDOW + 4 * 0x10_0000);
     assert_eq!(root::DYNAMIC_RUNTIME.base % TABLE_SPAN, 0);
     assert_eq!(DYNAMIC_RUNTIME_STRIDE % TABLE_SPAN, 0);
+    // The band is last, so the badge limit is the only bound on raising the process limit.
+    assert_eq!(root::REGIONS.last(), Some(&root::DYNAMIC_RUNTIME));
+    let at_badge_limit = (nt_exe_image::DYNAMIC_PROCESS_PI_LIMIT - STATIC_PROCESS_COUNT) as u64;
+    assert!(root::DYNAMIC_RUNTIME
+        .base
+        .checked_add(at_badge_limit * DYNAMIC_RUNTIME_STRIDE)
+        .is_some_and(|end| end <= 0x0000_8000_0000_0000));
 }
 
 #[test]
@@ -133,6 +140,7 @@ fn every_lane_of_every_process_has_a_mirror() {
     let lanes = (HOSTED_PROCESS_LIMIT * WORKER_LANES_PER_PROCESS) as u64;
     assert!(lanes * WORKER_MIRROR_STRIDE <= root::WORKER_MIRRORS.len);
     assert_eq!(root::WORKER_MIRRORS.base % WORKER_MIRROR_STRIDE, 0);
+    assert_eq!((HOSTED_PROCESS_LIMIT, WORKER_LANES_PER_PROCESS), (32, 32));
     // Lane sets are 64-bit masks.
     assert!(WORKER_LANES_PER_PROCESS <= 64);
 }
