@@ -583,6 +583,7 @@ dependencies = [
  "nt-printf",
  "nt-security",
  "nt-syscall-abi",
+ "nt-thread-start",
  "nt-unwind",
 ]
 

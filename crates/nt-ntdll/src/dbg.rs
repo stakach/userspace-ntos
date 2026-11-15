@@ -376,7 +376,9 @@ pub fn breakpoint() {}
 #[inline]
 pub unsafe fn emit(msg: *const u8, len: usize) {
     core::arch::asm!(
+        // The debug service resumes past the byte that follows the trap, as NT's does.
         "int 0x2d",
+        "int3",
         in("eax") service::PRINT,
         in("rcx") msg,
         in("rdx") len,

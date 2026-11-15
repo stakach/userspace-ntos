@@ -252,16 +252,20 @@ fn main() -> ExitCode {
         };
         let argc = nt_syscall_abi::exact_argc_of(syscall.name)
             .expect("every canonical syscall has an exact argument count");
-        if matches!(syscall.name, "NtInitializeNlsFiles" | "NtGetNlsSectionPtr") {
-            // These named Nt exports map installed NLS files inside ntdll. They retain the
-            // shared ABI name/arity but must never enter the native service table. Check the
-            // emitted PE, not just the Rust source.
+        if matches!(
+            syscall.name,
+            "NtInitializeNlsFiles" | "NtGetNlsSectionPtr" | "NtCreateUserProcess"
+        ) {
+            // These named Nt exports are sequences of other native services inside ntdll (the
+            // NLS file mappings, combined process-and-thread creation). They retain the shared
+            // ABI name/arity but must never enter the native service table. Check the emitted
+            // PE, not just the Rust source.
             check(
                 !image
                     .bytes
                     .get(export.rva as usize..)
                     .is_some_and(|body| native_stub::matches(body, syscall.ssn, argc)),
-                &format!("{} native export is a user-mode file mapping", syscall.name),
+                &format!("{} native export is composed inside ntdll", syscall.name),
             );
             continue;
         }

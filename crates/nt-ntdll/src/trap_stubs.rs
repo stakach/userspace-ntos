@@ -86,6 +86,42 @@ macro_rules! define_stub_arity {
             }
         }
     };
+    // The service is the fixed sequence of native services in `user_process_create`; the named
+    // export keeps the shared ABI name and arity and never enters the native service table.
+    (nt_create_user_process, $name:literal, $ssn:literal, 11) => {
+        #[cfg(target_arch = "x86_64")]
+        #[export_name = $name]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe extern "win64" fn nt_create_user_process(
+            process_handle: u64,
+            thread_handle: u64,
+            process_access: u64,
+            thread_access: u64,
+            process_object_attributes: u64,
+            thread_object_attributes: u64,
+            process_flags: u64,
+            thread_flags: u64,
+            process_parameters: u64,
+            create_info: u64,
+            attribute_list: u64,
+        ) -> u64 {
+            unsafe {
+                crate::user_process_create::create_native(
+                    process_handle,
+                    thread_handle,
+                    process_access,
+                    thread_access,
+                    process_object_attributes,
+                    thread_object_attributes,
+                    process_flags,
+                    thread_flags,
+                    process_parameters,
+                    create_info,
+                    attribute_list,
+                )
+            }
+        }
+    };
     ($fn:ident, $name:literal, $ssn:literal, 0) => {
         define_typed_stub!($fn, $name, $ssn, 0, ());
     };

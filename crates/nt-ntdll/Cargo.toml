@@ -24,6 +24,7 @@ nt-nls = { workspace = true }
 nt-security = { workspace = true }
 nt-pe-loader = { workspace = true }
 nt-port-core = { workspace = true }
+nt-thread-start = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

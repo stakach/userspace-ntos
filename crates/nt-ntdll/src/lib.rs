@@ -77,6 +77,7 @@ pub mod sync;
 pub mod transport;
 pub mod trap_stubs;
 pub mod user_exit;
+pub mod user_process_create;
 
 /// `NTSTATUS` — the 32-bit status every `Nt*` stub returns in `rax` (`STATUS_SUCCESS` = 0).
 pub type NtStatus = u32;
