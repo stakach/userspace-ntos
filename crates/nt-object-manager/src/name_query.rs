@@ -7,10 +7,17 @@ pub const OBJECT_NAME_INFORMATION_BYTES: usize = 16;
 
 /// The namespace path `ObQueryNameString` reports for an object of type `type_name` whose
 /// header name is `namespace_path`; an unnamed object has the empty path.
+///
+/// A File is named by its type's QueryName procedure (`IopQueryNameFile`: the device name
+/// followed by the filesystem's FileNameInformation), never by its header. A caller that can
+/// only read the header has no name to report for one, and the empty string is not that name.
 pub fn header_object_name<'a>(
-    _type_name: &[u8],
+    type_name: &[u8],
     namespace_path: &'a [u8],
 ) -> Result<&'a [u8], NtStatus> {
+    if type_name == b"File" {
+        return Err(NtStatus::NOT_SUPPORTED);
+    }
     Ok(namespace_path)
 }
 
@@ -83,6 +90,20 @@ mod tests {
             Some(16)
         );
         assert_eq!(output, [0; 16]);
+    }
+
+    /// kernel32 `GetFinalPathNameByHandleW` reads `Name.Buffer[8..]` after a successful query
+    /// on a File handle; an empty header name returned as success is a NULL `Buffer` there.
+    #[test]
+    fn file_is_not_named_by_its_object_header() {
+        assert_eq!(
+            header_object_name(b"File", b""),
+            Err(NtStatus::NOT_SUPPORTED)
+        );
+        assert_eq!(
+            header_object_name(b"File", b"\\Device\\x"),
+            Err(NtStatus::NOT_SUPPORTED)
+        );
     }
 
     #[test]
