@@ -1108,6 +1108,12 @@ struct AuthoritativeUnknownSyscallContext {
 }
 
 impl SyscallReplyContext {
+    /// The ingress-owned x64 register arguments (R10, RDX, R8, R9). Handlers take these
+    /// rather than rereading the root IPC buffer, which later kernel queries can overwrite.
+    fn register_args(&self) -> [u64; 4] {
+        [self.regs[9], self.regs[3], self.regs[7], self.regs[8]]
+    }
+
     unsafe fn capture(m0: u64, m1: u64, m2: u64, m3: u64) -> Self {
         let mut regs = [0u64; 18];
         regs[0] = m0;

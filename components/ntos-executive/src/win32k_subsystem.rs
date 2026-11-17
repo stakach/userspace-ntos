@@ -18424,7 +18424,8 @@ unsafe fn current_request_argument(index: u64) -> Option<u64> {
     let sh = WIN32K_SHARED_VADDR;
     let caller_sp = read_volatile((sh + SH_REQ_CALLER_SP) as *const u64);
     if caller_sp != 0 {
-        let address = caller_sp.checked_add(0x28 + (index - 4) * 8)?;
+        let address =
+            nt_syscall_abi::user_stack_args::user_stack_argument_address(caller_sp, index).ok()?;
         Some(read_volatile(address as *const u64))
     } else {
         let nargs = read_volatile((sh + SH_REQ_NARGS) as *const u64);
@@ -19018,17 +19019,12 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     }
     if nargs > 4 {
         if caller_sp != 0 {
-            let last_tail = nargs - 5;
-            if caller_sp
-                .checked_add(0x28)
-                .and_then(|base| {
-                    last_tail
-                        .checked_mul(8)
-                        .and_then(|offset| base.checked_add(offset))
-                })
-                .is_none()
+            // Fail the caller exactly as NT's service entry does when its stack tail is not
+            // user memory, rather than letting this component fault on its behalf.
+            if let Err(status) =
+                nt_syscall_abi::user_stack_args::validate_user_stack_argument_tail(caller_sp, nargs)
             {
-                return STATUS_INVALID_PARAMETER;
+                return status as u32 as u64;
             }
         } else if staged_nargs < nargs {
             return STATUS_INVALID_PARAMETER;

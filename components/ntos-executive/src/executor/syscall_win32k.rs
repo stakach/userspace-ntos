@@ -23,7 +23,11 @@ pub(super) unsafe fn syscall_win32k_route(
     let dll_pe_store = &mut *lp.images.dll_pe_store;
     let reg = &mut *lp.images.reg;
     let Event { pi, scratch_base, pml4, .. } = *ev;
-    let Syscall { current_tid, .. } = *call;
+    let Syscall { current_tid, sp, syscall_reply_context, .. } = *call;
+    // The argument words belong to this syscall's ingress capture. The root IPC buffer is
+    // reused by every kernel query this route makes before dispatch (a periodic census, for
+    // one), so rereading it here could forward another reply's words as this caller's.
+    let [a0, _, a2, a3] = syscall_reply_context.register_args(); // R10, RDX, R8, R9
     let process_role = nt_handler.hosted_process_role(pi);
     let winlogon_gui_client =
         process_role == Some(nt_exe_image::HostedProcessRole::InteractiveLogon);
@@ -49,7 +53,7 @@ pub(super) unsafe fn syscall_win32k_route(
     } else {
         0
     };
-    let modal_message_buffer = get_recv_mr(9);
+    let modal_message_buffer = a0;
     let dialog_modal_dispatch = dialog_modal_expected_ssn != 0
         && dialog_modal_expected_ssn == lp.msg.m0
         && if WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed) != 0 {
@@ -211,11 +215,9 @@ pub(super) unsafe fn syscall_win32k_route(
     // exactly as the native x64 syscall passed them (arg1=R10, arg2=RDX, arg3=R8, arg4=R9);
     // pointer/buffer args are marshaled per SSN as needed. Per-process stack/heap
     // mirrors are already selected by `pi` above (smss_stack_read reaches winlogon's stack).
-    let a0 = get_recv_mr(9); // R10 = arg1
+    // arg1=R10, arg3=R8, arg4=R9 and the real syscall-entry RSP (for win32k stack args) were
+    // taken from the ingress capture above.
     let a1 = lp.msg.m3; // RDX = arg2
-    let a2 = get_recv_mr(7); // R8 = arg3
-    let a3 = get_recv_mr(8); // R9 = arg4
-    let sp = get_recv_mr(16); // real syscall-entry RSP for win32k stack args
     if lp.msg.m0 == 0x1002 {
         let n = NTUSER_CALL_ONE_PARAM_TRACE.fetch_add(1, Ordering::Relaxed);
         if n < 192 {

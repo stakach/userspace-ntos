@@ -8921,11 +8921,16 @@ pub(crate) unsafe fn trace_win32k_tcb_debug_state() {
 
 /// rust-micro extension: `TCB::ReadDebugState(reply_cap)` returns compact scheduler/IPC state for
 /// a target TCB and, when `reply_cap != 0`, the TCB currently bound to that reply object.
+///
+/// The reply spills words 4.. into the root IPC buffer, which still holds the message being
+/// serviced (a hosted syscall's R8/R9/R10/RSP words). This read is observation only, so the
+/// enclosing message is restored once the state has been copied out.
 pub(crate) unsafe fn tcb_read_debug_state(
     tcb: u64,
     reply_cap: u64,
     out: &mut [u64; TCB_DEBUG_STATE_WORDS],
 ) {
+    let _message = crate::ipc_message::SavedMessageBuffer::capture();
     let (r0, r1, r2, r3): (u64, u64, u64, u64);
     core::arch::asm!(
         "syscall",

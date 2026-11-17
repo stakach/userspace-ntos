@@ -7493,6 +7493,12 @@ pub(crate) fn census_tick_static(now: u64) {
         return;
     }
     CENSUS_LAST_DUMP.store(now, Ordering::Relaxed);
+    // The dump runs inside whatever root turn ticked it, including a hosted syscall whose
+    // argument words are still in the root IPC buffer. Its kernel queries spill replies into
+    // that buffer, so the observed message is restored when the dump ends.
+    // SAFETY: the root TCB's IPC buffer is mapped for the whole service loop, and this
+    // root-only pass invokes no IPC while the snapshot is being taken or restored.
+    let _message = unsafe { ipc_message::SavedMessageBuffer::capture() };
     let n = CENSUS_PERIODIC_DUMPS.fetch_add(1, Ordering::Relaxed);
     print_periodic_census_heartbeat(n, now);
     win32k_glue::print_callback_owner_census();
