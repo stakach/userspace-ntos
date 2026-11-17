@@ -624,13 +624,15 @@ pub const REACTOS_EXPLORER_SHELL_COM_REGISTRATION_SCRIPTS: &[ReactOsComClassRegi
     },
     ReactOsComClassRegistrationScript {
         clsid: CLSID_REBAR_BAND_SITE,
-        // `syssetup.inf` `[OleControlDlls]` registers shell32.dll after the other module that
-        // carries this class (browseui.dll in ReactOS, explorerframe.dll in LiberNT), and both
-        // scripts are `ForceRemove`, so the installed value names shell32.dll. LiberNT's
-        // browseui.dll is a forwarder stub with no `DllGetClassObject`.
-        module: "shell32.dll",
-        source_path: "references/reactos/dll/win32/shell32/res/rgs/rebarbandsite.rgs",
-        rgs: include_str!("../../../references/reactos/dll/win32/shell32/res/rgs/rebarbandsite.rgs"),
+        // The band site is browseui's `CBandSite` (`browseui.cpp` `OBJECT_ENTRY`), which the
+        // pinned LiberNT release builds into explorerframe.dll; its browseui.dll is a forwarder
+        // stub without `DllGetClassObject`. shell32 carries a `rebarbandsite.rgs` resource but
+        // has no object-map entry for the class, so its DllRegisterServer never writes it and
+        // its class factory answers CLASS_E_CLASSNOTAVAILABLE. syssetup.inf `[OleControlDlls]`
+        // registers explorerframe.dll.
+        module: "explorerframe.dll",
+        source_path: "references/reactos/dll/win32/browseui/res/rebarbandsite.rgs",
+        rgs: include_str!("../../../references/reactos/dll/win32/browseui/res/rebarbandsite.rgs"),
         mask_bit: REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE,
     },
 ];
@@ -2345,7 +2347,7 @@ mod tests {
             "",
         );
         assert_eq!(ty, RegistryValueType::Sz as u32);
-        assert_eq!(data, utf16le_sz("shell32.dll"));
+        assert_eq!(data, utf16le_sz("explorerframe.dll"));
 
         let (ty, data) = value_bytes(
             &overlay,
@@ -2353,7 +2355,7 @@ mod tests {
             "",
         );
         assert_eq!(ty, RegistryValueType::Sz as u32);
-        assert_eq!(data, utf16le_sz("Shell Rebar Band Site"));
+        assert_eq!(data, utf16le_sz("Shell Rebar BandSite"));
 
         let (ty, data) = value_bytes(
             &overlay,

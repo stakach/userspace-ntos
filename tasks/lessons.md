@@ -900,3 +900,18 @@ diagnosis-free failure.
   `^error: test failed` and `could not compile`, and require the count to be zero.
 - Before wrapping or renaming a function, search `crates/nt-compat-exports/tests` for its name;
   a test that parses it by name keeps passing only while the body stays under that name.
+
+## A Registration Script Is Not A Registered Class
+- A `.rgs` resource inside a DLL is not proof that the DLL serves the class. ATL's
+  `DllRegisterServer` writes only the scripts of classes in its object map, and its
+  `DllGetClassObject` answers only those. ReactOS shell32 carries `rebarbandsite.rgs` without an
+  `OBJECT_ENTRY` for `CLSID_RebarBandSite`; seeding the class to shell32 made combase report
+  `CLASS_E_CLASSNOTAVAILABLE` instead of a missing export.
+- Before seeding a COM class on behalf of setup, find the module whose object map implements it
+  in the pinned release (ReactOS `browseui.cpp` -> LiberNT `explorerframe.dll`) and confirm its
+  exported `DllGetClassObject`; the INF registration order alone does not decide it.
+
+## Released Images Can Come From Wine, Not ReactOS
+- LiberNT's comctl32 6.0 is Wine's: its `DllMain` registers no classes, and `RegisterClassNameW`
+  registers one class by unversioned name when user32 asks. Read the released binary's strings
+  and exports before assuming the ReactOS source of the same DLL describes it.
