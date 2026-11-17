@@ -2,7 +2,8 @@
 
 use nt_ntdll::loader::api_set::api_set_version;
 use nt_ntdll::loader::failure_trace::{
-    failure_hash, record_load_failure, record_procedure_miss, FailureLedger, FailureRecord,
+    failure_hash, record_load_failure, record_procedure_miss, record_redirected_load,
+    record_redirected_unload, FailureLedger, FailureRecord,
 };
 use nt_ntdll::loader::file_name_redirection::{LoadName, OPEN_CAPACITY};
 use nt_ntdll::rtl::activation_redirection::RTL_DOS_APPLY_FILE_REDIRECTION_USTR_FLAG_RESPECT_DOT_LOCAL;
@@ -14,10 +15,12 @@ include!(concat!(env!("OUT_DIR"), "/release_api_sets.rs"));
 
 static LOAD_FAILURES: FailureLedger<24> = FailureLedger::new();
 static PROCEDURE_MISSES: FailureLedger<24> = FailureLedger::new();
+static REDIRECTED_LOADS: FailureLedger<24> = FailureLedger::new();
 
 pub(super) fn reset() {
     LOAD_FAILURES.reset();
     PROCEDURE_MISSES.reset();
+    REDIRECTED_LOADS.reset();
 }
 
 fn counted(buffer: *const u16, length: usize, maximum_length: usize) -> UnicodeString {
@@ -123,5 +126,25 @@ pub(super) fn report_procedure_miss(module: &[u8], name: Option<&[u8]>, ordinal:
     ]);
     if PROCEDURE_MISSES.admit(hash) {
         emit(&record_procedure_miss(module, name, ordinal, status));
+    }
+}
+
+/// Report a load whose name file-name redirection sent to another image, once per distinct
+/// name, image and status.
+pub(super) fn report_redirected_load(requested: &[u8], opened: &[u8], status: u32, base: u64) {
+    if requested == opened {
+        return;
+    }
+    if REDIRECTED_LOADS.admit(failure_hash(&[requested, opened, &status.to_le_bytes()])) {
+        emit(&record_redirected_load(requested, opened, status, base));
+    }
+}
+
+/// Report the unload of a module loaded from a redirected path (bounded by the same ledger).
+pub(super) fn report_redirected_unload(path: &[u8], base: u64, status: u32) {
+    if !path.is_empty()
+        && REDIRECTED_LOADS.admit(failure_hash(&[b"unload", path, &base.to_le_bytes()]))
+    {
+        emit(&record_redirected_unload(path, base, status));
     }
 }

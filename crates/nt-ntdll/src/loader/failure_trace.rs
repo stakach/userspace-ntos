@@ -116,6 +116,26 @@ pub fn record_load_failure(requested: &[u8], opened: &[u8], status: u32) -> Fail
     finish(record, status)
 }
 
+/// A DLL name that file-name redirection sent to another image, and how its load ended.
+pub fn record_redirected_load(requested: &[u8], opened: &[u8], status: u32, base: u64) -> FailureRecord {
+    let mut record = FailureRecord::new();
+    record.push_bytes(b"[ldr-redirect] name=");
+    push_quoted(&mut record, ascii(requested));
+    record.push_bytes(b" open=");
+    push_quoted(&mut record, ascii(opened));
+    let _ = core::write!(&mut record, " base=0x{base:x}");
+    finish(record, status)
+}
+
+/// A module loaded from a redirected path was unloaded.
+pub fn record_redirected_unload(path: &[u8], base: u64, status: u32) -> FailureRecord {
+    let mut record = FailureRecord::new();
+    record.push_bytes(b"[ldr-unload-redirected] path=");
+    push_quoted(&mut record, ascii(path));
+    let _ = core::write!(&mut record, " base=0x{base:x}");
+    finish(record, status)
+}
+
 /// A failed activation-context section lookup by string key.
 pub fn record_section_lookup_failure(section_id: u32, key: &[u16], status: u32) -> FailureRecord {
     let mut record = FailureRecord::new();
@@ -155,6 +175,22 @@ mod tests {
             record_load_failure(b"system32\\nfs41_np.dll", b"system32\\nfs41_np.dll", 0xc000_0135)
                 .bytes(),
             &b"[ldr-load-failed] name=\"system32\\nfs41_np.dll\" status=0xc0000135\n"[..]
+        );
+    }
+
+    #[test]
+    fn names_the_redirected_image_and_its_base() {
+        assert_eq!(
+            record_redirected_load(b"comctl32.dll", b"c:\\w\\winsxs\\a\\comctl32.dll", 0, 0x7ff0_0000).bytes(),
+            &b"[ldr-redirect] name=\"comctl32.dll\" open=\"c:\\w\\winsxs\\a\\comctl32.dll\" base=0x7ff00000 status=0x00000000\n"[..]
+        );
+    }
+
+    #[test]
+    fn names_an_unloaded_redirected_module() {
+        assert_eq!(
+            record_redirected_unload(b"c:\\a\\x.dll", 0x10000, 0).bytes(),
+            &b"[ldr-unload-redirected] path=\"c:\\a\\x.dll\" base=0x10000 status=0x00000000\n"[..]
         );
     }
 

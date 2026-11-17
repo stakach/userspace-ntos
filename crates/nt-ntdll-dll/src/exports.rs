@@ -14913,6 +14913,27 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
     // A key that is simply not redirected is the ordinary answer. Any other failure changes
     // what the caller does next, so name the section and key once.
     #[cfg(target_arch = "x86_64")]
+    // A window-class lookup that succeeded is the start of user32's side-by-side class path
+    // (ClassNameToVersion -> VersionRegisterClass); name the first few.
+    #[cfg(target_arch = "x86_64")]
+    if status == STATUS_SUCCESS
+        && section_id
+            == nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_WINDOW_CLASS_REDIRECTION
+    {
+        let key = unsafe {
+            let key = string_to_find as *const u8;
+            core::slice::from_raw_parts(
+                core::ptr::read_unaligned(key.add(8) as *const *const u16),
+                core::ptr::read_unaligned(key as *const u16) as usize / 2,
+            )
+        };
+        let context = if flags & FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0 {
+            unsafe { core::ptr::read_unaligned((returned_data as *const u8).add(56) as *const u64) }
+        } else {
+            0
+        };
+        report_activation_class_lookup(key, context);
+    }
     if (status as i32) < 0 && status != STATUS_SXS_KEY_NOT_FOUND {
         let key = if status == STATUS_INVALID_PARAMETER || string_to_find.is_null() {
             &[][..]
@@ -14935,8 +14956,37 @@ static ACTIVATION_SECTION_LOOKUP_FAILURES: nt_ntdll::loader::failure_trace::Fail
     nt_ntdll::loader::failure_trace::FailureLedger::new();
 
 #[cfg(target_arch = "x86_64")]
+static ACTIVATION_CLASS_LOOKUPS: nt_ntdll::loader::failure_trace::FailureLedger<8> =
+    nt_ntdll::loader::failure_trace::FailureLedger::new();
+
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn reset_activation_section_lookup_failures() {
     ACTIVATION_SECTION_LOOKUP_FAILURES.reset();
+    ACTIVATION_CLASS_LOOKUPS.reset();
+}
+
+#[cfg(target_arch = "x86_64")]
+fn report_activation_class_lookup(key: &[u16], context: u64) {
+    use core::fmt::Write;
+    let mut key_bytes = [0u8; 96];
+    let mut key_len = 0;
+    for &unit in key.iter().take(key_bytes.len() / 2) {
+        key_bytes[key_len..key_len + 2].copy_from_slice(&unit.to_le_bytes());
+        key_len += 2;
+    }
+    let hash = nt_ntdll::loader::failure_trace::failure_hash(&[&key_bytes[..key_len]]);
+    if !ACTIVATION_CLASS_LOOKUPS.admit(hash) {
+        return;
+    }
+    let mut record = nt_ntdll::loader::failure_trace::FailureRecord::new();
+    record.push_bytes(b"[actctx-class] key=\"");
+    for &unit in key.iter().take(64) {
+        record.push_bytes(&[if (0x20..0x7f).contains(&unit) && unit != 0x22 { unit as u8 } else { b'?' }]);
+    }
+    // TEB.ClientId.UniqueProcess.
+    let pid = unsafe { core::ptr::read_unaligned((current_teb() + 0x40) as *const u64) };
+    let _ = core::write!(&mut record, "\" actctx=0x{context:x} pid=0x{pid:x}\n");
+    unsafe { crate::dbg_print_bytes(record.bytes().as_ptr(), record.bytes().len()) };
 }
 
 #[cfg(target_arch = "x86_64")]

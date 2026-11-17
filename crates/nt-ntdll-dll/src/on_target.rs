@@ -3283,6 +3283,7 @@ unsafe fn snap_module(
                     }
                 };
                 let mut dep_base = (&*table).find_load(&dep_name);
+                let newly_redirected = dep_base == 0;
                 let mut edge = DependencySnap {
                     base: dep_base,
                     increment_existing_reference: dep_base != 0,
@@ -3313,6 +3314,16 @@ unsafe fn snap_module(
                         );
                         out.missing += 1;
                         return;
+                    }
+                }
+                if newly_redirected {
+                    if let Ok(imported) = imported {
+                        name_redirection::report_redirected_load(
+                            imported.open_name(),
+                            dep_name.open_name(),
+                            out.status,
+                            dep_base,
+                        );
                     }
                 }
                 // Remember a binding the base name alone would not reproduce (a second module
@@ -4023,6 +4034,17 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
     let mut status = unsafe { name_redirection::apply(&mut name) };
     if status == 0 {
         status = unsafe { ldr_load_dll_inner(&name, base_addr, &mut trace) };
+        let base = if base_addr.is_null() || status != 0 {
+            0
+        } else {
+            unsafe { core::ptr::read_unaligned(base_addr) as u64 }
+        };
+        name_redirection::report_redirected_load(
+            requested.open_name(),
+            name.open_name(),
+            status,
+            base,
+        );
     }
     if (status as i32) < 0 {
         name_redirection::report_load_failure(requested.open_name(), name.open_name(), status);
@@ -4309,6 +4331,15 @@ unsafe fn teardown_unreferenced_modules(teardown: &[u64]) -> u32 {
         }
         unsafe { forget_unloaded_module_static_tls(base) };
         let status = unsafe { nt_unmap_view_of_section(base) };
+        {
+            let mut path = [0u8; MODULE_PATH_CAP];
+            let length = {
+                let recorded = unsafe { (&*table).path_for_base(base) };
+                path[..recorded.len()].copy_from_slice(recorded);
+                recorded.len()
+            };
+            name_redirection::report_redirected_unload(&path[..length], base, status);
+        }
         if (status as i32) < 0 {
             return status;
         }
