@@ -9847,8 +9847,6 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
         w32_row_heap_cap,
         w32_row_pool_len,
         w32_row_pool_cap,
-        w32_row_uservm_len,
-        w32_row_uservm_cap,
         w32_row_fails,
     ) = win32k_glue::win32k_client_process_row_stats();
     print_str(b" w32-rows=");
@@ -9859,10 +9857,6 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(w32_row_pool_len as u64);
     print_str(b"/");
     print_u64(w32_row_pool_cap as u64);
-    print_str(b":");
-    print_u64(w32_row_uservm_len as u64);
-    print_str(b"/");
-    print_u64(w32_row_uservm_cap as u64);
     print_str(b"/");
     print_u64(w32_row_fails);
     let (
@@ -28014,7 +28008,6 @@ static WIN32K_ROOT_IMAGE_MAP_OWNER: AtomicU64 = AtomicU64::new(0);
 /// consecutive caps). Retained so the connect marshaling can copy_cap + RO-map the arena into a
 /// GUI client's VSpace (the gSharedInfo client-mapping).
 static WIN32K_HEAP_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
-pub(crate) static WIN32K_USERVM_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap base of win32k's POOL arena (WIN32K_POOL_VADDR, where session-lifetime object bodies can
 /// live). Retained so pool-resident win32k pointers can be copy_cap + RO-mapped into a GUI client's
 /// VSpace. DESKTOPINFO is translated by the arena that actually owns the live pointer.
@@ -28030,7 +28023,6 @@ static WIN32K_POOL_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// Per-pi bit set once win32k's canonical GDI handle-table Section has an exact client alias
 /// named by that process's `PEB->GdiSharedHandleTable`.
 static GDI_SHARED_TABLE_MAPPED: AtomicU64 = AtomicU64::new(0);
-static GDI_USERVM_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// Latched (=1) the first time the executive seeds winlogon's PEB->GdiSharedHandleTable + gdi32's
 /// cached global with the client GDI handle-table VA (client-GDI mapping milestone). Read by the spec.
 pub(crate) static WINLOGON_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
@@ -32600,15 +32592,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     count: win32k_subsystem::WIN32K_FTYP_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: pts_for(win32k_subsystem::WIN32K_FTYP_FRAMES),
-                };
-                n += 1;
-                // GDI-attribute user-mode VM arena (own window + PTs, fresh frames).
-                regions[n] = Region {
-                    source: FrameSource::FreshZeroed,
-                    base_va: win32k_subsystem::WIN32K_USERVM_VADDR,
-                    count: win32k_subsystem::WIN32K_USERVM_FRAMES,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: pts_for(win32k_subsystem::WIN32K_USERVM_FRAMES),
                 };
                 n += 1;
                 // Staged system font (arial.ttf) — its own PT window, aliased frames (only if present).

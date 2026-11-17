@@ -7219,72 +7219,87 @@ pub(crate) fn registry_live_handler_pointer() -> Result<*mut ExecNtHandler, u32>
     if handler.is_null() { Err(0xc000_00a3) } else { Ok(handler) }
 }
 
-/// Service `MmSecureVirtualMemory` for the authenticated hosted process generation. The returned
-/// value is an opaque executive lease token and is meaningful only to the matching unsecure call.
-pub(crate) unsafe fn service_win32k_mm_secure_request(
+/// Service win32k's Mm imports for the authenticated hosted process generation it is attached
+/// to. A secure handle is an opaque executive lease token meaningful only to the matching
+/// unsecure call; allocations and frees are the native private-VAD effect on that process.
+pub(crate) unsafe fn service_win32k_mm_request(
     client_pi: u64,
     client_generation: u64,
-    op: u64,
-    address_or_handle: u64,
-    size: u64,
-    protection: u64,
-) -> (i32, u64) {
+    words: [u64; nt_io_manager::win32k_virtual_memory_wire::WORDS],
+) -> (i32, u64, u64) {
+    use nt_io_manager::win32k_virtual_memory_wire::VirtualMemoryRequest;
     const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
     const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler_ptr.is_null() {
-        return (STATUS_DEVICE_NOT_READY, 0);
+        return (STATUS_DEVICE_NOT_READY, 0, 0);
     }
     let handler = &mut *handler_ptr;
     let Ok(pi) = usize::try_from(client_pi) else {
-        return (STATUS_DEVICE_NOT_READY, 0);
+        return (STATUS_DEVICE_NOT_READY, 0, 0);
     };
     if client_generation == 0
         || handler.pm_pid_for_pi(pi).is_none()
         || handler.hosted_process_generation(pi) != Some(client_generation)
     {
-        return (STATUS_DEVICE_NOT_READY, 0);
+        return (STATUS_DEVICE_NOT_READY, 0, 0);
     }
+    let Ok(request) = VirtualMemoryRequest::decode(words) else {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    };
+    let range = |result: Result<(u64, u64), u32>| match result {
+        Ok((base, size)) => (0, base, size),
+        Err(status) => (status as i32, 0, 0),
+    };
 
-    match op {
-        crate::win32k_subsystem::W32_MM_SECURE_OP_SECURE => {
-            let Ok(protection) = u32::try_from(protection) else {
-                return (STATUS_INVALID_PARAMETER, 0);
-            };
-            handler
-                .service_win32k_secure_virtual_memory(pi, address_or_handle, size, protection)
-                .map(|handle| (0, handle))
-                .unwrap_or_else(|status| {
-                    // win32k's EngSecureMem reports a refusal as NULL and its callers fail
-                    // without a message; name the range here.
-                    static REFUSALS_TRACED: AtomicU64 = AtomicU64::new(0);
-                    if REFUSALS_TRACED.fetch_add(1, Ordering::Relaxed) < 16 {
-                        print_str(b"[win32k-secure-refused] pi=");
-                        print_u64(pi as u64);
-                        print_str(b" address=0x");
-                        print_hex_u64(address_or_handle);
-                        print_str(b" size=0x");
-                        print_hex_u64(size);
-                        print_str(b" protect=0x");
-                        print_hex(protection);
-                        print_str(b" status=0x");
-                        print_hex(status);
-                        print_str(b"\n");
-                    }
-                    (status as i32, 0)
-                })
-        }
-        crate::win32k_subsystem::W32_MM_SECURE_OP_UNSECURE => {
-            if size != 0 || protection != 0 {
-                return (STATUS_INVALID_PARAMETER, 0);
-            }
-            handler
-                .service_win32k_unsecure_virtual_memory(pi, address_or_handle)
-                .map(|()| (0, 0))
-                .unwrap_or_else(|status| (status as i32, 0))
-        }
-        _ => (STATUS_INVALID_PARAMETER, 0),
+    match request {
+        VirtualMemoryRequest::Secure {
+            address,
+            size,
+            protection,
+        } => handler
+            .service_win32k_secure_virtual_memory(pi, address, size, protection)
+            .map(|handle| (0, handle, 0))
+            .unwrap_or_else(|status| {
+                // win32k's EngSecureMem reports a refusal as NULL and its callers fail
+                // without a message; name the range here.
+                static REFUSALS_TRACED: AtomicU64 = AtomicU64::new(0);
+                if REFUSALS_TRACED.fetch_add(1, Ordering::Relaxed) < 16 {
+                    print_str(b"[win32k-secure-refused] pi=");
+                    print_u64(pi as u64);
+                    print_str(b" address=0x");
+                    print_hex_u64(address);
+                    print_str(b" size=0x");
+                    print_hex_u64(size);
+                    print_str(b" protect=0x");
+                    print_hex(protection);
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                }
+                (status as i32, 0, 0)
+            }),
+        VirtualMemoryRequest::Unsecure { handle } => handler
+            .service_win32k_unsecure_virtual_memory(pi, handle)
+            .map_or_else(|status| (status as i32, 0, 0), |()| (0, 0, 0)),
+        VirtualMemoryRequest::Allocate {
+            base,
+            size,
+            allocation_type,
+            protection,
+        } => range(handler.service_win32k_allocate_virtual_memory(
+            pi,
+            base,
+            size,
+            allocation_type,
+            protection,
+        )),
+        VirtualMemoryRequest::Free {
+            base,
+            size,
+            free_type,
+        } => range(handler.service_win32k_free_virtual_memory(pi, base, size, free_type)),
     }
 }
 
@@ -7804,10 +7819,6 @@ pub(crate) unsafe fn prepare_callback_gdi_projection(
     let Some(field) = peb.checked_add(0xf8) else { return false; };
     let table = win32k_glue::map_gdi_shared_handle_table_into_client(&mut *pointer, pml4, pi);
     if table == 0 || callback_client_runtime(client).is_none()
-        || (&(*pointer).process_vspaces).get(pi).copied() != Some(pml4)
-    { return false; }
-    if !win32k_glue::map_gdi_user_attributes_into_client(&mut *pointer, pml4, pi)
-        || callback_client_runtime(client).is_none()
         || (&(*pointer).process_vspaces).get(pi).copied() != Some(pml4)
     { return false; }
     if (*pointer).process_memory_write_checked(pi, field, &table.to_le_bytes()).is_err()

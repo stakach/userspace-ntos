@@ -118,6 +118,7 @@ use nt_compat_exports::{
     WIN32K_HAL_IMPORTS, WIN32K_NTOSKRNL_IMPORTS,
 };
 use nt_kernel_exec::provider_pool as shared_pool;
+use nt_io_manager::win32k_virtual_memory_wire::VirtualMemoryRequest;
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the FSD class.
 use crate::ntoskrnl_shared::{
@@ -1632,9 +1633,11 @@ pub const W32_PS_OP_RELEASE_THREAD_WAIT: u64 = 24;
 pub const W32_ATOM_LABEL: u64 = 0x77E;
 pub const W32_ATOM_OP_ADD_NAME: u64 = 1;
 pub const W32_ATOM_OP_ADD_INTEGER: u64 = 2;
-/// Process-scoped `MmSecureVirtualMemory` leases. The executive validates the current client VAD
-/// and owns the opaque lease; win32k receives no mutable MM state or raw executive pointer.
-pub const W32_MM_SECURE_LABEL: u64 = 0x77F;
+/// Mm imports acting on the attached client: `ZwAllocateVirtualMemory`, `ZwFreeVirtualMemory`
+/// and `MmSecureVirtualMemory` leases. The executive owns the client's VADs and the opaque lease;
+/// win32k receives no mutable MM state or raw executive pointer
+/// ([`nt_io_manager::win32k_virtual_memory_wire`]).
+pub const W32_MM_LABEL: u64 = 0x77F;
 pub const W32_MM_QUERY_PAGE_LABEL: u64 = 0x785;
 pub const W32_DEVICE_PROPERTY_LABEL: u64 = 0x780;
 pub const W32_DEVICE_INTERFACES_LABEL: u64 = 0x784;
@@ -1708,8 +1711,6 @@ pub const W32_FILE_OBJECT_DEVICE_NAME: u64 = 6;
 pub const W32_FILE_OBJECT_RELEASE_WAIT: u64 = 7;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
-pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
-pub const W32_MM_SECURE_OP_UNSECURE: u64 = 2;
 pub const W32_EVENT_OP_CREATE: u64 = 1;
 pub const W32_EVENT_OP_CREATE_NAMED: u64 = 40;
 pub const W32_EVENT_OP_REFERENCE: u64 = 2;
@@ -2743,23 +2744,6 @@ unsafe fn reclaiming_pool_free(p: u64) -> bool {
         .is_some_and(|catalog| catalog.retire(allocation.identity) == Ok(allocation))
 }
 
-/// User-mode VM arena for `ZwAllocateVirtualMemory(NtCurrentProcess(), ...)`. win32k's GDI attribute
-/// pool ([`GdiPoolAllocateSection`], win32ss/gdi/ntgdi/gdipool.c) reserves a 64 KiB user-mode region
-/// per pool section (`MEM_RESERVE`) then commits pages on demand (`MEM_COMMIT`) — the DC_ATTR /
-/// RGN_ATTR storage. In this single-address-space host the whole arena is pre-mapped RW, so RESERVE
-/// hands out a tracked 64 KiB slot run, COMMIT is a no-op, and MEM_RELEASE returns slots for later
-/// GUI-capable service clients. Own 2 MiB-aligned window + PTs (spawn_win32k_host).
-pub const WIN32K_USERVM_VADDR: u64 = 0x0000_0100_0C00_0000;
-pub const WIN32K_USERVM_FRAMES: u64 = 1024; // 4 MiB, pre-mapped (64 GDI-pool sections)
-const USERVM_GRANULARITY: u64 = 0x1_0000;
-const USERVM_SLOT_COUNT: usize = ((WIN32K_USERVM_FRAMES * 0x1000) / USERVM_GRANULARITY) as usize;
-const USERVM_FIRST_SLOT: usize = 1; // slot 0 stays reserved for arena metadata/sentinel space
-static WIN32K_USERVM_NEXT_SLOT: AtomicU64 = AtomicU64::new(USERVM_FIRST_SLOT as u64);
-static WIN32K_USERVM_FREE_MASK: AtomicU64 = AtomicU64::new(0);
-static WIN32K_USERVM_ALLOC_MASK: AtomicU64 = AtomicU64::new(0);
-static WIN32K_USERVM_RUN_SLOTS: [AtomicU64; USERVM_SLOT_COUNT] =
-    [const { AtomicU64::new(0) }; USERVM_SLOT_COUNT];
-
 /// A system font (arial.ttf) staged off disk into a buffer mapped into win32k's VSpace (both the
 /// executive + win32k map the same frames here). At bring-up the host feeds these bytes to
 /// win32k's `IntGdiAddFontMemResource` so the desktop-graphics font realize finds a real font (the
@@ -2773,108 +2757,6 @@ pub const FONTBUF_FRAMES: u64 = 64; // 256 KiB (arial.ttf = 180,144 B)
 /// RVA 0x12C840 landed inside LiberNT's EngCopyBits. The callable entry allocates and copies
 /// the font, sets FR_PRIVATE | FR_NOT_ENUM, and links the result to the current process.
 pub const INT_GDI_ADD_FONT_MEM_RESOURCE_RVA: u64 = 0x0e_bd10;
-
-fn uservm_mask(slot: usize, slots: usize) -> Option<u64> {
-    if slots == 0 || slot < USERVM_FIRST_SLOT || slot + slots > USERVM_SLOT_COUNT {
-        return None;
-    }
-    if slots >= 64 {
-        return Some(u64::MAX << slot);
-    }
-    Some(((1u64 << slots) - 1) << slot)
-}
-
-fn uservm_slots_for(size: u64) -> Option<usize> {
-    if size == 0 {
-        return None;
-    }
-    let bytes = size.max(USERVM_GRANULARITY);
-    let slots = ((bytes + USERVM_GRANULARITY - 1) / USERVM_GRANULARITY) as usize;
-    if slots == 0 || slots > USERVM_SLOT_COUNT - USERVM_FIRST_SLOT {
-        None
-    } else {
-        Some(slots)
-    }
-}
-
-fn uservm_slot_base(slot: usize) -> u64 {
-    WIN32K_USERVM_VADDR + slot as u64 * USERVM_GRANULARITY
-}
-
-unsafe fn uservm_publish_run(slot: usize, slots: usize, mask: u64) -> u64 {
-    WIN32K_USERVM_ALLOC_MASK.fetch_or(mask, Ordering::Relaxed);
-    for index in slot..slot + slots {
-        WIN32K_USERVM_RUN_SLOTS[index].store(0, Ordering::Relaxed);
-    }
-    WIN32K_USERVM_RUN_SLOTS[slot].store(slots as u64, Ordering::Relaxed);
-    let base = uservm_slot_base(slot);
-    core::ptr::write_bytes(base as *mut u8, 0, slots * USERVM_GRANULARITY as usize);
-    base
-}
-
-unsafe fn uservm_alloc(size: u64) -> u64 {
-    let Some(slots) = uservm_slots_for(size) else {
-        return 0;
-    };
-
-    let free_mask = WIN32K_USERVM_FREE_MASK.load(Ordering::Relaxed);
-    for slot in USERVM_FIRST_SLOT..=USERVM_SLOT_COUNT - slots {
-        let Some(mask) = uservm_mask(slot, slots) else {
-            continue;
-        };
-        if free_mask & mask == mask {
-            WIN32K_USERVM_FREE_MASK.fetch_and(!mask, Ordering::Relaxed);
-            return uservm_publish_run(slot, slots, mask);
-        }
-    }
-
-    let mut next_slot = WIN32K_USERVM_NEXT_SLOT.load(Ordering::Relaxed) as usize;
-    if !(USERVM_FIRST_SLOT..=USERVM_SLOT_COUNT).contains(&next_slot) {
-        next_slot = USERVM_FIRST_SLOT;
-    }
-    if next_slot + slots > USERVM_SLOT_COUNT {
-        print_str(b"[win32k-host] USERVM EXHAUSTED size=0x");
-        print_hex(size as u32);
-        print_str(b" next_slot=0x");
-        print_hex(next_slot as u32);
-        print_str(b" free_mask=0x");
-        print_u64(free_mask);
-        print_str(b"\n");
-        return 0;
-    }
-    let Some(mask) = uservm_mask(next_slot, slots) else {
-        return 0;
-    };
-    WIN32K_USERVM_NEXT_SLOT.store((next_slot + slots) as u64, Ordering::Relaxed);
-    uservm_publish_run(next_slot, slots, mask)
-}
-
-unsafe fn uservm_release(base: u64) -> bool {
-    let arena_end = WIN32K_USERVM_VADDR + WIN32K_USERVM_FRAMES * 0x1000;
-    if base < uservm_slot_base(USERVM_FIRST_SLOT)
-        || base >= arena_end
-        || (base - WIN32K_USERVM_VADDR) % USERVM_GRANULARITY != 0
-    {
-        return false;
-    }
-    let slot = ((base - WIN32K_USERVM_VADDR) / USERVM_GRANULARITY) as usize;
-    if slot >= USERVM_SLOT_COUNT {
-        return false;
-    }
-    let slots = WIN32K_USERVM_RUN_SLOTS[slot].load(Ordering::Relaxed) as usize;
-    let Some(mask) = uservm_mask(slot, slots) else {
-        return false;
-    };
-    if WIN32K_USERVM_ALLOC_MASK.load(Ordering::Relaxed) & mask != mask {
-        return false;
-    }
-    WIN32K_USERVM_ALLOC_MASK.fetch_and(!mask, Ordering::Relaxed);
-    WIN32K_USERVM_FREE_MASK.fetch_or(mask, Ordering::Relaxed);
-    for index in slot..slot + slots {
-        WIN32K_USERVM_RUN_SLOTS[index].store(0, Ordering::Relaxed);
-    }
-    true
-}
 
 // --- ntoskrnl trampolines (extern "win64"; win64 args = rcx, rdx, r8, r9, stack) -------------
 
@@ -3943,39 +3825,32 @@ unsafe fn win32k_atom_broker_call(operation: u64, value: u64) -> (i32, u64) {
     (status as u32 as i32, atom)
 }
 
-unsafe fn win32k_mm_secure_broker_call(
-    operation: u64,
-    address_or_handle: u64,
-    size: u64,
-    protection: u64,
-) -> (i32, u64) {
-    let (_label, status, handle, _, _) = crate::driver_launch::call_on4(
-        (W32_MM_SECURE_LABEL << 12) | 4,
-        operation,
-        address_or_handle,
-        size,
-        protection,
-    );
-    (status as u32 as i32, handle)
+/// One request against the attached client's address space; returns `(status, first, second)`.
+unsafe fn win32k_mm_broker_call(request: VirtualMemoryRequest) -> (i32, u64, u64) {
+    let [op, first, second, third] = request.encode();
+    let (words, status, out1, out2, _) =
+        crate::driver_launch::call_on4_raw((W32_MM_LABEL << 12) | 4, op, first, second, third);
+    if words != 3 || status != status as u32 as u64 {
+        crate::provider_bugcheck::report(0xc4, [W32_MM_LABEL, op, words, status]);
+    }
+    (status as u32 as i32, out1, out2)
 }
 
 extern "win64" fn s_mm_secure_virtual_memory(address: u64, size: u64, protection: u32) -> u64 {
-    let (status, handle) = unsafe {
-        win32k_mm_secure_broker_call(
-            W32_MM_SECURE_OP_SECURE,
+    let (status, handle, _) = unsafe {
+        win32k_mm_broker_call(VirtualMemoryRequest::Secure {
             address,
             size,
-            u64::from(protection),
-        )
+            protection,
+        })
     };
     if status == 0 { handle } else { 0 }
 }
 
 extern "win64" fn s_mm_unsecure_virtual_memory(handle: u64) {
-    let (status, _) =
-        unsafe { win32k_mm_secure_broker_call(W32_MM_SECURE_OP_UNSECURE, handle, 0, 0) };
+    let (status, _, _) = unsafe { win32k_mm_broker_call(VirtualMemoryRequest::Unsecure { handle }) };
     if status != 0 {
-        panic!("executive MM secure broker rejected unsecure: {status:#010x}");
+        panic!("executive MM broker rejected unsecure: {status:#010x}");
     }
 }
 
@@ -9590,23 +9465,6 @@ pub(crate) unsafe fn win32k_user_heap_committed_frames() -> u64 {
     ((used + 0xfff) / 0x1000).clamp(1, WIN32K_HEAP_FRAMES)
 }
 
-pub(crate) fn win32k_uservm_committed_frames() -> u64 {
-    let mut high_slot = WIN32K_USERVM_NEXT_SLOT
-        .load(Ordering::Relaxed)
-        .clamp(USERVM_FIRST_SLOT as u64, USERVM_SLOT_COUNT as u64) as usize;
-    let allocated = WIN32K_USERVM_ALLOC_MASK.load(Ordering::Relaxed);
-    let mut slot = USERVM_SLOT_COUNT;
-    while slot > USERVM_FIRST_SLOT {
-        slot -= 1;
-        if allocated & (1u64 << slot) != 0 {
-            high_slot = high_slot.max(slot + 1);
-            break;
-        }
-    }
-    let frames = (high_slot as u64 * USERVM_GRANULARITY + 0xfff) / 0x1000;
-    frames.clamp(USERVM_GRANULARITY / 0x1000, WIN32K_USERVM_FRAMES)
-}
-
 pub(crate) fn win32k_heap_server_to_client(addr: u64) -> Option<u64> {
     let heap_lo = WIN32K_HEAP_VADDR;
     let heap_hi = heap_lo + WIN32K_HEAP_FRAMES * 0x1000;
@@ -9625,6 +9483,16 @@ fn win32k_heap_client_to_server(addr: u64) -> Option<u64> {
     } else {
         None
     }
+}
+
+/// The page-rounded range `[base, base + size)` when it lies entirely in the client view of the
+/// USER heap window, whose Section pages are backed for every heap the window holds.
+fn win32k_heap_client_view_pages(base: u64, size: u64) -> Option<(u64, u64)> {
+    let page = base & !0xfff;
+    let end = base.checked_add(size)?.checked_add(0xfff)? & !0xfff;
+    let client_end = CSRSS_W32_SHARED_VA + WIN32K_HEAP_FRAMES * 0x1000;
+    (size != 0 && win32k_heap_client_to_server(page).is_some() && end <= client_end)
+        .then_some((page, end - page))
 }
 
 unsafe fn desktop_heap_client_mapping(desk_body: u64) -> Option<(u64, u64, u64)> {
@@ -10689,89 +10557,84 @@ extern "win64" fn s_ex_free_pool(p: u64) {
 
 // --- ZwAllocateVirtualMemory + RTL_BITMAP (GDI DC_ATTR / RGN_ATTR pool) -----------------------
 
-const MEM_COMMIT: u64 = 0x1000;
-const MEM_RESERVE: u64 = 0x2000;
-const MEM_DECOMMIT: u64 = 0x4000;
-const MEM_RELEASE: u64 = 0x8000;
+const MEM_COMMIT: u32 = 0x1000;
+/// `NtCurrentProcess()`: the client win32k is attached to.
+const NT_CURRENT_PROCESS: u64 = u64::MAX;
 
 /// `NTSTATUS ZwAllocateVirtualMemory(HANDLE, PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T
-/// RegionSize, ULONG AllocationType, ULONG Protect)`. win32k uses this both for the GDI attribute
-/// pool (`GdiPoolAllocateSection` reserves 64 KiB, then commits pages on demand) and for small
-/// user-mode buffers while resolving window stations/desktops. The USERVM arena is pre-mapped RW:
-/// reserve and bare-commit allocate tracked 64 KiB slot runs, while commit into an already mapped
-/// view is bookkeeping because the backing pages are already present.
+/// RegionSize, ULONG AllocationType, ULONG Protect)`. win32k allocates user-mode memory in the
+/// client it is attached to: GDI attribute pool sections (`GdiPoolAllocateSection`), bitmap bits
+/// (`EngAllocUserMem`) and window-station, desktop and security buffers. The executive performs
+/// the native private-VAD allocation in that client, so the memory is the client's own and can be
+/// secured. `IntUserHeapCommitRoutine` commits inside a USER heap view instead; that view projects
+/// a heap Section whose pages are already backed, so the commit only reports the page range.
 extern "win64" fn s_zw_allocate_virtual_memory(
-    _process: u64,
+    process: u64,
     base_io: *mut u64,
-    _zero_bits: u64,
+    zero_bits: u64,
     size_io: *mut u64,
-    alloc_type: u64,
-    _protect: u64,
+    alloc_type: u32,
+    protect: u32,
 ) -> i32 {
     if base_io.is_null() || size_io.is_null() {
-        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    if process != NT_CURRENT_PROCESS {
+        return STATUS_INVALID_HANDLE_I32;
+    }
+    if zero_bits != 0 {
+        return STATUS_NOT_SUPPORTED_I32;
     }
     unsafe {
-        if alloc_type & (MEM_COMMIT | MEM_RESERVE) == 0 {
-            return STATUS_INVALID_PARAMETER_I32;
-        }
-        let want = read_volatile(size_io);
-        if want == 0 {
-            return STATUS_INVALID_PARAMETER_I32;
-        }
-        let size = (want + 0xFFF) & !0xFFF;
-        if alloc_type & MEM_RESERVE != 0 {
-            let base = uservm_alloc(size.max(0x1_0000));
-            if base == 0 {
-                return 0xC000_0017u32 as i32; // STATUS_NO_MEMORY
+        let base = read_unaligned(base_io);
+        let size = read_unaligned(size_io);
+        if alloc_type == MEM_COMMIT {
+            if let Some((page, bytes)) = win32k_heap_client_view_pages(base, size) {
+                write_unaligned(base_io, page);
+                write_unaligned(size_io, bytes);
+                return 0;
             }
-            write_volatile(base_io, base);
-            write_volatile(size_io, size.max(0x1_0000));
-        } else {
-            // MEM_COMMIT: the region was already reserved (pre-mapped). Keep *BaseAddress; if the
-            // caller passed a bare COMMIT with no reservation, back it from the arena.
-            if read_volatile(base_io) == 0 {
-                let base = uservm_alloc(size.max(0x1000));
-                if base == 0 {
-                    return 0xC000_0017u32 as i32;
-                }
-                write_volatile(base_io, base);
-            }
-            write_volatile(size_io, size.max(0x1000));
         }
-        0 // STATUS_SUCCESS
+        let (status, base, size) = win32k_mm_broker_call(VirtualMemoryRequest::Allocate {
+            base,
+            size,
+            allocation_type: alloc_type,
+            protection: protect,
+        });
+        if status >= 0 {
+            write_unaligned(base_io, base);
+            write_unaligned(size_io, size);
+        }
+        status
     }
 }
 
-/// `NTSTATUS ZwFreeVirtualMemory(HANDLE, PVOID* BaseAddress, PSIZE_T RegionSize, ULONG FreeType)`.
-/// ReactOS callers release both GDI reservations and short-lived user buffers with MEM_RELEASE; some
-/// pass zero `RegionSize`, others pass the captured size, so the tracked allocation base is the
-/// authority for returning a slot run to the arena.
+/// `NTSTATUS ZwFreeVirtualMemory(HANDLE, PVOID* BaseAddress, PSIZE_T RegionSize, ULONG FreeType)`
+/// against the attached client, with the native release/decommit and secure-lease policy.
 extern "win64" fn s_zw_free_virtual_memory(
-    _process: u64,
+    process: u64,
     base_io: *mut u64,
     size_io: *mut u64,
-    free_type: u64,
+    free_type: u32,
 ) -> i32 {
     if base_io.is_null() || size_io.is_null() {
-        return STATUS_INVALID_PARAMETER_I32;
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    if process != NT_CURRENT_PROCESS {
+        return STATUS_INVALID_HANDLE_I32;
     }
     unsafe {
-        let base = read_volatile(base_io);
-        if free_type == MEM_RELEASE {
-            if !uservm_release(base) {
-                return STATUS_INVALID_PARAMETER_I32;
-            }
-            write_volatile(base_io, 0);
-            write_volatile(size_io, 0);
-            return 0;
+        let (status, base, size) = win32k_mm_broker_call(VirtualMemoryRequest::Free {
+            base: read_unaligned(base_io),
+            size: read_unaligned(size_io),
+            free_type,
+        });
+        if status >= 0 {
+            write_unaligned(base_io, base);
+            write_unaligned(size_io, size);
         }
-        if free_type == MEM_DECOMMIT {
-            write_volatile(size_io, (read_volatile(size_io) + 0xFFF) & !0xFFF);
-            return 0;
-        }
+        status
     }
-    STATUS_INVALID_PARAMETER_I32
 }
 
 use nt_kernel_exec::rtl_bitmap;

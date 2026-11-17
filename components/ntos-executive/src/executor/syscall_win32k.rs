@@ -4504,19 +4504,17 @@ pub(super) unsafe fn syscall_win32k_route(
         print_str(b"\n");
     }
     // ★ CLIENT-GDI HANDLE-TABLE ALIAS. The early win32k process-create callout maps
-    // the canonical Section and writes PEB+0xf8 before gdi32's GdiProcessSetup. The
-    // user-attribute area also precedes client-side GdiValidateHandle. Winlogon needs this for the
-    // msgina dialog DC/font setup; later interactive shell clients use the same cataloged
-    // role path instead of fixed pi checks.
+    // the canonical Section and writes PEB+0xf8 before gdi32's GdiProcessSetup. GDI user
+    // attributes are the client's own private memory (win32k allocates them there). Winlogon
+    // needs this for the msgina dialog DC/font setup; later interactive shell clients use the
+    // same cataloged role path instead of fixed pi checks.
     if uses_client_gdi {
         let gdi_va = win32k_glue::map_gdi_shared_handle_table_into_client(
             &mut nt_handler,
             pml4,
             pi,
         );
-        let gdi_attributes =
-            win32k_glue::map_gdi_user_attributes_into_client(&mut nt_handler, pml4, pi);
-        if gdi_va != 0 && gdi_attributes {
+        if gdi_va != 0 {
             record_hosted_client_gdi_mapping(
                 &mut nt_handler, pi, gdi_va, dispatch_client.logical_caller,
             );

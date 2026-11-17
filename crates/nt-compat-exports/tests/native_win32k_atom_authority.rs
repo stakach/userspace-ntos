@@ -9,7 +9,7 @@ fn atom_pump_passes_exact_physical_envelope_to_the_service() {
         .split("else if label == crate::win32k_subsystem::W32_ATOM_LABEL")
         .nth(1)
         .expect("native win32k atom ingress")
-        .split("else if label == crate::win32k_subsystem::W32_MM_SECURE_LABEL")
+        .split("else if label == crate::win32k_subsystem::W32_MM_LABEL")
         .next()
         .unwrap();
     for field in ["ch,", "*reply_cap,", "msg.badge,", "msg.mi,", "msg.m0,", "msg.m1,"] {

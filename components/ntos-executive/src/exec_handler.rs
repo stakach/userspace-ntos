@@ -293,6 +293,9 @@ mod virtual_memory_query;
 #[path = "exec_virtual_memory_flush.rs"]
 mod virtual_memory_flush;
 
+#[path = "exec_win32k_virtual_memory.rs"]
+mod win32k_virtual_memory;
+
 #[path = "exec_file_cancel_ex.rs"]
 mod file_cancel_ex;
 
@@ -2398,6 +2401,40 @@ fn allocate_vad_between(
             upper_bound,
         ),
     }
+}
+
+/// `MM_HIGHEST_VAD_ADDRESS` for x64 user space.
+const HIGHEST_VAD_ADDRESS: u64 = 0x0000_07ff_fffd_ffff;
+
+/// `NtAllocateVirtualMemory` bounds on the captured `*BaseAddress` and `*RegionSize`.
+fn check_private_allocate_range(base_in: u64, want: u64) -> Result<(), u32> {
+    if base_in > HIGHEST_VAD_ADDRESS {
+        return Err(nt_address_space::STATUS_INVALID_PARAMETER_2);
+    }
+    if HIGHEST_VAD_ADDRESS + 1 - base_in < want || want == 0 {
+        return Err(nt_address_space::STATUS_INVALID_PARAMETER_4);
+    }
+    Ok(())
+}
+
+fn check_free_type(free_type: u32) -> Result<(), u32> {
+    if free_type != nt_address_space::MEM_RELEASE && free_type != nt_address_space::MEM_DECOMMIT {
+        return Err(nt_address_space::STATUS_INVALID_PARAMETER_4);
+    }
+    Ok(())
+}
+
+/// `NtFreeVirtualMemory` bounds on the captured `*BaseAddress` and `*RegionSize`.
+fn check_free_range(base: u64, size: u64) -> Result<(), u32> {
+    const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
+    const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
+    if base >= HIGHEST_USER_ADDRESS {
+        return Err(nt_address_space::STATUS_INVALID_PARAMETER_2);
+    }
+    if HIGHEST_USER_ADDRESS - base < size {
+        return Err(STATUS_INVALID_PARAMETER_3);
+    }
+    Ok(())
 }
 
 unsafe fn allocate_vad_avoiding_fixed_authorities(
@@ -18001,11 +18038,7 @@ impl ExecNtHandler {
         args: &[u64],
         memory: SyscallUserMemory,
     ) -> u32 {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
         const PROCESS_VM_OPERATION: u32 = 0x0008;
-        const HIGHEST_VAD_ADDRESS: u64 = 0x0000_07ff_fffd_ffff;
-        let ctx = self.loop_ctx.unwrap();
         let base_ptr = args[1];
         let size_ptr = args[3];
         let zero_bits = args[2];
@@ -18020,38 +18053,93 @@ impl ExecNtHandler {
             Ok(range) => range,
             Err(status) => return status,
         };
-        if base_in > HIGHEST_VAD_ADDRESS {
-            return nt_address_space::STATUS_INVALID_PARAMETER_2;
-        }
-        if HIGHEST_VAD_ADDRESS + 1 - base_in < want || want == 0 {
-            return nt_address_space::STATUS_INVALID_PARAMETER_4;
+        if let Err(status) = check_private_allocate_range(base_in, want) {
+            return status;
         }
         let (target_pid, target_pi) =
             match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
                 Ok(target) => target,
                 Err(status) => return status,
             };
-        let Some(target_process) = self.capture_process_identity(target_pi) else {
-            return nt_process::STATUS_INVALID_HANDLE;
+        if self.process_is_terminating(target_pid) {
+            return nt_process::STATUS_PROCESS_IS_TERMINATING;
+        }
+        let lock_memory_privilege = self.current_token_has_privilege(nt_security::SE_LOCK_MEMORY);
+        let (plan, created_vad) = match self.allocate_private_virtual_memory(
+            target_pid,
+            target_pi,
+            base_in,
+            want,
+            zero_bits,
+            allocation_type,
+            protection,
+            lock_memory_privilege,
+        ) {
+            Ok(allocation) => allocation,
+            Err(status) => return status,
         };
-        if self.pm.process(target_pid).is_some_and(|process| {
+        let publication = self.publish_vm_range(
+            memory,
+            nt_address_space::native_output::VmRangeOutput {
+                base_pointer: base_ptr,
+                size_pointer: size_ptr,
+            },
+            plan.base,
+            plan.size,
+            None,
+        );
+        // NT retains success for a new VAD; existing private VAD operations report a late fault.
+        if !created_vad {
+            if let Err(status) = publication {
+                return status;
+            }
+        }
+        NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
+        0
+    }
+
+    /// A user-mode caller cannot change the address space of a process that has begun exiting.
+    fn process_is_terminating(&self, pid: nt_process::ProcessId) -> bool {
+        self.pm.process(pid).is_some_and(|process| {
             matches!(
                 process.state,
                 nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
             )
-        }) {
-            return nt_process::STATUS_PROCESS_IS_TERMINATING;
-        }
+        })
+    }
+
+    /// The `NtAllocateVirtualMemory` effect on one resolved process, after its parameters,
+    /// captured range and process access have been validated. Returns the allocated range and
+    /// whether it created a VAD. Process-state admission belongs to the caller: system calls
+    /// refuse an exiting process, while win32k's attached client keeps its address space through
+    /// its Win32 exit callouts, as NT does until the address space is deleted.
+    pub(crate) unsafe fn allocate_private_virtual_memory(
+        &mut self,
+        target_pid: nt_process::ProcessId,
+        target_pi: usize,
+        base_in: u64,
+        want: u64,
+        zero_bits: u64,
+        allocation_type: u32,
+        protection: u32,
+        lock_memory_privilege: bool,
+    ) -> Result<(nt_address_space::VmAllocatePlan, bool), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+        let ctx = self.loop_ctx.ok_or(0xC000_00A3u32)?;
+        let target_process = self
+            .capture_process_identity(target_pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         if allocation_type & nt_address_space::MEM_LARGE_PAGES != 0 {
-            if !self.current_token_has_privilege(nt_security::SE_LOCK_MEMORY) {
-                return STATUS_PRIVILEGE_NOT_HELD;
+            if !lock_memory_privilege {
+                return Err(STATUS_PRIVILEGE_NOT_HELD);
             }
-            return STATUS_INVALID_PARAMETER;
+            return Err(STATUS_INVALID_PARAMETER);
         }
         if allocation_type & (nt_address_space::MEM_PHYSICAL | nt_address_space::MEM_WRITE_WATCH)
             != 0
         {
-            return STATUS_INVALID_PARAMETER;
+            return Err(STATUS_INVALID_PARAMETER);
         }
         let copy_on_write = matches!(
             protection & 0xff,
@@ -18059,12 +18147,12 @@ impl ExecNtHandler {
         );
         let created_vad = base_in == 0 || allocation_type & nt_address_space::MEM_RESERVE != 0;
         if created_vad && copy_on_write {
-            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+            return Err(nt_address_space::STATUS_INVALID_PAGE_PROTECTION);
         }
         let placement_limit = if base_in == 0 && zero_bits != 0 {
             let highest = u64::MAX >> zero_bits;
             if highest > HIGHEST_VAD_ADDRESS {
-                return nt_address_space::STATUS_INVALID_PARAMETER_3;
+                return Err(nt_address_space::STATUS_INVALID_PARAMETER_3);
             }
             PRIVATE_VM_LIMIT.min(highest + 1)
         } else {
@@ -18073,10 +18161,10 @@ impl ExecNtHandler {
         let procs = &mut *ctx.procs;
         let target = procs[target_pi];
         if target.pml4 == 0 || target.scratch_base == 0 {
-            return nt_process::STATUS_INVALID_HANDLE;
+            return Err(nt_process::STATUS_INVALID_HANDLE);
         }
         let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
-            return nt_process::STATUS_INVALID_HANDLE;
+            return Err(nt_process::STATUS_INVALID_HANDLE);
         };
         // STATIC scratch, not stack — see the matching note in the free path.
         let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
@@ -18094,14 +18182,14 @@ impl ExecNtHandler {
             placement_limit,
         ) {
             Ok(plan) => plan,
-            Err(status) => return status,
+            Err(status) => return Err(status),
         };
         if let Err(status) = hosted_thread_memory_access(target_pi as u64, plan.base, plan.size) {
-            return status;
+            return Err(status);
         }
         crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
         if !created_vad && allocation_type != nt_address_space::MEM_RESET && copy_on_write {
-            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+            return Err(nt_address_space::STATUS_INVALID_PAGE_PROTECTION);
         }
         if !self.secured_virtual_memory.permits_allocation(
             u64::from(target_pid),
@@ -18109,7 +18197,7 @@ impl ExecNtHandler {
             allocation_type,
             protection,
         ) {
-            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+            return Err(nt_address_space::STATUS_INVALID_PAGE_PROTECTION);
         }
 
         let commit_delta = after
@@ -18155,7 +18243,7 @@ impl ExecNtHandler {
                     if let Err(status) =
                         ensure_process_user_page_table(self, target_pi, table_base, target.pml4)
                     {
-                        return status;
+                        return Err(status);
                     }
                     if table_base == final_table {
                         break;
@@ -18168,7 +18256,7 @@ impl ExecNtHandler {
         let prepared_commit =
             match self.prepare_process_commit_charge(target_pid, target_pi, commit_delta) {
                 Ok(prepared) => prepared,
-                Err(status) => return status,
+                Err(status) => return Err(status),
             };
 
         // Commit the plan EXTENT-WISE, not page-wise.
@@ -18282,28 +18370,11 @@ impl ExecNtHandler {
                 }
                 page += 0x1000;
             }
-            return map_status;
+            return Err(map_status);
         }
         *vm_map = *after;
         self.commit_process_commit_charge(prepared_commit);
-        let publication = self.publish_vm_range(
-            memory,
-            nt_address_space::native_output::VmRangeOutput {
-                base_pointer: base_ptr,
-                size_pointer: size_ptr,
-            },
-            plan.base,
-            plan.size,
-            None,
-        );
-        // NT retains success for a new VAD; existing private VAD operations report a late fault.
-        if !created_vad {
-            if let Err(status) = publication {
-                return status;
-            }
-        }
-        NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
-        0
+        Ok((plan, created_vad))
     }
 
     pub(crate) unsafe fn ensure_residency_page(
@@ -18570,87 +18641,12 @@ impl ExecNtHandler {
         })
     }
 
-    pub(crate) unsafe fn service_win32k_secure_virtual_memory(
-        &mut self,
-        target_pi: usize,
-        address: u64,
-        size: u64,
-        protection: u32,
-    ) -> Result<u64, u32> {
-        let access = match protection {
-            nt_address_space::PAGE_READONLY => {
-                nt_address_space::SecuredVirtualMemoryAccess::ReadOnly
-            }
-            nt_address_space::PAGE_READWRITE => {
-                nt_address_space::SecuredVirtualMemoryAccess::ReadWrite
-            }
-            _ => return Err(nt_address_space::STATUS_INVALID_PAGE_PROTECTION),
-        };
-        let end = address
-            .checked_add(size)
-            .filter(|end| size != 0 && *end <= USER_ADDRESS_LIMIT)
-            .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
-        let pid = self
-            .pm_pid_for_pi(target_pi)
-            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let fault_access = match access {
-            nt_address_space::SecuredVirtualMemoryAccess::ReadOnly => {
-                nt_address_space::FaultAccess::Read
-            }
-            nt_address_space::SecuredVirtualMemoryAccess::ReadWrite => {
-                nt_address_space::FaultAccess::Write
-            }
-        };
-        let mut information = self.query_memory_basic_information(target_pi, address)?;
-        let allocation_base = information.allocation_base;
-        let mut cursor = address;
-        while cursor < end {
-            if information.allocation_base != allocation_base
-                || nt_address_space::vm_access_page_plan(
-                    cursor & !(nt_address_space::PAGE_SIZE - 1),
-                    information,
-                    fault_access,
-                )
-                .is_err()
-            {
-                return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
-            }
-            let region_end = information
-                .base_address
-                .checked_add(information.region_size)
-                .filter(|region_end| *region_end > cursor)
-                .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
-            cursor = region_end.min(end);
-            if cursor < end {
-                information = self.query_memory_basic_information(target_pi, cursor)?;
-            }
-        }
-        self.secured_virtual_memory
-            .secure(u64::from(pid), address, size, access)
-    }
-
-    pub(crate) fn service_win32k_unsecure_virtual_memory(
-        &mut self,
-        target_pi: usize,
-        handle: u64,
-    ) -> Result<(), u32> {
-        let pid = self
-            .pm_pid_for_pi(target_pi)
-            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        self.secured_virtual_memory
-            .unsecure(u64::from(pid), handle)
-            .map(|_| ())
-    }
-
     unsafe fn nt_free_virtual_memory(&mut self, args: &[u64]) -> u32 {
-        const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
         const PROCESS_VM_OPERATION: u32 = 0x0008;
-        const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
 
         let free_type = nt_ulong_arg(args[3]);
-        if free_type != nt_address_space::MEM_RELEASE && free_type != nt_address_space::MEM_DECOMMIT
-        {
-            return nt_address_space::STATUS_INVALID_PARAMETER_4;
+        if let Err(status) = check_free_type(free_type) {
+            return status;
         }
         let base_ptr = args[1];
         let size_ptr = args[2];
@@ -18659,11 +18655,8 @@ impl ExecNtHandler {
             Ok(range) => range,
             Err(status) => return status,
         };
-        if base >= HIGHEST_USER_ADDRESS {
-            return nt_address_space::STATUS_INVALID_PARAMETER_2;
-        }
-        if HIGHEST_USER_ADDRESS - base < size {
-            return STATUS_INVALID_PARAMETER_3;
+        if let Err(status) = check_free_range(base, size) {
+            return status;
         }
 
         let (target_pid, target_pi) =
@@ -18671,19 +18664,44 @@ impl ExecNtHandler {
                 Ok(target) => target,
                 Err(status) => return status,
             };
-        let Some(target_process) = self.capture_process_identity(target_pi) else {
-            return nt_process::STATUS_INVALID_HANDLE;
-        };
-        if self.pm.process(target_pid).is_some_and(|process| {
-            matches!(
-                process.state,
-                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
-            )
-        }) {
+        if self.process_is_terminating(target_pid) {
             return nt_process::STATUS_PROCESS_IS_TERMINATING;
         }
+        let plan = match self.free_private_virtual_memory(target_pid, target_pi, base, size, free_type)
+        {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+        // NT keeps the completed free even if its output pages were among those released.
+        let _ = self.publish_vm_range(
+            memory,
+            nt_address_space::native_output::VmRangeOutput {
+                base_pointer: base_ptr,
+                size_pointer: size_ptr,
+            },
+            plan.base,
+            plan.size,
+            None,
+        );
+        0
+    }
+
+    /// The `NtFreeVirtualMemory` effect on one resolved process, after its free type, captured
+    /// range and process access have been validated. Returns the released or decommitted range.
+    /// Process-state admission belongs to the caller, as for the allocation.
+    pub(crate) unsafe fn free_private_virtual_memory(
+        &mut self,
+        target_pid: nt_process::ProcessId,
+        target_pi: usize,
+        base: u64,
+        size: u64,
+        free_type: u32,
+    ) -> Result<nt_address_space::VmFreePlan, u32> {
+        let Some(target_process) = self.capture_process_identity(target_pi) else {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        };
         let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
-            return nt_process::STATUS_INVALID_HANDLE;
+            return Err(nt_process::STATUS_INVALID_HANDLE);
         };
         // ★ The before/after snapshots live in STATIC scratch, never on the stack. The executive's
         // rootserver stack floats immediately after its loaded image and is only a few pages; a
@@ -18697,16 +18715,16 @@ impl ExecNtHandler {
         *after = *before;
         let plan = match after.free(base, size, free_type) {
             Ok(plan) => plan,
-            Err(status) => return status,
+            Err(status) => return Err(status),
         };
         let Some((ownership_base, ownership_size)) = plan.ownership_range(before) else {
-            return nt_address_space::STATUS_UNABLE_TO_FREE_VM;
+            return Err(nt_address_space::STATUS_UNABLE_TO_FREE_VM);
         };
         if let Err(status) = hosted_thread_memory_retirement_access(target_pi as u64, ownership_base, ownership_size) {
-            return status;
+            return Err(status);
         }
         if !self.secured_virtual_memory.permits_free(u64::from(target_pid), before, plan) {
-            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+            return Err(nt_address_space::STATUS_INVALID_PAGE_PROTECTION);
         }
         let released_commit = before
             .private_committed_bytes()
@@ -18714,7 +18732,7 @@ impl ExecNtHandler {
         if released_commit != 0 {
             if let Err(status) = self.ensure_process_commit_owner(target_pid, target_pi) {
                 self.drain_job_notifications();
-                return status;
+                return Err(status);
             }
         }
         let _ = vm_page_lock_retire_range(target_pi as u64, plan.base, plan.size);
@@ -18727,7 +18745,7 @@ impl ExecNtHandler {
                     .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
             {
                 if let Err(status) = vm_unmap_private_page(target_pi, target_process, page, self) {
-                    return status;
+                    return Err(status);
                 }
             }
             page += 0x1000;
@@ -18736,18 +18754,7 @@ impl ExecNtHandler {
         if released_commit != 0 {
             self.release_process_commit(target_pid, released_commit);
         }
-        // NT keeps the completed free even if its output pages were among those released.
-        let _ = self.publish_vm_range(
-            memory,
-            nt_address_space::native_output::VmRangeOutput {
-                base_pointer: base_ptr,
-                size_pointer: size_ptr,
-            },
-            plan.base,
-            plan.size,
-            None,
-        );
-        0
+        Ok(plan)
     }
 
     fn token_id_for_handle(

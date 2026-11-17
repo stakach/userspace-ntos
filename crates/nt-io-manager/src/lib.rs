@@ -131,6 +131,7 @@ pub mod win32k_async_read_wire;
 pub mod win32k_section_create_wire;
 pub mod win32k_mm_section_wire;
 pub mod win32k_section_map_wire;
+pub mod win32k_virtual_memory_wire;
 pub mod win32k_buffered_ioctl_wire;
 pub mod win32k_source_irp_ioctl_wire;
 pub mod win32k_source_pnp_wire;

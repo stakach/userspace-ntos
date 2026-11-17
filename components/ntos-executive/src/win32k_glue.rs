@@ -1447,7 +1447,6 @@ static WIN32K_CLIENT_CAP_BANK_FAILS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_PROCESS_ROW_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();
 static mut WIN32K_POOL_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();
-static mut GDI_USERVM_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
@@ -1479,11 +1478,7 @@ pub(crate) fn reset_win32k_client_process_rows(slots: usize) -> bool {
             &mut *core::ptr::addr_of_mut!(WIN32K_POOL_CLIENT_MAPPED_FRAMES),
             slots,
         );
-        let uservm_rows = reset_win32k_atomic_process_rows(
-            &mut *core::ptr::addr_of_mut!(GDI_USERVM_CLIENT_MAPPED_FRAMES),
-            slots,
-        );
-        heap_rows && pool_rows && uservm_rows
+        heap_rows && pool_rows
     }
 }
 
@@ -1495,10 +1490,6 @@ unsafe fn win32k_pool_mapped_row(pi: usize) -> Option<&'static AtomicU64> {
     (&*core::ptr::addr_of!(WIN32K_POOL_CLIENT_MAPPED_FRAMES)).get(pi)
 }
 
-unsafe fn gdi_uservm_mapped_row(pi: usize) -> Option<&'static AtomicU64> {
-    (&*core::ptr::addr_of!(GDI_USERVM_CLIENT_MAPPED_FRAMES)).get(pi)
-}
-
 unsafe fn win32k_user_heap_mapped_rows() -> &'static [AtomicU64] {
     (&*core::ptr::addr_of!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES)).as_slice()
 }
@@ -1507,23 +1498,16 @@ unsafe fn win32k_pool_mapped_rows() -> &'static [AtomicU64] {
     (&*core::ptr::addr_of!(WIN32K_POOL_CLIENT_MAPPED_FRAMES)).as_slice()
 }
 
-unsafe fn gdi_uservm_mapped_rows() -> &'static [AtomicU64] {
-    (&*core::ptr::addr_of!(GDI_USERVM_CLIENT_MAPPED_FRAMES)).as_slice()
-}
-
 pub(crate) fn win32k_client_process_row_stats(
-) -> (usize, usize, usize, usize, usize, usize, u64) {
+) -> (usize, usize, usize, usize, u64) {
     unsafe {
         let heap_rows = &*core::ptr::addr_of!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES);
         let pool_rows = &*core::ptr::addr_of!(WIN32K_POOL_CLIENT_MAPPED_FRAMES);
-        let uservm_rows = &*core::ptr::addr_of!(GDI_USERVM_CLIENT_MAPPED_FRAMES);
         (
             heap_rows.len(),
             heap_rows.capacity(),
             pool_rows.len(),
             pool_rows.capacity(),
-            uservm_rows.len(),
-            uservm_rows.capacity(),
             WIN32K_CLIENT_PROCESS_ROW_ALLOCATION_FAILURES.load(Ordering::Relaxed),
         )
     }
@@ -6630,11 +6614,9 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(candidate: nt_user_host::Pro
         WIN32K_CLIENT_MAPPED.fetch_and(bit, Ordering::Relaxed);
         WIN32K_POOL_CLIENT_MAPPED.fetch_and(bit, Ordering::Relaxed);
         GDI_SHARED_TABLE_MAPPED.fetch_and(bit, Ordering::Relaxed);
-        GDI_USERVM_MAPPED.fetch_and(bit, Ordering::Relaxed);
     }
     if let Some(row) = win32k_user_heap_mapped_row(pi) { row.store(0, Ordering::Relaxed); }
     if let Some(row) = win32k_pool_mapped_row(pi) { row.store(0, Ordering::Relaxed); }
-    if let Some(row) = gdi_uservm_mapped_row(pi) { row.store(0, Ordering::Relaxed); }
     true
 }
 
@@ -6769,38 +6751,6 @@ pub(crate) unsafe fn map_gdi_shared_handle_table_into_client(
         print_str(b"\n");
     }
     client_base
-}
-
-pub(crate) unsafe fn map_gdi_user_attributes_into_client(
-    handler: &mut ExecNtHandler,
-    pml4: u64,
-    pi: usize,
-) -> bool {
-    let base = WIN32K_USERVM_FRAME_BASE.load(Ordering::Relaxed);
-    if base == 0 {
-        return false;
-    }
-    let already_mapped =
-        gdi_uservm_mapped_row(pi).is_some_and(|row| row.load(Ordering::Relaxed) != 0);
-    let mapped = map_win32k_arena_prefix_into_client(
-        handler,
-        pml4,
-        pi,
-        base,
-        win32k_subsystem::WIN32K_USERVM_VADDR,
-        win32k_subsystem::WIN32K_USERVM_FRAMES,
-        win32k_subsystem::win32k_uservm_committed_frames(),
-        gdi_uservm_mapped_rows(),
-        &GDI_USERVM_MAPPED,
-        RW_NX,
-        b"live GDI user attributes",
-    );
-    if mapped && !already_mapped {
-        print_str(b"[win32k-svc] RW-mapped live GDI user attributes into pi 0x");
-        print_hex(pi as u32);
-        print_str(b"\n");
-    }
-    mapped
 }
 
 // --- win32k cross-AS client-memory sharing (the authentic "win32k shares the caller's user AS") ---

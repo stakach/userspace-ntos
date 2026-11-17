@@ -1022,7 +1022,6 @@ unsafe fn map_region(pml4: u64, r: &Region, bank: &mut ComponentMapCapBank) {
     } else {
         0
     };
-    let mut first = 0;
     for i in 0..mapped_count {
         let cap = match r.source {
             FrameSource::FreshZeroed | FrameSource::DemandZeroed { .. } => fresh_base + i,
@@ -1039,20 +1038,10 @@ unsafe fn map_region(pml4: u64, r: &Region, bank: &mut ComponentMapCapBank) {
                 }
             },
         };
-        if i == 0 {
-            first = match r.source {
-                FrameSource::FreshZeroed | FrameSource::DemandZeroed { .. } => cap,
-                FrameSource::Alias(base) => base,
-                FrameSource::AliasList(frames) => frames.first().copied().unwrap_or(0),
-            };
-        }
         let va = r.base_va + i * 0x1000;
         let error = page_map_r(cap, va, rights_at(r.rights, i), pml4);
         component_expect(b"region-map", va, error);
         component_map_cap_bank_store(bank, cap);
-    }
-    if r.base_va == crate::win32k_subsystem::WIN32K_USERVM_VADDR && first != 0 {
-        crate::WIN32K_USERVM_FRAME_BASE.store(first, Ordering::Relaxed);
     }
 }
 
@@ -4171,27 +4160,24 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
-        } else if label == crate::win32k_subsystem::W32_MM_SECURE_LABEL
+        } else if label == crate::win32k_subsystem::W32_MM_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let (status, handle) = unsafe {
-                crate::service_sec_image::service_win32k_mm_secure_request(
+            let (status, first, second) = unsafe {
+                crate::service_sec_image::service_win32k_mm_request(
                     ch.client_pi,
                     ch.client_generation,
-                    msg.m0,
-                    msg.m1,
-                    msg.m2,
-                    msg.m3,
+                    [msg.m0, msg.m1, msg.m2, msg.m3],
                 )
             };
             pump_reply_recv4_into!(
                 ch,
                 *reply_cap,
                 msg,
-                2,
+                3,
                 status as u32 as u64,
-                handle,
-                0,
+                first,
+                second,
                 0
             );
             continue;
