@@ -14956,28 +14956,32 @@ static ACTIVATION_SECTION_LOOKUP_FAILURES: nt_ntdll::loader::failure_trace::Fail
     nt_ntdll::loader::failure_trace::FailureLedger::new();
 
 #[cfg(target_arch = "x86_64")]
-static ACTIVATION_CLASS_LOOKUPS: nt_ntdll::loader::failure_trace::FailureLedger<8> =
-    nt_ntdll::loader::failure_trace::FailureLedger::new();
+static ACTIVATION_CLASS_LOOKUPS: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn reset_activation_section_lookup_failures() {
     ACTIVATION_SECTION_LOOKUP_FAILURES.reset();
-    ACTIVATION_CLASS_LOOKUPS.reset();
+    ACTIVATION_CLASS_LOOKUPS.store(0, Ordering::Release);
 }
 
+/// The first 32 successful window-class lookups of a process, each with its callers, so the
+/// user32 path that asked (create, class query or registration) is visible.
 #[cfg(target_arch = "x86_64")]
+#[inline(never)]
 fn report_activation_class_lookup(key: &[u16], context: u64) {
     use core::fmt::Write;
-    let mut key_bytes = [0u8; 96];
-    let mut key_len = 0;
-    for &unit in key.iter().take(key_bytes.len() / 2) {
-        key_bytes[key_len..key_len + 2].copy_from_slice(&unit.to_le_bytes());
-        key_len += 2;
-    }
-    let hash = nt_ntdll::loader::failure_trace::failure_hash(&[&key_bytes[..key_len]]);
-    if !ACTIVATION_CLASS_LOOKUPS.admit(hash) {
+    if ACTIVATION_CLASS_LOOKUPS.fetch_add(1, Ordering::AcqRel) >= 32 {
         return;
     }
+    let mut callers = [core::ptr::null_mut::<c_void>(); 5];
+    let captured = unsafe {
+        crate::security_exports::rtl_capture_stack_back_trace(
+            1,
+            callers.len() as u32,
+            callers.as_mut_ptr(),
+            core::ptr::null_mut(),
+        )
+    } as usize;
     let mut record = nt_ntdll::loader::failure_trace::FailureRecord::new();
     record.push_bytes(b"[actctx-class] key=\"");
     for &unit in key.iter().take(64) {
@@ -14985,7 +14989,11 @@ fn report_activation_class_lookup(key: &[u16], context: u64) {
     }
     // TEB.ClientId.UniqueProcess.
     let pid = unsafe { core::ptr::read_unaligned((current_teb() + 0x40) as *const u64) };
-    let _ = core::write!(&mut record, "\" actctx=0x{context:x} pid=0x{pid:x}\n");
+    let _ = core::write!(&mut record, "\" actctx=0x{context:x} pid=0x{pid:x} callers=");
+    for caller in &callers[..captured.min(callers.len())] {
+        let _ = core::write!(&mut record, "0x{:x},", *caller as u64);
+    }
+    record.push_bytes(b"\n");
     unsafe { crate::dbg_print_bytes(record.bytes().as_ptr(), record.bytes().len()) };
 }
 
