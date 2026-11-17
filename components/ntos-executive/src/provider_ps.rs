@@ -106,7 +106,7 @@ pub(crate) fn dispatch(
                 if !pm.has_yield_candidate(tid) {
                     return Err(0x4000_0024);
                 }
-                sel4_rt::yield_now();
+                crate::yield_now();
                 Ok((0, 0, 0))
             }),
         W32_PS_OP_QUERY_PROCESS_JOB if value == 0 => pm

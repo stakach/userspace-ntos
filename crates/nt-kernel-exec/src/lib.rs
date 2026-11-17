@@ -62,6 +62,7 @@ pub mod session_section;
 pub mod single_list;
 pub mod slist;
 mod spin;
+pub mod spin_watch;
 pub mod stall;
 mod timer;
 pub mod timezone;

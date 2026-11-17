@@ -39266,7 +39266,7 @@ impl ExecNtHandler {
                 if !has_candidate {
                     return STATUS_NO_YIELD_PERFORMED;
                 }
-                sel4_rt::yield_now();
+                crate::yield_now();
                 0
             }
             // NtQueryPerformanceCounter(*Counter[R10]=args[0], *Frequency[RDX]=args[1] optional).

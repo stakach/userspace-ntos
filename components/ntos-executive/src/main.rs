@@ -26,6 +26,7 @@ mod csrss_thread_probe;
 mod startup_readiness_probe;
 mod desktop_completion_marker;
 pub use serial_records::{debug_put_char, print_str, print_u64};
+pub use serial_records::yield_now;
 
 mod acpi_platform;
 mod boot_namespace;

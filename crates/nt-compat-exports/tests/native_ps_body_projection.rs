@@ -184,9 +184,7 @@ mod win32k_subsystem {
     pub const W32_PS_OP_SET_PROCESS_PRIORITY_CLASS: u64 = 20;
     pub const W32_PS_OP_QUERY_PROCESS_SESSION_ID_EX: u64 = 21;
 }
-mod sel4_rt {
-    pub fn yield_now() {}
-}
+fn yield_now() {}
 #[path = "../../../components/ntos-executive/src/provider_ps.rs"]
 mod provider_ps;
 
