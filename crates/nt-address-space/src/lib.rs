@@ -25,6 +25,7 @@ pub mod commitment;
 pub mod protection;
 pub mod query;
 pub mod image_view_placement;
+pub mod page_table_span;
 pub mod scratch;
 pub mod vm_lock_continuation;
 

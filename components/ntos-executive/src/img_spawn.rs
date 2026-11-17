@@ -1092,10 +1092,17 @@ pub(crate) unsafe fn spawn_sec_image(
     if setup_env {
         map_initial_process_hosted_client_env_pt(pi, pml4);
     }
-    // A second demand-mapped image (ntdll) — reserve its VA's page table too (same pdpt/pd
-    // as the image since both are within one 1 GiB / 512 GiB slot; only the PT differs).
+    // A second demand-mapped image (ntdll) — reserve every leaf page table its extent touches
+    // (same pdpt/pd as the image since both are within one 1 GiB / 512 GiB slot). An image
+    // larger than one 2 MiB table needs more than one; a page in a missing table cannot be
+    // made resident and faults the process with STATUS_INSUFFICIENT_RESOURCES.
     if let Some((ntdll_base, ntdll_pe)) = ntdll {
-        map_initial_process_page_table(pi, pml4, ntdll_base, b"ntdll-pt");
+        for table in nt_address_space::page_table_span::covering_page_tables(
+            ntdll_base,
+            image_extent(ntdll_pe),
+        ) {
+            map_initial_process_page_table(pi, pml4, table, b"ntdll-pt");
+        }
         if !register_image_committed_mappings(pi, ntdll_pe, ntdll_base) {
             let ntdll_size = image_extent(ntdll_pe);
             print_str(b"[spawn-vad] ntdll committed mapping failed pi=");
