@@ -31,6 +31,7 @@ pub mod dll_open_name;
 pub mod file_map_failure;
 pub mod file_name_redirection;
 pub mod host;
+pub mod image_entry;
 pub mod ifeo;
 pub mod init;
 pub mod lifecycle;

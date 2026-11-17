@@ -555,12 +555,30 @@ unsafe fn data_directory(base: u64, idx: u64) -> (u32, u32) {
     }
 }
 
-/// The `AddressOfEntryPoint` RVA of a mapped PE image (0 if none). OptionalHeader+16 on both PE32/32+.
+/// The entry point RVA the loader calls as `DllMain`: `AddressOfEntryPoint` for a DLL, 0 for any
+/// other image and for a DLL without one.
 ///
 /// # Safety
 /// `base` must be a mapped PE image (DOS + NT headers readable).
 #[cfg(target_arch = "x86_64")]
 unsafe fn entry_point_rva(base: u64) -> u32 {
+    // SAFETY: reading the mapped PE headers per the contract.
+    unsafe {
+        let e_lfanew = rd32(base, 0x3c) as u64;
+        let characteristics = (rd32(base, e_lfanew + 20) >> 16) as u16; // FileHeader.Characteristics
+        nt_ntdll::loader::image_entry::dll_entry_point_rva(
+            characteristics,
+            image_entry_point_rva(base),
+        )
+    }
+}
+
+/// The image's own `AddressOfEntryPoint`, whatever kind of image it is.
+///
+/// # Safety
+/// `base` must be a mapped PE image.
+#[cfg(target_arch = "x86_64")]
+unsafe fn image_entry_point_rva(base: u64) -> u32 {
     // SAFETY: reading the mapped PE headers per the contract.
     unsafe {
         let e_lfanew = rd32(base, 0x3c) as u64;
@@ -3654,7 +3672,9 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
         core::ptr::write_unaligned((fullbuf as *mut u16).add(full_units), 0);
 
         core::ptr::write_unaligned((entry + 0x30) as *mut u64, base); // DllBase
-        let epr = entry_point_rva(base);
+        // LdrpInitializeProcess publishes the executable's own entry; any other image keeps
+        // one only if it is a DLL (LdrpMapDll).
+        let epr = if base == EXE_BASE { image_entry_point_rva(base) } else { entry_point_rva(base) };
         let ep = if epr != 0 { base + epr as u64 } else { 0 };
         core::ptr::write_unaligned((entry + 0x38) as *mut u64, ep); // EntryPoint
         core::ptr::write_unaligned((entry + 0x40) as *mut u32, size_of_image(base)); // SizeOfImage
@@ -3933,7 +3953,13 @@ unsafe fn set_ldr_process_attached(base: u64, attached: bool) {
             }
             let flags = (entry + 0x68) as *mut u32;
             let mut value = core::ptr::read_unaligned(flags);
-            value |= LDRP_IMAGE_DLL | LDRP_ENTRY_PROCESSED;
+            // LdrpMapDll marks only an IMAGE_FILE_DLL image as LDRP_IMAGE_DLL.
+            let e_lfanew = rd32(base, 0x3c) as u64;
+            let characteristics = (rd32(base, e_lfanew + 20) >> 16) as u16;
+            if characteristics & nt_ntdll::loader::image_entry::IMAGE_FILE_DLL != 0 {
+                value |= LDRP_IMAGE_DLL;
+            }
+            value |= LDRP_ENTRY_PROCESSED;
             if attached {
                 value |= LDRP_PROCESS_ATTACH_CALLED;
             } else {
