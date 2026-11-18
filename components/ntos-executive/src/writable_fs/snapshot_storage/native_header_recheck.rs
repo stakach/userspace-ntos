@@ -65,6 +65,20 @@ pub(crate) unsafe fn settled_header_recheck_id() -> Option<u64> {
         .then_some(owner.id)
 }
 
+/// The recheck `id` has outer work: its next header read can enter, or it settled and its
+/// waiting owner must advance. An entered read is completed by its own terminal instead.
+pub(crate) unsafe fn header_outer_io_queued(id: u64) -> bool {
+    let Some(owner) = (&*core::ptr::addr_of!(PENDING_HEADER)).as_ref() else { return false; };
+    if owner.id != id {
+        return false;
+    }
+    if owner.failed.is_some() || matches!(&owner.state, HeaderState::Ready(_) | HeaderState::Aborted) {
+        return true;
+    }
+    matches!(&owner.state, HeaderState::Running(recheck)
+        if !owner.entered && recheck.pending().is_none() && !recheck.is_done())
+}
+
 /// Move the mounted proof and exact reserve lease into one asynchronous recheck owner.
 /// A refused admission restores the original proof before any native effect enters.
 pub(crate) unsafe fn begin_wal_continuation_recheck() -> Result<u64, u32> {

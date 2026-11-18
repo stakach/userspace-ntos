@@ -221,6 +221,18 @@ pub(super) unsafe fn fold_system_wal_native() -> Result<bool, u32> {
     Err(snapshot_storage::BUSY)
 }
 
+/// This fold holds the snapshot reserve and has work only the outer owner may claim.
+pub(crate) unsafe fn outer_io_queued() -> bool {
+    match (&*core::ptr::addr_of!(WORK)).as_ref() {
+        Some(Work::Rechecking { id, .. }) => snapshot_storage::header_outer_io_queued(*id),
+        Some(Work::Active(active)) => !active.entered && !active.failed
+            && active.cursor.as_ref().is_some_and(|cursor| {
+                cursor.pending().is_none() && !cursor.is_done()
+            }),
+        Some(Work::Stalled(_)) | None => false,
+    }
+}
+
 pub(crate) unsafe fn claim_next() -> Option<native_snapshot_io::SnapshotClaim> {
     let _durable = crate::allocator::enter_durable();
     if advance_recheck().is_err() { return None; }

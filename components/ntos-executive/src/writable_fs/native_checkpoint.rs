@@ -139,6 +139,16 @@ pub(super) unsafe fn checkpoint_dirty_native() -> Result<bool, u32> {
     Err(snapshot_storage::BUSY)
 }
 
+/// This checkpoint holds the snapshot reserve and has work only the outer owner may claim.
+pub(super) unsafe fn outer_io_queued() -> bool {
+    match (&*core::ptr::addr_of!(WORK)).as_ref() {
+        Some(Work::Rechecking { id }) => snapshot_storage::header_outer_io_queued(*id),
+        Some(Work::Committing { commit, entered, failed, .. }) =>
+            !*entered && !*failed && commit.pending().is_none() && !commit.is_done(),
+        Some(Work::Done { .. }) | None => false,
+    }
+}
+
 pub(super) unsafe fn claim_next() -> Option<native_snapshot_io::SnapshotClaim> {
     let _durable = crate::allocator::enter_durable();
     if advance_recheck().is_err() { return None; }

@@ -92,6 +92,7 @@ mod server;
 mod service_sec_image;
 mod wal_fold_cadence;
 mod volume_lazy_flush;
+mod outer_native_io;
 mod volume_checkpoint_deferral;
 mod hosted_stack_growth;
 mod local_section_file;

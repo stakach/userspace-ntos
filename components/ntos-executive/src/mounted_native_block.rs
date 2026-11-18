@@ -740,11 +740,19 @@ fn next_sector_claim() -> Option<WorkClaim> {
         .map(WorkClaim::Sector)
 }
 
-/// A queued mounted sector must wake the root Receive even when no unrelated IRQ arrives.
-/// The entered physical command owns its completion; only a vacant slot can be redriven.
+/// Queued outer-only work (a mounted sector, or I/O of a background snapshot owner that holds
+/// the reserve) must wake the root Receive even when no unrelated IRQ arrives, and makes a
+/// nested frame yield to the outer owner ([`crate::outer_native_io`]). The entered physical
+/// command owns its completion; only a vacant slot can be redriven.
 fn queued_timer_work() -> bool {
     native_disk_relation::native_storage_route().is_some()
-        && crate::mounted_volume::mounted_sector_claimable() == Some(true)
+        && crate::outer_native_io::OuterNativeIo {
+            sector: crate::mounted_volume::mounted_sector_claimable() == Some(true),
+            background_snapshot: unsafe {
+                crate::writable_fs::native_snapshot_io::background_outer_io_queued()
+            },
+        }
+        .queued()
 }
 
 fn claimable_timer_work() -> bool {

@@ -94,6 +94,12 @@ pub(crate) fn admission_busy(status: u32) -> bool {
 
 static mut RELATION_WAL_FIRST: bool = false;
 
+/// A background snapshot owner (lazy checkpoint or SYSTEM WAL fold) holds the reserve and has
+/// I/O that only the outer owner claims. Foreground registry owners claim their own commands.
+pub(crate) unsafe fn background_outer_io_queued() -> bool {
+    super::native_checkpoint::outer_io_queued() || super::system_wal_fold::native::outer_io_queued()
+}
+
 /// Claim at most one request from an owner already retained in the executive. No caller may
 /// create a physical command from a copied LBA or an unheld snapshot lease.
 pub(crate) unsafe fn claim_next_native_snapshot_io() -> Option<SnapshotClaim> {
