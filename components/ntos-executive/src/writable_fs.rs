@@ -313,6 +313,11 @@ static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
 // an exact CM checkpoint image. Boot replay can leave such a suffix even before a new mutation.
 static SYSTEM_WAL_FOLD_REQUIRED: AtomicBool = AtomicBool::new(false);
 
+/// Volume bytes that no begun checkpoint captures. The service loop publishes them lazily.
+pub(crate) fn snapshot_publication_owed() -> bool {
+    WRITABLE_FS_SNAPSHOT_DIRTY.load(Ordering::Acquire)
+}
+
 /// Terminal service-loop evidence only; observing this flag must not checkpoint it.
 pub(crate) fn snapshot_dirty_for_diagnostics() -> bool {
     WRITABLE_FS_SNAPSHOT_DIRTY.load(Ordering::Acquire)

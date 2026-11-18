@@ -151,6 +151,10 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             service_sec_image::system_wal_fold_next_deadline(),
             DELAY_TIMER_SOURCE_SYSTEM_WAL_FOLD,
         ),
+        (
+            service_sec_image::volume_lazy_flush_deadline(),
+            DELAY_TIMER_SOURCE_VOLUME_LAZY_FLUSH,
+        ),
         (watchdog_deadline(), DELAY_TIMER_SOURCE_WATCHDOG),
         (
             driver_launch::hosted_dpc_next_deadline(now.monotonic_100ns),

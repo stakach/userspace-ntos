@@ -31,7 +31,9 @@ pub use serial_records::yield_now;
 mod acpi_platform;
 mod boot_namespace;
 mod boot_progress;
-pub(crate) use boot_progress::{boot_progress_epoch, note_boot_progress, BootProgress};
+pub(crate) use boot_progress::{
+    boot_progress_epoch, boot_progress_sealed, note_boot_progress, BootProgress,
+};
 mod ahci_maintenance;
 mod allocator;
 mod component_heap;
@@ -89,6 +91,7 @@ mod hosted_driver_nls_exports;
 mod server;
 mod service_sec_image;
 mod wal_fold_cadence;
+mod volume_lazy_flush;
 mod volume_checkpoint_deferral;
 mod hosted_stack_growth;
 mod local_section_file;
@@ -3162,6 +3165,8 @@ const DELAY_TIMER_SOURCE_QUEUED_WORK_RECEIVE_POLL: u64 = 46;
 /// Parked hive edits and durability requests are attempted again at their poll deadline even
 /// when the completion that satisfies them was consumed by another owner's service turn.
 const DELAY_TIMER_SOURCE_MUTABLE_HIVE_WORK: u64 = 47;
+/// A dirty mounted volume is published lazily even when no caller waits for it.
+const DELAY_TIMER_SOURCE_VOLUME_LAZY_FLUSH: u64 = 48;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;

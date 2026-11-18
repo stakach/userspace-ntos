@@ -83,12 +83,10 @@ pub(super) struct Diag {
     pub(super) wl_ring: &'static mut [u16; 48],
     pub(super) wl_ri: usize,
     pub(super) ssn_ri: usize,
-    /// Boot-milestone watchdog state is wall-clock based: `last_progress_t` is the monotonic
-    /// time (100ns units) at the last epoch bump. An expired milestone window requests
-    /// bounded stall validation, not proof of a deadlock.
+    /// Boot-milestone watchdog: wall-clock silence before the epoch seals requests bounded
+    /// stall validation, not proof of a deadlock. A sealed epoch is an interactive desktop.
     pub(super) progress_epoch: fn() -> u64,
-    pub(super) last_progress_epoch: u64,
-    pub(super) last_progress_t: u64,
+    pub(super) milestones: nt_hosted_runtime::BootMilestoneWatch,
     pub(super) stall_deferrals: nt_hosted_runtime::ProgressDeferralBudget<super::StallDeferralSnapshot>,
     /// FORWARD-PROGRESS CENSUS (see `print_progress_census`): attribute the wall-clock
     /// between two consecutive loop tops to the badge that was serviced in between.

@@ -21,7 +21,7 @@ pub(super) type Maintained =
 // TCG device setup can spend more than 45 seconds between finite publication
 // milestones. Keep this diagnostic window finite while the installer frontier
 // is investigated; the outer boot harness bounds the whole run to one hour.
-const STALL_BUDGET_100NS: u64 = 180 * 10_000_000;
+pub(crate) const BOOT_MILESTONE_STALL_BUDGET_100NS: u64 = 180 * 10_000_000;
 
 #[inline(never)]
 pub(super) unsafe fn maintain(
@@ -874,7 +874,7 @@ pub(super) unsafe fn maintain(
         }
     }
     // Progress-stall accounting: reset the wall-clock window on any epoch bump (real forward
-    // progress); quiesce if no progress for STALL_BUDGET_100NS.
+    // progress); quiesce if no progress for BOOT_MILESTONE_STALL_BUDGET_100NS.
     {
         let quiesce_started = crate::disk_census_ticks();
         let ep = (lp.diag.progress_epoch)();
@@ -902,25 +902,24 @@ pub(super) unsafe fn maintain(
             if CENSUS_LAST_DUMP.load(Ordering::Relaxed) == now {
             }
         }
-        if ep != lp.diag.last_progress_epoch {
-            lp.diag.last_progress_epoch = ep;
-            lp.diag.last_progress_t = now;
+        let verdict = lp.diag.milestones.observe(ep, crate::boot_progress_sealed(), now);
+        if verdict == nt_hosted_runtime::MilestoneVerdict::Progressed {
             let _ = lp.diag.stall_deferrals.observe_progress(ep);
         } else if cfg!(not(feature = "mup-provider-kernel-only"))
             && ingress.is_none()
-            && now.wrapping_sub(lp.diag.last_progress_t) >= STALL_BUDGET_100NS
+            && verdict == nt_hosted_runtime::MilestoneVerdict::Silent
         {
             let deferral =
                 progress_stall_deferral_snapshot(&nt_handler, lp.parks.crash_parked, lp.parks.wait_parked);
             if deferral.is_some() && lp.diag.stall_deferrals.grant(ep, deferral.unwrap()) {
                 let snapshot = deferral.unwrap();
                 trace_progress_stall_deferral(snapshot, &nt_handler, lp.parks.crash_parked, lp.parks.wait_parked);
-                lp.diag.last_progress_t = now;
-            } else if nt_handler.grant_installer_inf_progress(ep, now, STALL_BUDGET_100NS) {
+                lp.diag.milestones.extend(now);
+            } else if nt_handler.grant_installer_inf_progress(ep, now, BOOT_MILESTONE_STALL_BUDGET_100NS) {
                 print_str(b"[quiesce] deferring installer INF traversal grant=");
                 print_u64(nt_handler.installer_inf_grants() as u64);
                 print_str(b"/2\n");
-                lp.diag.last_progress_t = now;
+                lp.diag.milestones.extend(now);
             } else {
                 dump_lsa_readiness_quiesce(
                     &nt_handler,

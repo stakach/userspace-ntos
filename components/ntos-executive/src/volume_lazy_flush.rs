@@ -1,0 +1,57 @@
+//! Lazy publication of a dirty mounted volume, after NT's lazy writer and `CmpLazyFlush`.
+//!
+//! NT does not leave modified file data or registry hives dirty until shutdown: the cache
+//! manager's lazy writer and the configuration manager's lazy flush write them out a few seconds
+//! after they change. The mounted volume's snapshot is this executive's durable image of both.
+//! A write that no caller asked to make durable is published once the volume has stayed dirty
+//! for [`LAZY_FLUSH_DELAY_100NS`], while the service loop that delivers its I/O completions is
+//! still running, so a later quiesce or shutdown finds a clean volume.
+
+/// `CmpLazyFlush`'s default delay after a registry change.
+pub(crate) const LAZY_FLUSH_DELAY_100NS: u64 = 5 * 10_000_000;
+
+/// When the volume was first observed dirty with no checkpoint begun since.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LazyFlush {
+    dirty_since: Option<u64>,
+}
+
+impl LazyFlush {
+    pub(crate) const fn new() -> Self {
+        Self { dirty_since: None }
+    }
+
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self { dirty_since: if raw == 0 { None } else { Some(raw) } }
+    }
+
+    pub(crate) const fn into_raw(self) -> u64 {
+        match self.dirty_since {
+            Some(at) => at,
+            None => 0,
+        }
+    }
+
+    /// Observe the volume at a service boundary. A clean volume (including one whose
+    /// checkpoint has begun) ends the interval. Returns true once a checkpoint is owed; the
+    /// interval then restarts, so a refused checkpoint is retried one delay later rather than
+    /// rearming an overdue wake.
+    pub(crate) fn observe(&mut self, dirty: bool, now_100ns: u64) -> bool {
+        if !dirty {
+            self.dirty_since = None;
+            return false;
+        }
+        let now = now_100ns.max(1);
+        let since = *self.dirty_since.get_or_insert(now);
+        let due = now.saturating_sub(since) >= LAZY_FLUSH_DELAY_100NS;
+        if due {
+            self.dirty_since = Some(now);
+        }
+        due
+    }
+
+    /// The wake deadline for an open interval.
+    pub(crate) fn deadline(self) -> Option<u64> {
+        self.dirty_since.map(|since| since.saturating_add(LAZY_FLUSH_DELAY_100NS))
+    }
+}

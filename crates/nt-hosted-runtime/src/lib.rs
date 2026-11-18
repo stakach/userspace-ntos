@@ -15,6 +15,7 @@ mod hosted_irq_call_stack;
 mod badge_census;
 mod shared_receive_census;
 mod timer_deadline_census;
+mod boot_milestone_watch;
 mod progress_deferral;
 mod installer_progress_deferral;
 mod setup_read_progress_deferral;
@@ -134,6 +135,7 @@ pub use badge_census::{
 };
 pub use shared_receive_census::{SharedReceiveCensus, SharedReceiveOwner, SharedReceiveReturn, SharedReceiveSample};
 pub use timer_deadline_census::{TimerDeadlineCensus, TimerDeadlineSample};
+pub use boot_milestone_watch::{BootMilestoneWatch, MilestoneVerdict};
 pub use progress_deferral::ProgressDeferralBudget;
 pub use installer_progress_deferral::{InstallerOwner, InstallerProgressDeferral};
 pub use setup_read_progress_deferral::SetupReadProgressDeferral;

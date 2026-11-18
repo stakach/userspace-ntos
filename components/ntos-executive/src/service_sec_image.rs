@@ -4642,6 +4642,7 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
     use crate::volume_checkpoint_deferral::Outcome;
     /// Episodes whose deferral and publication each get one trace line.
     const TRACED_EPISODES: u64 = 16;
+    owe_lazy_volume_checkpoint(nt_handler);
     let checkpoint_status = match publish_required_dirty_volume(nt_handler) {
         Ok(status) => status,
         Err(status) => return status,
@@ -4689,6 +4690,37 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
             report_service_finalize_failure(b"volume-checkpoint", status)
         }
     }
+}
+
+/// Open interval of the lazy volume flush, as [`crate::volume_lazy_flush::LazyFlush`] raw.
+static VOLUME_LAZY_FLUSH: AtomicU64 =
+    AtomicU64::new(crate::volume_lazy_flush::LazyFlush::new().into_raw());
+
+/// Owe a checkpoint for volume bytes that have stayed dirty for the lazy-flush delay. Only a
+/// mounted, unblocked volume qualifies: a blocked mount waits for boot recovery instead.
+fn owe_lazy_volume_checkpoint(nt_handler: &mut ExecNtHandler) {
+    use crate::volume_lazy_flush::LazyFlush;
+    let eligible = unsafe { crate::writable_fs::writable_fs_mounted() }
+        && !crate::writable_fs::system_wal_fold_blocked();
+    let mut lazy = LazyFlush::from_raw(VOLUME_LAZY_FLUSH.load(Ordering::Acquire));
+    let opened = lazy.deadline().is_none();
+    let due = lazy.observe(
+        eligible && crate::writable_fs::snapshot_publication_owed(),
+        monotonic_time_100ns(),
+    );
+    VOLUME_LAZY_FLUSH.store(lazy.into_raw(), Ordering::Release);
+    if due {
+        nt_handler.writable_fs_dirty = true;
+        nt_handler.writable_fs_commit_required = true;
+    }
+    if due || (opened && lazy.deadline().is_some()) {
+        unsafe { rearm_registered_active_delay_timer() };
+    }
+}
+
+pub(crate) fn volume_lazy_flush_deadline() -> Option<u64> {
+    crate::volume_lazy_flush::LazyFlush::from_raw(VOLUME_LAZY_FLUSH.load(Ordering::Acquire))
+        .deadline()
 }
 
 /// Preserve dirty-state and commit requirements until the volume snapshot is durable.
@@ -11242,8 +11274,11 @@ pub(crate) unsafe fn service_sec_image(
             wl_ri,
             ssn_ri,
             progress_epoch,
-            last_progress_epoch,
-            last_progress_t,
+            milestones: nt_hosted_runtime::BootMilestoneWatch::new(
+                last_progress_epoch,
+                last_progress_t,
+                loop_maintenance::BOOT_MILESTONE_STALL_BUDGET_100NS,
+            ),
             stall_deferrals,
             census_prev_t,
             census_prev_badge,

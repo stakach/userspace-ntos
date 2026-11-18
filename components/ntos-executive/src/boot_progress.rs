@@ -73,6 +73,10 @@ impl LocalBootProgressObserver {
                 .is_ok()
     }
 
+    pub(super) fn sealed(&self) -> bool {
+        self.sealed.load(Ordering::Acquire)
+    }
+
     pub(super) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
     }
@@ -91,6 +95,12 @@ pub(crate) fn note_boot_progress(progress: BootProgress) {
             b"[quiesce] Explorer runtime paint milestones complete; boot-progress epoch sealed\n",
         );
     }
+}
+
+/// Explorer's runtime paint milestones have completed; the boot frontier is finite and closed.
+#[inline]
+pub(crate) fn boot_progress_sealed() -> bool {
+    BOOT_PROGRESS.sealed()
 }
 
 #[inline]
