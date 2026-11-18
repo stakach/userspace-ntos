@@ -17879,6 +17879,19 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         Err(_) => return (0xC000_000Bu32 as i32, 0xC000_000B),
     };
     write_volatile((current_kpcr_va() + 0x30) as *mut u64, teb_context);
+    // win32k's EngSetLastError writes the TEB selected above. When that is the THREADINFO-bound
+    // TEB view rather than the caller's, start it from the caller's value and publish what
+    // win32k set when the dispatch returns.
+    let last_error_view = (teb_context != client_teb && client_teb != 0).then(|| {
+        let seeded = read_volatile(
+            (client_teb + nt_user_host::win32k_teb::TEB_LAST_ERROR_VALUE) as *const u32,
+        );
+        write_volatile(
+            (teb_context + nt_user_host::win32k_teb::TEB_LAST_ERROR_VALUE) as *mut u32,
+            seeded,
+        );
+        seeded
+    });
     let t = current_w32thread();
     sync_threadinfo_process(t);
     // ★ Publish the dispatch THREADINFO into the CURRENT-THREAD OBJECT (`Thread->Tcb.Win32Thread`).
@@ -17959,6 +17972,19 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     } else {
         dispatch_ssn(ssn, a0, a1, a2, a3)
     };
+    if let Some(seeded) = last_error_view {
+        let after = read_volatile(
+            (teb_context + nt_user_host::win32k_teb::TEB_LAST_ERROR_VALUE) as *const u32,
+        );
+        if let Some(error) =
+            nt_user_host::win32k_teb::caller_last_error_after_dispatch(seeded, after)
+        {
+            write_volatile(
+                (client_teb + nt_user_host::win32k_teb::TEB_LAST_ERROR_VALUE) as *mut u32,
+                error,
+            );
+        }
+    }
     if ssn == SSN_NT_USER_LOAD_KEYBOARD_LAYOUT_EX && result != 0 {
         let _ = refresh_default_keyboard_layout();
         let _ = bind_default_keyboard_layout_to_thread(t);

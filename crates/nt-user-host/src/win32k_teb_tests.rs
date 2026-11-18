@@ -1,5 +1,5 @@
-use crate::win32k_teb::{purpose_for_win32k_syscall, select_dispatch_teb, DispatchTebCandidates, DispatchTebPurpose,
-    DispatchTebError};
+use crate::win32k_teb::{caller_last_error_after_dispatch, purpose_for_win32k_syscall,
+    select_dispatch_teb, DispatchTebCandidates, DispatchTebPurpose, DispatchTebError};
 
 #[test]
 fn system_thread_dispatch_uses_teb_that_owns_threadinfo_client_info() {
@@ -119,4 +119,15 @@ fn keyboard_layout_activation_uses_threadinfo_client_info_identity() {
     assert_eq!(select_dispatch_teb(purpose, candidates), Ok(candidates.callout_teb));
     let foreign = DispatchTebCandidates { thread_client_info: 0x2000_0800, ..candidates };
     assert_eq!(select_dispatch_teb(purpose, foreign), Err(DispatchTebError::ClientInfoMismatch));
+}
+
+#[test]
+fn a_win32k_error_on_the_bound_teb_reaches_the_caller() {
+    // NtUserCreateWindowEx for an unregistered versioned class: co_UserCreateWindowEx sets
+    // ERROR_CANNOT_FIND_WND_CLASS on the dispatch TEB, and user32 retries through
+    // VersionRegisterClass only when the caller's GetLastError() returns it.
+    assert_eq!(caller_last_error_after_dispatch(0, 0x57f), Some(0x57f));
+    assert_eq!(caller_last_error_after_dispatch(0x583, 0x57f), Some(0x57f));
+    // Nothing set: the caller keeps its own value.
+    assert_eq!(caller_last_error_after_dispatch(0x57f, 0x57f), None);
 }

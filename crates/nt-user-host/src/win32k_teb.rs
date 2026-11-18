@@ -6,6 +6,21 @@
 
 const WIN32_CLIENT_INFO_OFFSET: u64 = 0x800;
 
+/// `TEB.LastErrorValue`.
+pub const TEB_LAST_ERROR_VALUE: u64 = 0x68;
+
+/// The caller's last error after a dispatch that ran on the THREADINFO-bound TEB.
+///
+/// win32k reports a failure with `EngSetLastError` (`win32ss/gdi/eng/error.c`), which writes
+/// `NtCurrentTeb()->LastErrorValue`; in NT that is the calling thread's own TEB. When the
+/// dispatch ran on a different TEB view, the value it held before the call was the caller's
+/// (`seeded`), so a different value afterwards (`after`) is what win32k set and the caller
+/// must see. An unchanged value leaves the caller's own, including anything a user-mode
+/// callback set during the dispatch.
+pub fn caller_last_error_after_dispatch(seeded: u32, after: u32) -> Option<u32> {
+    (after != seeded).then_some(after)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DispatchTebPurpose {
     ThreadInfo,
