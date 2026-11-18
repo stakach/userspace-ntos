@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use nt_kernel_exec::rtl_atom::{self, OwnedAtomTable};
 
@@ -73,7 +74,8 @@ struct JobPolicy {
     restrictions: u32,
     members: Vec<u64>,
     granted_user_handles: Vec<u64>,
-    atoms: Option<OwnedAtomTable>,
+    /// Boxed so its address is a stable `PRTL_ATOM_TABLE` handle while the table grows.
+    atoms: Option<Box<OwnedAtomTable>>,
 }
 
 /// Session-local policy installed by win32k's registered job callout.
@@ -131,10 +133,10 @@ impl JobUiPolicyStore {
             .try_reserve(1)
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let atoms = if restrictions & JOB_OBJECT_UILIMIT_GLOBALATOMS != 0 {
-            Some(
+            Some(Box::new(
                 OwnedAtomTable::with_capacity(JOB_ATOM_CAPACITY)
                     .ok_or(STATUS_INSUFFICIENT_RESOURCES)?,
-            )
+            ))
         } else {
             None
         };
@@ -155,10 +157,10 @@ impl JobUiPolicyStore {
         }
         let index = self.job_index(job).ok_or(STATUS_INVALID_HANDLE)?;
         if restrictions & JOB_OBJECT_UILIMIT_GLOBALATOMS != 0 && self.jobs[index].atoms.is_none() {
-            self.jobs[index].atoms = Some(
+            self.jobs[index].atoms = Some(Box::new(
                 OwnedAtomTable::with_capacity(JOB_ATOM_CAPACITY)
                     .ok_or(STATUS_INSUFFICIENT_RESOURCES)?,
-            );
+            ));
         }
         self.jobs[index].restrictions = restrictions;
         Ok(())
@@ -299,7 +301,14 @@ impl JobUiPolicyStore {
         self.jobs[index]
             .atoms
             .as_mut()
-            .map(OwnedAtomTable::raw_table_address)
+            .map(|table| &mut **table as *mut OwnedAtomTable as u64)
+    }
+
+    /// The job's private table behind an opaque handle from
+    /// [`Self::private_atom_table_for_process`], if this store owns that handle.
+    pub fn atom_table_for_handle(&mut self, handle: u64) -> Option<&mut OwnedAtomTable> {
+        self.jobs.iter_mut().filter_map(|job| job.atoms.as_deref_mut())
+            .find(|table| *table as *const OwnedAtomTable as u64 == handle)
     }
 
     fn atom_table_mut(&mut self, job: u64) -> Result<&mut OwnedAtomTable, u32> {
@@ -309,7 +318,7 @@ impl JobUiPolicyStore {
         }
         self.jobs[index]
             .atoms
-            .as_mut()
+            .as_deref_mut()
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)
     }
 

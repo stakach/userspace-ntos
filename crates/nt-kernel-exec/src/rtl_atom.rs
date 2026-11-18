@@ -23,11 +23,14 @@
 //!   `MAKEINTATOM` value — the atom IS the low 16 bits (0 → 0xC000), returned WITHOUT touching the
 //!   table. A `"#<decimal>"` string names integer atom `<decimal> & 0xFFFF`. Integer atoms are
 //!   never stored.
-//! - **String atoms** are stored case-insensitively; dynamic atoms are minted from 0xC000 upward.
-//!   Re-adding an existing name bumps its reference count; deleting decrements and frees at zero.
-//!   Pinned atoms are never ref-counted or deleted.
+//! - **String atoms** are stored case-insensitively. A new atom takes the lowest free slot and
+//!   its value is `0xC000 + slot` (ReactOS `RtlpCreateAtomHandle`), so a freed atom value is
+//!   reused and a table holds up to 0x4000 atoms. Re-adding an existing name bumps its reference
+//!   count; deleting decrements and frees at zero. Pinned atoms are never ref-counted or deleted.
+//! - **Storage**: fixed 16-byte entries plus an out-of-line name heap compacted on exhaustion,
+//!   so capacity no longer scales with the 255-character maximum. [`OwnedAtomTable`] grows its
+//!   arena on demand up to 0x4000 atoms.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 /// NTSTATUS values these functions return (subset used by the atom table).
@@ -48,28 +51,37 @@ pub mod status {
 const FLAG_PINNED: u16 = 0x0001;
 /// First dynamically-assigned atom value (Windows: string atoms start at 0xC000).
 const FIRST_DYNAMIC_ATOM: u16 = 0xC000;
-/// Maximum characters stored per atom name (Windows `RTL_MAXIMUM_ATOM_LENGTH` is 255; the atom
-/// table entry stores an inline copy — names longer than this are rejected `OBJECT_NAME_INVALID`).
+/// Dynamic atoms are `0xC000 + slot` (ReactOS `RtlpCreateAtomHandle`), so a table holds at most
+/// 0x4000 string atoms and a freed slot's atom value is reused by the next new atom.
+pub const MAX_ATOMS: usize = 0x4000;
+/// Maximum characters stored per atom name (Windows `RTL_MAXIMUM_ATOM_LENGTH` is 255; longer
+/// names are rejected with `INVALID_PARAMETER`).
 pub const NAME_CAP: usize = 255;
 
 /// Table header field offsets.
 mod hdr {
     /// Magic marking an initialized table (`'motA'`, matching ReactOS `Table->Signature`).
     pub const SIGNATURE: usize = 0x00;
-    /// Number of entry slots the arena backs.
+    /// Number of entry slots.
     pub const CAPACITY: usize = 0x04;
     /// Number of occupied slots.
     pub const COUNT: usize = 0x08;
-    /// Next dynamic atom value to hand out.
-    pub const NEXT_ATOM: usize = 0x0C;
+    /// Lowest slot that may be free; every slot below it is occupied.
+    pub const FREE_HINT: usize = 0x0C;
+    /// Arena offset of the name heap.
+    pub const NAMES_BASE: usize = 0x10;
+    /// Arena offset one past the name heap.
+    pub const NAMES_END: usize = 0x14;
+    /// Arena offset of the next unused name-heap byte.
+    pub const NAMES_TOP: usize = 0x18;
     /// Total header size; entry array starts here.
-    pub const SIZE: usize = 0x10;
+    pub const SIZE: usize = 0x20;
 }
 const SIGNATURE_MAGIC: u32 = 0x416F_746D; // 'motA' little-endian bytes m,t,o,A
 
-/// Per-atom entry field offsets. Entry size is [`ENTRY_SIZE`].
+/// Per-atom entry field offsets. Names live out of line in the name heap.
 mod ent {
-    /// Atom value (0 = free slot).
+    /// Atom value (0 = free slot); always `0xC000 + slot` when occupied.
     pub const ATOM: usize = 0x00;
     /// Reference count.
     pub const REF: usize = 0x02;
@@ -77,30 +89,53 @@ mod ent {
     pub const FLAGS: usize = 0x04;
     /// Name length in characters.
     pub const NAME_LEN: usize = 0x06;
-    /// Inline UTF-16 name buffer.
-    pub const NAME: usize = 0x08;
+    /// Arena offset of the name characters in the name heap.
+    pub const NAME_OFF: usize = 0x08;
 }
-/// Size of one atom entry: header (8 bytes) + inline name buffer + terminating null.
-pub const ENTRY_SIZE: usize = ent::NAME + (NAME_CAP + 1) * 2;
+/// Size of one fixed atom entry.
+pub const ENTRY_SIZE: usize = 0x10;
 
-/// An allocation-backed atom table whose address remains stable for its lifetime. This is the
-/// owning form used for the executive's global atom table; the raw functions below remain the ABI
-/// used by hosted ntoskrnl/win32k exports.
+/// A name-heap record: owner slot (u16), capacity in characters (u16), then the characters.
+mod rec {
+    pub const OWNER: usize = 0x00;
+    pub const CHARS: usize = 0x02;
+    pub const NAME: usize = 0x04;
+}
+
+const fn record_bytes(chars: usize) -> usize {
+    rec::NAME + chars * 2
+}
+
+/// Arena bytes for `slots` atoms whose names average `average_chars` characters. Every arena
+/// also reserves room for one maximum-length name.
+pub const fn arena_bytes(slots: usize, average_chars: usize) -> usize {
+    hdr::SIZE + slots * (ENTRY_SIZE + record_bytes(average_chars)) + record_bytes(NAME_CAP)
+}
+
+/// Name-heap sizing used when a raw arena does not state its slot count.
+const DEFAULT_AVERAGE_CHARS: usize = 32;
+
+/// An allocation-backed atom table. Its arena grows on demand (up to [`MAX_ATOMS`] atoms), so a
+/// caller that needs a stable opaque handle boxes this owner and passes the box address.
 pub struct OwnedAtomTable {
     arena: Vec<u8>,
 }
 
 impl OwnedAtomTable {
-    /// Create a table with exactly `capacity` string-atom slots.
+    /// Create a table that holds `capacity` maximum-length names before it first grows.
     pub fn with_capacity(capacity: usize) -> Option<Self> {
-        if capacity == 0 || capacity > u32::MAX as usize {
+        if capacity == 0 {
             return None;
         }
-        let arena_len = hdr::SIZE.checked_add(capacity.checked_mul(ENTRY_SIZE)?)?;
-        let mut arena = vec![0u8; arena_len];
-        // SAFETY: `arena` is writable for `arena_len` bytes and its allocation remains stable: no
-        // method changes its length or capacity after construction.
-        if unsafe { create(arena.as_mut_ptr(), arena.len()) }.is_null() {
+        Self::with_layout(capacity.min(MAX_ATOMS), NAME_CAP)
+    }
+
+    fn with_layout(slots: usize, average_chars: usize) -> Option<Self> {
+        let mut arena = Vec::new();
+        arena.try_reserve_exact(arena_bytes(slots, average_chars)).ok()?;
+        arena.resize(arena_bytes(slots, average_chars), 0);
+        // SAFETY: `arena` is writable for its whole length and is not resized while in use.
+        if unsafe { create_with_slots(arena.as_mut_ptr(), arena.len(), slots) }.is_null() {
             return None;
         }
         Some(Self { arena })
@@ -116,11 +151,76 @@ impl OwnedAtomTable {
         self.arena.as_mut_ptr()
     }
 
-    /// Return the stable raw RTL table address for a provider that must pass the table through an
-    /// existing kernel ABI. The allocation does not move because atom operations never resize it;
-    /// the pointer remains valid only while this owner is alive.
+    /// Address of the current arena. It changes when a growing add relocates the table, so
+    /// an opaque `PRTL_ATOM_TABLE` handle must be the owner's (boxed) address, not this.
     pub fn raw_table_address(&mut self) -> u64 {
         self.as_mut_ptr() as u64
+    }
+
+    /// Current slot capacity; grows on demand up to [`MAX_ATOMS`].
+    pub fn capacity(&self) -> usize {
+        // SAFETY: the arena holds a table initialized by `create_with_slots`.
+        unsafe { rd_u32(self.as_ptr(), hdr::CAPACITY) as usize }
+    }
+
+    /// Number of stored string atoms.
+    pub fn len(&self) -> usize {
+        // SAFETY: as above.
+        unsafe { rd_u32(self.as_ptr(), hdr::COUNT) as usize }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Double the slot capacity (bounded by [`MAX_ATOMS`]) and the name heap, preserving every
+    /// atom's value, reference count, pin and name. A refused growth leaves the table unchanged.
+    fn grow(&mut self) -> bool {
+        let slots = self.capacity();
+        if slots >= MAX_ATOMS {
+            return false;
+        }
+        let next_slots = (slots * 2).clamp(8, MAX_ATOMS);
+        // SAFETY: both tables are initialized; the old one is only read.
+        let names = unsafe { rd_u32(self.as_ptr(), hdr::NAMES_END) - rd_u32(self.as_ptr(), hdr::NAMES_BASE) } as usize;
+        let mut arena = Vec::new();
+        let length = hdr::SIZE + next_slots * ENTRY_SIZE + names * 2;
+        if arena.try_reserve_exact(length).is_err() {
+            return false;
+        }
+        arena.resize(length, 0);
+        // SAFETY: `arena` is writable for `length` bytes; the source table is valid.
+        unsafe {
+            if create_with_slots(arena.as_mut_ptr(), length, next_slots).is_null()
+                || !copy_entries(self.as_ptr(), arena.as_mut_ptr())
+            {
+                return false;
+            }
+        }
+        self.arena = arena;
+        true
+    }
+
+    /// Raw `RtlAddAtomToAtomTable` over this table, growing it when it is full.
+    ///
+    /// # Safety
+    /// `name` is a MAKEINTATOM value or a valid null-terminated UTF-16 string; `out_atom` is
+    /// writable if non-null.
+    pub unsafe fn add_raw(&mut self, name: *const u16, out_atom: *mut u16) -> u32 {
+        loop {
+            let status = unsafe { add(self.as_mut_ptr(), name, out_atom) };
+            if status != status::NO_MEMORY || !self.grow() {
+                return status;
+            }
+        }
+    }
+
+    /// Raw `RtlLookupAtomInAtomTable` over this table.
+    ///
+    /// # Safety
+    /// See [`Self::add_raw`].
+    pub unsafe fn lookup_raw(&self, name: *const u16, out_atom: *mut u16) -> u32 {
+        unsafe { lookup(self.as_ptr(), name, out_atom) }
     }
 
     /// Add an explicit-length UTF-16 name. The slice need not contain a trailing null.
@@ -131,8 +231,8 @@ impl OwnedAtomTable {
         }
         terminated[..name.len()].copy_from_slice(name);
         let mut atom = 0u16;
-        // SAFETY: `terminated` is null-terminated and the owned table allocation is valid.
-        let status = unsafe { add(self.as_mut_ptr(), terminated.as_ptr(), &mut atom) };
+        // SAFETY: `terminated` is null-terminated.
+        let status = unsafe { self.add_raw(terminated.as_ptr(), &mut atom) };
         if status == status::SUCCESS {
             Ok(atom)
         } else {
@@ -162,7 +262,7 @@ impl OwnedAtomTable {
         let mut out = 0u16;
         // SAFETY: small pointer values are the documented MAKEINTATOM representation and are not
         // dereferenced by `add`.
-        let status = unsafe { add(self.as_mut_ptr(), atom as usize as *const u16, &mut out) };
+        let status = unsafe { self.add_raw(atom as usize as *const u16, &mut out) };
         if status == status::SUCCESS {
             Ok(out)
         } else {
@@ -352,27 +452,71 @@ pub unsafe fn check_integer_atom(name: *const u16) -> Option<u16> {
 }
 
 /// `RtlCreateAtomTable` — lay a fresh (empty) atom table over `arena`/`arena_len` and return the
-/// opaque table pointer (== `arena`). Idempotent: if `arena` already holds an initialized table,
-/// its contents are left intact (matches Windows returning `STATUS_SUCCESS` when `*AtomTable`
-/// already exists). Returns null if the arena cannot hold the header plus at least one entry.
+/// opaque table pointer (== `arena`). The slot count follows from the arena size, assuming
+/// names average 32 characters, capped at [`MAX_ATOMS`]. Idempotent: if `arena` already holds an
+/// initialized table, its contents are left intact (matches Windows returning `STATUS_SUCCESS`
+/// when `*AtomTable` already exists). Returns null if the arena cannot hold one slot plus one
+/// maximum-length name.
 ///
 /// # Safety
 /// `arena` must be writable for `arena_len` bytes and remain valid for the table's lifetime.
 pub unsafe fn create(arena: *mut u8, arena_len: usize) -> *mut u8 {
-    if arena.is_null() || arena_len < hdr::SIZE + ENTRY_SIZE {
+    let room = arena_len.saturating_sub(hdr::SIZE + record_bytes(NAME_CAP));
+    let slots = (room / (ENTRY_SIZE + record_bytes(DEFAULT_AVERAGE_CHARS))).min(MAX_ATOMS);
+    create_with_slots(arena, arena_len, slots)
+}
+
+/// Lay a fresh table with exactly `slots` entries over `arena`; the rest is the name heap.
+///
+/// # Safety
+/// See [`create`].
+pub unsafe fn create_with_slots(arena: *mut u8, arena_len: usize, slots: usize) -> *mut u8 {
+    if arena.is_null() || slots == 0 || slots > MAX_ATOMS || arena_len > u32::MAX as usize {
+        return core::ptr::null_mut();
+    }
+    let names_base = hdr::SIZE + slots * ENTRY_SIZE;
+    if arena_len < names_base + record_bytes(NAME_CAP) {
         return core::ptr::null_mut();
     }
     if rd_u32(arena, hdr::SIGNATURE) == SIGNATURE_MAGIC {
         return arena; // already initialized
     }
-    let capacity = ((arena_len - hdr::SIZE) / ENTRY_SIZE) as u32;
-    // Zero the header + entry array so every slot's atom == 0 (free).
-    core::ptr::write_bytes(arena, 0, hdr::SIZE + capacity as usize * ENTRY_SIZE);
+    core::ptr::write_bytes(arena, 0, names_base);
     wr_u32(arena, hdr::SIGNATURE, SIGNATURE_MAGIC);
-    wr_u32(arena, hdr::CAPACITY, capacity);
+    wr_u32(arena, hdr::CAPACITY, slots as u32);
     wr_u32(arena, hdr::COUNT, 0);
-    wr_u32(arena, hdr::NEXT_ATOM, FIRST_DYNAMIC_ATOM as u32);
+    wr_u32(arena, hdr::FREE_HINT, 0);
+    wr_u32(arena, hdr::NAMES_BASE, names_base as u32);
+    wr_u32(arena, hdr::NAMES_END, arena_len as u32);
+    wr_u32(arena, hdr::NAMES_TOP, names_base as u32);
     arena
+}
+
+/// Copy every live atom of `source` into the empty, larger table `target` at the same slot.
+unsafe fn copy_entries(source: *const u8, target: *mut u8) -> bool {
+    let slots = rd_u32(source, hdr::CAPACITY);
+    if slots > rd_u32(target, hdr::CAPACITY) || rd_u32(target, hdr::COUNT) != 0 {
+        return false;
+    }
+    for slot in 0..slots {
+        let from = entry(source, slot);
+        if rd_u16(from, ent::ATOM) == 0 {
+            continue;
+        }
+        let len = rd_u16(from, ent::NAME_LEN) as usize;
+        let Some(name_off) = alloc_name(target, slot, len) else { return false; };
+        core::ptr::copy_nonoverlapping(
+            source.add(rd_u32(from, ent::NAME_OFF) as usize),
+            target.add(name_off as usize),
+            len * 2,
+        );
+        let to = entry_mut(target, slot);
+        core::ptr::copy_nonoverlapping(from, to, ENTRY_SIZE);
+        wr_u32(to, ent::NAME_OFF, name_off);
+    }
+    wr_u32(target, hdr::COUNT, rd_u32(source, hdr::COUNT));
+    wr_u32(target, hdr::FREE_HINT, rd_u32(source, hdr::FREE_HINT));
+    true
 }
 
 /// `RtlDestroyAtomTable` — validate an atom table, delete every atom, and invalidate the arena.
@@ -385,8 +529,9 @@ pub unsafe fn create(arena: *mut u8, arena_len: usize) -> *mut u8 {
 /// `table` must be the arena pointer returned by [`create`] and writable for `arena_len` bytes.
 pub unsafe fn destroy(table: *mut u8, arena_len: usize) -> u32 {
     if table.is_null()
-        || arena_len < hdr::SIZE + ENTRY_SIZE
+        || arena_len < hdr::SIZE
         || rd_u32(table, hdr::SIGNATURE) != SIGNATURE_MAGIC
+        || rd_u32(table, hdr::NAMES_END) as usize != arena_len
     {
         return status::INVALID_PARAMETER;
     }
@@ -408,47 +553,95 @@ unsafe fn entry_mut(table: *mut u8, i: u32) -> *mut u8 {
     table.add(hdr::SIZE + i as usize * ENTRY_SIZE)
 }
 
-/// Case-insensitively compare an entry's inline name to `name`/`len`.
-unsafe fn name_eq(e: *const u8, name: *const u16, len: usize) -> bool {
+#[inline]
+unsafe fn name_char(table: *const u8, e: *const u8, k: usize) -> u16 {
+    rd_u16(table, rd_u32(e, ent::NAME_OFF) as usize + k * 2)
+}
+
+/// Case-insensitively compare an entry's name to `name`/`len`.
+unsafe fn name_eq(table: *const u8, e: *const u8, name: *const u16, len: usize) -> bool {
     if rd_u16(e, ent::NAME_LEN) as usize != len {
         return false;
     }
-    for k in 0..len {
-        let a = rd_u16(e, ent::NAME + k * 2);
-        let b = core::ptr::read_unaligned(name.add(k));
-        if up(a) != up(b) {
-            return false;
-        }
-    }
-    true
+    (0..len).all(|k| up(name_char(table, e, k)) == up(core::ptr::read_unaligned(name.add(k))))
 }
 
 /// Find the slot index of the string atom `name`/`len`, or `None`.
 unsafe fn find_by_name(table: *const u8, name: *const u16, len: usize) -> Option<u32> {
-    let cap = rd_u32(table, hdr::CAPACITY);
-    for i in 0..cap {
+    (0..rd_u32(table, hdr::CAPACITY)).find(|&i| {
         let e = entry(table, i);
-        if rd_u16(e, ent::ATOM) != 0 && name_eq(e, name, len) {
-            return Some(i);
-        }
-    }
-    None
+        rd_u16(e, ent::ATOM) != 0 && name_eq(table, e, name, len)
+    })
 }
 
-/// Find the slot index holding atom value `atom`, or `None`.
+/// The slot holding atom value `atom`, or `None`: dynamic atoms are `0xC000 + slot`.
 unsafe fn find_by_atom(table: *const u8, atom: u16) -> Option<u32> {
-    let cap = rd_u32(table, hdr::CAPACITY);
-    for i in 0..cap {
-        let e = entry(table, i);
-        if rd_u16(e, ent::ATOM) == atom {
-            return Some(i);
+    let slot = u32::from(atom.checked_sub(FIRST_DYNAMIC_ATOM)?);
+    (slot < rd_u32(table, hdr::CAPACITY) && rd_u16(entry(table, slot), ent::ATOM) == atom)
+        .then_some(slot)
+}
+
+/// Reserve name storage for `slot`, compacting the heap once if its tail is exhausted.
+/// Returns the arena offset of the record's characters.
+unsafe fn alloc_name(table: *mut u8, slot: u32, chars: usize) -> Option<u32> {
+    let bytes = record_bytes(chars) as u32;
+    if rd_u32(table, hdr::NAMES_END) - rd_u32(table, hdr::NAMES_TOP) < bytes {
+        compact_names(table);
+        if rd_u32(table, hdr::NAMES_END) - rd_u32(table, hdr::NAMES_TOP) < bytes {
+            return None;
         }
     }
-    None
+    let record = rd_u32(table, hdr::NAMES_TOP);
+    wr_u16(table, record as usize + rec::OWNER, slot as u16);
+    wr_u16(table, record as usize + rec::CHARS, chars as u16);
+    wr_u32(table, hdr::NAMES_TOP, record + bytes);
+    Some(record + rec::NAME as u32)
+}
+
+/// Slide every live name record down over the records of deleted atoms. A record is live
+/// exactly when its owner slot is occupied and still names this record.
+unsafe fn compact_names(table: *mut u8) {
+    let slots = rd_u32(table, hdr::CAPACITY);
+    let top = rd_u32(table, hdr::NAMES_TOP);
+    let mut read = rd_u32(table, hdr::NAMES_BASE);
+    let mut write = read;
+    while read < top {
+        let owner = u32::from(rd_u16(table, read as usize + rec::OWNER));
+        let bytes = record_bytes(rd_u16(table, read as usize + rec::CHARS) as usize) as u32;
+        let live = owner < slots && {
+            let e = entry(table, owner);
+            rd_u16(e, ent::ATOM) != 0 && rd_u32(e, ent::NAME_OFF) == read + rec::NAME as u32
+        };
+        if live {
+            if write != read {
+                core::ptr::copy(table.add(read as usize), table.add(write as usize), bytes as usize);
+                wr_u32(entry_mut(table, owner), ent::NAME_OFF, write + rec::NAME as u32);
+            }
+            write += bytes;
+        }
+        read += bytes;
+    }
+    wr_u32(table, hdr::NAMES_TOP, write);
+}
+
+/// The lowest free slot, at or above the free hint.
+unsafe fn free_slot(table: *const u8) -> Option<u32> {
+    (rd_u32(table, hdr::FREE_HINT)..rd_u32(table, hdr::CAPACITY))
+        .find(|&i| rd_u16(entry(table, i), ent::ATOM) == 0)
+}
+
+unsafe fn release_slot(table: *mut u8, slot: u32) {
+    let e = entry_mut(table, slot);
+    core::ptr::write_bytes(e, 0, ENTRY_SIZE);
+    wr_u32(table, hdr::COUNT, rd_u32(table, hdr::COUNT).saturating_sub(1));
+    if slot < rd_u32(table, hdr::FREE_HINT) {
+        wr_u32(table, hdr::FREE_HINT, slot);
+    }
 }
 
 /// `RtlAddAtomToAtomTable(table, name, out_atom)`. Integer atoms return their value directly. A new
-/// string atom is minted from 0xC000 up; re-adding bumps the reference count. Returns an NTSTATUS.
+/// string atom takes the lowest free slot and is `0xC000 + slot`; re-adding bumps the reference
+/// count. `NO_MEMORY` means every slot is occupied or the name heap cannot hold the name.
 ///
 /// # Safety
 /// `table` must be a table from [`create`] (or null → `INVALID_HANDLE`); `name` an integer atom or
@@ -489,34 +682,24 @@ pub unsafe fn add(table: *mut u8, name: *const u16, out_atom: *mut u16) -> u32 {
         }
         return status::SUCCESS;
     }
-    // New atom: find a free slot.
-    let cap = rd_u32(table, hdr::CAPACITY);
-    let mut free = None;
-    for i in 0..cap {
-        if rd_u16(entry(table, i), ent::ATOM) == 0 {
-            free = Some(i);
-            break;
-        }
-    }
-    let i = match free {
-        Some(i) => i,
-        None => return status::NO_MEMORY,
+    let Some(slot) = free_slot(table) else {
+        return status::NO_MEMORY;
     };
-    let atom = rd_u32(table, hdr::NEXT_ATOM) as u16;
-    if atom < FIRST_DYNAMIC_ATOM {
-        return status::NO_MEMORY; // wrapped past the dynamic range
+    let Some(name_off) = alloc_name(table, slot, len) else {
+        return status::NO_MEMORY;
+    };
+    for k in 0..len {
+        wr_u16(table, name_off as usize + k * 2, core::ptr::read_unaligned(name.add(k)));
     }
-    wr_u32(table, hdr::NEXT_ATOM, atom as u32 + 1);
-    wr_u32(table, hdr::COUNT, rd_u32(table, hdr::COUNT) + 1);
-    let e = entry_mut(table, i);
+    let atom = FIRST_DYNAMIC_ATOM + slot as u16;
+    let e = entry_mut(table, slot);
     wr_u16(e, ent::ATOM, atom);
     wr_u16(e, ent::REF, 1);
     wr_u16(e, ent::FLAGS, 0);
     wr_u16(e, ent::NAME_LEN, len as u16);
-    for k in 0..len {
-        wr_u16(e, ent::NAME + k * 2, core::ptr::read_unaligned(name.add(k)));
-    }
-    wr_u16(e, ent::NAME + len * 2, 0);
+    wr_u32(e, ent::NAME_OFF, name_off);
+    wr_u32(table, hdr::COUNT, rd_u32(table, hdr::COUNT) + 1);
+    wr_u32(table, hdr::FREE_HINT, slot + 1);
     if !out_atom.is_null() {
         core::ptr::write_unaligned(out_atom, atom);
     }
@@ -557,8 +740,8 @@ pub unsafe fn lookup(table: *const u8, name: *const u16, out_atom: *mut u16) -> 
 }
 
 /// `RtlDeleteAtomFromAtomTable(table, atom)`. Integer atoms (< 0xC000) are a no-op success.
-/// String atoms decrement the ref count and free the slot at zero; pinned atoms return
-/// `WAS_LOCKED` (a success code) without deleting.
+/// String atoms decrement the ref count and free the slot (and its atom value) at zero; pinned
+/// atoms return `WAS_LOCKED` (a success code) without deleting.
 ///
 /// # Safety
 /// `table` must be a table from [`create`] (or null → `INVALID_HANDLE`).
@@ -569,9 +752,8 @@ pub unsafe fn delete(table: *mut u8, atom: u16) -> u32 {
     if !valid_table(table) {
         return status::INVALID_HANDLE;
     }
-    let i = match find_by_atom(table, atom) {
-        Some(i) => i,
-        None => return status::INVALID_HANDLE,
+    let Some(i) = find_by_atom(table, atom) else {
+        return status::INVALID_HANDLE;
     };
     let e = entry_mut(table, i);
     if rd_u16(e, ent::FLAGS) & FLAG_PINNED != 0 {
@@ -579,10 +761,7 @@ pub unsafe fn delete(table: *mut u8, atom: u16) -> u32 {
     }
     let rc = rd_u16(e, ent::REF).wrapping_sub(1);
     if rc == 0 {
-        wr_u16(e, ent::ATOM, 0); // free the slot
-        wr_u16(e, ent::NAME_LEN, 0);
-        let cnt = rd_u32(table, hdr::COUNT);
-        wr_u32(table, hdr::COUNT, cnt.saturating_sub(1));
+        release_slot(table, i);
     } else {
         wr_u16(e, ent::REF, rc);
     }
@@ -619,24 +798,16 @@ pub unsafe fn empty(table: *mut u8, delete_pinned: bool) -> u32 {
     if !valid_table(table) {
         return status::INVALID_HANDLE;
     }
-    let cap = rd_u32(table, hdr::CAPACITY);
-    let mut kept = 0u32;
-    for i in 0..cap {
-        let e = entry_mut(table, i);
+    for i in 0..rd_u32(table, hdr::CAPACITY) {
+        let e = entry(table, i);
         if rd_u16(e, ent::ATOM) == 0 {
             continue;
         }
         if !delete_pinned && (rd_u16(e, ent::FLAGS) & FLAG_PINNED) != 0 {
-            kept += 1;
             continue;
         }
-        wr_u16(e, ent::ATOM, 0);
-        wr_u16(e, ent::REF, 0);
-        wr_u16(e, ent::FLAGS, 0);
-        wr_u16(e, ent::NAME_LEN, 0);
-        wr_u16(e, ent::NAME, 0);
+        release_slot(table, i);
     }
-    wr_u32(table, hdr::COUNT, kept);
     status::SUCCESS
 }
 
@@ -668,9 +839,8 @@ pub unsafe fn query(
     if !valid_table(table) {
         return status::INVALID_HANDLE;
     }
-    let i = match find_by_atom(table, atom) {
-        Some(i) => i,
-        None => return status::INVALID_HANDLE,
+    let Some(i) = find_by_atom(table, atom) else {
+        return status::INVALID_HANDLE;
     };
     let e = entry(table, i);
     if !ref_count.is_null() {
@@ -703,7 +873,7 @@ pub unsafe fn query(
     }
     let chars = copy / 2;
     for k in 0..chars {
-        core::ptr::write_unaligned(name.add(k), rd_u16(e, ent::NAME + k * 2));
+        core::ptr::write_unaligned(name.add(k), name_char(table, e, k));
     }
     core::ptr::write_unaligned(name.add(chars), 0);
     core::ptr::write_unaligned(name_len, (chars * 2) as u32);
@@ -719,9 +889,8 @@ pub unsafe fn query_list(table: *const u8, atoms: &mut [u16], count: *mut u32) -
     if !valid_table(table) {
         return status::INVALID_HANDLE;
     }
-    let cap = rd_u32(table, hdr::CAPACITY);
     let mut total = 0usize;
-    for i in 0..cap {
+    for i in 0..rd_u32(table, hdr::CAPACITY) {
         let atom = rd_u16(entry(table, i), ent::ATOM);
         if atom == 0 {
             continue;
@@ -805,6 +974,119 @@ mod tests {
         s.encode_utf16().chain(core::iter::once(0)).collect()
     }
 
+    fn names(prefix: &str, count: usize) -> std::vec::Vec<std::vec::Vec<u16>> {
+        (0..count).map(|i| std::format!("{prefix}{i}").encode_utf16().collect()).collect()
+    }
+
+    /// Boot 44408128523: win32k's 64 KiB atom arena held 126 entries (520 bytes each), and
+    /// every class registration after the 126th failed with STATUS_NO_MEMORY.
+    #[test]
+    fn a_64k_raw_arena_holds_far_more_than_126_class_atoms() {
+        let mut a = arena(0x10000);
+        unsafe {
+            let t = create(a.as_mut_ptr(), a.len());
+            for (index, name) in names("WindowClass", 600).iter().enumerate() {
+                let terminated: std::vec::Vec<u16> = name.iter().copied().chain([0]).collect();
+                let mut atom = 0u16;
+                assert_eq!(add(t, terminated.as_ptr(), &mut atom), status::SUCCESS, "atom {index}");
+                assert_eq!(atom, 0xC000 + index as u16);
+            }
+            assert_eq!(rd_u32(t, hdr::COUNT), 600);
+        }
+    }
+
+    #[test]
+    fn owned_table_grows_to_the_full_dynamic_atom_range() {
+        let mut table = OwnedAtomTable::with_capacity(37).unwrap();
+        for (index, name) in names("A", MAX_ATOMS).iter().enumerate() {
+            assert_eq!(table.add_name(name), Ok(0xC000 + index as u16), "atom {index}");
+        }
+        assert_eq!(table.len(), MAX_ATOMS);
+        let extra: std::vec::Vec<u16> = "OneTooMany".encode_utf16().collect();
+        assert_eq!(table.add_name(&extra), Err(status::NO_MEMORY));
+        let first: std::vec::Vec<u16> = "A0".encode_utf16().collect();
+        assert_eq!(table.find_name(&first), Ok(0xC000));
+        let last: std::vec::Vec<u16> = std::format!("A{}", MAX_ATOMS - 1).encode_utf16().collect();
+        assert_eq!(table.find_name(&last), Ok(0xFFFF));
+    }
+
+    #[test]
+    fn growth_preserves_values_references_pins_and_long_names() {
+        let mut table = OwnedAtomTable::with_capacity(1).unwrap();
+        let long = std::vec![b'L' as u16; NAME_CAP];
+        let atom = table.add_name(&long).unwrap();
+        assert_eq!(table.add_name(&long), Ok(atom));
+        let pinned: std::vec::Vec<u16> = "Pinned".encode_utf16().collect();
+        let pinned_atom = table.add_name(&pinned).unwrap();
+        assert_eq!(table.pin(pinned_atom), status::SUCCESS);
+        for name in names("Fill", 200) {
+            table.add_name(&name).unwrap();
+        }
+        assert!(table.capacity() > 1);
+        let mut name = [0u16; NAME_CAP + 1];
+        let capacity = (name.len() * 2) as u32;
+        let queried = table.query(atom, &mut name, capacity);
+        assert_eq!((queried.status, queried.reference_count), (status::SUCCESS, 2));
+        assert_eq!(&name[..NAME_CAP], long.as_slice());
+        assert_eq!(table.delete(pinned_atom), status::WAS_LOCKED);
+    }
+
+    #[test]
+    fn deleted_atom_values_and_name_storage_are_reused_without_exhaustion() {
+        let mut table = OwnedAtomTable::with_capacity(4).unwrap();
+        let resident: std::vec::Vec<u16> = "Resident".encode_utf16().collect();
+        let resident_atom = table.add_name(&resident).unwrap();
+        // Far more create/delete cycles than there are atom values, with full-length names.
+        for round in 0..(MAX_ATOMS * 3) {
+            let mut name: std::vec::Vec<u16> = std::format!("Transient{round}").encode_utf16().collect();
+            name.resize(NAME_CAP, b'x' as u16);
+            let atom = table.add_name(&name).unwrap();
+            assert_eq!(atom, 0xC001, "a freed slot's atom value is reused");
+            assert_eq!(table.delete(atom), status::SUCCESS);
+        }
+        assert_eq!(table.capacity(), 4, "churn never needs to grow the table");
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.find_name(&resident), Ok(resident_atom));
+    }
+
+    #[test]
+    fn compaction_keeps_live_names_intact() {
+        let mut a = arena(arena_bytes(8, 8));
+        unsafe {
+            let t = create_with_slots(a.as_mut_ptr(), a.len(), 8);
+            let all = names("Name", 8);
+            let mut atoms = std::vec::Vec::new();
+            for name in &all {
+                let terminated: std::vec::Vec<u16> = name.iter().copied().chain([0]).collect();
+                let mut atom = 0u16;
+                assert_eq!(add(t, terminated.as_ptr(), &mut atom), status::SUCCESS);
+                atoms.push(atom);
+            }
+            for &atom in atoms.iter().step_by(2) {
+                assert_eq!(delete(t, atom), status::SUCCESS);
+            }
+            // Churn long names well past the heap size so it must compact repeatedly.
+            let long: std::vec::Vec<u16> = core::iter::repeat(b'Z' as u16).take(200)
+                .chain([0]).collect();
+            for _ in 0..50 {
+                let mut churn = 0u16;
+                assert_eq!(add(t, long.as_ptr(), &mut churn), status::SUCCESS);
+                assert_eq!(delete(t, churn), status::SUCCESS);
+            }
+            let mut long_atom = 0u16;
+            assert_eq!(add(t, long.as_ptr(), &mut long_atom), status::SUCCESS);
+            for (index, name) in all.iter().enumerate().skip(1).step_by(2) {
+                let terminated: std::vec::Vec<u16> = name.iter().copied().chain([0]).collect();
+                let mut found = 0u16;
+                assert_eq!(lookup(t, terminated.as_ptr(), &mut found), status::SUCCESS);
+                assert_eq!(found, atoms[index]);
+            }
+            let mut found = 0u16;
+            assert_eq!(lookup(t, long.as_ptr(), &mut found), status::SUCCESS);
+            assert_eq!(found, long_atom);
+        }
+    }
+
     #[test]
     fn create_lays_out_header() {
         let mut a = arena(4096);
@@ -812,7 +1094,7 @@ mod tests {
             let t = create(a.as_mut_ptr(), a.len());
             assert!(!t.is_null());
             assert_eq!(rd_u32(t, hdr::SIGNATURE), SIGNATURE_MAGIC);
-            assert_eq!(rd_u32(t, hdr::NEXT_ATOM), FIRST_DYNAMIC_ATOM as u32);
+            assert_eq!(rd_u32(t, hdr::COUNT), 0);
             assert!(rd_u32(t, hdr::CAPACITY) > 0);
             // Idempotent.
             let t2 = create(a.as_mut_ptr(), a.len());

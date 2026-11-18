@@ -10736,85 +10736,59 @@ extern "win64" fn s_rtl_are_bits_clear(bm: u64, start: u32, count: u32) -> u8 {
 
 use nt_kernel_exec::rtl_atom;
 
-/// Reusable arenas backing the atom tables this component hands out (`gAtomTable` +
-/// per-window-station tables). Lazily pool-allocated on demand; each table is a distinct sub-region
-/// so class atoms (global table) and global atoms (winsta tables) don't collide. Each arena is 64 KiB
-/// (≈125 full-length entries — ample for system classes + user atoms).
-const ATOM_ARENA_BYTES: u64 = 0x10000;
+/// Atom tables this component hands out (`gAtomTable` and per-window-station tables). Each is a
+/// boxed [`rtl_atom::OwnedAtomTable`] whose box address is the opaque `PRTL_ATOM_TABLE`; the
+/// table grows on demand up to the NT dynamic-atom limit (0xC000..=0xFFFF) while that handle
+/// stays stable. A job's private table (JOB_OBJECT_UILIMIT_GLOBALATOMS) is owned by the job
+/// policy store and resolved through it.
+static mut ATOM_TABLES: Vec<u64> = Vec::new();
+/// Initial slots per table; it grows when full.
+const ATOM_TABLE_INITIAL_CAPACITY: usize = 256;
 
-#[derive(Clone, Copy)]
-struct AtomArenaRecord {
-    table: u64,
-    in_use: bool,
+unsafe fn atom_table(handle: u64) -> Option<&'static mut rtl_atom::OwnedAtomTable> {
+    if handle == 0 {
+        return None;
+    }
+    if (&*core::ptr::addr_of!(ATOM_TABLES)).contains(&handle) {
+        return Some(&mut *(handle as *mut rtl_atom::OwnedAtomTable));
+    }
+    win32_job_ui_policy().atom_table_for_handle(handle)
+        .map(|table| &mut *(table as *mut rtl_atom::OwnedAtomTable))
 }
 
-static mut ATOM_ARENAS: Option<Vec<AtomArenaRecord>> = None;
-
-fn atom_arenas_mut() -> &'static mut Vec<AtomArenaRecord> {
-    unsafe {
-        let slot = &mut *core::ptr::addr_of_mut!(ATOM_ARENAS);
-        if slot.is_none() {
-            *slot = Some(Vec::new());
-        }
-        slot.as_mut().expect("initialized above")
+fn trace_atom_add_refused(handle: u64, name: u64, status: u32) {
+    static REFUSALS: AtomicU64 = AtomicU64::new(0);
+    let refusal = REFUSALS.fetch_add(1, Ordering::Relaxed);
+    if refusal >= 32 && !refusal.is_power_of_two() {
+        return;
     }
+    print_str(b"[win32k-atom] add refused status=0x");
+    print_hex(status);
+    print_str(b" table=");
+    print_win32k_hex64(handle);
+    if let Some(table) = unsafe { atom_table(handle) } {
+        print_str(b" live/capacity=");
+        print_u64(table.len() as u64);
+        print_str(b"/");
+        print_u64(table.capacity() as u64);
+    }
+    print_str(b" name-chars=");
+    let chars = if name > 0xFFFF {
+        unsafe { (0..=rtl_atom::NAME_CAP as u64).take_while(|k|
+            read_unaligned((name + k * 2) as *const u16) != 0).count() as u64 }
+    } else {
+        0
+    };
+    print_u64(chars);
+    print_str(b" refusals=");
+    print_u64(refusal + 1);
+    print_str(b"\n");
 }
 
-fn atom_arenas() -> Option<&'static Vec<AtomArenaRecord>> {
-    unsafe { (&*core::ptr::addr_of!(ATOM_ARENAS)).as_ref() }
-}
-
-unsafe fn atom_arena_alloc() -> u64 {
-    let arenas = atom_arenas_mut();
-    for record in arenas.iter_mut() {
-        if record.table != 0 && !record.in_use {
-            record.in_use = true;
-            return record.table;
-        }
-    }
-    if arenas.try_reserve(1).is_err() {
-        print_str(b"[win32k-atom] ERROR: arena record allocation failed\n");
-        return 0;
-    }
-    let arena = pool_alloc(ATOM_ARENA_BYTES);
-    if arena == 0 {
-        return 0;
-    }
-    arenas.push(AtomArenaRecord {
-        table: arena,
-        in_use: true,
-    });
-    arena
-}
-
-fn atom_arena_release(table: u64) -> bool {
-    unsafe {
-        if let Some(arenas) = (&mut *core::ptr::addr_of_mut!(ATOM_ARENAS)).as_mut() {
-            if let Some(record) = arenas.iter_mut().find(|record| record.table == table) {
-                let was_in_use = record.in_use;
-                record.in_use = false;
-                return was_in_use;
-            }
-        }
-    }
-    false
-}
-
-fn atom_arena_is_in_use(table: u64) -> bool {
-    if let Some(arenas) = atom_arenas() {
-        for record in arenas {
-            if record.table == table {
-                return record.in_use;
-            }
-        }
-    }
-    false
-}
-
-/// `NTSTATUS RtlCreateAtomTable(ULONG TableSize, PRTL_ATOM_TABLE* AtomTable)`. Pool-allocate an
-/// arena, lay a fresh table over it, write `*AtomTable`. Idempotent if `*AtomTable` already set
-/// (matches ReactOS sdk/lib/rtl/atom.c). This is what populates win32k's `gAtomTable`
-/// (session.c:20 `InitSessionImpl`), previously null under the `s_zero` stub.
+/// `NTSTATUS RtlCreateAtomTable(ULONG TableSize, PRTL_ATOM_TABLE* AtomTable)`. Allocate a
+/// growable table and write its handle to `*AtomTable`. Idempotent if `*AtomTable` is already
+/// set (matches ReactOS sdk/lib/rtl/atom.c). This populates win32k's `gAtomTable`
+/// (session.c:20 `InitSessionImpl`).
 extern "win64" fn s_rtl_create_atom_table(_size: u32, out_table: *mut u64) -> i32 {
     if out_table.is_null() {
         return rtl_atom::status::INVALID_PARAMETER as i32;
@@ -10823,34 +10797,59 @@ extern "win64" fn s_rtl_create_atom_table(_size: u32, out_table: *mut u64) -> i3
         if read_unaligned(out_table) != 0 {
             return rtl_atom::status::SUCCESS as i32; // already created
         }
-        let arena = atom_arena_alloc();
-        if arena == 0 {
+        let tables = &mut *core::ptr::addr_of_mut!(ATOM_TABLES);
+        if tables.try_reserve(1).is_err() {
             return rtl_atom::status::NO_MEMORY as i32;
         }
-        let table = rtl_atom::create(arena as *mut u8, ATOM_ARENA_BYTES as usize);
-        if table.is_null() {
-            atom_arena_release(arena);
+        let Some(table) = rtl_atom::OwnedAtomTable::with_capacity(ATOM_TABLE_INITIAL_CAPACITY) else {
             return rtl_atom::status::NO_MEMORY as i32;
-        }
-        write_unaligned(out_table, table as u64);
+        };
+        let handle = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(table)) as u64;
+        tables.push(handle);
+        write_unaligned(out_table, handle);
     }
     rtl_atom::status::SUCCESS as i32
 }
 /// `NTSTATUS RtlAddAtomToAtomTable(PRTL_ATOM_TABLE, PWSTR AtomName, PRTL_ATOM* Atom)`.
 extern "win64" fn s_rtl_add_atom_to_atom_table(table: u64, name: u64, out: *mut u16) -> i32 {
-    unsafe { rtl_atom::add(table as *mut u8, name as *const u16, out) as i32 }
+    let status = unsafe {
+        match atom_table(table) {
+            Some(owned) => owned.add_raw(name as *const u16, out),
+            // Integer atoms never touch a table; anything else needs a live one.
+            None => rtl_atom::add(core::ptr::null_mut(), name as *const u16, out),
+        }
+    };
+    if status != rtl_atom::status::SUCCESS {
+        trace_atom_add_refused(table, name, status);
+    }
+    status as i32
 }
 /// `NTSTATUS RtlLookupAtomInAtomTable(PRTL_ATOM_TABLE, PWSTR AtomName, PRTL_ATOM* Atom)`.
 extern "win64" fn s_rtl_lookup_atom_in_atom_table(table: u64, name: u64, out: *mut u16) -> i32 {
-    unsafe { rtl_atom::lookup(table as *const u8, name as *const u16, out) as i32 }
+    unsafe {
+        match atom_table(table) {
+            Some(owned) => owned.lookup_raw(name as *const u16, out) as i32,
+            None => rtl_atom::lookup(core::ptr::null(), name as *const u16, out) as i32,
+        }
+    }
 }
 /// `NTSTATUS RtlDeleteAtomFromAtomTable(PRTL_ATOM_TABLE, RTL_ATOM Atom)`.
 extern "win64" fn s_rtl_delete_atom_from_atom_table(table: u64, atom: u32) -> i32 {
-    unsafe { rtl_atom::delete(table as *mut u8, atom as u16) as i32 }
+    unsafe {
+        match atom_table(table) {
+            Some(owned) => owned.delete(atom as u16) as i32,
+            None => rtl_atom::delete(core::ptr::null_mut(), atom as u16) as i32,
+        }
+    }
 }
 /// `NTSTATUS RtlPinAtomInAtomTable(PRTL_ATOM_TABLE, RTL_ATOM Atom)`.
 extern "win64" fn s_rtl_pin_atom_in_atom_table(table: u64, atom: u32) -> i32 {
-    unsafe { rtl_atom::pin(table as *mut u8, atom as u16) as i32 }
+    unsafe {
+        match atom_table(table) {
+            Some(owned) => owned.pin(atom as u16) as i32,
+            None => rtl_atom::pin(core::ptr::null_mut(), atom as u16) as i32,
+        }
+    }
 }
 /// `NTSTATUS RtlQueryAtomInAtomTable(PRTL_ATOM_TABLE, RTL_ATOM, PULONG RefCount, PULONG PinCount,
 /// PWSTR AtomName, PULONG NameLength)`.
@@ -10863,31 +10862,24 @@ extern "win64" fn s_rtl_query_atom_in_atom_table(
     name_len: *mut u32,
 ) -> i32 {
     unsafe {
-        rtl_atom::query(
-            table as *const u8,
-            atom as u16,
-            ref_count,
-            pin_count,
-            name as *mut u16,
-            name_len,
-        ) as i32
+        match atom_table(table) {
+            Some(owned) => owned.query_raw(atom as u16, ref_count, pin_count,
+                name as *mut u16, name_len) as i32,
+            None => rtl_atom::query(core::ptr::null(), atom as u16, ref_count, pin_count,
+                name as *mut u16, name_len) as i32,
+        }
     }
 }
-/// `NTSTATUS RtlDestroyAtomTable(PRTL_ATOM_TABLE)`. Clear the raw table and release its typed atom
-/// arena for reuse. The general win32k pool remains bump-only; atom arenas have separate ownership
-/// because all allocations are fixed-size and only reachable through this RTL atom table API.
+/// `NTSTATUS RtlDestroyAtomTable(PRTL_ATOM_TABLE)`. Free a table this component created.
 extern "win64" fn s_rtl_destroy_atom_table(table: u64) -> i32 {
-    if table == 0 {
-        return rtl_atom::status::INVALID_PARAMETER as i32;
+    unsafe {
+        let tables = &mut *core::ptr::addr_of_mut!(ATOM_TABLES);
+        let Some(index) = tables.iter().position(|handle| *handle == table && table != 0) else {
+            return rtl_atom::status::INVALID_PARAMETER as i32;
+        };
+        tables.swap_remove(index);
+        drop(alloc::boxed::Box::from_raw(table as *mut rtl_atom::OwnedAtomTable));
     }
-    if !atom_arena_is_in_use(table) {
-        return rtl_atom::status::INVALID_PARAMETER as i32;
-    }
-    let status = unsafe { rtl_atom::destroy(table as *mut u8, ATOM_ARENA_BYTES as usize) };
-    if status != rtl_atom::status::SUCCESS {
-        return status as i32;
-    }
-    atom_arena_release(table);
     rtl_atom::status::SUCCESS as i32
 }
 
