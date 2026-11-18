@@ -69,6 +69,9 @@ PROCESS_EXIT = re.compile(
 USER_HIVE_LOADED = re.compile(
     rb"\[cm-load\] NtLoadKey MOUNTED \\Registry\\User\\(S-1-5-21-[0-9-]+) "
 )
+DESKTOP_EPOCH_SEALED = re.compile(
+    rb"\[quiesce\] Explorer runtime paint milestones complete; boot-progress epoch sealed"
+)
 SPEC_PASS = re.compile(rb" {0,2}PASS ([A-Za-z0-9_]+)")
 DIRECTORY_PUBLISH_REPLY = re.compile(
     rb"\[directory-publish\] token=([0-9]+) stage=reply status=(?:0x){1,2}0+"
@@ -248,10 +251,18 @@ def post_setup_idle_evidence(serial):
     setup.exe exits 0 on its failure path too, so its exit alone proves nothing. Winlogon
     only logs a user on once setup is no longer in progress; a user hive loaded after the
     last setup.exe exited 0 is the evidence that the disk holds a completed installation.
+
+    A continuation boot of such a disk never runs setup.exe. Its evidence is a user logon
+    followed by Explorer completing its runtime paint milestones (the executive seals its
+    boot-progress epoch), so a later idle stop keeps the painted-desktop disk.
     """
     starts = list(SETUP_PROCESS_START.finditer(serial))
     if not starts:
-        return None
+        hive = USER_HIVE_LOADED.search(serial)
+        if hive is None or DESKTOP_EPOCH_SEALED.search(serial, hive.end()) is None:
+            return None
+        return (f"user hive {hive.group(1).decode()} loaded; "
+                f"Explorer desktop paint milestones sealed afterwards")
     start = starts[-1]
     exited = None
     for match in PROCESS_EXIT.finditer(serial, start.end()):

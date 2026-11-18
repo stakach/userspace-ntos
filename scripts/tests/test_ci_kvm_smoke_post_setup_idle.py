@@ -40,5 +40,33 @@ class PostSetupIdleEvidenceTests(unittest.TestCase):
             SETUP_START + SETUP_EXIT + USER_HIVE + second))
 
 
+DESKTOP_SEALED = (b"[quiesce] Explorer runtime paint milestones complete; "
+                  b"boot-progress epoch sealed\r\n")
+
+
+class ContinuationDesktopIdleEvidenceTests(unittest.TestCase):
+    """A continuation boot never replays setup; its milestone is a logged-on painted desktop."""
+
+    def test_user_logon_then_sealed_desktop_is_evidence(self):
+        evidence = post_setup_idle_evidence(USER_HIVE + b"noise\r\n" + DESKTOP_SEALED)
+        self.assertIn("desktop", evidence)
+        self.assertIn("S-1-5-21-2098853176-875348418-1423597592-1000", evidence)
+
+    def test_sealed_desktop_without_user_logon_is_not_evidence(self):
+        system = USER_HIVE.replace(b"S-1-5-21-2098853176-875348418-1423597592-1000", b"S-1-5-18")
+        for serial in (DESKTOP_SEALED, system + DESKTOP_SEALED, DESKTOP_SEALED + USER_HIVE):
+            with self.subTest(serial=serial):
+                self.assertIsNone(post_setup_idle_evidence(serial))
+
+    def test_user_logon_without_sealed_desktop_is_not_evidence(self):
+        self.assertIsNone(post_setup_idle_evidence(USER_HIVE))
+
+    def test_setup_in_this_boot_keeps_the_setup_rule(self):
+        # A boot that ran setup is judged by setup's outcome, never by a later desktop.
+        failed = SETUP_EXIT.replace(b"0x00000000", b"0x00000001")
+        self.assertIsNone(post_setup_idle_evidence(
+            SETUP_START + failed + USER_HIVE + DESKTOP_SEALED))
+
+
 if __name__ == "__main__":
     unittest.main()
