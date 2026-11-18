@@ -2701,12 +2701,12 @@ unsafe fn receive_continuation_authorized(ch: &PumpChannel, previous: &PumpResul
         && (!ch.caps.kernel_irq_yield || previous.reply_cap == ch.reply_cap)
 }
 
-/// Resume only the receive half after the exact external service wait has been ACKed and
-/// retired by the root owner. Its prior request and service Reply must never be sent again.
-pub(crate) unsafe fn component_pump_continue_service_wait(
+/// Authenticate a parked service-wait continuation before anything is sent to the provider.
+/// A refusal here is proven pre-effect: no Reply, request or shared-page write has occurred.
+pub(crate) unsafe fn service_wait_continuation_authority(
     ch: &PumpChannel,
     previous: &PumpResult,
-) -> Result<PumpResult, u32> {
+) -> Result<(), u32> {
     let yielded = previous.is_service_wait_yield();
     let reply_matches = previous.service_wait_yield.is_some_and(|wait| previous.reply_cap == wait.reply);
     let stale = previous.service_wait_yield.map(|wait|
@@ -2726,6 +2726,16 @@ pub(crate) unsafe fn component_pump_continue_service_wait(
         }
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
+    Ok(())
+}
+
+/// Resume only the receive half after the exact external service wait has been ACKed and
+/// retired by the root owner. Its prior request and service Reply must never be sent again.
+pub(crate) unsafe fn component_pump_continue_service_wait(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    service_wait_continuation_authority(ch, previous)?;
     component_pump_continue_receive_half(ch, previous, false, false, false)
 }
 

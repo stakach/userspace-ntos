@@ -589,6 +589,7 @@ pub(crate) unsafe fn trace_stale_suspension_frames(lane_index: u64, lane_generat
                 nt_component_suspension::SuspensionPhase::MaintenanceReady { .. } => 6,
                 nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. } => 7,
                 nt_component_suspension::SuspensionPhase::NestedTerminal => 8,
+                nt_component_suspension::SuspensionPhase::ResumeRefused { .. } => 11,
             };
             let no_wait_details = [0u64; 7];
             let (pending_kind, wait_id, pending_dispatch, pending_ssn, admitted, wait_details) =
@@ -1924,6 +1925,8 @@ enum ComponentPumpCompletion {
     UserCallbackSuspended,
     FailedRetained(PendingComponentDispatch, i32),
     Failed(i32),
+    /// A continuation's resume authority was refused before the provider was re-entered.
+    ResumeRefused(i32),
 }
 
 enum ComponentSuspensionRuntimeOutcome {

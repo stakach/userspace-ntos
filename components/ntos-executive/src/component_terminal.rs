@@ -590,6 +590,47 @@ fn report_retained_failure(
     }
 }
 
+/// Fail the one client whose resume authority was refused, with the refusal status, exactly
+/// once. The lane was already quarantined with no provider effect; this is the client's only
+/// native effect, recorded before it is entered and never retried if uncertain.
+pub(super) unsafe fn fail_refused_client(
+    lane: nt_component_suspension::LaneHandle,
+    key: nt_component_suspension::SuspensionKey,
+    continuation: HostedNativeContinuation,
+) {
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    if continuation.return_target.is_abandoned()
+        || !matches!(continuation.destination, HostedContinuationDestination::Win32k)
+    {
+        // No live client Reply to fail; the quarantined frame keeps its exact owner.
+        report_retained_failure(lane, b"resume-refused-no-client", None, None, false);
+        return;
+    }
+    let Some(reply) = continuation.return_target.delivery() else {
+        report_retained_failure(lane, b"resume-refused-no-client", None, None, false);
+        return;
+    };
+    let status = lanes.begin_refused_client_delivery(lane, key)
+        .expect("refused resume lost its client delivery owner");
+    let delivered = match reply {
+        HostedReply::Syscall { reply_cap } => reply_parked_syscall(reply_cap, u64::from(status)),
+        HostedReply::Callback { reply_cap, context } => {
+            win32k_glue::complete_staged_user_callback_context(context, u64::from(status))
+                && win32k_glue::restart_staged_user_callback_context(context, reply_cap)
+        }
+    };
+    let outcome = if delivered { retire_reply(continuation) } else { Err(0xC000_0001) };
+    lanes.record_refused_client_delivery(lane, key, outcome)
+        .expect("refused resume lost its client delivery record");
+    print_str(b"[component-terminal] resume refused lane=");
+    print_u64(lane.index as u64);
+    print_str(b" generation=");
+    print_u64(lane.generation);
+    print_str(b" client-status=0x");
+    print_hex(status);
+    print_str(if outcome.is_ok() { b" client=failed\n" } else { b" client=indeterminate\n" });
+}
+
 unsafe fn process_output(
     nt_handler: &mut ExecNtHandler,
     continuation: HostedNativeContinuation,

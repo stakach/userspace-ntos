@@ -278,6 +278,8 @@ pub(crate) unsafe fn run_hosted(
                             PendingComponentDispatch::Provider(pending), status,
                         ),
                 },
+                win32k_glue::ServiceWaitPumpCompletion::ResumeRefused(status) =>
+                    ComponentPumpCompletion::ResumeRefused(status),
                 win32k_glue::ServiceWaitPumpCompletion::ServiceReparked(pending) =>
                     ComponentPumpCompletion::Reparked(PendingComponentDispatch::ServiceWait(pending)),
                 win32k_glue::ServiceWaitPumpCompletion::ReceiveReparked(pending) =>
@@ -305,6 +307,7 @@ pub(crate) unsafe fn run_hosted(
             ComponentPumpCompletion::Failed(_) => (0, 8),
             ComponentPumpCompletion::UserCallbackSuspended => (0, 9),
             ComponentPumpCompletion::CaptureRefused(_, _, _) => (0, 10),
+            ComponentPumpCompletion::ResumeRefused(_) => (0, 11),
         };
         trace_nested_provider_outer(b"pump-return", resume.key,
             frame.owner.dispatch_id, next_wait, detail);
@@ -577,6 +580,15 @@ unsafe fn finish_hosted_resume(
                 callback_transfer,
                 captured,
             );
+            return Some(ComponentSuspensionRuntimeOutcome::Terminal);
+        }
+        ComponentPumpCompletion::ResumeRefused(status) => {
+            // Proven pre-effect: nothing reached the provider. Quarantine only this lane and
+            // fail only this frame's client; every other lane and client keeps running.
+            (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .refuse_resume_no_effects(lane, reply_object, resume.key, frame.owner, status as u32)
+                .unwrap_or_else(|error| panic!("refused resume lost its running owner: {:?}", error));
+            component_terminal::fail_refused_client(lane, resume.key, continuation);
             return Some(ComponentSuspensionRuntimeOutcome::Terminal);
         }
         ComponentPumpCompletion::Failed(status) => {

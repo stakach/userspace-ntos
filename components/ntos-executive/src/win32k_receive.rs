@@ -122,6 +122,8 @@ pub(crate) enum ServiceWaitPumpCompletion {
     ServiceReparked(PendingServiceWaitDispatch),
     ReceiveReparked(PendingReceiveDispatch),
     CaptureRefused(PendingServiceWaitDispatch, crate::spawn_hosts::PumpResult, crate::spawn_hosts::PumpChannel),
+    /// The continuation's authority was refused before anything reached the provider.
+    ResumeRefused(i32),
 }
 
 #[derive(Clone, Copy)]
@@ -1405,6 +1407,7 @@ pub(crate) unsafe fn trace_callback_service_wait_resumed(
         | ServiceWaitPumpCompletion::Restored(Provider::RetainedFailure(..)) => 7,
         ServiceWaitPumpCompletion::Restored(Provider::Failed(_)) => 8,
         ServiceWaitPumpCompletion::Restored(Provider::NestedSourceDeferred) => 9,
+        ServiceWaitPumpCompletion::ResumeRefused(_) => 10,
     };
     print_str(b"[callback-return-service-wait] stage=resumed sample/dispatch/ssn/pi/tid/lane/service-token/callback-token/outcome=");
     for value in [sample, dispatch.dispatch_id, dispatch.ssn, client.pi as u64, client.tid,
@@ -1419,6 +1422,21 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
     pending: PendingServiceWaitDispatch,
 ) -> ServiceWaitPumpCompletion {
     let nested = pending.snapshot.callback_token.is_some();
+    // Authenticate before selecting a client window or restoring the shared page, so a stale
+    // continuation is refused with no effect on the provider or any other client.
+    if let Err(status) = crate::spawn_hosts::service_wait_continuation_authority(
+        &pending.snapshot.channel, &pending.snapshot.pump,
+    ) {
+        static SERVICE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+        if SERVICE_REFUSALS.fetch_add(1, Ordering::Relaxed) < 8 {
+            print_str(b"[service-wait-resume] stage=refused pi/tid/dispatch/status=");
+            print_u64(pending.snapshot.client.pi as u64); print_str(b"/"); print_u64(pending.snapshot.client.tid);
+            print_str(b"/"); print_u64(pending.snapshot.dispatch.dispatch_id);
+            print_str(b"/0x"); print_hex(status);
+            print_str(b"\n");
+        }
+        return ServiceWaitPumpCompletion::ResumeRefused(status as i32);
+    }
     let (selected, restored) = select_and_restore_shared_resume_snapshot(
         pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
     );

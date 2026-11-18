@@ -79,9 +79,11 @@ fn callback_terminal_reply_uses_context_restart_not_zero_length_ipc() {
     }
     let mut replies = CallbackReply(0);
     replies.visit_file(&source("component_terminal.rs"));
+    // The terminal Reply stage and the refused-resume client failure both restart a
+    // callback client; every such arm is checked above for the stale-register hazard.
     assert_eq!(
-        replies.0, 1,
-        "inspect the actual callback terminal Reply stage"
+        replies.0, 2,
+        "inspect the callback terminal Reply stage and the refused-resume client failure"
     );
 }
 

@@ -45,6 +45,8 @@ pub mod badge;
 pub mod source_registry;
 mod message;
 mod service_wait;
+mod resume_refusal;
+pub use resume_refusal::RefusedClientDelivery;
 pub use service_wait::{ServiceWaitOccupancy, ServiceWaitTokenIssuer};
 mod receive_probe;
 pub mod peer_registry;
@@ -214,6 +216,9 @@ pub enum SuspensionPhase<R> {
     ResumingChildParked { completion: R, cancelled: bool, scope: NestedExecutionIdentity },
     /// An uncertain child or restore permanently fences this parent epoch.
     ResumingChildQuarantined { completion: R, cancelled: bool, scope: NestedExecutionIdentity },
+    /// The resume was refused before its continuation re-entered the provider. Only this lane
+    /// is quarantined; the frame is never selected or resumed again.
+    ResumeRefused { completion: R, cancelled: bool, status: u32, client: RefusedClientDelivery },
     Cancelled { completion: R },
     MaintenanceWaiting { captured_pass: u64 },
     MaintenanceReady { observed_pass: u64 },
@@ -627,6 +632,7 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
             SuspensionPhase::Waiting | SuspensionPhase::Resuming { .. }
             | SuspensionPhase::ResumingChildParked { .. }
             | SuspensionPhase::ResumingChildQuarantined { .. }
+            | SuspensionPhase::ResumeRefused { .. }
             | SuspensionPhase::MaintenanceWaiting { .. }
             | SuspensionPhase::MaintenanceReady { .. }
             | SuspensionPhase::MaintenanceResuming { .. }

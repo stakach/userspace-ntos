@@ -247,6 +247,7 @@ pub(crate) fn print_hold_snapshot(now: u64) {
                 nt_component_suspension::SuspensionPhase::MaintenanceReady { .. } => "maintenance-ready",
                 nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. } => "maintenance-resuming",
                 nt_component_suspension::SuspensionPhase::NestedTerminal => "nested-terminal",
+                nt_component_suspension::SuspensionPhase::ResumeRefused { .. } => "resume-refused",
             };
             let _ = writeln!(cursor,
                 "[cursor-lookup-frame] lane={:?} key={:?} seq={} phase={} owner={:?}",
