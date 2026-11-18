@@ -177,7 +177,7 @@ pub(super) extern "win64" fn ke_release_mutant(body: u64, wait: u8) -> i32 {
         unsafe { crate::provider_bugcheck::report(0xc4, [W32_EVENT_LABEL, W32_SYNC_OP_RELEASE_MUTANT, body, status as u32 as u64]); }
     }
     unsafe {
-        if !refresh_header(body, id, lease.canonical) {
+        if refresh_header(body, id, lease.canonical).is_err() {
             crate::provider_bugcheck::report(0xc4, [W32_EVENT_LABEL, W32_SYNC_OP_QUERY, body, 1]);
         }
         release_operation(lease);
@@ -198,7 +198,7 @@ pub(super) extern "win64" fn ke_release_semaphore(body: u64, _increment: i32,
         unsafe { crate::provider_bugcheck::report(0xc4, [W32_EVENT_LABEL, W32_SYNC_OP_RELEASE_SEMAPHORE, body, status as u32 as u64]); }
     }
     unsafe {
-        if !refresh_header(body, id, lease.canonical) {
+        if refresh_header(body, id, lease.canonical).is_err() {
             crate::provider_bugcheck::report(0xc4, [W32_EVENT_LABEL, W32_SYNC_OP_QUERY, body, 2]);
         }
         release_operation(lease);
@@ -220,47 +220,88 @@ unsafe fn release_operation(lease: nt_provider_wait::ProviderLocalSyncOperationL
         .expect("sync operation lease lost");
 }
 
+/// Why a dispatcher-header refresh could not be made coherent with the root's state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RefreshFailure {
+    /// The root refused the query; carries its NTSTATUS.
+    Query(u32),
+    /// The body no longer names the queried, live catalog row.
+    Identity,
+    /// The root's owner words name no thread this provider can resolve.
+    Owner,
+}
+
+impl RefreshFailure {
+    pub(super) const fn status(self) -> i32 {
+        match self {
+            Self::Query(status) => status as i32,
+            Self::Identity => STATUS_INVALID_HANDLE_I32,
+            Self::Owner => STATUS_INVALID_PARAMETER_I32,
+        }
+    }
+
+    pub(super) const fn name(self) -> &'static [u8] {
+        match self {
+            Self::Query(_) => b"query",
+            Self::Identity => b"identity",
+            Self::Owner => b"owner",
+        }
+    }
+}
+
 /// Refresh the guest-visible dispatcher header from the root's selected state. The root may
 /// consume a newly released count before the release broker reply reaches this component.
 pub(super) unsafe fn refresh_header(
     body: u64,
     id: ProviderLocalSyncId,
     canonical: ProviderWaitObject,
-) -> bool {
+) -> Result<(), RefreshFailure> {
     let (status, state, owner_tid, owner_generation) = win32k_event_broker_call(
         W32_SYNC_OP_QUERY, id.raw(), canonical.object_id, encoded(canonical),
     );
-    if status != 0 { return false; }
+    if status != 0 { return Err(RefreshFailure::Query(status as u32)); }
     let snapshot = {
         let _metadata = ProviderMetadataGuard::acquire();
         let Some(snapshot) = catalog().and_then(|catalog| catalog.snapshot_for_body(body).ok()) else {
-            return false;
+            return Err(RefreshFailure::Identity);
         };
         if snapshot.id != id || snapshot.canonical != Some(canonical) || snapshot.delete_pending {
-            return false;
+            return Err(RefreshFailure::Identity);
         }
         snapshot
     };
-    let owner_thread = match snapshot.kind {
-        ProviderSyncKind::Semaphore { .. } if owner_tid == 0 && owner_generation == 0 => 0,
-        ProviderSyncKind::Mutant if owner_tid == 0 && owner_generation == 0 => 0,
-        ProviderSyncKind::Mutant if owner_tid != 0 && owner_generation != 0 => {
-            let Some(index) = thread_context_index_for_tid(owner_tid) else { return false; };
-            if thread_ctx_generation(index) != owner_generation { return false; }
+    use nt_provider_wait::ProviderSyncQueryOwner;
+    let owner = ProviderSyncQueryOwner::from_words(owner_tid, owner_generation)
+        .ok_or(RefreshFailure::Owner)?;
+    let owner_thread = match (snapshot.kind, owner) {
+        (_, ProviderSyncQueryOwner::Unowned) => 0,
+        (ProviderSyncKind::Mutant, ProviderSyncQueryOwner::Hosted { tid, generation }) => {
+            let index = thread_context_index_for_tid(tid).ok_or(RefreshFailure::Owner)?;
+            if thread_ctx_generation(index) != generation { return Err(RefreshFailure::Owner); }
             let thread = thread_ctx_ethread(index);
-            if thread == 0 { return false; }
+            if thread == 0 { return Err(RefreshFailure::Owner); }
             thread
         }
-        _ => return false,
+        // The root names a kernel owner only to its own lane: the owner is the thread this
+        // lane executes as, which for a Ps callout is the retiring target's ETHREAD.
+        (ProviderSyncKind::Mutant, ProviderSyncQueryOwner::QueryingCaller) => {
+            let thread = current_ethread();
+            if thread == 0 { return Err(RefreshFailure::Owner); }
+            thread
+        }
+        _ => return Err(RefreshFailure::Owner),
     };
     core::ptr::write_unaligned((body + 4) as *mut i32, state as u32 as i32);
     if matches!(snapshot.kind, ProviderSyncKind::Mutant) {
         core::ptr::write_unaligned((body + 0x28) as *mut u64, owner_thread);
     }
-    true
+    Ok(())
 }
 
-pub(super) unsafe fn refresh_wait_header(body: u64, lease: ProviderLocalSyncLease) -> bool {
+pub(super) unsafe fn refresh_wait_header(
+    body: u64,
+    lease: ProviderLocalSyncLease,
+) -> Result<(), RefreshFailure> {
     refresh_header(body, lease.id, lease.canonical)
 }
 

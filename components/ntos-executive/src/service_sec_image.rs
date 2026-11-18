@@ -6234,13 +6234,14 @@ pub(crate) unsafe fn service_win32k_provider_sync_request(
                 _ => return (INVALID_PARAMETER, 0, 0, 0),
             };
             let canonical = nt_provider_wait::ProviderWaitObject::new(kind, arg2, arg3 as u32 as u64);
+            // A kernel-job caller passes its own authenticated owner; a hosted channel passes none.
+            let querying = owner.map(|owner| owner.caller);
             crate::provider_dispatcher_backend::snapshot_sync(provider, arg1, canonical)
-                .and_then(|snapshot| match snapshot.mutant_owner {
-                    None => Ok((snapshot.signal_state as u32 as u64, 0, 0)),
-                    Some(nt_component_suspension::SuspensionCaller::Hosted(client)) =>
-                        Ok((snapshot.signal_state as u32 as u64, client.client_tid, client.client_generation)),
-                    Some(nt_component_suspension::SuspensionCaller::Kernel { .. }) =>
-                        Err(INVALID_PARAMETER as u32),
+                .and_then(|snapshot| {
+                    let (tid, generation) = nt_provider_wait::ProviderSyncQueryOwner::select(
+                        snapshot.mutant_owner, querying,
+                    ).ok_or(INVALID_PARAMETER as u32)?.words();
+                    Ok((snapshot.signal_state as u32 as u64, tid, generation))
                 })
         }
         _ => Err(INVALID_PARAMETER as u32),

@@ -19,6 +19,8 @@ mod local_timer;
 mod stack_activation;
 mod stack_publication;
 mod stack_ready;
+mod sync_query;
+pub use sync_query::*;
 pub use stack_ready::ProviderStackReadyReceipt;
 
 pub use abi::*;

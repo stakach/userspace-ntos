@@ -6457,6 +6457,22 @@ unsafe fn provider_wait_object_for_dispatcher(
     Ok((canonical, Some(ProviderWaitLease::File(token))))
 }
 
+fn trace_sync_refresh_failure(wait_id: u64, body: u64, failure: local_sync::RefreshFailure) {
+    print_str(b"[win32k-sync-refresh] stage=wait-resume reason=");
+    print_str(failure.name());
+    print_str(b" wait-id=");
+    print_win32k_hex64(wait_id);
+    print_str(b" body=");
+    print_win32k_hex64(body);
+    print_str(b" status=0x");
+    print_hex(failure.status() as u32);
+    print_str(b" pi/tid=");
+    print_u64(current_lane_ids().client_pi.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(current_lane_ids().thread_id.load(Ordering::Relaxed));
+    print_str(b"\n");
+}
+
 unsafe fn current_provider_wait_owner() -> Option<nt_provider_wait::ProviderWaitOwner> {
     let activation = match active_provider_stack_event_activation() {
         Some(activation) => activation,
@@ -6620,11 +6636,17 @@ unsafe fn provider_wait_rendezvous(
                 if !wait_context.restore() {
                     park();
                 }
+                // A satisfied wait publishes each sync object's root-selected header. If one
+                // cannot be made coherent, the wait completes with that failure; this lane may
+                // hold root's running token, so it never stops here.
+                let mut completion = status;
                 if status >= 0 && status < admission.count as i32 {
                     for index in 0..admission.count {
                         if let Some(ProviderWaitLease::Sync(lease)) = admission.leases[index] {
-                            if !local_sync::refresh_wait_header(bodies[index], lease) {
-                                park();
+                            if let Err(failure) = local_sync::refresh_wait_header(bodies[index], lease) {
+                                trace_sync_refresh_failure(wait_id, bodies[index], failure);
+                                completion = failure.status();
+                                break;
                             }
                         }
                     }
@@ -6632,7 +6654,7 @@ unsafe fn provider_wait_rendezvous(
                 if !admission.release() {
                     park();
                 }
-                return status;
+                return completion;
             }
             W32_DISPATCH_LABEL => {
                 if timeout_kind == nt_provider_wait::ProviderWaitTimeoutKind::Poll {
