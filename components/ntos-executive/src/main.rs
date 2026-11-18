@@ -1420,11 +1420,13 @@ pub(crate) const HOSTED_PROCESS_IMAGE_CAP: usize = MAX_PI * 4;
 /// Per-process VAD extents. A real NT process's VAD is an unbounded AVL tree; ours is a fixed slot
 /// array, and `insert` returns STATUS_INSUFFICIENT_RESOURCES once it is full.
 ///
-/// ★ BATCH 58 measured this and RULED IT OUT as the `CopyDirectory` frontier. The later full
-/// explorer desktop path reaches 48 live/split private VAD extents while still making real forward
-/// progress. Keep the reset-safe table fixed, but size it with measured runway so the headroom gate
-/// remains meaningful instead of sitting exactly on its three-quarter ceiling.
-const VM_REGION_CAPACITY: usize = 96;
+/// Every image view, section view, stack and heap segment of a process is an extent here, and so
+/// is the user memory win32k allocates in a GUI client (GDI attribute pool sections, DIB bits,
+/// window-station and desktop buffers). 96 extents ran Explorer out during tray setup: its DIB
+/// allocations and its next DLL view both failed with STATUS_INSUFFICIENT_RESOURCES (#406). No
+/// `VmRegionMap` of this capacity lives on the bounded rootserver stack; snapshots use the static
+/// scratch below.
+const VM_REGION_CAPACITY: usize = 256;
 /// The VAD authority covers the complete user-address domain. Automatic private allocations retain
 /// [`SMSS_ALLOC_VA`] as their preferred floor in the syscall policy layer; explicit reservations may
 /// occupy lower addresses when normal NT rounding admits them.
@@ -1681,6 +1683,18 @@ pub(crate) static mut VM_MAP_BEFORE: nt_address_space::VmRegionMap<VM_REGION_CAP
     new_process_vm_region_map();
 pub(crate) static mut VM_MAP_AFTER: nt_address_space::VmRegionMap<VM_REGION_CAPACITY> =
     new_process_vm_region_map();
+/// Guard-page growth snapshots. Growth can map pages and admit working-set changes between its
+/// snapshot and its exact apply, so it keeps its own scratch rather than sharing the pair above.
+pub(crate) static mut VM_MAP_STACK_GROWTH_BEFORE: nt_address_space::VmRegionMap<
+    VM_REGION_CAPACITY,
+> = new_process_vm_region_map();
+pub(crate) static mut VM_MAP_STACK_GROWTH_CANDIDATE: nt_address_space::VmRegionMap<
+    VM_REGION_CAPACITY,
+> = new_process_vm_region_map();
+/// Candidate map for retiring a win32k Section projection from its client process.
+pub(crate) static mut VM_MAP_SECTION_RETIREMENT: nt_address_space::VmRegionMap<
+    VM_REGION_CAPACITY,
+> = new_process_vm_region_map();
 pub(crate) static mut COMMITTED_MAP_BEFORE: nt_address_space::VmCommittedRangeTable<
     PROCESS_COMMITTED_MAPPING_CAPACITY,
 > = nt_address_space::VmCommittedRangeTable::new();

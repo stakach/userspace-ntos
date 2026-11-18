@@ -111,11 +111,13 @@ pub(crate) unsafe fn service_hosted_stack_growth(
         extension_disabled: u32::from_le_bytes(flags) & 0x0001_0000 != 0,
         protection: protection & !PAGE_GUARD,
     };
-    let before = *map;
-    let mut candidate = before;
+    let before = &mut *core::ptr::addr_of_mut!(VM_MAP_STACK_GROWTH_BEFORE);
+    let candidate = &mut *core::ptr::addr_of_mut!(VM_MAP_STACK_GROWTH_CANDIDATE);
+    *before = *map;
+    *candidate = *before;
     let changes = prepare_guard_growth_into(
-        &before,
-        &mut candidate,
+        before,
+        candidate,
         geometry,
         fault_address,
         policy,
@@ -131,7 +133,7 @@ pub(crate) unsafe fn service_hosted_stack_growth(
     }
     if handler.pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime)
         || handler.capture_process_identity(pi) != Some(process)
-        || *map != before
+        || *map != *before
     {
         return Err(nt_process::STATUS_INVALID_HANDLE);
     }
@@ -145,8 +147,8 @@ pub(crate) unsafe fn service_hosted_stack_growth(
         Err(status) => return Err(status),
     };
     let plan = prepare_guard_growth_into(
-        &before,
-        &mut candidate,
+        before,
+        candidate,
         geometry,
         fault_address,
         policy,

@@ -105,3 +105,58 @@ fn gdi_pool_section_secures_only_its_committed_pages() {
         Err(STATUS_INVALID_PAGE_PROTECTION)
     );
 }
+
+/// Fill a client's VAD table with distinct allocations, as image views, stacks and heap segments
+/// occupy a GUI process before win32k allocates in it.
+fn occupy<const N: usize>(map: &mut VmRegionMap<N>, extents: usize) {
+    for index in 0..extents as u64 {
+        map.allocate(
+            Some(0x1000_0000 + index * 0x2_0000),
+            0x1_0000,
+            MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    }
+    assert_eq!(map.extent_count(), extents);
+}
+
+#[test]
+fn a_full_client_vad_table_refuses_eng_alloc_user_mem_with_insufficient_resources() {
+    // Explorer during tray setup (boot 44235934294): every EngAllocUserMem failed and the next
+    // DLL view failed with 0xc000009a, once the 96-extent table was full.
+    let mut explorer = VmRegionMap::<96>::new(0x1_0000, USER_LIMIT);
+    occupy(&mut explorer, 96);
+    assert_eq!(
+        explorer.allocate(None, 0x80, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE),
+        Err(STATUS_INSUFFICIENT_RESOURCES)
+    );
+}
+
+#[test]
+fn a_client_with_that_load_still_gets_securable_win32k_memory_at_executive_capacity() {
+    let mut explorer = VmRegionMap::<256>::new(0x1_0000, USER_LIMIT);
+    occupy(&mut explorer, 96);
+    // GDI attribute pool sections, each a reserve with its first page committed.
+    for _ in 0..8 {
+        let reserve = explorer
+            .allocate(None, 0x1_0000, MEM_RESERVE, PAGE_READWRITE)
+            .unwrap();
+        explorer
+            .allocate(Some(reserve.base), PAGE_SIZE, MEM_COMMIT, PAGE_READWRITE)
+            .unwrap();
+    }
+    for _ in 0..64 {
+        let bits = explorer
+            .allocate(None, 0x4000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+            .unwrap();
+        let access = secure_access_for_protection(PAGE_READWRITE).unwrap();
+        assert_eq!(
+            validate_secure_range(bits.base, 0x4000, access, USER_LIMIT, |va| {
+                explorer.query_basic(va, USER_LIMIT)
+            }),
+            Ok(())
+        );
+    }
+    assert!(explorer.extent_count() <= 256);
+}

@@ -30946,7 +30946,8 @@ impl ExecNtHandler {
             return Err(nt_process::STATUS_INVALID_HANDLE);
         }
         let map = process_vm_region_map_mut(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let mut after = *map;
+        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_SECTION_RETIREMENT);
+        *after = *map;
         let released = after.unmap_mapped(base)?;
         if released.base != base || released.size != size {
             return Err(nt_process::STATUS_INVALID_HANDLE);
@@ -30954,7 +30955,7 @@ impl ExecNtHandler {
         if !process_committed_mapping_unregister_allocation(pi as u64, base) {
             return Err(nt_process::STATUS_INVALID_HANDLE);
         }
-        *map = after;
+        *map = *after;
         Ok(())
     }
 

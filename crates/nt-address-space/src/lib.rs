@@ -2233,13 +2233,16 @@ impl<const N: usize> VmRegionMap<N> {
     }
 
     fn set_page_protection_override(
-        &mut self,
+        overrides: &mut [Option<VmProtectionOverride>; VM_PROTECTION_OVERRIDE_CAPACITY],
         page: u64,
         default_protection: u32,
         new_protection: u32,
     ) -> Result<(), u32> {
-        if let Some(index) = self.protection_override_index(page) {
-            self.protection_overrides[index] =
+        if let Some(index) = overrides
+            .iter()
+            .position(|slot| slot.is_some_and(|entry| entry.page == page))
+        {
+            overrides[index] =
                 (new_protection != default_protection).then_some(VmProtectionOverride {
                     page,
                     protection: new_protection,
@@ -2249,8 +2252,7 @@ impl<const N: usize> VmRegionMap<N> {
         if new_protection == default_protection {
             return Ok(());
         }
-        let slot = self
-            .protection_overrides
+        let slot = overrides
             .iter_mut()
             .find(|slot| slot.is_none())
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
@@ -2721,14 +2723,21 @@ impl<const N: usize> VmRegionMap<N> {
             }
             position = extent.end().min(end);
         }
-        let mut next = *self;
+        // Only the override table changes; stage it alone so a full table leaves `self` intact
+        // without copying the whole extent array.
+        let mut overrides = self.protection_overrides;
         let mut page = base;
         while page < end {
             let default_protection = self.extent_at(page).unwrap().protection;
-            next.set_page_protection_override(page, default_protection, new_protection)?;
+            Self::set_page_protection_override(
+                &mut overrides,
+                page,
+                default_protection,
+                new_protection,
+            )?;
             page += PAGE_SIZE;
         }
-        *self = next;
+        self.protection_overrides = overrides;
         Ok(VmProtectPlan {
             base,
             size: end - base,

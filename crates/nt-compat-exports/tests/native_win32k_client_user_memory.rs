@@ -101,3 +101,45 @@ fn gdi_attributes_are_not_projected_from_a_shared_arena() {
     let main = include_str!("../../../components/ntos-executive/src/main.rs");
     assert!(!main.contains("WIN32K_USERVM"));
 }
+
+#[test]
+fn win32k_vm_refusals_are_named_with_client_vad_occupancy() {
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    let broker = service
+        .split("pub(crate) unsafe fn service_win32k_mm_request(")
+        .nth(1)
+        .unwrap()
+        .split("\npub(crate) unsafe fn ")
+        .next()
+        .unwrap();
+    for trace in ["[win32k-alloc-refused]", "[win32k-free-refused]", "[win32k-secure-refused]"] {
+        assert!(broker.contains(trace), "{trace} names the refused request");
+    }
+    assert!(broker.contains("extent_count()") && broker.contains("VM_REGION_CAPACITY"));
+}
+
+#[test]
+fn gui_client_vad_tables_fit_win32k_user_memory_without_stack_snapshots() {
+    let main = include_str!("../../../components/ntos-executive/src/main.rs");
+    let capacity: usize = main
+        .split("const VM_REGION_CAPACITY: usize = ")
+        .nth(1)
+        .expect("VAD capacity")
+        .split(';')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(capacity >= 256, "Explorer exhausted a {capacity}-extent table (#406)");
+    // A table of this size must never be copied onto the bounded rootserver stack.
+    for (file, source) in [
+        ("hosted_stack_growth.rs", include_str!("../../../components/ntos-executive/src/hosted_stack_growth.rs")),
+        ("exec_handler.rs", include_str!("../../../components/ntos-executive/src/exec_handler.rs")),
+    ] {
+        for copy in ["let before = *map;", "let mut candidate = before;", "let mut after = *map;"] {
+            assert!(!source.contains(copy), "{file} copies a VmRegionMap onto the stack: {copy}");
+        }
+    }
+    let address_space = include_str!("../../nt-address-space/src/lib.rs");
+    assert!(!address_space.contains("let mut next = *self;"), "protect stages the whole map");
+}

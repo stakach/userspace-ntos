@@ -7253,6 +7253,32 @@ pub(crate) unsafe fn service_win32k_mm_request(
         Ok((base, size)) => (0, base, size),
         Err(status) => (status as i32, 0, 0),
     };
+    // win32k reports these refusals only as a NULL bitmap or a failed pool section; name the
+    // request and the client's VAD occupancy here.
+    let refused = |trace: &[u8], base: u64, size: u64, kind: u32, protect: u32, status: u32| {
+        static REFUSALS_TRACED: AtomicU64 = AtomicU64::new(0);
+        if REFUSALS_TRACED.fetch_add(1, Ordering::Relaxed) >= 32 {
+            return;
+        }
+        print_str(trace);
+        print_str(b" pi=");
+        print_u64(pi as u64);
+        print_str(b" base=0x");
+        print_hex_u64(base);
+        print_str(b" size=0x");
+        print_hex_u64(size);
+        print_str(b" type=0x");
+        print_hex(kind);
+        print_str(b" protect=0x");
+        print_hex(protect);
+        print_str(b" status=0x");
+        print_hex(status);
+        print_str(b" vad=");
+        print_u64(process_vm_region_map(pi).map_or(0, |map| map.extent_count() as u64));
+        print_str(b"/");
+        print_u64(crate::VM_REGION_CAPACITY as u64);
+        print_str(b"\n");
+    };
 
     match request {
         VirtualMemoryRequest::Secure {
@@ -7289,18 +7315,24 @@ pub(crate) unsafe fn service_win32k_mm_request(
             size,
             allocation_type,
             protection,
-        } => range(handler.service_win32k_allocate_virtual_memory(
-            pi,
-            base,
-            size,
-            allocation_type,
-            protection,
-        )),
+        } => range(
+            handler
+                .service_win32k_allocate_virtual_memory(pi, base, size, allocation_type, protection)
+                .inspect_err(|&status| {
+                    refused(b"[win32k-alloc-refused]", base, size, allocation_type, protection, status)
+                }),
+        ),
         VirtualMemoryRequest::Free {
             base,
             size,
             free_type,
-        } => range(handler.service_win32k_free_virtual_memory(pi, base, size, free_type)),
+        } => range(
+            handler
+                .service_win32k_free_virtual_memory(pi, base, size, free_type)
+                .inspect_err(|&status| {
+                    refused(b"[win32k-free-refused]", base, size, free_type, 0, status)
+                }),
+        ),
     }
 }
 
