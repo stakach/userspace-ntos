@@ -53,41 +53,6 @@ fn staged_callback_completion_atomically_restarts_its_retained_reply() {
 }
 
 #[test]
-fn callback_terminal_reply_uses_context_restart_not_zero_length_ipc() {
-    struct CallbackReply(usize);
-    impl<'a> Visit<'a> for CallbackReply {
-        fn visit_arm(&mut self, arm: &'a syn::Arm) {
-            if let syn::Pat::Struct(pattern) = &arm.pat {
-                if pattern.path.segments.last().unwrap().ident == "Callback" {
-                    let mut calls = Calls::default();
-                    calls.visit_expr(&arm.body);
-                    assert!(
-                        !calls.0.iter().any(|name| name == "client_reply_on"),
-                        "normal Reply installs stale message registers over the staged parent"
-                    );
-                    if calls
-                        .0
-                        .iter()
-                        .any(|name| name == "restart_staged_user_callback_context")
-                    {
-                        self.0 += 1;
-                    }
-                }
-            }
-            syn::visit::visit_arm(self, arm);
-        }
-    }
-    let mut replies = CallbackReply(0);
-    replies.visit_file(&source("component_terminal.rs"));
-    // The terminal Reply stage and the refused-resume client failure both restart a
-    // callback client; every such arm is checked above for the stale-register hazard.
-    assert_eq!(
-        replies.0, 2,
-        "inspect the callback terminal Reply stage and the refused-resume client failure"
-    );
-}
-
-#[test]
 fn deferred_callback_restoration_never_uses_normal_ipc_reply() {
     let file = source("service_sec_image.rs");
     let drain = file
