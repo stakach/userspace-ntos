@@ -854,29 +854,123 @@ pub(crate) unsafe fn receive_continuation_is_current(
         })
 }
 
+/// The first authority predicate a parked service-wait continuation failed on resume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ServiceWaitStale {
+    ChannelKind,
+    RouteLane,
+    ChannelRoute,
+    Dispatch,
+    Binding,
+    Reply,
+    FrameNotResuming,
+    NotRunning,
+    StillExternalTop,
+    Lookup,
+}
+
+impl ServiceWaitStale {
+    pub(crate) const fn name(self) -> &'static [u8] {
+        match self {
+            Self::ChannelKind => b"channel-kind",
+            Self::RouteLane => b"route-lane",
+            Self::ChannelRoute => b"channel-route",
+            Self::Dispatch => b"dispatch",
+            Self::Binding => b"binding",
+            Self::Reply => b"reply",
+            Self::FrameNotResuming => b"frame-not-resuming",
+            Self::NotRunning => b"not-running",
+            Self::StillExternalTop => b"still-external-top",
+            Self::Lookup => b"lookup",
+        }
+    }
+}
+
+/// Authenticate a parked service-wait continuation before its receive half resumes. Each
+/// predicate is checked separately so a refusal names the exact authority that changed.
 pub(crate) unsafe fn service_wait_continuation_is_current(
     channel: &crate::spawn_hosts::PumpChannel,
     yielded: ServiceWaitYield,
-) -> bool {
+) -> Result<(), ServiceWaitStale> {
     if channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
         || !(channel.caps.hosted_receive_yield || channel.caps.nested_service_wait_yield)
         || channel.kernel_caller.is_some()
-        || yielded.route.identity().lane != yielded.dispatch.lane()
-        || runtime::channel_route(channel).ok().flatten() != Some(yielded.route)
-        || runtime::dispatch(yielded.route).ok() != Some(yielded.dispatch)
     {
-        return false;
+        return Err(ServiceWaitStale::ChannelKind);
+    }
+    let lane = yielded.dispatch.lane();
+    if yielded.route.identity().lane != lane {
+        return Err(ServiceWaitStale::RouteLane);
+    }
+    if runtime::channel_route(channel).ok().flatten() != Some(yielded.route) {
+        return Err(ServiceWaitStale::ChannelRoute);
+    }
+    if runtime::dispatch(yielded.route).ok() != Some(yielded.dispatch) {
+        return Err(ServiceWaitStale::Dispatch);
     }
     let lanes = &*core::ptr::addr_of!(crate::service_sec_image::COMPONENT_SUSPENSIONS);
-    if !lanes.binding(yielded.dispatch.lane()).is_ok_and(|binding| {
+    if !lanes.binding(lane).is_ok_and(|binding| {
         binding.executor_id == channel.tcb
             && binding.receive_endpoint == channel.fault_ep
     }) {
-        return false;
+        return Err(ServiceWaitStale::Binding);
     }
-    matches!(runtime::service_wait_resume_completed_exact(
+    if runtime::current_reply(yielded.route).ok() != Some(yielded.reply) {
+        return Err(ServiceWaitStale::Reply);
+    }
+    let key = nt_component_suspension::SuspensionKey::service_wait(yielded.token);
+    if !lanes.frame(lane, key).is_ok_and(|frame| frame.is_some_and(|frame|
+        matches!(frame.phase, nt_component_suspension::SuspensionPhase::Resuming { .. })))
+    {
+        return Err(ServiceWaitStale::FrameNotResuming);
+    }
+    if lanes.running() != Some(lane) {
+        return Err(ServiceWaitStale::NotRunning);
+    }
+    if lanes.external_top(lane).ok() == Some(Some(yielded.token)) {
+        return Err(ServiceWaitStale::StillExternalTop);
+    }
+    // The individual predicates above are the exact readiness rule; keep the runtime's own
+    // composed check authoritative so the two can never drift apart.
+    match runtime::service_wait_resume_completed_exact(
         yielded.route, yielded.dispatch, yielded.reply, yielded.token,
-    ), Ok(true))
+    ) {
+        Ok(true) => Ok(()),
+        _ => Err(ServiceWaitStale::Lookup),
+    }
+}
+
+/// Print the refused authority with the identities a diagnosis needs.
+pub(crate) unsafe fn trace_service_wait_stale(
+    channel: &crate::spawn_hosts::PumpChannel,
+    yielded: ServiceWaitYield,
+    stale: ServiceWaitStale,
+) {
+    static TRACES: AtomicU64 = AtomicU64::new(0);
+    if TRACES.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    let lanes = &*core::ptr::addr_of!(crate::service_sec_image::COMPONENT_SUSPENSIONS);
+    let lane = yielded.dispatch.lane();
+    print_str(b"[service-wait-stale] reason=");
+    print_str(stale.name());
+    print_str(b" lane/gen/epoch/token=");
+    print_u64(u64::from(lane.index)); print_str(b"/");
+    print_u64(lane.generation); print_str(b"/");
+    print_u64(yielded.dispatch.epoch()); print_str(b"/");
+    print_u64(yielded.token);
+    print_str(b" route-lane=");
+    print_u64(u64::from(yielded.route.identity().lane.index));
+    print_str(b" wait-reply/current-reply/channel-reply=");
+    print_u64(yielded.reply); print_str(b"/");
+    print_u64(runtime::current_reply(yielded.route).unwrap_or(u64::MAX)); print_str(b"/");
+    print_u64(channel.reply_cap);
+    print_str(b" current-epoch=");
+    print_u64(runtime::dispatch(yielded.route).map_or(u64::MAX, |dispatch| dispatch.epoch()));
+    print_str(b" running-lane=");
+    print_u64(lanes.running().map_or(u64::MAX, |running| u64::from(running.index)));
+    print_str(b" external-top/depth=");
+    print_u64(lanes.external_top(lane).ok().flatten().unwrap_or(u64::MAX)); print_str(b"/");
+    print_u64(lanes.external_depth(lane).map_or(u64::MAX, |depth| depth as u64));
+    print_str(b"\n");
 }
 
 /// Authenticate the exact component lane and original receive half before leaving maintenance.

@@ -23,6 +23,7 @@ pub(crate) use receive::{prepare_receive_yield, prepare_root_ingress_yield, prep
     root_ingress_unwind_continuation_is_current,
     resume_suspended_receive_component, receive_continuation_is_current,
     resume_suspended_service_wait_component, service_wait_continuation_is_current,
+    trace_service_wait_stale,
     trace_callback_service_wait_resumed,
     trace_receive_phase, ReceiveFaultCapture, ReceivePumpCompletion, ServiceWaitPumpCompletion,
     RootMaintenancePumpCompletion, RootMaintenancePumpReturn,

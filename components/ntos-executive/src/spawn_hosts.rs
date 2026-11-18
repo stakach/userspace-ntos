@@ -2709,8 +2709,12 @@ pub(crate) unsafe fn component_pump_continue_service_wait(
 ) -> Result<PumpResult, u32> {
     let yielded = previous.is_service_wait_yield();
     let reply_matches = previous.service_wait_yield.is_some_and(|wait| previous.reply_cap == wait.reply);
-    let current = previous.service_wait_yield.is_some_and(|wait|
-        crate::win32k_glue::service_wait_continuation_is_current(ch, wait));
+    let stale = previous.service_wait_yield.map(|wait|
+        crate::win32k_glue::service_wait_continuation_is_current(ch, wait).err().map(|stale| {
+            crate::win32k_glue::trace_service_wait_stale(ch, wait, stale);
+            stale
+        }));
+    let current = matches!(stale, Some(None));
     if !yielded || !reply_matches || !current {
         static SERVICE_WAIT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
         if SERVICE_WAIT_REJECTIONS.fetch_add(1, Ordering::Relaxed) < 8 {
