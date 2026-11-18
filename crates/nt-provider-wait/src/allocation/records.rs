@@ -9,27 +9,43 @@ const BLOCK_CAPACITY: usize = 256;
 pub(super) struct Records {
     blocks: Vec<Vec<ProviderAllocationRecord>>,
     len: usize,
+    /// Every record read or written through this table, for complexity tests.
+    #[cfg(test)]
+    pub(super) visits: core::cell::Cell<usize>,
 }
 
 impl Records {
     pub(super) const fn new() -> Self {
-        Self { blocks: Vec::new(), len: 0 }
+        Self {
+            blocks: Vec::new(),
+            len: 0,
+            #[cfg(test)]
+            visits: core::cell::Cell::new(0),
+        }
     }
 
     pub(super) fn len(&self) -> usize { self.len }
 
     pub(super) fn get(&self, slot: usize) -> Option<&ProviderAllocationRecord> {
+        #[cfg(test)]
+        self.visits.set(self.visits.get() + 1);
         if slot >= self.len { return None; }
         self.blocks.get(slot / BLOCK_CAPACITY)?.get(slot % BLOCK_CAPACITY)
     }
 
     fn get_mut(&mut self, slot: usize) -> Option<&mut ProviderAllocationRecord> {
+        #[cfg(test)]
+        self.visits.set(self.visits.get() + 1);
         if slot >= self.len { return None; }
         self.blocks.get_mut(slot / BLOCK_CAPACITY)?.get_mut(slot % BLOCK_CAPACITY)
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &ProviderAllocationRecord> {
         self.blocks.iter().flat_map(|block| block.iter()).take(self.len)
+            .inspect(move |_| {
+                #[cfg(test)]
+                self.visits.set(self.visits.get() + 1);
+            })
     }
 
     pub(super) fn try_append(&mut self) -> Result<usize, ()> {

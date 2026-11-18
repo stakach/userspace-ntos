@@ -138,8 +138,16 @@ impl ProviderAllocationRecord {
 pub struct ProviderAllocationCatalog {
     catalog_id: u64,
     records: records::Records,
-    /// Live record slots sorted by base. Records themselves never relocate.
+    /// Live record slots sorted by base. Records themselves never relocate. Live records form
+    /// a laminar family (nested or disjoint, unique bases), so every allocation overlapping a
+    /// range is either inside it (a contiguous run of this index) or one of its containers (the
+    /// parent chain of its predecessor).
     live_by_base: Vec<usize>,
+    /// Retired slots, ascending, for lowest-slot reuse.
+    dead_slots: Vec<usize>,
+    /// Retired slots keyed by (arena id, arena generation, base, slot), so re-registering the
+    /// same address in the same arena reuses that address's slot.
+    dead_by_key: Vec<(u64, u64, u64, usize)>,
     pins: Vec<ProviderAllocationPinRecord>,
     next_pin_id: u64,
     #[cfg(test)]
@@ -162,6 +170,8 @@ impl ProviderAllocationCatalog {
             catalog_id: 0,
             records: records::Records::new(),
             live_by_base: Vec::new(),
+            dead_slots: Vec::new(),
+            dead_by_key: Vec::new(),
             pins: Vec::new(),
             next_pin_id: 1,
             #[cfg(test)]
@@ -216,29 +226,37 @@ impl ProviderAllocationCatalog {
             .checked_add(capacity)
             .filter(|_| base != 0 && capacity != 0)
             .ok_or(ProviderAllocationError::InvalidRange)?;
-        let mut parent: Option<usize> = None;
-        for (slot, record) in self.records.iter().enumerate() {
-            if !record.live || base >= record.end() || record.base >= end {
-                continue;
-            }
-            if record.retiring || record.arena == arena {
+        // Allocations starting inside the new range must lie wholly inside it.
+        let first_inside = self.live_by_position(base);
+        let after_inside = self.live_by_position(end);
+        for &slot in &self.live_by_base[first_inside..after_inside] {
+            let record = self.records[slot];
+            if record.retiring || record.arena == arena || record.base == base || record.end() > end {
                 return Err(ProviderAllocationError::AddressInUse);
-            }
-            let new_contains_existing = base < record.base && end >= record.end();
-            let existing_contains_new = record.base < base && record.end() >= end;
-            if !new_contains_existing && !existing_contains_new {
-                return Err(ProviderAllocationError::AddressInUse);
-            }
-            if existing_contains_new && parent.map_or(true, |current| record.capacity < self.records[current].capacity) {
-                parent = Some(slot);
             }
         }
+        // Allocations starting below it overlap only as containers of its predecessor; each
+        // must contain the whole range. The first such container is the innermost parent.
+        let mut parent: Option<usize> = None;
+        let mut container = first_inside.checked_sub(1).map(|position| self.live_by_base[position]);
+        while let Some(slot) = container {
+            let record = self.records[slot];
+            if record.end() > base {
+                if record.retiring || record.arena == arena || record.end() < end {
+                    return Err(ProviderAllocationError::AddressInUse);
+                }
+                parent.get_or_insert(slot);
+            }
+            container = record.parent;
+        }
 
-        let reusable_slot = self
-            .records
-            .iter()
-            .position(|record| !record.live && record.arena == arena && record.base == base)
-            .or_else(|| self.records.iter().position(|record| !record.live));
+        let same_address = self.dead_by_key.partition_point(|&(id, generation, dead_base, _)|
+            (id, generation, dead_base) < (arena.id, arena.generation, base));
+        let reusable_slot = self.dead_by_key.get(same_address)
+            .filter(|&&(id, generation, dead_base, _)|
+                (id, generation, dead_base) == (arena.id, arena.generation, base))
+            .map(|&(_, _, _, slot)| slot)
+            .or_else(|| self.dead_slots.first().copied());
         let generation = reusable_slot.map_or(Ok(1), |slot| {
             self.records[slot].generation.checked_add(1)
                 .ok_or(ProviderAllocationError::IdentityExhausted)
@@ -246,15 +264,24 @@ impl ProviderAllocationCatalog {
         let next_slot = reusable_slot.unwrap_or(self.records.len());
         u64::try_from(next_slot).ok().and_then(|slot| slot.checked_add(1))
             .ok_or(ProviderAllocationError::IdentityExhausted)?;
-        // All fallible index growth precedes record and parent-link mutation.
+        // All fallible index growth precedes record and parent-link mutation. Retirement may
+        // later free every slot, so the free-slot indexes reserve room for all of them now.
+        let slots = self.records.len() + usize::from(reusable_slot.is_none());
         self.live_by_base.try_reserve(1).map_err(|_| ProviderAllocationError::NoCapacity)?;
+        self.dead_slots.try_reserve(slots.saturating_sub(self.dead_slots.len()))
+            .map_err(|_| ProviderAllocationError::NoCapacity)?;
+        self.dead_by_key.try_reserve(slots.saturating_sub(self.dead_by_key.len()))
+            .map_err(|_| ProviderAllocationError::NoCapacity)?;
         let slot = match reusable_slot {
-            Some(slot) => slot,
+            Some(slot) => {
+                self.take_dead_slot(slot);
+                slot
+            }
             None => self.records.try_append().map_err(|_| ProviderAllocationError::NoCapacity)?,
         };
-        for &child in &self.live_by_base {
-            let record = self.records[child];
-            if record.parent == parent && record.base > base && record.end() <= end {
+        for position in first_inside..after_inside {
+            let child = self.live_by_base[position];
+            if self.records[child].parent == parent {
                 self.records[child].parent = Some(slot);
             }
         }
@@ -267,9 +294,34 @@ impl ProviderAllocationCatalog {
             capacity,
             parent,
         };
-        let position = self.live_by_base.partition_point(|&live| self.records[live].base < base);
-        self.live_by_base.insert(position, slot);
+        self.live_by_base.insert(first_inside, slot);
         self.records[slot].snapshot(slot)
+    }
+
+    /// The first position in `live_by_base` whose allocation starts at or above `address`.
+    fn live_by_position(&self, address: u64) -> usize {
+        self.live_by_base.partition_point(|&live| self.records[live].base < address)
+    }
+
+    fn take_dead_slot(&mut self, slot: usize) {
+        let record = self.records[slot];
+        let key = (record.arena.id, record.arena.generation, record.base, slot);
+        if let Ok(position) = self.dead_by_key.binary_search(&key) {
+            self.dead_by_key.remove(position);
+        }
+        if let Ok(position) = self.dead_slots.binary_search(&slot) {
+            self.dead_slots.remove(position);
+        }
+    }
+
+    /// Capacity for every slot was reserved when the slot was last registered.
+    fn record_dead_slot(&mut self, slot: usize) {
+        let record = self.records[slot];
+        let key = (record.arena.id, record.arena.generation, record.base, slot);
+        let position = self.dead_by_key.binary_search(&key).unwrap_err();
+        self.dead_by_key.insert(position, key);
+        let position = self.dead_slots.binary_search(&slot).unwrap_err();
+        self.dead_slots.insert(position, slot);
     }
 
     pub fn snapshot(
@@ -420,10 +472,11 @@ impl ProviderAllocationCatalog {
     ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
         let snapshot = self.validate_retirement(identity)?;
         let slot = self.slot(identity)?;
-        let position = self.live_by_base.partition_point(|&live| self.records[live].base < snapshot.base);
+        let position = self.live_by_position(snapshot.base);
         debug_assert_eq!(self.live_by_base.get(position), Some(&slot));
         self.live_by_base.remove(position);
         self.records[slot].live = false;
+        self.record_dead_slot(slot);
         Ok(snapshot)
     }
 
@@ -502,12 +555,12 @@ impl ProviderAllocationCatalog {
         if self.pins.iter().any(|pin| pin.identity == identity) {
             return Err(ProviderAllocationError::Pinned);
         }
-        if self.records.iter().enumerate().any(|(index, record)| {
-            index != slot
-                && record.live
-                && record.base >= retiring.base
-                && record.end() <= retiring.end()
-        }) {
+        // Bases are unique, so the live allocation after this one in base order is inside it
+        // exactly when it starts before this one ends.
+        let next = self.live_by_position(retiring.base) + 1;
+        if self.live_by_base.get(next).is_some_and(|&inner|
+            self.records[inner].base < retiring.end())
+        {
             return Err(ProviderAllocationError::ContainsLiveAllocations);
         }
         retiring.snapshot(slot)
@@ -543,6 +596,90 @@ mod tests {
 
     fn arena(id: u64) -> ProviderArenaIdentity {
         ProviderArenaIdentity { id, generation: 1 }
+    }
+
+    /// Boot 44246316182: win32k held more than 65,536 live pool allocations, and every
+    /// ExAllocatePool/ExFreePool walked the whole record table several times. Registering
+    /// and retiring one allocation must cost a lookup, not a pass over every live allocation.
+    #[test]
+    fn register_and_retire_do_not_scan_every_live_allocation() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        catalog.register(arena(1), 0x10_0000, 0x1000_0000).unwrap();
+        let mut retired = Vec::new();
+        for index in 0..8_192u64 {
+            let allocation = catalog.register(arena(2), 0x20_0000 + index * 0x100, 0x80).unwrap();
+            if index % 64 == 0 {
+                retired.push(allocation);
+            }
+        }
+        for allocation in &retired {
+            catalog.retire(allocation.identity).unwrap();
+        }
+        let budget = 512;
+        catalog.records.visits.set(0);
+        let added = catalog.register(arena(2), 0x20_0000 + 8_192 * 0x100, 0x80).unwrap();
+        let register_visits = catalog.records.visits.get();
+        assert!(register_visits < budget, "register visited {register_visits} records");
+        catalog.records.visits.set(0);
+        assert_eq!(catalog.validate_retirement(added.identity), Ok(added));
+        catalog.retire(added.identity).unwrap();
+        let retire_visits = catalog.records.visits.get();
+        assert!(retire_visits < budget, "retire visited {retire_visits} records");
+    }
+
+    /// The indexed register/retire rules agree with the direct definition over random
+    /// nested, disjoint and partially overlapping ranges across arenas and slot reuse.
+    #[test]
+    fn indexed_catalog_matches_the_direct_overlap_and_reuse_rules() {
+        #[derive(Clone, Copy)]
+        struct Model { arena: u64, base: u64, end: u64, live: bool, slot: u64 }
+        let mut catalog = ProviderAllocationCatalog::new();
+        let mut model: Vec<Model> = Vec::new();
+        let mut identities: Vec<ProviderAllocationSnapshot> = Vec::new();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        for _ in 0..4_000 {
+            if next() % 3 == 0 && !identities.is_empty() {
+                let pick = (next() as usize) % identities.len();
+                let snapshot = identities[pick];
+                let slot = snapshot.identity.allocation_id;
+                let row = model.iter().position(|row| row.live && row.slot == slot).unwrap();
+                let contains = model.iter().any(|other| other.live && other.slot != slot
+                    && other.base >= model[row].base && other.end <= model[row].end);
+                let result = catalog.retire(snapshot.identity);
+                assert_eq!(result.is_ok(), !contains);
+                if result.is_ok() {
+                    model[row].live = false;
+                    identities.swap_remove(pick);
+                }
+                continue;
+            }
+            let arena_id = 1 + next() % 3;
+            let base = 0x1000 + (next() % 64) * 0x100;
+            let end = base + 0x100 * (1 + next() % 8);
+            let overlap_ok = model.iter().filter(|row| row.live && base < row.end && row.base < end)
+                .all(|row| row.arena != arena_id
+                    && ((base < row.base && end >= row.end) || (row.base < base && row.end >= end)));
+            let expected_slot = model.iter().filter(|row| !row.live && row.arena == arena_id
+                    && row.base == base).map(|row| row.slot).min()
+                .or_else(|| model.iter().filter(|row| !row.live).map(|row| row.slot).min());
+            let result = catalog.register(arena(arena_id), base, end - base);
+            assert_eq!(result.is_ok(), overlap_ok, "register {arena_id}/{base:#x}..{end:#x}");
+            if let Ok(snapshot) = result {
+                let slot = snapshot.identity.allocation_id;
+                if let Some(expected) = expected_slot {
+                    assert_eq!(slot, expected);
+                    model.retain(|row| row.slot != slot);
+                }
+                model.push(Model { arena: arena_id, base, end, live: true, slot });
+                identities.push(snapshot);
+            }
+            let probe = 0x1000 + (next() % (72 * 0x100));
+            let innermost = model.iter().filter(|row| row.live && row.base <= probe && probe < row.end)
+                .min_by_key(|row| row.end - row.base).map(|row| row.slot);
+            assert_eq!(catalog.containing(probe, 1).ok().map(|found| found.identity.allocation_id),
+                innermost, "containing {probe:#x}");
+        }
     }
 
     #[test]
