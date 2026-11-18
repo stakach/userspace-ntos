@@ -313,6 +313,24 @@ static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
 // an exact CM checkpoint image. Boot replay can leave such a suffix even before a new mutation.
 static SYSTEM_WAL_FOLD_REQUIRED: AtomicBool = AtomicBool::new(false);
 
+/// Whether the mounted volume's storage path can serve a checkpoint now.
+pub(crate) unsafe fn storage_path() -> crate::volume_lazy_flush::StoragePath {
+    use crate::volume_lazy_flush::StoragePath;
+    if !writable_fs_mounted() {
+        return StoragePath::Unmounted;
+    }
+    if WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
+        return StoragePath::Blocked;
+    }
+    match crate::fs_loader::exec_fs_mount_identity()
+        .and_then(crate::fs_loader::exec_block_route_kind)
+    {
+        Some(nt_fs::BlockSourceKind::Native) => StoragePath::Native,
+        Some(nt_fs::BlockSourceKind::Draining) => StoragePath::Draining,
+        Some(nt_fs::BlockSourceKind::Boot) | None => StoragePath::Boot,
+    }
+}
+
 /// Volume bytes that no begun checkpoint captures. The service loop publishes them lazily.
 pub(crate) fn snapshot_publication_owed() -> bool {
     WRITABLE_FS_SNAPSHOT_DIRTY.load(Ordering::Acquire)
@@ -879,10 +897,14 @@ fn note_checkpoint_published() {
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
 /// `Ok(false)` means the volume was already clean.
 pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
-    if crate::fs_loader::exec_fs_mount_identity()
+    match crate::fs_loader::exec_fs_mount_identity()
         .and_then(crate::fs_loader::exec_block_route_kind)
-        == Some(nt_fs::BlockSourceKind::Native) {
-        return native_checkpoint::checkpoint_dirty_native();
+    {
+        Some(nt_fs::BlockSourceKind::Native) => return native_checkpoint::checkpoint_dirty_native(),
+        // The boot source admits no new snapshot I/O while it drains to the native disk stack.
+        // Nothing is consumed; the owed publication waits for the native route.
+        Some(nt_fs::BlockSourceKind::Draining) => return Err(snapshot_storage::BUSY),
+        Some(nt_fs::BlockSourceKind::Boot) | None => {}
     }
     let wal_format = !legacy_snapshot_writes_allowed();
     if WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {

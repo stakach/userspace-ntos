@@ -55,3 +55,46 @@ impl LazyFlush {
         self.dirty_since.map(|since| since.saturating_add(LAZY_FLUSH_DELAY_100NS))
     }
 }
+
+/// Whether the mounted volume's storage path can serve a checkpoint now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoragePath {
+    /// No writable volume is mounted.
+    Unmounted,
+    /// An uncertain snapshot write blocked the mount until boot recovery.
+    Blocked,
+    /// The boot block source serves snapshot I/O synchronously.
+    Boot,
+    /// The boot source is draining to the native disk stack and admits no new snapshot I/O.
+    Draining,
+    /// The native disk stack serves snapshot I/O asynchronously.
+    Native,
+}
+
+impl StoragePath {
+    /// A lazy flush is attempted only where the storage path can serve it; elsewhere the
+    /// dirty interval waits, exactly as NT's lazy writer leaves pages dirty for its next scan.
+    pub(crate) const fn serves_checkpoint(self) -> bool {
+        matches!(self, Self::Boot | Self::Native)
+    }
+}
+
+/// What the service boundary does with a failed checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailedCheckpoint {
+    /// Only the lazy flush owed it and the volume stays writable: retry one delay later.
+    RetryLazily,
+    /// A caller is waiting for durability, or the mount is now blocked: a durability fault.
+    Refuse,
+}
+
+pub(crate) const fn classify_failed_checkpoint(
+    caller_required: bool,
+    mount_blocked: bool,
+) -> FailedCheckpoint {
+    if caller_required || mount_blocked {
+        FailedCheckpoint::Refuse
+    } else {
+        FailedCheckpoint::RetryLazily
+    }
+}

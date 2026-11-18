@@ -74,3 +74,58 @@ fn the_milestone_gate_does_not_stop_a_sealed_interactive_desktop() {
     assert!(window.starts_with("ep, crate::boot_progress_sealed(), now)"));
     assert!(window.contains("MilestoneVerdict::Silent"));
 }
+
+// Run 44264311242 resumed a published disk: the volume was dirty from boot setup, the lazy flush
+// fell due while the boot block source was draining to the native disk stack, the synchronous
+// checkpoint failed with 0xc0000001, and the boundary treated it as fatal.
+
+use volume_lazy_flush::{classify_failed_checkpoint, FailedCheckpoint, StoragePath};
+
+#[test]
+fn the_lazy_flush_waits_while_the_storage_path_cannot_serve_it() {
+    assert!(StoragePath::Boot.serves_checkpoint());
+    assert!(StoragePath::Native.serves_checkpoint());
+    for path in [StoragePath::Unmounted, StoragePath::Blocked, StoragePath::Draining] {
+        assert!(!path.serves_checkpoint(), "{path:?}");
+    }
+}
+
+#[test]
+fn a_failed_lazy_only_checkpoint_is_retried_not_fatal() {
+    assert_eq!(classify_failed_checkpoint(false, false), FailedCheckpoint::RetryLazily);
+    assert_eq!(classify_failed_checkpoint(true, false), FailedCheckpoint::Refuse);
+    assert_eq!(classify_failed_checkpoint(false, true), FailedCheckpoint::Refuse);
+}
+
+#[test]
+fn a_draining_route_is_busy_for_every_checkpoint_and_eligibility_uses_the_route() {
+    let fs = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
+    let checkpoint = fs
+        .split("pub(crate) unsafe fn checkpoint_dirty_volume()")
+        .nth(1)
+        .unwrap()
+        .split("snapshot_storage::acquire()")
+        .next()
+        .unwrap();
+    assert!(
+        checkpoint.contains("BlockSourceKind::Draining") && checkpoint.contains("snapshot_storage::BUSY"),
+        "a draining route admits no snapshot I/O and consumes nothing"
+    );
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    let owe = service
+        .split("fn owe_lazy_volume_checkpoint(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(owe.contains("serves_checkpoint()"));
+    let boundary = service
+        .split("fn checkpoint_service_loop_volume(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(boundary.contains("classify_failed_checkpoint("));
+}

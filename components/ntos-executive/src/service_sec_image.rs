@@ -4642,10 +4642,27 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
     use crate::volume_checkpoint_deferral::Outcome;
     /// Episodes whose deferral and publication each get one trace line.
     const TRACED_EPISODES: u64 = 16;
+    let caller_required = nt_handler.writable_fs_commit_required;
     owe_lazy_volume_checkpoint(nt_handler);
     let checkpoint_status = match publish_required_dirty_volume(nt_handler) {
         Ok(status) => status,
         Err(status) => return status,
+    };
+    // NT's lazy writer leaves a deferred flush dirty for its next scan; only a caller waiting
+    // for durability, or a mount an uncertain write has blocked, turns a refusal into a fault.
+    let retry_lazily = |nt_handler: &mut ExecNtHandler, status: u32| {
+        use crate::volume_lazy_flush::{classify_failed_checkpoint, FailedCheckpoint};
+        let lazy_only = classify_failed_checkpoint(
+            caller_required,
+            crate::writable_fs::system_wal_fold_blocked(),
+        ) == FailedCheckpoint::RetryLazily;
+        if lazy_only {
+            nt_handler.writable_fs_commit_required = false;
+            print_str(b"[writable-fs-snapshot] lazy checkpoint deferred status=0x");
+            print_hex(status);
+            print_str(b"\n");
+        }
+        lazy_only
     };
     match nt_handler.volume_checkpoint_deferral.observe(
         checkpoint_status, crate::writable_fs::checkpoint_progress, monotonic_time_100ns,
@@ -4675,6 +4692,10 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
             }
             nt_fs::STATUS_SUCCESS
         }
+        Outcome::Stalled { status, .. } if retry_lazily(nt_handler, status) => {
+            nt_fs::STATUS_SUCCESS
+        }
+        Outcome::Failed(status) if retry_lazily(nt_handler, status) => nt_fs::STATUS_SUCCESS,
         Outcome::Stalled { status, deferrals, stalled_100ns } => {
             print_str(b"[writable-fs-snapshot] service-loop checkpoint stalled deferrals=");
             print_u64(deferrals);
@@ -4697,11 +4718,11 @@ static VOLUME_LAZY_FLUSH: AtomicU64 =
     AtomicU64::new(crate::volume_lazy_flush::LazyFlush::new().into_raw());
 
 /// Owe a checkpoint for volume bytes that have stayed dirty for the lazy-flush delay. Only a
-/// mounted, unblocked volume qualifies: a blocked mount waits for boot recovery instead.
+/// storage path that can serve it qualifies: a draining boot source waits for the native disk
+/// stack, and a blocked mount waits for boot recovery.
 fn owe_lazy_volume_checkpoint(nt_handler: &mut ExecNtHandler) {
     use crate::volume_lazy_flush::LazyFlush;
-    let eligible = unsafe { crate::writable_fs::writable_fs_mounted() }
-        && !crate::writable_fs::system_wal_fold_blocked();
+    let eligible = unsafe { crate::writable_fs::storage_path() }.serves_checkpoint();
     let mut lazy = LazyFlush::from_raw(VOLUME_LAZY_FLUSH.load(Ordering::Acquire));
     let opened = lazy.deadline().is_none();
     let due = lazy.observe(
