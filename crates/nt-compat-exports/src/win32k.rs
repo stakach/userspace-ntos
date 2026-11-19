@@ -209,7 +209,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("RtlAnsiStringToUnicodeString", Implemented, "native counted-string conversion and allocation backed by validated CP1252"),
     e("RtlInitAnsiString", Implemented, "implemented in crate::rtl (host-tested UNICODE_STRING/string ops)"),
     e("RtlCreateUnicodeString", Implemented, "allocates a terminated copy from the reclaiming win32k RTL pool"),
-    e("RtlFreeUnicodeString", Implemented, "returns owned buffers to the reclaiming win32k RTL pool and clears the descriptor"),
+    e("RtlFreeUnicodeString", Implemented, "frees the buffer through the strict ExFreePoolWithTag ownership path (any win32k pool) and clears the descriptor"),
     e("RtlAppendUnicodeStringToString", Implemented, "implemented in crate::rtl (host-tested UNICODE_STRING/string ops)"),
     e("RtlFormatCurrentUserKeyPath", Partial, "formats the projected primary-token SID as an owned \\Registry\\User\\<sid> path; thread-token impersonation remains pending"),
     e("RtlMultiByteToUnicodeN", Implemented, "bounded byte conversion through the validated CP1252 multibyte table"),

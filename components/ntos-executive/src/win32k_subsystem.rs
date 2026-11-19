@@ -12963,7 +12963,12 @@ extern "win64" fn s_rtl_free_unicode_string(string: *mut u8) {
     unsafe {
         let buffer = read_unaligned(string.add(8) as *const u64);
         if buffer != 0 {
-            reclaiming_pool_free(buffer);
+            // ntoskrnl RtlFreeUnicodeString is ExFreePoolWithTag(Buffer, TAG_USTR): win32k frees
+            // strings it allocated itself with TAG_USTR this way, not only RtlCreateUnicodeString
+            // copies. Route through the single strict pool-ownership free (boot 44538507382:
+            // ~58k USTR buffers leaked while this freed only the reclaiming arena and ignored
+            // its refusal).
+            s_ex_free_pool_with_tag(buffer, u64::from(u32::from_le_bytes(*b"USTR")));
             write_unaligned(string as *mut u16, 0);
             write_unaligned((string as *mut u16).add(1), 0);
             write_unaligned(string.add(8) as *mut u64, 0);
@@ -13224,7 +13229,7 @@ extern "win64" fn s_rtl_ansi_string_to_unicode_string(
         );
         if status != 0 {
             if allocate_destination != 0 {
-                reclaiming_pool_free(output_buffer);
+                assert!(reclaiming_pool_free(output_buffer), "unicode conversion buffer lost its owner");
                 write_unaligned(destination.add(8) as *mut u64, 0);
             }
             return status;
