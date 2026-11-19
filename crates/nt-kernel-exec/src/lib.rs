@@ -13,6 +13,7 @@
 extern crate alloc;
 
 mod completion;
+pub mod arena_heap;
 pub mod cache_invalidation;
 pub mod apc_state;
 mod cyclic_ids;

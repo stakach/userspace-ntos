@@ -213,6 +213,27 @@ impl ProviderAllocationCatalog {
             })
     }
 
+    /// Live allocations per arena, written into `out` in first-seen order; returns how many
+    /// arenas were seen (entries beyond `out` are counted in the return value only). One pass
+    /// over the live index, allocation-free, for a periodic census.
+    pub fn live_by_arena(&self, out: &mut [(ProviderArenaIdentity, usize)]) -> usize {
+        let mut seen = 0;
+        for &slot in &self.live_by_base {
+            let arena = self.records[slot].arena;
+            let known = seen.min(out.len());
+            match out[..known].iter_mut().find(|(known, _)| *known == arena) {
+                Some((_, count)) => *count += 1,
+                None => {
+                    if seen < out.len() {
+                        out[seen] = (arena, 1);
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        seen
+    }
+
     pub fn register(
         &mut self,
         arena: ProviderArenaIdentity,
@@ -601,6 +622,21 @@ mod tests {
     /// Boot 44246316182: win32k held more than 65,536 live pool allocations, and every
     /// ExAllocatePool/ExFreePool walked the whole record table several times. Registering
     /// and retiring one allocation must cost a lookup, not a pass over every live allocation.
+    #[test]
+    fn live_by_arena_counts_only_live_allocations() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let a = catalog.register(arena(1), 0x1000, 0x100).unwrap();
+        catalog.register(arena(1), 0x2000, 0x100).unwrap();
+        catalog.register(arena(2), 0x3000, 0x100).unwrap();
+        catalog.retire(a.identity).unwrap();
+        let mut out = [(ProviderArenaIdentity { id: 0, generation: 0 }, 0usize); 4];
+        assert_eq!(catalog.live_by_arena(&mut out), 2);
+        assert_eq!(&out[..2], &[(arena(1), 1), (arena(2), 1)]);
+        let mut short = [(ProviderArenaIdentity { id: 0, generation: 0 }, 0usize); 1];
+        assert_eq!(catalog.live_by_arena(&mut short), 2);
+        assert_eq!(short[0], (arena(1), 1));
+    }
+
     #[test]
     fn register_and_retire_do_not_scan_every_live_allocation() {
         let mut catalog = ProviderAllocationCatalog::new();

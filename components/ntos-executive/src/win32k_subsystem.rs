@@ -2003,6 +2003,33 @@ pub fn provider_pool_census() -> ProviderPoolCensus {
     }
 }
 
+/// Every 16384th registration, print live provider allocations per arena, so a leaking
+/// arena shows as a count that only grows.
+fn trace_provider_allocation_census(catalog: &nt_provider_wait::ProviderAllocationCatalog) {
+    static REGISTERED: AtomicU64 = AtomicU64::new(0);
+    let registered = REGISTERED.fetch_add(1, Ordering::Relaxed) + 1;
+    if registered % 16384 != 0 {
+        return;
+    }
+    let mut arenas = [(nt_provider_wait::ProviderArenaIdentity { id: 0, generation: 0 }, 0usize); 16];
+    let seen = catalog.live_by_arena(&mut arenas);
+    print_str(b"[provider-allocation-census] registered=");
+    print_u64(registered);
+    print_str(b" live=");
+    print_u64(catalog.statistics().live as u64);
+    print_str(b" arenas=");
+    print_u64(seen as u64);
+    for (arena, live) in arenas.iter().take(seen.min(arenas.len())) {
+        print_str(b" ");
+        print_u64(arena.id);
+        print_str(b"/");
+        print_u64(arena.generation);
+        print_str(b"=");
+        print_u64(*live as u64);
+    }
+    print_str(b"\n");
+}
+
 fn register_provider_allocation_observed(
     catalog: &mut nt_provider_wait::ProviderAllocationCatalog,
     arena: nt_provider_wait::ProviderArenaIdentity,
@@ -2010,7 +2037,10 @@ fn register_provider_allocation_observed(
     capacity: u64,
 ) -> bool {
     match catalog.register(arena, payload, capacity) {
-        Ok(_) => true,
+        Ok(_) => {
+            trace_provider_allocation_census(catalog);
+            true
+        }
         Err(nt_provider_wait::ProviderAllocationError::NoCapacity) => {
             fn print_statistics(statistics: nt_provider_wait::ProviderAllocationStatistics) {
                 print_str(b" slots="); print_u64(statistics.slots as u64);
@@ -9009,82 +9039,26 @@ fn ob_type_mismatch_trace(handle: u64, obj_type: u64, which: &[u8]) {
     print_str(b"\n");
 }
 
-const HEAP_HDR_SIZE: u64 = 16;
-const HEAP_ALLOC_MARKER: u64 = 0xffff_ffff_ffff_fffd;
+const HEAP_HDR_SIZE: u64 = nt_kernel_exec::arena_heap::HEADER_SIZE;
+const _: () = assert!(POOL_DATA_OFF == nt_kernel_exec::arena_heap::DATA_OFFSET);
+const _: () = assert!(HEAP_HANDLE_SIZE_OFF + 8 <= 0x20, "nested heap handle words precede the allocator header");
 const HEAP_HANDLE_MAGIC: u64 = 0x4845_4150_5355_4253; // "HEAPSUBS"
 const HEAP_HANDLE_MAGIC_OFF: u64 = 0x10;
 const HEAP_HANDLE_SIZE_OFF: u64 = 0x18;
 const HEAP_ZERO_MEMORY: u64 = 0x0000_0008;
 const HEAP_REALLOC_IN_PLACE_ONLY: u64 = 0x0000_0010;
 
-/// Allocate from a hosted heap arena. The block header stores the aligned payload capacity; free
-/// blocks use the second header word as a next pointer, and live blocks carry a marker.
+/// Allocate from a hosted heap arena (see [`nt_kernel_exec::arena_heap`]).
 unsafe fn heap_alloc_in_raw(
     arena_base: u64,
     arena_bytes: u64,
     size: u64,
     zero: bool,
 ) -> u64 {
-    if size == 0 {
-        return 0;
-    }
-    let want = align16(size);
-    let head = (arena_base + 8) as *mut u64;
-    let mut prev = 0u64;
-    let mut cur = read_volatile(head);
-    let mut scanned = 0usize;
-    while cur != 0 && scanned < 4096 {
-        let cap = read_volatile(cur as *const u64);
-        let next = read_volatile((cur + 8) as *const u64);
-        if cap >= want {
-            if prev == 0 {
-                write_volatile(head, next);
-            } else {
-                write_volatile((prev + 8) as *mut u64, next);
-            }
-            if cap >= want + HEAP_HDR_SIZE + 16 {
-                let split = cur + HEAP_HDR_SIZE + want;
-                write_volatile(split as *mut u64, cap - want - HEAP_HDR_SIZE);
-                write_volatile((split + 8) as *mut u64, next);
-                if prev == 0 {
-                    write_volatile(head, split);
-                } else {
-                    write_volatile((prev + 8) as *mut u64, split);
-                }
-                write_volatile(cur as *mut u64, want);
-            }
-            write_volatile((cur + 8) as *mut u64, HEAP_ALLOC_MARKER);
-            let payload = cur + HEAP_HDR_SIZE;
-            if zero {
-                core::ptr::write_bytes(payload as *mut u8, 0, size as usize);
-            }
-            return payload;
-        }
-        prev = cur;
-        cur = next;
-        scanned += 1;
-    }
-
-    let ctr = arena_base as *mut u64;
-    let mut cur = read_volatile(ctr);
-    if cur < POOL_DATA_OFF {
-        cur = POOL_DATA_OFF;
-    }
-    let hdr = align16(arena_base + cur);
-    let cap = arena_base + arena_bytes;
-    if hdr + HEAP_HDR_SIZE + want > cap {
-        return 0;
-    }
-    write_volatile(ctr, (hdr + HEAP_HDR_SIZE + want) - arena_base);
-    write_volatile(hdr as *mut u64, want);
-    write_volatile((hdr + 8) as *mut u64, HEAP_ALLOC_MARKER);
-    let payload = hdr + HEAP_HDR_SIZE;
-    if zero {
-        core::ptr::write_bytes(payload as *mut u8, 0, size as usize);
-    }
-    if arena_base == WIN32K_HEAP_VADDR {
+    let payload = nt_kernel_exec::arena_heap::alloc(arena_base, arena_bytes, size, zero);
+    if payload != 0 && arena_base == WIN32K_HEAP_VADDR {
         (&*((arena_base + WIN32K_HEAP_PUBLISHED_HIGH_WATER_OFF) as *const AtomicU64))
-            .fetch_max((hdr + HEAP_HDR_SIZE + want) - arena_base, Ordering::Release);
+            .fetch_max(nt_kernel_exec::arena_heap::bump(arena_base), Ordering::Release);
     }
     payload
 }
@@ -9138,92 +9112,11 @@ unsafe fn heap_alloc_in(
 }
 
 unsafe fn heap_block_capacity_in(arena_base: u64, arena_bytes: u64, p: u64) -> Option<u64> {
-    let arena_start = arena_base + POOL_DATA_OFF;
-    let arena_end = arena_base + arena_bytes;
-    if p < arena_start + HEAP_HDR_SIZE || p >= arena_end || (p & 15) != 0 {
-        return None;
-    }
-    let hdr = p - HEAP_HDR_SIZE;
-    let cap = read_volatile(hdr as *const u64);
-    let marker = read_volatile((hdr + 8) as *const u64);
-    if marker != HEAP_ALLOC_MARKER || cap == 0 || (cap & 15) != 0 {
-        return None;
-    }
-    if hdr < arena_start || hdr + HEAP_HDR_SIZE + cap > arena_end {
-        return None;
-    }
-    Some(cap)
+    nt_kernel_exec::arena_heap::capacity(arena_base, arena_bytes, p)
 }
 
 unsafe fn heap_free_in_raw(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
-    let Some(cap) = heap_block_capacity_in(arena_base, arena_bytes, p) else {
-        return false;
-    };
-    let hdr = p - HEAP_HDR_SIZE;
-
-    let head = (arena_base + 8) as *mut u64;
-    let mut prev = 0u64;
-    let mut cur = read_volatile(head);
-    let mut scanned = 0usize;
-    while cur != 0 && cur < hdr && scanned < 4096 {
-        prev = cur;
-        cur = read_volatile((cur + 8) as *const u64);
-        scanned += 1;
-    }
-    if scanned >= 4096 {
-        return false;
-    }
-
-    write_volatile(hdr as *mut u64, cap);
-    write_volatile((hdr + 8) as *mut u64, cur);
-    if prev == 0 {
-        write_volatile(head, hdr);
-    } else {
-        write_volatile((prev + 8) as *mut u64, hdr);
-    }
-
-    let mut block = hdr;
-    let mut block_cap = cap;
-    if cur != 0 && block + HEAP_HDR_SIZE + block_cap == cur {
-        let cur_cap = read_volatile(cur as *const u64);
-        let cur_next = read_volatile((cur + 8) as *const u64);
-        block_cap += HEAP_HDR_SIZE + cur_cap;
-        write_volatile(block as *mut u64, block_cap);
-        write_volatile((block + 8) as *mut u64, cur_next);
-    }
-    if prev != 0 {
-        let prev_cap = read_volatile(prev as *const u64);
-        if prev + HEAP_HDR_SIZE + prev_cap == block {
-            let next = read_volatile((block + 8) as *const u64);
-            block = prev;
-            block_cap += HEAP_HDR_SIZE + prev_cap;
-            write_volatile(block as *mut u64, block_cap);
-            write_volatile((block + 8) as *mut u64, next);
-        }
-    }
-
-    let ctr = arena_base as *mut u64;
-    let high = arena_base + read_volatile(ctr);
-    if block + HEAP_HDR_SIZE + block_cap == high {
-        let mut list_prev = 0u64;
-        let mut list_cur = read_volatile(head);
-        let mut scanned = 0usize;
-        while list_cur != 0 && list_cur != block && scanned < 4096 {
-            list_prev = list_cur;
-            list_cur = read_volatile((list_cur + 8) as *const u64);
-            scanned += 1;
-        }
-        if list_cur == block {
-            let next = read_volatile((block + 8) as *const u64);
-            if list_prev == 0 {
-                write_volatile(head, next);
-            } else {
-                write_volatile((list_prev + 8) as *mut u64, next);
-            }
-            write_volatile(ctr, block - arena_base);
-        }
-    }
-    true
+    nt_kernel_exec::arena_heap::free(arena_base, arena_bytes, p)
 }
 
 unsafe fn heap_free_in(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
@@ -9420,8 +9313,7 @@ unsafe fn hosted_heap_init(base: u64, reserve_size: u64) -> u64 {
     {
         return 0;
     }
-    write_volatile(base as *mut u64, POOL_DATA_OFF);
-    write_volatile((base + 8) as *mut u64, 0);
+    nt_kernel_exec::arena_heap::init(base);
     write_volatile(
         (base + HEAP_HANDLE_MAGIC_OFF) as *mut u64,
         HEAP_HANDLE_MAGIC,
@@ -10085,10 +9977,33 @@ extern "win64" fn s_rtl_free_heap(heap: u64, _flags: u64, base: u64) -> u64 {
     }
     unsafe {
         let Some((arena_base, arena_bytes)) = hosted_heap_bounds(heap) else {
+            trace_rtl_free_heap_refused(heap, base, b"heap");
             return 0;
         };
-        heap_free_in(arena_base, arena_bytes, base) as u64
+        let freed = heap_free_in(arena_base, arena_bytes, base);
+        if !freed {
+            trace_rtl_free_heap_refused(heap, base, b"block");
+        }
+        freed as u64
     }
+}
+
+/// RtlFreeHeap returning FALSE leaves the block allocated; name every refusal.
+fn trace_rtl_free_heap_refused(heap: u64, base: u64, reason: &[u8]) {
+    static REFUSALS: AtomicU64 = AtomicU64::new(0);
+    let refusal = REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
+    if refusal > 16 && !refusal.is_power_of_two() {
+        return;
+    }
+    print_str(b"[win32k-heap] RtlFreeHeap refused reason=");
+    print_str(reason);
+    print_str(b" heap=");
+    print_win32k_hex64(heap);
+    print_str(b" block=");
+    print_win32k_hex64(base);
+    print_str(b" refusals=");
+    print_u64(refusal);
+    print_str(b"\n");
 }
 /// `SIZE_T RtlSizeHeap(HeapHandle, Flags, Base)`.
 extern "win64" fn s_rtl_size_heap(heap: u64, _flags: u64, base: u64) -> u64 {
