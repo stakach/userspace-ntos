@@ -65,6 +65,62 @@ pub(super) unsafe fn cpu_exception(
         // held by the DEBUG_EVENT. The next event has already been received.
         return ControlFlow::Break(Turn::Next);
     }
+    // NT first-chance delivery (#285): the thread's own handlers see the exception through
+    // ntdll!KiUserExceptionDispatcher. An unhandled one returns as NtRaiseException with
+    // FirstChance = FALSE, which terminates the process with the exception code.
+    if let Some(fault) = nt_thread_start::user_exception::HardwareFault::from_vector(lp.msg.m3) {
+        let reply = local().reply_main_slot.load(Ordering::Relaxed);
+        match crate::user_exception_delivery::deliver_user_exception(
+            nt_handler, pi, lp.msg.badge, fault, fip, lp.msg.m1, lp.msg.m2, reply, ntdll,
+        ) {
+            Ok(code) => {
+                if crate::user_exception_delivery::trace_delivery() {
+                    print_str(b"[user-exception] delivered pi=");
+                    print_u64(pi as u64);
+                    print_str(b" badge=");
+                    print_u64(lp.msg.badge);
+                    print_str(b" vector=");
+                    print_u64(lp.msg.m3);
+                    print_str(b" code=0x");
+                    print_hex(code);
+                    print_str(b" ip=0x");
+                    print_hex_u64(fip);
+                    print_str(b"\n");
+                }
+                procs[pi].faults = lp.exit.faults;
+                procs[pi].first = lp.exit.first;
+                procs[pi].ntfaults = lp.exit.ntfaults;
+                pfilled[pi] = *filled_pages;
+                let _ = finalize_service_loop_state(nt_handler);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
+                )?;
+                lp.msg.badge = nb;
+                lp.msg.mi = nmi;
+                lp.msg.m0 = nm0;
+                lp.msg.m1 = nm1;
+                lp.msg.m2 = nm2;
+                lp.msg.m3 = nm3;
+                return ControlFlow::Break(Turn::Next);
+            }
+            Err(reason) => {
+                print_str(b"[user-exception] not delivered pi=");
+                print_u64(pi as u64);
+                print_str(b" vector=");
+                print_u64(lp.msg.m3);
+                print_str(b" reason=");
+                print_str(match reason {
+                    crate::user_exception_delivery::NotDelivered::UnknownThread => b"thread",
+                    crate::user_exception_delivery::NotDelivered::ThreadState => b"state",
+                    crate::user_exception_delivery::NotDelivered::NoDispatcher => b"dispatcher",
+                    crate::user_exception_delivery::NotDelivered::Frame => b"frame",
+                    crate::user_exception_delivery::NotDelivered::StackWrite(_) => b"stack-write",
+                    crate::user_exception_delivery::NotDelivered::Restart => b"restart",
+                });
+                print_str(b"\n");
+            }
+        }
+    }
     // ★ POST-LOGON CPU-EXCEPTION DIAGNOSTIC (bounded to the first 4). A label-3 fault
     // reports only IP/SP/FLAGS/vector/code, which is not enough to tell a bad POINTER from a
     // bad TARGET. Recover the faulting thread's GPRs, the stack's return-address chain and —

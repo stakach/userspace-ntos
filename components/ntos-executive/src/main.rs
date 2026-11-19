@@ -132,6 +132,7 @@ mod native_image_sections;
 pub(crate) use exec_handler::file_image_section;
 mod hosted_routed_image_capture;
 mod thread_context;
+mod user_exception_delivery;
 mod thread_suspend;
 mod boot_registry_mutation_work;
 mod object_wait;

@@ -54,7 +54,7 @@ pub(crate) use hosted::{
     parkable_hosted_reply_binding,
     finish_acknowledged_hosted_reply, hosted_can_resume, hosted_cancellation_census,
     hosted_cancellation_proven,
-    hosted_reply_cancelled, owns_hosted_reply, release_hosted_reply, reply_hosted, restart_hosted,
+    hosted_reply_cancelled, owns_hosted_reply, release_hosted_reply, reply_hosted, restart_hosted, can_restart_hosted,
     stop_and_cancel_hosted, stop_hosted_caller, take_hosted_with,
     HostedHandoffRefused, quarantine_refused_handoff, fail_quarantined_native_call,
     take_selected_root_hosted_with, reconcile_root_ingress_import_no_effect,

@@ -1215,14 +1215,8 @@ pub(crate) unsafe fn parkable_hosted_reply_binding(
     matching.next().is_none().then_some(binding)
 }
 
-/// Only a known, mutation-free kernel rejection may become an ordinary NT failure Reply.
-/// Any ownership/query uncertainty retains the entered restart and stops the caller's adapter.
-pub(crate) unsafe fn restart_hosted(
-    reply: u64,
-    tcb: u64,
-    context: &nt_thread_start::amd64_context::LegacyContextRestore,
-) -> Result<Result<(), u64>, Error> {
-    use nt_component_suspension::ExternalRestartObservation;
+/// The delivered hosted Call bound to `reply` whose executor is exactly `tcb`.
+unsafe fn restartable_row(reply: u64, tcb: u64) -> Result<&'static mut HostedCall, Error> {
     let row = (&mut *core::ptr::addr_of_mut!(CALLS))
         .iter_mut()
         .filter_map(Option::as_mut)
@@ -1234,6 +1228,24 @@ pub(crate) unsafe fn restart_hosted(
     {
         return Err(Error::PhysicalIdentity);
     }
+    Ok(row)
+}
+
+/// Whether `restart_hosted(reply, tcb, ..)` would reach the kernel. A caller that must mutate
+/// user state before the restart proves this first, so a refusal here has had no effect.
+pub(crate) unsafe fn can_restart_hosted(reply: u64, tcb: u64) -> bool {
+    restartable_row(reply, tcb).is_ok()
+}
+
+/// Only a known, mutation-free kernel rejection may become an ordinary NT failure Reply.
+/// Any ownership/query uncertainty retains the entered restart and stops the caller's adapter.
+pub(crate) unsafe fn restart_hosted(
+    reply: u64,
+    tcb: u64,
+    context: &nt_thread_start::amd64_context::LegacyContextRestore,
+) -> Result<Result<(), u64>, Error> {
+    use nt_component_suspension::ExternalRestartObservation;
+    let row = restartable_row(reply, tcb)?;
     let call = row.call.as_mut().expect("retained context restart");
     if !call.is_restarted() {
         let _saved = crate::ipc_message::SavedMessageBuffer::capture();

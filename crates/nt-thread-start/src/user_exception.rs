@@ -114,6 +114,25 @@ pub enum HardwareFault {
     AlignmentCheck,
 }
 
+impl HardwareFault {
+    /// The fault an AMD64 processor vector raised in user mode reports, for the vectors that
+    /// carry no further state. #PF (14) needs the memory manager's outcome, and a #GP that
+    /// is a privileged instruction needs the instruction bytes, so neither is produced here.
+    pub fn from_vector(vector: u64) -> Option<Self> {
+        Some(match vector {
+            0 => Self::DivideError,
+            1 => Self::Debug,
+            3 => Self::Breakpoint,
+            4 => Self::Overflow,
+            5 => Self::BoundRange,
+            6 => Self::InvalidOpcode,
+            13 => Self::GeneralProtection,
+            17 => Self::AlignmentCheck,
+            _ => return None,
+        })
+    }
+}
+
 /// The exception record for `fault` at `rip`, and the RIP the delivered CONTEXT must carry.
 pub fn classify(fault: HardwareFault, rip: u64) -> (ExceptionRecord, u64) {
     use HardwareFault::*;
@@ -219,6 +238,22 @@ pub fn plan_user_exception_stack(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vectors_map_to_the_exceptions_ki_trap_handlers_raise() {
+        let code = |vector| HardwareFault::from_vector(vector).map(|fault| classify(fault, 0x1000).0.code);
+        assert_eq!(code(0), Some(STATUS_INTEGER_DIVIDE_BY_ZERO));
+        assert_eq!(code(1), Some(STATUS_SINGLE_STEP));
+        assert_eq!(code(3), Some(STATUS_BREAKPOINT));
+        assert_eq!(code(4), Some(STATUS_INTEGER_OVERFLOW));
+        assert_eq!(code(5), Some(STATUS_ARRAY_BOUNDS_EXCEEDED));
+        assert_eq!(code(6), Some(STATUS_ILLEGAL_INSTRUCTION));
+        assert_eq!(code(13), Some(STATUS_ACCESS_VIOLATION));
+        assert_eq!(code(17), Some(STATUS_DATATYPE_MISALIGNMENT));
+        for vector in [2, 7, 8, 14, 16, 18, 19, 255] {
+            assert_eq!(HardwareFault::from_vector(vector), None, "vector {vector}");
+        }
+    }
 
     fn context(rsp: u64, rip: u64) -> [u8; AMD64_CONTEXT_SIZE] {
         let mut context = [0u8; AMD64_CONTEXT_SIZE];
