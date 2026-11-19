@@ -41703,6 +41703,46 @@ impl ExecNtHandler {
                 }
                 0
             },
+            // NtQuerySystemInformationEx(Class, InputBuffer, InputLength, Buffer, Length, *ReturnLength).
+            // The one class with an input this personality serves is SystemSupportedProcessorArchitectures
+            // (input: a process handle, 0 for the system); its entries come from nt-syscall.
+            NativeService::NtQuerySystemInformationEx => unsafe {
+                use nt_syscall::supported_architectures as architectures;
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+                const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+                if nt_ulong_arg(args[0]) != architectures::SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES {
+                    return STATUS_INVALID_INFO_CLASS;
+                }
+                let input_length = nt_ulong_arg(args[2]) as usize;
+                let mut handle_bytes = [0u8; 8];
+                if input_length == 8 && !self.xas_read(args[1], &mut handle_bytes) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let handle = u64::from_le_bytes(handle_bytes);
+                let process_machine = if handle == 0 {
+                    None
+                } else if self.resolve_process_handle(handle).is_some() {
+                    // Every process this kernel runs is an AMD64 image.
+                    Some(architectures::IMAGE_FILE_MACHINE_AMD64)
+                } else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                let (status, bytes, length) =
+                    match architectures::encode(input_length, nt_ulong_arg(args[4]) as usize, process_machine) {
+                        Ok((bytes, length)) => (0, Some(bytes), length),
+                        Err((status, length)) => (status, None, length),
+                    };
+                if let Some(bytes) = bytes {
+                    if !self.xas_try_write_buf(args[3], &bytes) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+                if args[5] != 0 && length != 0 && !self.xas_write_u32(args[5], length) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                status
+            },
             // NtQueryDefaultLocale(UserProfile, *DefaultLocaleId[RDX]=args[1]). The caller may pass a
             // stack local (winsrv's hard-error cache) or an image/DLL global (ntdll loader state), so
             // use the common cross-address-space DWORD copyout and report a bad pointer truthfully.

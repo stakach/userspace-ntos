@@ -26371,6 +26371,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtPowerInformation, 139),
             (NativeService::NtNotifyChangeKey, 117),
             (NativeService::NtNotifyChangeMultipleKeys, 0x455),
+            (NativeService::NtQuerySystemInformationEx, 0x308),
             (
                 NativeService::NtOpenEventPair,
                 SSN_NT_OPEN_EVENT_PAIR as u32,

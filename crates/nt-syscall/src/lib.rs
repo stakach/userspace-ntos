@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 pub mod hard_error;
 pub mod copy_preflight;
 pub mod input_pagein;
+pub mod supported_architectures;
 pub mod system_information;
 
 // NTSTATUS (spec §18)
@@ -323,6 +324,8 @@ pub enum NativeService {
     NtNotifyChangeKey,
     /// `NtNotifyChangeKey` with an optional second key in another hive.
     NtNotifyChangeMultipleKeys,
+    /// `NtQuerySystemInformation` for classes that take an input buffer.
+    NtQuerySystemInformationEx,
 }
 
 impl NativeService {
@@ -540,6 +543,7 @@ impl NativeService {
             NtPowerInformation => "NtPowerInformation",
             NtNotifyChangeKey => "NtNotifyChangeKey",
             NtNotifyChangeMultipleKeys => "NtNotifyChangeMultipleKeys",
+            NtQuerySystemInformationEx => "NtQuerySystemInformationEx",
             NtImpersonateClientOfPort => "NtImpersonateClientOfPort",
         }
     }
@@ -765,6 +769,7 @@ impl NativeService {
         NativeService::NtPowerInformation,
         NativeService::NtNotifyChangeKey,
         NativeService::NtNotifyChangeMultipleKeys,
+        NativeService::NtQuerySystemInformationEx,
     ];
 }
 
