@@ -7,6 +7,7 @@
 //! direct calls.
 
 use super::loop_flow::*;
+use super::loop_user_exception::deliver_to_user;
 use super::loop_receive::{receive, reply_receive};
 use super::*;
 use crate::executor::local;
@@ -66,10 +67,10 @@ pub(super) unsafe fn cpu_exception(
         return ControlFlow::Break(Turn::Next);
     }
     // NT first-chance delivery (#285), after the debugger's first chance.
-    if let Some(fault) = nt_thread_start::user_exception::HardwareFault::from_vector(lp.msg.m3) {
+    if let Some(fault) = crate::user_exception_delivery::cpu_fault(nt_handler, pi, lp.msg.m3, fip) {
         if deliver_to_user(
-            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi, fault,
-            fip, ntdll, &mut lp.msg,
+            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
+            event_runtime.tcb, fault, fip, ntdll, &mut lp.msg,
         )? {
             return ControlFlow::Break(Turn::Next);
         }

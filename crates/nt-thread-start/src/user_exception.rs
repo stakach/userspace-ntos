@@ -15,6 +15,9 @@
 
 use crate::{AMD64_CONTEXT_SIZE, CONTEXT_RIP_OFFSET, CONTEXT_RSP_OFFSET};
 
+mod privileged_instruction;
+pub use privileged_instruction::{is_privileged_instruction, PRIVILEGED_INSTRUCTION_WINDOW};
+
 pub const EXCEPTION_RECORD_SIZE: usize = 0x98;
 pub const MACHINE_FRAME_SIZE: usize = 0x28;
 /// `sizeof(KUSER_EXCEPTION_STACK)`: its members, padded to the CONTEXT's 16-byte alignment.
@@ -89,6 +92,19 @@ pub enum PageFaultOutcome {
     InPageError(u32),
 }
 
+impl PageFaultOutcome {
+    /// trap.S PageFaultError: the exception a failed MmAccessFault `status` raises. Anything
+    /// other than an access, guard page or stack overflow failure is an in-page error.
+    pub fn from_access_fault_status(status: u32) -> Self {
+        match status {
+            STATUS_ACCESS_VIOLATION => Self::AccessViolation,
+            STATUS_GUARD_PAGE_VIOLATION => Self::GuardPage,
+            STATUS_STACK_OVERFLOW => Self::StackOverflow,
+            status => Self::InPageError(status),
+        }
+    }
+}
+
 /// A processor exception raised in user mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HardwareFault {
@@ -130,6 +146,16 @@ impl HardwareFault {
             17 => Self::AlignmentCheck,
             _ => return None,
         })
+    }
+
+    /// A user #GP, given the instruction bytes readable at the faulting RIP
+    /// (KiGeneralProtectionFaultUserMode).
+    pub fn general_protection(instruction: &[u8]) -> Self {
+        if is_privileged_instruction(instruction) {
+            Self::PrivilegedInstruction
+        } else {
+            Self::GeneralProtection
+        }
     }
 }
 
@@ -238,6 +264,38 @@ pub fn plan_user_exception_stack(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_access_faults_raise_what_trap_s_raises() {
+        let record = |status| {
+            classify(
+                HardwareFault::PageFault {
+                    error_code: 0x4, // user read, not present
+                    address: 0x5000,
+                    outcome: PageFaultOutcome::from_access_fault_status(status),
+                },
+                0x1000,
+            )
+            .0
+        };
+        assert_eq!(record(STATUS_ACCESS_VIOLATION).code, STATUS_ACCESS_VIOLATION);
+        assert_eq!(record(STATUS_GUARD_PAGE_VIOLATION).code, STATUS_GUARD_PAGE_VIOLATION);
+        assert_eq!(record(STATUS_STACK_OVERFLOW).code, STATUS_STACK_OVERFLOW);
+        // Any other status is STATUS_IN_PAGE_ERROR with the status as ExceptionInformation[2].
+        let device_error = record(0xc000_0185);
+        assert_eq!(device_error.code, STATUS_IN_PAGE_ERROR);
+        assert_eq!(device_error.parameter_count, 3);
+        assert_eq!(device_error.parameters[..3], [0, 0x5000, 0xc000_0185]);
+    }
+
+    #[test]
+    fn a_general_protection_fault_decodes_its_instruction() {
+        let code = |bytes: &[u8]| classify(HardwareFault::general_protection(bytes), 0x1000).0.code;
+        assert_eq!(code(&[0xfa]), STATUS_PRIVILEGED_INSTRUCTION); // cli
+        assert_eq!(code(&[0x0f, 0x30]), STATUS_PRIVILEGED_INSTRUCTION); // wrmsr
+        assert_eq!(code(&[0x48, 0x8b, 0x04, 0x25]), STATUS_ACCESS_VIOLATION); // mov rax, [abs]
+        assert_eq!(code(&[]), STATUS_ACCESS_VIOLATION); // unreadable RIP
+    }
 
     #[test]
     fn vectors_map_to_the_exceptions_ki_trap_handlers_raise() {

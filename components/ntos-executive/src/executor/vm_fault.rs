@@ -8,6 +8,7 @@
 //! direct calls.
 
 use super::loop_flow::*;
+use super::loop_user_exception::{deliver_to_user, dispatch_first_chance};
 use super::loop_receive::{receive, reply_receive};
 use super::*;
 use crate::executor::local;
@@ -50,7 +51,7 @@ pub(super) unsafe fn vm_fault(
             return ControlFlow::Break(Turn::Next);
         }
         if deliver_to_user(
-            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
+            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi, event_runtime.tcb,
             page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::AccessViolation),
             lp.msg.m0, ntdll, &mut lp.msg,
         )? {
@@ -350,7 +351,7 @@ pub(super) unsafe fn vm_fault(
             return ControlFlow::Break(Turn::Next);
         }
         if deliver_to_user(
-            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
+            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi, event_runtime.tcb,
             page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::AccessViolation),
             lp.msg.m0, ntdll, &mut lp.msg,
         )? {
@@ -486,10 +487,11 @@ pub(super) unsafe fn vm_fault(
             return ControlFlow::Break(Turn::Next);
         }
         Ok(Some(_)) => {
-            if deliver_to_user(
-                &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
+            if dispatch_first_chance(
+                &mut lp.exit, &mut lp.parks, &mut lp.ingress, nt_handler, procs, pfilled,
+                filled_pages, pi, event_runtime.tcb,
                 page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::StackOverflow),
-                lp.msg.m0, ntdll, &mut lp.msg,
+                lp.msg.m0, nt_process::dbgk::DBGK_BLOCK_VM_FAULT, ntdll, &mut lp.msg,
             )? {
                 return ControlFlow::Break(Turn::Next);
             }
@@ -615,10 +617,11 @@ pub(super) unsafe fn vm_fault(
             // guard and raises STATUS_GUARD_PAGE_VIOLATION; it is not retried silently.
             note_boot_progress(BootProgress::PageMappingPublished);
             lp.exit.faults += 1;
-            if deliver_to_user(
-                &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
+            if dispatch_first_chance(
+                &mut lp.exit, &mut lp.parks, &mut lp.ingress, nt_handler, procs, pfilled,
+                filled_pages, pi, event_runtime.tcb,
                 page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::GuardPage),
-                lp.msg.m0, ntdll, &mut lp.msg,
+                lp.msg.m0, nt_process::dbgk::DBGK_BLOCK_VM_FAULT, ntdll, &mut lp.msg,
             )? {
                 return ControlFlow::Break(Turn::Next);
             }
@@ -667,6 +670,13 @@ pub(super) unsafe fn vm_fault(
             print_str(b"[private-page] fault failed status=0x");
             print_hex(status);
             print_str(b"\n");
+            if dispatch_first_chance(
+                &mut lp.exit, &mut lp.parks, &mut lp.ingress, nt_handler, procs, pfilled,
+                filled_pages, pi, event_runtime.tcb, page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::from_access_fault_status(status)),
+                lp.msg.m0, nt_process::dbgk::DBGK_BLOCK_VM_FAULT, ntdll, &mut lp.msg,
+            )? {
+                return ControlFlow::Break(Turn::Next);
+            }
             return ControlFlow::Break(lp.park_and_log(pi, b"private-page", lp.msg.m0, addr));
         }
     }
@@ -722,6 +732,13 @@ pub(super) unsafe fn vm_fault(
             print_str(b"[native-image] fault failed status=0x");
             print_hex(status);
             print_str(b"\n");
+            if dispatch_first_chance(
+                &mut lp.exit, &mut lp.parks, &mut lp.ingress, nt_handler, procs, pfilled,
+                filled_pages, pi, event_runtime.tcb, page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::from_access_fault_status(status)),
+                lp.msg.m0, nt_process::dbgk::DBGK_BLOCK_VM_FAULT, ntdll, &mut lp.msg,
+            )? {
+                return ControlFlow::Break(Turn::Next);
+            }
             return ControlFlow::Break(lp.park_and_log(pi, b"native-image", lp.msg.m0, addr));
         }
     }
@@ -789,6 +806,13 @@ pub(super) unsafe fn vm_fault(
             print_str(b" status=0x");
             print_hex(status);
             print_str(b"\n");
+            if dispatch_first_chance(
+                &mut lp.exit, &mut lp.parks, &mut lp.ingress, nt_handler, procs, pfilled,
+                filled_pages, pi, event_runtime.tcb, page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::from_access_fault_status(status)),
+                lp.msg.m0, nt_process::dbgk::DBGK_BLOCK_VM_FAULT, ntdll, &mut lp.msg,
+            )? {
+                return ControlFlow::Break(Turn::Next);
+            }
             return ControlFlow::Break(lp.park_and_log(pi, b"section-fault", lp.msg.m0, addr));
         }
     }
@@ -954,7 +978,7 @@ pub(super) unsafe fn vm_fault(
             return ControlFlow::Break(Turn::Next);
         }
         if deliver_to_user(
-            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
+            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi, event_runtime.tcb,
             page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::AccessViolation),
             lp.msg.m0, ntdll, &mut lp.msg,
         )? {
@@ -1135,6 +1159,7 @@ pub(super) unsafe fn vm_fault(
     let mut allocation_failed = false;
     let mut image_protect_failed = false;
     let mut fault_page_serviced = true;
+    let mut image_fault_status = 0;
     let image_fault_access = vm_fault_access_from_x86_error(lp.msg.m3);
     if let Err(status) = service_image_page_residency(
         &mut nt_handler,
@@ -1159,6 +1184,7 @@ pub(super) unsafe fn vm_fault(
         print_str(b"\n");
         image_protect_failed = status == nt_address_space::STATUS_ACCESS_VIOLATION;
         allocation_failed = true;
+        image_fault_status = status;
         fault_page_serviced = false;
     }
     for bi in 1..batch_pages {
@@ -1228,6 +1254,14 @@ pub(super) unsafe fn vm_fault(
     // mapping/cache authorities. Apply the same ownership barrier as every other receive.
     let _ = finalize_service_loop_state(&mut nt_handler);
     if allocation_failed {
+        let status = image_fault_status;
+        if dispatch_first_chance(
+            &mut lp.exit, &mut lp.parks, &mut lp.ingress, nt_handler, procs, pfilled,
+            filled_pages, pi, event_runtime.tcb, page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::from_access_fault_status(status)),
+            lp.msg.m0, nt_process::dbgk::DBGK_BLOCK_VM_FAULT, ntdll, &mut lp.msg,
+        )? {
+            return ControlFlow::Break(Turn::Next);
+        }
         if image_protect_failed {
             return ControlFlow::Break(lp.park_and_log(pi, b"image-protect", lp.msg.m0, addr));
         } else {

@@ -8,6 +8,7 @@
 //! direct calls.
 
 use super::loop_flow::*;
+use super::loop_process_termination::{critical_termination_turn, terminate_process_turn};
 use super::loop_receive::receive;
 use super::*;
 use crate::executor::local;
@@ -984,116 +985,17 @@ pub(super) unsafe fn syscall_nt_route(
             current_tid,
             drop_reply,
         } => {
-            if drop_reply {
-                assert_eq!(tcb_suspend_r(event_runtime.tcb), 0,
-                    "process self termination must stop before Reply cancellation");
-            }
-            let preserve_tid = if current_tid != 0 {
-                Some(current_tid)
-            } else {
-                None
-            };
-            let reply_dropped = if drop_reply && !apc_owned_terminating_reply {
-                drop_current_hosted_reply()
-            } else {
-                false
-            };
-            if let Some(pid) = nt_handler.pm_pid_for_pi(process_index as usize) {
-                if nt_handler.pm.is_process_signaled(pid) {
-                    if let Some(status) = nt_handler.pm.process(pid)
-                        .and_then(|process| process.exit_status) {
-                        let _ = nt_handler.observe_install_pipe_child_terminal(
-                            process_index as usize, status,
-                        );
-                    }
-                }
-            }
-            let reclaimed = terminate_hosted_process_mechanisms(
-                process_index,
-                preserve_tid,
-                &mut *delay_queue,
-                &mut nt_handler,
-            );
-            let current_deleted = if drop_reply && current_tid != 0 {
-                terminate_hosted_thread_mechanism(
-                    current_tid,
-                    &mut *delay_queue,
-                    &mut nt_handler,
-                )
-            } else {
-                false
-            };
-            let final_process_teardown = drop_reply || current_tid == 0;
-            if final_process_teardown {
-                if let Some(pid) = nt_handler.pm_pid_for_pi(process_index as usize) {
-                    let _ = nt_handler.try_delete_hosted_process_object(pid);
-                }
-            }
-            nt_handler.refresh_process_manager_gates();
-            if drop_reply && reply_dropped && current_deleted {
-                PM_TERMINATE_PROCESS_NO_REPLY.fetch_add(1, Ordering::Relaxed);
-                if process_index < 64 {
-                    PM_TERMINATE_PROCESS_NO_REPLY_PIS
-                        .fetch_or(1u64 << process_index, Ordering::Relaxed);
-                }
-            }
-            print_str(b"[process-term] pi=");
-            print_u64(process_index as u64);
-            print_str(b" current_tid=");
-            print_u64(current_tid);
-            print_str(b" drop_reply=");
-            print_u64(drop_reply as u64);
-            print_str(b" reply-dropped=");
-            print_u64(reply_dropped as u64);
-            print_str(b" apc-owned=");
-            print_u64(apc_owned_terminating_reply as u64);
-            print_str(b" reclaimed=");
-            print_u64(reclaimed as u64);
-            print_str(b" current-deleted=");
-            print_u64(current_deleted as u64);
-            print_str(b" runtimes-pending=");
-            print_u64(
-                nt_handler
-                    .thread_runtime
-                    .has_process(process_index as usize)
-                    as u64,
-            );
-            print_str(b"\n");
-            if drop_reply {
-                let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
-                let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
-                )?;
-                lp.msg.badge = nb;
-                lp.msg.mi = nmi;
-                lp.msg.m0 = nm0;
-                lp.msg.m1 = nm1;
-                lp.msg.m2 = nm2;
-                lp.msg.m3 = nm3;
+            if terminate_process_turn(
+                nt_handler, &mut lp.ingress, &mut lp.exit, &mut lp.msg, event_runtime.tcb,
+                process_index, current_tid, drop_reply, apc_owned_terminating_reply,
+            )? {
                 return ControlFlow::Break(Turn::Next);
             }
         }
         ExecPostAction::CriticalTermination { code, object } => {
-            assert_eq!(tcb_suspend_r(event_runtime.tcb), 0,
-                "critical termination must stop before Reply cancellation");
-            let reply_dropped = !apc_owned_terminating_reply
-                && drop_current_hosted_reply();
-            // A critical process can bugcheck while it is running a win32k user-mode
-            // callback; unwind those continuations so win32k is idle (not stranded in its
-            // callback receive loop) for the gate. No-op when it held none.
-            let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
-            print_str(b"[critical-termination] bugcheck=0x");
-            print_hex(code);
-            print_str(b" object=0x");
-            print_hex((object >> 32) as u32);
-            print_hex(object as u32);
-            print_str(b" reply-dropped=");
-            print_u64(reply_dropped as u64);
-            print_str(b" -> fatal stop\n");
-            lp.exit.stop = code as u64;
-            lp.exit.record(b"fatal-stop");
-            return ControlFlow::Break(Turn::Exit);
+            return critical_termination_turn(
+                &mut lp.exit, event_runtime.tcb, pi, code, object, apc_owned_terminating_reply,
+            );
         }
         ExecPostAction::None => {}
     }

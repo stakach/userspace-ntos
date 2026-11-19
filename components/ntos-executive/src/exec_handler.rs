@@ -9159,8 +9159,19 @@ impl ExecNtHandler {
         if first_chance {
             return STATUS_UNHANDLED_EXCEPTION;
         }
+        unsafe { self.terminate_process_for_exception(self.pi, self.current_tid, code) }
+    }
 
-        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+    /// KiDispatchException's last step for an exception nothing handled: terminate the
+    /// process with the exception code, or bugcheck when the process is critical. Sets the
+    /// post action the caller's turn executes; returns a status only when termination fails.
+    pub(crate) unsafe fn terminate_process_for_exception(
+        &mut self,
+        pi: usize,
+        current_tid: u64,
+        code: u32,
+    ) -> u32 {
+        let Some(pid) = self.pm_pid_for_pi(pi) else {
             return STATUS_INVALID_HANDLE;
         };
         if let Some(bugcheck) = self.pm.critical_process_termination_code(pid) {
@@ -9183,11 +9194,11 @@ impl ExecNtHandler {
                 self.release_process_handles(pid, reserved_files);
                 self.refresh_job_time_sampling();
                 self.post_action = ExecPostAction::TerminateProcess {
-                    process_index: self.pi as u8,
-                    current_tid: self.current_tid,
+                    process_index: pi as u8,
+                    current_tid,
                     drop_reply: true,
                 };
-                unsafe { wait_wake_dispatcher_set(self) };
+                wait_wake_dispatcher_set(self);
                 0
             }
             Err(status) => {

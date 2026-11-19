@@ -17,12 +17,18 @@ pub(crate) enum NotDelivered {
     ThreadState,
     /// ntdll does not export the dispatcher.
     NoDispatcher,
-    /// The frame does not fit the thread's stack or the CONTEXT is not restorable.
-    Frame,
-    /// Writing the frame to the user stack failed.
-    StackWrite(u32),
+    /// The frame does not fit the thread's stack, the CONTEXT is not restorable, or writing
+    /// the frame to the stack failed. KiDispatchException then terminates the process.
+    Unwritable(Unwritable),
     /// The fault Call cannot be restarted, or the kernel refused the restart; it is unchanged.
     Restart,
+}
+
+/// The thread whose exception frame could not be written, and that exception's code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Unwritable {
+    pub(crate) tid: u64,
+    pub(crate) code: u32,
 }
 
 impl NotDelivered {
@@ -31,8 +37,7 @@ impl NotDelivered {
             Self::UnknownThread => b"thread",
             Self::ThreadState => b"state",
             Self::NoDispatcher => b"dispatcher",
-            Self::Frame => b"frame",
-            Self::StackWrite(_) => b"stack-write",
+            Self::Unwritable(_) => b"unwritable-frame",
             Self::Restart => b"restart",
         }
     }
@@ -43,6 +48,37 @@ static DELIVERY_TRACE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::Ato
 /// Whether this delivery is among the first 16, which are traced.
 pub(crate) fn trace_delivery() -> bool {
     DELIVERY_TRACE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16
+}
+
+/// The CPU exception a user `vector` raised at `ip` reports. A #GP decodes the instruction
+/// bytes the thread can read there (KiGeneralProtectionFaultUserMode).
+pub(crate) unsafe fn cpu_fault(
+    handler: &mut ExecNtHandler,
+    pi: usize,
+    vector: u64,
+    ip: u64,
+) -> Option<HardwareFault> {
+    const GENERAL_PROTECTION: u64 = 13;
+    if vector != GENERAL_PROTECTION {
+        return HardwareFault::from_vector(vector);
+    }
+    use nt_thread_start::user_exception::PRIVILEGED_INSTRUCTION_WINDOW;
+    let mut bytes = [0u8; PRIVILEGED_INSTRUCTION_WINDOW];
+    // The window may run into an unreadable page; the bytes before it still decode.
+    let to_page_end = (0x1000 - (ip & 0xfff)) as usize;
+    let readable = [PRIVILEGED_INSTRUCTION_WINDOW, to_page_end.min(PRIVILEGED_INSTRUCTION_WINDOW)]
+        .into_iter()
+        .find(|len| handler.process_memory_read_status(pi, ip, &mut bytes[..*len]).is_ok())
+        .unwrap_or(0);
+    Some(HardwareFault::general_protection(&bytes[..readable]))
+}
+
+/// The DBGKM_EXCEPTION record a debugger sees for `fault` at `ip`: the same record the
+/// thread's own handlers receive.
+pub(crate) fn debug_record(fault: HardwareFault, ip: u64) -> nt_process::dbgk::ExceptionRecord {
+    let (record, _) = nt_thread_start::user_exception::classify(fault, ip);
+    nt_process::dbgk::ExceptionRecord::new(record.code, record.address)
+        .with_parameters(&record.parameters[..record.parameter_count as usize])
 }
 
 /// Deliver `fault` raised at `ip` by the thread behind `badge` in process `pi`.
@@ -87,13 +123,13 @@ pub(crate) unsafe fn deliver_user_exception(
         runtime.user_stack_allocation_base,
         crate::exec_handler::HIGHEST_USER_ADDRESS,
     )
-    .map_err(|_| NotDelivered::Frame)?;
+    .map_err(|_| NotDelivered::Unwritable(Unwritable { tid: runtime.tid, code: record.code }))?;
     if !crate::spawn_hosts::shared_ingress::owner::runtime::can_restart_hosted(reply, tcb) {
         return Err(NotDelivered::Restart);
     }
     handler
         .process_memory_write_status(pi, prepared.frame_va, &prepared.frame)
-        .map_err(NotDelivered::StackWrite)?;
+        .map_err(|_| NotDelivered::Unwritable(Unwritable { tid: runtime.tid, code: record.code }))?;
     match crate::spawn_hosts::shared_ingress::owner::runtime::restart_hosted(
         reply,
         tcb,

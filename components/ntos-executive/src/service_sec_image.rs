@@ -32,6 +32,10 @@ mod loop_native_call;
 mod loop_vm_fault;
 #[path = "executor/exceptions.rs"]
 mod loop_exceptions;
+#[path = "executor/process_termination.rs"]
+mod loop_process_termination;
+#[path = "executor/user_exception.rs"]
+mod loop_user_exception;
 #[path = "executor/maintenance.rs"]
 mod loop_maintenance;
 #[path = "executor/body.rs"]
