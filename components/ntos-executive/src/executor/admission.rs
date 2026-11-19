@@ -118,14 +118,43 @@ pub(super) unsafe fn admit<'a>(
         ).expect("selected Receive child owns its exact fault observation");
         assert!(receive_vspace::validate_current(&nt_handler, event_runtime.binding(), observed),
             "Receive child and held provider require exact distinct current VSpace objects");
-        service_receive_child_fault(
+        match service_receive_child_fault(
             &mut nt_handler,
-            observed.observation,
+            observed,
             event_runtime.binding(),
             procs[event_runtime.pi].pml4,
             procs[event_runtime.pi].scratch_base,
-        )
-        .expect("changed or uncertain Receive fault retains child Call and parent");
+        ) {
+            Ok(ReceiveChildFaultOutcome::Serviced) => {}
+            Ok(ReceiveChildFaultOutcome::PageInOwned) => {
+                // The page-in row owns the child's Reply; the child's CALLS row still holds the
+                // parent. That row's one acknowledged Reply settles the outer boundary later.
+                win32k_glue::trace_receive_phase(
+                    b"fault-pagein-owned",
+                    observed.parent,
+                    observed.child,
+                    observed.trace_owner,
+                );
+                crate::native_image_pagein_work::redrive_receive_child(&mut nt_handler, lp.dispatcher);
+                let _ = finalize_service_loop_state(&mut nt_handler);
+                let received = receive(
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
+                )?;
+                (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
+                return ControlFlow::Break(Turn::Next);
+            }
+            Err(status) => {
+                // A changed or uncertain fault keeps the child's Call and Reply delivered and
+                // its parent held. Stop the root instead of replaying or replacing either.
+                print_str(b"[receive-child] fault retained status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                lp.exit.stop = u64::from(status);
+                lp.exit.stop_ssn = 0;
+                lp.exit.record(b"receive-child-fault-retained");
+                return ControlFlow::Break(Turn::Exit);
+            }
+        }
         thread_wait_state_clear_badge_running(&mut nt_handler, lp.msg.badge);
         lp.parks.wait_parked = wait_parked_owner_mask(&nt_handler);
         if procs[event_runtime.pi].faults == 0 { procs[event_runtime.pi].first = lp.msg.m1; }

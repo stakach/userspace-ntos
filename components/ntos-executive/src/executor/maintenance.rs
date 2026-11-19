@@ -1109,6 +1109,49 @@ pub(super) unsafe fn maintain(
     }
     // This delivery still owns its Reply and captured message. An outer resume can select
     // a different Receive child, so leave that work to a boundary without this ingress.
+    } else if let Some(action) = crate::native_image_pagein_work::receive_child_root_action(
+        if badge_has_delay_timer(lp.msg.badge) || hosted_irq_lines_from_badge(lp.msg.badge) != 0 {
+            nt_user_host::receive_child_pagein::ReceiveChildRootEvent::Notification
+        } else if hosted_ingress_binding(lp.msg.badge).is_some_and(|binding|
+            crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_is_current(
+                binding, local().reply_main_slot.load(Ordering::Relaxed)))
+        {
+            nt_user_host::receive_child_pagein::ReceiveChildRootEvent::SelectedChild
+        } else {
+            nt_user_host::receive_child_pagein::ReceiveChildRootEvent::Unrelated
+        },
+    ) {
+        // An owned page-in holds the child's Reply while its parent stays held. Only storage
+        // completion and that exact row may run until the child's settlement boundary.
+        use nt_user_host::receive_child_pagein::ReceiveChildRootAction as Action;
+        match action {
+            Action::ServicePageIn => {
+                if let Err(status) = crate::receive_child_pagein::service_notification(
+                    &mut nt_handler, nt_dispatcher, lp.msg.badge,
+                ) {
+                    lp.exit.stop = status.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
+                    lp.exit.record(b"receive-child-pagein-notification");
+                    return ControlFlow::Break(Turn::Exit);
+                }
+            }
+            Action::DeferUnrelated => {
+                crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+                    local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge,
+                ).expect("unexecuted unrelated Call retains its exact ingress owner");
+            }
+            Action::RefuseIdentity | Action::StopRetained => {
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
+                lp.exit.record(b"receive-child-pagein-retained");
+                return ControlFlow::Break(Turn::Exit);
+            }
+        }
+        let received = receive(
+            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
+        )?;
+        (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
+        return ControlFlow::Break(Turn::Next);
     } else {
         ingress = Some(nt_handler.admit_hosted_thread_ingress(lp.msg.badge)
             .expect("selected Receive child retains its current ingress binding"));

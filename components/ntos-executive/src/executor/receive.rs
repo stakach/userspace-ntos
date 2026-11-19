@@ -67,6 +67,13 @@ pub(super) unsafe fn receive(
             exit.record(b"queued-callback-child-transfer");
             return ControlFlow::Break(Turn::Exit);
         }
+    } else if crate::native_image_pagein_work::owns_receive_child() {
+        if !crate::receive_child_pagein::prepare_receive() {
+            exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+            exit.stop_ssn = 0;
+            exit.record(b"receive-child-pagein-shot");
+            return ControlFlow::Break(Turn::Exit);
+        }
     } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
         if !prepare_service_receive(&mut *ingress.delay_queue, nt_handler) {
             exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -109,6 +116,13 @@ pub(super) unsafe fn reply_receive(
             exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
             exit.stop_ssn = 0;
             exit.record(b"queued-callback-child-transfer");
+            return ControlFlow::Break(Turn::Exit);
+        }
+    } else if crate::native_image_pagein_work::owns_receive_child() {
+        if !crate::receive_child_pagein::prepare_receive() {
+            exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+            exit.stop_ssn = 0;
+            exit.record(b"receive-child-pagein-shot");
             return ControlFlow::Break(Turn::Exit);
         }
     } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {

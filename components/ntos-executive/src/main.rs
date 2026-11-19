@@ -167,6 +167,7 @@ mod hosted_spawn_uncertainty;
 mod section_pagein_work;
 mod provider_section_map_work;
 mod native_image_pagein_work;
+mod receive_child_pagein;
 mod routed_pagein_source;
 mod vm_lock_pagein_work;
 mod vm_copy_work;
@@ -18103,6 +18104,16 @@ unsafe fn ack_parked_add_device_retry_timer() -> Result<(), nt_status::NtStatus>
         .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
     LAST_REARM_AUTHORITY.invalidate();
     let _ = service_sec_image::root_add_device_retry_wake_due(monotonic_time_100ns());
+    TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
+    delay_timer_ack_irq()
+}
+
+/// ACK only the Receive child page-in shot while the held parent awaits its child's settlement.
+/// Overdue general timers are drained by the ordinary loop after that parent is restored.
+unsafe fn ack_receive_child_pagein_timer() -> Result<(), nt_status::NtStatus> {
+    let _delivery = TIMER_DELIVERY_GATE.try_enter()
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    LAST_REARM_AUTHORITY.invalidate();
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     delay_timer_ack_irq()
 }

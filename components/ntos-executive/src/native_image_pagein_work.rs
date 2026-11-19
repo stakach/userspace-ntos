@@ -1,4 +1,5 @@
 //! Retained routed SEC_IMAGE page-ins for faults and syscall copy probes.
+//! A selected Receive child's fault is owned here too, with its held parent still parked.
 
 use crate::*;
 use alloc::vec::Vec;
@@ -15,6 +16,15 @@ use nt_memory_manager::routed_image_read::RoutedImageRead;
 use nt_memory_manager::RoutedSectionLease;
 use nt_pe_loader::{ImagePageFileSpan, ImagePageFillCapture};
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
+use nt_user_host::receive_child_pagein::{
+    ReceiveChildPageIn, ReceiveChildRootAction, ReceiveChildRootEvent,
+};
+
+type ReceiveTurn = ReceiveChildPageIn<
+    nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+    nt_component_suspension::ExternalAdmissionKey,
+    nt_component_suspension::NestedExecutionIdentity,
+>;
 
 type ImageRead = RoutedImageRead<
     (ImageAreaId, RoutedSectionLease), u64, driver_launch::hosted_file_capture::Capture,
@@ -52,6 +62,9 @@ impl CopyService {
 #[derive(Clone, Copy)]
 enum Purpose {
     Fault,
+    /// The selected Receive child's fault. This row owns the child's Reply; its CALLS row
+    /// owns the held parent and settles it from that one acknowledged Reply.
+    ReceiveChild,
     SyscallCopy(SyscallCopy),
     VmLock { token: u64, caller_pi: usize },
     VmCopy { token: u64, caller_pi: usize, service_number: u32 },
@@ -101,6 +114,11 @@ struct Work {
     purpose: Purpose,
     progress: nt_syscall::copy_preflight::CopyOutputContinuation,
     drive_progress: bool,
+    receive: Option<ReceiveTurn>,
+}
+
+impl Purpose {
+    const fn is_fault(self) -> bool { matches!(self, Self::Fault | Self::ReceiveChild) }
 }
 
 impl Work {
@@ -150,6 +168,18 @@ unsafe fn prepare_page(
     observation: ImageFaultObservation, purpose: Purpose, reply: u64,
     parked: bool,
 ) -> Result<Option<Work>, u32> {
+    let (tid, badge) = (handler.current_tid, handler.current_badge);
+    prepare_page_as(handler, pi, page, access, observation, purpose, reply, parked, tid, badge)
+}
+
+/// `tid` and `badge` name the faulting thread explicitly. The Receive root boundary runs
+/// before the handler's current-thread selection for its event.
+#[allow(clippy::too_many_arguments)]
+unsafe fn prepare_page_as(
+    handler: &mut ExecNtHandler, pi: usize, page: u64, access: FaultAccess,
+    observation: ImageFaultObservation, purpose: Purpose, reply: u64,
+    parked: bool, tid: u64, badge: u64,
+) -> Result<Option<Work>, u32> {
     let Some(view) = handler.native_image_view_for_page(pi, page)? else { return Ok(None); };
     let Some(source) = handler.image_sections.source_for_view(view.view) else { return Err(INVALID); };
     if !matches!(source.contents, crate::native_image_sections::NativeImageContents::RetainedRouted) {
@@ -163,7 +193,7 @@ unsafe fn prepare_page(
     let producer = has_source_producer(view.view.area(), rva);
     let uncertain = has_uncertain_source_owner(view.view.area(), rva);
     let decision = routed_source_read_decision(existing, source_ready, producer, uncertain);
-    if matches!(purpose, Purpose::Fault) && existing && !source_ready {
+    if purpose.is_fault() && existing && !source_ready {
         let sequence = UNREADY_FAULT_TRACE.fetch_add(1, Ordering::Relaxed);
         if sequence < 16 || sequence.is_power_of_two() {
             let mut record = nt_printf::record::RecordBuffer::<320>::new();
@@ -177,7 +207,7 @@ unsafe fn prepare_page(
             } else { record.bytes() });
         }
     }
-    if matches!(purpose, Purpose::Fault)
+    if purpose.is_fault()
         && decision == RoutedSourceReadDecision::Ready
     { return Ok(None); }
     if matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. } | Purpose::VmCopy { .. }
@@ -207,7 +237,6 @@ unsafe fn prepare_page(
         return Err(INVALID);
     }
     nt_address_space::image_view_fault_access_status(info.protect, access)?;
-    let tid = handler.current_tid;
     let tcb = handler.hosted_thread_tcb(tid).ok_or(INVALID)?;
     let caller_pi = match purpose {
         Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. }
@@ -215,14 +244,14 @@ unsafe fn prepare_page(
         _ => pi,
     };
     let logical = handler.capture_provider_logical_caller(
-        caller_pi, tid, handler.current_badge, tcb,
+        caller_pi, tid, badge, tcb,
     ).ok_or(INVALID)?;
     let capture = driver_launch::hosted_file_capture::capture_owned(file, device, granted_access)?;
     if capture.fs_context() != context { return Err(INVALID); }
     let origin_driver = driver_launch::io_manager_mut().device(DeviceId(device))
         .ok_or(INVALID)?.driver_id.raw();
     Ok(Some(Work {
-        pi, tid, badge: handler.current_badge, reply, logical, view, page, rva, access,
+        pi, tid, badge, reply, logical, view, page, rva, access,
         observation, info, lease, origin_driver, capture: Some(capture),
         fill: ImagePageFillCapture::new(plan), span: None, read: None,
         phase: if decision == RoutedSourceReadDecision::EnterRead {
@@ -232,7 +261,7 @@ unsafe fn prepare_page(
         pending_irp_since_100ns: None,
         failure: None, failure_logged: false, cancel_requested: false,
         purpose, progress: nt_syscall::copy_preflight::CopyOutputContinuation::PageReady,
-        drive_progress: false,
+        drive_progress: false, receive: None,
     }))
 }
 
@@ -264,6 +293,50 @@ pub(crate) unsafe fn submit(
         else { return Ok(false); };
     install_work(work, false)?;
     Ok(true)
+}
+
+/// Own the selected Receive child's fault when its routed source page is not ready. The child
+/// Reply is parked before any provider READ; the held parent stays in the child's CALLS row.
+/// Returns false, with no effect, for a ready, local or legacy page.
+pub(crate) unsafe fn submit_receive_child(
+    handler: &mut ExecNtHandler,
+    child: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+    admission: nt_component_suspension::ExternalAdmissionKey,
+    parent: nt_component_suspension::NestedExecutionIdentity,
+    page: u64, access: FaultAccess, observation: ImageFaultObservation,
+) -> Result<bool, u32> {
+    let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if admission.reply() != reply || admission.executor() != child.tcb
+        || handler.hosted_thread_tcb(child.tid) != Some(child.tcb)
+        || owns_receive_child()
+    {
+        return Err(INVALID);
+    }
+    let turn = ReceiveTurn::admit(child, admission, parent, page).map_err(|_| INVALID)?;
+    let Some(mut work) = prepare_page_as(handler, child.pi, page, access, observation,
+        Purpose::ReceiveChild, reply, false, child.tid, child.badge)?
+        else { return Ok(false); };
+    work.receive = Some(turn);
+    install_work(work, false)?;
+    print_str(b"[native-image-pagein] receive child owned pi=");
+    print_u64(child.pi as u64);
+    print_str(b" tid="); print_u64(child.tid);
+    print_str(b" page=0x"); print_hex((page >> 32) as u32); print_hex(page as u32);
+    print_str(b"\n");
+    Ok(true)
+}
+
+/// True while a page-in row owns the selected Receive child's Reply. The turn is consumed
+/// at the acknowledged settlement; retiring the parked Reply after that is ordinary work.
+pub(crate) fn owns_receive_child() -> bool {
+    unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten().any(|row| row.receive.is_some()) }
+}
+
+/// The root's admission of one event while the Receive child's page-in owns its Reply.
+pub(crate) fn receive_child_root_action(event: ReceiveChildRootEvent) -> Option<ReceiveChildRootAction> {
+    unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten()
+        .find_map(|row| row.receive.as_ref()) }
+        .map(|turn| turn.root_action(event))
 }
 
 unsafe fn next_syscall_page(
@@ -446,7 +519,7 @@ pub(crate) fn wake_due(now: u64) -> u64 {
 fn diagnostic_probe(work: &Work, executing: bool) -> Option<(
     nt_hosted_runtime::SpanOwner, u64, crate::installer_child_span_census::PageInProbe,
 )> {
-    if !matches!(work.purpose, Purpose::Fault) { return None; }
+    if !work.purpose.is_fault() { return None; }
     let nt_user_host::process_identity::ProcessGeneration::Hosted(process_generation) =
         work.view.process.generation else { return None; };
     let phase = match work.phase {
@@ -763,7 +836,7 @@ unsafe fn advance(
             ) {
                 work.failure = Some(status);
                 work.phase = match work.purpose {
-                    Purpose::Fault => Phase::Cancel,
+                    Purpose::Fault | Purpose::ReceiveChild => Phase::Cancel,
                     // The Reply is this row's alone; returning the handler's status replays
                     // nothing, whatever state the source owner was left in.
                     Purpose::SyscallRetry { .. } => Phase::ReplyReady,
@@ -788,7 +861,7 @@ unsafe fn advance(
                 other => {
                     work.failure = Some(other.err().unwrap_or(INVALID));
                     work.phase = match work.purpose {
-                        Purpose::Fault => Phase::Cancel,
+                        Purpose::Fault | Purpose::ReceiveChild => Phase::Cancel,
                         Purpose::SyscallRetry { .. } => Phase::ReplyReady,
                         _ => Phase::Indeterminate,
                     };
@@ -798,6 +871,8 @@ unsafe fn advance(
             if matches!(work.purpose, Purpose::SyscallCopy(_)) {
                 assert!(work.progress.map_completed());
                 work.phase = Phase::ScanSyscall;
+            } else if work.receive.as_mut().is_some_and(|turn| turn.page_mapped().is_err()) {
+                work.phase = Phase::Indeterminate;
             } else {
                 work.phase = Phase::ReplyReady;
             }
@@ -872,7 +947,7 @@ unsafe fn advance(
                     Purpose::RoutedFileModeInput { identity, irp_id, token } =>
                         crate::service_sec_image::file_mode_input_page_completed(
                             identity, irp_id, token, work.pi, work.page, 0),
-                    Purpose::Fault | Purpose::SyscallCopy(_)
+                    Purpose::Fault | Purpose::ReceiveChild | Purpose::SyscallCopy(_)
                     | Purpose::SyscallRetry { .. } => unreachable!(),
                 };
                 if completed {
@@ -887,6 +962,14 @@ unsafe fn advance(
                     Some(_) => reply_parked_syscall(work.reply, u64::from(status)),
                 },
                 Purpose::Fault => client_reply_on(work.reply, 0, 0, 0, 0, 0),
+                Purpose::ReceiveChild => {
+                    if work.receive.as_mut().is_none_or(|turn| turn.enter_reply().is_err()) {
+                        work.phase = Phase::Indeterminate;
+                        return false;
+                    }
+                    // The child's CALLS row settles its held parent from this one Reply.
+                    client_reply_on(work.reply, 0, 0, 0, 0, 0)
+                }
                 Purpose::SyscallCopy(_) => {
                     let status = work.progress.reply_status()
                         .expect("retained copy Reply has terminal status");
@@ -927,11 +1010,37 @@ unsafe fn advance(
             false
         }
         Phase::ReplySent => {
+            if let Some(turn) = work.receive.take() {
+                match turn.acknowledge() {
+                    Ok(settled) => {
+                        print_str(b"[native-image-pagein] receive child settled tid=");
+                        print_u64(settled.child().tid);
+                        print_str(b" page=0x");
+                        print_hex((settled.page() >> 32) as u32);
+                        print_hex(settled.page() as u32);
+                        print_str(b"\n");
+                    }
+                    Err((_, turn)) => {
+                        work.receive = Some(turn);
+                        work.phase = Phase::Indeterminate;
+                        return false;
+                    }
+                }
+            }
             if parked_reply::retire_sent(work.reply).is_err() { return false; }
             thread_wait_state_clear_badge_ready(handler, work.badge);
             true
         }
         Phase::Cancel => {
+            if matches!(work.purpose, Purpose::ReceiveChild) {
+                // A held Receive parent has no cancellation settlement. Retain the child's
+                // Call and Reply with the parent; the root stops rather than replaying.
+                let status = work.failure.unwrap_or(INVALID);
+                work.failure = Some(status);
+                if let Some(turn) = work.receive.as_mut() { turn.retain(status); }
+                work.phase = Phase::Indeterminate;
+                return false;
+            }
             if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }
                 | Purpose::RoutedFileModeInput { .. }) {
                 let source = crate::routed_pagein_source::RoutedPageInSource::Image {
@@ -946,7 +1055,7 @@ unsafe fn advance(
                     Purpose::RoutedFileModeInput { identity, irp_id, token } =>
                         crate::service_sec_image::file_mode_input_page_completed(
                             identity, irp_id, token, work.pi, work.page, status),
-                    Purpose::Fault | Purpose::SyscallCopy(_)
+                    Purpose::Fault | Purpose::ReceiveChild | Purpose::SyscallCopy(_)
                     | Purpose::SyscallRetry { .. } => unreachable!(),
                 };
                 if completed {
@@ -978,6 +1087,9 @@ unsafe fn advance(
             true
         }
         Phase::Indeterminate => {
+            if let Some(turn) = work.receive.as_mut() {
+                turn.retain(work.failure.unwrap_or(RESOURCES));
+            }
             if !work.failure_logged {
                 print_str(b"[native-image-pagein] retained uncertain owner pi=");
                 print_u64(work.pi as u64);
@@ -997,14 +1109,30 @@ unsafe fn advance(
 pub(crate) unsafe fn redrive(
     handler: &mut ExecNtHandler, dispatcher: &NativeSyscallDispatcher,
 ) {
-    if next_deadline().is_none_or(|deadline| monotonic_time_100ns() < deadline)
-        || ACTIVE.swap(true, Ordering::AcqRel)
-    { return; }
+    if next_deadline().is_none_or(|deadline| monotonic_time_100ns() < deadline) { return; }
+    redrive_rows(handler, dispatcher, false);
+}
+
+/// Drive only the Receive child's row, at each root notification while its parent is held.
+/// No other row can reply, dispatch a syscall or enter a provider from this turn.
+pub(crate) unsafe fn redrive_receive_child(
+    handler: &mut ExecNtHandler, dispatcher: &NativeSyscallDispatcher,
+) {
+    if owns_receive_child() { redrive_rows(handler, dispatcher, true); }
+}
+
+unsafe fn redrive_rows(
+    handler: &mut ExecNtHandler, dispatcher: &NativeSyscallDispatcher, receive_child_only: bool,
+) {
+    if ACTIVE.swap(true, Ordering::AcqRel) { return; }
     let _durable = allocator::enter_durable();
     let admissions_before = ADMISSIONS.load(Ordering::Acquire);
     let mut immediate_followup = false;
     let count = (&*core::ptr::addr_of!(WORK)).len();
     for index in 0..count {
+        if receive_child_only && !(&*core::ptr::addr_of!(WORK))[index].as_ref()
+            .is_some_and(|row| matches!(row.purpose, Purpose::ReceiveChild))
+        { continue; }
         let Some(mut work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].take() else { continue; };
         EXECUTING_INDEX.store(index as u64, Ordering::Release);
         EXECUTING_TID.store(work.tid, Ordering::Release);
@@ -1012,7 +1140,7 @@ pub(crate) unsafe fn redrive(
         *core::ptr::addr_of_mut!(EXECUTING_SOURCE) =
             Some((work.view.view.area(), work.rva, work.phase));
         let (caller_pi, resume_ip, sp, flags, transport, service) = match work.purpose {
-            Purpose::Fault => (work.pi, 0, 0, 0, false, 0),
+            Purpose::Fault | Purpose::ReceiveChild => (work.pi, 0, 0, 0, false, 0),
             Purpose::SyscallCopy(call) =>
                 (work.pi, call.resume_ip, call.sp, call.flags, call.native_call_transport,
                     call.service.number()),
@@ -1024,7 +1152,7 @@ pub(crate) unsafe fn redrive(
             Purpose::SyscallRetry { caller_pi, .. } => (caller_pi, 0, 0, 0, false, 0),
         };
         EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);
-        let is_fault = matches!(work.purpose, Purpose::Fault);
+        let is_fault = work.purpose.is_fault();
         let mut budget = LocalDriveBudget::new(LOCAL_FAULT_STEPS);
         let done = service_sec_image::with_pagein_caller_target_context(
             handler, caller_pi, work.pi, work.tid, work.badge,

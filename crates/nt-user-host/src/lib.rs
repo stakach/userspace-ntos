@@ -28,6 +28,7 @@ pub mod provider_wait_selection;
 pub mod pending_caller;
 pub mod hosted_return_target;
 pub mod receive_child_barrier;
+pub mod receive_child_pagein;
 pub mod root_ingress_pass;
 pub mod retained_owner_table;
 pub mod durable_context_lease;

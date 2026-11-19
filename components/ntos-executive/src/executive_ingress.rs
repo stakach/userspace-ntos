@@ -218,13 +218,17 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
         if let Some((_reply, message)) = delivered {
             return ReceiveOutcome::Message(materialize(message));
         }
+        // A page-in row owning the delivered child's Reply waits here for notifications only;
+        // every hosted or component arrival stays retained in its own row until settlement.
         assert!(
-            !runtime::receive_child_pending(),
+            !runtime::receive_child_pending() || crate::native_image_pagein_work::owns_receive_child(),
             "Receive child cannot be replaced by another ingress before its exact settlement"
         );
         // The snapshot journal owns the mounted volume through COMMIT and its terminal ACK.
-        // Autonomous Calls stay retained and unadmitted while that ownership is live.
-        if !crate::writable_fs::registry_journal::owns_volume()
+        // Autonomous Calls stay retained and unadmitted while that ownership is live, and
+        // while a held Receive parent awaits its child.
+        if !runtime::receive_child_pending()
+            && !crate::writable_fs::registry_journal::owns_volume()
             && !crate::service_sec_image::root_add_device_exclusive_pending()
             && !crate::service_sec_image::root_queued_callback_exclusive_pending()
             && !crate::driver_launch::unsettled_queued_callback()

@@ -5474,17 +5474,27 @@ pub(crate) unsafe fn service_legacy_image_page_residency(
     )
 }
 
+/// How the outer boundary disposed of a selected Receive child's fault.
+pub(super) enum ReceiveChildFaultOutcome {
+    /// The page is installed; the boundary replies to the child and settles its parent.
+    Serviced,
+    /// An owned page-in row parked the child's Reply before any provider READ. It replies once
+    /// after exact terminal, copy, acknowledgement and installation; the parent stays held.
+    PageInOwned,
+}
+
 /// The outer boundary alone owns the handler and may service a retained Receive child.
 unsafe fn service_receive_child_fault(
     handler: &mut ExecNtHandler,
-    capture: crate::win32k_glue::ReceiveFaultCapture,
+    observed: crate::spawn_hosts::shared_ingress::owner::runtime::ReceiveChildObservation,
     binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
     pml4: u64,
     scratch_base: u64,
-) -> Result<(), u32> {
-    match capture {
+) -> Result<ReceiveChildFaultOutcome, u32> {
+    match observed.observation {
         crate::win32k_glue::ReceiveFaultCapture::Resident(resident) => {
             handler.service_captured_private_read_fault(resident, binding)
+                .map(|()| ReceiveChildFaultOutcome::Serviced)
         }
         crate::win32k_glue::ReceiveFaultCapture::StackGuard(guard) => {
             if guard.child != binding
@@ -5513,7 +5523,8 @@ unsafe fn service_receive_child_fault(
                 scratch_base,
                 vm_fault_access_from_x86_error(guard.error_code),
             )? {
-                Some(nt_thread_start::stack_vad::StackVadOutcome::Grown) => Ok(()),
+                Some(nt_thread_start::stack_vad::StackVadOutcome::Grown) =>
+                    Ok(ReceiveChildFaultOutcome::Serviced),
                 _ => Err(nt_address_space::STATUS_ACCESS_VIOLATION),
             }
         }
@@ -5525,6 +5536,16 @@ unsafe fn service_receive_child_fault(
             {
                 return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
             }
+            // A routed source that is not ready would make Direct residency dispatch a READ
+            // that can return Pending. Own it first; a ready or local page stays inline.
+            if crate::receive_child_pagein::deferral_admitted()
+                && crate::native_image_pagein_work::submit_receive_child(
+                    handler, binding, observed.child, observed.parent,
+                    image.page, image.access, image.observation,
+                )?
+            {
+                return Ok(ReceiveChildFaultOutcome::PageInOwned);
+            }
             match handler.service_native_image_page_residency(
                 binding.pi,
                 image.page,
@@ -5535,7 +5556,7 @@ unsafe fn service_receive_child_fault(
                 None => service_legacy_image_page_residency(
                     handler, binding.pi, image.page, image.access, image.observation,
                 ),
-            }
+            }.map(|()| ReceiveChildFaultOutcome::Serviced)
         }
     }
 }
