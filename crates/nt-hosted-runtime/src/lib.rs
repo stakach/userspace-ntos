@@ -33,6 +33,7 @@ mod driver_load_receipt;
 mod dxg_registration;
 mod contiguous_ram;
 mod provider_export_worker;
+mod caller_marshal;
 mod gop_bar_projection;
 mod hosted_driver_thread_object;
 mod hosted_current_thread_kpcr;
@@ -61,6 +62,10 @@ pub use contiguous_ram::{ContiguousRamCachePolicy, ContiguousRamError, Contiguou
     ContiguousRamPrepareTable, ContiguousRamReceipt, ContiguousRamRequest,
     ContiguousRamLeaseBank, ContiguousRamLease, ContiguousRamLeaseSource,
     ContiguousRamPublishedMapping, ContiguousRamProjectedMapping};
+pub use caller_marshal::{
+    classify_hosted_caller_arguments, hosted_wddm_bridge_send_ioctl_marshal_policy,
+    HostedCallerArgument, HostedCallerMarshalError,
+};
 pub use dxg_registration::{
     dxg_recommendation_settle_admitted,
     dxg_contiguous_dependent_admitted,
@@ -1072,6 +1077,14 @@ pub enum HostedProviderArgumentMarshal {
     CallerOutU32,
     CallerInOutU32,
     CallerOutPhysicalAddress,
+    /// A caller buffer the provider may read and write; its length is a ULONG argument.
+    CallerInOutBuffer {
+        length_arg: u8,
+    },
+    /// A fixed-size caller cell the provider may read and write.
+    CallerInOutFixed {
+        bytes: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1096,6 +1109,8 @@ pub enum HostedProviderExportSideEffect {
 pub enum HostedProviderExportResultSemantics {
     NtStatus,
     Void,
+    /// A BOOLEAN in the low byte of RAX.
+    Boolean,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
