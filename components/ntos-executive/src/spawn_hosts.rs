@@ -4046,6 +4046,22 @@ unsafe fn component_pump_loop(
             pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
                 status as u32 as u64, out1, out2, out3);
             continue;
+        } else if label == crate::win32k_subsystem::W32_WDDM_BRIDGE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            // A routed WDDM bridge slot runs the provider synchronously, like a hosted
+            // provider export: the win32k Call stays held until the provider returns.
+            let (status, result) = if shared_pump::authenticated_badge(ch, msg.badge) {
+                unsafe {
+                    crate::driver_launch::service_win32k_wddm_bridge_call(
+                        ch, *reply_cap, msg.badge, msg.mi, [msg.m0, msg.m1, msg.m2, msg.m3],
+                    )
+                }
+            } else {
+                (nt_process::STATUS_INVALID_PARAMETER as i32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, result, 0, 0);
+            continue;
         } else if label == crate::win32k_subsystem::W32_USER_OBJECT_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {

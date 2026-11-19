@@ -55,6 +55,7 @@ mod hosted_dxg_registration;
 #[path = "hosted_provider_export_lane.rs"]
 pub(crate) mod hosted_provider_export_lane;
 pub(super) use hosted_dxg_registration::bridge_dxg_registration_entry;
+pub(crate) use hosted_dxg_registration::wddm_bridge::service as service_win32k_wddm_bridge_call;
 
 #[path = "hosted_wmi.rs"]
 mod hosted_wmi;
@@ -22285,6 +22286,7 @@ unsafe fn clear_hosted_provider_singletons_for_instance(instance: usize) -> u64 
                     singleton.owner_domain,
                     singleton.provider_publication_cookie,
                 );
+                hosted_dxg_registration::wddm_bridge::retire_provider(singleton.owner_domain);
                 *singleton = HostedProviderSingleton::empty();
             }
         }
@@ -33059,8 +33061,11 @@ unsafe fn project_provider_resource_state(
 }
 
 fn provider_export_result_success(policy: HostedProviderExportMarshalPolicy, result: u64) -> bool {
-    policy.result_semantics == HostedProviderExportResultSemantics::Void
-        || result == STATUS_SUCCESS as u64
+    match policy.result_semantics {
+        HostedProviderExportResultSemantics::Void => true,
+        HostedProviderExportResultSemantics::NtStatus => result == STATUS_SUCCESS as u64,
+        HostedProviderExportResultSemantics::Boolean => result as u8 != 0,
+    }
 }
 
 fn provider_policy_uses_packet_array(policy: HostedProviderExportMarshalPolicy) -> bool {
@@ -33799,15 +33804,16 @@ where
             print_str(b"[provider-export] reject stage=dxg-worker-owner\n");
             return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
         };
+        let dependent = hosted_provider_export_lane::Dependent::Hosted(dependent_index);
         if let Err(status) = hosted_provider_export_lane::prepare(
-            singleton.instance, dependent_index, owner, provider_publication_cookie) {
+            singleton.instance, dependent, owner, provider_publication_cookie) {
             print_str(b"[provider-export] reject stage=dxg-worker-prepare status=0x");
             print_hex(status.raw() as u32);
             print_str(b"\n");
             return hosted_provider_export_failure(status.raw() as i32);
         }
         let Some(selection) = hosted_provider_export_lane::select(
-            singleton.instance, owner, provider_publication_cookie)
+            singleton.instance, dependent, owner, provider_publication_cookie)
         else {
             print_str(b"[provider-export] reject stage=dxg-worker-select\n");
             return hosted_provider_export_failure(nt_status::NtStatus::DEVICE_BUSY.raw() as i32);

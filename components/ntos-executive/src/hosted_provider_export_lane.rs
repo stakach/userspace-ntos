@@ -41,10 +41,33 @@ struct PendingStartupRestore {
     retryable: bool,
 }
 
+/// The domain whose call the worker serves. The owner pair names both domains; the kind keeps
+/// a hosted dependent and a win32k dependent with equal numeric identities apart.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum Dependent {
+    Hosted(usize),
+    Win32k(nt_provider_wait::ProviderDomainIdentity),
+}
+
+impl Dependent {
+    unsafe fn owns(self, owner: HostedProviderObjectOwner, provider: usize) -> bool {
+        match self {
+            Self::Hosted(dependent) => hosted_provider_object_owner_is_live(owner, provider, dependent),
+            Self::Win32k(identity) => {
+                instance(provider).and_then(instance_domain_identity).is_some_and(|domain|
+                    owner.provider_matches(domain.domain_id.raw(), domain.cookie))
+                    && owner.dependent_matches(identity.domain, identity.generation)
+                    && crate::current_win32k_provider_domain() == Some(identity)
+            }
+        }
+    }
+}
+
 struct Lane {
     provider: usize,
     domain: HostedDomainIdentity,
     pml4: u64,
+    dependent: Dependent,
     owner: HostedProviderObjectOwner,
     publication: u64,
     ordinal: u64,
@@ -73,12 +96,14 @@ pub(super) struct Selection {
     pub publication: u64,
 }
 
-unsafe fn index_for(provider: usize, owner: HostedProviderObjectOwner, publication: u64) -> Option<usize> {
+unsafe fn index_for(provider: usize, dependent: Dependent, owner: HostedProviderObjectOwner,
+    publication: u64) -> Option<usize> {
     let inst = instance(provider)?;
     let domain = instance_domain_identity(inst)?;
     (&*core::ptr::addr_of!(LANES)).iter().position(|row| {
         row.provider == provider && row.domain == domain && row.pml4 == inst.pml4
-            && row.owner == owner && row.publication == publication && row.phase != Phase::Retired
+            && row.dependent == dependent && row.owner == owner
+            && row.publication == publication && row.phase != Phase::Retired
     })
 }
 
@@ -124,12 +149,12 @@ pub(crate) unsafe fn is_channel(ch: &crate::spawn_hosts::PumpChannel) -> bool {
 }
 
 pub(super) unsafe fn prepare(
-    provider: usize, dependent: usize, owner: HostedProviderObjectOwner, publication: u64,
+    provider: usize, dependent: Dependent, owner: HostedProviderObjectOwner, publication: u64,
 ) -> Result<(), nt_status::NtStatus> {
-    if publication == 0 || !hosted_provider_object_owner_is_live(owner, provider, dependent) {
+    if publication == 0 || !dependent.owns(owner, provider) {
         return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
     }
-    if let Some(index) = index_for(provider, owner, publication) {
+    if let Some(index) = index_for(provider, dependent, owner, publication) {
         let row = &(&*core::ptr::addr_of!(LANES))[index];
         return if row.phase == Phase::Ready && row.route.is_some_and(|route|
             matches!(runtime::ready_for_admission(route), Ok(true))) { Ok(()) }
@@ -158,7 +183,7 @@ pub(super) unsafe fn prepare(
         rows.try_reserve(1).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         let ordinal = ORDINAL_BIT | (rows.len() as u64).checked_add(1)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-        rows.push(Lane { provider, domain, pml4: inst.pml4, owner, publication, ordinal,
+        rows.push(Lane { provider, domain, pml4: inst.pml4, dependent, owner, publication, ordinal,
             handle: 0, route: None, component_shared: 0, executive_shared: 0,
             phase: Phase::Preparing, startup_dispatch: None, startup_restore: None });
         rows.len() - 1
@@ -411,8 +436,8 @@ pub(crate) unsafe fn drain() -> usize {
         let after = (last != usize::MAX).then_some(last);
         next_ready_pending_lane(rows.len(), after, |index| {
             let row = &rows[index];
-            if row.phase != Phase::StartupRestore || index_for(row.provider, row.owner,
-                row.publication) != Some(index) {
+            if row.phase != Phase::StartupRestore || index_for(row.provider, row.dependent,
+                row.owner, row.publication) != Some(index) {
                 return PendingLaneReadiness::Absent;
             }
             let Some(pending) = row.startup_restore.as_ref().filter(|pending| pending.retryable)
@@ -491,9 +516,9 @@ pub(crate) unsafe fn validate_startup_ready(ch: &crate::spawn_hosts::PumpChannel
             Ok(nt_component_suspension::ReplyBindingObservation::BoundToTarget))
 }
 
-pub(super) unsafe fn select(provider: usize, owner: HostedProviderObjectOwner,
-    publication: u64) -> Option<Selection> {
-    let Some(index) = index_for(provider, owner, publication) else {
+pub(super) unsafe fn select(provider: usize, dependent: Dependent,
+    owner: HostedProviderObjectOwner, publication: u64) -> Option<Selection> {
+    let Some(index) = index_for(provider, dependent, owner, publication) else {
         print_str(b"[dxg-worker] select reject=index\n");
         return None;
     };

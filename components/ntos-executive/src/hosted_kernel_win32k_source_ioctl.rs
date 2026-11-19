@@ -665,6 +665,27 @@ impl Work {
             self.source_address, self.source_ticket, self.source_generation,
         )
     }
+    /// dxgkrnl's bridge interface names its own code; win32k receives routed entries instead.
+    unsafe fn project_wddm_bridge(&mut self, length: usize) -> bool {
+        use super::hosted_dxg_registration::wddm_bridge::{project_query_interface, ProjectionResult};
+        if self.code != nt_io_manager::wddm_bridge_interface::IOCTL_WDDM_BRIDGE_QUERY_INTERFACE
+            || self.terminal.is_none_or(|(status, _)| status != 0)
+        {
+            return true;
+        }
+        match project_query_interface(self.route, self.target.device_id().raw(),
+            &mut self.output[..length])
+        {
+            ProjectionResult::Projected => true,
+            ProjectionResult::Retry => false,
+            ProjectionResult::Refused(status) => {
+                self.terminal = Some((status as u32, 0));
+                self.output.fill(0);
+                true
+            }
+        }
+    }
+
     unsafe fn project_monitor_array(&mut self, length: usize) -> bool {
         use nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity;
         use nt_io_manager::video_monitor_array_projection::{
@@ -970,6 +991,7 @@ impl Work {
             }
         }
         if !self.project_monitor_array(length) { return false; }
+        if !self.project_wddm_bridge(length) { return false; }
         if self.pool_map_handled && status == 0
             && self.code == nt_video_miniport::IOCTL_VIDEO_MAP_VIDEO_MEMORY
             && !super::hosted_video_pool_map::publish_map(

@@ -38,6 +38,8 @@ mod allocation;
 pub(super) mod recommendation;
 #[path = "hosted_dxg_registration/vidpn.rs"]
 pub(super) mod vidpn;
+#[path = "hosted_dxg_registration/wddm_bridge.rs"]
+pub(super) mod wddm_bridge;
 
 #[derive(Clone, Copy)]
 struct DxgResolution {

@@ -414,31 +414,10 @@ pub(crate) unsafe fn complete_terminal(packet: u64, length: u64) -> i32 {
             return STATUS_INVALID_PARAMETER_I32;
         }
     }
-    let mut projected_output = Vec::new();
-    let output = if handoff.code
-        == nt_io_manager::wddm_bridge_interface::IOCTL_WDDM_BRIDGE_QUERY_INTERFACE
-        && status == 0
-    {
-        if projected_output.try_reserve_exact(handoff.output.len()).is_err() {
-            replace_busy(index, nonce, OriginSlot::Live(origin));
-            return STATUS_INSUFFICIENT_RESOURCES_I32;
-        }
-        projected_output.extend_from_slice(handoff.output);
-        if !super::wddm_bridge::project(&mut projected_output) {
-            replace_busy(index, nonce, OriginSlot::Live(origin));
-            let _ = wire::publish_terminal_ack(
-                packet_bytes, TerminalPublication::Failed(STATUS_INVALID_PARAMETER_I32 as u32),
-            );
-            return STATUS_INVALID_PARAMETER_I32;
-        }
-        &projected_output[..]
-    } else {
-        handoff.output
-    };
     let prior_phase = origin.phase;
     origin.phase = OriginPhase::Indeterminate;
     if !origin.source.publish_terminal(
-        handoff.status, handoff.information, output,
+        handoff.status, handoff.information, handoff.output,
         origin.source.output_va, origin.source.iosb_va,
     ) {
         replace_busy(index, nonce, OriginSlot::Live(origin));

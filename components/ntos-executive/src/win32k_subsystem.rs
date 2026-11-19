@@ -1652,6 +1652,8 @@ pub const W32_LARGE_POOL_RETIRE_LABEL: u64 = 0x7ae;
 pub const W32_USER_OBJECT_LABEL: u64 = 0x7af;
 /// Reserve, commit and release reserve-only session views ([`session_view`]).
 pub const W32_SESSION_VIEW_LABEL: u64 = 0x7b0;
+/// A routed WDDM bridge slot: `(slot, entry rsp)` -> `(status, provider result)` ([`wddm_bridge`]).
+pub const W32_WDDM_BRIDGE_LABEL: u64 = 0x7b1;
 pub const W32_ATTACH_PLAIN: u64 = 1;
 pub const W32_ATTACH_DETACH: u64 = 2;
 pub const W32_ATTACH_STACK: u64 = 3;
@@ -13472,7 +13474,7 @@ pub(crate) const WIN32K_REGISTRY_OP_SYNC_INVALIDATE_RELATIONS: u64 = 16;
 const WIN32K_REGISTRY_USE_PREVIOUS_MODE: u64 = 1 << 63;
 #[path = "win32k_subsystem/device_registry.rs"]
 mod device_registry;
-mod wddm_bridge;
+pub(crate) mod wddm_bridge;
 mod desktop_parse;
 #[path = "win32k_subsystem/device_relations.rs"]
 mod device_relations;
