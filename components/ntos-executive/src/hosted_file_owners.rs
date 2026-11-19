@@ -1011,6 +1011,9 @@ pub(crate) enum GenericFilePumpDrive {
     Yielded,
     AwaitingLocalChild,
     Retained,
+    /// The pump returned with its lane still running after a scheduler yield. Its typed
+    /// continuation is the only receiver for that lane; the root drives it again at once.
+    SchedulerYielded,
     Blocked,
 }
 
@@ -1038,7 +1041,8 @@ fn generic_orphan_after(floor: u64) -> bool {
 /// Capped boot probe for the exact Hook File resume. Stages: 1/2/3 recorded
 /// entry/before/after; 10/11/12 native resume entry/before/after owner take;
 /// 13/14/15 alias invocation entry/return/exit; 16 returned, 17 yielded,
-/// 18 retryable refusal, 19 take refusal, 20 uncertain refusal.
+/// 18 retryable refusal, 19 take refusal, 20 uncertain refusal, 21 scheduler yield with the
+/// lane still running.
 fn trace_generic_file_resume(stage: u64, selector: GenericFilePumpSelector) {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     if COUNT.fetch_add(1, Ordering::Relaxed) >= 80 { return; }
@@ -1199,6 +1203,7 @@ unsafe fn resume_generic_file_pump(
         owner.recorded_generic_child_ran = None;
     }
     let mut owners = Some((invocation, continuation));
+    let mut scheduler_yielded = false;
     let progress = hosted_input_hook_live::with_suspended_hook_alias(
         selector.irp_id,
         row(selector.row_id).hook_pump.map(|h| h.initial_key).unwrap_or(selector.key),
@@ -1251,7 +1256,10 @@ unsafe fn resume_generic_file_pump(
         }
         Err((invocation, continuation)) => {
             let retryable = continuation.retry_without_new_child();
-            trace_generic_file_resume(if retryable { 18 } else { 20 }, selector);
+            scheduler_yielded = continuation.scheduler_yield_pending();
+            trace_generic_file_resume(
+                if scheduler_yielded { 21 } else if retryable { 18 } else { 20 }, selector,
+            );
             (invocation, selector.key, continuation, false, retryable)
         }
     };
@@ -1262,7 +1270,11 @@ unsafe fn resume_generic_file_pump(
                 row(id).hook_pump_claimed = true;
                 row(id).recorded_generic_child_ran = recorded_child_ran;
             }
-            GenericFilePumpDrive::Retained
+            if scheduler_yielded {
+                GenericFilePumpDrive::SchedulerYielded
+            } else {
+                GenericFilePumpDrive::Retained
+            }
         }
         Ok(()) => {
             let _ = quarantine_dispatch_pump(

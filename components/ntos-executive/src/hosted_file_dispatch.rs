@@ -46,6 +46,10 @@ impl FileDispatchContinuation {
         self.native.retry_without_new_child()
     }
 
+    pub(super) fn scheduler_yield_pending(&self) -> bool {
+        self.native.scheduler_yield_pending()
+    }
+
     pub(super) fn record_child_step(
         &mut self,
         step: crate::service_sec_image::NestedChildStep,

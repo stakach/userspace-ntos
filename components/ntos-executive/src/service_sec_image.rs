@@ -14522,7 +14522,10 @@ unsafe fn settle_one_generic_file_pump_after(floor: u64) -> FilePumpTurn {
             || crate::driver_launch::hook_source_unsettled_after(floor) =>
             FilePumpTurn::Retained,
         Progress::NoWork => FilePumpTurn::Settled,
-        Progress::Returned | Progress::Pending | Progress::Yielded => FilePumpTurn::Progressed,
+        // A scheduler-yielded continuation owns a running lane; it is driven again, never
+        // waited for with an idle root receive.
+        Progress::Returned | Progress::Pending | Progress::Yielded | Progress::SchedulerYielded =>
+            FilePumpTurn::Progressed,
         // A successful deposit returns Retained while the sealed receipt is held by the
         // row. It is progress, not a restore refusal.
         Progress::Retained if deposited => FilePumpTurn::Progressed,

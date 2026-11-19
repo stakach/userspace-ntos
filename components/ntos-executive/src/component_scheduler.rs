@@ -175,6 +175,13 @@ enum PendingReceiveMode {
 
 impl PendingChildWorkRestore {
     pub(super) const fn retryable(&self) -> bool { self.retryable }
+
+    /// The child's receive yielded for scheduler work while its lane keeps running. Only this
+    /// continuation's own receive may collect that lane's next message: the root must drive it
+    /// again and must never take an idle receive in its place.
+    pub(super) fn scheduler_yield_pending(&self) -> bool {
+        self.retryable && self.mode == PendingReceiveMode::SchedulerYield
+    }
 }
 
 /// A component result remains owned by its physical parent on restore refusal. The retained

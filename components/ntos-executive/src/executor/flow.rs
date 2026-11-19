@@ -500,6 +500,15 @@ pub(super) unsafe fn wait_retained_settlement(
         exit.record(b"retained-add-device-receive-prepare");
         return QueuedCallbackPark::Turn(Turn::Exit);
     }
+    // An idle receive is refused while a component lane runs: that lane's next message belongs
+    // to the pump continuation that resumed it. A settlement that reports Retained here broke
+    // the pump-return invariant; name it rather than misreport an ingress failure.
+    if crate::spawn_hosts::shared_ingress::owner::runtime::hold_snapshot().running.is_some() {
+        exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+        exit.stop_ssn = 0;
+        exit.record(b"retained-settlement-running-lane");
+        return QueuedCallbackPark::Turn(Turn::Exit);
+    }
     let fault_ep = ingress.fault_ep;
     let received = match receive(
         ingress, nt_handler, exit, fault_ep,

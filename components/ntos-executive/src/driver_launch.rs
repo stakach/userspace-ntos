@@ -74803,6 +74803,13 @@ impl FileIrpPumpContinuation {
         self.child_step.is_some() || self.restore_retryable()
     }
 
+    /// The native pump is parked mid-receive after a scheduler yield; its lane still runs.
+    pub(super) fn scheduler_yield_pending(&self) -> bool {
+        matches!(self.pump.as_ref(),
+            Some(component_scheduler::HostedPumpRestore::ChildWorkPending(pending))
+                if pending.scheduler_yield_pending())
+    }
+
     /// A child is selected at the outer root boundary, after this File's Rust stack unwound.
     /// The sealed observation is retained here so a later restore refusal cannot run it twice.
     pub(super) fn record_child_step(
