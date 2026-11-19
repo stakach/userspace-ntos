@@ -509,6 +509,7 @@ pub(super) unsafe fn syscall_tail(
             && lpc_connect_wait_park(
                 pending,
                 pi as u32,
+                event_runtime.process,
                 lp.msg.badge,
                 nt_handler.current_tid,
             )

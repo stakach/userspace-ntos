@@ -1454,6 +1454,7 @@ unsafe fn lpc_receive_wait_park(
 unsafe fn lpc_connect_wait_park(
     pending: PendingLpcConnectPark,
     pi: u32,
+    process: nt_user_host::process_identity::ProcessIdentity,
     badge: u64,
     tid: u64,
 ) -> bool {
@@ -1469,6 +1470,7 @@ unsafe fn lpc_connect_wait_park(
     }
     let continuation = LpcConnectContinuation {
         pi,
+        process,
         badge,
         tid,
         memory: pending.memory,
@@ -12541,23 +12543,28 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     {
         generation = current_generation;
         LPC_RECEIVE_WAIT_REDRIVES.fetch_add(1, Ordering::Relaxed);
-        let receive = match lpc_client().map(|lpc| lpc.reply_wait_receive(wait.request.port_handle))
-        {
-            Some(Ok(received)) => Some(Ok(received)),
-            Some(Err(status)) if status == nt_status::NtStatus::PENDING => None,
-            Some(Err(status)) => Some(Err(status.raw() as u32)),
-            None => Some(Err(nt_status::NtStatus::UNSUCCESSFUL.raw() as u32)),
-        };
-        let Some(receive) = receive else {
-            continue;
-        };
-
         let continuation = wait.continuation;
         let pi = continuation.pi as usize;
+        // Resolve the exact parked receiver before taking a message from the port. A receiver
+        // whose process or runtime has retired must not consume a message another server
+        // thread could still receive; its wait is cancelled without a broker effect.
         let mirror = (pi < MAX_PI
             && nt_handler.capture_thread_process_identity(pi, continuation.tid)
                 == Some(continuation.process)).then(||
             mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
+        let receive = if mirror.is_none() {
+            Some(Err(nt_status::NtStatus::INVALID_HANDLE.raw() as u32))
+        } else {
+            match lpc_client().map(|lpc| lpc.reply_wait_receive(wait.request.port_handle)) {
+                Some(Ok(received)) => Some(Ok(received)),
+                Some(Err(status)) if status == nt_status::NtStatus::PENDING => None,
+                Some(Err(status)) => Some(Err(status.raw() as u32)),
+                None => Some(Err(nt_status::NtStatus::UNSUCCESSFUL.raw() as u32)),
+            }
+        };
+        let Some(receive) = receive else {
+            continue;
+        };
         let status = if let Some((_, _, _, _, scratch_base)) = mirror {
             crate::executor::local().client_pi.store(pi as u64, Ordering::Relaxed);
             crate::executor::local().scratch_base.store(scratch_base, Ordering::Relaxed);
@@ -12849,7 +12856,11 @@ unsafe fn lpc_connect_wait_complete(
             .is_some_and(|port| lpc_name_is(&port.name, b"\\Windows\\ApiPort"));
     let completed_lsa_auth_connect = completion.status == nt_syscall::STATUS_SUCCESS
         && lpc_name_is(connection_name, b"\\LsaAuthenticationPort");
-    let mirror = (pi < MAX_PI).then(||
+    // Publish only into the exact connector that parked; a retired or reused process index
+    // receives no handle or connection data.
+    let mirror = (pi < MAX_PI
+        && nt_handler.capture_thread_process_identity(pi, continuation.tid)
+            == Some(continuation.process)).then(||
         mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
     let status = if let Some((_, _, _, _, scratch_base)) = mirror {
         crate::executor::local().client_pi.store(pi as u64, Ordering::Relaxed);
@@ -15686,8 +15697,12 @@ unsafe fn pending_file_io_redrive_pass(
             .get_exact(identity).filter(|live| live.irp_id == pending.irp_id)
         else { continue; };
         pending = live;
-        let Some((_, _, _, _, scratch_base)) =
-            mirror_ctx_for(nt_handler, pending.badge, pending.pi as usize, pending.tid)
+        // Publish only to the exact caller recorded at park time: its process generation,
+        // thread lifetime and badge binding, not merely whatever now runs at this pi/tid.
+        let exact_caller = crate::pending_file_caller::caller(identity, pending)
+            .is_some_and(|caller| nt_handler.validate_provider_logical_caller(caller));
+        let Some((_, _, _, _, scratch_base)) = exact_caller.then(||
+            mirror_ctx_for(nt_handler, pending.badge, pending.pi as usize, pending.tid)).flatten()
         else {
             // Terminal provider output and the parked Reply remain owned by this exact row.
             // Do not acknowledge or publish either into a retired caller's address space.

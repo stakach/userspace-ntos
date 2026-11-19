@@ -23932,6 +23932,7 @@ struct PendingLpcConnectPark {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LpcConnectContinuation {
     pi: u32,
+    process: nt_user_host::process_identity::ProcessIdentity,
     badge: u64,
     tid: u64,
     memory: SyscallUserMemory,
