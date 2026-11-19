@@ -534,12 +534,17 @@ pub(super) unsafe fn syscall_nt_route(
         let dispatch_generation = nt_handler.hosted_process_generation(pi);
         let installer_span = installer_child_span_census::begin(
             &nt_handler, pi, current_tid, lp.msg.badge, lp.msg.m0 as u32);
+        let dispatch_serial = crate::serial_records::root_serial_bytes();
         let dispatch_started = crate::disk_census_ticks();
         let res =
             nt_dispatcher.dispatch(lp.msg.m0 as u32, &argv[..n], &origin, &mut nt_handler);
         sc.current_apc_handoff = nt_handler.current_apc_handoff.take();
         let elapsed_ticks = crate::disk_census_ticks().wrapping_sub(dispatch_started);
         crate::record_native_dispatch_ticks(lp.msg.m0, elapsed_ticks);
+        crate::hot_service_cost_census::record_dispatch(
+            table_entry.map(|entry| entry.service), res.status, elapsed_ticks,
+            crate::serial_records::root_serial_bytes().wrapping_sub(dispatch_serial),
+        );
         native_process_time_census::record_dispatch(
             pi, dispatch_generation,
             table_entry.map(|entry| entry.service), res.status,

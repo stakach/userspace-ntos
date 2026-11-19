@@ -63,6 +63,7 @@ mod registry_security_audit;
 mod diagnostic_receipt_budget;
 mod registry_checkpoint_audit;
 mod registry_query_audit;
+mod hot_service_cost_census;
 mod provider_registry_caller;
 mod provider_directory_broker;
 mod provider_user_object_broker;
@@ -7534,6 +7535,7 @@ pub(crate) fn census_tick_static(now: u64) {
     spawn_hosts::print_active_syscall_receive_census();
     service_sec_image::trace_csrss_post_resume_census(n);
     print_native_ssn_time();
+    hot_service_cost_census::print_census();
     driver_launch::print_hosted_file_rpc_phase();
     driver_launch::print_hosted_pnp_relation_census();
     driver_launch::print_hosted_video_registry_set_census();

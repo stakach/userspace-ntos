@@ -254,6 +254,7 @@ dependencies = [
  "nt-printf",
  "nt-process",
  "nt-status",
+ "nt-syscall",
  "nt-types",
  "nt-user-callback",
  "nt-user-host",

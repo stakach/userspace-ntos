@@ -1,10 +1,12 @@
 //! Complete diagnostic records from the executive's single dispatch executor.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_printf::record::LineBuffer;
 
 static READY: AtomicBool = AtomicBool::new(false);
 static mut ROOT_LINES: LineBuffer<4096> = LineBuffer::new();
+/// Bytes Root fed to its serial framing; components and workers never reach the counter.
+static ROOT_SERIAL_BYTES: AtomicU64 = AtomicU64::new(0);
 
 const ANCHOR_OFFSET: usize = 4096 - core::mem::size_of::<usize>();
 const _: () = assert!(ANCHOR_OFFSET >= sel4_rt::IPC_BUFFER_SIZE_BYTES);
@@ -42,10 +44,16 @@ pub fn print_str(bytes: &[u8]) {
             sel4_rt::print_str(bytes);
             return;
         }
+        ROOT_SERIAL_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         // Only Root's private page contains a pointer. The record syscall is non-IPC and
         // cannot reenter the single Root executor while its framing buffer is borrowed.
         (&mut *(anchor as *mut LineBuffer<4096>)).feed(bytes, sel4_rt::print_record);
     }
+}
+
+/// Monotonic count of serial bytes Root has emitted, for per-dispatch cost attribution.
+pub(crate) fn root_serial_bytes() -> u64 {
+    ROOT_SERIAL_BYTES.load(Ordering::Relaxed)
 }
 
 /// Root's private IPC page alone carries the record anchor; components and workers see zero.

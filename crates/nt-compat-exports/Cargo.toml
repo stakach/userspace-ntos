@@ -16,6 +16,7 @@ nt-ahci = { path = "../nt-ahci" }
 nt-acpi = { path = "../nt-acpi" }
 nt-fs = { path = "../nt-fs" }
 nt-printf = { path = "../nt-printf" }
+nt-syscall = { path = "../nt-syscall" }
 nt-io-manager = { path = "../nt-io-manager" }
 nt-status = { path = "../nt-status" }
 nt-types = { path = "../nt-types" }
