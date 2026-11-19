@@ -135,11 +135,12 @@ fn publish_hpet(real: u64) -> u64 {
     published.time_100ns
 }
 
-/// Read the monotonic clock. The HPET callback runs at most once: for a reference
-/// check, which is bracketed by counter readings, or whenever the counter is not
-/// serving. A projection never becomes a reading without the discipline's consent.
+/// Read the monotonic clock. The HPET callback runs once for a reference check,
+/// which is bracketed by counter readings, or whenever the counter is not serving;
+/// a check whose sample is suspect takes exactly one more. A projection never
+/// becomes a reading without the discipline's consent.
 #[inline]
-pub(crate) fn now_or_hpet(hpet_now: impl FnOnce() -> u64) -> u64 {
+pub(crate) fn now_or_hpet(hpet_now: impl Fn() -> u64) -> u64 {
     if ADMISSION.load(Ordering::Acquire) != ADMITTED {
         return publish_hpet(hpet_now());
     }
@@ -161,11 +162,19 @@ pub(crate) fn now_or_hpet(hpet_now: impl FnOnce() -> u64) -> u64 {
         }
         return published.time_100ns;
     }
-    let reference_100ns = hpet_now();
-    let sample = ReferenceSample { tsc_before, reference_100ns, tsc_after: ordered_tsc() };
-    if let TscObservation::Failed(_) = tsc.observe(sample, ordinal) {
+    let mut sample = ReferenceSample { tsc_before, reference_100ns: hpet_now(), tsc_after: ordered_tsc() };
+    let mut observation = tsc.observe(sample, ordinal);
+    // A reading that disagrees with the projection once is never returned: a second bracketed
+    // sample settles which clock is wrong, and that sample is the one published.
+    if let TscObservation::Suspect { .. } = observation {
+        let tsc_before = ordered_tsc();
+        sample = ReferenceSample { tsc_before, reference_100ns: hpet_now(), tsc_after: ordered_tsc() };
+        observation = tsc.observe(sample, ordinal);
+    }
+    if let TscObservation::Failed(_) = observation {
         ADMISSION.store(FAILED, Ordering::Release);
     }
+    let reference_100ns = sample.reference_100ns;
     drop(clock);
     publish_hpet(reference_100ns)
 }
@@ -198,13 +207,14 @@ pub(crate) fn append_census(record: &mut nt_printf::record::RecordBuffer<4096>) 
     let discipline = |field: fn(&DisciplinedTsc) -> u64| tsc.as_ref().map_or(0, field);
     let _ = writeln!(
         record,
-        "[tsc-clock] state={} attempts={} fast={} hpet={} anchors={} excursions={} uncertain={} contended={} hz={} seed-hz={} rate-ppm={} max-rate-ppm={} max-offset-100ns={} fast-behind={} reconciled={} last-hpet={} published={}",
+        "[tsc-clock] state={} attempts={} fast={} hpet={} anchors={} excursions={} suspect={} uncertain={} contended={} hz={} seed-hz={} rate-ppm={} max-rate-ppm={} max-offset-100ns={} fast-behind={} reconciled={} last-hpet={} published={}",
         state,
         ATTEMPTS.load(Ordering::Relaxed),
         FAST_READS.load(Ordering::Relaxed),
         HPET_READS.load(Ordering::Relaxed),
         discipline(DisciplinedTsc::anchors),
         discipline(DisciplinedTsc::excursions),
+        discipline(DisciplinedTsc::suspect_samples),
         discipline(DisciplinedTsc::uncertain_samples),
         CONTENDED.load(Ordering::Relaxed),
         discipline(DisciplinedTsc::frequency_hz),

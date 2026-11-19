@@ -1,4 +1,4 @@
-//! Bounded observation of the existing HPET main-counter read.
+//! The HPET main-counter read and its bounded observation.
 //!
 //! The counters are diagnostic only. They never select a clock or change scheduling.
 
@@ -36,8 +36,23 @@ fn ordered_tsc() -> u64 {
     ((high as u64) << 32) | low as u64
 }
 
-/// Read the mapped main counter exactly once. One in 1024 calls is timed; every
-/// call pays only one relaxed atomic increment beyond the original volatile read.
+/// A coherent main-counter value from 32-bit reads of each half (high, low, high).
+/// A 64-bit load may be served as two 32-bit accesses and tear at a low-word carry.
+///
+/// # Safety
+/// `counter` must address a mapped, readable HPET main-counter register.
+#[inline]
+pub(crate) unsafe fn read_main_counter(counter: *const u64) -> u64 {
+    let low = counter as *const u32;
+    let high = unsafe { low.add(1) };
+    nt_delay_execution::read_split_counter(
+        || unsafe { core::ptr::read_volatile(high) },
+        || unsafe { core::ptr::read_volatile(low) },
+    )
+}
+
+/// Read the mapped main counter coherently. One in 1024 calls is timed; every
+/// call pays only one relaxed atomic increment beyond the counter read.
 ///
 /// # Safety
 /// `counter` must address a mapped, readable HPET main-counter register.
@@ -45,11 +60,11 @@ fn ordered_tsc() -> u64 {
 pub(crate) unsafe fn read_counter(counter: *const u64) -> u64 {
     let ordinal = READS.fetch_add(1, Ordering::Relaxed);
     if ordinal & SAMPLE_MASK != 0 {
-        return unsafe { core::ptr::read_volatile(counter) };
+        return unsafe { read_main_counter(counter) };
     }
 
     let before = ordered_tsc();
-    let value = unsafe { core::ptr::read_volatile(counter) };
+    let value = unsafe { read_main_counter(counter) };
     let after = ordered_tsc();
     SAMPLES.fetch_add(1, Ordering::Relaxed);
     if let Some(cycles) = after.checked_sub(before) {

@@ -70,8 +70,14 @@ pub enum TscObservation {
     /// The projection now starts at this sample. `offset_100ns` is how far the previous
     /// projection was from it.
     Anchored { offset_100ns: u64 },
-    /// The counter and the reference disagree by more than the rate tolerance allows, or the
-    /// reference went backwards. The fast path is withdrawn until the counter is re-measured.
+    /// While disciplined, the reference disagrees with the projection for the first time. One
+    /// reading cannot say which clock is wrong: a 64-bit reference read torn across a carry is
+    /// 2^32 ticks off. Nothing changed. The caller must not return this reading; it takes another
+    /// bracketed sample, which settles the disagreement, and returns that one.
+    Suspect { offset_100ns: u64, allowed_100ns: u64 },
+    /// The counter and the reference disagree by more than the rate tolerance allows on two
+    /// consecutive samples, or the reference went backwards while measuring. The fast path is
+    /// withdrawn until the counter is re-measured.
     Excursion { offset_100ns: u64, allowed_100ns: u64 },
     Failed(TscClockError),
 }
@@ -100,6 +106,9 @@ pub struct DisciplinedTsc {
     /// Excursions not yet forgiven by a sustained clean run.
     strikes: u32,
     rate_measured: bool,
+    /// The previous sample was a [`TscObservation::Suspect`].
+    suspect: bool,
+    suspects: u64,
     anchors: u64,
     excursions: u64,
     uncertain_samples: u64,
@@ -127,6 +136,8 @@ impl DisciplinedTsc {
             clean_windows: 0,
             strikes: 0,
             rate_measured: false,
+            suspect: false,
+            suspects: 0,
             anchors: 0,
             excursions: 0,
             uncertain_samples: 0,
@@ -145,6 +156,8 @@ impl DisciplinedTsc {
     /// Every excursion since admission, forgiven or not.
     pub const fn excursions(&self) -> u64 { self.excursions }
     pub const fn uncertain_samples(&self) -> u64 { self.uncertain_samples }
+    /// Reference samples set aside because they disagreed with the projection once.
+    pub const fn suspect_samples(&self) -> u64 { self.suspects }
     /// How far the last measured window was from the estimate it replaced.
     pub const fn last_rate_error_ppm(&self) -> u64 { self.last_rate_error_ppm }
     /// The largest such difference, not counting the first window's distance from the seed.
@@ -199,11 +212,15 @@ impl DisciplinedTsc {
         match (self.phase, self.anchor) {
             // The reference is behind an earlier reading of itself. Whichever reading was
             // wrong, the counter was not: withdraw, and measure again from this one.
+            (TscPhase::Disciplined, Some(anchor)) if mark.time_100ns < anchor.time_100ns => {
+                self.disagree(mark, anchor.time_100ns - mark.time_100ns, 0)
+            }
             (_, Some(anchor)) if mark.time_100ns < anchor.time_100ns => {
                 self.excursion(mark, anchor.time_100ns - mark.time_100ns, 0)
             }
             (TscPhase::Disciplined, Some(anchor)) => self.check(anchor, mark),
             _ => {
+                self.suspect = false;
                 self.anchor = Some(mark);
                 if self.measure_window(mark) && self.clean_windows >= CLEAN_WINDOWS_TO_ADMIT {
                     self.phase = TscPhase::Disciplined;
@@ -231,8 +248,9 @@ impl DisciplinedTsc {
             + (elapsed * u128::from(RATE_TOLERANCE_PPM)).div_ceil(PPM);
         self.max_offset_100ns = self.max_offset_100ns.max(offset_100ns);
         if u128::from(offset_100ns) > allowed {
-            return self.excursion(mark, offset_100ns, allowed.min(u128::from(u64::MAX)) as u64);
+            return self.disagree(mark, offset_100ns, allowed.min(u128::from(u64::MAX)) as u64);
         }
+        self.suspect = false;
         self.anchor = Some(mark);
         self.anchors += 1;
         if self.measure_window(mark) && self.clean_windows >= FORGIVENESS_WINDOWS {
@@ -241,8 +259,19 @@ impl DisciplinedTsc {
         TscObservation::Anchored { offset_100ns }
     }
 
+    /// A first disagreement sets the sample aside; a second consecutive one is an excursion.
+    fn disagree(&mut self, mark: Mark, offset_100ns: u64, allowed_100ns: u64) -> TscObservation {
+        if self.suspect {
+            return self.excursion(mark, offset_100ns, allowed_100ns);
+        }
+        self.suspect = true;
+        self.suspects += 1;
+        TscObservation::Suspect { offset_100ns, allowed_100ns }
+    }
+
     /// Withdraw the fast path and measure the counter again from this sample.
     fn excursion(&mut self, mark: Mark, offset_100ns: u64, allowed_100ns: u64) -> TscObservation {
+        self.suspect = false;
         self.excursions += 1;
         self.strikes += 1;
         self.max_offset_100ns = self.max_offset_100ns.max(offset_100ns);

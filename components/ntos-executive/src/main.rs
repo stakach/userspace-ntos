@@ -7087,7 +7087,7 @@ pub(crate) fn w32_census_enter(ssn: u64) {
     if n % 128 == 0 {
         let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
         let raw = if period != 0 {
-            unsafe { core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64) }
+            unsafe { hpet_read_observation::read_main_counter((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64) }
         } else {
             0
         };

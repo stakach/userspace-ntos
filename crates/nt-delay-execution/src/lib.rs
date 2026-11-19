@@ -12,6 +12,9 @@ pub use calibrated_tsc::{CalibratedTscEpoch, TscClockError};
 #[cfg(test)]
 mod calibrated_tsc_tests;
 
+mod split_counter;
+pub use split_counter::read_split_counter;
+
 mod disciplined_tsc;
 pub use disciplined_tsc::{
     DisciplinedTsc, MonotonicTime, Published, ReferenceSample, TscObservation, TscPhase, TscRead,

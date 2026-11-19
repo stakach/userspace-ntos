@@ -77,6 +77,25 @@ impl Clock {
         }
     }
 
+    /// One bracketed reference read, as the adapter takes it.
+    fn reference_sample(&mut self, tsc_before: u64) -> ReferenceSample {
+        self.machine.advance(core::mem::take(&mut self.stall_next_reference_ns));
+        let position = self.latch_position.unwrap_or_else(|| {
+            // Anywhere in the read, both ends included.
+            self.latch_sequence = self.latch_sequence
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.latch_sequence >> 33) % 1025
+        });
+        let latch_ns = self.reference_read_ns * position / 1024;
+        self.machine.advance(latch_ns);
+        let reference_100ns = self.machine.reference_100ns()
+            .wrapping_add(core::mem::take(&mut self.glitch_next_reference_100ns));
+        self.machine.advance(self.reference_read_ns - latch_ns);
+        self.reference_reads += 1;
+        ReferenceSample { tsc_before, reference_100ns, tsc_after: self.machine.tsc }
+    }
+
     fn now(&mut self) -> Reading {
         let ordinal = self.ordinal;
         self.ordinal += 1;
@@ -84,25 +103,14 @@ impl Clock {
         let (reading, source) = match self.tsc.read(tsc_before, ordinal) {
             TscRead::Fast(time) => (time, Source::Fast),
             TscRead::NeedsReference => {
-                self.machine.advance(core::mem::take(&mut self.stall_next_reference_ns));
-                let position = self.latch_position.unwrap_or_else(|| {
-                    // Anywhere in the read, both ends included.
-                    self.latch_sequence = self.latch_sequence
-                        .wrapping_mul(6_364_136_223_846_793_005)
-                        .wrapping_add(1_442_695_040_888_963_407);
-                    (self.latch_sequence >> 33) % 1025
-                });
-                let latch_ns = self.reference_read_ns * position / 1024;
-                self.machine.advance(latch_ns);
-                let reference_100ns = self.machine.reference_100ns()
-                    + core::mem::take(&mut self.glitch_next_reference_100ns);
-                self.machine.advance(self.reference_read_ns - latch_ns);
-                let sample = ReferenceSample {
-                    tsc_before, reference_100ns, tsc_after: self.machine.tsc,
-                };
+                let mut sample = self.reference_sample(tsc_before);
                 self.last_observation = Some(self.tsc.observe(sample, ordinal));
-                self.reference_reads += 1;
-                (reference_100ns, Source::Reference)
+                // The adapter never returns a suspect reading; a second sample settles it.
+                if matches!(self.last_observation, Some(TscObservation::Suspect { .. })) {
+                    sample = self.reference_sample(self.machine.tsc);
+                    self.last_observation = Some(self.tsc.observe(sample, ordinal));
+                }
+                (sample.reference_100ns, Source::Reference)
             }
         };
         let published = self.published.publish(reading);
@@ -465,31 +473,47 @@ fn a_counter_that_goes_backwards_fails_for_the_boot() {
 }
 
 #[test]
-fn a_reference_glitch_is_an_excursion_and_not_the_end_of_the_counter() {
-    // One reference reading 42.9 s ahead: a 64-bit HPET counter read split into two 32-bit
-    // reads around a carry. The counter is not at fault, and the reference then appears to go
-    // backwards from the anchor the glitch left behind.
+fn a_torn_reference_read_is_set_aside_and_never_anchored_or_published() {
+    // One reference reading 2^32 HPET ticks (42.9 s at 100 MHz) ahead: a 64-bit counter read
+    // split into two 32-bit reads around a carry. The counter is not at fault.
     let mut clock = Clock::disciplined();
     clock.machine.advance(CHECK_INTERVAL_100NS * 100 + 1_000);
+    let anchors = clock.tsc.anchors();
     clock.glitch_next_reference_100ns = 429_496_729;
-    clock.now();
-    assert!(matches!(clock.last_observation, Some(TscObservation::Excursion { .. })));
-    clock.machine.advance(50_000);
-    clock.now();
-    assert!(matches!(clock.last_observation, Some(TscObservation::Excursion { .. })),
+    let reading = clock.checked_now(PLACEMENT_BOUND_100NS);
+    assert_eq!(reading.source, Source::Reference);
+    assert!(matches!(clock.last_observation, Some(TscObservation::Anchored { .. })),
         "{:?}", clock.last_observation);
-    assert_eq!((clock.tsc.phase(), clock.tsc.excursions()), (TscPhase::Measuring, 2));
+    assert_eq!(clock.tsc.suspect_samples(), 1);
+    assert_eq!(clock.tsc.anchors(), anchors + 1, "only the confirming sample is an anchor");
+    assert!(clock.published.latest() <= clock.machine.reference_100ns(),
+        "the torn reading was never published");
+    assert_eq!((clock.tsc.phase(), clock.tsc.excursions()), (TscPhase::Disciplined, 0));
+    clock.run(NS_PER_SECOND, 50_000, PLACEMENT_BOUND_100NS);
+    assert_eq!(clock.tsc.excursions(), 0);
+}
 
-    let windows = u64::from(CLEAN_WINDOWS_TO_ADMIT);
-    let mut recovered_after = 0;
-    while clock.tsc.phase() != TscPhase::Disciplined {
-        assert!(recovered_after < 10 * NS_PER_SECOND, "never re-admitted");
-        clock.machine.advance(50_000);
-        clock.now();
-        recovered_after += 50_000;
-    }
-    assert!(recovered_after < (windows + 1) * window_ns());
-    assert_eq!(clock.tsc.excursions(), 2);
+#[test]
+fn a_torn_reference_read_behind_the_anchor_is_also_set_aside() {
+    let mut clock = Clock::disciplined();
+    clock.machine.advance(CHECK_INTERVAL_100NS * 100 + 1_000);
+    // A torn read can also land 2^32 ticks behind; a wrapping offset models it.
+    clock.glitch_next_reference_100ns = 0u64.wrapping_sub(clock.machine.reference_100ns() / 2);
+    clock.checked_now(PLACEMENT_BOUND_100NS);
+    assert_eq!(clock.tsc.suspect_samples(), 1);
+    assert_eq!((clock.tsc.phase(), clock.tsc.excursions()), (TscPhase::Disciplined, 0));
+}
+
+#[test]
+fn a_disagreement_that_a_second_sample_confirms_is_an_excursion() {
+    // A genuine counter jump disagrees twice, so it still withdraws the fast path.
+    let mut clock = Clock::disciplined();
+    clock.machine.advance(50_000);
+    clock.machine.tsc += TRUE_HZ / 20;
+    clock.now();
+    assert_eq!(clock.tsc.suspect_samples(), 1);
+    assert!(matches!(clock.last_observation, Some(TscObservation::Excursion { .. })));
+    assert_eq!(clock.tsc.phase(), TscPhase::Measuring);
 }
 
 #[test]
