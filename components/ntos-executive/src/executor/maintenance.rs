@@ -240,7 +240,10 @@ pub(super) unsafe fn maintain(
                 (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
                 return ControlFlow::Break(Turn::Next);
             }
-            ConnectPumpSettlement::RetryableRestore => {
+            // A retained owner is waiting on its own native completion (for example a
+            // mounted read behind the lazy checkpoint's physical command). Wait for the root
+            // event that settles it; only a blocked owner is a refusal.
+            ConnectPumpSettlement::RetryableRestore | ConnectPumpSettlement::Retained => {
                 match park_queued_callback_root_receive(
                     &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, true,
                 ) {
@@ -248,10 +251,10 @@ pub(super) unsafe fn maintain(
                     QueuedCallbackPark::Turn(turn) => return ControlFlow::Break(turn),
                 };
             }
-            ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+            ConnectPumpSettlement::Blocked => {
                 lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 lp.exit.stop_ssn = 0;
-                lp.exit.record(b"add-device-connect-retained");
+                lp.exit.record(b"add-device-connect-blocked");
                 return ControlFlow::Break(Turn::Exit);
             }
         }
@@ -340,7 +343,7 @@ pub(super) unsafe fn maintain(
                 ConnectPumpSettlement::AwaitingLocalChild => {
                     awaiting_connect_child = true;
                 }
-                ConnectPumpSettlement::RetryableRestore => {
+                ConnectPumpSettlement::RetryableRestore | ConnectPumpSettlement::Retained => {
                     match park_queued_callback_root_receive(
                         &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, true,
                     ) {
@@ -348,10 +351,10 @@ pub(super) unsafe fn maintain(
                         QueuedCallbackPark::Turn(turn) => return ControlFlow::Break(turn),
                     };
                 }
-                ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+                ConnectPumpSettlement::Blocked => {
                     lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     lp.exit.stop_ssn = 0;
-                    lp.exit.record(b"add-device-connect-retained");
+                    lp.exit.record(b"add-device-connect-blocked");
                     return ControlFlow::Break(Turn::Exit);
                 }
             }
@@ -374,7 +377,7 @@ pub(super) unsafe fn maintain(
                     awaiting_connect_child = true;
                     true
                 }
-                ConnectPumpSettlement::RetryableRestore => {
+                ConnectPumpSettlement::RetryableRestore | ConnectPumpSettlement::Retained => {
                     match park_queued_callback_root_receive(
                         &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, true,
                     ) {
@@ -382,10 +385,10 @@ pub(super) unsafe fn maintain(
                         QueuedCallbackPark::Turn(turn) => return ControlFlow::Break(turn),
                     };
                 }
-                ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+                ConnectPumpSettlement::Blocked => {
                     lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     lp.exit.stop_ssn = 0;
-                    lp.exit.record(b"add-device-connect-retained");
+                    lp.exit.record(b"add-device-connect-blocked");
                     return ControlFlow::Break(Turn::Exit);
                 }
             }
@@ -664,7 +667,8 @@ pub(super) unsafe fn maintain(
                     QueuedCallbackPark::Turn(turn) => return ControlFlow::Break(turn),
                 };
             }
-            ConnectPumpSettlement::RetryableRestore => {
+            // A retained owner waits on its own native completion; only Blocked refuses.
+            ConnectPumpSettlement::RetryableRestore | ConnectPumpSettlement::Retained => {
                 match park_queued_callback_root_receive(
                     &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, false,
                 ) {
@@ -672,7 +676,7 @@ pub(super) unsafe fn maintain(
                     QueuedCallbackPark::Turn(turn) => return ControlFlow::Break(turn),
                 };
             }
-            ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+            ConnectPumpSettlement::Blocked => {
                 lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 lp.exit.stop_ssn = 0;
                 lp.exit.record(b"queued-callback-unsettled");
