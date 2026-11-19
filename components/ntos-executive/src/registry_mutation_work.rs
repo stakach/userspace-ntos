@@ -1605,10 +1605,12 @@ unsafe fn advance(
                     work.phase = Phase::Prepare(attempts.take_upload(attempt)?.into_preparation());
                 } else if attempt.outcome_status() == Some(nt_status::NtStatus::DEVICE_BUSY.raw() as i32)
                     && !work.cancelled
-                    && matches!(&work.caller, Caller::Hosted(_))
                 {
-                    // CM ACKed an exact no-token refusal. Keep the original caller, Reply,
-                    // mutation journal and mount while a prior writer releases its lease.
+                    // CM ACKed an exact no-token refusal: another writer holds SYSTEM. NT has
+                    // no transient registry failure, so neither a hosted caller nor a driver
+                    // (for example a registry write during StartDevice) may see this status.
+                    // Keep the original caller, Reply, mutation journal and mount while the
+                    // prior writer releases its lease, and complete with the real result.
                     attempts.retry_acknowledged_busy(attempt)?;
                     return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as i32);
                 } else if attempt.outcome_status() == Some(0xC000_0059u32 as i32)

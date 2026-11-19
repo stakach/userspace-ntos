@@ -28,9 +28,12 @@ fn hosted_system_create_keeps_its_reply_through_acknowledged_writer_busy() {
         .expect("terminal no-effect failure path");
     assert!(acknowledged < retry && retry < terminal,
         "BUSY retry must precede terminal reply only after CM acknowledged the outcome");
-    assert!(branch[acknowledged..retry].contains("Caller::Hosted")
-        && branch[acknowledged..retry].contains("DEVICE_BUSY"),
-        "only the hosted BUSY outcome may retry under this native caller policy");
+    // NT has no transient registry failure: hosted callers and drivers (a registry write in
+    // StartDevice) both keep their owner through an acknowledged writer BUSY.
+    let busy = &branch[acknowledged..retry];
+    let busy = &busy[busy.rfind("DEVICE_BUSY").expect("acknowledged BUSY outcome")..];
+    assert!(!busy.contains("Caller::Hosted"),
+        "the BUSY retry applies to every caller, not only hosted ones");
 }
 
 #[test]
