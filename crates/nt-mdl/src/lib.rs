@@ -25,6 +25,7 @@ extern crate alloc;
 pub mod page_lock;
 pub mod create_mdl;
 pub mod contiguous;
+pub mod pfn;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -41,8 +42,8 @@ pub const MDL_OFF_MAPPED_SYSTEM_VA: u64 = 24;
 pub const MDL_OFF_START_VA: u64 = 32;
 pub const MDL_OFF_BYTE_COUNT: u64 = 40;
 pub const MDL_OFF_BYTE_OFFSET: u64 = 44;
-/// A generous fixed MDL projection size (the real WDK MDL header is 48 bytes; a
-/// single-page MDL adds a PFN array, but v0.1 doesn't populate it).
+/// The x64 WDK MDL header size. The PFN array that follows it is described by
+/// [`pfn`]; its capacity is fixed by the MDL's own `Size` field.
 pub const MDL_SIZE: usize = 48;
 
 /// Bytes needed for the public MDL header and one PFN slot per spanned page.

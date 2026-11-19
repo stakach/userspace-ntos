@@ -143,6 +143,25 @@ impl ResourceMappingTable {
         self.rows.iter()
     }
 
+    /// The physical page behind `virtual_page` in this exact domain generation and VSpace, once
+    /// its PageMap is acknowledged. A prepared, uncertain or retiring leaf has no translation.
+    pub fn mapped_physical_page(
+        &self,
+        domain: MappingDomain,
+        pml4: u64,
+        virtual_page: u64,
+    ) -> Option<u64> {
+        self.rows
+            .iter()
+            .find(|row| {
+                row.key.domain == domain
+                    && row.key.pml4 == pml4
+                    && row.key.virtual_page == virtual_page
+                    && row.phase == MappingPhase::Mapped
+            })
+            .map(|row| row.key.physical_page)
+    }
+
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), MappingError> {
         self.rows
             .try_reserve(additional)

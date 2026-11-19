@@ -673,6 +673,9 @@ version = "0.1.0"
 [[package]]
 name = "nt-pnp-context"
 version = "0.1.0"
+dependencies = [
+ "nt-mdl",
+]
 
 [[package]]
 name = "nt-pnp-manager"

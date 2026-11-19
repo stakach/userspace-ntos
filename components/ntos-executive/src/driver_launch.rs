@@ -458,6 +458,8 @@ mod hosted_driver_process_state;
 pub(crate) mod hosted_driver_ps_handle_reference;
 #[path = "hosted_driver_create_mdl.rs"]
 mod hosted_driver_create_mdl;
+#[path = "hosted_mdl_pfn.rs"]
+mod hosted_mdl_pfn;
 #[path = "hosted_driver_pci_root.rs"]
 pub(crate) mod hosted_driver_pci_root;
 pub(crate) const FSD_SERVICE_PCI_ROOT_LABEL: u64 = hosted_driver_pci_root::LABEL;
@@ -57826,6 +57828,33 @@ unsafe fn hosted_irq_lanes() -> Option<&'static Vec<HostedIrqLaneRuntime>> {
     (*core::ptr::addr_of!(HOSTED_IRQ_LANES)).as_ref()
 }
 
+/// The physical page behind a mapped IRQ-lane stack, arena, shared or arg leaf of this instance.
+unsafe fn hosted_irq_lane_page_physical(
+    instance: usize,
+    domain: HostedDomainIdentity,
+    pml4: u64,
+    page: u64,
+) -> Option<u64> {
+    let base = hosted_worker_component_base_for_slot(FSD_IRQ_LANE_COMPONENT_SLOT)?;
+    let offset = page.checked_sub(base)?;
+    hosted_irq_lanes()?.iter().find_map(|lane| {
+        if lane.projection_instance != instance || lane.domain != domain || lane.pml4 != pml4
+            || !matches!(lane.state, HostedIrqLaneState::Booting | HostedIrqLaneState::Ready)
+        {
+            return None;
+        }
+        let in_bank = |start: u64, leaves: &[HostedIrqLaneLeaf]| {
+            let index = usize::try_from(offset.checked_sub(start)? / 0x1000).ok()?;
+            leaves.get(index).copied()
+        };
+        let leaf = in_bank(0, &lane.stack)
+            .or_else(|| in_bank(FSD_IRQ_LANE_ARENA_OFFSET, &lane.arena))
+            .or_else(|| in_bank(FSD_IRQ_LANE_SHARED_OFFSET, &lane.shared))
+            .or_else(|| in_bank(FSD_IRQ_LANE_ARG_OFFSET, &lane.arg))?;
+        (leaf.mapped && leaf.cap != 0).then(|| crate::get_frame_paddr_checked(leaf.cap).ok())?
+    })
+}
+
 unsafe fn release_hosted_irq_lane_leaf(leaf: &mut HostedIrqLaneLeaf) -> u64 {
     let mut failures = 0u64;
     if leaf.exec_cap != 0 && leaf.exec_mapped {
@@ -66394,9 +66423,33 @@ unsafe fn service_hosted_driver_mdl_for_instance(
             }
         }
         HOSTED_MDL_OP_BUILD_NONPAGED => {
-            if hosted_instance_pool_allocation_exec_if_live(inst, mdl, nt_mdl::MDL_SIZE as u64)
-            .is_none()
+            // MmBuildMdlForNonPagedPool / MmProbeAndLockPages: record the real PFN of every
+            // spanned page, from owned frames, before the registry marks the MDL built.
+            let registry = hosted_mdl_registry_mut();
+            let Some(allocated) = registry.allocated_bytes_for_key(key) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(id) = registry.id_for(key) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let (Some(address), Some(length)) = (registry.virtual_address(id), registry.byte_count(id))
+            else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(mdl_exec) =
+                hosted_instance_pool_allocation_exec_if_live(inst, mdl, u64::from(allocated))
+            else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64) != address & !0xfff
+                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32)
+                    != (address & 0xfff) as u32
+                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) != length
             {
+                return STATUS_INVALID_PARAMETER;
+            }
+            if let Err(error) = hosted_mdl_pfn::populate(instance_index, inst, mdl_exec, allocated) {
+                hosted_mdl_pfn::note_refusal(instance_index, mdl, address, length, error);
                 return STATUS_INVALID_PARAMETER;
             }
             match hosted_mdl_registry_mut().build_for_nonpaged_key(key) {
@@ -66485,6 +66538,13 @@ unsafe fn service_hosted_driver_mdl_for_instance(
                     != source_process
                 || read_unaligned((target_exec + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *const u64)
                     != address
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            if hosted_mdl_pfn::copy_partial(
+                source_exec, source_allocated, target_exec, target_allocated,
+            )
+            .is_err()
             {
                 return STATUS_INVALID_PARAMETER;
             }
@@ -68868,6 +68928,7 @@ unsafe fn spawn_hosted_driver_worker_thread_with_shared_bank(
     while i < FSD_WORKER_STACK_FRAMES {
         let target = alloc_frame();
         hosted_thread_resources::root(construction, target);
+        hosted_thread_resources::stack_frame(construction, stack_base, i as usize, target);
         let exec_target = copy_cap(target);
         hosted_thread_resources::root(construction, exec_target);
         let page = stack_base + i * 0x1000;

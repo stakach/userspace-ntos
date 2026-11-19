@@ -37,6 +37,8 @@ struct Construction {
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
     reference: Option<nt_process::native_handle::NativeThreadProcessReference>,
     priority_plan: Option<nt_process::KernelThreadPriorityPlan>,
+    /// The worker stack's component base and the frame cap mapped at each of its pages.
+    stack: Option<(u64, [u64; FSD_WORKER_STACK_FRAMES as usize])>,
 }
 
 static mut OWNERS: Vec<Construction> = Vec::new();
@@ -83,6 +85,7 @@ pub(super) unsafe fn begin(
         caller: None,
         reference: None,
         priority_plan: None,
+        stack: None,
     });
     Some(id)
 }
@@ -334,6 +337,35 @@ pub(super) unsafe fn mapping(id: usize, cap: u64) {
         )
         .expect("mapping without retained cap");
     *resource = Resource::Root { cap, mapped: true };
+}
+
+/// Record the frame mapped at one worker stack page, so an MDL over the stack has a real PFN.
+pub(super) unsafe fn stack_frame(id: usize, base: u64, index: usize, cap: u64) {
+    let row = owner(id);
+    assert!(!row.ready && index < FSD_WORKER_STACK_FRAMES as usize);
+    let stack = row.stack.get_or_insert((base, [0; FSD_WORKER_STACK_FRAMES as usize]));
+    assert_eq!(stack.0, base);
+    stack.1[index] = cap;
+}
+
+/// The physical page behind a live worker stack page of this exact instance VSpace.
+pub(super) unsafe fn stack_page_physical(
+    instance: usize,
+    domain: HostedDomainIdentity,
+    pml4: u64,
+    page: u64,
+) -> Option<u64> {
+    (&*core::ptr::addr_of!(OWNERS)).iter().find_map(|row| {
+        if row.instance != instance || row.domain != domain || row.pml4 != pml4
+            || !row.ready || row.stopped || row.finished
+        {
+            return None;
+        }
+        let (base, frames) = row.stack?;
+        let index = usize::try_from(page.checked_sub(base)? / 0x1000).ok()?;
+        let cap = *frames.get(index).filter(|cap| **cap != 0)?;
+        crate::get_frame_paddr_checked(cap).ok()
+    })
 }
 
 pub(super) unsafe fn child(id: usize, cnode: u64, slot: u64) {
