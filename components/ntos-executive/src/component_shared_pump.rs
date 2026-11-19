@@ -782,36 +782,52 @@ unsafe fn trace_inline_irq_checkpoint_failure(
     crate::print_str(b"\n");
 }
 
+/// Why an inline IRQ checkpoint did not return the exact receiver.
+enum InlineIrqRefusal {
+    /// The checkpoint observed a different route, dispatch or Reply.
+    Lost,
+    /// The parent could not be parked; no scheduler work ran and the receive is intact.
+    NotServiced,
+    /// The work ran and this receiver's parent is still held: it is owed its restore first.
+    ParentRetained(runtime::nested::NestedRestoreTicket),
+}
+
 unsafe fn service_inline_irq_checkpoint(
     ch: &PumpChannel,
     route: PeerRoute,
-) -> Result<(), runtime::Error> {
+) -> Result<(), InlineIrqRefusal> {
     let before = inline_irq_observation(ch, route);
     let Some(dispatch) = before.dispatch else {
         trace_inline_irq_checkpoint_failure(ch, InlineIrqCheckpointError::Preflight(
             InlineIrqCheckpointMismatch::Dispatch), route, None, before.reply, before);
-        return Err(runtime::Error::PhysicalIdentity);
+        return Err(InlineIrqRefusal::Lost);
     };
     let Some(reply) = before.reply else {
         trace_inline_irq_checkpoint_failure(ch, InlineIrqCheckpointError::Preflight(
             InlineIrqCheckpointMismatch::Reply), route, Some(dispatch), None, before);
-        return Err(runtime::Error::PhysicalIdentity);
+        return Err(InlineIrqRefusal::Lost);
     };
     let mut checkpoint = match InlineIrqCheckpoint::begin(route, dispatch, reply, before) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
             trace_inline_irq_checkpoint_failure(ch, error, route, Some(dispatch), Some(reply), before);
-            return Err(runtime::Error::PhysicalIdentity);
+            return Err(InlineIrqRefusal::Lost);
         }
     };
     // The ticket preserves whether this entry had a parent. In the idle case
     // service_irq_yield parks nothing and must return the same idle receiver.
     let scope = crate::driver_launch::ComponentSchedulerScope::enter();
-    scope.service_irq_yield(ch.shared_va);
+    match scope.service_irq_yield(ch.shared_va) {
+        Ok(_) => {}
+        Err(crate::driver_launch::SchedulerServiceRefusal::Park) =>
+            return Err(InlineIrqRefusal::NotServiced),
+        Err(crate::driver_launch::SchedulerServiceRefusal::ParentRetained(parent)) =>
+            return Err(InlineIrqRefusal::ParentRetained(parent.into_ticket())),
+    }
     let after = inline_irq_observation(ch, route);
     if let Err(error) = checkpoint.verify_after(after) {
         trace_inline_irq_checkpoint_failure(ch, error, route, Some(dispatch), Some(reply), after);
-        return Err(runtime::Error::PhysicalIdentity);
+        return Err(InlineIrqRefusal::Lost);
     }
     Ok(())
 }
@@ -1257,9 +1273,20 @@ pub(super) unsafe fn receive(
         // continuously republished timer demand can starve a worker's READY Call forever.
         timer_probe_consumed = timer_checkpoint;
         if inline_irq_checkpoint && irq_checkpoint {
-            if service_inline_irq_checkpoint(ch, route).is_err() {
-                crate::print_str(b"[pump-ingress] inline IRQ checkpoint lost its route\n");
-                return PumpMessage::transport_wall();
+            match service_inline_irq_checkpoint(ch, route) {
+                Ok(()) => {}
+                Err(InlineIrqRefusal::Lost) => {
+                    crate::print_str(b"[pump-ingress] inline IRQ checkpoint lost its route\n");
+                    return PumpMessage::transport_wall();
+                }
+                // Nothing ran: keep the IRQ bits for a later checkpoint and receive as before.
+                Err(InlineIrqRefusal::NotServiced) => {
+                    irq_checkpoint = false;
+                    continue;
+                }
+                // The held receiver must not be received from; its owner restores it first.
+                Err(InlineIrqRefusal::ParentRetained(ticket)) =>
+                    return nested_restore_refusal(Some(ticket)),
             }
             // The checkpoint restored the exact route and Reply. A timer notification can
             // keep this higher-priority receiver runnable indefinitely while its provider

@@ -244,9 +244,12 @@ pub(crate) unsafe fn run_kernel_job(
         }
         if redrive_nested_hosted_file_work() { continue; }
         {
+            // Root level: no continuation keeps a parent this service could not restore, so
+            // the dropped handle makes the root its owner. Drain it before receiving (#333).
             let scope = driver_launch::ComponentSchedulerScope::enter();
-            scope.service_irq_yield(0);
+            drop(scope.service_irq_yield(0));
         }
+        crate::service_sec_image::drain_root_restores();
         crate::registry_mutation_work::redrive_provider();
         if ingress::resume_acknowledged_retained_services()
             .map_err(|_| nt_process::STATUS_UNSUCCESSFUL)? { continue; }
@@ -686,7 +689,11 @@ unsafe fn receive_driver_entry_yields(
                 status,
             ));
         }
-        scope.service_irq_yield(receiving.shared_va);
+        if scope.service_irq_yield(receiving.shared_va).is_err() {
+            // DriverEntry has no owner for a retained scheduler yield yet (#333): receiving
+            // on its held lane would block the root, so stop here rather than hang.
+            panic!("DriverEntry scheduler service could not hand back its lane");
+        }
         // Dedicated IRQ workers can perform nested IPC. Recheck authority after those effects,
         // without minting another attempt or permitting a failed entered continuation to replay.
         if let Err(status) = validate_driver_entry_execution(caller, capture, &receive_attempt) {

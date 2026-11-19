@@ -165,8 +165,8 @@ impl AddDevicePumpContinuation {
 
     pub(super) fn retry_without_new_child(&self) -> bool {
         self.child_step.is_some()
-            || matches!(self.pump, Some(component_scheduler::HostedPumpRestore::ChildWorkPending(ref pending))
-                if pending.retryable())
+            || self.pump.as_ref()
+                .is_some_and(component_scheduler::HostedPumpRestore::retryable_continuation)
             || matches!(self.pump,
                 Some(component_scheduler::HostedPumpRestore::Retained { retryable: true, .. }))
     }
@@ -188,6 +188,7 @@ impl AddDevicePumpContinuation {
             component_scheduler::HostedPumpRestore::ChildWorkReady { .. } => 1,
             component_scheduler::HostedPumpRestore::ChildWorkPending(_) => 2,
             component_scheduler::HostedPumpRestore::Retained { .. } => 3,
+            component_scheduler::HostedPumpRestore::SchedulerYieldRetained(_) => 5,
             _ => 4,
         });
         let next = match pump {
@@ -205,10 +206,7 @@ impl AddDevicePumpContinuation {
                     }
                 }
             }
-            component_scheduler::HostedPumpRestore::ChildWorkPending(pending)
-                if pending.retryable() =>
-                    component_scheduler::retry_child_work(
-                        component_scheduler::HostedPumpRestore::ChildWorkPending(pending)),
+            pump if pump.retryable_continuation() => component_scheduler::retry_child_work(pump),
             component_scheduler::HostedPumpRestore::Retained {
                 result, key, ticket, retryable: true,
             } => component_scheduler::retry_retained_add_device_restore(
@@ -228,6 +226,8 @@ impl AddDevicePumpContinuation {
                 4 | (u64::from(*retryable) << 8),
             Some(component_scheduler::HostedPumpRestore::ChildWorkQuarantined { .. }) => 5,
             Some(component_scheduler::HostedPumpRestore::Unattributed(_)) => 6,
+            Some(component_scheduler::HostedPumpRestore::SchedulerYieldRetained(pending)) =>
+                7 | (u64::from(pending.retryable()) << 8),
             None => 0,
         };
         trace_add_device_resume_gate(20, detail);

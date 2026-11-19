@@ -25,9 +25,12 @@ pub(crate) unsafe fn drive<T: Copy + Eq>(
             return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
         }
         {
+            // Root level: no continuation keeps a parent this service could not restore, so
+            // the dropped handle makes the root its owner. Drain it before receiving (#333).
             let scope = driver_launch::ComponentSchedulerScope::enter();
-            scope.service_irq_yield(0);
+            drop(scope.service_irq_yield(0));
         }
+        service_sec_image::drain_root_restores();
         registry_mutation_work::redrive_provider();
         if ingress::resume_acknowledged_retained_services()
             .map_err(|_| nt_process::STATUS_UNSUCCESSFUL)?

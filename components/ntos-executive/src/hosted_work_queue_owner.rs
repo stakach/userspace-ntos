@@ -369,8 +369,7 @@ pub(crate) unsafe fn queued_callback_root_action() -> Option<QueuedCallbackRootA
                 Some(QueuedCallbackRootAction::ResumeRecordedStep(selector)),
         component_scheduler::HostedPumpRestore::ChildWorkReady { .. } =>
             Some(QueuedCallbackRootAction::NeedsChild(selector)),
-        component_scheduler::HostedPumpRestore::ChildWorkPending(pending)
-            if pending.retryable() =>
+        pump if pump.retryable_continuation() =>
                 Some(QueuedCallbackRootAction::RetryRestore(selector)),
         _ => None,
     }
@@ -532,8 +531,7 @@ unsafe fn retain_result(
             let progress = match &pump {
                 component_scheduler::HostedPumpRestore::ChildWorkReady { .. } =>
                     QueuedCallbackProgress::NeedsChild,
-                component_scheduler::HostedPumpRestore::ChildWorkPending(pending)
-                    if pending.retryable() => QueuedCallbackProgress::PendingRestore,
+                pump if pump.retryable_continuation() => QueuedCallbackProgress::PendingRestore,
                 _ => QueuedCallbackProgress::Blocked,
             };
             row.pump = Some(pump);
@@ -678,9 +676,8 @@ pub(crate) unsafe fn resume_queued_callback_after_file_settlement(
             || rows.iter().flatten().any(|other| other.sequence > row.sequence
                 && (other.pump.is_some() || other.resuming))
         { return QueuedCallbackProgress::Blocked; }
-        let retry = matches!(row.pump.as_ref(),
-            Some(component_scheduler::HostedPumpRestore::ChildWorkPending(pending))
-                if pending.retryable());
+        let retry = row.pump.as_ref()
+            .is_some_and(component_scheduler::HostedPumpRestore::retryable_continuation);
         (row.file_floor, row.child_step.is_some(), retry)
     };
     if crate::driver_launch::generic_file_pump_unsettled_after(floor) {

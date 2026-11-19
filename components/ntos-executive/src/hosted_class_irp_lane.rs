@@ -29,6 +29,8 @@ const _: () = assert!(ARG_OFFSET + FSD_ARG_FRAMES * 0x1000 <= FSD_WORKER_STRIDE)
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase { Preparing, Ready, DeletePrepared, Entered, NestedRestore,
+    /// The callback's pump is retained mid scheduler-yield in `delete_yield` (#333).
+    SchedulerYield,
     DeleteCompleted, Uncertain, Retiring, Retired }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -62,6 +64,7 @@ struct Lane {
     delete_ticket: Option<DynamicDeleteTicket>,
     delete_restore: Option<PendingDeleteRestore>,
     delete_unattributed_result: Option<crate::spawn_hosts::PumpResult>,
+    delete_yield: Option<component_scheduler::PendingSchedulerYield>,
 }
 
 static mut LANES: Vec<Lane> = Vec::new();
@@ -154,7 +157,8 @@ pub(super) unsafe fn prepare(instance_index: usize) -> Result<(), nt_status::NtS
         rows.push(Lane { instance: instance_index, domain, pml4: inst.pml4, ordinal, handle: 0,
             route: None, component_shared: 0, executive_shared: 0, phase: Phase::Preparing,
             current_irp: None, startup_dispatch: None,
-            delete_ticket: None, delete_restore: None, delete_unattributed_result: None });
+            delete_ticket: None, delete_restore: None, delete_unattributed_result: None,
+            delete_yield: None });
         rows.len() - 1
     };
     let result = construct(index, inst);
@@ -389,7 +393,14 @@ pub(super) unsafe fn dispatch_callback(
     if instance_domain_identity(inst) != Some((&*core::ptr::addr_of!(LANES))[index].domain)
         || !mark_entered(instance_index, selection, None)
     { return DeleteCallbackProgress::Retained; }
-    match component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller) {
+    settle_delete_pump(index, component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller))
+}
+
+/// Own every outcome of the entered DeleteProcedure pump, on first entry and on resume.
+unsafe fn settle_delete_pump(
+    index: usize, pump: component_scheduler::HostedPumpRestore,
+) -> DeleteCallbackProgress {
+    match pump {
         component_scheduler::HostedPumpRestore::Restored(result) => {
             finish_delete_result(index, result)
         }
@@ -417,7 +428,24 @@ pub(super) unsafe fn dispatch_callback(
             (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
             DeleteCallbackProgress::Uncertain
         }
+        component_scheduler::HostedPumpRestore::SchedulerYieldRetained(pending) => {
+            let retryable = pending.retryable();
+            let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+            row.delete_yield = Some(pending);
+            row.phase = Phase::SchedulerYield;
+            if retryable { DeleteCallbackProgress::Retained } else { DeleteCallbackProgress::Uncertain }
+        }
     }
+}
+
+/// Continue the callback's own scheduler yield; the callback is never entered again.
+unsafe fn resume_delete_yield(index: usize) -> DeleteCallbackProgress {
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    let Some(pending) = row.delete_yield.take_if(|pending| pending.retryable()) else {
+        return DeleteCallbackProgress::Uncertain;
+    };
+    row.phase = Phase::Entered;
+    settle_delete_pump(index, component_scheduler::resume_scheduler_yield(pending))
 }
 
 unsafe fn finish_delete_result(
@@ -545,6 +573,9 @@ pub(super) unsafe fn next_pending_delete() -> Option<usize> {
             Phase::DeleteCompleted => PendingLaneReadiness::Ready,
             Phase::NestedRestore if row.delete_restore.as_ref()
                 .is_some_and(|pending| pending.retryable) => PendingLaneReadiness::Ready,
+            Phase::SchedulerYield if row.delete_yield.as_ref()
+                .is_some_and(component_scheduler::PendingSchedulerYield::retryable) =>
+                PendingLaneReadiness::Ready,
             Phase::DeletePrepared => {
                 let Some(primary) = hosted_ingress_sources::primary_route(row.instance) else {
                     return PendingLaneReadiness::Blocked;
@@ -569,6 +600,8 @@ pub(super) unsafe fn has_pending_delete() -> bool {
             Phase::DeletePrepared | Phase::DeleteCompleted => true,
             Phase::NestedRestore => row.delete_restore.as_ref()
                 .is_some_and(|pending| pending.retryable),
+            Phase::SchedulerYield => row.delete_yield.as_ref()
+                .is_some_and(component_scheduler::PendingSchedulerYield::retryable),
             _ => false,
         }
     })
@@ -585,6 +618,7 @@ pub(super) unsafe fn poll_pending_delete(instance_index: usize) -> DeleteCallbac
             None => DeleteCallbackProgress::Retained,
         },
         Phase::NestedRestore => retry_delete_restore(index),
+        Phase::SchedulerYield => resume_delete_yield(index),
         _ => DeleteCallbackProgress::Uncertain,
     }
 }

@@ -178,7 +178,7 @@ pub(crate) use hosted_dpc_scheduler::{
     next_deadline as hosted_dpc_next_deadline, wake_due as hosted_dpc_wake_due,
 };
 use component_scheduler::hosted_component_pump;
-pub(crate) use component_scheduler::ComponentSchedulerScope;
+pub(crate) use component_scheduler::{ComponentSchedulerScope, SchedulerServiceRefusal};
 pub(crate) use component_scheduler::handoff_exact_component_once;
 
 #[path = "device_property.rs"]
@@ -74819,9 +74819,7 @@ impl FileIrpPumpContinuation {
     pub(super) const fn child_work_ready(&self) -> bool { self.ready_for_child }
 
     pub(super) fn restore_retryable(&self) -> bool {
-        matches!(self.pump.as_ref(),
-            Some(component_scheduler::HostedPumpRestore::ChildWorkPending(pending))
-                if pending.retryable())
+        self.pump.as_ref().is_some_and(component_scheduler::HostedPumpRestore::retryable_continuation)
     }
 
     /// Retry a saved child observation or a scheduler refusal without selecting another child.
@@ -74831,9 +74829,7 @@ impl FileIrpPumpContinuation {
 
     /// The native pump is parked mid-receive after a scheduler yield; its lane still runs.
     pub(super) fn scheduler_yield_pending(&self) -> bool {
-        matches!(self.pump.as_ref(),
-            Some(component_scheduler::HostedPumpRestore::ChildWorkPending(pending))
-                if pending.scheduler_yield_pending())
+        self.pump.as_ref().is_some_and(component_scheduler::HostedPumpRestore::scheduler_yield_pending)
     }
 
     /// A child is selected at the outer root boundary, after this File's Rust stack unwound.

@@ -34,6 +34,8 @@ enum Phase {
     Entered,
     Suspended,
     NestedRestore,
+    /// The unwinder's pump is retained mid scheduler-yield in `scheduler_yield` (#333).
+    SchedulerYield,
     Completed,
     Uncertain,
     Retiring,
@@ -56,6 +58,39 @@ struct SourceCompletionLane {
     dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
     startup_dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
     nested_restore: Option<SourcePendingRestore>,
+    scheduler_yield: Option<SourceSchedulerYield>,
+}
+
+/// A scheduler service could not hand the unwinder's lane back. Each variant keeps the whole
+/// continuation, so the retry resumes the same receive and never enters the command again.
+enum SourceSchedulerYield {
+    /// The first slice, retained by the generic pump.
+    Dispatch(component_scheduler::PendingSchedulerYield),
+    /// A resumed hosted wait, retained by `poll` with its own outer parent still parked.
+    Resume {
+        step: component_scheduler::SchedulerYieldStep,
+        pump: crate::spawn_hosts::PumpResult,
+        channel: crate::spawn_hosts::PumpChannel,
+        parent: Option<runtime::nested::ParkedParentHandle>,
+    },
+}
+
+impl SourceSchedulerYield {
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Dispatch(pending) => pending.retryable(),
+            Self::Resume { step, .. } => step.retryable(),
+        }
+    }
+}
+
+/// What one resumed hosted-wait slice left behind.
+enum Resumed {
+    NotReady,
+    Pump(crate::spawn_hosts::PumpResult),
+    /// The service did not hand the lane back: `step` is owed before its next receive.
+    Yield(component_scheduler::SchedulerYieldStep, crate::spawn_hosts::PumpResult,
+        crate::spawn_hosts::PumpChannel),
 }
 
 #[derive(Clone, Copy)]
@@ -267,6 +302,7 @@ pub(super) unsafe fn prepare(
             dispatch: None,
             startup_dispatch: None,
             nested_restore: None,
+            scheduler_yield: None,
         });
         index
     };
@@ -596,6 +632,15 @@ pub(super) unsafe fn dispatch(
     if phase == Phase::Suspended {
         return SourceCompletionDispatch::Suspended;
     }
+    if phase == Phase::SchedulerYield {
+        return if (&*core::ptr::addr_of!(LANES))[index]
+            .scheduler_yield.as_ref().is_some_and(SourceSchedulerYield::retryable)
+        {
+            SourceCompletionDispatch::Suspended
+        } else {
+            SourceCompletionDispatch::Uncertain
+        };
+    }
     if phase == Phase::NestedRestore {
         return if (&*core::ptr::addr_of!(LANES))[index]
             .nested_restore.as_ref().is_some_and(|pending| pending.retryable)
@@ -640,7 +685,15 @@ pub(super) unsafe fn dispatch(
         row.command = Some(command);
         row.phase = Phase::Entered;
     }
-    match component_scheduler::hosted_component_pump_with_caller_retained(&channel, caller) {
+    settle_dispatch_pump(index,
+        component_scheduler::hosted_component_pump_with_caller_retained(&channel, caller))
+}
+
+/// Own every outcome of the entered first slice, on first entry and on resume.
+unsafe fn settle_dispatch_pump(
+    index: usize, pump: component_scheduler::HostedPumpRestore,
+) -> SourceCompletionDispatch {
+    match pump {
         component_scheduler::HostedPumpRestore::Restored(pump) => finish_slice(index, pump),
         component_scheduler::HostedPumpRestore::Retained {
             result, key, ticket, retryable,
@@ -664,7 +717,95 @@ pub(super) unsafe fn dispatch(
             (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
             SourceCompletionDispatch::Uncertain
         }
+        component_scheduler::HostedPumpRestore::SchedulerYieldRetained(pending) =>
+            retain_scheduler_yield(index, SourceSchedulerYield::Dispatch(pending)),
     }
+}
+
+unsafe fn retain_scheduler_yield(index: usize, retained: SourceSchedulerYield) -> SourceCompletionDispatch {
+    let retryable = retained.retryable();
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    row.scheduler_yield = Some(retained);
+    row.phase = Phase::SchedulerYield;
+    if retryable { SourceCompletionDispatch::Suspended } else { SourceCompletionDispatch::Uncertain }
+}
+
+/// Continue the retained scheduler yield once. A refusal keeps it; the command is never
+/// entered again and an uncertain restore is never replayed.
+unsafe fn resume_scheduler_yield(index: usize) -> SourceCompletionDispatch {
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    let Some(retained) = row.scheduler_yield.take_if(|retained| retained.retryable()) else {
+        return SourceCompletionDispatch::Uncertain;
+    };
+    match retained {
+        SourceSchedulerYield::Dispatch(pending) => {
+            row.phase = Phase::Entered;
+            settle_dispatch_pump(index, component_scheduler::resume_scheduler_yield(pending))
+        }
+        SourceSchedulerYield::Resume { step, pump, mut channel, parent } => {
+            let (Some(route), Some(worker)) = (row.route, worker(row.instance, row.ordinal)) else {
+                return retain_scheduler_yield(index,
+                    SourceSchedulerYield::Resume { step, pump, channel, parent });
+            };
+            let Ok(caller) = hosted_thread_resources::registry_caller(worker) else {
+                return retain_scheduler_yield(index,
+                    SourceSchedulerYield::Resume { step, pump, channel, parent });
+            };
+            // The retained slice already owns its outer parent. A lane running here would be a
+            // second parent this row cannot hold, so the slice waits for a boundary without one.
+            if runtime::running_lane().is_some() {
+                return retain_scheduler_yield(index,
+                    SourceSchedulerYield::Resume { step, pump, channel, parent });
+            }
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            let step = component_scheduler::retry_scheduler_yield_restore(step);
+            if !matches!(step, component_scheduler::SchedulerYieldStep::Service
+                | component_scheduler::SchedulerYieldStep::Receive)
+            {
+                return retain_scheduler_yield(index,
+                    SourceSchedulerYield::Resume { step, pump, channel, parent });
+            }
+            let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+            row.phase = Phase::Entered;
+            let resumed = (|| -> Result<Resumed, ()> {
+                let _caller = crate::provider_registry_caller::Scope::enter(&channel, caller)
+                    .map_err(|_| ())?;
+                let scope = component_scheduler::ComponentSchedulerScope::enter();
+                continue_yields(&scope, route, &mut channel, pump, step)
+            })();
+            settle_resumed(index, resumed, parent)
+        }
+    }
+}
+
+/// Drive a resumed hosted wait's scheduler yields to its next stop. Only this lane's own
+/// receive follows a service, and only once the service has handed the lane back. The caller
+/// holds the registry caller and scheduler scopes for the whole slice.
+unsafe fn continue_yields(
+    scope: &component_scheduler::ComponentSchedulerScope,
+    route: PeerRoute,
+    channel: &mut crate::spawn_hosts::PumpChannel,
+    mut pump: crate::spawn_hosts::PumpResult,
+    mut step: component_scheduler::SchedulerYieldStep,
+) -> Result<Resumed, ()> {
+    while pump.scheduler_yielded {
+        if !step.may_receive() {
+            step = component_scheduler::scheduler_yield_step(scope.service_irq_yield(channel.shared_va));
+            if !step.may_receive() {
+                return Ok(Resumed::Yield(step, pump, *channel));
+            }
+        }
+        step = component_scheduler::SchedulerYieldStep::Service;
+        channel.reply_cap = runtime::current_reply(route).map_err(|_| ())?;
+        pump = crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
+            channel, &pump)
+            .map_err(|_| ())?;
+    }
+    if pump.completed {
+        let dispatch = runtime::dispatch(route).map_err(|_| ())?;
+        runtime::complete(route, dispatch, pump.reply_cap, LABEL).map_err(|_| ())?;
+    }
+    Ok(Resumed::Pump(pump))
 }
 
 unsafe fn finish_slice(
@@ -834,6 +975,9 @@ pub(super) unsafe fn continuation_ready(
             pending.retryable && runtime::nested::pending_ticket(pending.ticket)
         });
     }
+    if row.phase == Phase::SchedulerYield {
+        return row.scheduler_yield.as_ref().is_some_and(SourceSchedulerYield::retryable);
+    }
     if row.phase != Phase::Suspended {
         return false;
     }
@@ -864,6 +1008,9 @@ pub(super) unsafe fn poll(
     if phase == Phase::NestedRestore {
         return retry_parent_restore(index);
     }
+    if phase == Phase::SchedulerYield {
+        return resume_scheduler_yield(index);
+    }
     if phase == Phase::Uncertain || phase == Phase::Entered {
         return SourceCompletionDispatch::Uncertain;
     }
@@ -883,35 +1030,37 @@ pub(super) unsafe fn poll(
         return SourceCompletionDispatch::Uncertain;
     };
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    let Ok(mut parent) = runtime::nested::park_current() else {
+    let Ok(parent) = runtime::nested::park_current() else {
         return SourceCompletionDispatch::Suspended;
     };
     (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Entered;
-    let resumed = (|| -> Result<Option<crate::spawn_hosts::PumpResult>, ()> {
+    let resumed = (|| -> Result<Resumed, ()> {
         if !runtime::resume_service(route).map_err(|_| ())? {
-            return Ok(None);
+            return Ok(Resumed::NotReady);
         }
         let _caller =
             crate::provider_registry_caller::Scope::enter(&channel, caller).map_err(|_| ())?;
         let scope = component_scheduler::ComponentSchedulerScope::enter();
-        let mut pump = crate::spawn_hosts::component_pump_resume_hosted_wait(&channel, &previous)
+        let pump = crate::spawn_hosts::component_pump_resume_hosted_wait(&channel, &previous)
             .map_err(|_| ())?;
-        while pump.scheduler_yielded {
-            scope.service_irq_yield(channel.shared_va);
-            channel.reply_cap = runtime::current_reply(route).map_err(|_| ())?;
-            pump = crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
-                &channel, &pump)
-                .map_err(|_| ())?;
-        }
-        if pump.completed {
-            let dispatch = runtime::dispatch(route).map_err(|_| ())?;
-            runtime::complete(route, dispatch, pump.reply_cap, LABEL).map_err(|_| ())?;
-        }
-        Ok(Some(pump))
+        continue_yields(&scope, route, &mut channel, pump,
+            component_scheduler::SchedulerYieldStep::Service)
     })();
+    settle_resumed(index, resumed, parent)
+}
+
+/// Return a resumed slice's result through the exact outer parent `poll` parked. A slice still
+/// owed its scheduler yield keeps that parent parked with it: the lane is not yet finished.
+unsafe fn settle_resumed(
+    index: usize,
+    resumed: Result<Resumed, ()>,
+    mut parent: Option<runtime::nested::ParkedParentHandle>,
+) -> SourceCompletionDispatch {
     let result = match resumed {
-        Ok(Some(pump)) => SourceResumeResult::Pump(pump),
-        Ok(None) => SourceResumeResult::NotReady,
+        Ok(Resumed::Yield(step, pump, channel)) => return retain_scheduler_yield(index,
+            SourceSchedulerYield::Resume { step, pump, channel, parent }),
+        Ok(Resumed::Pump(pump)) => SourceResumeResult::Pump(pump),
+        Ok(Resumed::NotReady) => SourceResumeResult::NotReady,
         Err(()) => SourceResumeResult::Failed,
     };
     let Some(handle) = parent.as_ref() else {

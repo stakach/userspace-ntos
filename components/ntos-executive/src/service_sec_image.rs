@@ -13791,6 +13791,13 @@ fn trace_running_lane_gate(
     print_str(b"\n");
 }
 
+/// Retry the root-owned restores (#333). Only a root-level boundary calls this: the service
+/// loop before it admits work, and a root-level loop before it services or receives again.
+pub(crate) unsafe fn drain_root_restores() {
+    trace_root_restore_drain(
+        crate::spawn_hosts::shared_ingress::owner::runtime::nested::drain_root_restore_queue());
+}
+
 /// Bounded evidence for the root restore queue; silent while it is empty.
 fn trace_root_restore_drain(drain: nt_component_suspension::RootRestoreDrain) {
     static TRACED: AtomicU64 = AtomicU64::new(0);

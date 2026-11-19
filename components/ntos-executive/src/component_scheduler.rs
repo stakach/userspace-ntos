@@ -73,15 +73,19 @@ impl ComponentSchedulerScope {
 
     /// Caller has retained the exact yielded invocation before any scheduler effect. A kernel
     /// caller must also have claimed its canonical receive attempt and released coordinator borrows.
+    /// A refusal names what is owed (#333): a refused park ran nothing, and a retained parent
+    /// is still held, so the caller must unwind to its owner instead of receiving on that lane.
     pub(crate) unsafe fn service_irq_yield(
         &self, shared_va: u64,
-    ) -> scsi_srb_scheduler_service::SchedulerServiceSample {
+    ) -> Result<scsi_srb_scheduler_service::SchedulerServiceSample, SchedulerServiceRefusal> {
         use scsi_srb_scheduler_service::{SchedulerServiceClock, SchedulerServicePhase};
         let mut clock = SchedulerServiceClock::new(crate::disk_census_ticks());
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = crate::allocator::enter_durable();
-        let mut parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
-            .expect("IRQ scheduling must preserve its exact parent invocation");
+        let Ok(mut parent) = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
+        else {
+            return Err(SchedulerServiceRefusal::Park);
+        };
         let yield_number = YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
         clock.transition(SchedulerServicePhase::TimerWork, crate::disk_census_ticks());
         crate::dispatcher_bootstrap::request_receive_checkpoint();
@@ -132,10 +136,54 @@ impl ComponentSchedulerScope {
             print_str(b"\n");
         }
         clock.transition(SchedulerServicePhase::ParentRestore, crate::disk_census_ticks());
-        crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(&mut parent)
-            .expect("IRQ scheduling must restore its retained parent invocation");
-        clock.finish(crate::disk_census_ticks(), timer_work, irq_lines, dpcs)
+        if crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(&mut parent).is_err() {
+            if let Some(parent) = parent {
+                return Err(SchedulerServiceRefusal::ParentRetained(parent));
+            }
+        }
+        Ok(clock.finish(crate::disk_census_ticks(), timer_work, irq_lines, dpcs))
     }
+}
+
+/// Why a scheduler service did not hand its lane back for receive.
+#[must_use = "a retained parent is owed its restore before the lane may be received from"]
+pub(crate) enum SchedulerServiceRefusal {
+    /// The parent could not be parked; no timer, IRQ or DPC work ran.
+    Park,
+    /// The work ran but the parent's restore was refused. The move-only handle is the parent's
+    /// only owner: a continuation keeps it as a ticket, and dropping it makes the root its owner.
+    ParentRetained(crate::spawn_hosts::shared_ingress::owner::runtime::nested::ParkedParentHandle),
+}
+
+pub(crate) type SchedulerYieldStep = nt_component_suspension::SchedulerYieldStep<
+    crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket>;
+
+/// The step a continuation owes after one scheduler service, taking ownership of any parent.
+pub(crate) fn scheduler_yield_step(
+    serviced: Result<scsi_srb_scheduler_service::SchedulerServiceSample, SchedulerServiceRefusal>,
+) -> SchedulerYieldStep {
+    use nt_component_suspension::SchedulerServiceEnd as End;
+    SchedulerYieldStep::after_service(match serviced {
+        Ok(_) => End::Restored,
+        Err(SchedulerServiceRefusal::Park) => End::ParkRefused,
+        Err(SchedulerServiceRefusal::ParentRetained(parent)) => End::ParentRetained(parent.into_ticket()),
+    })
+}
+
+/// Retry the owed restore of a scheduler-yield continuation once. Only a proven no-effect
+/// refusal stays retryable; an uncertain one is fenced and never replayed.
+pub(crate) unsafe fn retry_scheduler_yield_restore(step: SchedulerYieldStep) -> SchedulerYieldStep {
+    use crate::spawn_hosts::shared_ingress::owner::runtime::nested;
+    use nt_component_suspension::RestoreRetry;
+    step.retry_restore(|ticket| {
+        if nested::restore_pending_ticket(ticket).is_ok() {
+            RestoreRetry::Restored
+        } else if nested::pending_ticket(ticket) {
+            RestoreRetry::RefusedNoEffect
+        } else {
+            RestoreRetry::Uncertain
+        }
+    })
 }
 
 impl Drop for ComponentSchedulerScope {
@@ -171,6 +219,9 @@ enum PendingReceiveMode {
     NestedRestore,
     /// The child receive has already run; only its retained scheduler receive may resume.
     SchedulerYield,
+    /// That scheduler service ran but left the lane held: `inner_ticket` is owed its restore,
+    /// then only the lane's receive continues. The service is never run twice (#333).
+    SchedulerServiced,
 }
 
 impl PendingChildWorkRestore {
@@ -214,6 +265,9 @@ pub(super) enum HostedPumpRestore {
         ticket: crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket,
         retryable: bool,
     },
+    /// The parent was retained mid scheduler-yield. Unlike `Retained`, the pump is unfinished:
+    /// its owner resumes it with [`resume_scheduler_yield`], which continues the lane's receive.
+    SchedulerYieldRetained(PendingSchedulerYield),
 }
 
 /// Read-only witness of the physical source held by a typed child-work continuation.
@@ -235,6 +289,8 @@ impl HostedPumpRestore {
                 (channel, *dispatch, result.reply_cap),
             Self::ChildWorkPending(pending) =>
                 (&pending.channel, pending.dispatch, pending.result.reply_cap),
+            Self::SchedulerYieldRetained(pending) =>
+                (&pending.entered.channel, pending.dispatch?, pending.entered.result.reply_cap),
             _ => return None,
         };
         if reply_cap == 0 || channel.reply_cap != reply_cap { return None; }
@@ -244,12 +300,32 @@ impl HostedPumpRestore {
         })
     }
 
+    /// A retained continuation its owner may drive again with [`retry_child_work`], without
+    /// selecting a new child.
+    pub(super) fn retryable_continuation(&self) -> bool {
+        match self {
+            Self::ChildWorkPending(pending) => pending.retryable(),
+            Self::SchedulerYieldRetained(pending) => pending.retryable(),
+            _ => false,
+        }
+    }
+
+    /// The retained pump stopped at a scheduler yield while its lane still runs: only its own
+    /// receive may collect that lane's next message.
+    pub(super) fn scheduler_yield_pending(&self) -> bool {
+        match self {
+            Self::ChildWorkPending(pending) => pending.scheduler_yield_pending(),
+            Self::SchedulerYieldRetained(pending) => pending.lane_running(),
+            _ => false,
+        }
+    }
+
     fn legacy(self) -> crate::spawn_hosts::PumpResult {
         match self {
             Self::Restored(result) => result,
             Self::Retained { .. } | Self::Unattributed(_)
             | Self::ChildWorkReady { .. } | Self::ChildWorkQuarantined { .. }
-            | Self::ChildWorkPending(_) =>
+            | Self::ChildWorkPending(_) | Self::SchedulerYieldRetained(_) =>
                 panic!("restore nested hosted parent"),
         }
     }
@@ -373,7 +449,7 @@ unsafe fn hosted_component_pump_inner(
     let Ok(route) = runtime::channel_route(&channel) else {
         return refusal::refuse(refusal::Invariant::PhysicalIngressIdentity, &channel, None);
     };
-    let mut parent = if channel.initial == crate::spawn_hosts::InitialAction::ReplyRequest {
+    let parent = if channel.initial == crate::spawn_hosts::InitialAction::ReplyRequest {
         crate::driver_launch::trace_port_connect_handoff_probe(20, &channel, 0);
         // Every check up to admission is free of effects on the target: a refusal leaves its
         // retained Call, canonical Reply and request page exactly as they were.
@@ -436,7 +512,7 @@ unsafe fn hosted_component_pump_inner(
             crate::disk_census_ticks());
     }
     crate::driver_launch::trace_port_connect_handoff_probe(25, channel, channel.reply_cap);
-    let mut result = crate::spawn_hosts::component_pump(channel);
+    let result = crate::spawn_hosts::component_pump(channel);
     crate::driver_launch::trace_port_connect_handoff_probe(26, channel, result.reply_cap);
     let result_flags = u64::from(result.completed)
         | (u64::from(result.scheduler_yielded) << 1)
@@ -452,19 +528,82 @@ unsafe fn hosted_component_pump_inner(
     crate::driver_launch::trace_port_connect_handoff_probe(27, channel, result_flags);
     trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 1, Some(&result));
     trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 1, Some(&result));
+    drive_entered_pump(&scope, EnteredPump {
+        channel: *channel, route, caller, parent, result,
+        step: SchedulerYieldStep::Service,
+        ordinals: (startup_ordinal, class_startup_ordinal),
+    }, timeline, observed_owner)
+}
+
+/// A hosted pump whose component has been entered. It is the whole state the remainder of
+/// the pump needs, so a pump retained mid scheduler-yield can continue exactly where it
+/// stopped once its owner has restored the held lane (#333).
+struct EnteredPump {
+    channel: crate::spawn_hosts::PumpChannel,
+    route: Option<nt_component_suspension::peer_registry::PeerRoute>,
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    /// The outer parent, still parked for the whole pump.
+    parent: Option<crate::spawn_hosts::shared_ingress::owner::runtime::nested::ParkedParentHandle>,
+    result: crate::spawn_hosts::PumpResult,
+    /// `Receive` only when this yield's service already ran and restored its lane.
+    step: SchedulerYieldStep,
+    ordinals: (Option<u64>, Option<u64>),
+}
+
+/// A pump retained mid scheduler-yield: the service could not hand its lane back, so neither
+/// the lane's receive nor the outer parent's restore has run. Only its owner may drive it, with
+/// [`resume_scheduler_yield`]; a retry of a mere restore would treat the yield as finished.
+#[must_use = "keep the retained pump until its scheduler yield resumes or is fenced"]
+pub(super) struct PendingSchedulerYield {
+    entered: EnteredPump,
+    dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
+}
+
+impl PendingSchedulerYield {
+    pub(super) const fn retryable(&self) -> bool { self.entered.step.retryable() }
+    /// The park was refused, so the lane was never held and still executes.
+    const fn lane_running(&self) -> bool {
+        matches!(self.entered.step, SchedulerYieldStep::Service)
+    }
+}
+
+unsafe fn drive_entered_pump(
+    scope: &ComponentSchedulerScope,
+    entered: EnteredPump,
+    mut timeline: Option<scsi_srb_pump_owner::ScsiSrbPumpTimeline<'_, SCSI_SRB_PUMP_OWNER_SLOTS>>,
+    observed_owner: Option<&scsi_srb_pump_owner::ScsiSrbPumpOwnerClaim<'_, SCSI_SRB_PUMP_OWNER_SLOTS>>,
+) -> HostedPumpRestore {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let EnteredPump { mut channel, route, caller, mut parent, mut result, mut step, ordinals } = entered;
+    let (startup_ordinal, class_startup_ordinal) = ordinals;
+    let channel = &mut channel;
     while result.scheduler_yielded {
-        if let Some(timeline) = timeline.as_mut() {
-            timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::SchedulerService,
-                crate::disk_census_ticks());
+        if !step.may_receive() {
+            if let Some(timeline) = timeline.as_mut() {
+                timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::SchedulerService,
+                    crate::disk_census_ticks());
+            }
+            trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 2, Some(&result));
+            trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 2, Some(&result));
+            let serviced = scope.service_irq_yield(channel.shared_va);
+            if let (Some(owner), Ok(sample)) = (observed_owner, serviced.as_ref()) {
+                owner.record_scheduler_service(*sample);
+            }
+            step = scheduler_yield_step(serviced);
+            if !step.may_receive() {
+                // The lane is held or was never serviced: receiving on it would block the root.
+                let dispatch = route.and_then(|route| runtime::dispatch(route).ok());
+                return HostedPumpRestore::SchedulerYieldRetained(PendingSchedulerYield {
+                    entered: EnteredPump {
+                        channel: *channel, route, caller, parent, result, step, ordinals,
+                    },
+                    dispatch,
+                });
+            }
+            trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 3, Some(&result));
+            trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 3, Some(&result));
         }
-        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 2, Some(&result));
-        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 2, Some(&result));
-        let service_sample = scope.service_irq_yield(channel.shared_va);
-        if let Some(owner) = observed_owner {
-            owner.record_scheduler_service(service_sample);
-        }
-        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 3, Some(&result));
-        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 3, Some(&result));
+        step = SchedulerYieldStep::Service;
         if route.is_some() {
             let _ = handoff_exact_component_once(channel.tcb);
         }
@@ -610,6 +749,37 @@ unsafe fn hosted_component_pump_inner(
     HostedPumpRestore::Restored(result)
 }
 
+/// Drive a pump retained mid scheduler-yield once. It reruns the service only when the service
+/// never ran; after the owed restore it continues only this lane's own receive, then finishes
+/// the pump as if it had never stopped. A refusal returns the same retained pump.
+pub(super) unsafe fn resume_scheduler_yield(mut pending: PendingSchedulerYield) -> HostedPumpRestore {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    // The pump already owns its outer parent. A lane running here would be a second parent
+    // nothing parked for this slice, so it waits for a boundary without one.
+    if runtime::running_lane().is_some() {
+        return HostedPumpRestore::SchedulerYieldRetained(pending);
+    }
+    pending.entered.step = retry_scheduler_yield_restore(pending.entered.step);
+    if !matches!(pending.entered.step, SchedulerYieldStep::Service | SchedulerYieldStep::Receive) {
+        return HostedPumpRestore::SchedulerYieldRetained(pending);
+    }
+    let PendingSchedulerYield { mut entered, dispatch } = pending;
+    // The lane runs again. It must still be the exact dispatch, caller and projection that
+    // stopped; otherwise the receive is never taken and the result stays uncertain.
+    let authentic = match entered.route {
+        Some(route) => runtime::dispatch(route).ok() == dispatch && dispatch.is_some_and(|dispatch|
+            entered.caller.is_none_or(|caller| crate::provider_registry_caller::resolve_retained(
+                route, dispatch, entered.channel.pml4).ok() == Some(caller))),
+        None => true,
+    } && crate::driver_launch::driver_thread_projection::enter(&entered.channel, entered.caller).is_ok();
+    if !authentic {
+        refusal::retain_uncertain(refusal::Invariant::YieldedReceiveContinuation,
+            &entered.channel, &mut entered.result, entered.parent.is_some());
+    }
+    let scope = ComponentSchedulerScope::enter();
+    drive_entered_pump(&scope, entered, None, None)
+}
+
 /// Shared completion contract for uninterrupted and resumed receive slices. A failed exact
 /// authentication leaves the caller responsible for retaining the entered result.
 unsafe fn authenticate_component_completion(
@@ -686,10 +856,13 @@ pub(super) unsafe fn resume_child_work(
 }
 
 /// Retry only a certified no-effects refusal. The consumed child step is never run again.
+/// A pump retained mid scheduler-yield is retried the same way, by continuing its own yield.
 pub(super) unsafe fn retry_child_work(pump: HostedPumpRestore) -> HostedPumpRestore {
     match pump {
         HostedPumpRestore::ChildWorkPending(pending) if pending.retryable =>
             resume_pending_child_work(pending),
+        HostedPumpRestore::SchedulerYieldRetained(pending) if pending.retryable() =>
+            resume_scheduler_yield(pending),
         other => other,
     }
 }
@@ -807,7 +980,7 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
         let restored = match pending.mode {
             PendingReceiveMode::ChildWork =>
                 runtime::nested::restore_child_work_parent(ticket).map(Some),
-            PendingReceiveMode::NestedRestore =>
+            PendingReceiveMode::NestedRestore | PendingReceiveMode::SchedulerServiced =>
                 runtime::nested::restore_pending_ticket(ticket).map(|_| None),
             PendingReceiveMode::SchedulerYield => {
                 pending.retryable = false;
@@ -868,8 +1041,10 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
             crate::spawn_hosts::component_pump_continue_nested_restore_receive(
                 &pending.channel, &pending.result,
             ).map_err(|status| (status, None)),
-        PendingReceiveMode::SchedulerYield => Ok(pending.result),
+        PendingReceiveMode::SchedulerYield | PendingReceiveMode::SchedulerServiced =>
+            Ok(pending.result),
     };
+    let serviced = pending.mode == PendingReceiveMode::SchedulerServiced;
     trace_connect_child_restore(22, &pending);
     let mut result = match receive {
         Ok(result) => result,
@@ -883,9 +1058,28 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
     trace_connect_child_result(0, &result);
     let mut channel = pending.channel;
     if result.scheduler_yielded {
-        trace_connect_child_result(1, &result);
-        scope.service_irq_yield(channel.shared_va);
-        trace_connect_child_result(2, &result);
+        if !serviced {
+            trace_connect_child_result(1, &result);
+            let step = scheduler_yield_step(scope.service_irq_yield(channel.shared_va));
+            if !step.may_receive() {
+                // Never receive on a lane the service did not hand back. A refused park ran
+                // nothing and the lane still executes; a held lane is owed its restore first.
+                pending.mode = match step.parent() {
+                    Some(ticket) => {
+                        pending.inner_ticket = Some(ticket);
+                        pending.inner_restored = false;
+                        pending.inner_receipt = None;
+                        PendingReceiveMode::SchedulerServiced
+                    }
+                    None => PendingReceiveMode::SchedulerYield,
+                };
+                pending.retryable = step.retryable();
+                pending.result = result;
+                pending.channel = channel;
+                return HostedPumpRestore::ChildWorkPending(pending);
+            }
+            trace_connect_child_result(2, &result);
+        }
         let _ = handoff_exact_component_once(channel.tcb);
         let reply = match runtime::current_reply(route) {
             Ok(reply) if reply != 0 => reply,
