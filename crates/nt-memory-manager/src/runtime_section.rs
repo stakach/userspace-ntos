@@ -327,6 +327,8 @@ struct GenericSectionPage {
     dirty: bool,
     dirty_epoch: u64,
     writer: PageWriter,
+    /// Retryable failures of section deletion's synchronous page write.
+    write_failures: u8,
 }
 
 impl GenericSectionPage {
@@ -339,6 +341,7 @@ impl GenericSectionPage {
             dirty: false,
             dirty_epoch: 0,
             writer: PageWriter::Idle,
+            write_failures: 0,
         }
     }
 }
@@ -376,6 +379,8 @@ pub struct GenericSectionTable {
     reference_authority: u64,
     reference_generation: u64,
     pages: Vec<GenericSectionPage>,
+    /// Retired routed sections whose FILE_OBJECT a page write still needs.
+    retired_writers: Vec<page_writes::RetiredPageWriter>,
     dirty_epoch: u64,
     page_write_generation: u64,
     section_generation: u64,
@@ -404,6 +409,7 @@ impl GenericSectionTable {
             reference_authority: 0,
             reference_generation: 0,
             pages: Vec::new(),
+            retired_writers: Vec::new(),
             dirty_epoch: 0,
             page_write_generation: 0,
             section_generation: 0,
@@ -443,6 +449,7 @@ impl GenericSectionTable {
             || !self.provider_client_aliases.is_empty()
             || !self.references.is_empty()
             || self.pages.iter().any(|page| page.live)
+            || !self.retired_writers.is_empty()
         {
             return false;
         }

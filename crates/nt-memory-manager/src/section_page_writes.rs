@@ -20,14 +20,42 @@ pub struct UnmappedPageWrite {
     pub released: bool,
 }
 
+/// A retired routed section reduced to the FILE_OBJECT reference its file data's page writes
+/// still need. NT keeps a page's PFN and the FILE_OBJECT its paging IRP references until the
+/// write completes (MiWriteComplete, NT5 modwrite.c), not the section object: the section
+/// retires while this owner settles its pages independently. A page whose write is uncertain
+/// never settles, so its owner, frame and FILE_OBJECT are retained and never reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetiredPageWriter {
+    pub(crate) identity: SectionIdentity,
+    pub(crate) control_area: u64,
+    pub(crate) backing: GenericSectionBacking,
+}
+
+/// MmIsRetryIoStatus (NT5 mi.h): a transient shortage, retried rather than lost.
+const fn retryable_write_status(status: u32) -> bool {
+    matches!(status, 0xC000_009A | 0xC000_0017 | 0xC000_0058) // RESOURCES, NO_MEMORY, WS_QUOTA
+}
+
+/// MiCleanSection retries a retryable status until `ReflushCount & MiIoRetryMask` (0x1f) is
+/// zero: 32 attempts (NT5 sectsup.c, miglobal.c).
+const SECTION_DELETE_WRITE_ATTEMPTS: u8 = 32;
+
 impl GenericSectionTable {
-    /// The exact section incarnation, including one released by its last handle and view whose
-    /// backing has not yet retired.
-    fn retained_section(&self, identity: SectionIdentity) -> Option<GenericSection> {
+    /// The control area and FILE_OBJECT reference of the exact section incarnation that may issue
+    /// a page write: a section whose backing has not retired (including one released by its last
+    /// handle and view), or a retired section's page writer.
+    fn writer_source(&self, identity: SectionIdentity) -> Option<(u64, GenericSectionBacking)> {
         self.sections
             .get(identity.index)
-            .copied()
             .filter(|section| section.backing.is_live() && section.generation == identity.generation)
+            .map(|section| (section.control_area, section.backing))
+            .or_else(|| {
+                self.retired_writers
+                    .iter()
+                    .find(|writer| writer.identity == identity)
+                    .map(|writer| (writer.control_area, writer.backing))
+            })
     }
 
     fn ticket_page(&self, ticket: SectionWritebackPage) -> Option<usize> {
@@ -64,11 +92,11 @@ impl GenericSectionTable {
         via: SectionIdentity,
         ticket: SectionWritebackPage,
     ) -> Result<SectionPageWrite, PageWriteRefusal> {
-        self.retained_section(via)
-            .filter(|section| {
-                section.backing.kind == GENERIC_SECTION_BACKING_ROUTED
-                    && section.backing.routed_lease.is_some()
-                    && section.control_area == ticket.control_area
+        self.writer_source(via)
+            .filter(|(area, backing)| {
+                backing.kind == GENERIC_SECTION_BACKING_ROUTED
+                    && backing.routed_lease.is_some()
+                    && *area == ticket.control_area
             })
             .ok_or(PageWriteRefusal::Stale)?;
         let index = self.ticket_page(ticket).ok_or(PageWriteRefusal::Stale)?;
@@ -90,8 +118,11 @@ impl GenericSectionTable {
         Ok(SectionPageWrite { ticket, via, generation })
     }
 
-    /// Settle a write exactly once. Success cleans only the version that was copied; a failure
-    /// leaves the page dirty for a later writer; an uncertain effect quarantines the page.
+    /// Settle a write exactly once. Success cleans only the version that was copied; an uncertain
+    /// effect quarantines the page. A failure leaves the page dirty for a later writer, except
+    /// once every section of the file data is released: MiCleanSection reissues only a retryable
+    /// status, a bounded number of times, and otherwise ignores the error and drops the page
+    /// (NT5 sectsup.c), so a failing page cannot hold its file data forever.
     pub fn finish_page_write(&mut self, write: SectionPageWrite, outcome: PageWriteOutcome) -> bool {
         let Some(index) = self.ticket_page(write.ticket) else {
             return false;
@@ -101,15 +132,27 @@ impl GenericSectionTable {
         {
             return false;
         }
+        let released = !self.control_area_live(write.ticket.control_area);
         let page = &mut self.pages[index];
         match outcome {
             PageWriteOutcome::Written => {
                 page.writer = PageWriter::Idle;
+                page.write_failures = 0;
                 if page.dirty && page.dirty_epoch == write.ticket.dirty_epoch {
                     page.dirty = false;
                 }
             }
-            PageWriteOutcome::Failed(_) => page.writer = PageWriter::Idle,
+            PageWriteOutcome::Failed(status) => {
+                page.writer = PageWriter::Idle;
+                if released && page.dirty_epoch == write.ticket.dirty_epoch {
+                    page.write_failures = page.write_failures.saturating_add(1);
+                    if !retryable_write_status(status)
+                        || page.write_failures >= SECTION_DELETE_WRITE_ATTEMPTS
+                    {
+                        page.dirty = false; // The lost write is not retried.
+                    }
+                }
+            }
             PageWriteOutcome::Uncertain => {
                 page.writer = PageWriter::Uncertain {
                     generation: write.generation,
@@ -126,12 +169,12 @@ impl GenericSectionTable {
         &self,
         section: SectionIdentity,
     ) -> Result<Vec<SectionWritebackPage>, u32> {
-        let section = self.retained_section(section).ok_or(STATUS_NOT_MAPPED_VIEW)?;
+        let (area, _) = self.writer_source(section).ok_or(STATUS_NOT_MAPPED_VIEW)?;
         let area = self
             .control_areas
             .iter()
             .copied()
-            .find(|area| area.id == section.control_area)
+            .find(|candidate| candidate.id == area)
             .ok_or(STATUS_NOT_MAPPED_VIEW)?;
         self.prepare_area_writeback(area, 0, area.extent)
     }
@@ -156,8 +199,8 @@ impl GenericSectionTable {
             {
                 continue;
             }
-            // Prefer a section a handle still holds; a released one retains its FILE_OBJECT
-            // until this write settles.
+            // Prefer a section a handle still holds; a released one, or a retired section's page
+            // writer, retains its FILE_OBJECT until this write settles.
             let via = self
                 .sections
                 .iter()
@@ -169,7 +212,13 @@ impl GenericSectionTable {
                         && section.backing.routed_lease.is_some()
                 })
                 .max_by_key(|(_, section)| section.live)
-                .map(|(index, section)| SectionIdentity { index, generation: section.generation });
+                .map(|(index, section)| SectionIdentity { index, generation: section.generation })
+                .or_else(|| {
+                    self.retired_writers
+                        .iter()
+                        .find(|writer| writer.control_area == area.id)
+                        .map(|writer| writer.identity)
+                });
             let Some(via) = via else {
                 continue;
             };
@@ -230,24 +279,31 @@ impl GenericSectionTable {
     /// whose file data has not yet retired, with that retained lease.
     pub fn retained_routed_sections(&self) -> Vec<(SectionIdentity, RoutedSectionLease)> {
         let mut sections = Vec::new();
-        for (index, section) in self.sections.iter().enumerate() {
+        let candidates = self
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(index, section)| (SectionIdentity { index, generation: section.generation }, section.backing))
+            .chain(self.retired_writers.iter().map(|writer| (writer.identity, writer.backing)));
+        for (identity, backing) in candidates {
             if let (true, GENERIC_SECTION_BACKING_ROUTED, Some(lease)) =
-                (section.backing.is_live(), section.backing.kind, section.backing.routed_lease)
+                (backing.is_live(), backing.kind, backing.routed_lease)
             {
                 if sections.try_reserve(1).is_err() {
                     break;
                 }
-                sections.push((SectionIdentity { index, generation: section.generation }, lease));
+                sections.push((identity, lease));
             }
         }
         sections
     }
 
-    /// The FILE_OBJECT lease of the exact retained routed section incarnation.
+    /// The FILE_OBJECT lease of the exact retained routed section incarnation, or of the page
+    /// writer it retired into.
     pub fn routed_lease_exact(&self, section: SectionIdentity) -> Option<RoutedSectionLease> {
-        self.retained_section(section)
-            .filter(|section| section.backing.kind == GENERIC_SECTION_BACKING_ROUTED)
-            .and_then(|section| section.backing.routed_lease)
+        self.writer_source(section)
+            .filter(|(_, backing)| backing.kind == GENERIC_SECTION_BACKING_ROUTED)
+            .and_then(|(_, backing)| backing.routed_lease)
     }
 
     /// The current dirty-version counter. A flush writes the versions dirtied before it began.
@@ -278,34 +334,102 @@ impl GenericSectionTable {
                 .is_some_and(|offset| offset < area.extent)
     }
 
-    /// Whether retirement must keep this section: a write it issues still owns its FILE_OBJECT,
-    /// or its released file data still has asynchronously written pages to settle.
-    pub(super) fn retirement_held(&self, section_index: usize) -> bool {
-        let section = self.sections[section_index];
-        let identity = SectionIdentity { index: section_index, generation: section.generation };
+    /// A write issued through this incarnation's FILE_OBJECT is still in flight.
+    pub(super) fn write_in_flight_via(&self, identity: SectionIdentity) -> bool {
+        self.pages.iter().any(|page| {
+            page.live && matches!(page.writer, PageWriter::InFlight { via, .. } if via == identity)
+        })
+    }
+
+    /// Whether this incarnation's FILE_OBJECT must outlive its section: a write through it is
+    /// uncertain, or it is the last reference of released file data that still owes a write.
+    pub(super) fn needs_retained_writer(&self, identity: SectionIdentity, area: u64) -> bool {
         if self.pages.iter().any(|page| {
-            page.live
-                && matches!(page.writer,
-                    PageWriter::InFlight { via, .. } | PageWriter::Uncertain { via, .. }
-                        if via == identity)
+            page.live && matches!(page.writer, PageWriter::Uncertain { via, .. } if via == identity)
         }) {
             return true;
         }
-        if self.control_area_live(section.control_area) {
+        if self.control_area_live(area) {
             return false;
         }
-        let Some(area) =
-            self.control_areas.iter().copied().find(|area| area.id == section.control_area)
+        let other_holder = self.sections.iter().enumerate().any(|(index, section)| {
+            section.backing.is_live()
+                && section.control_area == area
+                && SectionIdentity { index, generation: section.generation } != identity
+        }) || self
+            .retired_writers
+            .iter()
+            .any(|writer| writer.control_area == area && writer.identity != identity);
+        let Some(control) = self.control_areas.iter().copied().find(|candidate| candidate.id == area)
         else {
             return false;
         };
-        self.pages.iter().any(|page| {
-            page.live
-                && page.control_area == area.id
-                && (page.writer != PageWriter::Idle
-                    || (area.kind == GENERIC_SECTION_BACKING_ROUTED
-                        && Self::page_needs_write(area, page)))
-        })
+        !other_holder
+            && control.kind == GENERIC_SECTION_BACKING_ROUTED
+            && self.pages.iter().any(|page| {
+                page.live
+                    && page.control_area == area
+                    && page.writer == PageWriter::Idle
+                    && Self::page_needs_write(control, page)
+            })
+    }
+
+    /// A resident page of released file data that no write owns or still owes.
+    pub(super) fn page_releasable(&self, page: &GenericSectionPage) -> bool {
+        page.live
+            && page.writer == PageWriter::Idle
+            && !self.control_areas.iter().any(|area| {
+                area.id == page.control_area
+                    && area.kind == GENERIC_SECTION_BACKING_ROUTED
+                    && Self::page_needs_write(*area, page)
+            })
+    }
+
+    /// Settle every retired page writer whose pages no longer need its FILE_OBJECT, releasing
+    /// the released file data's settled frames first.
+    pub(super) fn drain_retired_writers(
+        &mut self,
+        io: &mut impl SectionRetirementIo,
+    ) -> Result<(), u32> {
+        let mut index = 0;
+        while index < self.retired_writers.len() {
+            let writer = self.retired_writers[index];
+            if self.write_in_flight_via(writer.identity) {
+                index += 1;
+                continue;
+            }
+            if !self.control_area_live(writer.control_area) {
+                self.release_settled_frames(writer.control_area, io)?;
+            }
+            if self.needs_retained_writer(writer.identity, writer.control_area) {
+                index += 1;
+                continue;
+            }
+            io.release_backing(writer.identity, writer.backing)?;
+            self.retired_writers.remove(index);
+            self.retire_control_area_if_unreferenced(writer.control_area);
+        }
+        Ok(())
+    }
+
+    /// Release, in order, the frames of released file data that no write owns or owes.
+    pub(super) fn release_settled_frames(
+        &mut self,
+        area: u64,
+        io: &mut impl SectionRetirementIo,
+    ) -> Result<(), u32> {
+        for page_index in 0..self.pages.len() {
+            let page = self.pages[page_index];
+            if page.control_area == area && self.page_releasable(&page) {
+                io.release_frame(page.frame)?;
+                self.pages[page_index] = GenericSectionPage::empty();
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn retired_writer_references(&self, area: u64) -> bool {
+        self.retired_writers.iter().any(|writer| writer.control_area == area)
     }
 }
 

@@ -108,9 +108,103 @@ fn an_uncertain_write_is_never_replayed_and_never_releases_its_frame_or_file() {
     assert!(table.release_handle(section));
     let mut io = Release::default();
     table.drain_retired(&mut io).unwrap();
-    assert!(io.frames.is_empty() && io.leases.is_empty());
-    assert_eq!(table.next_retirement(), None);
+    // The section retires; only the quarantined page keeps its frame and its write's FILE_OBJECT.
+    assert_eq!(io.frames, vec![101]);
+    assert!(io.leases.is_empty(), "the uncertain write's FILE_OBJECT stays referenced");
+    assert!(!table.section(section).is_some_and(|section| section.backing.is_live()));
+    assert_eq!(table.routed_lease_exact(identity), RoutedSectionLease::new(11));
+    assert_eq!(table.page_write_state(tickets[0]), Some(PageWriteState::Uncertain));
     assert_eq!(table.next_unmapped_page_write(), None, "the quarantined page is not rewritten");
+    table.drain_retired(&mut io).unwrap();
+    assert_eq!((io.frames.len(), io.leases.len()), (1, 0), "never settled, never reused");
+}
+
+const RESOURCES: u32 = 0xC000_009A;
+
+/// Section deletion with a dirty page (MiCleanSection, NT5 sectsup.c): the section itself
+/// retires at once and its FILE_OBJECT stays with the page until the page's write settles.
+fn released_dirty_page() -> (GenericSectionTable, usize, SectionIdentity) {
+    let (mut table, section, identity) = routed_table(11);
+    let plan = table.plan_flush(3, 0x10000, 0).unwrap();
+    let ticket = table.prepare_writeback(plan).unwrap()[1];
+    let write = table.begin_page_write(identity, ticket).unwrap();
+    assert!(table.finish_page_write(write, PageWriteOutcome::Written));
+    assert!(table.unmap_view(3, 0x10000).is_some());
+    assert!(table.release_handle(section));
+    let mut io = Release::default();
+    table.drain_retired(&mut io).unwrap();
+    assert_eq!(io.frames, vec![101], "the clean page is released with the section");
+    assert!(io.leases.is_empty());
+    assert!(!table.section(section).is_some_and(|section| section.backing.is_live()),
+        "a page that still owes a write does not keep its section");
+    (table, section, identity)
+}
+
+#[test]
+fn a_retryable_failure_is_retried_by_the_page_owner_then_dropped() {
+    let (mut table, _, identity) = released_dirty_page();
+    // MmIsRetryIoStatus statuses are reissued until ReflushCount & MiIoRetryMask(0x1f) is 0.
+    for attempt in 0..32 {
+        let next = table.next_unmapped_page_write().unwrap_or_else(|| panic!("attempt {attempt}"));
+        assert_eq!((next.via, next.ticket.page_index, next.released), (identity, 0, true));
+        let write = table.begin_page_write(next.via, next.ticket).unwrap();
+        assert!(table.finish_page_write(write, PageWriteOutcome::Failed(RESOURCES)));
+        let mut io = Release::default();
+        table.drain_retired(&mut io).unwrap();
+        if attempt < 31 {
+            assert!(io.frames.is_empty() && io.leases.is_empty(), "attempt {attempt}");
+        } else {
+            // "NOTE that the error status is ignored": the page is dropped and released.
+            assert_eq!(io.frames, vec![100]);
+            assert_eq!(io.leases, vec![RoutedSectionLease::new(11).unwrap()]);
+        }
+    }
+    assert_eq!(table.next_unmapped_page_write(), None);
+    assert_eq!(table.routed_lease_exact(identity), None);
+}
+
+#[test]
+fn a_definite_failure_at_section_deletion_is_not_retried() {
+    let (mut table, _, identity) = released_dirty_page();
+    let next = table.next_unmapped_page_write().unwrap();
+    let write = table.begin_page_write(next.via, next.ticket).unwrap();
+    let mut io = Release::default();
+    table.drain_retired(&mut io).unwrap();
+    assert!(io.frames.is_empty() && io.leases.is_empty(), "the in-flight write owns both");
+    assert!(table.finish_page_write(write, PageWriteOutcome::Failed(IO_ERROR)));
+    assert_eq!(table.next_unmapped_page_write(), None);
+    table.drain_retired(&mut io).unwrap();
+    assert_eq!(io.frames, vec![100]);
+    assert_eq!(io.leases, vec![RoutedSectionLease::new(11).unwrap()]);
+    assert_eq!(table.routed_lease_exact(identity), None);
+}
+
+#[test]
+fn an_uncertain_write_at_section_deletion_keeps_only_its_own_page() {
+    let (mut table, _, identity) = released_dirty_page();
+    let next = table.next_unmapped_page_write().unwrap();
+    let write = table.begin_page_write(next.via, next.ticket).unwrap();
+    assert!(table.finish_page_write(write, PageWriteOutcome::Uncertain));
+    let mut io = Release::default();
+    for _ in 0..2 {
+        table.drain_retired(&mut io).unwrap();
+        assert!(io.frames.is_empty() && io.leases.is_empty());
+        assert_eq!(table.next_unmapped_page_write(), None, "never replayed");
+    }
+    assert_eq!(table.routed_lease_exact(identity), RoutedSectionLease::new(11));
+}
+
+#[test]
+fn the_mapped_page_writer_keeps_a_failing_page_of_a_live_section_dirty() {
+    let (mut table, section, identity) = routed_table(11);
+    assert!(table.map_view(4, section, 0x20000, 0x1000, 0));
+    assert!(table.unmap_view(3, 0x10000).is_some());
+    for _ in 0..40 {
+        let next = table.next_unmapped_page_write().unwrap();
+        assert_eq!((next.via, next.ticket.page_index, next.released), (identity, 1, false));
+        let write = table.begin_page_write(next.via, next.ticket).unwrap();
+        assert!(table.finish_page_write(write, PageWriteOutcome::Failed(IO_ERROR)));
+    }
 }
 
 #[test]

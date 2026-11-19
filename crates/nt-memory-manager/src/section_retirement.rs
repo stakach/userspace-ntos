@@ -98,14 +98,18 @@ impl GenericSectionTable {
             .iter()
             .enumerate()
             .find(|(index, section)| {
-                !section.live && section.backing.is_live() && !self.retirement_held(*index)
+                let identity = SectionIdentity { index: *index, generation: section.generation };
+                !section.live
+                    && section.backing.is_live()
+                    && !self.write_in_flight_via(identity)
+                    && !self.needs_retained_writer(identity, section.control_area)
             })?;
         let page = if self.control_area_live(section.control_area) {
             None
         } else {
             self.pages
                 .iter()
-                .find(|page| page.live && page.control_area == section.control_area)
+                .find(|page| page.control_area == section.control_area && self.page_releasable(page))
         };
         Some(SectionRetirement {
             section_index,
@@ -146,28 +150,36 @@ impl GenericSectionTable {
 
     /// Resource release is ordered: all frames before their file-object reference. Failure leaves
     /// the failed resource and every later resource owned, without replaying completed releases.
-    /// A section whose file data still owes asynchronous paging writes is kept whole.
+    /// A section waits only for a write in flight through its own FILE_OBJECT. When its file data
+    /// still needs that FILE_OBJECT (an uncertain write, or released pages owing a write), the
+    /// section retires into a page writer that keeps only the FILE_OBJECT and those pages.
     pub fn drain_retired(&mut self, io: &mut impl SectionRetirementIo) -> Result<(), u32> {
         for section_index in 0..self.sections.len() {
             let section = self.sections[section_index];
-            if section.live || !section.backing.is_live() || self.retirement_held(section_index) {
+            let identity = SectionIdentity { index: section_index, generation: section.generation };
+            if section.live || !section.backing.is_live() || self.write_in_flight_via(identity) {
                 continue;
             }
             if !self.control_area_live(section.control_area) {
-                for page_index in 0..self.pages.len() {
-                    let page = self.pages[page_index];
-                    if page.live && page.control_area == section.control_area {
-                        io.release_frame(page.frame)?;
-                        self.pages[page_index] = GenericSectionPage::empty();
-                    }
-                }
+                self.release_settled_frames(section.control_area, io)?;
             }
-            let identity = SectionIdentity { index: section_index, generation: section.generation };
+            if self.needs_retained_writer(identity, section.control_area) {
+                if self.retired_writers.try_reserve(1).is_err() {
+                    continue; // The section stays whole and retries.
+                }
+                self.retired_writers.push(super::page_writes::RetiredPageWriter {
+                    identity,
+                    control_area: section.control_area,
+                    backing: section.backing,
+                });
+                self.sections[section_index] = GenericSection::empty();
+                continue;
+            }
             io.release_backing(identity, section.backing)?;
             self.sections[section_index] = GenericSection::empty();
             self.retire_control_area_if_unreferenced(section.control_area);
         }
-        Ok(())
+        self.drain_retired_writers(io)
     }
 }
 

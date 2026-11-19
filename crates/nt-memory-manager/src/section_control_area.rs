@@ -159,6 +159,7 @@ impl GenericSectionTable {
             .sections
             .iter()
             .any(|section| section.backing.is_live() && section.control_area == id)
+            || self.retired_writer_references(id)
         {
             return;
         }
