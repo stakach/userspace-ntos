@@ -90,9 +90,7 @@ pub(crate) struct CapturedDirectory {
     context: nt_fs::LayeredOpenContextId,
     relative: Vec<u8>,
     overlay_file: Option<u64>,
-    parameters: nt_io_manager::DirectoryQueryParameters,
-    return_single: bool,
-    restart_scan: bool,
+    request: nt_io_manager::DirectoryQueryRequest,
     output: Vec<u8>,
 }
 
@@ -903,10 +901,7 @@ impl MountedVolumeBackend {
                             .filter(|binding| binding.context == owner.context)
                             .ok_or(NtStatus::INVALID_HANDLE)?;
                         let mut query = binding.directory_query;
-                        let result = nt_fs::query_directory(&mut query, &entries,
-                            owner.parameters.information_class, owner.return_single,
-                            owner.parameters.pattern.as_ref().map(|pattern| pattern.as_units()),
-                            owner.restart_scan, &mut owner.output);
+                        let result = owner.request.query(&mut query, &entries, &mut owner.output);
                         binding.directory_query = query;
                         Ok((status(result.status), result.information as u64))
                     })(),

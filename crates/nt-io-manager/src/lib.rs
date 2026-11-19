@@ -201,6 +201,7 @@ pub use device_property_transfer::{
 pub use directory_control::{
     directory_notify_access_granted, valid_directory_notify_parameters,
     valid_directory_query_parameters, DirectoryNotifyParameters, DirectoryQueryParameters,
+    DirectoryQueryRequest,
     IRP_MN_NOTIFY_CHANGE_DIRECTORY, IRP_MN_QUERY_DIRECTORY, SL_WATCH_TREE,
 };
 pub use dispatch::{

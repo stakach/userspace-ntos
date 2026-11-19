@@ -746,6 +746,8 @@ pub(super) unsafe fn maintain(
         crate::driver_launch::redrive_hosted_driver_zw_fs_control_file(nt_handler as *mut _);
         crate::driver_launch::redrive_hosted_driver_zw_write_file(nt_handler as *mut _);
         crate::driver_launch::redrive_hosted_driver_zw_read_query_file(nt_handler as *mut _);
+        #[cfg(feature = "source-irp-integration")]
+        crate::win32k_glue::source_irp_integration::redrive(nt_handler as *mut _);
         crate::hosted_routed_file_close_work::redrive(&mut nt_handler);
         crate::driver_launch::hosted_consumer_file_objects::redrive();
         crate::driver_launch::win32k_file_owners::redrive();

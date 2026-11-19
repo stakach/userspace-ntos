@@ -531,6 +531,10 @@ impl Work {
         let delivery = self.delivery.as_mut().expect("provider CREATE delivery");
         delivery.bind_handle(handle).expect("bound provider CREATE handle");
         delivery.publish_handle(handle).expect("published provider CREATE handle");
+        crate::mounted_provider_open_trace::opened(
+            self.captured.origin, self.captured.device_id, file, handle,
+            delivery.irp().is_some(), &self.captured.relative_name,
+        );
         Ok(handle)
     }
 

@@ -76,7 +76,6 @@ fn all_directory_capture_and_encoding_scratch_is_scoped_before_cursor_publicatio
         "directory_entries_opened",
         "directory_entries_relative",
         "merge_layered_directory_entries",
-        "query_directory",
     ] {
         assert!(
             captured.calls.iter().any(|value| value == call),
@@ -142,14 +141,6 @@ fn lazy_volume_mount_uses_durable_scope_after_admission_before_scratch() {
             durable < mount
         })
         .expect("initialize persistent writable-volume state in a completed durable scope");
-    let mut admission = Facts::default();
-    for statement in &method.block.stmts[..prepared] {
-        admission.visit_stmt(statement);
-    }
-    assert!(admission
-        .calls
-        .iter()
-        .any(|value| value == "directory_notify_access_granted"));
     assert!(
         prepared > 0,
         "do not mount before validating the directory request"

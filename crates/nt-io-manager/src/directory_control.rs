@@ -1,6 +1,9 @@
 //! Typed `IRP_MJ_DIRECTORY_CONTROL` query and notification parameters.
 
+use nt_status::NtStatus;
 use nt_types::{AccessMask, UnicodeString};
+
+use crate::{IoParameters, IrpProjection, StackFlags};
 
 pub const IRP_MN_QUERY_DIRECTORY: u8 = 0x01;
 pub const IRP_MN_NOTIFY_CHANGE_DIRECTORY: u8 = 0x02;
@@ -38,6 +41,75 @@ pub fn directory_notify_access_granted(granted: AccessMask) -> bool {
     granted.contains(AccessMask::GENERIC_ALL)
         || granted.contains(AccessMask::GENERIC_READ)
         || granted.bits() & FILE_LIST_DIRECTORY != 0
+}
+
+/// An admitted `IRP_MN_QUERY_DIRECTORY` on a directory File. A filesystem keeps this owned
+/// request across a pending completion and runs it against the File's own cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryQueryRequest {
+    parameters: DirectoryQueryParameters,
+    return_single_entry: bool,
+    restart_scan: bool,
+}
+
+impl DirectoryQueryRequest {
+    /// Admit the exact stack location. Positional (`SL_INDEX_SPECIFIED`) queries are refused
+    /// until seek semantics exist; no part of the request is synthesized.
+    pub fn admit(
+        irp: &IrpProjection,
+        is_directory: bool,
+        granted_access: u32,
+        system_buffer_len: usize,
+    ) -> Result<Self, NtStatus> {
+        if !is_directory {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if !directory_notify_access_granted(AccessMask::from_bits_retain(granted_access)) {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        let IoParameters::QueryDirectory(parameters) = &irp.parameters else {
+            return Err(NtStatus::INVALID_PARAMETER);
+        };
+        if irp.minor != IRP_MN_QUERY_DIRECTORY {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if irp.flags.contains(StackFlags::INDEX_SPECIFIED) || parameters.file_index != 0 {
+            return Err(NtStatus::NOT_SUPPORTED);
+        }
+        if parameters.length as usize > system_buffer_len {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(Self {
+            parameters: parameters.clone(),
+            return_single_entry: irp.flags.contains(StackFlags::RETURN_SINGLE_ENTRY),
+            restart_scan: irp.flags.contains(StackFlags::RESTART_SCAN),
+        })
+    }
+
+    /// The caller's output length; the encoder never writes beyond it.
+    pub fn length(&self) -> usize {
+        self.parameters.length as usize
+    }
+
+    /// Encode the next records of a complete directory listing into `output` and advance the
+    /// File's cursor. The returned status and information are the IRP's `IoStatus`.
+    pub fn query(
+        &self,
+        cursor: &mut nt_fs::DirectoryQueryState,
+        entries: &[nt_fs::DirectoryEntry],
+        output: &mut [u8],
+    ) -> nt_fs::DirectoryQueryResult {
+        let length = self.length().min(output.len());
+        nt_fs::query_directory(
+            cursor,
+            entries,
+            self.parameters.information_class,
+            self.return_single_entry,
+            self.parameters.pattern.as_ref().map(|pattern| pattern.as_units()),
+            self.restart_scan,
+            &mut output[..length],
+        )
+    }
 }
 
 #[cfg(test)]

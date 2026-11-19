@@ -72,6 +72,9 @@ mod native_file_target_open_work;
 mod native_directory_effect_work;
 mod provider_section_broker;
 mod gdi_routed_image_work;
+mod mounted_image_closure;
+mod mounted_query_directory_trace;
+mod mounted_provider_open_trace;
 mod provider_service_ingress;
 mod process_information_bridge;
 mod process_information_capture;
@@ -3166,6 +3169,8 @@ const DELAY_TIMER_SOURCE_QUEUED_WORK_RECEIVE_POLL: u64 = 46;
 const DELAY_TIMER_SOURCE_MUTABLE_HIVE_WORK: u64 = 47;
 /// A dirty mounted volume is published lazily even when no caller waits for it.
 const DELAY_TIMER_SOURCE_VOLUME_LAZY_FLUSH: u64 = 48;
+/// The validation profile's retained source-probe owner redrives its mounted image reads.
+const DELAY_TIMER_SOURCE_SOURCE_IRP_PROBE: u64 = 49;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -15638,6 +15643,16 @@ pub(crate) unsafe fn object_manager_lookup_path(path: &str) -> Result<u64, nt_st
     client.lookup(path, true).map(|id| id.0)
 }
 
+/// The exact stored target of the symbolic link named `path` (the final link is not followed).
+pub(crate) unsafe fn object_manager_query_symbolic_link(
+    path: &str,
+) -> Result<Vec<u16>, nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    client.query_symbolic_link(path, true)
+}
+
 pub(crate) unsafe fn object_manager_create_session_namespace(
     session_id: u32,
 ) -> Result<nt_object_client::SessionNamespace, nt_status::NtStatus> {
@@ -17751,7 +17766,11 @@ unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSna
 
 /// Publish retry readiness only; cleanup and native execution stay at their outer boundaries.
 unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
-    subdrain!(25, driver_launch::mounted_native_block_wake_due(now_100ns))
+    #[cfg(feature = "source-irp-integration")]
+    let source_irp_probe = win32k_glue::source_irp_integration::wake_due(now_100ns);
+    #[cfg(not(feature = "source-irp-integration"))]
+    let source_irp_probe = 0;
+    source_irp_probe + subdrain!(25, driver_launch::mounted_native_block_wake_due(now_100ns))
         + subdrain!(26, driver_launch::hosted_driver_dynamic_delete::wake_due(now_100ns))
         + subdrain!(27, driver_launch::hosted_provider_export_lane::wake_due(now_100ns))
         + subdrain!(28, spawn_hosts::shared_ingress::owner::runtime::nested::wake_abort_due(now_100ns))
@@ -30685,12 +30704,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut mounted_volume_install_root = None;
     if let Some(fs) = exec_fs() {
         match mounted_volume::register_mounted_volume(fs) {
-            Ok((device_id, file_ok, installed_root, device_path)) => {
+            Ok((device_id, file_ok, installed_root)) => {
                 // The current boot-image assignment makes the mounted system volume drive C:.
                 // The physical installation directory is discovered, never inferred from C:.
                 let boot_paths = nt_fs::BootPaths::new(b'C', &installed_root)
                     .expect("validated installation root must fit hosted process paths");
-                boot_namespace::publish(&device_path, &boot_paths)
+                boot_namespace::publish(device_id, &boot_paths)
                     .expect("mounted system volume aliases must publish before hosted startup");
                 img_spawn::publish_boot_paths(boot_paths);
                 mounted_volume_device_id = Some(device_id);

@@ -9,31 +9,10 @@ impl MountedVolumeBackend {
         irp: &IrpProjection,
     ) -> Result<DispatchOutcome, NtStatus> {
         let (context, binding) = self.binding(irp)?;
-        if !binding.is_directory {
-            return Err(NtStatus::INVALID_DEVICE_REQUEST);
-        }
-        if !nt_io_manager::directory_notify_access_granted(nt_types::AccessMask::from_bits_retain(
-            binding.granted_access,
-        )) {
-            return Err(NtStatus::ACCESS_DENIED);
-        }
-        let IoParameters::QueryDirectory(parameters) = &irp.parameters else {
-            return Err(NtStatus::INVALID_PARAMETER);
-        };
-        if irp.minor != nt_io_manager::IRP_MN_QUERY_DIRECTORY {
-            return Err(NtStatus::INVALID_DEVICE_REQUEST);
-        }
-        if irp
-            .flags
-            .contains(nt_io_manager::StackFlags::INDEX_SPECIFIED)
-            || parameters.file_index != 0
-        {
-            return Err(NtStatus::NOT_SUPPORTED);
-        }
-        let length = parameters.length as usize;
-        if length > ctx.system_buffer.len() {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
+        let request = nt_io_manager::DirectoryQueryRequest::admit(
+            irp, binding.is_directory, binding.granted_access, ctx.system_buffer.len(),
+        )?;
+        let length = request.length();
         let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
         let record = self.opens.get(context, file_id.raw()).map_err(status)?;
         let physical_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
@@ -66,10 +45,7 @@ impl MountedVolumeBackend {
                 self.pending_directories.borrow_mut().capture(irp.irp_id.raw(),
                     physical_mount.value(), CapturedDirectory {
                         irp: irp.irp_id, file: file_id, context, relative: source.relative,
-                        overlay_file: source.overlay_file, parameters: parameters.clone(),
-                        return_single: irp.flags.contains(nt_io_manager::StackFlags::RETURN_SINGLE_ENTRY),
-                        restart_scan: irp.flags.contains(nt_io_manager::StackFlags::RESTART_SCAN),
-                        output,
+                        overlay_file: source.overlay_file, request, output,
                     }, lookup).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
                 if route_kind == nt_fs::BlockSourceKind::Native {
                     crate::service_sec_image::mounted_installer_file_trace::ingress(
@@ -141,19 +117,7 @@ impl MountedVolumeBackend {
             )
             .map_err(status)?;
             let mut query = binding.directory_query;
-            let result = nt_fs::query_directory(
-                &mut query,
-                &entries,
-                parameters.information_class,
-                irp.flags
-                    .contains(nt_io_manager::StackFlags::RETURN_SINGLE_ENTRY),
-                parameters
-                    .pattern
-                    .as_ref()
-                    .map(|pattern| pattern.as_units()),
-                irp.flags.contains(nt_io_manager::StackFlags::RESTART_SCAN),
-                &mut ctx.system_buffer[..length],
-            );
+            let result = request.query(&mut query, &entries, &mut ctx.system_buffer[..length]);
             (query, result)
         };
         self.bindings[context_index(context).ok_or(NtStatus::INVALID_HANDLE)?]

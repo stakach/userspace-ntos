@@ -138,6 +138,7 @@ impl ExecNtHandler {
                 resume_flags: 0,
             });
             self.pending_file_io_wait = synchronous;
+            crate::mounted_query_directory_trace::pending(file_id, irp_id.raw(), information_class);
             return STATUS_PENDING;
         }
         if nt_io_completion::file_io_status_copies_output(status) {
@@ -151,6 +152,14 @@ impl ExecNtHandler {
                 information = 0;
             }
         }
+        let delivered = if nt_io_completion::file_io_status_copies_output(status) {
+            &routed_output[..information as usize]
+        } else {
+            &[][..]
+        };
+        crate::mounted_query_directory_trace::complete_inline(
+            file_id, self.pi as u32, information_class, delivered, status, information,
+        );
         self.complete_terminal_file_io(
             file_id,
             event_obj_idx,

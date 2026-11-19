@@ -171,3 +171,138 @@ fn kernel_job_recipient_owns_the_return_status_contract() {
     assert!(fields.driver && fields.executive,
         "DriverEntry and runtime executive jobs have distinct authenticated status locations");
 }
+
+fn path_calls(source: &str) -> Vec<String> {
+    #[derive(Default)]
+    struct Calls(Vec<String>);
+    impl<'ast> Visit<'ast> for Calls {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*call.func {
+                self.0.push(path.path.segments.iter()
+                    .map(|segment| segment.ident.to_string()).collect::<Vec<_>>().join("::"));
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let mut calls = Calls::default();
+    calls.visit_file(&syn::parse_file(source).unwrap());
+    calls.0
+}
+
+fn feature_enabled_gate(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| attribute.path().is_ident("cfg")
+        && matches!(&attribute.meta, syn::Meta::List(list) if {
+            let tokens = list.tokens.to_string();
+            tokens.contains("source-irp-integration") && !tokens.trim_start().starts_with("not")
+        }))
+}
+
+/// Every call to `callee` sits inside a statement or item compiled only with the validation
+/// feature, and at least one such call exists. Production builds never reach the hook.
+fn gated_statement_calls(source: &str, callee: &str) -> bool {
+    struct Gated<'a> { callee: &'a str, depth: usize, gated: bool, ungated: bool }
+    impl<'ast> Visit<'ast> for Gated<'_> {
+        fn visit_stmt(&mut self, statement: &'ast syn::Stmt) {
+            let attributes: &[syn::Attribute] = match statement {
+                syn::Stmt::Local(local) => &local.attrs,
+                syn::Stmt::Expr(syn::Expr::Call(call), _) => &call.attrs,
+                syn::Stmt::Expr(syn::Expr::Block(block), _) => &block.attrs,
+                syn::Stmt::Expr(syn::Expr::MethodCall(call), _) => &call.attrs,
+                _ => &[],
+            };
+            let gated = feature_enabled_gate(attributes);
+            self.depth += usize::from(gated);
+            syn::visit::visit_stmt(self, statement);
+            self.depth -= usize::from(gated);
+        }
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            let gated = feature_enabled_gate(&item.attrs);
+            self.depth += usize::from(gated);
+            syn::visit::visit_item_fn(self, item);
+            self.depth -= usize::from(gated);
+        }
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*call.func {
+                let name = path.path.segments.iter()
+                    .map(|segment| segment.ident.to_string()).collect::<Vec<_>>().join("::");
+                if name.ends_with(self.callee) {
+                    if self.depth != 0 { self.gated = true; } else { self.ungated = true; }
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let mut gated = Gated { callee, depth: 0, gated: false, ungated: false };
+    gated.visit_file(&syn::parse_file(source).unwrap());
+    gated.gated && !gated.ungated
+}
+
+#[test]
+fn source_probe_is_a_retained_service_loop_work_item() {
+    let startup = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    let calls = path_calls(startup);
+    assert!(!calls.iter().any(|call| call.ends_with("source_irp_integration::run_configured")),
+        "the probe must not run synchronously before the service loop delivers mounted I/O");
+    assert!(gated_statement_calls(startup, "source_irp_integration::submit_configured"),
+        "startup submits the retained probe owner under the validation feature only");
+
+    for (name, source, hook) in [
+        ("maintenance", include_str!("../../../components/ntos-executive/src/executor/maintenance.rs"),
+            "source_irp_integration::redrive"),
+        ("deadline", include_str!("../../../components/ntos-executive/src/timer_deadline.rs"),
+            "source_irp_integration::next_deadline"),
+        ("wake", include_str!("../../../components/ntos-executive/src/main.rs"),
+            "source_irp_integration::wake_due"),
+        ("quiesce", include_str!("../../../components/ntos-executive/src/executor/flow.rs"),
+            "source_irp_integration::has_outstanding"),
+    ] {
+        assert!(gated_statement_calls(source, hook),
+            "{name}: the service loop must drive the retained probe through {hook}");
+    }
+
+    // Retirement evidence arrives through ordinary service-loop I/O; no private pump loop.
+    struct Loops { depth: usize, pumped: bool }
+    impl<'ast> Visit<'ast> for Loops {
+        fn visit_expr_loop(&mut self, expression: &'ast syn::ExprLoop) {
+            self.depth += 1;
+            syn::visit::visit_expr_loop(self, expression);
+            self.depth -= 1;
+        }
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*call.func {
+                self.pumped |= self.depth != 0 && path.path.segments.last()
+                    .is_some_and(|segment| segment.ident == "redrive_win32k_source_work");
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let module = include_str!("../../../components/ntos-executive/src/source_irp_integration.rs");
+    let mut loops = Loops { depth: 0, pumped: false };
+    loops.visit_file(&syn::parse_file(module).unwrap());
+    assert!(!loops.pumped, "the probe must yield to the service loop instead of pumping inline");
+}
+
+#[test]
+fn source_probe_reads_its_image_through_the_shared_mounted_closure() {
+    let module = include_str!("../../../components/ntos-executive/src/source_irp_integration.rs");
+    let gdi = include_str!("../../../components/ntos-executive/src/gdi_routed_image_work.rs");
+    let closure = include_str!("../../../components/ntos-executive/src/mounted_image_closure.rs");
+    let calls = path_calls(module);
+    assert!(calls.iter().any(|call| call.ends_with("installed_image_reader")),
+        "the shared route contract selects the image reader");
+    assert!(calls.iter().any(|call| call.ends_with("MountedImageClosure::new"))
+        && calls.iter().any(|call| call.ends_with("load_installed_from_catalog")),
+        "on the mounted route the probe maps only bytes its retained closure acquired");
+    assert!(module.contains("InstalledImageReader::MountedVolume"),
+        "the mounted-route arm is explicit");
+    for (name, source) in [("source probe", module), ("GDI work", gdi)] {
+        let calls = path_calls(source);
+        assert!(calls.iter().any(|call| call.ends_with("MountedImageClosure::new")),
+            "{name} must reuse the shared closure owner");
+        assert!(!calls.iter().any(|call| call.ends_with("MountedSystemImageRead::new")
+            || call.ends_with("SystemImageLoadPlan::new")),
+            "{name} must not duplicate the plan/read/catalog steps");
+    }
+    assert!(path_calls(closure).iter().any(|call| call.ends_with("MountedSystemImageRead::new")),
+        "the closure owns exact mounted File reads");
+}

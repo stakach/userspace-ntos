@@ -40,6 +40,7 @@ pub(super) fn from_resolved_file_target(
 }
 
 pub(super) struct CapturedCreate {
+    pub origin: crate::mounted_provider_open_trace::CreateOrigin,
     pub caller: nt_process::native_handle::NativeHandleCaller,
     pub request: nt_io_manager::io_create_file::OwnedIoCreateFileRequest,
     pub device_id: u64,
@@ -84,7 +85,7 @@ pub(super) fn capture(
     .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let packet = unsafe { core::slice::from_raw_parts(exec_packet as *const u8, length) };
     let request = decode(packet).map_err(wire_status)?;
-    resolve_request(caller, request)
+    resolve_request(crate::mounted_provider_open_trace::CreateOrigin::HostedDriver, caller, request)
 }
 
 pub(super) fn capture_win32k(
@@ -102,10 +103,11 @@ pub(super) fn capture_win32k(
         crate::win32k_subsystem::copy_provider_pool_allocation(component_packet, length)?
     };
     let request = decode(&packet).map_err(wire_status)?;
-    resolve_request(caller, request)
+    resolve_request(crate::mounted_provider_open_trace::CreateOrigin::Win32k, caller, request)
 }
 
 fn resolve_request(
+    origin: crate::mounted_provider_open_trace::CreateOrigin,
     caller: nt_process::native_handle::NativeHandleCaller,
     request: nt_io_manager::io_create_file::OwnedIoCreateFileRequest,
 ) -> Result<CapturedCreate, u32> {
@@ -126,6 +128,7 @@ fn resolve_request(
         (device_id, Some(file_id), Some(related_file), copy_name(&request.name)?)
     };
     Ok(CapturedCreate {
+        origin,
         caller,
         request,
         device_id,

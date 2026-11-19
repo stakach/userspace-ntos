@@ -303,6 +303,12 @@ pub(super) unsafe fn mark_wait_parked(
         parks.crash_parked,
         parks.wait_parked,
     );
+    // Only the validation profile compiles the retained source-probe owner.
+    #[cfg(feature = "source-irp-integration")]
+    let source_irp_probe_outstanding =
+        crate::win32k_glue::source_irp_integration::has_outstanding();
+    #[cfg(not(feature = "source-irp-integration"))]
+    let source_irp_probe_outstanding = false;
     if !cfg!(feature = "mup-provider-kernel-only")
         && (live_top_badges(nt_handler) & !(parks.crash_parked | parks.wait_parked)) == 0
         && !pre_user_shell_frontier_pending(
@@ -330,6 +336,7 @@ pub(super) unsafe fn mark_wait_parked(
         && crate::vm_copy_work::next_deadline().is_none()
         && crate::provider_section_broker::next_deadline().is_none()
         && !crate::gdi_routed_image_work::has_outstanding()
+        && !source_irp_probe_outstanding
         && !crate::native_directory_open_work::occupied()
         && !crate::native_file_target_open_work::occupied()
         && !crate::native_directory_effect_work::has_outstanding(nt_handler)

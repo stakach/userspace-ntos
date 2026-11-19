@@ -44,6 +44,11 @@ pub(super) struct OwnerDeadlines {
 /// wait selection, hardware rearm or provider execution occurs here.
 /// Candidate order preserves the established equal-deadline source precedence.
 pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> Option<(u64, u64)> {
+    // Only the validation profile compiles the retained source-probe owner.
+    #[cfg(feature = "source-irp-integration")]
+    let source_irp_probe = win32k_glue::source_irp_integration::next_deadline();
+    #[cfg(not(feature = "source-irp-integration"))]
+    let source_irp_probe = None;
     nt_time::earliest_deadline([
         (owner.dispatcher.delay, DELAY_TIMER_SOURCE_DELAY_QUEUE),
         (
@@ -129,6 +134,7 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             DELAY_TIMER_SOURCE_NATIVE_DIRECTORY_EFFECT),
         (provider_section_broker::next_deadline(), DELAY_TIMER_SOURCE_PROVIDER_SECTION),
         (gdi_routed_image_work::next_deadline(), DELAY_TIMER_SOURCE_GDI_ROUTED_IMAGE),
+        (source_irp_probe, DELAY_TIMER_SOURCE_SOURCE_IRP_PROBE),
         (
             provider_directory_broker::next_deadline(),
             DELAY_TIMER_SOURCE_PROVIDER_DIRECTORY,

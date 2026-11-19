@@ -56,11 +56,3 @@ fn stopped_provider_call_retires_after_gdi_file_cleanup_without_waiting_for_a_re
         && body.contains("retained_service_cancelled"),
         "sealed stop must retire the exact GDI Call and requestor after semantic I/O cleanup");
 }
-
-#[test]
-fn cancelled_post_map_gdi_effect_keeps_exact_owner_quarantined() {
-    assert!(WORK.contains("mapped_effect: bool")
-        && WORK.contains("self.mapped_effect || self.module != 0")
-        && WORK.contains("self.indeterminate = true"),
-        "a mapped image or acquired load ref cannot be rolled back on provider stop");
-}

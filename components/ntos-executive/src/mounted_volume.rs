@@ -343,7 +343,7 @@ fn discover_installed_root(fs: &crate::Fat32) -> Result<nt_fs::InstalledRoot, Nt
 
 pub(crate) fn register_mounted_volume(
     fs: crate::Fat32,
-) -> Result<(u64, bool, nt_fs::InstalledRoot, String), NtStatus> {
+) -> Result<(u64, bool, nt_fs::InstalledRoot), NtStatus> {
     let physical_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
         .ok_or(NtStatus::DEVICE_NOT_READY)?;
     let installed_root = discover_installed_root(&fs)?;
@@ -404,5 +404,5 @@ pub(crate) fn register_mounted_volume(
     );
     crate::print_u64(probe_ok as u64);
     crate::print_str(b"\n");
-    Ok((device_id, probe_ok, installed_root, device_path))
+    Ok((device_id, probe_ok, installed_root))
 }

@@ -11176,9 +11176,10 @@ pub(crate) unsafe fn service_sec_image(
     }
     #[cfg(feature = "source-irp-integration")]
     {
-        // The live handler and source redrive context exist; SMSS is still suspended.
-        let status = crate::win32k_glue::source_irp_integration::run_configured(nt_handler as *mut _);
-        assert_eq!(status, 0, "native source IRP fixture did not prove completion");
+        // Record the retained probe owner; the service loop delivers its mounted File I/O,
+        // lane dispatches and retirement evidence, then reports the result marker.
+        let status = crate::win32k_glue::source_irp_integration::submit_configured();
+        assert_eq!(status, 0, "native source IRP fixture could not be submitted");
     }
     nt_handler.capture_desktop_launch_contract();
     #[cfg(not(feature = "mup-provider-kernel-only"))]
@@ -16423,6 +16424,15 @@ unsafe fn pending_file_io_redrive_pass(
             }
             .expect("pending File IOSB owner disappeared");
             pending = table.get_exact(identity).expect("settled File IOSB owner disappeared");
+            if pending.major == nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL
+                && matches!(pending.operation, nt_io_manager::PendingFileIoOperation::Transfer)
+            {
+                if let Some(file_id) = hosted_file_id {
+                    crate::mounted_query_directory_trace::complete_pending(
+                        file_id, pending.pi, pending.irp_id, terminal_status, terminal_information,
+                    );
+                }
+            }
         }
 
         let completion_event = pending.completion_event();
