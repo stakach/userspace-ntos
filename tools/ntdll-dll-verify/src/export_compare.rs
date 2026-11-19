@@ -158,6 +158,44 @@ fn ordinal_target_matches(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameStatus {
+    /// The release name is not exported.
+    Missing,
+    /// The name is exported but its ordinal has no function.
+    EmptyEntry,
+    OrdinalDiff,
+    Ok,
+}
+
+impl NameStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::EmptyEntry => "empty_entry",
+            Self::OrdinalDiff => "ordinal_diff",
+            Self::Ok => "ok",
+        }
+    }
+}
+
+/// Every release export name with the source-built DLL's ordinal for it and its status.
+fn name_statuses<'a>(
+    expected: &'a Exports,
+    actual: &'a Exports,
+) -> impl Iterator<Item = (&'a str, u16, Option<u16>, NameStatus)> + 'a {
+    expected.by_name.iter().map(|(name, ordinal)| {
+        let found = actual.by_name.get(name).copied();
+        let status = match found {
+            None => NameStatus::Missing,
+            Some(found) if !actual.by_ordinal.contains_key(&found) => NameStatus::EmptyEntry,
+            Some(found) if found != *ordinal => NameStatus::OrdinalDiff,
+            Some(_) => NameStatus::Ok,
+        };
+        (name.as_str(), *ordinal, found, status)
+    })
+}
+
 pub fn compare_exports(reference: &Path, built: &Path) -> Result<(), String> {
     let expected = read_exports(reference)?;
     let actual = read_exports(built)?;
@@ -169,24 +207,15 @@ pub fn compare_exports(reference: &Path, built: &Path) -> Result<(), String> {
     // Stable TSV is intentionally emitted even on failure, so a failed build retains evidence.
     println!("kind\tconsumer\tsymbol\treference_ordinal\tbuilt_ordinal\tstatus");
     let mut missing_names = 0;
-    for (name, ordinal) in &expected.by_name {
-        let found = actual.by_name.get(name);
-        let status = match found {
-            None => {
-                missing_names += 1;
-                "missing"
-            }
-            Some(found) if !actual.by_ordinal.contains_key(found) => {
-                missing_names += 1;
-                "empty_entry"
-            }
-            Some(found) if found != ordinal => "ordinal_diff",
-            Some(_) => "ok",
-        };
+    for (name, ordinal, found, status) in name_statuses(&expected, &actual) {
+        if matches!(status, NameStatus::Missing | NameStatus::EmptyEntry) {
+            missing_names += 1;
+        }
         println!(
-            "name\t-\t{}\t{ordinal}\t{}\t{status}",
+            "name\t-\t{}\t{ordinal}\t{}\t{}",
             escape_tsv(name),
-            found.map(u16::to_string).unwrap_or_default()
+            found.map(|ordinal| ordinal.to_string()).unwrap_or_default(),
+            status.label()
         );
     }
     let mut bad_ordinals = 0;
@@ -220,5 +249,46 @@ pub fn compare_exports(reference: &Path, built: &Path) -> Result<(), String> {
         Err("source-built ntdll does not satisfy installed LiberNT imports".into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exports(entries: &[(&str, u16)]) -> Exports {
+        let mut by_name = BTreeMap::new();
+        let mut by_ordinal: BTreeMap<u16, BTreeSet<String>> = BTreeMap::new();
+        for (name, ordinal) in entries {
+            by_name.insert(name.to_string(), *ordinal);
+            by_ordinal.entry(*ordinal).or_default().insert(name.to_string());
+        }
+        Exports { by_name, by_ordinal }
+    }
+
+    #[test]
+    fn a_release_export_absent_from_the_built_dll_fails_the_gate() {
+        let release = exports(&[("LdrLoadDll", 1), ("RtlGetVersion", 2), ("NtClose", 3)]);
+        let built = exports(&[("NtClose", 7), ("LdrLoadDll", 1), ("RtlExtra", 9)]);
+        let statuses: Vec<_> = name_statuses(&release, &built)
+            .map(|(name, _, _, status)| (name, status))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ("LdrLoadDll", NameStatus::Ok),
+                ("NtClose", NameStatus::OrdinalDiff),
+                ("RtlGetVersion", NameStatus::Missing),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_without_a_function_counts_as_missing() {
+        let release = exports(&[("NtClose", 3)]);
+        let mut built = exports(&[("NtClose", 3)]);
+        built.by_ordinal.clear();
+        let (_, _, found, status) = name_statuses(&release, &built).next().unwrap();
+        assert_eq!((found, status), (Some(3), NameStatus::EmptyEntry));
     }
 }
