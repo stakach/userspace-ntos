@@ -18,6 +18,7 @@ impl DeviceType {
     pub const NETWORK_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0014);
     pub const TAPE_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0020);
     pub const KEYBOARD: DeviceType = DeviceType(0x0000_000b);
+    pub const MAILSLOT: DeviceType = DeviceType(0x0000_000c);
     pub const NAMED_PIPE: DeviceType = DeviceType(0x0000_0011);
     pub const NULL: DeviceType = DeviceType(0x0000_0015);
     pub const SERIAL_PORT: DeviceType = DeviceType(0x0000_001b);

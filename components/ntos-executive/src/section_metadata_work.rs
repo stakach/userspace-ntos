@@ -1186,20 +1186,14 @@ unsafe fn advance(
                 return Step::Progress;
             }
             output.resize(length, 0);
-            let result = driver_launch::io_manager_mut().build_and_dispatch_external_to_device(
+            // MiCreateImageFileMap reads the image header with IoPageRead (NT5 creasect.c).
+            let result = driver_launch::io_manager_mut().build_and_dispatch_paging_to_device(
                 nt_types::ClientId(driver_launch::IO_MANAGER_COMPONENT_ID),
                 DeviceId(capture.device_id()),
-                Some(FileId(capture.file_id())),
-                0,
+                FileId(capture.file_id()),
                 work.tid,
-                nt_io_abi::major::IRP_MJ_READ,
-                IoParameters::Read(nt_io_manager::ReadWriteParameters {
-                    length: length as u32,
-                    key: 0,
-                    offset,
-                }),
-                0,
-                length as u32,
+                nt_io_manager::irp_request_flags::PagingTransfer::Read,
+                offset,
                 &mut output[..length],
             );
             match result {

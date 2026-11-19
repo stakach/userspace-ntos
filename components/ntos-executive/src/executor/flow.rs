@@ -334,6 +334,7 @@ pub(super) unsafe fn mark_wait_parked(
         && crate::native_image_pagein_work::next_deadline().is_none()
         && crate::vm_lock_pagein_work::next_deadline().is_none()
         && crate::vm_copy_work::next_deadline().is_none()
+        && crate::service_sec_image::section_writeback_work::next_deadline().is_none()
         && crate::provider_section_broker::next_deadline().is_none()
         && !crate::gdi_routed_image_work::has_outstanding()
         && !source_irp_probe_outstanding

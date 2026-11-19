@@ -1315,7 +1315,7 @@ impl MountedVolumeBackend {
                 crate::writable_fs::read_completed_into(
                     overlay_file,
                     resolved,
-                    synchronous,
+                    nt_io_manager::transfer_moves_file_position(synchronous, irp.request_flags),
                     &mut ctx.system_buffer[..parameters.length as usize],
                 )
             };
@@ -1361,9 +1361,12 @@ impl MountedVolumeBackend {
                 total_sectors: self.fs.total_sectors,
                 sectors_per_cluster: self.fs.spc,
             };
-            let position = (self.shares.get(installed_open).map_err(status)?.create_options
-                & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT) != 0)
-                .then_some((installed_open, u64::from(offset) + expected as u64));
+            let position = nt_io_manager::transfer_moves_file_position(
+                self.shares.get(installed_open).map_err(status)?.create_options
+                    & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT) != 0,
+                irp.request_flags,
+            )
+            .then_some((installed_open, u64::from(offset) + expected as u64));
             self.read_completions.borrow_mut().capture_range(irp.irp_id.raw(),
                 physical_mount.value(), file_id.raw(), geometry, first_cluster, offset,
                 expected, position).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
@@ -1382,10 +1385,12 @@ impl MountedVolumeBackend {
         if written != expected {
             return Err(status(nt_fs::STATUS_DATA_ERROR));
         }
-        if self.shares.get(installed_open).map_err(status)?.create_options
-            & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
-            != 0
-        {
+        if nt_io_manager::transfer_moves_file_position(
+            self.shares.get(installed_open).map_err(status)?.create_options
+                & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                != 0,
+            irp.request_flags,
+        ) {
             self.shares
                 .get_mut(installed_open)
                 .map_err(status)?
@@ -1616,7 +1621,9 @@ impl MountedVolumeBackend {
         let synchronous = binding.create_options
             & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
             != 0;
-        let append_only = binding.granted_access & nt_fs::FILE_APPEND_DATA != 0
+        // A paging write names its page explicitly; append-only access governs API writes.
+        let append_only = !irp.request_flags.is_paging_io()
+            && binding.granted_access & nt_fs::FILE_APPEND_DATA != 0
             && binding.granted_access & (nt_fs::FILE_WRITE_DATA | 0x4000_0000 | 0x1000_0000) == 0;
         let resolved = nt_io_manager::resolve_regular_file_write_offset(
             Some(parameters.offset as i64),
@@ -1625,12 +1632,29 @@ impl MountedVolumeBackend {
             info.metadata.end_of_file,
             append_only,
         )?;
+        // Paging I/O never extends the file and never moves its position (NT5 fastfat write.c).
+        let length = if irp.request_flags.is_paging_io() {
+            nt_io_manager::paging_write_length(
+                resolved.value(),
+                parameters.length as usize,
+                info.metadata.end_of_file,
+            )
+        } else {
+            parameters.length as usize
+        };
+        if length == 0 {
+            return Ok(DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            });
+        }
         let (result, written) = unsafe {
             crate::writable_fs::write_completed(
                 overlay_file,
                 resolved,
-                synchronous,
-                &ctx.system_buffer[..parameters.length as usize],
+                nt_io_manager::transfer_moves_file_position(synchronous, irp.request_flags),
+                &ctx.system_buffer[..length],
             )
         };
         Ok(DispatchOutcome::Completed {

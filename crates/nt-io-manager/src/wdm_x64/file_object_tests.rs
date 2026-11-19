@@ -286,3 +286,31 @@ fn event_self_links_use_final_virtual_address_not_the_writer_buffer() {
         assert_eq!(&bytes[offset + 0x10..offset + 0x18], &head.to_le_bytes());
     }
 }
+
+#[test]
+fn a_synchronous_file_object_resolves_the_file_pointer_from_its_current_byte_offset() {
+    // NT5 read.c/write.c: FO_SYNCHRONOUS_IO uses FILE_OBJECT.CurrentByteOffset for -2.
+    let pointer = crate::FILE_USE_FILE_POINTER_POSITION as u64;
+    for (options, synchronous) in [(0x20, true), (0x10, true), (0, false)] {
+        let mut bytes = [0; WDM_X64_FILE_OBJECT_SIZE];
+        write_wdm_file_object(&mut bytes, initialization(options, false)).unwrap();
+        bytes[0x68..0x70].copy_from_slice(&0x2400u64.to_le_bytes());
+        assert_eq!(
+            wdm_file_object_transfer_offset(&bytes, pointer),
+            Ok(if synchronous { 0x2400 } else { pointer })
+        );
+        assert_eq!(wdm_file_object_transfer_offset(&bytes, 0x10), Ok(0x10));
+    }
+    let mut bytes = [0; WDM_X64_FILE_OBJECT_SIZE];
+    write_wdm_file_object(&mut bytes, initialization(0x20, false)).unwrap();
+    bytes[0x68..0x70].copy_from_slice(&(-5i64).to_le_bytes());
+    assert_eq!(
+        wdm_file_object_transfer_offset(&bytes, pointer),
+        Err(WdmLayoutError::InvalidField),
+        "a corrupt negative position is never transferred"
+    );
+    assert_eq!(
+        wdm_file_object_transfer_offset(&bytes[..0x60], pointer),
+        Err(WdmLayoutError::BufferTooSmall)
+    );
+}

@@ -619,6 +619,8 @@ pub struct IrpRecord {
     pub user_data: u64,
     /// Requesting thread identity used by NT's thread-scoped cancellation contract.
     pub requestor_tid: u64,
+    /// Request-wide `IRP.Flags`, fixed by the originator at admission.
+    pub(crate) request_flags: crate::irp_request_flags::IrpRequestFlags,
 }
 
 impl IrpRecord {
@@ -659,7 +661,13 @@ impl IrpRecord {
             cancel: CancelState::NotCancelled,
             user_data: 0,
             requestor_tid: 0,
+            request_flags: crate::irp_request_flags::IrpRequestFlags::NONE,
         }
+    }
+
+    /// The request-wide `IRP.Flags` every driver in the stack observes.
+    pub fn request_flags(&self) -> crate::irp_request_flags::IrpRequestFlags {
+        self.request_flags
     }
 
     /// File-body case policy committed by initial admission, not the driver's current stack flag.

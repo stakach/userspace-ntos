@@ -83,7 +83,7 @@ pub(crate) unsafe fn probe_font_section_after_file_close(device_id: u64, scratch
                     let metadata = crate::routed_section_io::query_metadata(
                         file.raw(), device_id, mount,
                     )?;
-                    let extent = metadata.prepare_readonly(
+                    let extent = metadata.prepare(
                         0, nt_address_space::PAGE_READONLY, AccessMask::GENERIC_READ.bits(),
                     )?;
                     if extent.section_size < PAGE_SIZE as u64 || extent.file_size < PAGE_SIZE as u64 {

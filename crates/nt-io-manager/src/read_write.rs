@@ -79,16 +79,60 @@ pub fn resolve_regular_file_read_offset(
     }
 }
 
-/// The `ByteOffset` a READ or WRITE IRP carries to a filesystem that keeps its Files' positions.
-/// A synchronous File transferred without a ByteOffset is read or written at its file pointer,
-/// which only that filesystem knows: it receives `FILE_USE_FILE_POINTER_POSITION` and resolves
-/// it. An asynchronous File has no file pointer to name.
-pub fn file_pointer_irp_byte_offset(byte_offset: Option<i64>, synchronous: bool) -> u64 {
-    match byte_offset {
+/// The `ByteOffset` an NtReadFile/NtWriteFile IRP carries (NT5 read.c/write.c, ReactOS iofunc.c).
+/// Append-only access gives drivers `FILE_WRITE_TO_END_OF_FILE`. A synchronous File transferred
+/// without a ByteOffset uses its file pointer, which only the FILE_OBJECT's owner knows: the IRP
+/// carries `FILE_USE_FILE_POINTER_POSITION` for that owner to resolve. An asynchronous File has
+/// no file pointer to use, so it must supply an offset unless it is a pipe or mailslot.
+pub fn transfer_irp_byte_offset(
+    byte_offset: Option<i64>,
+    synchronous: bool,
+    append_only: bool,
+    pipe_or_mailslot: bool,
+) -> Result<u64, NtStatus> {
+    if byte_offset.is_none() && !synchronous && !pipe_or_mailslot {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    if append_only {
+        return Ok(FILE_WRITE_TO_END_OF_FILE as u64);
+    }
+    Ok(match byte_offset {
         Some(value) => value as u64,
         None if synchronous => FILE_USE_FILE_POINTER_POSITION as u64,
         None => 0,
+    })
+}
+
+/// Resolve the file-pointer sentinel where the FILE_OBJECT lives, before any driver sees it: a
+/// synchronous File's transfer uses its `CurrentByteOffset` (NT5 read.c/write.c). An asynchronous
+/// File's sentinel reaches its driver unchanged.
+pub const fn resolve_file_object_byte_offset(
+    irp_offset: u64,
+    synchronous_file: bool,
+    current_byte_offset: u64,
+) -> u64 {
+    if synchronous_file && irp_offset == FILE_USE_FILE_POINTER_POSITION as u64 {
+        current_byte_offset
+    } else {
+        irp_offset
     }
+}
+
+/// Whether a completed transfer moves the File's `CurrentByteOffset`. A synchronous File's
+/// position follows its transfers, but paging I/O never moves it (ReactOS vfatfs rw.c, NT5
+/// fastfat read.c/write.c: `SynchronousIo && !PagingIo`).
+pub const fn transfer_moves_file_position(
+    synchronous_file: bool,
+    request_flags: crate::irp_request_flags::IrpRequestFlags,
+) -> bool {
+    synchronous_file && !request_flags.is_paging_io()
+}
+
+/// Bytes a paging write may transfer. Paging I/O never extends a file (NT5 fastfat write.c):
+/// a write starting at or beyond EOF transfers nothing and one crossing it is clipped.
+pub fn paging_write_length(offset: u64, length: usize, end_of_file: u64) -> usize {
+    let available = end_of_file.saturating_sub(offset);
+    usize::try_from(available).map_or(length, |available| length.min(available))
 }
 
 /// Resolve `NtWriteFile.ByteOffset` for a regular local file. Append-only access overrides the
@@ -597,6 +641,32 @@ mod offset_tests {
     use super::*;
 
     #[test]
+    fn paging_transfers_never_move_the_file_position() {
+        use crate::irp_request_flags::{IrpRequestFlags, PagingTransfer};
+        // ReactOS vfatfs rw.c and NT5 fastfat read.c/write.c: `SynchronousIo && !PagingIo`.
+        assert!(transfer_moves_file_position(true, IrpRequestFlags::NONE));
+        assert!(!transfer_moves_file_position(false, IrpRequestFlags::NONE));
+        for transfer in [
+            PagingTransfer::Read,
+            PagingTransfer::SynchronousWrite,
+            PagingTransfer::AsynchronousWrite,
+        ] {
+            assert!(!transfer_moves_file_position(true, IrpRequestFlags::paging(transfer)));
+            assert!(!transfer_moves_file_position(false, IrpRequestFlags::paging(transfer)));
+        }
+    }
+
+    #[test]
+    fn paging_writes_never_extend_the_file() {
+        // NT5 fastfat write.c: a paging write is clipped to FileSize, never extending it.
+        assert_eq!(paging_write_length(0, 0x1000, 0x1800), 0x1000);
+        assert_eq!(paging_write_length(0x1000, 0x1000, 0x1800), 0x800);
+        assert_eq!(paging_write_length(0x1800, 0x1000, 0x1800), 0);
+        assert_eq!(paging_write_length(0x9000, 0x1000, 0x1800), 0);
+        assert_eq!(paging_write_length(u64::MAX, 0x1000, u64::MAX), 0);
+    }
+
+    #[test]
     fn completion_position_uses_file_mode_not_offset_source() {
         for offset in [
             ResolvedFileOffset::Current(50),
@@ -658,8 +728,8 @@ mod offset_tests {
 
     #[test]
     fn a_synchronous_transfer_without_an_offset_names_the_file_pointer() {
-        let carried = file_pointer_irp_byte_offset(None, true);
-        // The filesystem resolves what it was handed against the position it keeps.
+        let carried = transfer_irp_byte_offset(None, true, false, false).unwrap();
+        // The FILE_OBJECT's owner resolves what it was handed against the position it keeps.
         assert_eq!(
             resolve_regular_file_read_offset(Some(carried as i64), true, 4096),
             Ok(ResolvedFileOffset::Current(4096))
@@ -668,16 +738,56 @@ mod offset_tests {
             resolve_regular_file_write_offset(Some(carried as i64), true, 4096, 8192, false),
             Ok(ResolvedFileOffset::Current(4096))
         );
+        assert_eq!(resolve_file_object_byte_offset(carried, true, 4096), 4096);
         // An explicit offset is carried as given, including the caller's own sentinels.
         for explicit in [0, 7, FILE_WRITE_TO_END_OF_FILE, FILE_USE_FILE_POINTER_POSITION] {
             for synchronous in [false, true] {
                 assert_eq!(
-                    file_pointer_irp_byte_offset(Some(explicit), synchronous),
-                    explicit as u64
+                    transfer_irp_byte_offset(Some(explicit), synchronous, false, false),
+                    Ok(explicit as u64)
                 );
             }
         }
-        assert_eq!(file_pointer_irp_byte_offset(None, false), 0);
+    }
+
+    #[test]
+    fn an_asynchronous_transfer_needs_an_offset_unless_it_is_a_pipe_or_mailslot() {
+        // ReactOS iofunc.c NtReadFile/NtWriteFile; NT5 read.c/write.c.
+        assert_eq!(
+            transfer_irp_byte_offset(None, false, false, false),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            transfer_irp_byte_offset(None, false, true, false),
+            Err(NtStatus::INVALID_PARAMETER),
+            "append-only access does not excuse a missing offset"
+        );
+        assert_eq!(transfer_irp_byte_offset(None, false, false, true), Ok(0));
+    }
+
+    #[test]
+    fn append_only_writes_carry_write_to_end_of_file() {
+        // NT5 write.c: append-only access gives drivers FILE_WRITE_TO_END_OF_FILE.
+        for offset in [None, Some(0), Some(77), Some(FILE_USE_FILE_POINTER_POSITION)] {
+            assert_eq!(
+                transfer_irp_byte_offset(offset, true, true, false),
+                Ok(FILE_WRITE_TO_END_OF_FILE as u64)
+            );
+        }
+        assert_eq!(
+            transfer_irp_byte_offset(Some(5), false, true, false),
+            Ok(FILE_WRITE_TO_END_OF_FILE as u64)
+        );
+    }
+
+    #[test]
+    fn only_a_synchronous_file_object_substitutes_its_current_byte_offset() {
+        let pointer = FILE_USE_FILE_POINTER_POSITION as u64;
+        assert_eq!(resolve_file_object_byte_offset(pointer, true, 0x1234), 0x1234);
+        assert_eq!(resolve_file_object_byte_offset(pointer, false, 0x1234), pointer);
+        for explicit in [0, 99, FILE_WRITE_TO_END_OF_FILE as u64] {
+            assert_eq!(resolve_file_object_byte_offset(explicit, true, 0x1234), explicit);
+        }
     }
 
     #[test]

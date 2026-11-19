@@ -4916,8 +4916,15 @@ pub(crate) mod section_pagein;
 pub(crate) use section_pagein::service_generic_section_frame;
 pub(crate) use section_pagein::service_prepare_data_section_file;
 
+/// Overlay-backed pages are written synchronously through the writable volume. Routed pages
+/// are written by retained paging IRPs in `section_writeback_work`.
 fn generic_section_writes_back(section: GenericSection) -> bool {
     section.backing.kind == GENERIC_SECTION_BACKING_OVERLAY
+}
+
+fn generic_section_tracks_dirty(section: GenericSection) -> bool {
+    generic_section_writes_back(section)
+        || section.backing.kind == nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED
 }
 
 fn generic_section_mark_dirty_if_backed(
@@ -4926,11 +4933,14 @@ fn generic_section_mark_dirty_if_backed(
     section: GenericSection,
     page_index: u64,
 ) -> Result<(), u32> {
-    if !generic_section_writes_back(section) {
+    if !generic_section_tracks_dirty(section) {
         return Ok(());
     }
     if generic_sections.mark_page_dirty(section_index, page_index) {
         GENERIC_SECTION_DIRTY_MARKS.fetch_add(1, Ordering::Relaxed);
+        if !generic_section_writes_back(section) {
+            section_writeback_work::request_scan();
+        }
         Ok(())
     } else {
         Err(nt_address_space::STATUS_NOT_COMMITTED)
@@ -4939,6 +4949,8 @@ fn generic_section_mark_dirty_if_backed(
 
 #[path = "service_section_writeback.rs"]
 mod section_writeback;
+#[path = "section_writeback_work.rs"]
+pub(crate) mod section_writeback_work;
 #[path = "service_section_scratch.rs"]
 mod section_scratch;
 pub(crate) use section_scratch::{service_read_file_coherent, service_resize_file_coherent, service_write_file_coherent};

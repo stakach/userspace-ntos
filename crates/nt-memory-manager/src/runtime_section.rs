@@ -13,6 +13,10 @@ pub use mount_binding::{SectionMountBindingError, SectionMountBindings};
 mod pages;
 pub use pages::{SectionPagePublication, SectionPagePublicationError};
 
+#[path = "section_page_writes.rs"]
+mod page_writes;
+pub use page_writes::UnmappedPageWrite;
+
 #[path = "section_file_io.rs"]
 mod file_io;
 pub use file_io::{SectionFilePage, SectionFileReadIo, SectionFileResizeIo, SectionFileWriteIo};
@@ -306,6 +310,14 @@ impl GenericSectionView {
     }
 }
 
+/// The asynchronous paging writer, if any, that owns a resident page's frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageWriter {
+    Idle,
+    InFlight { generation: u64, via: SectionIdentity },
+    Uncertain { generation: u64, via: SectionIdentity },
+}
+
 #[derive(Clone, Copy)]
 struct GenericSectionPage {
     live: bool,
@@ -314,6 +326,7 @@ struct GenericSectionPage {
     frame: u64,
     dirty: bool,
     dirty_epoch: u64,
+    writer: PageWriter,
 }
 
 impl GenericSectionPage {
@@ -325,6 +338,7 @@ impl GenericSectionPage {
             frame: 0,
             dirty: false,
             dirty_epoch: 0,
+            writer: PageWriter::Idle,
         }
     }
 }
@@ -363,6 +377,7 @@ pub struct GenericSectionTable {
     reference_generation: u64,
     pages: Vec<GenericSectionPage>,
     dirty_epoch: u64,
+    page_write_generation: u64,
     section_generation: u64,
     view_generation: u64,
     provider_view_generation: u64,
@@ -390,6 +405,7 @@ impl GenericSectionTable {
             reference_generation: 0,
             pages: Vec::new(),
             dirty_epoch: 0,
+            page_write_generation: 0,
             section_generation: 0,
             view_generation: 0,
             provider_view_generation: 0,
@@ -978,7 +994,9 @@ impl GenericSectionTable {
         let section = self.section(section_index).ok_or(STATUS_NOT_MAPPED_VIEW)?;
         if !matches!(
             section.backing.kind,
-            GENERIC_SECTION_BACKING_DISK | GENERIC_SECTION_BACKING_OVERLAY
+            GENERIC_SECTION_BACKING_DISK
+                | GENERIC_SECTION_BACKING_OVERLAY
+                | GENERIC_SECTION_BACKING_ROUTED
         ) {
             return Err(STATUS_NOT_MAPPED_VIEW);
         }

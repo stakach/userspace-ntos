@@ -298,6 +298,36 @@ pub fn write_wdm_file_object(
     Ok(())
 }
 
+const WDM_X64_FILE_OBJECT_FLAGS_OFFSET: usize = 0x50;
+const WDM_X64_FILE_OBJECT_CURRENT_BYTE_OFFSET_OFFSET: usize = 0x68;
+const FO_SYNCHRONOUS_IO: u32 = 0x0000_0002;
+
+/// The `Parameters.Read/Write.ByteOffset` a driver receives for this FILE_OBJECT: a synchronous
+/// File's file-pointer sentinel becomes its `CurrentByteOffset` (NT5 read.c/write.c).
+pub fn wdm_file_object_transfer_offset(
+    file_object: &[u8],
+    irp_offset: u64,
+) -> Result<u64, WdmLayoutError> {
+    let end = WDM_X64_FILE_OBJECT_CURRENT_BYTE_OFFSET_OFFSET + 8;
+    if file_object.len() < end {
+        return Err(WdmLayoutError::BufferTooSmall);
+    }
+    let flags = u32::from_le_bytes(
+        file_object[WDM_X64_FILE_OBJECT_FLAGS_OFFSET..WDM_X64_FILE_OBJECT_FLAGS_OFFSET + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let current = i64::from_le_bytes(
+        file_object[WDM_X64_FILE_OBJECT_CURRENT_BYTE_OFFSET_OFFSET..end].try_into().unwrap(),
+    );
+    let synchronous = flags & FO_SYNCHRONOUS_IO != 0;
+    let resolved = crate::resolve_file_object_byte_offset(irp_offset, synchronous, current as u64);
+    if synchronous && irp_offset == crate::FILE_USE_FILE_POINTER_POSITION as u64 && current < 0 {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    Ok(resolved)
+}
+
 fn validate_file_object_address(address: u64) -> Result<(), WdmLayoutError> {
     if address == 0
         || address & 7 != 0

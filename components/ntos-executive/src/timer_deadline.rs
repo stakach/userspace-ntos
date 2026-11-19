@@ -127,6 +127,8 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
         (native_image_pagein_work::next_deadline(), DELAY_TIMER_SOURCE_NATIVE_IMAGE_PAGEIN),
         (vm_lock_pagein_work::next_deadline(), DELAY_TIMER_SOURCE_VM_LOCK_PAGEIN),
         (vm_copy_work::next_deadline(), DELAY_TIMER_SOURCE_VM_COPY),
+        (service_sec_image::section_writeback_work::next_deadline(),
+            DELAY_TIMER_SOURCE_SECTION_WRITEBACK),
         (native_directory_open_work::next_deadline(), DELAY_TIMER_SOURCE_NATIVE_DIRECTORY_OPEN),
         (native_file_target_open_work::next_deadline(),
             DELAY_TIMER_SOURCE_NATIVE_FILE_TARGET_OPEN),

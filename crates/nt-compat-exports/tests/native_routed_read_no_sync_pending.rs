@@ -38,7 +38,6 @@ fn a_named_mapped_input_page_parks_the_caller_on_the_section_worker() {
 #[test]
 fn synchronous_routed_io_dispatches_only_on_the_boot_inline_route() {
     for (start, end) in [
-        ("pub(crate) fn read(file_id", "Ok(ExternalDispatchResult::Completed"),
         ("fn query_information(", "match result {"),
     ] {
         let prefix = body(IO, start, end);

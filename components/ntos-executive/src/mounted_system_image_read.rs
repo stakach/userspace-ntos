@@ -5,7 +5,7 @@
 use alloc::{string::String, vec::Vec};
 use nt_io_manager::{
     CreateOptions, CreateParameters, DeviceId, ExternalDispatchResult, FileId,
-    InformationParameters, IoParameters, ReadWriteParameters, ShareAccess,
+    InformationParameters, IoParameters, ShareAccess,
 };
 use nt_memory_manager::{routed_image_read::RoutedImageRead, CompletedFileQuery};
 use nt_types::{AccessMask, ClientId, UnicodeString};
@@ -514,20 +514,14 @@ impl MountedSystemImageRead {
             return SnapshotStep::Progress;
         }
         output.resize(window.length, 0);
-        let result = driver_launch::io_manager_mut().build_and_dispatch_external_to_device(
+        // IoPageRead for the system image: paging I/O never moves CurrentByteOffset.
+        let result = driver_launch::io_manager_mut().build_and_dispatch_paging_to_device(
             CLIENT,
             DeviceId(self.device),
-            self.file,
+            self.file.expect("entered image read owns its File"),
             0,
-            0,
-            nt_io_abi::major::IRP_MJ_READ,
-            IoParameters::Read(ReadWriteParameters {
-                length: window.length as u32,
-                key: 0,
-                offset: window.offset,
-            }),
-            0,
-            window.length as u32,
+            nt_io_manager::irp_request_flags::PagingTransfer::Read,
+            window.offset,
             &mut output,
         );
         let read = self.read.as_mut().expect("entered routed image read");

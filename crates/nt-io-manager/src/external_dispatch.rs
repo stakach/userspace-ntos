@@ -1093,6 +1093,7 @@ impl<P> IoManager<P> {
             major,
             params,
             stack_flags,
+            crate::irp_request_flags::IrpRequestFlags::NONE,
             input_len,
             output_len,
             initial_information,
@@ -1126,10 +1127,63 @@ impl<P> IoManager<P> {
             major,
             params,
             StackFlags::empty(),
+            crate::irp_request_flags::IrpRequestFlags::NONE,
             input_len,
             output_len,
             0,
             system_buffer,
+        )
+    }
+
+    /// Issue a Memory Manager paging transfer on the File's own device: `IoPageRead`,
+    /// `IoSynchronousPageWrite` or `IoAsynchronousPageWrite` (ReactOS iofunc.c, NT5 iosubs.c).
+    /// The IRP carries `IRP_PAGING_IO|IRP_NOCACHE` (plus `IRP_SYNCHRONOUS_PAGING_IO` for the
+    /// synchronous transfers) to every driver in the stack, so no filesystem moves the File's
+    /// `CurrentByteOffset`. `transfer` is the page-in destination or the dirty page; the caller
+    /// owns it until terminal delivery exactly as for any external dispatch.
+    pub fn build_and_dispatch_paging_to_device(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        file_id: FileId,
+        requestor_tid: u64,
+        paging: crate::irp_request_flags::PagingTransfer,
+        offset: u64,
+        transfer: &mut [u8],
+    ) -> Result<ExternalDispatchResult, NtStatus> {
+        let length = u32::try_from(transfer.len()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if length == 0 || i64::try_from(offset).is_err() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let parameters = crate::ReadWriteParameters { length, key: 0, offset };
+        let (major, params, input_len, output_len) = match paging {
+            crate::irp_request_flags::PagingTransfer::Read => {
+                (nt_io_abi::major::IRP_MJ_READ, IoParameters::Read(parameters), 0, length)
+            }
+            crate::irp_request_flags::PagingTransfer::SynchronousWrite
+            | crate::irp_request_flags::PagingTransfer::AsynchronousWrite => {
+                (nt_io_abi::major::IRP_MJ_WRITE, IoParameters::Write(parameters), length, 0)
+            }
+        };
+        let driver_id = self
+            .device(device_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .driver_id;
+        self.build_and_dispatch_external(
+            client,
+            driver_id,
+            device_id,
+            Some(file_id),
+            0,
+            requestor_tid,
+            major,
+            params,
+            StackFlags::empty(),
+            crate::irp_request_flags::IrpRequestFlags::paging(paging),
+            input_len,
+            output_len,
+            0,
+            transfer,
         )
     }
 
@@ -1144,6 +1198,7 @@ impl<P> IoManager<P> {
         major: u8,
         mut params: IoParameters,
         stack_flags: StackFlags,
+        request_flags: crate::irp_request_flags::IrpRequestFlags,
         input_len: u32,
         output_len: u32,
         initial_information: u64,
@@ -1181,6 +1236,10 @@ impl<P> IoManager<P> {
         };
         let mut irp =
             self.build_irp_record(client, driver_id, device_id, file_id, major, params)?;
+        if !request_flags.admits(major, irp.origin_minor) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        irp.request_flags = request_flags;
         for location in &mut irp.stack {
             location.flags = stack_flags;
         }

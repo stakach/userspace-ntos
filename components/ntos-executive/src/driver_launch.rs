@@ -39781,6 +39781,10 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         || request.stack_location >= request.stack_count
         || request.stack_count > u8::MAX as u32
         || request.flags & !0xffff != 0
+        || request._reserved1 != 0
+        || nt_io_manager::irp_request_flags::IrpRequestFlags::from_wire(
+            request.major, request.minor, request.irp_flags,
+        ).is_none()
         || (request._reserved0 != 0
             && !((request._reserved0 == nt_io_abi::IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE
                 && matches!(request.major,
@@ -39974,6 +39978,19 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     if uses_file_object && fo == 0 {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
+    // The FILE_OBJECT lives here, so its synchronous file pointer is resolved here before the
+    // driver sees the transfer (NT5 read.c/write.c). Paging IRPs always name their offset.
+    let read_write_byte_offset = if matches!(major, IRP_MJ_READ | IRP_MJ_WRITE) && fo != 0 && !owns_fo {
+        match nt_io_manager::wdm_file_object_transfer_offset(
+            core::slice::from_raw_parts(fo as *const u8, WDM_X64_FILE_OBJECT_SIZE),
+            request.read_write_byte_offset,
+        ) {
+            Ok(offset) => offset,
+            Err(_) => return (STATUS_INVALID_PARAMETER, 0),
+        }
+    } else {
+        request.read_write_byte_offset
+    };
     let mut created_file_storage = None;
     if owns_fo {
         let Some(name_len) = create_file_name_len.checked_add(2) else {
@@ -40420,12 +40437,12 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         IRP_MJ_READ => WdmIoStackParameters::Read {
             length: outlen as u32,
             key: request.read_write_key,
-            byte_offset: request.read_write_byte_offset,
+            byte_offset: read_write_byte_offset,
         },
         IRP_MJ_WRITE => WdmIoStackParameters::Write {
             length: inlen as u32,
             key: request.read_write_key,
-            byte_offset: request.read_write_byte_offset,
+            byte_offset: read_write_byte_offset,
         },
         IRP_MJ_QUERY_INFORMATION => WdmIoStackParameters::QueryInformation {
             length: outlen as u32,
@@ -40791,7 +40808,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         WdmIrpInit {
             packet_size: irp_packet_len as u16,
             mdl_address: mdl,
-            flags: irp_flags,
+            // Request-wide bits (paging, no-cache) were admitted for this major above; the
+            // transfer-method bits come from the target device.
+            flags: irp_flags | request.irp_flags,
             system_buffer,
             user_buffer,
             thread: s_current_thread(),
@@ -50662,6 +50681,7 @@ fn hosted_irp_dispatch_request(
             nt_io_abi::IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE
         } else { 0 },
         flags: irp.flags.bits() as u32 | ((irp.control.bits() as u32) << 8),
+        irp_flags: irp.request_flags.bits(),
         target_domain_id: target.hosted_domain_id,
         target_domain_cookie: target.hosted_domain_cookie,
         irp_id: irp.irp_id.raw(),
@@ -51628,7 +51648,7 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
         )?;
         let metadata = crate::routed_section_io::query_metadata(file.raw(), device.raw(), mount)?;
         if metadata.end_of_file < 4
-            || metadata.prepare_readonly(0, 0x02, AccessMask::GENERIC_READ.bits()).is_err()
+            || metadata.prepare(0, 0x02, AccessMask::GENERIC_READ.bits()).is_err()
         {
             return Ok(false);
         }

@@ -39,7 +39,7 @@ pub use wire::{
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 19;
+pub const IO_ABI_VERSION: u32 = 20;
 
 /// Root-authenticated `IrpDispatchRequest._reserved0` value for a canonical subsidiary File
 /// lifecycle IRP. Native retains an inline terminal until physical completion ACK.
@@ -614,8 +614,8 @@ mod tests {
 
     #[test]
     fn initial_information_wire_appends_scalar_without_moving_existing_fields() {
-        assert_eq!(IO_ABI_VERSION, 19);
-        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 280);
+        assert_eq!(IO_ABI_VERSION, 20);
+        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 288);
         assert_eq!(
             core::mem::offset_of!(IrpDispatchRequest, target_domain_id),
             16
@@ -642,8 +642,23 @@ mod tests {
     }
 
     #[test]
+    fn request_wide_irp_flags_append_without_moving_existing_fields() {
+        assert_eq!(core::mem::offset_of!(IrpDispatchRequest, scsi_relation_generation), 272);
+        assert_eq!(core::mem::offset_of!(IrpDispatchRequest, irp_flags), 280);
+        let request = IrpDispatchRequest {
+            major: major::IRP_MJ_READ,
+            irp_flags: 0x43,
+            ..Default::default()
+        };
+        let bytes = bytemuck::bytes_of(&request);
+        assert_eq!(&bytes[280..284], &0x43u32.to_le_bytes());
+        assert_eq!(bytemuck::pod_read_unaligned::<IrpDispatchRequest>(bytes), request);
+        assert!(bytemuck::try_pod_read_unaligned::<IrpDispatchRequest>(&bytes[..280]).is_err());
+    }
+
+    #[test]
     fn create_case_provenance_reuses_reserved_word_without_moving_query_information() {
-        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 280);
+        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 288);
         assert_eq!(
             core::mem::offset_of!(IrpDispatchRequest, create_case_sensitive),
             244
@@ -677,7 +692,7 @@ mod tests {
 
     #[test]
     fn file_create_options_reuses_reserved_word_without_moving_other_fields() {
-        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 280);
+        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 288);
         assert_eq!(
             core::mem::offset_of!(IrpDispatchRequest, file_create_options),
             228

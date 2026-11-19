@@ -7,7 +7,7 @@
 use crate::*;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use nt_io_manager::{DeviceId, ExternalDispatchResult, FileId, IoParameters, ReadWriteParameters};
+use nt_io_manager::{DeviceId, ExternalDispatchResult, FileId};
 use nt_memory_manager::image_section::{ImageAreaId, ImageViewRef};
 use nt_memory_manager::routed_image_read::RoutedImageRead;
 use nt_memory_manager::RoutedSectionLease;
@@ -687,12 +687,10 @@ unsafe fn advance_read(work: &mut Work) -> Step {
         return Step::Progress;
     }
     output.resize(window.length, 0);
-    let result = driver_launch::io_manager_mut().build_and_dispatch_external_to_device(
+    // The image comes from its Section File through IoPageRead, never moving CurrentByteOffset.
+    let result = driver_launch::io_manager_mut().build_and_dispatch_paging_to_device(
         nt_types::ClientId(driver_launch::IO_MANAGER_COMPONENT_ID), DeviceId(device),
-        Some(FileId(file)), 0, work.tid, nt_io_abi::major::IRP_MJ_READ,
-        IoParameters::Read(ReadWriteParameters { length: window.length as u32, key: 0,
-            offset: window.offset }),
-        0, window.length as u32, &mut output,
+        FileId(file), work.tid, nt_io_manager::irp_request_flags::PagingTransfer::Read, window.offset, &mut output,
     );
     match result {
         Ok(ExternalDispatchResult::Completed { status, information, .. }) => {

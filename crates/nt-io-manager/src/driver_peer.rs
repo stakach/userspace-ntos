@@ -338,6 +338,8 @@ fn build_dispatch_request(
         minor: irp.minor,
         _reserved0: if scsi.is_some() { nt_io_abi::IRP_DISPATCH_SCSI_SRB } else { 0 },
         flags: irp.flags.bits() as u32 | ((irp.control.bits() as u32) << 8),
+        irp_flags: irp.request_flags.bits(),
+        _reserved1: 0,
         set_information_control,
         target_domain_id: target.domain_id.raw(),
         target_domain_cookie: target.cookie,
@@ -810,6 +812,7 @@ mod initial_information_tests {
             buffer: None,
             user_data: 0,
             requestor_tid: 20,
+            request_flags: Default::default(),
         }
     }
 

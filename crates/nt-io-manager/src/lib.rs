@@ -87,6 +87,7 @@ pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;
 mod irp;
 pub mod io_paging_priority;
+pub mod irp_request_flags;
 pub mod internal_block_io;
 pub mod scsi_srb_transport;
 pub mod scsi_block_command;
@@ -302,8 +303,9 @@ pub use quota::{
     QueryQuotaParameters, QuotaValidationError, SetQuotaParameters,
 };
 pub use read_write::{
-    file_pointer_irp_byte_offset, resolve_regular_file_read_offset,
-    resolve_regular_file_write_offset, ResolvedFileOffset,
+    paging_write_length, resolve_file_object_byte_offset, resolve_regular_file_read_offset,
+    resolve_regular_file_write_offset, transfer_irp_byte_offset, transfer_moves_file_position,
+    ResolvedFileOffset,
     FILE_USE_FILE_POINTER_POSITION, FILE_WRITE_TO_END_OF_FILE,
 };
 pub use retained_completion::{
@@ -337,7 +339,7 @@ pub use wdm_x64::{
     write_wdm_device_object, write_wdm_driver_object,
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     write_wdm_irp_completion_targets,
-    write_wdm_open_device_projection,
+    write_wdm_open_device_projection, wdm_file_object_transfer_offset,
     WdmDeviceObjectInit, WdmDeviceObjectAllocationLayout, WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE,
     WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WdmLayoutError, WdmOpenDeviceProjectionInit,
@@ -2427,6 +2429,7 @@ mod tests {
             buffer: None,
             user_data: 0,
             requestor_tid: 0,
+            request_flags: Default::default(),
         }
     }
 

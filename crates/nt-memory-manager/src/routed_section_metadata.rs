@@ -8,7 +8,7 @@ use crate::{SectionFileIdentity, SectionMountId};
 
 const STATUS_PENDING: u32 = 0x0000_0103;
 const STATUS_DATA_ERROR: u32 = 0xc000_003e;
-const STATUS_MEDIA_WRITE_PROTECTED: u32 = 0xc000_00a2;
+const STATUS_NOT_SUPPORTED: u32 = 0xc000_00bb;
 
 #[derive(Clone, Copy)]
 pub struct CompletedFileQuery<'a> {
@@ -56,19 +56,18 @@ impl RoutedSectionMetadata {
         })
     }
 
-    /// Initial routed admission is read-only/COW until per-file writeback is coherent.
-    pub fn prepare_readonly(
+    /// Admit a routed data section. As in NT's MmCreateSection, the File handle's granted access
+    /// is the authority for a writable section (NT5 MmMakeFileAccess): the filesystem refused
+    /// write access to read-only media at CREATE. Shared pages are written back through the same
+    /// FILE_OBJECT with paging IRPs. Growing the file to a larger section needs the routed
+    /// filesystem's own EOF update, which this admission does not issue.
+    pub fn prepare(
         self,
         maximum_size: u64,
         protection: u32,
         granted_access: u32,
     ) -> Result<DataSectionFileExtent, u32> {
-        prepare_data_section_file(
-            maximum_size,
-            protection,
-            granted_access,
-            &mut ReadOnlyRoutedFile(self),
-        )
+        prepare_data_section_file(maximum_size, protection, granted_access, &mut RoutedFile(self))
     }
 }
 
@@ -81,19 +80,19 @@ pub fn decode_standard_query(query: CompletedFileQuery<'_>) -> Result<(u64, bool
     Ok((end_of_file as u64, standard[21] != 0))
 }
 
-struct ReadOnlyRoutedFile(RoutedSectionMetadata);
+struct RoutedFile(RoutedSectionMetadata);
 
-impl DataSectionFileIo for ReadOnlyRoutedFile {
+impl DataSectionFileIo for RoutedFile {
     fn query_file(&mut self) -> Result<DataSectionFileInfo, u32> {
         Ok(DataSectionFileInfo {
             end_of_file: self.0.end_of_file,
             is_directory: self.0.is_directory,
-            read_only_volume: true,
+            read_only_volume: false,
         })
     }
 
     fn extend_file(&mut self, _size: u64) -> Result<(), u32> {
-        Err(STATUS_MEDIA_WRITE_PROTECTED)
+        Err(STATUS_NOT_SUPPORTED)
     }
 }
 
@@ -119,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_metadata_uses_mounted_file_identity_and_readonly_cow_policy() {
+    fn exact_metadata_uses_mounted_file_identity_and_handle_access_policy() {
         let (mount, standard, internal) = metadata(0x2345, false, 0x321);
         let result =
             RoutedSectionMetadata::from_queries(mount, query(&standard), query(&internal)).unwrap();
@@ -129,16 +128,21 @@ mod tests {
         );
         assert_eq!(result.end_of_file, 0x2345);
         assert_eq!(
-            result.prepare_readonly(0, 0x08, 0x01).unwrap().section_size,
+            result.prepare(0, 0x08, 0x01).unwrap().section_size,
             0x2345
         );
+        // NT5 MmMakeFileAccess: a shared writable section needs FILE_WRITE_DATA on the File.
+        assert_eq!(result.prepare(0, 0x04, 0x03).unwrap().section_size, 0x2345);
+        assert_eq!(result.prepare(0, 0x04, 0x01), Err(0xc000_0022));
+        assert_eq!(result.prepare(0, 0x40, 0x23).unwrap().file_size, 0x2345);
         assert_eq!(
-            result.prepare_readonly(0, 0x04, 0x03),
-            Err(STATUS_MEDIA_WRITE_PROTECTED)
+            result.prepare(0x3000, 0x08, 0x01),
+            Err(crate::STATUS_SECTION_TOO_BIG)
         );
         assert_eq!(
-            result.prepare_readonly(0x3000, 0x08, 0x01),
-            Err(crate::STATUS_SECTION_TOO_BIG)
+            result.prepare(0x3000, 0x04, 0x03),
+            Err(STATUS_NOT_SUPPORTED),
+            "growing the routed file is the filesystem's EOF update, not issued here"
         );
     }
 
@@ -148,7 +152,7 @@ mod tests {
         let metadata =
             RoutedSectionMetadata::from_queries(mount, query(&standard), query(&internal))
                 .unwrap();
-        let extent = metadata.prepare_readonly(0, 0x08, 0x01).unwrap();
+        let extent = metadata.prepare(0, 0x08, 0x01).unwrap();
         assert_eq!(extent.file_size, metadata.end_of_file);
         let tail = crate::data_section::plan_data_section_page_read(
             2,
@@ -222,7 +226,7 @@ mod tests {
             RoutedSectionMetadata::from_queries(mount, query(&directory), query(&internal))
                 .unwrap();
         assert_eq!(
-            result.prepare_readonly(0, 0x02, 0x01),
+            result.prepare(0, 0x02, 0x01),
             Err(crate::data_section::STATUS_INVALID_FILE_FOR_SECTION)
         );
     }

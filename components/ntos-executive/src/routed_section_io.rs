@@ -2,7 +2,6 @@
 
 use nt_io_manager::{
     DeviceId, ExternalDispatchResult, FileId, InformationParameters, IoParameters,
-    ReadWriteParameters,
 };
 use nt_types::ClientId;
 use nt_memory_manager::data_section::{DataSectionFileInfo, STATUS_IO_DEVICE_ERROR};
@@ -151,9 +150,9 @@ pub(crate) fn query_standard(file_id: u64, device_id: u64) -> Result<DataSection
 /// into an I/O error here.
 pub(crate) fn read(file_id: u64, device_id: u64, offset: u64, output: &mut [u8]) -> (u32, usize) {
     const STATUS_IN_PAGE_ERROR: u32 = 0xc000_0006;
-    let Ok(length) = u32::try_from(output.len()) else {
+    if u32::try_from(output.len()).is_err() {
         return (STATUS_IO_DEVICE_ERROR, 0);
-    };
+    }
     if !crate::mounted_volume::mount_id_for_live_device(device_id)
         .is_some_and(crate::mounted_volume::boot_inline_read_admitted)
     {
@@ -161,21 +160,15 @@ pub(crate) fn read(file_id: u64, device_id: u64, offset: u64, output: &mut [u8])
             output.len(), STATUS_IN_PAGE_ERROR, 0);
         return (STATUS_IN_PAGE_ERROR, 0);
     }
+    // IoPageRead: paging I/O never moves the File's CurrentByteOffset.
     let result = unsafe {
-        driver_launch::io_manager_mut().build_and_dispatch_external_to_device(
+        driver_launch::io_manager_mut().build_and_dispatch_paging_to_device(
             ClientId(IO_MANAGER_COMPONENT_ID),
             DeviceId(device_id),
-            Some(FileId(file_id)),
+            FileId(file_id),
             0,
-            0,
-            nt_io_abi::major::IRP_MJ_READ,
-            IoParameters::Read(ReadWriteParameters {
-                length,
-                key: 0,
-                offset,
-            }),
-            0,
-            length,
+            nt_io_manager::irp_request_flags::PagingTransfer::Read,
+            offset,
             output,
         )
     };

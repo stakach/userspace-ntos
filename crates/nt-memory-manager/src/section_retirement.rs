@@ -97,7 +97,9 @@ impl GenericSectionTable {
             .sections
             .iter()
             .enumerate()
-            .find(|(_, section)| !section.live && section.backing.is_live())?;
+            .find(|(index, section)| {
+                !section.live && section.backing.is_live() && !self.retirement_held(*index)
+            })?;
         let page = if self.control_area_live(section.control_area) {
             None
         } else {
@@ -144,10 +146,11 @@ impl GenericSectionTable {
 
     /// Resource release is ordered: all frames before their file-object reference. Failure leaves
     /// the failed resource and every later resource owned, without replaying completed releases.
+    /// A section whose file data still owes asynchronous paging writes is kept whole.
     pub fn drain_retired(&mut self, io: &mut impl SectionRetirementIo) -> Result<(), u32> {
         for section_index in 0..self.sections.len() {
             let section = self.sections[section_index];
-            if section.live || !section.backing.is_live() {
+            if section.live || !section.backing.is_live() || self.retirement_held(section_index) {
                 continue;
             }
             if !self.control_area_live(section.control_area) {

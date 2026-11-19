@@ -110,6 +110,8 @@ pub struct IrpProjection {
     pub buffer: Option<IoBufferRef>,
     pub user_data: u64,
     pub requestor_tid: u64,
+    /// Request-wide `IRP.Flags`, identical at every stack location.
+    pub request_flags: crate::irp_request_flags::IrpRequestFlags,
 }
 
 impl IrpProjection {
@@ -143,6 +145,7 @@ impl IrpProjection {
             buffer: record.buffer,
             user_data: record.user_data,
             requestor_tid: record.requestor_tid,
+            request_flags: record.request_flags,
         })
     }
 }

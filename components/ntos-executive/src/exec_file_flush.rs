@@ -2,6 +2,17 @@
 use super::*;
 
 impl ExecNtHandler {
+    /// The routed stream NtFlushBuffersFile on `handle` flushes, when its grant permits a flush:
+    /// the File's device and FCB (`FsContext`), the identity NT's SectionObjectPointers belong to.
+    pub(crate) fn routed_flush_stream(&self, handle: u64) -> Option<(u64, u64)> {
+        if handle > u32::MAX as u64 || self.active_synchronous_file_retry.is_some() {
+            return None;
+        }
+        let capture = self.capture_hosted_file(handle).ok()?;
+        nt_fs::file_flush_access_allowed(capture.granted_access, true)
+            .then_some((capture.route.device_id, capture.route.fs_context))
+    }
+
     /// The caller probes IOSB before routing. None means a non-overlay handle owns the operation.
     pub(super) unsafe fn try_flush_overlay_file(&mut self, handle: u64, iosb: u64) -> Option<u32> {
         let process_handle = nt_process::Handle::try_from(handle).ok()?;

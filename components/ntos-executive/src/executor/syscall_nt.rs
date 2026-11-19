@@ -216,7 +216,53 @@ pub(super) unsafe fn syscall_nt_route(
             origin, resume_ip, sp, flags, native_call_transport,
         )
     } else { Ok(false) };
-    if matches!(lock_preflight, Ok(true)) {
+    // Routed Section pages owe paging writes before a view flush or a cache flush completes.
+    let writeback_preflight = if !stack_args_valid {
+        Ok(false)
+    } else if lp.msg.m0 == SSN_NT_FLUSH_VM {
+        crate::service_sec_image::section_writeback_work::submit_vm_flush(
+            &mut nt_handler, &argv[..4], resume_ip, sp, flags, native_call_transport)
+    } else if lp.msg.m0 == SSN_NT_FLUSH_BUFFERS_FILE {
+        // The parked caller reissues this call once its stream's pages are durable.
+        let retry = if native_call_transport {
+            Some(nt_syscall_abi::SyscallRetryReply::native_call([0; 5]))
+        } else {
+            let mut instruction = [0u8; 2];
+            resume_ip.checked_sub(2)
+                .filter(|ip| nt_handler.xas_read(*ip, &mut instruction))
+                .and_then(|_| nt_syscall_abi::unknown_syscall_retry_ip(resume_ip, instruction))
+                .map(|retry_ip| {
+                    let registers = syscall_reply_context.regs;
+                    nt_syscall_abi::SyscallRetryReply::unknown_syscall(
+                        registers[0], registers, retry_ip, sp, flags)
+                })
+        };
+        crate::service_sec_image::section_writeback_work::submit_cache_flush(
+            &mut nt_handler, &argv[..2], retry, resume_ip, sp, flags, native_call_transport)
+    } else {
+        Ok(false)
+    };
+    if matches!(writeback_preflight, Ok(true)) {
+        thread_wait_state_park_badge_waiting(&mut nt_handler, lp.msg.badge);
+        {
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            crate::service_sec_image::section_writeback_work::redrive(&mut nt_handler);
+        }
+        let _ = finalize_service_loop_state(&mut nt_handler);
+        let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
+        let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
+            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
+        )?;
+        lp.msg.badge = nb;
+        lp.msg.mi = nmi;
+        lp.msg.m0 = nm0;
+        lp.msg.m1 = nm1;
+        lp.msg.m2 = nm2;
+        lp.msg.m3 = nm3;
+        return ControlFlow::Break(Turn::Next);
+    } else if let Err(status) = writeback_preflight {
+        sc.result = status as u64;
+    } else if matches!(lock_preflight, Ok(true)) {
         thread_wait_state_park_badge_waiting(&mut nt_handler, lp.msg.badge);
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();

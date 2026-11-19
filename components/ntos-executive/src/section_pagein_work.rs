@@ -5,7 +5,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_io_manager::{
     DeviceId, ExternalDispatchResult, FileId, InformationParameters, IoParameters, IrpId,
-    ReadWriteParameters,
 };
 use nt_memory_manager::data_section::{
     plan_data_section_read_window, DataSectionReadWindow, DATA_PAGE_SIZE,
@@ -658,20 +657,14 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 return false;
             }
             output.resize(plan.length(), 0);
-            let result = driver_launch::io_manager_mut().build_and_dispatch_external_to_device(
+            // IoPageRead: paging I/O never moves the File's CurrentByteOffset.
+            let result = driver_launch::io_manager_mut().build_and_dispatch_paging_to_device(
                 nt_types::ClientId(driver_launch::IO_MANAGER_COMPONENT_ID),
                 DeviceId(work.capture.device_id()),
-                Some(FileId(work.capture.file_id())),
-                0,
+                FileId(work.capture.file_id()),
                 work.tid,
-                nt_io_abi::major::IRP_MJ_READ,
-                IoParameters::Read(ReadWriteParameters {
-                    length: plan.length() as u32,
-                    key: 0,
-                    offset: plan.offset(),
-                }),
-                0,
-                plan.length() as u32,
+                nt_io_manager::irp_request_flags::PagingTransfer::Read,
+                plan.offset(),
                 &mut output,
             );
             match result {

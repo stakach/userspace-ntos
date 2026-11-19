@@ -180,7 +180,7 @@ impl ExecNtHandler {
                             crate::routed_section_io::query_metadata(file_id, device_id, mount)?;
                         (capture, metadata)
                     };
-                    let extent = metadata.prepare_readonly(maxsize, page_protection, access)?;
+                    let extent = metadata.prepare(maxsize, page_protection, access)?;
                     let lease = crate::hosted_routed_section_capture::reserve(capture)
                         .map_err(|_capture| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
                     routed_lease = Some(lease);

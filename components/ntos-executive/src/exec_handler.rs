@@ -222,6 +222,7 @@ mod virtual_memory_query;
 
 #[path = "exec_virtual_memory_flush.rs"]
 mod virtual_memory_flush;
+pub(crate) use virtual_memory_flush::VmFlushRequest;
 
 #[path = "exec_win32k_virtual_memory.rs"]
 mod win32k_virtual_memory;
@@ -27760,21 +27761,29 @@ impl ExecNtHandler {
         ))
     }
 
-    /// `ByteOffset` of a hosted READ or WRITE. A registered kernel filesystem keeps its Files'
-    /// positions, so a synchronous transfer without a ByteOffset names the file pointer for it
-    /// to resolve; any other driver receives the captured value unchanged.
+    /// `ByteOffset` of a hosted READ or WRITE (NT5 read.c/write.c). The FILE_OBJECT's owner
+    /// resolves the file-pointer sentinel of a synchronous File; an asynchronous File other than
+    /// a pipe or mailslot must name its offset. `granted_access` selects append-only writes.
     fn hosted_transfer_byte_offset(
         &self,
         route: HostedFileRoute,
         captured_offset: Option<i64>,
-        offset_value: u64,
         synchronous: bool,
-    ) -> u64 {
-        if driver_launch::require_registered_kernel_filesystem_device(route.device_id).is_ok() {
-            nt_io_manager::file_pointer_irp_byte_offset(captured_offset, synchronous)
-        } else {
-            offset_value
-        }
+        write_granted_access: Option<u32>,
+    ) -> Result<u64, u32> {
+        const FILE_WRITE_DATA: u32 = 0x0000_0002;
+        const FILE_APPEND_DATA: u32 = 0x0000_0004;
+        let pipe_or_mailslot = driver_launch::io_manager_mut()
+            .device(nt_io_manager::DeviceId(route.device_id))
+            .is_some_and(|device| matches!(device.device_type,
+                nt_io_manager::DeviceType::NAMED_PIPE | nt_io_manager::DeviceType::MAILSLOT));
+        let append_only = write_granted_access.is_some_and(|access| {
+            access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == FILE_APPEND_DATA
+        });
+        nt_io_manager::transfer_irp_byte_offset(
+            captured_offset, synchronous, append_only, pipe_or_mailslot,
+        )
+        .map_err(|status| status.raw() as u32)
     }
 
     unsafe fn dispatch_hosted_file_set_information_for(
@@ -40380,18 +40389,24 @@ impl ExecNtHandler {
                                 completion_file_id = file_id;
                                 routed_fs_context = route.fs_context;
                                 let synchronous = mode.is_synchronous();
+                                let irp_offset = self.hosted_transfer_byte_offset(
+                                    route, captured_offset, synchronous,
+                                    Some(capture.granted_access),
+                                );
                                 let sync_reply_capacity = if synchronous {
                                     REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
                                         && wait_reply_pool_has_free()
                                 } else {
                                     true
                                 };
-                                let owner_capacity = if sync_reply_capacity {
+                                let owner_capacity = if sync_reply_capacity && irp_offset.is_ok() {
                                     self.reserve_pending_file_io_owner()
                                 } else {
                                     false
                                 };
-                                let prepared = if !owner_capacity || !sync_reply_capacity {
+                                let prepared = if let Err(status) = irp_offset {
+                                    Err(status)
+                                } else if !owner_capacity || !sync_reply_capacity {
                                     Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
                                 } else {
                                     match self.prepare_hosted_file_io(
@@ -40441,10 +40456,8 @@ impl ExecNtHandler {
                                             nt_io_manager::ReadWriteParameters {
                                                 length: len as u32,
                                                 key: key_value,
-                                                offset: self.hosted_transfer_byte_offset(
-                                                    route, captured_offset, offset_value,
-                                                    synchronous,
-                                                ),
+                                                offset: irp_offset
+                                                    .expect("admitted write offset"),
                                             },
                                             &payload,
                                             &mut output,
@@ -40765,7 +40778,6 @@ impl ExecNtHandler {
                         return status;
                     }
                 }
-                let offset_value = u64::from_le_bytes(captured_offset_bytes);
                 let signed_offset = i64::from_le_bytes(captured_offset_bytes);
                 let captured_offset = retained_parameters.map_or_else(
                     || (byte_offset != 0).then_some(signed_offset),
@@ -40989,6 +41001,9 @@ impl ExecNtHandler {
                                 npfs_route_fid = route.fs_context;
                                 completion_file_id = file_id;
                                 let synchronous = mode.is_synchronous();
+                                let irp_offset = self.hosted_transfer_byte_offset(
+                                    route, captured_offset, synchronous, None,
+                                );
                                 let prepare_started = diagnostic_time_100ns();
                                 let sync_reply_capacity = if synchronous {
                                     REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
@@ -40996,12 +41011,14 @@ impl ExecNtHandler {
                                 } else {
                                     true
                                 };
-                                let owner_capacity = if sync_reply_capacity {
+                                let owner_capacity = if sync_reply_capacity && irp_offset.is_ok() {
                                     self.reserve_pending_file_io_owner()
                                 } else {
                                     false
                                 };
-                                let prepared = if !owner_capacity || !sync_reply_capacity {
+                                let prepared = if let Err(status) = irp_offset {
+                                    Err(status)
+                                } else if !owner_capacity || !sync_reply_capacity {
                                     Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
                                 } else {
                                     match self.prepare_hosted_file_io(
@@ -41044,10 +41061,8 @@ impl ExecNtHandler {
                                             nt_io_manager::ReadWriteParameters {
                                                 length: len as u32,
                                                 key: key_value,
-                                                offset: self.hosted_transfer_byte_offset(
-                                                    route, captured_offset, offset_value,
-                                                    synchronous,
-                                                ),
+                                                offset: irp_offset
+                                                    .expect("admitted read offset"),
                                             },
                                             &[],
                                             &mut output,

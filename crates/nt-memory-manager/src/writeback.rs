@@ -28,6 +28,66 @@ pub struct SectionWritebackPage {
     pub(crate) dirty_epoch: u64,
 }
 
+impl SectionWritebackPage {
+    pub const fn control_area(self) -> u64 {
+        self.control_area
+    }
+    /// The dirty version this ticket names; later stores carry a later epoch.
+    pub const fn dirty_epoch(self) -> u64 {
+        self.dirty_epoch
+    }
+}
+
+/// Exclusive ownership of one dirty page's asynchronous paging write, from dispatch to its exact
+/// terminal and acknowledged outcome. `via` is the section whose retained FILE_OBJECT issues the
+/// IRP; neither the page's frame nor that section's backing can retire while the write is owned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SectionPageWrite {
+    pub(crate) ticket: SectionWritebackPage,
+    pub(crate) via: crate::SectionIdentity,
+    pub(crate) generation: u64,
+}
+
+impl SectionPageWrite {
+    pub const fn ticket(self) -> SectionWritebackPage {
+        self.ticket
+    }
+    pub const fn via(self) -> crate::SectionIdentity {
+        self.via
+    }
+}
+
+/// The settled result of a paging write, known only after its terminal completion and strict
+/// acknowledgement (or a definite refusal before any driver entry).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageWriteOutcome {
+    /// The driver accepted every byte of the ticket.
+    Written,
+    /// Definite failure, or a short write: the page stays dirty for a later writer.
+    Failed(u32),
+    /// The effect is unknown (lost completion or ACK). The page is never written again and its
+    /// frame is never released, so an uncertain write is not replayed.
+    Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageWriteState {
+    Idle,
+    InFlight,
+    Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageWriteRefusal {
+    /// The ticket no longer names the page's current dirty version, or `via` cannot issue it.
+    Stale,
+    /// Another write owns the page; wait for its outcome.
+    InFlight,
+    /// An earlier write's effect is unknown; the page cannot be written again.
+    Uncertain,
+    Exhausted,
+}
+
 /// A virtual alias of a section page, before filtering residency and private COW ownership.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SectionPageAlias {

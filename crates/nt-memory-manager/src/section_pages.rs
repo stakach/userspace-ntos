@@ -75,6 +75,7 @@ impl GenericSectionTable {
             frame,
             dirty: false,
             dirty_epoch: epoch,
+            writer: PageWriter::Idle,
         };
         if let Some(index) = self.pages.iter().position(|entry| !entry.live) {
             self.pages[index] = page;
@@ -165,7 +166,7 @@ impl GenericSectionTable {
         self.prepare_area_writeback(area, plan.section_offset, end)
     }
 
-    fn prepare_area_writeback(
+    pub(super) fn prepare_area_writeback(
         &self,
         area: ControlArea,
         start: u64,

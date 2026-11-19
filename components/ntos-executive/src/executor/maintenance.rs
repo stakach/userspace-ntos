@@ -635,6 +635,7 @@ pub(super) unsafe fn maintain(
         crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
         crate::vm_lock_pagein_work::redrive(&mut nt_handler);
         crate::vm_copy_work::redrive(&mut nt_handler);
+        crate::service_sec_image::section_writeback_work::redrive(&mut nt_handler);
         crate::provider_section_broker::redrive(nt_handler as *mut _);
         crate::gdi_routed_image_work::redrive(&mut nt_handler);
         crate::provider_directory_broker::redrive(nt_handler as *mut _);

@@ -166,6 +166,10 @@ pub struct IrpDispatchRequest {
     /// Exact accepted PDO relation generation for `_reserved0 == IRP_DISPATCH_SCSI_SRB`.
     /// Zero for every other dispatch kind.
     pub scsi_relation_generation: u64,
+    /// Request-wide `IRP.Flags` chosen by the originator (paging, no-cache, synchronous API,
+    /// mount completion). Buffer-method bits are derived by the Driver Host, never carried.
+    pub irp_flags: u32,
+    pub _reserved1: u32,
 }
 
 impl IrpDispatchRequest {
@@ -201,7 +205,8 @@ const _: () = {
     assert!(size_of::<IoDeviceControlRequest>() == 56);
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
-    assert!(size_of::<IrpDispatchRequest>() == 280);
+    assert!(size_of::<IrpDispatchRequest>() == 288);
+    assert!(core::mem::offset_of!(IrpDispatchRequest, irp_flags) == 280);
     assert!(core::mem::offset_of!(IrpDispatchRequest, file_create_options) == 228);
     assert!(core::mem::offset_of!(IrpDispatchRequest, create_case_sensitive) == 244);
     assert!(core::mem::offset_of!(IrpDispatchRequest, initial_information) == 248);
