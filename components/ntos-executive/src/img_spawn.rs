@@ -666,6 +666,9 @@ pub(crate) unsafe fn build_sec_image_text() -> alloc::vec::Vec<u8> {
     t
 }
 
+/// The NT version every hosted process sees in its PEB and KUSER_SHARED_DATA.
+const HOSTED_OS: nt_user_host::WindowsProfile = nt_user_host::WindowsProfile::libernt_release();
+
 pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64, system_root: &[u8]) {
     let interrupt_time = monotonic_time_100ns();
     let time = nt_time_snapshot_at(interrupt_time);
@@ -674,9 +677,9 @@ pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64, system_root: &[u
     nt_ntdll_layout::kuser::initialize_page_with_active_console(
         page,
         nt_ntdll_layout::kuser::StaticInformation {
-            nt_product_type: 1,
-            nt_major_version: 6,
-            nt_minor_version: 1,
+            nt_product_type: HOSTED_OS.product_type,
+            nt_major_version: HOSTED_OS.os_major,
+            nt_minor_version: HOSTED_OS.os_minor,
             image_number_low: 0x014c,
             image_number_high: 0x8664,
             number_of_physical_pages: SYSTEM_PHYSICAL_PAGES
@@ -782,10 +785,10 @@ pub(crate) unsafe fn spawn_pe_thread(
         (env_scratch + 0x1000 + 0xbc) as *mut u32,
         NT_GLOBAL_FLAG.load(Ordering::Relaxed),
     );
-    core::ptr::write_volatile((env_scratch + 0x1000 + 0x118) as *mut u32, 6);
-    core::ptr::write_volatile((env_scratch + 0x1000 + 0x11c) as *mut u32, 1);
-    core::ptr::write_volatile((env_scratch + 0x1000 + 0x120) as *mut u16, 7601);
-    core::ptr::write_volatile((env_scratch + 0x1000 + 0x124) as *mut u32, 2);
+    core::ptr::write_volatile((env_scratch + 0x1000 + 0x118) as *mut u32, HOSTED_OS.os_major);
+    core::ptr::write_volatile((env_scratch + 0x1000 + 0x11c) as *mut u32, HOSTED_OS.os_minor);
+    core::ptr::write_volatile((env_scratch + 0x1000 + 0x120) as *mut u16, HOSTED_OS.os_build);
+    core::ptr::write_volatile((env_scratch + 0x1000 + 0x124) as *mut u32, HOSTED_OS.platform_id);
     let _ = page_map(copy_cap(peb), PEB_VA, RW_NX, pml4);
     // KUSER_SHARED_DATA at 0x7FFE0000 (PML4[0], vs the image at PML4[2]) — a fresh PT chain.
     let pdpt2 = alloc_slot();
@@ -1382,10 +1385,10 @@ pub(crate) unsafe fn spawn_sec_image(
             (scr + 0x1000 + 0xB8) as *mut u32,
             SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u32,
         );
-        core::ptr::write_volatile((scr + 0x1000 + 0x118) as *mut u32, 6);
-        core::ptr::write_volatile((scr + 0x1000 + 0x11c) as *mut u32, 1);
-        core::ptr::write_volatile((scr + 0x1000 + 0x120) as *mut u16, 7601);
-        core::ptr::write_volatile((scr + 0x1000 + 0x124) as *mut u32, 2);
+        core::ptr::write_volatile((scr + 0x1000 + 0x118) as *mut u32, HOSTED_OS.os_major);
+        core::ptr::write_volatile((scr + 0x1000 + 0x11c) as *mut u32, HOSTED_OS.os_minor);
+        core::ptr::write_volatile((scr + 0x1000 + 0x120) as *mut u16, HOSTED_OS.os_build);
+        core::ptr::write_volatile((scr + 0x1000 + 0x124) as *mut u32, HOSTED_OS.platform_id);
         // The genuine win32k process-create callout maps its canonical GDI Section into this
         // suspended process and writes PEB->GdiSharedHandleTable before its loader runs.
         let peb_client = checked_spawn_copy_cap(peb, b"peb-target");

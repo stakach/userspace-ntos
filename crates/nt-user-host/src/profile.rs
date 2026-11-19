@@ -30,6 +30,21 @@ impl WindowsProfile {
         }
     }
 
+    /// The version the pinned LiberNT release kernel publishes: its `ntoskrnl.exe` exports
+    /// `NtMajorVersion` = 10, `NtMinorVersion` = 0 and `NtBuildNumber` = 0xC00065F4 (build
+    /// 26100), and the release is built for target 0xA00. Its ntdll selects api-set contracts
+    /// from these PEB fields, and its images import Windows 10-only contracts.
+    pub const fn libernt_release() -> Self {
+        WindowsProfile {
+            os_major: 10,
+            os_minor: 0,
+            os_build: 26100,
+            platform_id: 2,
+            product_type: 1,
+            number_of_processors: 1,
+        }
+    }
+
     /// Windows 11 23H2 (build 22631) — a later profile, not the v0.1 target.
     pub fn windows11_23h2() -> Self {
         WindowsProfile {

@@ -91,8 +91,6 @@ static LDR_MANIFEST_PROBER_ROUTINE: AtomicU64 = AtomicU64::new(0);
 static RTL_PROCESS_ACTIVATION_CONTEXT: AtomicU64 = AtomicU64::new(0);
 static RTL_IMPLICIT_ACTIVATION_CONTEXT: AtomicU64 = AtomicU64::new(0);
 static RTL_EMPTY_ACTIVATION_CONTEXT: AtomicU64 = AtomicU64::new(0);
-static LDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK: AtomicU64 = AtomicU64::new(0);
-static LDR_APP_COMPAT_DLL_REDIRECTION_CONTEXT: AtomicU64 = AtomicU64::new(0);
 static RTL_START_POOL_THREAD: AtomicU64 = AtomicU64::new(0);
 static RTL_EXIT_POOL_THREAD: AtomicU64 = AtomicU64::new(0);
 static LDR_LOADER_LOCK_ACQUISITION_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -5391,11 +5389,11 @@ pub extern "system" fn ldr_process_initialization_complete() -> NtStatus {
 
 /// `LdrQueryModuleServiceTags(PVOID DllHandle, PULONG ServiceTagBuffer, PULONG BufferSize)`.
 ///
-/// Service-tag DDAG metadata is not modelled yet. Return a real empty result: required count is zero
-/// and no buffer entries are written.
+/// The loader records no service tags for modules, so it cannot answer which ones a module
+/// has; reporting "none" would be a made-up result. ReactOS declares this export as a stub.
 ///
 /// # Safety
-/// `buffer_size` is writable.
+/// No argument is dereferenced.
 #[export_name = "LdrQueryModuleServiceTags"]
 pub unsafe extern "system" fn ldr_query_module_service_tags(
     _dll_handle: *mut c_void,
@@ -5405,16 +5403,16 @@ pub unsafe extern "system" fn ldr_query_module_service_tags(
     if buffer_size.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    unsafe { *buffer_size = 0 };
-    STATUS_SUCCESS
+    STATUS_NOT_IMPLEMENTED
 }
 
 /// `LdrSetMUICacheType(ULONG Type) -> NTSTATUS`.
 ///
-/// MUI cache selection is accepted but has no effect while alternate resources are disabled.
+/// There is no MUI resource cache to configure (alternate resources are disabled, as in
+/// ReactOS, which declares this export as a stub).
 #[export_name = "LdrSetMUICacheType"]
 pub extern "system" fn ldr_set_mui_cache_type(_cache_type: u32) -> NtStatus {
-    STATUS_SUCCESS
+    STATUS_NOT_IMPLEMENTED
 }
 
 /// `LdrInitializeThunk(ULONG_PTR Unknown1, ULONG_PTR Unknown2, ULONG_PTR Unknown3,
@@ -10154,24 +10152,21 @@ pub(crate) unsafe fn ldr_entry_activation_context_for_base(base: u64) -> *mut c_
 /// PLDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK_FUNCTION CallbackFunction, PVOID CallbackData)
 /// -> NTSTATUS`.
 ///
-/// Store the process-local AppCompat redirection callback. The recursive DLL loader does not consult
-/// it yet, but callers can install/clear the callback without losing the registration state.
+/// The loader has no AppCompat redirection hook, so a callback could never run. ReactOS
+/// `ldrapi.c` reports this as `STATUS_NOT_IMPLEMENTED`; so does this export.
 ///
 /// # Safety
-/// `callback_function` is either NULL or a valid callback with the ReactOS
-/// `PLDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK_FUNCTION` ABI.
+/// No argument is dereferenced.
 #[export_name = "LdrSetAppCompatDllRedirectionCallback"]
 pub unsafe extern "system" fn ldr_set_app_compat_dll_redirection_callback(
     flags: u32,
-    callback_function: *mut c_void,
-    callback_data: *mut c_void,
+    _callback_function: *mut c_void,
+    _callback_data: *mut c_void,
 ) -> NtStatus {
     if flags != 0 {
         return STATUS_INVALID_PARAMETER_1;
     }
-    LDR_APP_COMPAT_DLL_REDIRECTION_CONTEXT.store(callback_data as u64, Ordering::Release);
-    LDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK.store(callback_function as u64, Ordering::Release);
-    STATUS_SUCCESS
+    STATUS_NOT_IMPLEMENTED
 }
 
 /// `LdrOpenImageFileOptionsKey(PCUNICODE_STRING SubKey, BOOLEAN Wow64, PHANDLE NewKeyHandle)
@@ -22534,8 +22529,8 @@ pub unsafe extern "system" fn rtl_get_nt_product_type(product_type: *mut u32) ->
     1
 }
 
-/// `RtlGetVersion(PRTL_OSVERSIONINFOW VersionInformation) -> NTSTATUS`. Report Windows 5.2 (the
-/// ReactOS-emulated target OS). OSVERSIONINFOW: dwOSVersionInfoSize@0, dwMajorVersion@4,
+/// `RtlGetVersion(PRTL_OSVERSIONINFOW VersionInformation) -> NTSTATUS`: the version the kernel
+/// published in the PEB. OSVERSIONINFOW: dwOSVersionInfoSize@0, dwMajorVersion@4,
 /// dwMinorVersion@8, dwBuildNumber@0xC, dwPlatformId@0x10, szCSDVersion[128]@0x14.
 ///
 /// # Safety
@@ -22545,27 +22540,38 @@ pub unsafe extern "system" fn rtl_get_version(vi: *mut c_void) -> NtStatus {
     if vi.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: vi valid per the contract (>= 0x114 bytes for OSVERSIONINFOW).
+    // ReactOS `dll/ntdll/rtl/version.c` `RtlGetVersion`: the version is the one the kernel
+    // published in the PEB; the product type and suite mask come from KUSER_SHARED_DATA.
     unsafe {
-        let p = vi as *mut u32;
-        *p.add(1) = 5; // major
-        *p.add(2) = 2; // minor
-        *p.add(3) = 3790; // build
-        *p.add(4) = 2; // VER_PLATFORM_WIN32_NT
-                       // szCSDVersion @ 0x14: zero the first wchar (empty).
-        *((vi as *mut u16).add(0x14 / 2)) = 0;
-        if *p >= 0x11C {
-            core::ptr::write_unaligned((vi as *mut u8).add(0x114) as *mut u16, 0); // SP major
-            core::ptr::write_unaligned((vi as *mut u8).add(0x116) as *mut u16, 0); // SP minor
-            core::ptr::write_unaligned((vi as *mut u8).add(0x118) as *mut u16, 0); // suite mask
-            *((vi as *mut u8).add(0x11A)) = 1; // VER_NT_WORKSTATION
-            *((vi as *mut u8).add(0x11B)) = 0; // reserved
-        }
+        let size = core::ptr::read_unaligned(vi as *const u32);
+        let Some(extended) = nt_ntdll::rtl::version::version_info_kind(size) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let peb = current_peb() as *const u8;
+        let version = nt_ntdll::rtl::version::PebVersion {
+            major: core::ptr::read_unaligned(peb.add(0x118) as *const u32),
+            minor: core::ptr::read_unaligned(peb.add(0x11c) as *const u32),
+            build: core::ptr::read_unaligned(peb.add(0x120) as *const u16),
+            csd_version: core::ptr::read_unaligned(peb.add(0x122) as *const u16),
+            platform: core::ptr::read_unaligned(peb.add(0x124) as *const u32),
+        };
+        let csd = core::ptr::read_unaligned(peb.add(0x2e8) as *const nt_ntdll_layout::UnicodeString);
+        let csd_units = if csd.length != 0 && csd.buffer != 0 {
+            core::slice::from_raw_parts(csd.buffer as *const u16, csd.length as usize / 2)
+        } else {
+            &[][..]
+        };
+        let kuser = KUSER_SHARED_DATA_VA as *const u8;
+        let product_type = core::ptr::read_unaligned(kuser.add(0x264) as *const u32);
+        let suite_mask = core::ptr::read_unaligned(kuser.add(0x2d0) as *const u32);
+        let out = core::slice::from_raw_parts_mut(vi as *mut u8, if extended { 0x11c } else { 0x114 });
+        nt_ntdll::rtl::version::fill_version_info(out, version, csd_units, product_type, suite_mask);
     }
     STATUS_SUCCESS
 }
 
-/// `RtlGetNtVersionNumbers(PULONG Major, PULONG Minor, PULONG Build)`.
+/// `RtlGetNtVersionNumbers(PULONG Major, PULONG Minor, PULONG Build)`: the PEB's version, as
+/// ReactOS `version.c` reports it (at least 5.1, build tagged 0xF0000000).
 ///
 /// # Safety
 /// Out-params are null or writable.
@@ -22576,14 +22582,21 @@ pub unsafe extern "system" fn rtl_get_nt_version_numbers(
     build: *mut u32,
 ) {
     unsafe {
+        let peb = current_peb() as *const u8;
+        let (reported_major, reported_minor, reported_build) =
+            nt_ntdll::rtl::version::nt_version_numbers(
+                core::ptr::read_unaligned(peb.add(0x118) as *const u32),
+                core::ptr::read_unaligned(peb.add(0x11c) as *const u32),
+                core::ptr::read_unaligned(peb.add(0x120) as *const u16),
+            );
         if !major.is_null() {
-            *major = 5;
+            *major = reported_major;
         }
         if !minor.is_null() {
-            *minor = 2;
+            *minor = reported_minor;
         }
         if !build.is_null() {
-            *build = 0xF000_0000 | 3790;
+            *build = reported_build;
         }
     }
 }
@@ -22603,21 +22616,14 @@ pub unsafe extern "system" fn rtl_get_product_info(
     if returned_product_type.is_null() {
         return 0;
     }
-    const PRODUCT_UNDEFINED: u32 = 0x0000_0000;
-    const PRODUCT_BUSINESS: u32 = 0x0000_0006;
-    const PRODUCT_PROFESSIONAL: u32 = 0x0000_0030;
     unsafe {
-        if os_major < 6 {
-            *returned_product_type = PRODUCT_UNDEFINED;
-            return 0;
-        }
-        *returned_product_type = if os_major == 6 && os_minor == 0 {
-            PRODUCT_BUSINESS
-        } else {
-            PRODUCT_PROFESSIONAL
-        };
+        let product_type =
+            core::ptr::read_unaligned((KUSER_SHARED_DATA_VA as *const u8).add(0x264) as *const u32);
+        let (product, valid) =
+            nt_ntdll::rtl::version::product_info(os_major, os_minor, product_type);
+        *returned_product_type = product;
+        valid as u8
     }
-    1
 }
 
 unsafe fn rtl_copy_preferred_ui_languages(
@@ -29459,78 +29465,17 @@ pub unsafe extern "system" fn csr_set_priority_class(
 
 // ---- Alpc* user-mode helpers ---------------------------------------------------------------------
 
-const ALPC_COMPLETION_LIST_SLOTS: usize = 16;
-
-static ALPC_COMPLETION_LISTS: [AtomicUsize; ALPC_COMPLETION_LIST_SLOTS] =
-    [const { AtomicUsize::new(0) }; ALPC_COMPLETION_LIST_SLOTS];
-static ALPC_COMPLETION_LIST_CONCURRENCY: [AtomicU32; ALPC_COMPLETION_LIST_SLOTS] =
-    [const { AtomicU32::new(0) }; ALPC_COMPLETION_LIST_SLOTS];
-
-fn alpc_completion_list_slot(completion_list: *mut c_void) -> Option<usize> {
-    let ptr = completion_list as usize;
-    if ptr == 0 {
-        return None;
-    }
-    for (i, slot) in ALPC_COMPLETION_LISTS.iter().enumerate() {
-        if slot.load(Ordering::Relaxed) == ptr {
-            return Some(i);
-        }
-    }
-    None
-}
-
-fn alpc_register_completion_list_ptr(
-    completion_list: *mut c_void,
-    completion_list_size: u32,
-    concurrency_count: u32,
-    attribute_flags: u32,
-) -> NtStatus {
-    let ptr = completion_list as usize;
-    if ptr == 0
-        || completion_list_size == 0
-        || !nt_ntdll::alpc::valid_attribute_flags(attribute_flags)
-    {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if let Some(i) = alpc_completion_list_slot(completion_list) {
-        ALPC_COMPLETION_LIST_CONCURRENCY[i].store(concurrency_count, Ordering::Relaxed);
-        return STATUS_SUCCESS;
-    }
-
-    for (i, slot) in ALPC_COMPLETION_LISTS.iter().enumerate() {
-        if slot
-            .compare_exchange(0, ptr, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            ALPC_COMPLETION_LIST_CONCURRENCY[i].store(concurrency_count, Ordering::Relaxed);
-            return STATUS_SUCCESS;
-        }
-    }
-    STATUS_NO_MEMORY
-}
-
-fn alpc_unregister_completion_list_ptr(completion_list: *mut c_void) {
-    if let Some(i) = alpc_completion_list_slot(completion_list) {
-        ALPC_COMPLETION_LIST_CONCURRENCY[i].store(0, Ordering::Relaxed);
-        ALPC_COMPLETION_LISTS[i].store(0, Ordering::Relaxed);
-    }
-}
-
 /// `AlpcAdjustCompletionListConcurrencyCount(PVOID CompletionList, ULONG ConcurrencyCount)`.
 ///
-/// Updates ntdll's bounded local registration state. Message delivery still flows through the
-/// regular ALPC receive path, so completion-list reads below observe an empty queue.
+/// No completion list can be registered (see AlpcRegisterCompletionList).
 #[export_name = "AlpcAdjustCompletionListConcurrencyCount"]
 pub unsafe extern "system" fn alpc_adjust_completion_list_concurrency_count(
     completion_list: *mut c_void,
     concurrency_count: u32,
 ) -> NtStatus {
-    let Some(i) = alpc_completion_list_slot(completion_list) else {
-        return STATUS_INVALID_PARAMETER;
-    };
-    ALPC_COMPLETION_LIST_CONCURRENCY[i].store(concurrency_count, Ordering::Relaxed);
-    STATUS_SUCCESS
+    // No completion list can be registered (see AlpcRegisterCompletionList).
+    let _ = (completion_list, concurrency_count);
+    STATUS_NOT_IMPLEMENTED
 }
 
 /// `AlpcFreeCompletionListMessage(PVOID CompletionList, PVOID Message)`.
@@ -29673,12 +29618,12 @@ pub unsafe extern "system" fn alpc_register_completion_list(
     concurrency_count: u32,
     attribute_flags: u32,
 ) -> NtStatus {
-    alpc_register_completion_list_ptr(
-        completion_list,
-        completion_list_size,
-        concurrency_count,
-        attribute_flags,
-    )
+    // Registration binds the list to a port in the kernel (NtAlpcSetInformationPort,
+    // AlpcRegisterCompletionListInformation). The executive has no completion-list delivery,
+    // so a list registered only in this process would never receive a message. ReactOS
+    // declares the completion-list exports as stubs.
+    let _ = (completion_list, completion_list_size, concurrency_count, attribute_flags);
+    STATUS_NOT_IMPLEMENTED
 }
 
 /// `AlpcRegisterCompletionListWorkerThread(PVOID CompletionList) -> NTSTATUS`.
@@ -29686,17 +29631,15 @@ pub unsafe extern "system" fn alpc_register_completion_list(
 pub unsafe extern "system" fn alpc_register_completion_list_worker_thread(
     completion_list: *mut c_void,
 ) -> NtStatus {
-    if alpc_completion_list_slot(completion_list).is_some() {
-        STATUS_SUCCESS
-    } else {
-        STATUS_INVALID_PARAMETER
-    }
+    // No completion list can be registered (see AlpcRegisterCompletionList).
+    let _ = completion_list;
+    STATUS_NOT_IMPLEMENTED
 }
 
 /// `AlpcUnregisterCompletionList(PVOID CompletionList)`.
 #[export_name = "AlpcUnregisterCompletionList"]
-pub unsafe extern "system" fn alpc_unregister_completion_list(completion_list: *mut c_void) {
-    alpc_unregister_completion_list_ptr(completion_list);
+pub unsafe extern "system" fn alpc_unregister_completion_list(_completion_list: *mut c_void) {
+    // Nothing to release: no completion list can be registered (see AlpcRegisterCompletionList).
 }
 
 /// `AlpcUnregisterCompletionListWorkerThread(PVOID CompletionList)`.
