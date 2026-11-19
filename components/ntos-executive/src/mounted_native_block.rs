@@ -1046,27 +1046,53 @@ unsafe fn service_registry_exact(
     dispatch_claim(route, WorkClaim::Snapshot(claim), None).progress()
 }
 
-/// A background snapshot owner holds the reserve and has a command to enter or an entered
-/// command to settle. A nested frame then drives it in place (`service_background_holder`).
+fn pending_is_background() -> bool {
+    unsafe {
+        (&*core::ptr::addr_of!(PENDING)).as_ref().is_some_and(|pending| {
+            matches!(&pending.claim, WorkClaim::Snapshot(claim) if claim.is_background())
+        })
+    }
+}
+
+/// What a nested frame may do for the background snapshot owner that holds the reserve.
+/// Foreground work keeps priority over the single physical slot: a queued mounted sector is
+/// left for the outer owner (and the nested yield it drives), and a foreground command already
+/// entered is settled by its own owner.
 pub(super) unsafe fn background_holder_ready() -> bool {
-    native_disk_relation::native_storage_route().is_some()
-        && crate::writable_fs::native_snapshot_io::background_owner_holds_reserve()
-        && ((&*core::ptr::addr_of!(PENDING)).is_some()
-            || crate::writable_fs::native_snapshot_io::background_outer_io_queued())
+    if native_disk_relation::native_storage_route().is_none()
+        || !crate::writable_fs::native_snapshot_io::background_owner_holds_reserve()
+    {
+        return false;
+    }
+    crate::outer_native_io::background_holder_step(
+        (&*core::ptr::addr_of!(PENDING)).is_some(),
+        pending_is_background(),
+        crate::mounted_volume::mounted_sector_claimable() == Some(true),
+        crate::writable_fs::native_snapshot_io::background_outer_io_queued(),
+    ) != crate::outer_native_io::BackgroundHolderStep::None
 }
 
 /// Under a parked nested parent, advance the background snapshot owner that holds the reserve:
-/// settle the one entered physical command through its exact completion/ACK, or enter the
+/// settle its one entered physical command through its exact completion/ACK, or enter the
 /// holder's next command. Foreground work waiting on that reserve can then be admitted.
 pub(super) unsafe fn service_background_holder() -> usize {
+    use crate::outer_native_io::{background_holder_step, BackgroundHolderStep};
     let Some(_guard) = NativeServiceGuard::enter() else { return 0; };
-    if (&*core::ptr::addr_of!(PENDING)).is_some() {
-        return poll_pending();
+    match background_holder_step(
+        (&*core::ptr::addr_of!(PENDING)).is_some(),
+        pending_is_background(),
+        crate::mounted_volume::mounted_sector_claimable() == Some(true),
+        crate::writable_fs::native_snapshot_io::background_outer_io_queued(),
+    ) {
+        BackgroundHolderStep::None => 0,
+        BackgroundHolderStep::Settle => poll_pending(),
+        BackgroundHolderStep::Enter => {
+            let Some(route) = native_disk_relation::native_storage_route() else { return 0; };
+            let Some(claim) = crate::writable_fs::native_snapshot_io::claim_background_snapshot_io()
+            else { return 0; };
+            dispatch_claim(route, WorkClaim::Snapshot(claim), None).progress()
+        }
     }
-    let Some(route) = native_disk_relation::native_storage_route() else { return 0; };
-    let Some(claim) = crate::writable_fs::native_snapshot_io::claim_background_snapshot_io()
-    else { return 0; };
-    dispatch_claim(route, WorkClaim::Snapshot(claim), None).progress()
 }
 
 pub(super) unsafe fn service_registry_recheck(id: u64) -> usize {

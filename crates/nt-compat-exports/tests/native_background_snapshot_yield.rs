@@ -160,3 +160,72 @@ fn kernel_job_and_bootstrap_frames_drive_the_holder_through_their_scheduler_pass
         assert!(irq < registry, "{file} drives the holder before redriving the blocked write");
     }
 }
+
+// Boot 44458933051 (2df2f110): the in-frame holder service kept the single physical slot busy
+// with the lazy checkpoint's 16 KiB payload reads. An IRP frame yields to the outer owner for a
+// queued mounted sector only with a vacant slot (`nested_ready`), so its foreground sectors
+// starved: `kind-irp=1 nested-ready=0 outer-io-queued=0` thousands of times, no video publish.
+
+use outer_native_io::{background_holder_step, BackgroundHolderStep};
+
+/// One nested IRP frame turn. The frame drives the holder at two points (its scheduler pass
+/// and its nested-work pass), then yields to the outer owner when the slot is vacant and a
+/// sector is queued. A background command entered in a turn settles at the next one.
+/// Returns the turns at which the foreground sectors and the checkpoint each finished.
+fn run_irp_frame(policy: impl Fn(bool, bool, bool, bool) -> BackgroundHolderStep) -> (usize, usize) {
+    let (mut sectors_left, mut checkpoint_left) = (4u32, 40u32);
+    let (mut sectors_done, mut checkpoint_done) = (usize::MAX, usize::MAX);
+    let mut slot: Option<bool> = None; // Some(is_background)
+    for turn in 0..400 {
+        let mut entered_this_turn = false;
+        for _pass in 0..2 {
+            let step = policy(slot.is_some(), slot == Some(true), sectors_left != 0,
+                checkpoint_left != 0);
+            match step {
+                BackgroundHolderStep::Settle if !entered_this_turn => {
+                    slot = None;
+                    checkpoint_left -= 1;
+                }
+                BackgroundHolderStep::Enter => { slot = Some(true); entered_this_turn = true; }
+                _ => {}
+            }
+        }
+        if slot.is_none() && sectors_left != 0 {
+            sectors_left -= 1; // the yield fires; the outer owner claims and completes it
+        }
+        if sectors_left == 0 && sectors_done == usize::MAX { sectors_done = turn; }
+        if checkpoint_left == 0 && checkpoint_done == usize::MAX { checkpoint_done = turn; }
+    }
+    (sectors_done, checkpoint_done)
+}
+
+/// 2df2f110's policy: settle a background command, and enter the next whenever the slot is
+/// vacant, regardless of queued foreground sectors.
+fn greedy(occupied: bool, background: bool, _sector: bool, enterable: bool) -> BackgroundHolderStep {
+    if occupied {
+        if background { BackgroundHolderStep::Settle } else { BackgroundHolderStep::None }
+    } else if enterable {
+        BackgroundHolderStep::Enter
+    } else {
+        BackgroundHolderStep::None
+    }
+}
+
+#[test]
+fn a_holder_that_always_takes_the_slot_starves_the_frames_foreground_sectors() {
+    let (sectors_done, checkpoint_done) = run_irp_frame(greedy);
+    assert!(sectors_done > checkpoint_done,
+        "no foreground sector ran while the whole checkpoint held the slot");
+}
+
+#[test]
+fn foreground_sectors_keep_priority_and_the_holder_still_completes() {
+    let (sectors_done, checkpoint_done) = run_irp_frame(background_holder_step);
+    assert!(sectors_done < 8, "foreground sectors run first");
+    assert!(checkpoint_done != usize::MAX, "the holder still completes");
+    assert_eq!(background_holder_step(false, false, true, true), BackgroundHolderStep::None);
+    assert_eq!(background_holder_step(true, false, false, true), BackgroundHolderStep::None,
+        "a foreground command is settled by its own owner");
+    assert_eq!(background_holder_step(true, true, true, true), BackgroundHolderStep::Settle);
+    assert_eq!(background_holder_step(false, false, false, true), BackgroundHolderStep::Enter);
+}

@@ -8,6 +8,13 @@ pub(crate) struct SnapshotStorageTicket {
     request: nt_fs::AsyncSnapshotRequest,
 }
 
+impl SnapshotStorageTicket {
+    /// The header recheck this read belongs to.
+    pub(crate) fn owner_id(&self) -> u64 {
+        self.owner_id
+    }
+}
+
 enum HeaderState {
     Running(nt_fs::AsyncSnapshotHeaderRecheck),
     Ready(nt_fs::RecheckedPairedWalSnapshot),

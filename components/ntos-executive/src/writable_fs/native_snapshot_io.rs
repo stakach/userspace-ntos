@@ -43,6 +43,19 @@ impl SnapshotClaim {
             SnapshotOwnerToken::Fold(_) => b"fold",
         }
     }
+    /// The command belongs to a background snapshot owner (lazy checkpoint or SYSTEM fold),
+    /// including the header recheck read that owner is waiting on.
+    pub(crate) unsafe fn is_background(&self) -> bool {
+        match &self.owner {
+            SnapshotOwnerToken::Checkpoint(_) | SnapshotOwnerToken::Fold(_) => true,
+            SnapshotOwnerToken::Storage(ticket) => {
+                let id = Some(ticket.owner_id());
+                id == super::native_checkpoint::recheck_id()
+                    || id == super::system_wal_fold::native::recheck_id()
+            }
+            _ => false,
+        }
+    }
     pub(crate) fn from_hive(
         mount: SectionMountId, operation: nt_fs::BlockOperation, input: Vec<u8>,
         ticket: super::hive_wal::HiveTicket,
