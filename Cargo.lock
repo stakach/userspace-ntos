@@ -253,6 +253,7 @@ dependencies = [
  "nt-pe-loader",
  "nt-printf",
  "nt-process",
+ "nt-security",
  "nt-status",
  "nt-syscall",
  "nt-types",

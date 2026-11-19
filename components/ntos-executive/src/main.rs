@@ -61,6 +61,7 @@ mod hosted_routed_file_close_work;
 mod registry_key_targets;
 mod registry_security_audit;
 mod diagnostic_receipt_budget;
+mod diagnostic_repeat_filter;
 mod registry_checkpoint_audit;
 mod registry_query_audit;
 mod hot_service_cost_census;
@@ -7536,6 +7537,7 @@ pub(crate) fn census_tick_static(now: u64) {
     service_sec_image::trace_csrss_post_resume_census(n);
     print_native_ssn_time();
     hot_service_cost_census::print_census();
+    registry_security_audit::print_admission_census();
     driver_launch::print_hosted_file_rpc_phase();
     driver_launch::print_hosted_pnp_relation_census();
     driver_launch::print_hosted_video_registry_set_census();
