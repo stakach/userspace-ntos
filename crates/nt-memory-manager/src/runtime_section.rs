@@ -17,6 +17,10 @@ pub use pages::{SectionPagePublication, SectionPagePublicationError};
 mod page_writes;
 pub use page_writes::UnmappedPageWrite;
 
+#[path = "section_stream_write.rs"]
+mod stream_write;
+pub use stream_write::{StreamWrite, StreamWritePage};
+
 #[path = "section_file_io.rs"]
 mod file_io;
 pub use file_io::{SectionFilePage, SectionFileReadIo, SectionFileResizeIo, SectionFileWriteIo};

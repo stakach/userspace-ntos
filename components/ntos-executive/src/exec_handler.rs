@@ -40539,6 +40539,21 @@ impl ExecNtHandler {
                                                 routed = true;
                                                 information = completed;
                                                 pending_write_irp_id = pending_irp_id;
+                                                // One cached copy: the accepted bytes reach the
+                                                // stream's resident section pages (CcCopyWrite).
+                                                let offset = irp_offset.expect("admitted write offset");
+                                                if driver_status as u32 == STATUS_PENDING {
+                                                    crate::service_sec_image::routed_write_coherence::retain_pending(
+                                                        self, pending_irp_id, route.device_id,
+                                                        route.fs_context, offset, &payload,
+                                                    );
+                                                } else if driver_status >= 0 {
+                                                    let accepted = (completed as usize).min(payload.len());
+                                                    crate::service_sec_image::routed_write_coherence::apply(
+                                                        self, route.device_id, route.fs_context,
+                                                        offset, &payload[..accepted],
+                                                    );
+                                                }
                                                 driver_status as u32
                                             }
                                             Err(route_status) => route_status,

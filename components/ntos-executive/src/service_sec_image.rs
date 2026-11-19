@@ -4960,6 +4960,8 @@ fn generic_section_mark_dirty_if_backed(
 mod section_writeback;
 #[path = "section_writeback_work.rs"]
 pub(crate) mod section_writeback_work;
+#[path = "routed_write_coherence.rs"]
+pub(crate) mod routed_write_coherence;
 #[path = "service_section_scratch.rs"]
 mod section_scratch;
 pub(crate) use section_scratch::{service_read_file_coherent, service_resize_file_coherent, service_write_file_coherent};
@@ -16775,6 +16777,11 @@ unsafe fn pending_file_io_redrive_pass(
             }
         }
         crate::pending_file_caller::retire(identity);
+        if finished.major == nt_io_abi::major::IRP_MJ_WRITE {
+            routed_write_coherence::settle_pending(
+                nt_handler, finished.irp_id, terminal_status, terminal_information,
+            );
+        }
         if let Some(event) = finished.transfer_event {
             assert!(finished.event_obj_idx == u64::MAX || finished.event_obj_idx == event.native_identity);
             nt_handler.release_transfer_event(event);

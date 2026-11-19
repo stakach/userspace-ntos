@@ -70,3 +70,18 @@ fn provider_view_stores_reach_the_page_writer() {
     assert!(PROVIDER_SECTIONS.contains("unmap_provider_view_exact((*mapping).view) != Some((*mapping).view) {\n        return Err(INVALID);\n    }\n    // Removing a writable routed view marks the pages it could write modified.\n    crate::service_sec_image::section_writeback_work::request_scan();"));
     assert!(WRITEBACK.contains("    harvest_stream(table, device_id, fs_context);\n    if scope_tickets(table, scope)"));
 }
+
+const HANDLER: &str = include_str!("../../../components/ntos-executive/src/exec_handler.rs");
+const SEC_IMAGE: &str = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+const COHERENCE: &str = include_str!("../../../components/ntos-executive/src/routed_write_coherence.rs");
+
+#[test]
+fn routed_writes_reach_resident_section_pages() {
+    // plan_stream_write/commit_stream_write are proven in nt-memory-manager; these bind the
+    // inline and pended NtWriteFile completions to them.
+    assert!(HANDLER.contains("routed_write_coherence::retain_pending(\n"));
+    assert!(HANDLER.contains("routed_write_coherence::apply(\n"));
+    assert!(SEC_IMAGE.contains("if finished.major == nt_io_abi::major::IRP_MJ_WRITE {\n            routed_write_coherence::settle_pending("));
+    assert!(COHERENCE.contains("table.plan_stream_write(section, offset, data.len() as u64)"));
+    assert!(COHERENCE.contains("if !copied || !table.commit_stream_write(plan) {"));
+}
