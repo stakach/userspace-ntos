@@ -29,6 +29,15 @@ impl DriverDispatchBackend for Backend {
                 file_context: Some(0x55),
             });
         }
+        if let IoParameters::SetInformation(parameters) = &irp.parameters {
+            let input = ctx.system_buffer.to_vec();
+            self.0.borrow_mut().calls.push((irp.major, irp.request_flags, parameters.info_class as u64, input));
+            return Ok(DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            });
+        }
         let (IoParameters::Read(parameters) | IoParameters::Write(parameters)) = &irp.parameters else {
             panic!("expected a transfer");
         };
@@ -153,4 +162,25 @@ fn paging_transfers_require_a_transfer_on_the_files_own_device() {
         Some(NtStatus::INVALID_PARAMETER)
     );
     assert!(seen.borrow().calls.is_empty());
+}
+
+#[test]
+fn a_file_size_update_is_fsrtl_set_file_size() {
+    // NT5 fsrtl/fastio.c FsRtlSetFileSize, as MmCreateSection and MmExtendSection issue it.
+    let (mut io, client, file, device, seen) = fixture();
+    let result = io.build_and_dispatch_file_size_update(client, device, file, 9, 0x5000).unwrap();
+    assert!(matches!(result, ExternalDispatchResult::Completed { status: NtStatus::SUCCESS, .. }));
+    let calls = &seen.borrow().calls;
+    assert_eq!(
+        calls[..],
+        [(major::IRP_MJ_SET_INFORMATION, IrpRequestFlags::file_size_update(), 20,
+            0x5000i64.to_le_bytes().to_vec())],
+        "FileEndOfFileInformation with IRP_PAGING_IO|IRP_SYNCHRONOUS_PAGING_IO"
+    );
+    assert_eq!(calls[0].1.bits(), 0x42);
+    drop(calls);
+    assert_eq!(
+        io.build_and_dispatch_file_size_update(client, device, file, 9, u64::MAX).err(),
+        Some(NtStatus::INVALID_PARAMETER)
+    );
 }

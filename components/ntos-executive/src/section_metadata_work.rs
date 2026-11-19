@@ -40,6 +40,18 @@ enum Phase {
     AckPending {
         irp: IrpId,
     },
+    /// MmCreateSection: a writable section larger than its file has the filesystem set the new
+    /// end of file first (FsRtlSetFileSize, NT5 creasect.c), then re-queries the file.
+    ExtendDispatch {
+        end_of_file: u64,
+    },
+    ExtendPending {
+        irp: IrpId,
+    },
+    ExtendAck {
+        irp: IrpId,
+        status: u32,
+    },
     HeaderDispatch,
     HeaderPending {
         irp: IrpId,
@@ -122,6 +134,9 @@ struct Work {
     origin_driver: Option<u64>,
     metadata: PendingSectionMetadataQueries<(), u64>,
     metadata_id: Option<PendingSectionMetadataId>,
+    mount: Option<nt_memory_manager::SectionMountId>,
+    /// The file's end of file was set for this section; the next query must cover it.
+    extended: bool,
     file_metadata: Option<nt_memory_manager::RoutedSectionMetadata>,
     image_header: Vec<u8>,
     sparse_image: Option<nt_pe_loader::IncrementalImageLayoutCapture>,
@@ -482,6 +497,8 @@ unsafe fn retain_work(
         origin_driver: submission.origin_driver,
         metadata,
         metadata_id,
+        mount: submission.mount,
+        extended: false,
         file_metadata: None,
         image_header: Vec::new(),
         sparse_image: None,
@@ -565,6 +582,9 @@ fn receive_owner_fields(work: &Work) -> [u64; 8] {
         Phase::Pending { irp, .. } => (2, irp.raw()),
         Phase::Copying { irp, .. } => (3, irp.raw()),
         Phase::AckPending { irp } => (4, irp.raw()),
+        Phase::ExtendDispatch { .. } => (18, 0),
+        Phase::ExtendPending { irp } => (19, irp.raw()),
+        Phase::ExtendAck { irp, .. } => (20, irp.raw()),
         Phase::HeaderDispatch => (5, 0),
         Phase::HeaderPending { irp, .. } => (6, irp.raw()),
         Phase::HeaderCopying { irp, .. } => (7, irp.raw()),
@@ -823,6 +843,59 @@ unsafe fn copy_data_section_output(handler: &mut ExecNtHandler, work: &mut Work)
     }
 }
 
+/// MmCreateSection sizing against the queried file (NT5 creasect.c): `Some(end_of_file)` when
+/// the file must first grow. Growth is admitted only where the file data's resident pages can
+/// stay coherent with the new end of file.
+unsafe fn admit_data_section_size(
+    handler: &ExecNtHandler,
+    work: &Work,
+    metadata: nt_memory_manager::RoutedSectionMetadata,
+    granted: u32,
+) -> Result<Option<u64>, u32> {
+    use nt_memory_manager::routed_section_metadata::RoutedSectionAdmission;
+    match metadata.admit(work.maxsize, work.page_protection, granted, work.extended)? {
+        RoutedSectionAdmission::Ready(_) => Ok(None),
+        RoutedSectionAdmission::ExtendFile(end_of_file) => {
+            let table = &*handler.loop_ctx.ok_or(0xc000_00a3u32)?.generic_sections;
+            table.validate_file_creation(
+                nt_memory_manager::GenericSectionBacking {
+                    kind: nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED,
+                    file: Some(metadata.file),
+                    file_extent: metadata.end_of_file,
+                    ..nt_memory_manager::GenericSectionBacking::none()
+                },
+                end_of_file,
+            )?;
+            Ok(Some(end_of_file))
+        }
+    }
+}
+
+/// The end-of-file update reached its terminal: re-query the file, which must now cover the
+/// section, or fail the creation with the filesystem's status.
+fn finish_file_extension(work: &mut Work, status: u32) {
+    if (status as i32) < 0 {
+        work.capture.take();
+        work.status = status;
+        work.phase = Phase::ReadyReply;
+        return;
+    }
+    let mount = work.mount.expect("routed Section mount");
+    match work.metadata.reserve(mount, ()) {
+        Ok(id) => {
+            work.metadata_id = Some(id);
+            work.extended = true;
+            work.file_metadata = None;
+            work.phase = Phase::Query;
+        }
+        Err(()) => {
+            work.capture.take();
+            work.status = STATUS_INSUFFICIENT_RESOURCES;
+            work.phase = Phase::ReadyReply;
+        }
+    }
+}
+
 unsafe fn advance(
     handler: &mut ExecNtHandler,
     queue: &mut nt_delay_execution::Queue,
@@ -887,6 +960,24 @@ unsafe fn advance(
                                     print_str(b"/");
                                     print_u64(observation.target().generation);
                                     print_str(b"\n");
+                                }
+                            }
+                        }
+                        if work.allocation_attrs & 0x0100_0000 == 0 {
+                            let granted = work.capture.as_ref()
+                                .expect("routed DATA File capture").granted_access();
+                            match admit_data_section_size(handler, work, metadata, granted) {
+                                Ok(Some(end_of_file)) => {
+                                    work.file_metadata = Some(metadata);
+                                    work.phase = Phase::ExtendDispatch { end_of_file };
+                                    return Step::Progress;
+                                }
+                                Ok(None) => {}
+                                Err(status) => {
+                                    work.capture.take();
+                                    work.status = status;
+                                    work.phase = Phase::ReadyReply;
+                                    return Step::Progress;
                                 }
                             }
                         }
@@ -1056,6 +1147,67 @@ unsafe fn advance(
                 .metadata
                 .acknowledge_backend(work.metadata_id.expect("routed metadata owner"), irp.raw()));
             work.phase = Phase::Query;
+            Step::Progress
+        }
+        Phase::ExtendDispatch { end_of_file } => {
+            if work.cancelled {
+                work.status = STATUS_CANCELLED;
+                work.capture.take();
+                work.phase = Phase::RevokeReply;
+                return Step::Progress;
+            }
+            let capture = work.capture.as_ref().expect("extended Section File capture");
+            // FsRtlSetFileSize: IRP_MJ_SET_INFORMATION FileEndOfFileInformation, paging bits.
+            let result = driver_launch::io_manager_mut().build_and_dispatch_file_size_update(
+                nt_types::ClientId(driver_launch::IO_MANAGER_COMPONENT_ID),
+                DeviceId(capture.device_id()),
+                FileId(capture.file_id()),
+                work.tid,
+                end_of_file,
+            );
+            match result {
+                Ok(ExternalDispatchResult::Completed { status, .. }) => {
+                    finish_file_extension(work, status.raw() as u32);
+                }
+                Ok(ExternalDispatchResult::Pending { irp_id }) => {
+                    work.phase = Phase::ExtendPending { irp: irp_id };
+                }
+                Err(status) => finish_file_extension(work, status.raw() as u32),
+            }
+            Step::Progress
+        }
+        Phase::ExtendPending { irp } => {
+            if work.cancelled && !work.cancel_requested {
+                work.cancel_requested = true;
+                let _ = driver_launch::cancel_irp_if_pending(irp.raw());
+            }
+            let Some(completion) = driver_launch::completed_irp_exact(irp.raw()) else {
+                return Step::Wait;
+            };
+            let capture = work.capture.as_ref().expect("pending Section extension File capture");
+            if completion.client_id != driver_launch::IO_MANAGER_COMPONENT_ID
+                || Some(completion.driver_id) != work.origin_driver
+                || completion.file_id != capture.file_id()
+                || completion.device_id != capture.device_id()
+                || completion.requestor_tid != work.tid
+                || completion.major != nt_io_abi::major::IRP_MJ_SET_INFORMATION
+            {
+                work.phase = Phase::Indeterminate;
+                return Step::Wait;
+            }
+            work.phase = Phase::ExtendAck { irp, status: completion.status };
+            Step::Progress
+        }
+        Phase::ExtendAck { irp, status } => {
+            // The backend ACK is entered once. An uncertain result retains all owners.
+            work.phase = Phase::Indeterminate;
+            if driver_launch::io_manager_mut()
+                .acknowledge_completed_irp_strict(irp)
+                .is_err()
+            {
+                return Step::Wait;
+            }
+            finish_file_extension(work, status);
             Step::Progress
         }
         Phase::HeaderDispatch => {

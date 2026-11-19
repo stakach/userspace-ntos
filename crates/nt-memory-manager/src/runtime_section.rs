@@ -17,6 +17,9 @@ pub use pages::{SectionPagePublication, SectionPagePublicationError};
 mod page_writes;
 pub use page_writes::UnmappedPageWrite;
 
+#[path = "section_extension.rs"]
+pub mod section_extension;
+
 #[path = "section_stream_write.rs"]
 mod stream_write;
 pub use stream_write::{StreamWrite, StreamWritePage};

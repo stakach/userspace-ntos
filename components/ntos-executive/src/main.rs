@@ -942,6 +942,9 @@ const _: () = {
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// NtFlushVirtualMemory flushes dirty pages from one mapped data-file view.
 pub const SSN_NT_FLUSH_VM: u64 = 84;
+/// NtExtendSection (LiberNT full-export band, `LIBERNT_FULL_EXPORT_SSN_BASE + 63`).
+pub const SSN_NT_EXTEND_SECTION: u64 =
+    nt_syscall_abi::LIBERNT_FULL_EXPORT_SSN_BASE as u64 + 63;
 pub const SSN_NT_FLUSH_BUFFERS_FILE: u64 = 81;
 pub const SSN_NT_LOCK_VM: u64 = 108;
 /// ReactOS x64 `ntoskrnl/sysfuncs.lst` zero-based service numbers for the global atom family.
@@ -3179,6 +3182,7 @@ const DELAY_TIMER_SOURCE_VOLUME_LAZY_FLUSH: u64 = 48;
 const DELAY_TIMER_SOURCE_SOURCE_IRP_PROBE: u64 = 49;
 /// Routed Section pages owe retained paging writes, or a flushing caller waits on them.
 const DELAY_TIMER_SOURCE_SECTION_WRITEBACK: u64 = 50;
+const DELAY_TIMER_SOURCE_SECTION_EXTEND: u64 = 51;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -17860,6 +17864,7 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(25, vm_lock_pagein_work::wake_due(now_100ns))
         + subdrain!(25, vm_copy_work::wake_due(now_100ns))
         + subdrain!(25, service_sec_image::section_writeback_work::wake_due(now_100ns))
+        + subdrain!(25, service_sec_image::section_extend_work::wake_due(now_100ns))
         + subdrain!(19, provider_section_broker::wake_due(now_100ns))
         + subdrain!(19, gdi_routed_image_work::wake_due(now_100ns))
         + subdrain!(21, provider_directory_broker::wake_due(now_100ns))
@@ -19294,6 +19299,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || vm_lock_pagein_work::has_thread(tid)
         || vm_copy_work::has_thread(tid)
         || service_sec_image::section_writeback_work::has_thread(tid)
+        || service_sec_image::section_extend_work::has_thread(tid)
     {
         return false;
     }
@@ -19342,6 +19348,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || vm_lock_pagein_work::has_thread(tid)
         || vm_copy_work::has_thread(tid)
         || service_sec_image::section_writeback_work::has_thread(tid)
+        || service_sec_image::section_extend_work::has_thread(tid)
     {
         return false;
     }
@@ -19471,6 +19478,7 @@ unsafe fn terminate_hosted_process_mechanisms(
         || vm_lock_pagein_work::has_process(process_index as usize, preserve_tid)
         || vm_copy_work::has_process(process_index as usize, preserve_tid)
         || service_sec_image::section_writeback_work::has_process(process_index as usize, preserve_tid)
+        || service_sec_image::section_extend_work::has_process(process_index as usize, preserve_tid)
     {
         return 0;
     }

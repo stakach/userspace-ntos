@@ -1,8 +1,8 @@
 //! Exact provider metadata required before a routed data section can be published.
 
 use crate::data_section::{
-    prepare_data_section_file, DataSectionFileExtent, DataSectionFileInfo, DataSectionFileIo,
-    STATUS_IO_DEVICE_ERROR,
+    complete_data_section_extension, plan_data_section_file, DataSectionFileExtent,
+    DataSectionFileInfo, DataSectionFilePlan, STATUS_IO_DEVICE_ERROR,
 };
 use crate::{SectionFileIdentity, SectionMountId};
 
@@ -59,16 +59,52 @@ impl RoutedSectionMetadata {
     /// Admit a routed data section. As in NT's MmCreateSection, the File handle's granted access
     /// is the authority for a writable section (NT5 MmMakeFileAccess): the filesystem refused
     /// write access to read-only media at CREATE. Shared pages are written back through the same
-    /// FILE_OBJECT with paging IRPs. Growing the file to a larger section needs the routed
-    /// filesystem's own EOF update, which this admission does not issue.
+    /// FILE_OBJECT with paging IRPs. A writable section larger than the file first has the
+    /// routed filesystem set the new end of file (FsRtlSetFileSize, NT5 creasect.c); the metadata
+    /// queried after that update (`extended`) must cover the section.
+    pub fn admit(
+        self,
+        maximum_size: u64,
+        protection: u32,
+        granted_access: u32,
+        extended: bool,
+    ) -> Result<RoutedSectionAdmission, u32> {
+        let info = DataSectionFileInfo {
+            end_of_file: self.end_of_file,
+            is_directory: self.is_directory,
+            read_only_volume: false,
+        };
+        match plan_data_section_file(maximum_size, protection, granted_access, info)? {
+            DataSectionFilePlan::Ready(extent) => Ok(RoutedSectionAdmission::Ready(extent)),
+            DataSectionFilePlan::Extend { section_size } if extended => {
+                complete_data_section_extension(section_size, info).map(RoutedSectionAdmission::Ready)
+            }
+            DataSectionFilePlan::Extend { section_size } => {
+                Ok(RoutedSectionAdmission::ExtendFile(section_size))
+            }
+        }
+    }
+
+    /// The extent of a section whose file already covers it. Growing the file is the retained
+    /// creation's own step (`admit`); a caller that cannot issue it is refused.
     pub fn prepare(
         self,
         maximum_size: u64,
         protection: u32,
         granted_access: u32,
     ) -> Result<DataSectionFileExtent, u32> {
-        prepare_data_section_file(maximum_size, protection, granted_access, &mut RoutedFile(self))
+        match self.admit(maximum_size, protection, granted_access, false)? {
+            RoutedSectionAdmission::Ready(extent) => Ok(extent),
+            RoutedSectionAdmission::ExtendFile(_) => Err(STATUS_NOT_SUPPORTED),
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutedSectionAdmission {
+    Ready(DataSectionFileExtent),
+    /// The routed filesystem must first set this end of file.
+    ExtendFile(u64),
 }
 
 pub fn decode_standard_query(query: CompletedFileQuery<'_>) -> Result<(u64, bool), u32> {
@@ -80,21 +116,6 @@ pub fn decode_standard_query(query: CompletedFileQuery<'_>) -> Result<(u64, bool
     Ok((end_of_file as u64, standard[21] != 0))
 }
 
-struct RoutedFile(RoutedSectionMetadata);
-
-impl DataSectionFileIo for RoutedFile {
-    fn query_file(&mut self) -> Result<DataSectionFileInfo, u32> {
-        Ok(DataSectionFileInfo {
-            end_of_file: self.0.end_of_file,
-            is_directory: self.0.is_directory,
-            read_only_volume: false,
-        })
-    }
-
-    fn extend_file(&mut self, _size: u64) -> Result<(), u32> {
-        Err(STATUS_NOT_SUPPORTED)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -142,7 +163,29 @@ mod tests {
         assert_eq!(
             result.prepare(0x3000, 0x04, 0x03),
             Err(STATUS_NOT_SUPPORTED),
-            "growing the routed file is the filesystem's EOF update, not issued here"
+            "growing the routed file is the retained creation's EOF update, not issued here"
+        );
+    }
+
+    #[test]
+    fn a_writable_section_larger_than_its_file_sets_the_end_of_file_first() {
+        // NT5 creasect.c MmCreateSection: MaximumSize > EndOfFile with PAGE_READWRITE or
+        // PAGE_EXECUTE_READWRITE calls FsRtlSetFileSize(File, MaximumSize).
+        let (mount, standard, internal) = metadata(0x2345, false, 0x321);
+        let small = RoutedSectionMetadata::from_queries(mount, query(&standard), query(&internal))
+            .unwrap();
+        assert_eq!(small.admit(0x3000, 0x04, 0x03, false), Ok(RoutedSectionAdmission::ExtendFile(0x3000)));
+        assert_eq!(small.admit(0x3000, 0x40, 0x23, false), Ok(RoutedSectionAdmission::ExtendFile(0x3000)));
+        assert_eq!(small.admit(0x3000, 0x02, 0x01, false), Err(crate::STATUS_SECTION_TOO_BIG));
+        assert_eq!(small.admit(0x3000, 0x04, 0x01, false), Err(0xc000_0022));
+        // After the update the re-queried file must cover the section.
+        assert_eq!(small.admit(0x3000, 0x04, 0x03, true), Err(STATUS_IO_DEVICE_ERROR));
+        let (mount, grown, internal) = metadata(0x3000, false, 0x321);
+        let grown = RoutedSectionMetadata::from_queries(mount, query(&grown), query(&internal))
+            .unwrap();
+        assert_eq!(
+            grown.admit(0x3000, 0x04, 0x03, true),
+            Ok(RoutedSectionAdmission::Ready(DataSectionFileExtent { section_size: 0x3000, file_size: 0x3000 }))
         );
     }
 

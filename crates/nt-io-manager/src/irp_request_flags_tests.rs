@@ -1,7 +1,7 @@
 use super::*;
 use nt_io_abi::major;
 
-const ORIGINS: [IrpRequestFlags; 8] = [
+const ORIGINS: [IrpRequestFlags; 9] = [
     IrpRequestFlags::NONE,
     IrpRequestFlags::api(true, false),
     IrpRequestFlags::api(false, true),
@@ -9,6 +9,7 @@ const ORIGINS: [IrpRequestFlags; 8] = [
     IrpRequestFlags::paging(PagingTransfer::Read),
     IrpRequestFlags::paging(PagingTransfer::SynchronousWrite),
     IrpRequestFlags::paging(PagingTransfer::AsynchronousWrite),
+    IrpRequestFlags::file_size_update(),
     IrpRequestFlags::mount_completion(),
 ];
 
@@ -46,9 +47,26 @@ fn paging_transfers_carry_the_memory_manager_words() {
     for origin in ORIGINS {
         assert_eq!(
             origin.is_paging_io(),
-            origin.paging_transfer().is_some(),
+            origin.paging_transfer().is_some() || origin == IrpRequestFlags::file_size_update(),
             "{origin:?}"
         );
+    }
+}
+
+#[test]
+fn the_memory_managers_file_size_update_is_paging_set_information() {
+    // NT5 fsrtl/fastio.c FsRtlSetFileSize: Irp->Flags = IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO.
+    let update = IrpRequestFlags::file_size_update();
+    assert_eq!(update.bits(), IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO);
+    assert!(update.is_paging_io() && update.paging_transfer().is_none());
+    for value in 0..=0x1b_u8 {
+        assert_eq!(update.admits(value, 0), value == major::IRP_MJ_SET_INFORMATION, "{value:#x}");
+    }
+    assert_eq!(IrpRequestFlags::from_wire(major::IRP_MJ_SET_INFORMATION, 0, 0x42), Some(update));
+    // A filesystem passing it down keeps it, buffered or not: a SET returns no data.
+    for raw in [0x42, 0x72] {
+        assert_eq!(IrpRequestFlags::from_driver_irp(major::IRP_MJ_SET_INFORMATION, 0, raw)
+            .unwrap().request, update);
     }
 }
 

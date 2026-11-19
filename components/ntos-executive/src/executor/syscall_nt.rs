@@ -240,6 +240,10 @@ pub(super) unsafe fn syscall_nt_route(
         };
         crate::service_sec_image::section_writeback_work::submit_cache_flush(
             &mut nt_handler, &argv[..2], retry, resume_ip, sp, flags, native_call_transport)
+    } else if lp.msg.m0 == SSN_NT_EXTEND_SECTION {
+        // MmExtendSection may wait on the file's own end-of-file update.
+        crate::service_sec_image::section_extend_work::submit(
+            &mut nt_handler, &argv[..2], resume_ip, sp, flags, native_call_transport)
     } else {
         Ok(false)
     };
@@ -248,6 +252,7 @@ pub(super) unsafe fn syscall_nt_route(
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             crate::service_sec_image::section_writeback_work::redrive(&mut nt_handler);
+            crate::service_sec_image::section_extend_work::redrive(&mut nt_handler);
         }
         let _ = finalize_service_loop_state(&mut nt_handler);
         let new_reply = local().reply_main_slot.load(Ordering::Relaxed);

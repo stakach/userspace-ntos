@@ -4962,6 +4962,8 @@ mod section_writeback;
 pub(crate) mod section_writeback_work;
 #[path = "routed_write_coherence.rs"]
 pub(crate) mod routed_write_coherence;
+#[path = "section_extend_work.rs"]
+pub(crate) mod section_extend_work;
 #[path = "service_section_scratch.rs"]
 mod section_scratch;
 pub(crate) use section_scratch::{service_read_file_coherent, service_resize_file_coherent, service_write_file_coherent};

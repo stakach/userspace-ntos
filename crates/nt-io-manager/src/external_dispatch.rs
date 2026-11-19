@@ -1187,6 +1187,48 @@ impl<P> IoManager<P> {
         )
     }
 
+    /// `FsRtlSetFileSize` (NT5 fsrtl/fastio.c) on the File's own device: IRP_MJ_SET_INFORMATION
+    /// FileEndOfFileInformation carrying `IRP_PAGING_IO|IRP_SYNCHRONOUS_PAGING_IO`. The Memory
+    /// Manager grows a mapped file this way (MmCreateSection, MmExtendSection); a pended update is
+    /// owned through its exact terminal and acknowledgement like any external dispatch.
+    pub fn build_and_dispatch_file_size_update(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        file_id: FileId,
+        requestor_tid: u64,
+        end_of_file: u64,
+    ) -> Result<ExternalDispatchResult, NtStatus> {
+        const FILE_END_OF_FILE_INFORMATION: u32 = 20;
+        let end_of_file = i64::try_from(end_of_file).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        let mut information = end_of_file.to_le_bytes();
+        let driver_id = self
+            .device(device_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .driver_id;
+        self.build_and_dispatch_external(
+            client,
+            driver_id,
+            device_id,
+            Some(file_id),
+            0,
+            requestor_tid,
+            nt_io_abi::major::IRP_MJ_SET_INFORMATION,
+            IoParameters::SetInformation(crate::SetInformationParameters {
+                info_class: FILE_END_OF_FILE_INFORMATION,
+                length: 8,
+                target_file: None,
+                control: crate::SetInformationControl::None,
+            }),
+            StackFlags::empty(),
+            crate::irp_request_flags::IrpRequestFlags::file_size_update(),
+            8,
+            0,
+            0,
+            &mut information,
+        )
+    }
+
     fn build_and_dispatch_external(
         &mut self,
         client: ClientId,

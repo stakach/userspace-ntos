@@ -85,3 +85,22 @@ fn routed_writes_reach_resident_section_pages() {
     assert!(COHERENCE.contains("table.plan_stream_write(section, offset, data.len() as u64)"));
     assert!(COHERENCE.contains("if !copied || !table.commit_stream_write(plan) {"));
 }
+
+const SECTION_METADATA: &str = include_str!("../../../components/ntos-executive/src/section_metadata_work.rs");
+const EXTEND: &str = include_str!("../../../components/ntos-executive/src/section_extend_work.rs");
+const SYSCALL_INGRESS: &str = include_str!("../../../components/ntos-executive/src/executor/syscall_nt.rs");
+
+#[test]
+fn routed_files_grow_through_their_filesystem_for_sections() {
+    // RoutedSectionMetadata::admit, plan/commit_section_extension and
+    // build_and_dispatch_file_size_update are proven in their crates; these bind the retained
+    // native owners of MmCreateSection's and MmExtendSection's FsRtlSetFileSize.
+    assert!(SECTION_METADATA.contains("metadata.admit(work.maxsize, work.page_protection, granted, work.extended)?"));
+    assert!(SECTION_METADATA.contains("Phase::ExtendDispatch { end_of_file } => {"));
+    assert!(SECTION_METADATA.contains(".build_and_dispatch_file_size_update("));
+    assert!(SECTION_METADATA.contains("|| completion.major != nt_io_abi::major::IRP_MJ_SET_INFORMATION"));
+    assert!(EXTEND.contains("table.plan_section_extension(section, requested)"));
+    assert!(EXTEND.contains("build_and_dispatch_file_size_update("));
+    assert!(EXTEND.contains("acknowledge_completed_irp_strict(irp)"));
+    assert!(SYSCALL_INGRESS.contains("} else if lp.msg.m0 == SSN_NT_EXTEND_SECTION {"));
+}

@@ -63,15 +63,23 @@ pub trait DataSectionFileIo {
     fn extend_file(&mut self, size: u64) -> Result<(), u32>;
 }
 
-/// Complete real file sizing before the caller can publish a section object or retain its backing.
-pub fn prepare_data_section_file(
+/// What a data section over a file needs before it can be published (NT5 MmCreateSection,
+/// creasect.c): the file already covers the section, or the file must first grow to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataSectionFilePlan {
+    Ready(DataSectionFileExtent),
+    /// `FsRtlSetFileSize` to `section_size`, then [`complete_data_section_extension`].
+    Extend { section_size: u64 },
+}
+
+/// Size a data section against the file's queried metadata without any file effect.
+pub fn plan_data_section_file(
     maximum_size: u64,
     protection: u32,
     granted_access: u32,
-    io: &mut impl DataSectionFileIo,
-) -> Result<DataSectionFileExtent, u32> {
+    info: DataSectionFileInfo,
+) -> Result<DataSectionFilePlan, u32> {
     check_data_section_file_access(protection, granted_access)?;
-    let mut info = io.query_file()?;
     if info.is_directory {
         return Err(STATUS_INVALID_FILE_FOR_SECTION);
     }
@@ -92,27 +100,56 @@ pub fn prepare_data_section_file(
     if section_size > MAX_DATA_SECTION_SIZE && section_size <= i64::MAX as u64 {
         return Err(STATUS_SECTION_TOO_BIG);
     }
-    if section_size > info.end_of_file {
-        if !matches!(protection, 0x04 | 0x40) {
-            return Err(STATUS_SECTION_TOO_BIG);
-        }
-        if section_size > i64::MAX as u64 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        io.extend_file(section_size)?;
-        info = io.query_file()?;
-        if info.is_directory
-            || info.read_only_volume
-            || info.end_of_file < section_size
-            || info.end_of_file > MAX_DATA_SECTION_SIZE
-        {
-            return Err(STATUS_IO_DEVICE_ERROR);
-        }
+    if section_size <= info.end_of_file {
+        return Ok(DataSectionFilePlan::Ready(DataSectionFileExtent {
+            section_size,
+            file_size: info.end_of_file,
+        }));
+    }
+    // A section larger than its file needs page-write protection (MmCreateSection).
+    if !matches!(protection, 0x04 | 0x40) {
+        return Err(STATUS_SECTION_TOO_BIG);
+    }
+    if section_size > i64::MAX as u64 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(DataSectionFilePlan::Extend { section_size })
+}
+
+/// The file's metadata after its filesystem accepted the new end of file.
+pub fn complete_data_section_extension(
+    section_size: u64,
+    info: DataSectionFileInfo,
+) -> Result<DataSectionFileExtent, u32> {
+    if info.is_directory
+        || info.read_only_volume
+        || info.end_of_file < section_size
+        || info.end_of_file > MAX_DATA_SECTION_SIZE
+    {
+        return Err(STATUS_IO_DEVICE_ERROR);
     }
     Ok(DataSectionFileExtent {
         section_size,
         file_size: info.end_of_file,
     })
+}
+
+/// Complete real file sizing before the caller can publish a section object or retain its backing.
+pub fn prepare_data_section_file(
+    maximum_size: u64,
+    protection: u32,
+    granted_access: u32,
+    io: &mut impl DataSectionFileIo,
+) -> Result<DataSectionFileExtent, u32> {
+    check_data_section_file_access(protection, granted_access)?;
+    let info = io.query_file()?;
+    match plan_data_section_file(maximum_size, protection, granted_access, info)? {
+        DataSectionFilePlan::Ready(extent) => Ok(extent),
+        DataSectionFilePlan::Extend { section_size } => {
+            io.extend_file(section_size)?;
+            complete_data_section_extension(section_size, io.query_file()?)
+        }
+    }
 }
 
 pub trait DataSectionReadIo {

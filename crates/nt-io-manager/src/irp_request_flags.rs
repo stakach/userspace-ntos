@@ -36,6 +36,8 @@ pub enum PagingTransfer {
 enum Origin {
     Ordinary { synchronous_api: bool, no_intermediate_buffering: bool },
     Paging(PagingTransfer),
+    /// `FsRtlSetFileSize`, which the Memory Manager uses to grow a mapped file.
+    FileSizeUpdate,
     MountCompletion,
 }
 
@@ -69,6 +71,14 @@ impl IrpRequestFlags {
         Self(Origin::Paging(transfer))
     }
 
+    /// `FsRtlSetFileSize` (NT5 fsrtl/fastio.c): MmCreateSection and MmExtendSection set a mapped
+    /// file's new end of file with IRP_MJ_SET_INFORMATION FileEndOfFileInformation and
+    /// `IRP_PAGING_IO|IRP_SYNCHRONOUS_PAGING_IO`, so the filesystem can tell the Memory Manager's
+    /// size update from a caller's.
+    pub const fn file_size_update() -> Self {
+        Self(Origin::FileSizeUpdate)
+    }
+
     /// `IopMountVolume`/`IoVerifyVolume` (NT5 internal.c, iosubs.c).
     pub const fn mount_completion() -> Self {
         Self(Origin::MountCompletion)
@@ -84,7 +94,7 @@ impl IrpRequestFlags {
     /// Paging I/O never moves `FILE_OBJECT.CurrentByteOffset` (ReactOS vfatfs rw.c,
     /// NT5 fastfat read.c/write.c).
     pub const fn is_paging_io(self) -> bool {
-        matches!(self.0, Origin::Paging(_))
+        matches!(self.0, Origin::Paging(_) | Origin::FileSizeUpdate)
     }
 
     pub const fn bits(self) -> u32 {
@@ -97,6 +107,7 @@ impl IrpRequestFlags {
                 IRP_PAGING_IO | IRP_NOCACHE | IRP_SYNCHRONOUS_PAGING_IO
             }
             Origin::Paging(PagingTransfer::AsynchronousWrite) => IRP_PAGING_IO | IRP_NOCACHE,
+            Origin::FileSizeUpdate => IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO,
             Origin::MountCompletion => IRP_MOUNT_COMPLETION | IRP_SYNCHRONOUS_PAGING_IO,
         }
     }
@@ -110,6 +121,7 @@ impl IrpRequestFlags {
             }
             Origin::Paging(PagingTransfer::Read) => major == IRP_MJ_READ,
             Origin::Paging(_) => major == IRP_MJ_WRITE,
+            Origin::FileSizeUpdate => major == nt_io_abi::major::IRP_MJ_SET_INFORMATION,
             Origin::MountCompletion => {
                 major == IRP_MJ_FILE_SYSTEM_CONTROL
                     && (minor == IRP_MN_MOUNT_VOLUME || minor == IRP_MN_VERIFY_VOLUME)
@@ -160,7 +172,7 @@ impl IrpRequestFlags {
 }
 
 /// Every request-wide origin, in decode order.
-const ORIGINS: [IrpRequestFlags; 8] = [
+const ORIGINS: [IrpRequestFlags; 9] = [
     IrpRequestFlags::api(false, false),
     IrpRequestFlags::api(true, false),
     IrpRequestFlags::api(false, true),
@@ -168,6 +180,7 @@ const ORIGINS: [IrpRequestFlags; 8] = [
     IrpRequestFlags::paging(PagingTransfer::Read),
     IrpRequestFlags::paging(PagingTransfer::SynchronousWrite),
     IrpRequestFlags::paging(PagingTransfer::AsynchronousWrite),
+    IrpRequestFlags::file_size_update(),
     IrpRequestFlags::mount_completion(),
 ];
 
