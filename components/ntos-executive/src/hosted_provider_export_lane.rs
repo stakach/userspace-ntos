@@ -136,7 +136,21 @@ pub(super) unsafe fn prepare(
             else { Err(nt_status::NtStatus::DEVICE_BUSY) };
     }
     let inst = instance(provider).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    if !inst.ready || inst.faulted { return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED); }
+    // Readiness gates device dispatch; a provider library (ndis.sys) is never device-ready but
+    // serves exports while its singleton is published and its primary lane is live.
+    if !nt_hosted_runtime::hosted_provider_worker_admissible(
+        inst.faulted,
+        find_hosted_provider_singleton_by_cookie(publication)
+            .is_some_and(|(_, singleton)| singleton.instance == provider),
+        hosted_ingress_sources::primary_route(provider).is_some(),
+    ) {
+        print_str(b"[dxg-worker] prepare reject=provider faulted=");
+        print_u64(u64::from(inst.faulted));
+        print_str(b" ready=");
+        print_u64(u64::from(inst.ready));
+        print_str(b"\n");
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    }
     let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
     let _durable = crate::allocator::enter_durable();
     let index = {

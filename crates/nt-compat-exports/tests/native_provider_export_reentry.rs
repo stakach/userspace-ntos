@@ -19,3 +19,20 @@ fn reentrant_exports_select_a_worker_lane_when_the_primary_cannot_admit() {
     let select = body.find("hosted_provider_export_lane::select(").expect("worker selection");
     assert!(admits < policy && policy < select);
 }
+
+/// Boot 44510687412 attempt 2: `dxg-worker-prepare status=0xc000009d` for E1000's callback into
+/// ndis.sys. The worker preparation required device readiness, which a provider library never
+/// reaches; it now requires a live, unfaulted published provider with a primary lane.
+#[test]
+fn worker_preparation_does_not_require_device_readiness() {
+    let lane = include_str!("../../../components/ntos-executive/src/hosted_provider_export_lane.rs");
+    let prepare = lane
+        .split("pub(super) unsafe fn prepare(")
+        .nth(1)
+        .unwrap()
+        .split("\nunsafe fn construct(")
+        .next()
+        .unwrap();
+    assert!(!prepare.contains("!inst.ready"), "device readiness does not gate exports");
+    assert!(prepare.contains("hosted_provider_worker_admissible("));
+}

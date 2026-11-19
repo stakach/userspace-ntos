@@ -32,6 +32,19 @@ pub const fn hosted_provider_export_needs_worker(dxg_callback: bool, primary_adm
     dxg_callback || !primary_admits
 }
 
+/// Whether a provider may get a worker lane for a reentrant export.
+///
+/// A provider library such as ndis.sys never publishes a device stack, so its instance never
+/// becomes dispatch-ready; readiness gates ordinary device dispatch, not exports. A worker lane
+/// needs a live, unfaulted provider with a published export singleton and a primary lane.
+pub const fn hosted_provider_worker_admissible(
+    faulted: bool,
+    singleton_published: bool,
+    primary_route: bool,
+) -> bool {
+    !faulted && singleton_published && primary_route
+}
+
 /// Pick the IRQL byte's containing bank only after native code has authenticated one exact
 /// physical lane. Provider workers cannot borrow the parked primary's IRQL state.
 pub const fn select_hosted_cr8_bank(primary_shared: u64, channel_shared: u64,
@@ -146,6 +159,17 @@ pub const fn select_hosted_provider_export_worker(
 #[cfg(test)]
 mod reentry_tests {
     use super::hosted_provider_export_needs_worker;
+
+    #[test]
+    fn a_provider_library_that_never_publishes_a_device_stack_gets_a_worker_lane() {
+        use super::hosted_provider_worker_admissible;
+        // Boot 44510687412 attempt 2: worker preparation for ndis.sys refused with
+        // STATUS_DEVICE_NOT_CONNECTED because the library's instance is never device-ready.
+        assert!(hosted_provider_worker_admissible(false, true, true));
+        assert!(!hosted_provider_worker_admissible(true, true, true));
+        assert!(!hosted_provider_worker_admissible(false, false, true));
+        assert!(!hosted_provider_worker_admissible(false, true, false));
+    }
 
     #[test]
     fn a_reentrant_export_into_a_running_provider_uses_a_worker_lane() {

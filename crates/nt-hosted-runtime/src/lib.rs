@@ -93,7 +93,8 @@ pub use dxg_registration::{
 };
 pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderWorkerIdentity,
     HostedWorkerBankLayout, classify_hosted_provider_export_completion,
-    select_hosted_cr8_bank, select_hosted_provider_export_worker, hosted_provider_export_needs_worker};
+    select_hosted_cr8_bank, select_hosted_provider_export_worker, hosted_provider_export_needs_worker,
+    hosted_provider_worker_admissible};
 pub use gop_bar_projection::{GopBarProjection, GopLegacyVgaPortAuthority,
     GopPciBarAuthority};
 pub use hosted_driver_thread_object::{HostedDriverThreadObjectKey,
