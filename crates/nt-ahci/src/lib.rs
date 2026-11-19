@@ -2,6 +2,8 @@
 #![no_std]
 
 mod census;
+mod transfer;
+pub use transfer::{transfer, Transfer, TransferOutcome};
 pub use census::{
     CommandCensus, CommandWindow, CommandWindowSnapshot, DirectReadBucket, DirectReadCensus,
     DirectReadSnapshot, DirectReadSource, FatOneSectorCallsite, IoOperation, IoSnapshot,
@@ -13,11 +15,6 @@ mod tests;
 pub const PORT_IS_FATAL: u32 = 0x7800_0000;
 pub const TASK_FILE_FAILURE: u32 = 0xa9; // BSY | DF | DRQ | ERR
 pub const DATA_OFFSET: usize = 0x800;
-
-/// ATA commands may complete with DRDY and DSC set; only failure/busy bits refuse the data.
-pub fn read_completion_ok(task_file_status: u32) -> bool {
-    task_file_status & TASK_FILE_FAILURE == 0
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -117,25 +114,7 @@ pub fn execute(
         return Err(Error::Busy);
     }
     let start = io.ticks();
-    let clb = u64::from(io.read_port(0)) | (u64::from(io.read_port(4)) << 32);
-    let fb = u64::from(io.read_port(8)) | (u64::from(io.read_port(12)) << 32);
-    if clb != dma_paddr || fb != dma_paddr + 0x400 || io.read_port(0x18) & 0x11 != 0x11 {
-        io.enable_ahci();
-        let cmd = io.read_port(0x18);
-        io.write_port(0x18, cmd & !1);
-        wait_clear(io, 0x18, 1 << 15, start, timeout_ticks)?;
-        let cmd = io.read_port(0x18);
-        io.write_port(0x18, cmd & !(1 << 4));
-        wait_clear(io, 0x18, 1 << 14, start, timeout_ticks)?;
-        io.write_dma(0x400, &[0; 256]);
-        io.write_port(0, dma_paddr as u32);
-        io.write_port(4, (dma_paddr >> 32) as u32);
-        io.write_port(8, (dma_paddr + 0x400) as u32);
-        io.write_port(12, ((dma_paddr + 0x400) >> 32) as u32);
-        let cmd = io.read_port(0x18);
-        io.write_port(0x18, cmd | (1 << 4));
-        io.write_port(0x18, cmd | (1 << 4) | 1);
-    }
+    transfer::ensure_running(io, dma_paddr, start, timeout_ticks)?;
     wait_clear(io, 0x20, 0x88, start, timeout_ticks)?;
     let mut table = [0u8; 144];
     table[0] = 0x27;

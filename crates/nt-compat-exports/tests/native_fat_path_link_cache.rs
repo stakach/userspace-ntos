@@ -7,7 +7,7 @@ fn mounted_fat_path_links_share_generation_bound_cache() {
     let lookup = FAT.split_once("unsafe fn fat_lookup_metadata(").unwrap().1
         .split_once("/// Find one native FAT directory entry").unwrap().0;
     assert!(lookup.contains("FatPathRequestKind::Fat"));
-    assert!(lookup.contains("EXEC_FAT_SECTOR_CACHE"));
+    assert!(lookup.contains("(&mut *fs.sector_cache)"));
     assert!(lookup.contains(".read_sector("));
     assert!(lookup.contains("exec_fs_mount_identity()"));
     assert!(lookup.contains("FatIoOwner::Executive"));

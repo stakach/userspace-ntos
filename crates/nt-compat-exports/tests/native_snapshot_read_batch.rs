@@ -100,9 +100,9 @@ impl<'ast> Visit<'ast> for ReadWiring {
         let mut condition = ReadWiring::default();
         condition.visit_expr(&expression.cond);
         if condition
-            .paths
+            .methods
             .iter()
-            .any(|path| path == "TASK_FILE_FAILURE")
+            .any(|method| method == "is_completed")
         {
             assert!(
                 expression

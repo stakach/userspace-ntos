@@ -317,7 +317,7 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
             let byte_start = sector_index * sector_size;
             let byte_end = byte_start + chunk_sectors * sector_size;
             let started = self.fat.census.then(disk_census_ticks);
-            let tfd = unsafe {
+            let outcome = unsafe {
                 ahci_read_sectors(
                     self.fat.ahci_vaddr,
                     self.fat.dma_vaddr,
@@ -330,14 +330,14 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
                 nt_ahci::IoOperation::Read,
                 started,
                 chunk_sectors as u64,
-                tfd & nt_ahci::TASK_FILE_FAILURE != 0,
+                !outcome.is_completed(),
             );
             crate::fs_loader::direct_read_census_record(
                 nt_ahci::DirectReadSource::Snapshot,
                 started,
                 chunk_sectors as u64,
             );
-            if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
+            if !outcome.is_completed() {
                 return Err(nt_fs::SnapshotBlockStoreError::Io);
             }
             unsafe {
@@ -393,7 +393,7 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
             let byte_start = sector_index * sector_size;
             let byte_end = byte_start + chunk_sectors * sector_size;
             let started = self.fat.census.then(disk_census_ticks);
-            let tfd = unsafe {
+            let outcome = unsafe {
                 ahci_write_sectors(
                     self.fat.ahci_vaddr,
                     self.fat.dma_vaddr,
@@ -406,9 +406,9 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
                 nt_ahci::IoOperation::Write,
                 started,
                 chunk_sectors as u64,
-                tfd & nt_ahci::TASK_FILE_FAILURE != 0,
+                !outcome.is_completed(),
             );
-            if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
+            if !outcome.is_completed() {
                 return Err(nt_fs::SnapshotBlockStoreError::Io);
             }
             let n = WRITABLE_FS_SNAPSHOT_WRITE_SECTORS

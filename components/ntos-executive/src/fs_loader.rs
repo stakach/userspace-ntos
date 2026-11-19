@@ -5,17 +5,10 @@
 #![allow(clippy::all)]
 use crate::*;
 
-#[repr(C)]
-struct FatSectorCacheScratch {
-    sector: u32,
-    valid: u32,
-    data: [u8; 512],
-}
-
-pub(crate) const FAT32_SCRATCH_OFFSET: u64 = 0xA00;
-const FAT32_FAT_CACHE_OFFSET: u64 = FAT32_SCRATCH_OFFSET;
-// The isolated storage host maps its image read-only and never uses this cache. The executive
-// owns one mounted FAT volume and serializes its native filesystem calls through the service loop.
+// The isolated storage host maps its image read-only and never uses these caches; its mount owns
+// a FAT sector cache in its own writable memory. The executive owns one mounted FAT volume and
+// serializes its native filesystem calls through the service loop. No cache lives in the AHCI DMA
+// run: the HBA owns that whole window for every issued command.
 static mut EXEC_FAT_RANGE_CURSORS: nt_fs::FatRangeCursorSet<16> =
     nt_fs::FatRangeCursorSet::new();
 static mut EXEC_FAT_SECTOR_CACHE: nt_fs::FatSectorCache = nt_fs::FatSectorCache::new();
@@ -33,9 +26,8 @@ static FAT_READ_FAILURE_REPORTS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 static DIRECT_READ_CENSUS_PRINTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-const _: () = assert!(
-    FAT32_FAT_CACHE_OFFSET + core::mem::size_of::<FatSectorCacheScratch>() as u64 <= 0x1000
-);
+/// The isolated host's mount is its cache's only user, so one constant generation suffices.
+const ISOLATED_HOST_MOUNT_GENERATION: u64 = 1;
 
 fn report_fat_read_failure(context: &[u8], sector: u64, count: u32, status: u32) {
     use core::sync::atomic::Ordering;
@@ -63,11 +55,11 @@ unsafe fn read_owner_sector(
     dma_vaddr: u64,
     dma_paddr: u64,
     lba: u64,
-) -> u32 {
+) -> nt_ahci::TransferOutcome {
     match owner {
         FatIoOwner::Executive => {
             if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Read { lba, sectors: 1 }) {
-                return 0xff;
+                return nt_ahci::TransferOutcome::Refused(nt_ahci::Error::Busy);
             }
             ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, lba)
         }
@@ -84,11 +76,11 @@ unsafe fn read_owner_sectors(
     dma_paddr: u64,
     lba: u64,
     count: u32,
-) -> u32 {
+) -> nt_ahci::TransferOutcome {
     match owner {
         FatIoOwner::Executive => {
             if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Read { lba, sectors: count }) {
-                return 0xff;
+                return nt_ahci::TransferOutcome::Refused(nt_ahci::Error::Busy);
             }
             ahci_read_sectors(ahci_vaddr, dma_vaddr, dma_paddr, lba, count)
         }
@@ -225,11 +217,11 @@ unsafe fn fat_read_sector_checked(
         nt_ahci::IoOperation::Read,
         census_started,
         1,
-        status & nt_ahci::TASK_FILE_FAILURE != 0,
+        !status.is_completed(),
     );
     fat_direct_read_census_record(census_started, 1, callsite);
-    if !nt_ahci::read_completion_ok(status) {
-        report_fat_read_failure(b"[fat-sector]", sector as u64, 1, status);
+    if !status.is_completed() {
+        report_fat_read_failure(b"[fat-sector]", sector as u64, 1, status.diagnostic());
         return None;
     }
     Some((fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8)
@@ -245,15 +237,15 @@ unsafe fn fat_read_sectors_checked(fs: &Fat32, sector: u32, count: u32) -> Optio
         nt_ahci::IoOperation::Read,
         census_started,
         count as u64,
-        status & nt_ahci::TASK_FILE_FAILURE != 0,
+        !status.is_completed(),
     );
     fat_direct_read_census_record(
         census_started,
         count as u64,
         nt_ahci::FatOneSectorCallsite::FilePayload,
     );
-    if !nt_ahci::read_completion_ok(status) {
-        report_fat_read_failure(b"[fat-sector]", sector as u64, count, status);
+    if !status.is_completed() {
+        report_fat_read_failure(b"[fat-sector]", sector as u64, count, status.diagnostic());
         return None;
     }
     Some((fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8)
@@ -381,40 +373,30 @@ pub(crate) fn print_direct_read_census_once() {
     }
 }
 
-unsafe fn fat_cache_invalidate(fs: &Fat32) {
-    if fs.census {
-        return;
-    }
-    let cache = &mut *((fs.dma_vaddr + FAT32_FAT_CACHE_OFFSET) as *mut FatSectorCacheScratch);
-    cache.valid = 0;
-}
-
 unsafe fn fat_chain_cache_invalidate(fs: &Fat32) {
+    (&mut *fs.sector_cache).invalidate();
     if fs.census {
-        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).invalidate();
         (&mut *core::ptr::addr_of_mut!(EXEC_FAT_DIRECTORY_CACHE)).invalidate();
         (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
-    } else {
-        fat_cache_invalidate(fs);
     }
 }
 
 /// Write one full FAT sector through the same AHCI DMA frame used by [`fat_read_sector`].
 #[allow(dead_code)]
-pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u32 {
+pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> nt_ahci::TransferOutcome {
     if !matches!(fs.io_owner, FatIoOwner::Executive)
         || fs.bps != 512
         || data.len() != fs.bps as usize
     {
-        return 0xff;
+        return nt_ahci::TransferOutcome::Refused(nt_ahci::Error::InvalidDma);
     }
     let Some(disk_lba) = nt_fs::checked_partition_lba(fs.volume_start_lba, sector) else {
-        return 0xff;
+        return nt_ahci::TransferOutcome::Refused(nt_ahci::Error::InvalidDma);
     };
     // A timed-out write may still have reached media, so invalidate before issuing it.
     fat_chain_cache_invalidate(fs);
     if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Write { lba: disk_lba, sectors: 1 }) {
-        return 0xff;
+        return nt_ahci::TransferOutcome::Refused(nt_ahci::Error::Busy);
     }
     let started = fs.census.then(disk_census_ticks);
     let status = ahci_write_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, data);
@@ -422,36 +404,36 @@ pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u
         nt_ahci::IoOperation::Write,
         started,
         1,
-        status & nt_ahci::TASK_FILE_FAILURE != 0,
+        !status.is_completed(),
     );
     status
 }
 
 #[allow(dead_code)]
-pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> u32 {
+pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> nt_ahci::TransferOutcome {
     if !matches!(fs.io_owner, FatIoOwner::Executive)
         || fs.bps != 512
         || data.is_empty()
         || data.len() % fs.bps as usize != 0
     {
-        return 0xff;
+        return nt_ahci::TransferOutcome::Refused(nt_ahci::Error::InvalidDma);
     }
     let sectors = (data.len() / fs.bps as usize) as u32;
     if sectors == 0 || sectors > AHCI_MAX_SECTORS_PER_WRITE {
-        return 0xff;
+        return nt_ahci::TransferOutcome::Refused(nt_ahci::Error::InvalidDma);
     }
     let Some(disk_lba) = nt_fs::checked_partition_lba(fs.volume_start_lba, sector) else {
-        return 0xff;
+        return nt_ahci::TransferOutcome::Refused(nt_ahci::Error::InvalidDma);
     };
     let Some(last) = sector.checked_add(sectors - 1) else {
-        return 0xff;
+        return nt_ahci::TransferOutcome::Refused(nt_ahci::Error::InvalidDma);
     };
     if nt_fs::checked_partition_lba(fs.volume_start_lba, last).is_none() {
-        return 0xff;
+        return nt_ahci::TransferOutcome::Refused(nt_ahci::Error::InvalidDma);
     }
     fat_chain_cache_invalidate(fs);
     if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Write { lba: disk_lba, sectors }) {
-        return 0xff;
+        return nt_ahci::TransferOutcome::Refused(nt_ahci::Error::Busy);
     }
     let started = fs.census.then(disk_census_ticks);
     let status = ahci_write_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, data);
@@ -459,7 +441,7 @@ pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> 
         nt_ahci::IoOperation::Write,
         started,
         sectors as u64,
-        status & nt_ahci::TASK_FILE_FAILURE != 0,
+        !status.is_completed(),
     );
     status
 }
@@ -515,11 +497,11 @@ pub(crate) unsafe fn fat_volume_size(fs: &Fat32) -> Option<nt_fs::VolumeSizeInfo
         nt_ahci::IoOperation::Read,
         census_started,
         1,
-        status & nt_ahci::TASK_FILE_FAILURE != 0,
+        !status.is_completed(),
     );
     fat_direct_read_census_record(census_started, 1, nt_ahci::FatOneSectorCallsite::Other);
-    if !nt_ahci::read_completion_ok(status) {
-        report_fat_read_failure(b"[fat-fsinfo]", fs.fs_info_sector as u64, 1, status);
+    if !status.is_completed() {
+        report_fat_read_failure(b"[fat-fsinfo]", fs.fs_info_sector as u64, 1, status.diagnostic());
         return None;
     }
     let base = fs.dma_vaddr + AHCI_DMA_DATA_OFFSET;
@@ -564,33 +546,18 @@ unsafe fn fat_next_checked(fs: &Fat32, cluster: u32) -> Result<u32, u32> {
         .filter(|sector| *sector < fs.data_start)
         .ok_or(nt_fs::STATUS_DATA_ERROR)?;
     let off = byte % fs.bps;
-    if fs.census {
-        let mount = exec_fs_mount_identity().ok_or(nt_fs::STATUS_DATA_ERROR)?;
-        let value = (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).read_entry(
-            mount.value(),
-            sec,
-            off,
-            |sector, data| {
-                let p = fat_read_sector_checked(fs, sector, nt_ahci::FatOneSectorCallsite::FatLink)
-                    .ok_or(nt_fs::STATUS_DATA_ERROR)?;
-                core::ptr::copy_nonoverlapping(p, data.as_mut_ptr(), data.len());
-                Ok(())
-            },
-        )?;
-        return Ok(value & 0x0FFF_FFFF);
-    }
-    let cache = &mut *((fs.dma_vaddr + FAT32_FAT_CACHE_OFFSET) as *mut FatSectorCacheScratch);
-    if cache.valid != 1 || cache.sector != sec {
-        let p = fat_read_sector_checked(fs, sec, nt_ahci::FatOneSectorCallsite::FatLink)
+    let generation = if fs.census {
+        exec_fs_mount_identity().ok_or(nt_fs::STATUS_DATA_ERROR)?.value()
+    } else {
+        ISOLATED_HOST_MOUNT_GENERATION
+    };
+    let value = (&mut *fs.sector_cache).read_entry(generation, sec, off, |sector, data| {
+        let p = fat_read_sector_checked(fs, sector, nt_ahci::FatOneSectorCallsite::FatLink)
             .ok_or(nt_fs::STATUS_DATA_ERROR)?;
-        core::ptr::copy_nonoverlapping(p, cache.data.as_mut_ptr(), cache.data.len());
-        cache.sector = sec;
-        cache.valid = 1;
-    }
-    if off as usize + core::mem::size_of::<u32>() > cache.data.len() {
-        return Err(nt_fs::STATUS_DATA_ERROR);
-    }
-    Ok((core::ptr::read_unaligned(cache.data.as_ptr().add(off as usize) as *const u32)) & 0x0FFF_FFFF)
+        core::ptr::copy_nonoverlapping(p, data.as_mut_ptr(), data.len());
+        Ok(())
+    })?;
+    Ok(value & 0x0FFF_FFFF)
 }
 
 /// Checked directory traversal for provider queries. Unlike the legacy visitor, an unreadable
@@ -980,9 +947,6 @@ pub(crate) unsafe fn fat_read_file(
                 (dest_vaddr + written as u64) as *mut u8,
                 bytes as usize,
             );
-            if run_clusters > 1 {
-                fat_cache_invalidate(fs);
-            }
             written += bytes;
             clusters_seen = clusters_seen.saturating_add(run_clusters);
             if next_after_run == last_cluster {
@@ -1015,9 +979,6 @@ pub(crate) unsafe fn fat_read_file(
                 (dest_vaddr + written as u64) as *mut u8,
                 bytes as usize,
             );
-            if sectors > 1 {
-                fat_cache_invalidate(fs);
-            }
             written += bytes;
             s += sectors;
         }
@@ -1097,9 +1058,6 @@ pub(crate) unsafe fn fat_read_file_range(
                 output.as_mut_ptr().add(written),
                 batch.copy_bytes,
             );
-            if batch.sectors > 1 {
-                fat_cache_invalidate(fs);
-            }
             written += batch.copy_bytes;
             if written < wanted {
                 let Some(next) = batch.next_cluster else {
@@ -1173,7 +1131,7 @@ unsafe fn fat_lookup_metadata(
             && matches!(fs.io_owner, FatIoOwner::Executive)
         {
             let mount = exec_fs_mount_identity()?;
-            let sector = (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE))
+            let sector = (&mut *fs.sector_cache)
                 .read_sector(mount.value(), request.sector, |sector, data| {
                     let ptr = fat_read_sector_checked(fs, sector, callsite)
                         .ok_or(nt_fs::STATUS_DATA_ERROR)?;
@@ -1670,8 +1628,8 @@ unsafe fn read_disk_sector_into(
     out: &mut [u8; nt_fs::DISK_SECTOR_BYTES],
 ) -> Option<()> {
     let status = read_owner_sector(owner, ahci_vaddr, dma_vaddr, dma_paddr, lba);
-    if !nt_ahci::read_completion_ok(status) {
-        report_fat_read_failure(b"[fat-mount]", lba, 1, status);
+    if !status.is_completed() {
+        report_fat_read_failure(b"[fat-mount]", lba, 1, status.diagnostic());
         return None;
     }
     core::ptr::copy_nonoverlapping(
@@ -1687,7 +1645,11 @@ unsafe fn fat32_mount_for_owner(
     dma_vaddr: u64,
     dma_paddr: u64,
     owner: FatIoOwner,
+    sector_cache: *mut nt_fs::FatSectorCache,
 ) -> Option<Fat32> {
+    if sector_cache.is_null() {
+        return None;
+    }
     let mut sector = [0u8; nt_fs::DISK_SECTOR_BYTES];
     read_disk_sector_into(owner, ahci_vaddr, dma_vaddr, dma_paddr, 0, &mut sector)?;
     nt_fs::validate_protective_mbr(&sector).ok()?;
@@ -1739,7 +1701,7 @@ unsafe fn fat32_mount_for_owner(
         ahci_vaddr,
         dma_vaddr,
         dma_paddr,
-        scratch_vaddr: dma_vaddr + FAT32_SCRATCH_OFFSET,
+        sector_cache,
         partition_guid: esp.unique_guid,
         volume_start_lba: esp.first_lba,
         snapshot_start_lba,
@@ -1764,15 +1726,29 @@ unsafe fn fat32_mount_for_owner(
 }
 
 pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> Option<Fat32> {
-    fat32_mount_for_owner(ahci_vaddr, dma_vaddr, dma_paddr, FatIoOwner::Executive)
+    fat32_mount_for_owner(
+        ahci_vaddr,
+        dma_vaddr,
+        dma_paddr,
+        FatIoOwner::Executive,
+        core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE),
+    )
 }
 
+/// `sector_cache` is writable memory of the isolated host that outlives the returned mount.
 pub(crate) unsafe fn fat32_mount_isolated_storage_host(
     ahci_vaddr: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
+    sector_cache: &mut nt_fs::FatSectorCache,
 ) -> Option<Fat32> {
-    fat32_mount_for_owner(ahci_vaddr, dma_vaddr, dma_paddr, FatIoOwner::IsolatedStorageHost)
+    fat32_mount_for_owner(
+        ahci_vaddr,
+        dma_vaddr,
+        dma_paddr,
+        FatIoOwner::IsolatedStorageHost,
+        sector_cache,
+    )
 }
 
 /// The executive's on-demand file-buffer POOL: a fresh VA region whose frames are allocated + mapped

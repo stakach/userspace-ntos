@@ -24,19 +24,15 @@ fn integer(expression: &Expr, expected: u64) -> bool {
             if matches!(value.base10_parse::<u64>(), Ok(actual) if actual == expected)))
 }
 
+/// The one AHCI success contract: anything but a released, error-free, full transfer failed.
 fn failure_mask(expression: &Expr, result: &str) -> bool {
-    let Expr::Binary(comparison) = plain(expression) else {
+    let Expr::Unary(negation) = plain(expression) else {
         return false;
     };
-    if !matches!(comparison.op, syn::BinOp::Ne(_)) || !integer(&comparison.right, 0) {
-        return false;
-    }
-    let Expr::Binary(mask) = plain(&comparison.left) else {
-        return false;
-    };
-    matches!(mask.op, syn::BinOp::BitAnd(_))
-        && path_ends(plain(&mask.left), result)
-        && path_ends(plain(&mask.right), "TASK_FILE_FAILURE")
+    matches!(negation.op, syn::UnOp::Not(_))
+        && matches!(plain(&negation.expr), Expr::MethodCall(outcome)
+            if outcome.method == "is_completed" && outcome.args.is_empty()
+                && path_ends(plain(&outcome.receiver), result))
 }
 
 #[derive(Default)]

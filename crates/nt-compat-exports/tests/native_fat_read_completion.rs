@@ -1,4 +1,4 @@
-//! Native FAT readers must not publish DMA bytes from failed AHCI completions.
+//! Native FAT readers must not publish DMA bytes unless the HBA released a complete transfer.
 
 const FAT: &str = include_str!("../../../components/ntos-executive/src/fs_loader.rs");
 
@@ -14,7 +14,7 @@ fn fat_payload_and_mount_readers_gate_dma_on_task_file_completion() {
         body_after("pub(crate) unsafe fn fat_volume_size(", "pub(crate) unsafe fn fat_next("),
         body_after("unsafe fn read_disk_sector_into(", "unsafe fn fat32_mount_for_owner("),
     ] {
-        assert!(body.contains("nt_ahci::read_completion_ok(status)"), "reader lacks task-file failure gate");
+        assert!(body.contains("if !status.is_completed() {"), "reader lacks the AHCI completion gate");
     }
 }
 
@@ -23,6 +23,6 @@ fn fsinfo_read_reconciles_with_fat_direct_read_census_before_failure() {
     let body = body_after("pub(crate) unsafe fn fat_volume_size(", "pub(crate) unsafe fn fat_next(");
     let account = body.find("disk_census_record(").unwrap();
     let direct = body.find("fat_direct_read_census_record(census_started, 1, nt_ahci::FatOneSectorCallsite::Other)").unwrap();
-    let reject = body.find("!nt_ahci::read_completion_ok(status)").unwrap();
+    let reject = body.find("if !status.is_completed() {").unwrap();
     assert!(account < direct && direct < reject);
 }

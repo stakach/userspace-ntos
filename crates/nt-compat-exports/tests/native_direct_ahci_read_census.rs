@@ -43,7 +43,7 @@ fn executive_fat_and_snapshot_reads_are_attributed_only_after_returned_attempts(
             read.find(recorder).unwrap()
                 > read
                     .find("let status =")
-                    .unwrap_or_else(|| read.find("let tfd =").unwrap())
+                    .unwrap_or_else(|| read.find("let outcome =").unwrap())
         );
     }
     assert!(FAT.contains("FatIoOwner::IsolatedStorageHost =>"));

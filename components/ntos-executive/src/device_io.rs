@@ -30,12 +30,15 @@ pub(crate) unsafe fn storage_probe(
     let ssts = core::ptr::read_volatile((ahci_vaddr + 0x100 + 0x28) as *const u32);
     let det = (ssts >> 8) & 0xF;
     // Read sector 0 via a real READ DMA EXT and validate the protective MBR.
-    let tfd = ahci_read_sector_isolated_storage_host(ahci_vaddr, dma_vaddr, dma_paddr, 0);
-    let mbr = core::slice::from_raw_parts(
-        (dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8,
-        nt_fs::DISK_SECTOR_BYTES,
-    );
-    let protective_mbr = nt_fs::validate_protective_mbr(mbr).is_ok();
+    let read = ahci_read_sector_isolated_storage_host(ahci_vaddr, dma_vaddr, dma_paddr, 0);
+    let tfd = read.diagnostic();
+    // The data window belongs to the HBA unless this read completed.
+    let protective_mbr = read.is_completed()
+        && nt_fs::validate_protective_mbr(core::slice::from_raw_parts(
+            (dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8,
+            nt_fs::DISK_SECTOR_BYTES,
+        ))
+        .is_ok();
     print_str(b"[storage-host] AHCI DET=");
     print_u64(det as u64);
     print_str(b" TFD=0x");
@@ -43,11 +46,15 @@ pub(crate) unsafe fn storage_probe(
     print_str(b" protective-mbr=");
     print_u64(protective_mbr as u64);
     print_str(b"\n");
-    if det != 0 && (tfd & 0x89) == 0 && protective_mbr {
+    if det != 0 && protective_mbr {
         verdict |= 1;
     }
     let (mut hive_size, mut smss_size, mut imports_size) = (0u32, 0u32, 0u32);
-    if let Some(fs) = fat32_mount_isolated_storage_host(ahci_vaddr, dma_vaddr, dma_paddr) {
+    // This host's own writable stack owns its FAT sector cache for the whole probe.
+    let mut fat_sector_cache = nt_fs::FatSectorCache::new();
+    if let Some(fs) =
+        fat32_mount_isolated_storage_host(ahci_vaddr, dma_vaddr, dma_paddr, &mut fat_sector_cache)
+    {
         verdict |= 2;
         // P7-A: source every ReactOS binary BY PATH from the real \reactos\system32 tree (LFN-aware
         // fat_open_path), NOT from the flat root ::NAME files. Each read tries the real path first
