@@ -12879,6 +12879,12 @@ unsafe fn lpc_connect_wait_complete(
             &completion,
         )
     } else {
+        // The connector retired before its terminal result. Close the accepted client
+        // communication port through its owner rather than leaving it for process teardown.
+        if completion.status == nt_syscall::STATUS_SUCCESS && completion.client_handle != 0 {
+            let _ = nt_handler.close_lpc_endpoint_owned(completion.connection_id,
+                nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT, completion.client_handle);
+        }
         nt_status::NtStatus::INVALID_HANDLE.raw() as u32
     };
 

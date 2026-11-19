@@ -36,3 +36,13 @@ fn pending_file_terminal_delivery_validates_the_recorded_caller() {
     let mirror = redrive.rfind("mirror_ctx_for(nt_handler, pending.badge").unwrap();
     assert!(exact < validate && validate < mirror);
 }
+
+#[test]
+fn a_retired_connector_s_accepted_port_is_closed_through_its_owner() {
+    let complete = body("unsafe fn lpc_connect_wait_complete(", "print_str(b\"[lpc-connect-wait] WAKE pi=\");");
+    let retired = complete.split_once("} else {").unwrap().1;
+    let close = retired.find("close_lpc_endpoint_owned(completion.connection_id").unwrap();
+    let refuse = retired.find("NtStatus::INVALID_HANDLE").unwrap();
+    assert!(close < refuse);
+    assert!(retired[..close].contains("completion.status == nt_syscall::STATUS_SUCCESS"));
+}
