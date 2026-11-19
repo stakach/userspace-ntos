@@ -98,6 +98,7 @@ impl ExecNtHandler {
         caller: nt_process::native_handle::NativeHandleCaller,
         desired_access: u32,
         create: bool,
+        creator: Option<Vec<u8>>,
     ) -> Result<ReservedProviderDirectoryObject, u32> {
         let _durable = allocator::enter_durable();
         const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
@@ -127,7 +128,7 @@ impl ExecNtHandler {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
         let security =
-            self.prepare_directory_object_security(&captured, caller, desired_access, create)?;
+            self.prepare_directory_object_security(&captured, caller, desired_access, create, creator)?;
         self.reserve_directory_object_open_from_security(security, caller, attributes)
     }
 
@@ -139,7 +140,8 @@ impl ExecNtHandler {
         create: bool,
     ) -> Result<ReservedDirectoryObjectOpen, u32> {
         let _durable = allocator::enter_durable();
-        let security = self.prepare_directory_object_security(captured, caller, desired_access, create)?;
+        let security =
+            self.prepare_directory_object_security(captured, caller, desired_access, create, None)?;
         self.reserve_directory_object_open_from_security(security, caller, captured.attributes)
     }
 

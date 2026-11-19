@@ -367,6 +367,33 @@ impl Broker {
                     .map_err(upload_status)?;
                 Ok((0, 0, 0, 0))
             }
+            16 => {
+                // SECURITY_BEGIN(token, length): a self-relative creator descriptor follows.
+                let length = usize::try_from(m2).map_err(|_| STATUS_INVALID_PARAMETER)?;
+                if m1 == 0 || m3 != 0 {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                self.uploads
+                    .begin_security(Self::owner(route, dispatch, caller, m1), length)
+                    .map_err(upload_status)?;
+                Ok((0, 0, 0, 0))
+            }
+            17 => {
+                // SECURITY_APPEND(token, offset << 32 | count, up to eight packed bytes).
+                let offset = (m2 >> 32) as usize;
+                let count = m2 as u32 as usize;
+                if m1 == 0 || count == 0 || count > 8 || (count < 8 && m3 >> (count * 8) != 0) {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                self.uploads
+                    .append_security(
+                        Self::owner(route, dispatch, caller, m1),
+                        offset,
+                        &m3.to_le_bytes()[..count],
+                    )
+                    .map_err(upload_status)?;
+                Ok((0, 0, 0, 0))
+            }
             4 => {
                 let token = m1;
                 if m2 != 0 || m3 != 0 {
@@ -384,7 +411,7 @@ impl Broker {
                     .try_reserve(1)
                     .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
                 let owner = Self::owner(route, dispatch, caller, token);
-                let capture = self.uploads.commit(owner).map_err(upload_status)?;
+                let mut capture = self.uploads.commit(owner).map_err(upload_status)?;
                 if token <= 4 {
                     crate::print_str(b"[directory-reserve] token=");
                     crate::print_u64(token);
@@ -404,6 +431,7 @@ impl Broker {
                     caller,
                     capture.desired_access,
                     create,
+                    capture.security_descriptor.take(),
                 );
                 let staged = match staged {
                     Ok(staged) => staged,

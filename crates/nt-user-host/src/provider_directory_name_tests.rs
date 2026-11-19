@@ -234,3 +234,50 @@ fn retirement_removes_only_the_completed_dispatch() {
     uploads.append(other, 0, &[1]).unwrap();
     assert_eq!(uploads.commit(other).unwrap().name, [1]);
 }
+
+#[test]
+fn creator_security_descriptor_travels_with_the_exact_upload() {
+    let mut uploads = DirectoryNameUploads::new();
+    uploads.begin(owner(), metadata(1)).unwrap();
+    uploads.append(owner(), 0, &[b'A' as u16]).unwrap();
+    let wrong = DirectoryUploadOwner { dispatch: 8, ..owner() };
+    assert_eq!(uploads.begin_security(wrong, 20), Err(DirectoryUploadError::WrongOwner));
+    assert_eq!(uploads.begin_security(owner(), 0), Err(DirectoryUploadError::InvalidLength));
+    assert_eq!(
+        uploads.begin_security(owner(), MAX_SECURITY_DESCRIPTOR_BYTES + 1),
+        Err(DirectoryUploadError::InvalidLength)
+    );
+    uploads.begin_security(owner(), 12).unwrap();
+    assert_eq!(uploads.begin_security(owner(), 12), Err(DirectoryUploadError::InvalidPhase));
+    assert_eq!(uploads.append_security(owner(), 4, &[1; 4]), Err(DirectoryUploadError::WrongOffset));
+    assert_eq!(uploads.append_security(owner(), 0, &[]), Err(DirectoryUploadError::InvalidChunk));
+    uploads.append_security(owner(), 0, &[1; 8]).unwrap();
+    assert_eq!(uploads.commit(owner()), Err(DirectoryUploadError::Incomplete));
+    assert_eq!(uploads.append_security(owner(), 8, &[2; 8]), Err(DirectoryUploadError::Overflow));
+    uploads.append_security(owner(), 8, &[2; 4]).unwrap();
+    let capture = uploads.commit(owner()).unwrap();
+    assert_eq!(capture.name, [b'A' as u16]);
+    assert_eq!(capture.security_descriptor.unwrap(), [1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2]);
+    assert_eq!(
+        uploads.append_security(owner(), 12, &[3]),
+        Err(DirectoryUploadError::InvalidPhase)
+    );
+}
+
+#[test]
+fn uploads_without_a_creator_descriptor_commit_none_and_aborts_drop_it() {
+    let mut uploads = DirectoryNameUploads::new();
+    uploads.begin(owner(), metadata(1)).unwrap();
+    uploads.append(owner(), 0, &[b'A' as u16]).unwrap();
+    assert_eq!(uploads.commit(owner()).unwrap().security_descriptor, None);
+    uploads.retire_definite(owner()).unwrap();
+    let next = DirectoryUploadOwner { dispatch: 9, ..owner() };
+    uploads.begin(next, metadata(1)).unwrap();
+    uploads.begin_security(next, 4).unwrap();
+    uploads.append_security(next, 0, &[1; 4]).unwrap();
+    uploads.abort(next).unwrap();
+    let last = DirectoryUploadOwner { dispatch: 10, ..owner() };
+    uploads.begin(last, metadata(1)).unwrap();
+    uploads.append(last, 0, &[b'B' as u16]).unwrap();
+    assert_eq!(uploads.commit(last).unwrap().security_descriptor, None);
+}

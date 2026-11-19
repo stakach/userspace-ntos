@@ -641,6 +641,62 @@ impl ExecNtHandler {
         self.sweep_data_section_security();
     }
 
+    /// The owned descriptor record for a Section handle, after ObReferenceObjectByHandle-style
+    /// granted-access validation. Only DATA Sections created through the admitted path own a
+    /// descriptor record; other Section bodies have no descriptor to query or replace.
+    fn data_section_security_record(
+        &self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<usize, u32> {
+        let section = self.pm.lookup_native_section_handle(caller, handle)?;
+        if section.granted_access() & required_access != required_access {
+            return Err(nt_security::STATUS_ACCESS_DENIED);
+        }
+        let ctx = self.loop_ctx.ok_or(0xC000_00A3u32)?;
+        let identity = unsafe { &*ctx.generic_sections }
+            .section_identity(section.section() as usize)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        self.data_section_security
+            .iter()
+            .position(|record| record.identity == identity)
+            .ok_or(0xC000_00BB) // STATUS_NOT_SUPPORTED
+    }
+
+    pub(crate) fn query_data_section_security(
+        &self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        handle: u64,
+        required_access: u32,
+        security_information: u32,
+    ) -> Result<Vec<u8>, u32> {
+        let index = self.data_section_security_record(caller, handle, required_access)?;
+        nt_security::query_security_descriptor_bytes(
+            &self.data_section_security[index].descriptor,
+            security_information,
+        )
+    }
+
+    pub(crate) fn set_data_section_security(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        handle: u64,
+        required_access: u32,
+        security_information: u32,
+        modification: &[u8],
+    ) -> Result<(), u32> {
+        let _durable = allocator::enter_durable();
+        let index = self.data_section_security_record(caller, handle, required_access)?;
+        let record = &mut self.data_section_security[index];
+        record.descriptor = nt_security::set_security_descriptor_bytes(
+            &record.descriptor,
+            security_information,
+            modification,
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn sweep_data_section_security(&mut self) {
         let Some(ctx) = self.loop_ctx else {
             return;

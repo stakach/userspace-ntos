@@ -18,6 +18,8 @@ const QUERY_SINGLE_RESTART: u64 = 12;
 const QUERY_READ: u64 = 13;
 const QUERY_ACK: u64 = 14;
 const MAKE_TEMPORARY: u64 = 15;
+const SECURITY_BEGIN: u64 = 16;
+const SECURITY_APPEND: u64 = 17;
 const MAX_NAME_UNITS: usize = 1024;
 const MAX_COMPONENT_UNITS: usize = 128;
 const STATUS_OBJECT_NAME_INVALID: i32 = 0xC000_0033u32 as i32;
@@ -31,13 +33,32 @@ struct DirectoryName {
     attributes: u32,
     units: usize,
     text: [u16; MAX_NAME_UNITS],
+    /// The creator descriptor in self-relative form, as SeCaptureSecurityDescriptor yields it.
+    security_descriptor: Option<Vec<u8>>,
+}
+
+/// The provider's own address space: a kernel-mode caller's descriptor is read in place,
+/// exactly as ObpCaptureObjectCreateInformation does for KernelMode (no probe).
+struct LocalMemory;
+
+impl nt_security::ClientMemory for LocalMemory {
+    fn read(&self, address: u64, bytes: &mut [u8]) -> bool {
+        if address == 0 {
+            return false;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(address as *const u8, bytes.as_mut_ptr(), bytes.len());
+        }
+        true
+    }
 }
 
 unsafe fn capture_name(object_attributes: u64) -> Result<DirectoryName, i32> {
     if object_attributes == 0 {
         return Err(STATUS_INVALID_PARAMETER_I32);
     }
-    if read_unaligned(object_attributes as *const u32) < 0x30 {
+    // ObpCaptureObjectCreateInformation: Length must be exactly sizeof(OBJECT_ATTRIBUTES).
+    if read_unaligned(object_attributes as *const u32) != 0x30 {
         return Err(STATUS_INVALID_PARAMETER_I32);
     }
     let root = read_unaligned((object_attributes + 8) as *const u64);
@@ -45,9 +66,17 @@ unsafe fn capture_name(object_attributes: u64) -> Result<DirectoryName, i32> {
     let attributes = read_unaligned((object_attributes + 24) as *const u32);
     let security_descriptor = read_unaligned((object_attributes + 32) as *const u64);
     let security_qos = read_unaligned((object_attributes + 40) as *const u64);
-    if security_descriptor != 0 || security_qos != 0 {
-        return Err(STATUS_NOT_SUPPORTED_I32);
-    }
+    let security_descriptor = if security_descriptor != 0 {
+        Some(
+            nt_security::capture_security_descriptor_bytes(&LocalMemory, security_descriptor)
+                .map_err(|status| status as i32)?,
+        )
+    } else {
+        None
+    };
+    // ObpCaptureObjectCreateInformation copies a kernel caller's QoS unvalidated, and no
+    // Directory create/open consults it, so it is accepted and has no consumer here.
+    let _ = security_qos;
     if name_ptr == 0 {
         return Err(STATUS_OBJECT_NAME_INVALID);
     }
@@ -92,6 +121,7 @@ unsafe fn capture_name(object_attributes: u64) -> Result<DirectoryName, i32> {
         attributes,
         units,
         text,
+        security_descriptor,
     })
 }
 
@@ -159,6 +189,26 @@ unsafe fn open_impl(
         if status != 0 {
             abort_with_label(label, token, 0);
             return status;
+        }
+    }
+
+    if let Some(descriptor) = name.security_descriptor.as_ref() {
+        let (status, _) =
+            call_with_label(label, SECURITY_BEGIN, token, descriptor.len() as u64, 0, false);
+        if status != 0 {
+            abort_with_label(label, token, 0);
+            return status;
+        }
+        for (index, chunk) in descriptor.chunks(8).enumerate() {
+            let mut packed = [0u8; 8];
+            packed[..chunk.len()].copy_from_slice(chunk);
+            let position = (((index * 8) as u64) << 32) | chunk.len() as u64;
+            let (status, _) = call_with_label(
+                label, SECURITY_APPEND, token, position, u64::from_le_bytes(packed), false);
+            if status != 0 {
+                abort_with_label(label, token, 0);
+                return status;
+            }
         }
     }
 

@@ -38027,6 +38027,28 @@ impl ExecNtHandler {
                     }
                     return 0;
                 }
+                if self.pm.lookup_native_section_handle(caller, args[0]).is_ok() {
+                    let descriptor = match self.query_data_section_security(
+                        caller, args[0], required_access, security_information,
+                    ) {
+                        Ok(descriptor) => descriptor,
+                        Err(status) => return status,
+                    };
+                    if args[4] == 0
+                        || !self.xas_write_u32(args[4], descriptor.len().min(u32::MAX as usize) as u32)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if args[2] == 0 || buffer_length < descriptor.len() {
+                        return STATUS_BUFFER_TOO_SMALL;
+                    }
+                    if !self.probe_user_output(args[2], descriptor.len())
+                        || !self.xas_try_write_buf(args[2], &descriptor)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    return 0;
+                }
                 if let Some(driver_status) = self.file_security_driver_status(
                     args[0],
                     required_access,
@@ -38305,6 +38327,21 @@ impl ExecNtHandler {
                     print_hex(status);
                     print_str(b"\n");
                     return status;
+                }
+                if self.pm.lookup_native_section_handle(caller, args[0]).is_ok() {
+                    let memory = ExecClientMemory { handler: self };
+                    let modification = match nt_security::capture_security_descriptor_bytes(
+                        &memory, args[2],
+                    ) {
+                        Ok(descriptor) => descriptor,
+                        Err(status) => return status,
+                    };
+                    return match self.set_data_section_security(
+                        caller, args[0], required_access, security_information, &modification,
+                    ) {
+                        Ok(()) => 0,
+                        Err(status) => status,
+                    };
                 }
                 if let Some(driver_status) = self.file_security_driver_status(
                     args[0],

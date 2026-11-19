@@ -5,6 +5,9 @@ use alloc::vec::Vec;
 /// A UNICODE_STRING length is a 16-bit byte count.
 pub const MAX_NAME_UNITS: usize = (u16::MAX as usize) / 2;
 pub const MAX_CHUNK_UNITS: usize = 64;
+/// Upper bound for a provider-supplied self-relative creator security descriptor.
+pub const MAX_SECURITY_DESCRIPTOR_BYTES: usize = 4096;
+pub const MAX_SECURITY_CHUNK_BYTES: usize = 64;
 
 /// Identity supplied only after the adapter authenticates the physical route and caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +32,9 @@ pub struct DirectoryNameCapture {
     pub attributes: u32,
     pub desired_access: u32,
     pub name: Vec<u16>,
+    /// The creator's self-relative SECURITY_DESCRIPTOR bytes, structurally unvalidated:
+    /// the Object Manager owner validates them exactly as a captured client descriptor.
+    pub security_descriptor: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +63,8 @@ struct Entry<R, D, C> {
     owner: DirectoryUploadOwner<R, D, C>,
     metadata: DirectoryNameMetadata,
     name: Vec<u16>,
+    /// Declared length and bytes received so far.
+    security: Option<(usize, Vec<u8>)>,
     phase: DirectoryUploadPhase,
 }
 
@@ -98,6 +106,7 @@ impl<R: Copy + Eq, D: Copy + Eq, C: Copy + Eq> DirectoryNameUploads<R, D, C> {
             entry.owner = owner;
             entry.metadata = metadata;
             entry.name.clear();
+            entry.security = None;
             entry.phase = DirectoryUploadPhase::Uploading;
             return Ok(());
         }
@@ -108,6 +117,7 @@ impl<R: Copy + Eq, D: Copy + Eq, C: Copy + Eq> DirectoryNameUploads<R, D, C> {
             owner,
             metadata,
             name: Vec::new(),
+            security: None,
             phase: DirectoryUploadPhase::Uploading,
         });
         Ok(())
@@ -143,6 +153,51 @@ impl<R: Copy + Eq, D: Copy + Eq, C: Copy + Eq> DirectoryNameUploads<R, D, C> {
         Ok(())
     }
 
+    /// Declare a creator security descriptor of `length` bytes for this upload.
+    pub fn begin_security(
+        &mut self,
+        owner: DirectoryUploadOwner<R, D, C>,
+        length: usize,
+    ) -> Result<(), DirectoryUploadError> {
+        let entry = self.entry_mut(owner)?;
+        if entry.phase != DirectoryUploadPhase::Uploading || entry.security.is_some() {
+            return Err(DirectoryUploadError::InvalidPhase);
+        }
+        if length == 0 || length > MAX_SECURITY_DESCRIPTOR_BYTES {
+            return Err(DirectoryUploadError::InvalidLength);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| DirectoryUploadError::NoMemory)?;
+        entry.security = Some((length, bytes));
+        Ok(())
+    }
+
+    pub fn append_security(
+        &mut self,
+        owner: DirectoryUploadOwner<R, D, C>,
+        offset: usize,
+        chunk: &[u8],
+    ) -> Result<(), DirectoryUploadError> {
+        let entry = self.entry_mut(owner)?;
+        if entry.phase != DirectoryUploadPhase::Uploading {
+            return Err(DirectoryUploadError::InvalidPhase);
+        }
+        let (length, bytes) = entry.security.as_mut().ok_or(DirectoryUploadError::InvalidPhase)?;
+        if chunk.is_empty() || chunk.len() > MAX_SECURITY_CHUNK_BYTES {
+            return Err(DirectoryUploadError::InvalidChunk);
+        }
+        if offset != bytes.len() {
+            return Err(DirectoryUploadError::WrongOffset);
+        }
+        if offset.checked_add(chunk.len()).is_none_or(|end| end > *length) {
+            return Err(DirectoryUploadError::Overflow);
+        }
+        bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
     pub fn commit(
         &mut self,
         owner: DirectoryUploadOwner<R, D, C>,
@@ -151,7 +206,9 @@ impl<R: Copy + Eq, D: Copy + Eq, C: Copy + Eq> DirectoryNameUploads<R, D, C> {
         if entry.phase != DirectoryUploadPhase::Uploading {
             return Err(DirectoryUploadError::InvalidPhase);
         }
-        if entry.name.len() != entry.metadata.total_units {
+        if entry.name.len() != entry.metadata.total_units
+            || entry.security.as_ref().is_some_and(|(length, bytes)| bytes.len() != *length)
+        {
             return Err(DirectoryUploadError::Incomplete);
         }
         entry.phase = DirectoryUploadPhase::Committed;
@@ -160,6 +217,7 @@ impl<R: Copy + Eq, D: Copy + Eq, C: Copy + Eq> DirectoryNameUploads<R, D, C> {
             attributes: entry.metadata.attributes,
             desired_access: entry.metadata.desired_access,
             name: core::mem::take(&mut entry.name),
+            security_descriptor: entry.security.take().map(|(_, bytes)| bytes),
         })
     }
 
@@ -186,6 +244,7 @@ impl<R: Copy + Eq, D: Copy + Eq, C: Copy + Eq> DirectoryNameUploads<R, D, C> {
             return Err(DirectoryUploadError::InvalidPhase);
         }
         entry.name.clear();
+        entry.security = None;
         entry.phase = DirectoryUploadPhase::Aborted;
         Ok(())
     }

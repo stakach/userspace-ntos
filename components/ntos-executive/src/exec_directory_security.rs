@@ -229,12 +229,15 @@ impl ExecNtHandler {
         Ok(())
     }
 
+    /// `provider_creator` is a self-relative creator descriptor a provider uploaded; it is
+    /// validated here exactly like a descriptor captured from client memory.
     pub(super) fn prepare_directory_object_security(
         &mut self,
         captured: &CapturedNamedObjectAttributes,
         caller: nt_process::native_handle::NativeHandleCaller,
         desired_access: u32,
         create: bool,
+        provider_creator: Option<Vec<u8>>,
     ) -> Result<DirectorySecurityAdmission, u32> {
         let _durable = allocator::enter_durable();
         let attributes = nt_object_manager::directory::admit_directory_object_attributes(
@@ -250,7 +253,10 @@ impl ExecNtHandler {
             caller,
         )?;
         let result = (|| {
-            let creator = if captured.security_descriptor != 0 {
+            let creator = if let Some(bytes) = provider_creator {
+                nt_security::validate_security_descriptor_bytes(&bytes)?;
+                Some(bytes)
+            } else if captured.security_descriptor != 0 {
                 Some(self.capture_named_creator_security_descriptor(captured.security_descriptor)?)
             } else {
                 None
