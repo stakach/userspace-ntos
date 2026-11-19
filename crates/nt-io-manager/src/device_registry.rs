@@ -103,6 +103,52 @@ impl DeviceRegistryKeyType {
     }
 }
 
+/// The ReactOS `IoOpenDeviceRegistryKey` contract (ntoskrnl/io/pnpmgr/pnpmgr.c): open an
+/// existing base key, `[Hardware Profiles\Current\System\CurrentControlSet\]` then
+/// `Control\Class\<DriverKey>` or `Enum\<InstancePath>`, with the caller's access; a
+/// Device key then creates/opens `Device Parameters` beneath that base with the same access.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReactOsDeviceRegistryKey {
+    pub base_path: Vec<u16>,
+    pub device_parameters: bool,
+}
+
+/// The relative name ReactOS creates beneath a Device base key.
+pub const DEVICE_PARAMETERS: &str = "Device Parameters";
+
+impl DeviceRegistryKeyType {
+    pub fn reactos_key(
+        self,
+        instance_path: &[u16],
+        driver_key: Option<&[u16]>,
+    ) -> Result<ReactOsDeviceRegistryKey, u32> {
+        let profile = matches!(self, Self::ProfileDevice | Self::ProfileDriver);
+        let (prefix, name, device_parameters) = match self {
+            Self::Device | Self::ProfileDevice => {
+                validate_relative_name(instance_path)?;
+                ("Enum\\", instance_path, true)
+            }
+            Self::Driver | Self::ProfileDriver => {
+                let name = driver_key.ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+                validate_relative_name(name)?;
+                ("Control\\Class\\", name, false)
+            }
+        };
+        let base = if profile { CURRENT_PROFILE } else { CURRENT_CONTROL_SET };
+        let length = base.encode_utf16().count() + 1 + prefix.encode_utf16().count() + name.len();
+        if length > MAX_NAME_UNITS {
+            return Err(STATUS_NAME_TOO_LONG);
+        }
+        let mut base_path = Vec::new();
+        base_path.try_reserve_exact(length).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        base_path.extend(base.encode_utf16());
+        base_path.push(b'\\' as u16);
+        base_path.extend(prefix.encode_utf16());
+        base_path.extend_from_slice(name);
+        Ok(ReactOsDeviceRegistryKey { base_path, device_parameters })
+    }
+}
+
 /// CM's DevicePropertyDriverKeyName is a REG_SZ payload, including one UTF-16 NUL terminator.
 /// Keep its counted code units intact; registry path authority is checked separately.
 pub fn decode_driver_key_property(bytes: &[u8]) -> Result<Vec<u16>, u32> {
@@ -228,6 +274,53 @@ fn join(prefix: &str, name: &[u16], suffix: &str) -> Result<Vec<u16>, u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().collect()
+    }
+
+    fn reactos(kind: DeviceRegistryKeyType) -> Result<ReactOsDeviceRegistryKey, u32> {
+        kind.reactos_key(&wide(r"PCI\VEN_1234&DEV_1111\3&0"),
+            Some(&wide(r"{4d36e968-e325-11ce-bfc1-08002be10318}\0000")))
+    }
+
+    #[test]
+    fn reactos_device_key_opens_the_enum_instance_then_device_parameters() {
+        let key = reactos(DeviceRegistryKeyType::Device).unwrap();
+        assert_eq!(String::from_utf16(&key.base_path).unwrap(),
+            r"\Registry\Machine\System\CurrentControlSet\Enum\PCI\VEN_1234&DEV_1111\3&0");
+        assert!(key.device_parameters);
+        assert_eq!(DEVICE_PARAMETERS, "Device Parameters");
+    }
+
+    #[test]
+    fn reactos_driver_key_opens_the_class_key_only() {
+        let key = reactos(DeviceRegistryKeyType::Driver).unwrap();
+        assert_eq!(String::from_utf16(&key.base_path).unwrap(),
+            r"\Registry\Machine\System\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000");
+        assert!(!key.device_parameters);
+    }
+
+    #[test]
+    fn reactos_hardware_profile_variants_prefix_the_current_profile() {
+        let device = reactos(DeviceRegistryKeyType::ProfileDevice).unwrap();
+        assert_eq!(String::from_utf16(&device.base_path).unwrap(),
+            r"\Registry\Machine\System\CurrentControlSet\Hardware Profiles\Current\System\CurrentControlSet\Enum\PCI\VEN_1234&DEV_1111\3&0");
+        assert!(device.device_parameters);
+        let driver = reactos(DeviceRegistryKeyType::ProfileDriver).unwrap();
+        assert_eq!(String::from_utf16(&driver.base_path).unwrap(),
+            r"\Registry\Machine\System\CurrentControlSet\Hardware Profiles\Current\System\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000");
+        assert!(!driver.device_parameters);
+    }
+
+    #[test]
+    fn reactos_keys_require_their_device_property() {
+        assert_eq!(DeviceRegistryKeyType::Driver.reactos_key(&wide("X"), None),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND));
+        assert_eq!(DeviceRegistryKeyType::Device.reactos_key(&[], None),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND));
+        assert_eq!(DeviceRegistryKeyType::ProfileDevice.reactos_key(&wide("a\0b"), None).is_err(), true);
+    }
     use alloc::{format, string::String, vec};
 
     #[test]
