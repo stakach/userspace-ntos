@@ -145,6 +145,20 @@ unsafe fn table(handler: &ExecNtHandler) -> Option<&'static mut GenericSectionTa
     handler.loop_ctx.map(|ctx| &mut *ctx.generic_sections)
 }
 
+/// A cache flush of the stream also writes what a provider (win32k) system view stored: such a
+/// view raises no write fault, and NT moves its dirty pages to the modified list when the system
+/// working set is trimmed (MiFlushDirtyBitsToPfn), which this service has no other point for. A
+/// process's NtFlushVirtualMemory collects only that process's own mappings.
+fn harvest_stream(table: &mut GenericSectionTable, device_id: u64, fs_context: u64) {
+    for (section, lease) in table.retained_routed_sections() {
+        let matches = unsafe { crate::hosted_routed_section_capture::route(lease, section) }
+            .is_some_and(|route| route.device_id == device_id && route.fs_context == fs_context);
+        if matches {
+            table.harvest_provider_view_writes(section);
+        }
+    }
+}
+
 /// Whether any page in scope still owes this flush a write.
 fn scope_tickets(
     table: &GenericSectionTable,
@@ -268,6 +282,7 @@ pub(crate) unsafe fn submit_cache_flush(
     };
     let scope = Scope::Stream { device_id, fs_context };
     let table = table(handler).ok_or(INVALID)?;
+    harvest_stream(table, device_id, fs_context);
     if scope_tickets(table, scope).map_or(true, |tickets| tickets.is_empty()) {
         return Ok(false);
     }

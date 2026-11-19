@@ -367,3 +367,50 @@ fn the_page_writer_runs_until_no_routed_page_owes_a_write() {
     assert_eq!(table.routed_lease_exact(identity), None);
     assert!(table.retained_routed_sections().is_empty());
 }
+
+const WIN32K: ProviderVspaceIdentity = ProviderVspaceIdentity { domain: 5, generation: 1 };
+
+/// A routed section that only a provider (win32k) view maps, with clean resident pages.
+fn provider_mapped(protection: u32) -> (GenericSectionTable, usize, SectionIdentity, ProviderSectionView) {
+    let mut table = GenericSectionTable::new();
+    let backing =
+        GenericSectionBacking::routed(RoutedSectionLease::new(11).unwrap(), file_identity(9), 0x1800);
+    let section = table
+        .create(2, 0x40, 0x1800, protection, SECTION_ATTR_SEC_COMMIT, backing)
+        .unwrap();
+    let identity = table.section_identity(section).unwrap();
+    let view = table.map_provider_view(WIN32K, identity, 0x7000_0000, 0x2000, 0).unwrap();
+    assert!(table.set_page_frame(section, 0, 100));
+    assert!(table.set_page_frame(section, 1, 101));
+    (table, section, identity, view)
+}
+
+#[test]
+fn a_writable_provider_view_dirties_its_pages_when_it_is_unmapped() {
+    // A system-space view has no write fault to observe; NT harvests its PTE dirty bits into
+    // the PFNs when the view is removed (MiRemoveMappedView, NT5 mapview.c).
+    let (mut table, _, identity, view) = provider_mapped(crate::PAGE_READWRITE);
+    assert_eq!(table.next_unmapped_page_write(), None, "a mapped page is not the writer's yet");
+    assert_eq!(table.unmap_provider_view_exact(view), Some(view));
+    let first = table.next_unmapped_page_write().expect("the provider's stores are written back");
+    assert_eq!((first.via, first.ticket.page_index, first.ticket.frame), (identity, 0, 100));
+    assert!(table.has_async_dirty_pages());
+}
+
+#[test]
+fn a_read_only_provider_view_dirties_nothing() {
+    let (mut table, _, _, view) = provider_mapped(crate::PAGE_READONLY);
+    assert_eq!(table.unmap_provider_view_exact(view), Some(view));
+    assert_eq!(table.next_unmapped_page_write(), None);
+    assert!(!table.has_async_dirty_pages());
+}
+
+#[test]
+fn a_flush_harvests_a_still_mapped_provider_view() {
+    // MiFlushDirtyBitsToPfn (NT5 flushsec.c) moves a still-mapped view's dirty bits to the PFN.
+    let (mut table, _, identity, _) = provider_mapped(crate::PAGE_READWRITE);
+    assert!(table.prepare_section_writeback(identity).unwrap().is_empty());
+    assert_eq!(table.harvest_provider_view_writes(identity), 2);
+    let tickets = table.prepare_section_writeback(identity).unwrap();
+    assert_eq!(tickets.iter().map(|ticket| ticket.page_index).collect::<Vec<_>>(), vec![0, 1]);
+}

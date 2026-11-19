@@ -306,6 +306,45 @@ impl GenericSectionTable {
             .and_then(|(_, backing)| backing.routed_lease)
     }
 
+    /// Mark every resident page a writable provider view of this file data maps as modified, and
+    /// return how many: MiFlushDirtyBitsToPfn (NT5 flushsec.c) for views that are still mapped.
+    /// A provider view's stores raise no write fault, so each page it can write is treated as
+    /// written.
+    pub fn harvest_provider_view_writes(&mut self, section: SectionIdentity) -> usize {
+        let Some((area, _)) = self.writer_source(section) else {
+            return 0;
+        };
+        let mut harvested = 0;
+        for index in 0..self.provider_views.len() {
+            let view = self.provider_views[index];
+            if self.sections.get(view.section.index).is_some_and(|section| section.control_area == area) {
+                harvested += self.harvest_provider_view(view);
+            }
+        }
+        harvested
+    }
+
+    /// Mark the resident pages of one writable provider view of a routed section modified: on a
+    /// flush, and when the view is removed (MiRemoveMappedView, NT5 mapview.c).
+    pub(super) fn harvest_provider_view(&mut self, view: ProviderSectionView) -> usize {
+        let Some(section) = self.section(view.section.index) else {
+            return 0;
+        };
+        if section.backing.kind != GENERIC_SECTION_BACKING_ROUTED
+            || !matches!(section.protection & 0xff, crate::PAGE_READWRITE | 0x40)
+        {
+            return 0;
+        }
+        let first = view.section_offset / 0x1000;
+        let pages = view.size / 0x1000;
+        (first..first.saturating_add(pages))
+            .filter(|&page_index| {
+                self.page_frame(view.section.index, page_index).is_some()
+                    && self.mark_page_dirty(view.section.index, page_index)
+            })
+            .count()
+    }
+
     /// The current dirty-version counter. A flush writes the versions dirtied before it began.
     pub fn dirty_epoch(&self) -> u64 {
         self.dirty_epoch

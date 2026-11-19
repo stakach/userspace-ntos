@@ -805,6 +805,8 @@ impl GenericSectionTable {
             *candidate == view
                 && self.section_identity(candidate.section.index) == Some(candidate.section)
         })?;
+        // The provider's stores are harvested before its view's record goes (MiRemoveMappedView).
+        self.harvest_provider_view(self.provider_views[index]);
         let view = self.provider_views.remove(index);
         self.clear_section_if_unreferenced(view.section.index);
         Some(view)

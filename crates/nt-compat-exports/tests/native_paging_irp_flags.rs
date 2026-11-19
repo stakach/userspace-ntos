@@ -60,3 +60,13 @@ fn driver_built_transfers_forward_their_own_irp_flags() {
     assert!(WRITE_FORWARD.contains("request_flags: write.request_flags(),"));
     assert!(DEVICE_FORWARD.contains("read.request_flags,"));
 }
+
+const PROVIDER_SECTIONS: &str = include_str!("../../../components/ntos-executive/src/provider_mm_section_objects.rs");
+
+#[test]
+fn provider_view_stores_reach_the_page_writer() {
+    // The harvest itself is proven in nt-memory-manager (unmap_provider_view_exact,
+    // harvest_provider_view_writes); these bind its native triggers.
+    assert!(PROVIDER_SECTIONS.contains("unmap_provider_view_exact((*mapping).view) != Some((*mapping).view) {\n        return Err(INVALID);\n    }\n    // Removing a writable routed view marks the pages it could write modified.\n    crate::service_sec_image::section_writeback_work::request_scan();"));
+    assert!(WRITEBACK.contains("    harvest_stream(table, device_id, fs_context);\n    if scope_tickets(table, scope)"));
+}

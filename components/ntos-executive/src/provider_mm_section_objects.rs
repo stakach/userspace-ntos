@@ -787,6 +787,8 @@ unsafe fn retire_mapping(sections: *mut GenericSectionTable, mapping: *mut Mappi
     if (&mut *sections).unmap_provider_view_exact((*mapping).view) != Some((*mapping).view) {
         return Err(INVALID);
     }
+    // Removing a writable routed view marks the pages it could write modified.
+    crate::service_sec_image::section_writeback_work::request_scan();
     Ok(())
 }
 
