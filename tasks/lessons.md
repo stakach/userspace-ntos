@@ -927,3 +927,6 @@ diagnosis-free failure.
 - `git add -A components crates` swept a known, failing, untracked test into a pushed commit.
   When the tree holds untracked files that must stay out, stage the changed paths by name
   (`git add -u` plus explicit new files) and read `git status --short` before committing.
+
+## Delete Invalidated Source-Text Checks, Never Repoint Them
+- When a change invalidates a source-text check, delete that check (or the whole test if nothing else is left in it). Do not repoint it at the new text. A repointed check pins the new implementation's spelling and proves nothing about the behaviour. The behaviour belongs in a policy test, such as a crate test of the rule itself.
