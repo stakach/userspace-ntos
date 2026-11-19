@@ -25805,7 +25805,9 @@ impl ExecNtHandler {
         if self.canonical_directories.owner_for_local(identity).is_none() {
             return Err(0xC000_00BB); // no exact canonical backing
         }
-        let reference = self.pm.reference_native_requestor(caller)?;
+        // The original syscall requestor, user or kernel. NtClose needs no granted access; only
+        // the handle-table close itself refuses a protect-from-close handle.
+        let reference = self.pm.reference_native_syscall_requestor(caller)?;
         self.pending_native_directory_effect_transfer = Some(
             crate::native_directory_effect_work::PendingNativeDirectoryEffect::new(
                 kind, reservation, reference, self.current_tid, self.current_badge, identity));
