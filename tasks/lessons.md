@@ -922,3 +922,8 @@ diagnosis-free failure.
 - LiberNT's comctl32 6.0 is Wine's: its `DllMain` registers no classes, and `RegisterClassNameW`
   registers one class by unversioned name when user32 asks. Read the released binary's strings
   and exports before assuming the ReactOS source of the same DLL describes it.
+
+## Stage Named Paths, Never `git add -A` Over Known Untracked Files
+- `git add -A components crates` swept a known, failing, untracked test into a pushed commit.
+  When the tree holds untracked files that must stay out, stage the changed paths by name
+  (`git add -u` plus explicit new files) and read `git status --short` before committing.
