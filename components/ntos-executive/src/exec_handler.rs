@@ -33526,16 +33526,30 @@ impl ExecNtHandler {
                         Ok(caller) => caller,
                         Err(status) => return status,
                     };
+                    let mut directory_identity = None;
                     if let Ok(target) = self.pm.inspect_native_close_target(caller, args[0]) {
                         if let nt_process::HandleObject::ObjectDirectory(identity) = target.object() {
+                            directory_identity = Some(identity);
                             if self.canonical_directories.owner_for_local(identity).is_some() {
                                 return self.reserve_native_directory_effect(ctx, args[0],
                                     crate::native_directory_effect_work::EffectKind::Close)
-                                    .map_or_else(|status| status, |()| 0x103);
+                                    .map_or_else(|status| {
+                                        crate::native_directory_effect_work::note_close_failure(
+                                            b"reserve", self.current_tid, identity, status);
+                                        status
+                                    }, |()| 0x103);
                             }
                         }
                     }
-                    match self.close_native_table_handle(caller, args[0]) {
+                    let result = self.close_native_table_handle(caller, args[0]);
+                    if let Some(identity) = directory_identity {
+                        if !matches!(result, Ok(true)) {
+                            crate::native_directory_effect_work::note_close_failure(
+                                b"table", self.current_tid, identity,
+                                result.err().unwrap_or(nt_process::STATUS_INVALID_HANDLE));
+                        }
+                    }
+                    match result {
                         Ok(closed) => closed,
                         Err(status) => return status,
                     }

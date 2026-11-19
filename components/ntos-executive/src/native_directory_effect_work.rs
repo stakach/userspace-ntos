@@ -72,6 +72,24 @@ impl PendingNativeDirectoryEffect {
     }
 }
 
+static CLOSE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// A refused directory NtClose is otherwise silent (#413: smss asserts on its \\KnownDlls close).
+pub(crate) fn note_close_failure(stage: &[u8], tid: u64, identity: u64, status: u32) {
+    if CLOSE_FAILURES.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    print_str(b"[native-directory-close-failed] stage=");
+    print_str(stage);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" identity=0x");
+    print_hex_u64(identity);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+}
+
 pub(crate) fn wake_now() {
     HAS_DETACHED.store(true, Ordering::Release);
     DETACHED_RETRY.store(monotonic_time_100ns(), Ordering::Release);
@@ -379,6 +397,9 @@ unsafe fn step_effect(handler: &mut ExecNtHandler, work: &mut PendingNativeDirec
             true
         }
         EffectPhase::Reply(status) => {
+            if status != 0 && work.kind == EffectKind::Close {
+                note_close_failure(b"effect", work.tid, work.identity, status);
+            }
             let delivered = work.reply == 0
                 || (!work.reply_indeterminate && reply_parked_syscall(work.reply, status as u64))
                 || (spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(work.reply)

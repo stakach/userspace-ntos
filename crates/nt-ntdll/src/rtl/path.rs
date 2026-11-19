@@ -296,17 +296,13 @@ pub fn determine_dos_path_name_type(path: &[u16]) -> DosPathType {
         }
         return DosPathType::Rooted;
     }
-    // Drive-letter forms: `X:`
+    // Drive forms `x:`. Any character designates a drive, as in ReactOS and Wine; smss relies
+    // on `?:` for a page file whose volume it chooses later.
     if n >= 2 && path[1] == b':' as u16 {
-        let d = path[0];
-        let is_letter =
-            (b'A' as u16..=b'Z' as u16).contains(&d) || (b'a' as u16..=b'z' as u16).contains(&d);
-        if is_letter {
-            if n >= 3 && is_sep(path[2]) {
-                return DosPathType::DriveAbsolute;
-            }
-            return DosPathType::DriveRelative;
+        if n >= 3 && is_sep(path[2]) {
+            return DosPathType::DriveAbsolute;
         }
+        return DosPathType::DriveRelative;
     }
     DosPathType::Relative
 }
@@ -732,6 +728,28 @@ mod tests {
         path.extend_from_slice(&element[usize::from(plan.skip_element_leading)..]);
         path.extend(plan.after);
         s(&path)
+    }
+
+    /// smss names its page file `?:\pagefile.sys` and resolves `?` to a volume after converting
+    /// the path (ReactOS `smss/pagefile.c`). RtlDetermineDosPathNameType_U only requires a
+    /// character before the colon (ReactOS `sdk/lib/rtl/path.c`, Wine `ntdll/path.c`).
+    #[test]
+    fn any_character_before_a_colon_is_a_drive_designator() {
+        for (path, expected) in [
+            ("?:\\pagefile.sys", DosPathType::DriveAbsolute),
+            ("1:\\x", DosPathType::DriveAbsolute),
+            ("?:x", DosPathType::DriveRelative),
+            ("?", DosPathType::Relative),
+        ] {
+            assert_eq!(determine_dos_path_name_type(&u(path)), expected, "{path}");
+        }
+        assert_eq!(
+            dos_path_name_to_nt_path_name(&u("?:\\pagefile.sys")).map(|v| s(&v)),
+            Some(std::string::String::from("\\??\\?:\\pagefile.sys"))
+        );
+        let plan = try_relative_nt_path_plan(&u("?:\\pagefile.sys"), &u("C:\\Windows"), true)
+            .expect("smss page-file name converts");
+        assert_eq!(s(&plan.nt_path), "\\??\\?:\\pagefile.sys");
     }
 
     #[test]
