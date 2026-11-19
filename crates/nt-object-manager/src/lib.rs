@@ -29,6 +29,7 @@ pub mod slot_ledger;
 mod store;
 mod types;
 pub mod win32k_ob;
+pub mod win32k_desktop_parse;
 pub mod win32k_user_objects;
 
 pub use access::compute_granted;

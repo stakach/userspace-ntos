@@ -246,20 +246,56 @@ fn security_by_body_and_by_generation_name_one_entry() {
     assert_eq!(store.security_descriptor_by_body(0), None);
 }
 
+
+/// IntDesktopObjectParse created "Default": the ObCreateObject reference becomes the handle's.
 #[test]
-fn desktop_names_are_scoped_to_the_exact_window_station_generation() {
+fn a_parse_created_desktop_is_inserted_and_opens_by_pointer() {
     let mut store = UserObjectStore::new();
-    let interactive = inserted(&mut store, ObKind::WindowStation, 0x5000,
-        UserObjectName::InteractiveWindowStation);
-    let service = inserted(&mut store, ObKind::WindowStation, 0x6000, UserObjectName::Unnamed);
-    let interactive_default = UserObjectName::desktop(interactive, b"Default").unwrap();
-    let service_default = UserObjectName::desktop(service, b"default").unwrap();
-    let first = inserted(&mut store, ObKind::Desktop, 0x7000, interactive_default);
-    let second = inserted(&mut store, ObKind::Desktop, 0x8000, service_default);
-    assert_eq!(store.named(UserObjectName::desktop(interactive, b"DEFAULT").unwrap()), Some(first));
-    assert_eq!(store.named(service_default), Some(second));
-    let stale = UserObjectIdentity { generation: interactive.generation + 100, ..interactive };
-    assert_eq!(store.named(UserObjectName::desktop(stale, b"default").unwrap()), None);
-    assert_eq!(UserObjectName::desktop(interactive, b""), None);
-    assert_eq!(UserObjectName::desktop(interactive, &[b'a'; DESKTOP_NAME_MAX + 1]), None);
+    store.create(ObKind::Desktop, DESKTOP_TYPE, 0x7000, None, UserObjectName::Unnamed, 0x2).unwrap();
+    let admission = store.admit_desktop_parse_result(NtStatus::SUCCESS, 0x7000, true).unwrap();
+    assert_eq!(admission.status, NtStatus::SUCCESS);
+    assert_eq!(admission.identity.body, 0x7000);
+    assert!(store.is_inserted(0x7000));
+    assert_eq!(store.counts(0x7000), Some((1, 1)));
+    // csrss's IntGetDesktopObjectHandle(pti->rpdesk) -> ObOpenObjectByPointer: the same body.
+    assert_eq!(store.open_handle(0x7000, admission.identity.generation), Ok(admission.identity));
+    assert_eq!(store.counts(0x7000), Some((2, 2)));
+    // A created result must be the unpublished body, and only with plain success.
+    assert_eq!(store.admit_desktop_parse_result(NtStatus::SUCCESS, 0x7000, true),
+        Err(NtStatus::INVALID_PARAMETER));
+}
+
+/// Open by name: IntDesktopObjectParse walked DesktopListHead and referenced the existing body;
+/// the new handle consumes that reference, and OBJ_OPENIF keeps its informational status.
+#[test]
+fn a_parse_opened_desktop_handle_consumes_the_parse_reference() {
+    let mut store = UserObjectStore::new();
+    let default = inserted(&mut store, ObKind::Desktop, 0x7000, UserObjectName::Unnamed);
+    assert_eq!(store.reference(0x7000), Ok(2));
+    let opened = store.admit_desktop_parse_result(NtStatus::SUCCESS, 0x7000, false).unwrap();
+    assert_eq!(opened.identity, default);
+    assert_eq!(store.counts(0x7000), Some((2, 2)));
+    assert_eq!(store.reference(0x7000), Ok(3));
+    let exists = store.admit_desktop_parse_result(NtStatus::OBJECT_NAME_EXISTS, 0x7000, false).unwrap();
+    assert_eq!(exists.status, NtStatus::OBJECT_NAME_EXISTS);
+    assert_eq!(store.counts(0x7000), Some((3, 3)));
+    // Without the parse's reference there is nothing for a handle to consume.
+    assert_eq!(store.admit_desktop_parse_result(NtStatus::SUCCESS, 0x7000, false),
+        Err(NtStatus::INVALID_PARAMETER));
+    assert_eq!(store.counts(0x7000), Some((3, 3)));
+}
+
+#[test]
+fn a_failed_or_foreign_parse_result_is_not_admitted() {
+    let mut store = UserObjectStore::new();
+    let failed = NtStatus(0xC000_0017u32 as i32);
+    assert_eq!(store.admit_desktop_parse_result(failed, 0, true), Err(failed));
+    inserted(&mut store, ObKind::WindowStation, 0x5000, UserObjectName::Unnamed);
+    assert_eq!(store.reference(0x5000), Ok(2));
+    assert_eq!(store.admit_desktop_parse_result(NtStatus::SUCCESS, 0x5000, false),
+        Err(NtStatus::OBJECT_TYPE_MISMATCH));
+    assert_eq!(store.admit_desktop_parse_result(NtStatus::SUCCESS, 0x9000, false),
+        Err(NtStatus::INVALID_HANDLE));
+    assert_eq!(store.admit_desktop_parse_result(NtStatus::OBJECT_NAME_EXISTS, 0x9000, true),
+        Err(NtStatus::INVALID_PARAMETER));
 }

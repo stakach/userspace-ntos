@@ -327,51 +327,6 @@ pub const DESKTOP_BODY_SIZE: u64 = 0x200;
 /// Body size to allocate for a `DESKTOPINFO` (+ `szDesktopName` tail, zeroed).
 pub const DESKTOPINFO_SIZE: u64 = 0x120;
 
-/// Wire a freshly-allocated, zeroed DESKTOP body to its DESKTOPINFO block (`DESKTOP.pDeskInfo`).
-/// Mirrors the effect of win32k's desktop allocation; kept here so the body layout lives with the
-/// object-type definition rather than in host glue.
-///
-/// # Safety
-/// `desktop_body` must point to at least [`DESKTOP_BODY_SIZE`] writable bytes.
-pub unsafe fn init_desktop_body(desktop_body: *mut u8, desktop_info: u64) {
-    core::ptr::write_unaligned(
-        desktop_body.add(desktop::P_DESK_INFO) as *mut u64,
-        desktop_info,
-    );
-    // InitializeListHead the DESKTOP's list heads (Flink=Blink=&head), as real IntCreateDesktop does.
-    // The window-manager/paint path walks these (PtiList, ShellHookWindows); a zeroed (NULL Flink) head
-    // null-derefs on the first traversal.
-    for off in [desktop::PTI_LIST, desktop::SHELL_HOOK_WINDOWS] {
-        let head = desktop_body.add(off) as u64;
-        core::ptr::write_unaligned(desktop_body.add(off) as *mut u64, head); // Flink = &head
-        core::ptr::write_unaligned(desktop_body.add(off + 8) as *mut u64, head);
-        // Blink = &head
-    }
-}
-
-/// Bind a newly allocated desktop to its creator's session only when its exact parent station
-/// belongs to that same session. The native desktop parse callback makes this assignment before
-/// publishing the object; our hosted parse adapter must do likewise.
-///
-/// # Safety
-/// Both pointers must refer to live, readable bodies of the indicated types. `desktop_body`
-/// must be writable and must not yet be published.
-pub unsafe fn bind_desktop_session(
-    desktop_body: *mut u8,
-    parent_station_body: *const u8,
-    current_session_id: u32,
-) -> bool {
-    if desktop_body.is_null() || parent_station_body.is_null() {
-        return false;
-    }
-    let parent_session_id = core::ptr::read_unaligned(parent_station_body as *const u32);
-    if parent_session_id != current_session_id {
-        return false;
-    }
-    core::ptr::write_unaligned(desktop_body.add(desktop::SESSION_ID) as *mut u32, current_session_id);
-    true
-}
-
 /// Insert a THREADINFO into a DESKTOP's `PtiList`, matching `InsertTailList` in
 /// `IntSetThreadDesktop`. Returns `false` when the desktop list head was not initialized or the
 /// thread entry is already linked elsewhere.
@@ -491,50 +446,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn desktop_body_wires_desk_info() {
-        let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
-        unsafe {
-            init_desktop_body(body.as_mut_ptr(), 0xDEC0_0000);
-            let p =
-                core::ptr::read_unaligned(body.as_ptr().add(desktop::P_DESK_INFO) as *const u64);
-            assert_eq!(p, 0xDEC0_0000);
-        }
-    }
-
-    #[test]
-    fn desktop_session_uses_current_process_only_for_its_exact_parent_station() {
-        let mut desktop = [0u8; DESKTOP_BODY_SIZE as usize];
-        let mut station = [0u8; 0x100];
-        station[..4].copy_from_slice(&1u32.to_le_bytes());
-        unsafe {
-            assert!(!bind_desktop_session(
-                desktop.as_mut_ptr(), station.as_ptr(), 0,
-            ));
-            assert_eq!(u32::from_le_bytes(desktop[..4].try_into().unwrap()), 0,
-                "a foreign session must not publish or mutate the desktop");
-            assert!(bind_desktop_session(
-                desktop.as_mut_ptr(), station.as_ptr(), 1,
-            ));
-            assert_eq!(u32::from_le_bytes(desktop[..4].try_into().unwrap()), 1);
-        }
-    }
-
-    #[test]
-    fn desktop_body_initializes_list_heads() {
-        // ShellHookWindows + PtiList must be self-referential empty list heads (Flink=Blink=&head),
-        // so win32k's list traversals (UserBuildShellHookHwndList) terminate immediately.
-        let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
-        let base = body.as_mut_ptr() as u64;
-        unsafe {
-            init_desktop_body(body.as_mut_ptr(), 0x1000);
-            for off in [desktop::PTI_LIST, desktop::SHELL_HOOK_WINDOWS] {
-                let flink = core::ptr::read_unaligned(body.as_ptr().add(off) as *const u64);
-                let blink = core::ptr::read_unaligned(body.as_ptr().add(off + 8) as *const u64);
-                assert_eq!(flink, base + off as u64);
-                assert_eq!(blink, base + off as u64);
-            }
-        }
+    /// ReactOS `UserInitializeDesktop` leaves PtiList as an empty list head.
+    unsafe fn init_desktop_body(desktop_body: *mut u8, _desktop_info: u64) {
+        let head = desktop_body.add(desktop::PTI_LIST) as u64;
+        core::ptr::write_unaligned(head as *mut u64, head);
+        core::ptr::write_unaligned((head + 8) as *mut u64, head);
     }
 
     #[test]

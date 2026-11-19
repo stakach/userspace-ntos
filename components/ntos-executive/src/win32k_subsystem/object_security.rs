@@ -167,20 +167,6 @@ pub(super) extern "win64" fn assign_export(
     }
 }
 
-pub(super) unsafe fn assign_opened_desktop(
-    parent: Option<&[u8]>,
-    creator: Option<&[u8]>,
-    object: u64,
-) -> i32 {
-    assign_from_descriptors(
-        0,
-        parent,
-        creator,
-        object,
-        nt_object_manager::object_type::desktop_object_type_addr(),
-    )
-}
-
 pub(crate) unsafe fn assign(
     packet: AssignmentPacket<'_>,
     subject: &nt_security::CapturedSubjectTokens<'_>,

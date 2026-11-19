@@ -8,12 +8,11 @@ const TREE_SHA256: &str =
 const WIN32K_SHA256: &str = "cce42491d4093ba391c25ae2612bbd714ce28f95aa6a56a127e9f55736be187f";
 const PDEV_ENTRY_RVA: u64 = 0x1b790;
 const GPMDEV_RVA: u64 = 0x1b7168;
-const HOST_GLOBALS: [(&str, u64); 5] = [
+const HOST_GLOBALS: [(&str, u64); 4] = [
     ("G_ATOM_TABLE_RVA", 0x23c2a8),
     ("GPDESK_INPUT_DESKTOP_RVA", 0x23ae70),
     ("GSPKL_BASE_LAYOUT_RVA", 0x23b9f8),
     ("NR_GUI_APPS_RUNNING_RVA", 0x23b8a0),
-    ("INPUT_WINDOW_STATION_RVA", 0x23cab8),
 ];
 
 fn source_rva(source: &str, name: &str) -> u64 {
@@ -143,7 +142,4 @@ fn host_globals_match_the_pinned_libernt_win32k_image() {
         rip_target(&bytes, 0x5d289, &[0xf0, 0x0f, 0xc1, 0x15]),
         HOST_GLOBALS[3].1
     );
-    // NtUserSwitchDesktop compares the target's parent to InputWindowStation.
-    assert_eq!(rip_target(&bytes, 0x539f0, &[0x48, 0x8b, 0x1d]), 0x16f340);
-    assert_eq!(relocated_global(&bytes, 0x16f340), HOST_GLOBALS[4].1);
 }

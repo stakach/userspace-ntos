@@ -1527,13 +1527,6 @@ pub const SSN_NT_USER_SWITCH_DESKTOP: u64 = 0x1288;
 /// SSN NtUserSetProcessWindowStation — win32k's real PROCESSINFO/EPROCESS station association.
 pub const SSN_NT_USER_SET_PROCESS_WINDOW_STATION: u64 = 0x10ac;
 
-/// Pinned LiberNT `InputWindowStation` (winsta.c:21), loaded through the relocation slot at
-/// RVA 0x16f340 by `NtUserSwitchDesktop` to compare the target desktop's parent.
-pub const INPUT_WINDOW_STATION_RVA: u64 = 0x23cab8;
-/// DESKTOP.rpwinstaParent offset, confirmed by pinned `NtUserSwitchDesktop` at VMA 0x639ec
-/// (`mov rax,[rcx+0x20]`) before comparison with `InputWindowStation`.
-pub const DESKTOP_RPWINSTA_PARENT_OFF: u64 = 0x20;
-
 pub const DESKTOP_HSECTION_OFF: u64 = 0x78;
 /// DESKTOP.pheapDesktop offset (`desktop.h` `struct _DESKTOP`: dwSessionId@0, pDeskInfo@8,
 /// ListEntry@0x10, rpwinstaParent@0x20, ..., hsectionDesktop@0x78, **pheapDesktop@0x80**). The
@@ -1542,17 +1535,8 @@ pub const DESKTOP_HSECTION_OFF: u64 = 0x78;
 /// at win32k RVA 0x4f5e3 (`mov rax,[rsp+0x40]=pdesk; mov rcx,[rax+0x80]=pheapDesktop; call
 /// RtlAllocateHeap`). Matches `nt_object_manager::win32k_ob::desktop` (pheapDesktop@0x80).
 pub const DESKTOP_PHEAP_OFF: u64 = 0x80;
-pub const DESKTOP_UL_HEAP_SIZE_OFF: u64 = 0x88;
 
-const DESKTOPINFO_PV_DESKTOP_BASE_OFF: u64 = 0x00;
-const DESKTOPINFO_PV_DESKTOP_LIMIT_OFF: u64 = 0x08;
-const DESKTOPINFO_APHK_START_OFF: u64 = 0x20;
-const DESKTOPINFO_HOOK_COUNT: u64 = 16; // WH_MINHOOK(-1)..WH_MAXHOOK(14)
-const DESKTOPINFO_NAME_OFF: u64 = 0x154;
 const DESKTOPINFO_MIN_ALLOC: u64 = 0x158;
-const DESKTOP_HEAP_INTERACTIVE_BYTES: u64 = 3 * 1024 * 1024;
-const DESKTOP_HEAP_NONINTERACTIVE_BYTES: u64 = 512 * 1024;
-const DESKTOP_HEAP_WINLOGON_BYTES: u64 = 128 * 1024;
 
 /// SSN of NtUserCreateDesktop (WIN32K_SERVICE_BASE 0x1000 + SSDT idx 0x22d). When a hosted client
 /// (winlogon) drives its own CreateWindowStation→CreateDesktop→SwitchDesktop chain, its
@@ -4661,7 +4645,7 @@ extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
 // passes into an `ObKind`, allocate bodies from the win32k pool and keep them in `OBJ_TABLE`
 // (bodies, counts, names, security). Handles live in each caller's ProcessManager table and are
 // published, resolved and closed through the root broker (`user_object_handle`).
-use nt_object_manager::win32k_ob::{bind_desktop_session, init_desktop_body, ObKind, DESKTOP_BODY_SIZE};
+use nt_object_manager::win32k_ob::{ObKind, DESKTOP_BODY_SIZE};
 use nt_object_manager::win32k_user_objects::{
     UserObjectError, UserObjectName, UserObjectRelease, UserObjectStore,
 };
@@ -7192,17 +7176,6 @@ extern "win64" fn s_rtl_image_directory_entry_to_data(
     }
 }
 
-/// Allocate + initialize a DESKTOP body from the win32k pool. The DESKTOPINFO is created later from
-/// the desktop's own section-backed heap, matching ReactOS `UserInitializeDesktop`.
-unsafe fn alloc_desktop_body() -> u64 {
-    let desk = pool_alloc(DESKTOP_BODY_SIZE);
-    if desk == 0 {
-        return 0;
-    }
-    init_desktop_body(desk as *mut u8, 0);
-    desk
-}
-
 unsafe fn object_attributes_unicode_buffer(object_attributes: u64) -> Option<(u64, usize)> {
     if object_attributes == 0 {
         return None;
@@ -7286,72 +7259,6 @@ unsafe fn object_attributes_name_leaf_eq_ascii(object_attributes: u64, leaf: &[u
     true
 }
 
-unsafe fn object_attributes_root_directory(object_attributes: u64) -> u64 {
-    if object_attributes == 0 {
-        0
-    } else {
-        read_unaligned((object_attributes + 0x08) as *const u64)
-    }
-}
-
-unsafe fn object_attributes_name_leaf_ascii(
-    object_attributes: u64,
-) -> Option<(
-    [u8; nt_object_manager::win32k_user_objects::DESKTOP_NAME_MAX],
-    usize,
-)> {
-    let Some((buffer, units)) = object_attributes_unicode_buffer(object_attributes) else {
-        return None;
-    };
-    if units == 0 {
-        return None;
-    }
-    let mut start = 0usize;
-    let mut index = 0usize;
-    while index < units {
-        let unit = read_unaligned((buffer + (index * 2) as u64) as *const u16);
-        if unit == b'\\' as u16 || unit == b'/' as u16 {
-            start = index + 1;
-        }
-        index += 1;
-    }
-    let len = units - start;
-    if len == 0 || len > nt_object_manager::win32k_user_objects::DESKTOP_NAME_MAX {
-        return None;
-    }
-    let mut leaf = [0u8; nt_object_manager::win32k_user_objects::DESKTOP_NAME_MAX];
-    let mut offset = 0usize;
-    while offset < len {
-        let unit = read_unaligned((buffer + ((start + offset) * 2) as u64) as *const u16);
-        if unit > 0x7f {
-            return None;
-        }
-        leaf[offset] = (unit as u8).to_ascii_lowercase();
-        offset += 1;
-    }
-    Some((leaf, len))
-}
-
-unsafe fn object_attributes_name_leaf_unicode(object_attributes: u64) -> Option<(u64, usize)> {
-    let Some((buffer, units)) = object_attributes_unicode_buffer(object_attributes) else {
-        return None;
-    };
-    if units == 0 {
-        return None;
-    }
-    let mut start = 0usize;
-    let mut index = 0usize;
-    while index < units {
-        let unit = read_unaligned((buffer + (index * 2) as u64) as *const u16);
-        if unit == b'\\' as u16 || unit == b'/' as u16 {
-            start = index + 1;
-        }
-        index += 1;
-    }
-    let len = units - start;
-    (len != 0).then_some((buffer + (start * 2) as u64, len))
-}
-
 /// The WindowStation body an exact caller-table handle names.
 unsafe fn desktop_root_from_handle(handle: u64) -> Option<(u64, u64)> {
     let window_station = nt_object_manager::object_type::window_station_object_type_addr();
@@ -7381,127 +7288,6 @@ unsafe fn effective_desktop_root(requested_root: u64) -> Option<(u64, u64)> {
         return desktop_root_from_handle(h);
     }
     None
-}
-
-unsafe fn desktop_heap_size_for(
-    winsta_body: u64,
-    object_attributes: u64,
-) -> u64 {
-    let input_winsta = {
-        let global = read_volatile((WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *const u64);
-        if global != 0 {
-            global
-        } else {
-            user_object_handle::store()
-                .named(UserObjectName::InteractiveWindowStation)
-                .map_or(0, |identity| identity.body)
-        }
-    };
-    if winsta_body == input_winsta && winsta_body != 0 {
-        if object_attributes_name_leaf_eq_ascii(object_attributes, b"winlogon") {
-            DESKTOP_HEAP_WINLOGON_BYTES
-        } else {
-            DESKTOP_HEAP_INTERACTIVE_BYTES
-        }
-    } else {
-        DESKTOP_HEAP_NONINTERACTIVE_BYTES
-    }
-}
-
-unsafe fn desktop_info_alloc_size(object_attributes: u64) -> u64 {
-    let name_bytes = object_attributes_name_leaf_unicode(object_attributes)
-        .map(|(_, units)| ((units + 1) * 2) as u64)
-        .unwrap_or(2);
-    align16((DESKTOPINFO_NAME_OFF + name_bytes).max(DESKTOPINFO_MIN_ALLOC))
-}
-
-unsafe fn initialize_desktop_info(
-    dinfo: u64,
-    heap_base: u64,
-    heap_size: u64,
-    object_attributes: u64,
-) {
-    write_volatile(
-        (dinfo + DESKTOPINFO_PV_DESKTOP_BASE_OFF) as *mut u64,
-        heap_base,
-    );
-    write_volatile(
-        (dinfo + DESKTOPINFO_PV_DESKTOP_LIMIT_OFF) as *mut u64,
-        heap_base + heap_size,
-    );
-
-    let mut hook = 0u64;
-    while hook < DESKTOPINFO_HOOK_COUNT {
-        let head = dinfo + DESKTOPINFO_APHK_START_OFF + hook * 16;
-        write_volatile(head as *mut u64, head);
-        write_volatile((head + 8) as *mut u64, head);
-        hook += 1;
-    }
-
-    let mut units = 0usize;
-    if let Some((src, len)) = object_attributes_name_leaf_unicode(object_attributes) {
-        while units < len {
-            let ch = read_unaligned((src + (units * 2) as u64) as *const u16);
-            write_volatile(
-                (dinfo + DESKTOPINFO_NAME_OFF + (units * 2) as u64) as *mut u16,
-                ch,
-            );
-            units += 1;
-        }
-    }
-    write_volatile(
-        (dinfo + DESKTOPINFO_NAME_OFF + (units * 2) as u64) as *mut u16,
-        0,
-    );
-}
-
-unsafe fn initialize_desktop_heap(
-    desk_body: u64,
-    winsta_body: u64,
-    object_attributes: u64,
-) -> bool {
-    if desk_body == 0 || winsta_body == 0 {
-        return false;
-    }
-    let existing_section = read_volatile((desk_body + DESKTOP_HSECTION_OFF) as *const u64);
-    let existing_heap = read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64);
-    if existing_section != 0 || existing_heap != 0 {
-        return existing_section != 0
-            && is_section(existing_section as *const u8)
-            && existing_heap != 0
-            && hosted_heap_bounds(existing_heap).is_some();
-    }
-
-    let heap_size = desktop_heap_size_for(winsta_body, object_attributes);
-    let section = pool_alloc(section_object::SIZE_OF as u64);
-    if section == 0 {
-        return false;
-    }
-    init_section(section as *mut u8, heap_size);
-    register_section_descriptor(section);
-    let (heap_base, mapped_size) = section_view(section, heap_size);
-    if heap_base == 0 || mapped_size < heap_size {
-        return false;
-    }
-    let pheap = hosted_heap_init(heap_base, heap_size);
-    if pheap == 0 {
-        return false;
-    }
-    let info_size = desktop_info_alloc_size(object_attributes);
-    let dinfo = s_rtl_allocate_heap(pheap, HEAP_ZERO_MEMORY, info_size);
-    if dinfo == 0 {
-        return false;
-    }
-
-    init_desktop_body(desk_body as *mut u8, dinfo);
-    initialize_desktop_info(dinfo, heap_base, heap_size, object_attributes);
-    write_volatile((desk_body + DESKTOP_HSECTION_OFF) as *mut u64, section);
-    write_volatile((desk_body + DESKTOP_PHEAP_OFF) as *mut u64, pheap);
-    write_volatile(
-        (desk_body + DESKTOP_UL_HEAP_SIZE_OFF) as *mut u64,
-        heap_size,
-    );
-    true
 }
 
 struct CapturedUserObjectSecurityDescriptor {
@@ -7839,126 +7625,22 @@ fn ob_open_object_by_name_existing(
     object_attributes: u64,
     obj_type: u64,
     access_mode: u64,
-    _access_state: u64,
+    access_state: u64,
     desired_access: u64,
     parse_context: u64,
     handle: *mut u64,
 ) -> i32 {
     unsafe {
         match classify_type(obj_type) {
-            Some(ObKind::Desktop) => {
-                if handle.is_null() {
-                    return STATUS_ACCESS_VIOLATION_I32;
-                }
-                let requested_root = object_attributes_root_directory(object_attributes);
-                let Some((_, winsta_body)) = effective_desktop_root(requested_root) else {
-                    return STATUS_OBJECT_NAME_NOT_FOUND;
-                };
-                user_object_handle::drain();
-                let Some(window_station) = user_object_handle::store().identity(winsta_body) else {
-                    return STATUS_INVALID_HANDLE_I32;
-                };
-                let mode = user_object_handle::access_mode(access_mode);
-                let attributes = object_attributes_handle_attributes(object_attributes);
-                let name = object_attributes_name_leaf_ascii(object_attributes)
-                    .and_then(|(leaf, len)| UserObjectName::desktop(window_station, &leaf[..len]));
-                if let Some(existing) = name.and_then(|name| user_object_handle::store().named(name)) {
-                    let granted =
-                        user_object_granted_access(ObKind::Desktop, obj_type, desired_access as u32);
-                    return match user_object_handle::open(existing, attributes, granted, mode) {
-                        Ok(opened) => {
-                            write_unaligned(handle, opened);
-                            if parse_context != 0 {
-                                write_volatile(parse_context as *mut u8, 0);
-                            }
-                            0
-                        }
-                        Err(status) => status,
-                    };
-                }
-                if parse_context == 0 {
-                    return STATUS_OBJECT_NAME_NOT_FOUND;
-                }
-                let security = match object_attributes_security_descriptor(object_attributes) {
-                    Ok(security) => security,
-                    Err(status) => return status,
-                };
-                let parent_security = {
-                    let Some((ObKind::WindowStation, descriptor)) =
-                        user_object_handle::store().security_descriptor_by_body(winsta_body)
-                    else {
-                        return STATUS_INVALID_HANDLE_I32;
-                    };
-                    descriptor.map(|bytes| {
-                        let mut captured = CapturedUserObjectSecurityDescriptor::empty();
-                        captured.bytes[..bytes.len()].copy_from_slice(bytes);
-                        captured.len = bytes.len();
-                        captured
-                    })
-                };
-                let body = alloc_desktop_body();
-                if body == 0 {
-                    return STATUS_INSUFFICIENT_RESOURCES_I32;
-                }
-                if !bind_desktop_session(
-                    body as *mut u8,
-                    winsta_body as *const u8,
-                    s_ps_get_current_process_session_id(),
-                ) {
-                    assert!(provider_pool_free(body), "foreign-session desktop body leaked");
-                    return 0xC000_0022u32 as i32; // STATUS_ACCESS_DENIED
-                }
-                write_volatile(
-                    (body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64,
-                    winsta_body,
-                );
-                if !initialize_desktop_heap(body, winsta_body, object_attributes) {
-                    return STATUS_INSUFFICIENT_RESOURCES_I32;
-                }
-                if user_object_handle::store()
-                    .create(
-                        ObKind::Desktop,
-                        obj_type,
-                        body,
-                        None,
-                        name.unwrap_or(UserObjectName::Unnamed),
-                        attributes,
-                    )
-                    .is_err()
-                {
-                    return STATUS_INSUFFICIENT_RESOURCES_I32;
-                }
-                let status = object_security::assign_opened_desktop(
-                    parent_security
-                        .as_ref()
-                        .map(CapturedUserObjectSecurityDescriptor::as_slice),
-                    security
-                        .as_ref()
-                        .map(CapturedUserObjectSecurityDescriptor::as_slice),
-                    body,
-                );
-                if status != 0 {
-                    s_ob_dereference_object(body);
-                    return status;
-                }
-                let (identity, attributes) = match user_object_handle::store().insert(body) {
-                    Ok(inserted) => inserted,
-                    Err(_) => {
-                        s_ob_dereference_object(body);
-                        return STATUS_INSUFFICIENT_RESOURCES_I32;
-                    }
-                };
-                let granted =
-                    user_object_granted_access(ObKind::Desktop, obj_type, desired_access as u32);
-                let published =
-                    match user_object_handle::publish_counted(identity, attributes, granted, mode) {
-                        Ok(published) => published,
-                        Err(status) => return status,
-                    };
-                write_unaligned(handle, published);
-                write_volatile(parse_context as *mut u8, 1); // Context = TRUE (object created)
-                0
-            }
+            Some(ObKind::Desktop) => desktop_parse::open(
+                object_attributes,
+                obj_type,
+                access_mode,
+                access_state,
+                desired_access,
+                parse_context,
+                handle,
+            ),
             Some(ObKind::WindowStation) => {
                 let name = if object_attributes_name_contains_ascii(object_attributes, b"service-") {
                     window_station_name(object_attributes)
@@ -13785,6 +13467,7 @@ pub(crate) const WIN32K_REGISTRY_OP_SYNC_INVALIDATE_RELATIONS: u64 = 16;
 const WIN32K_REGISTRY_USE_PREVIOUS_MODE: u64 = 1 << 63;
 #[path = "win32k_subsystem/device_registry.rs"]
 mod device_registry;
+mod desktop_parse;
 #[path = "win32k_subsystem/device_relations.rs"]
 mod device_relations;
 #[path = "win32k_registry_deferred_value.rs"]

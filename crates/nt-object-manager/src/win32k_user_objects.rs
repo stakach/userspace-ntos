@@ -16,6 +16,15 @@
 //! `static`, and allocates and frees bodies from its own pool.
 
 use crate::win32k_ob::ObKind;
+use nt_status::NtStatus;
+
+/// How a successful Desktop parse result becomes the caller's handle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DesktopParseAdmission {
+    /// The parse status the caller sees (`STATUS_OBJECT_NAME_EXISTS` for an OBJ_OPENIF open).
+    pub status: NtStatus,
+    pub identity: UserObjectIdentity,
+}
 
 /// Live and created-but-not-inserted objects the provider can own at once.
 pub const USER_OBJECT_CAPACITY: usize = 64;
@@ -33,47 +42,6 @@ pub enum UserObjectName {
     InteractiveWindowStation,
     /// A noninteractive service window station, one per logon session.
     ServiceWindowStation { authentication_id: u64 },
-    /// A desktop's leaf name under the exact window station body generation it was created in.
-    Desktop { window_station: u64, window_station_generation: u64, leaf: DesktopLeaf },
-}
-
-/// Maximum ASCII desktop leaf name retained for open-by-name lookups.
-pub const DESKTOP_NAME_MAX: usize = 48;
-
-/// A case-insensitive ASCII desktop leaf name, stored lowercased.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct DesktopLeaf {
-    len: u8,
-    bytes: [u8; DESKTOP_NAME_MAX],
-}
-
-impl DesktopLeaf {
-    /// `None` for an empty, oversized or non-ASCII leaf.
-    pub fn new(leaf: &[u8]) -> Option<Self> {
-        if leaf.is_empty() || leaf.len() > DESKTOP_NAME_MAX || !leaf.is_ascii() {
-            return None;
-        }
-        let mut bytes = [0; DESKTOP_NAME_MAX];
-        for (slot, byte) in bytes.iter_mut().zip(leaf) {
-            *slot = byte.to_ascii_lowercase();
-        }
-        Some(Self { len: leaf.len() as u8, bytes })
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.len)]
-    }
-}
-
-impl UserObjectName {
-    /// The name of a desktop `leaf` under the window station `parent`.
-    pub fn desktop(parent: UserObjectIdentity, leaf: &[u8]) -> Option<Self> {
-        Some(Self::Desktop {
-            window_station: parent.body,
-            window_station_generation: parent.generation,
-            leaf: DesktopLeaf::new(leaf)?,
-        })
-    }
 }
 
 /// The exact body a handle names.
@@ -411,6 +379,46 @@ impl UserObjectStore {
     pub fn object_type_addr_by_body(&self, body: u64) -> Option<u64> {
         let entry = self.entry(body)?;
         (entry.identity.kind != ObKind::Other).then_some(entry.identity.object_type)
+    }
+
+    /// `ObOpenObjectByName` after the WindowStation parse procedure returned a Desktop. Win32k's
+    /// `IntDesktopObjectParse` either created the body (`ObCreateObject`, Context = TRUE), whose
+    /// creator reference becomes the first handle's, or found it on `DesktopListHead` and took
+    /// one `ObReferenceObject` reference, which the new handle consumes. Each count is counted
+    /// here; on an error the caller still owns the reference the parse returned.
+    pub fn admit_desktop_parse_result(
+        &mut self,
+        status: NtStatus,
+        object: u64,
+        created: bool,
+    ) -> Result<DesktopParseAdmission, NtStatus> {
+        if status.is_error() {
+            return Err(status);
+        }
+        if object == 0
+            || (created && status != NtStatus::SUCCESS)
+            || (!created && status != NtStatus::SUCCESS && status != NtStatus::OBJECT_NAME_EXISTS)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let entry = self.entry(object).ok_or(NtStatus::INVALID_HANDLE)?;
+        if entry.identity.kind != ObKind::Desktop {
+            return Err(NtStatus::OBJECT_TYPE_MISMATCH);
+        }
+        if created {
+            if entry.inserted {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            // The handle takes the opener's attributes, not those of win32k's ObCreateObject.
+            let (identity, _) = self.insert(object).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+            Ok(DesktopParseAdmission { status, identity })
+        } else {
+            let identity = self.transfer_reference_to_handle(object).map_err(|error| match error {
+                UserObjectError::Overflow => NtStatus::INSUFFICIENT_RESOURCES,
+                _ => NtStatus::INVALID_PARAMETER,
+            })?;
+            Ok(DesktopParseAdmission { status, identity })
+        }
     }
 
     /// The inserted object that currently holds `name`.
