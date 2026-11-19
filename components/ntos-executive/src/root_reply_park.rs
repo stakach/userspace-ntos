@@ -154,6 +154,34 @@ impl RootReplyPark {
     }
 }
 
+/// The exact root selector, its pool record and the pool's record census. Equality before and
+/// after a hosted Reply import proves that the import left no root-pool effect.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct RootSelectorObservation {
+    main: u64,
+    record: Option<(nt_component_suspension::RootReplyIdentity,
+        Option<nt_component_suspension::RootReplySlotState>)>,
+    live: usize,
+    used: usize,
+}
+
+pub(crate) unsafe fn observe_root_selector() -> RootSelectorObservation {
+    let pool = wait_reply_pool_ref();
+    let main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    RootSelectorObservation {
+        main,
+        record: pool.find_cap(main).map(|identity| (identity, pool.state(identity).ok())),
+        live: pool.live_count(),
+        used: pool.used_count(),
+    }
+}
+
+/// Whether a numeric Reply has any root-pool record or is the current root selector.
+pub(crate) unsafe fn root_pool_records_reply(reply: u64) -> bool {
+    reply == 0 || REPLY_MAIN_SLOT.load(Ordering::Relaxed) == reply
+        || wait_reply_pool_ref().find_cap(reply).is_some()
+}
+
 /// Keep a refused hosted Call's Reply in its existing shared owner while allowing the root
 /// receiver to accept a different Call. This does not cancel, reuse, or retry the old Reply.
 /// The used pool record stays unavailable until its exact retained owner settles it.

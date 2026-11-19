@@ -3,6 +3,7 @@
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use crate::*;
 use nt_component_suspension::{IngressExecutionOwner, ReceivedMessage, ReplyBindingObservation};
+use nt_user_host::root_handoff_readmission::{HandoffAdmissionGate, HandoffRefusal};
 
 // seL4 boot-cap slot for the executive's own TCB; used only as a live Reply-query probe.
 const ROOT_THREAD_CAP: u64 = 1;
@@ -135,10 +136,10 @@ pub(crate) unsafe fn import_selected_root_child(
 ) -> SelectedRootImportResult {
     let imported = runtime::take_selected_root_hosted_with(
         snapshot, admission, parent, |reply, _message| match install_hosted_reply(reply) {
-            HostedReplyImport::Imported => runtime::SelectedRootImportOutcome::Imported,
+            HostedReplyImport::Imported => runtime::RootReplyImportOutcome::Imported,
             HostedReplyImport::RefusedNoEffect =>
-                runtime::SelectedRootImportOutcome::RefusedNoEffect,
-            HostedReplyImport::Retained => runtime::SelectedRootImportOutcome::Retained,
+                runtime::RootReplyImportOutcome::RefusedNoEffect,
+            HostedReplyImport::Retained => runtime::RootReplyImportOutcome::Retained,
         },
     );
     match imported {
@@ -150,6 +151,73 @@ pub(crate) unsafe fn import_selected_root_child(
     }
 }
 
+/// Root-only. While it excludes, root receive admits no other Call, autonomous work or receive.
+static mut HANDOFF_GATE: HandoffAdmissionGate<crate::HostedThreadRole> = HandoffAdmissionGate::new();
+
+/// One serial record per gate transition; `detail` is the resolution or the refusal of proof.
+fn trace_handoff(
+    stage: &str, refusal: HandoffRefusal, detail: &dyn core::fmt::Debug,
+    key: nt_user_host::root_handoff_readmission::HandoffKey<crate::HostedThreadRole>,
+) {
+    use core::fmt::Write;
+    let binding = key.binding();
+    let mut record = nt_printf::record::RecordBuffer::<256>::new();
+    let _ = writeln!(record,
+        "[ingress-handoff] {} refusal={:?} detail={:?} pi/pid/gen/tid/tcb={}/{}/{:?}/{}/{} reply/seq={}/{}",
+        stage, refusal, detail, binding.pi, binding.process.pid, binding.process.generation,
+        binding.tid, binding.tcb, key.admission().reply(), key.admission().admission_sequence());
+    sel4_rt::print_record(record.bytes());
+}
+
+/// Exclude unrelated work for a refused hosted handoff, then re-admit it only for the exact
+/// receipt CALLS issues after sealing that Call in its own row. Without that proof the gate
+/// keeps excluding and the caller stops at its service boundary; the Call and Reply stay owned.
+unsafe fn readmit_after_refused_handoff(
+    refusal: runtime::HostedHandoffRefused,
+    import_entry: Option<crate::root_reply_park::RootSelectorObservation>,
+) -> bool {
+    let Some((key, reason)) = refusal.selected else {
+        use core::fmt::Write;
+        let mut record = nt_printf::record::RecordBuffer::<128>::new();
+        let _ = writeln!(record,
+            "[ingress-handoff] unselected refusal error={:?}; root stays stopped", refusal.error);
+        sel4_rt::print_record(record.bytes());
+        return false;
+    };
+    let gate = &mut *core::ptr::addr_of_mut!(HANDOFF_GATE);
+    let refused = match gate.refuse(key, reason) {
+        Ok(refused) => refused,
+        Err(error) => {
+            trace_handoff("exclusion-retained", reason, &error, key);
+            return false;
+        }
+    };
+    let receipt = match runtime::quarantine_refused_handoff(refused, import_entry) {
+        Ok(receipt) => receipt,
+        Err((error, _refused)) => {
+            // The gate keeps this exclusion; the token proves nothing without the seal.
+            trace_handoff("exclusion-retained", reason, &error, key);
+            return false;
+        }
+    };
+    match gate.readmit(receipt) {
+        Ok(resolution) => {
+            trace_handoff("readmitted", reason, &resolution, key);
+            // NT fails the refused system service rather than leaving its caller blocked.
+            match runtime::fail_quarantined_native_call(key) {
+                Ok(true) => trace_handoff("caller-failed", reason, &"STATUS_INSUFFICIENT_RESOURCES", key),
+                Ok(false) => trace_handoff("caller-awaits-rundown", reason, &resolution, key),
+                Err(error) => trace_handoff("caller-reply-retained", reason, &error, key),
+            }
+            true
+        }
+        Err((error, _receipt)) => {
+            trace_handoff("exclusion-retained", reason, &error, key);
+            false
+        }
+    }
+}
+
 /// This runs only at a root event boundary. Nested pumps enqueue hosted Calls without touching
 /// REPLY_MAIN_SLOT, which may still be the Reply of their outer blocked syscall.
 pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
@@ -158,6 +226,10 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
         REPLY_MAIN_SLOT.load(Ordering::Relaxed),
         "shared root receive must own the current hosted Reply"
     );
+    if !(&*core::ptr::addr_of!(HANDOFF_GATE)).admits_unrelated_work() {
+        print_str(b"[ingress-handoff] refused handoff still lacks proof; root stays excluded\n");
+        return ReceiveOutcome::RetainedFailure;
+    }
     match runtime::take_outer_boundary() {
         Ok(Some(boundary)) => return ReceiveOutcome::OuterBoundary(boundary),
         Ok(None) => {}
@@ -194,21 +266,31 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
             }
         }
         let mut import_outcome = HostedReplyImport::RefusedNoEffect;
+        let mut import_entry = None;
         let delivered = match runtime::take_hosted_with(|reply, _message| {
             if !runtime::receive_child_delivery_allowed(reply) {
-                return false;
+                return runtime::RootReplyImportOutcome::RefusedNoEffect;
             }
+            import_entry = Some(crate::root_reply_park::observe_root_selector());
             import_outcome = install_hosted_reply(reply);
-            import_outcome == HostedReplyImport::Imported
+            match import_outcome {
+                HostedReplyImport::Imported => runtime::RootReplyImportOutcome::Imported,
+                HostedReplyImport::RefusedNoEffect =>
+                    runtime::RootReplyImportOutcome::RefusedNoEffect,
+                HostedReplyImport::Retained => runtime::RootReplyImportOutcome::Retained,
+            }
         }) {
             Ok(delivered) => delivered,
-            Err(_) => {
+            Err(refusal) => {
                 if import_outcome == HostedReplyImport::Retained {
                     print_str(b"[ingress-receive-error] Reply pool import retained\n");
                 }
-                // The hosted ingress row still owns the exact Call and Reply. Do not
-                // admit another receive until that owner can be reconciled.
+                // The hosted ingress row still owns the exact Call and Reply. Only its seal
+                // and the gate's exact receipt may re-admit other work; it is never redelivered.
                 print_str(b"[ingress-receive-error] hosted handoff retained\n");
+                if readmit_after_refused_handoff(refusal, import_entry) {
+                    continue;
+                }
                 return ReceiveOutcome::RetainedFailure;
             }
         };

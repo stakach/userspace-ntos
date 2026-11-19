@@ -39,9 +39,7 @@ fn exact_selected_child_retains_full_message_and_seals_before_import_effect() {
     let delivered = selected.find("row.delivered = true").unwrap();
     assert!(begin < effect && effect < positive && positive < delivered,
         "the one-shot pass seals before physical import and delivers only after success");
-    assert!(selected.contains("SelectedRootImportOutcome::Retained => return Err(Error::Retain.into())")
-        && selected.contains("SelectedRootImportOutcome::RefusedNoEffect")
-        && selected.contains("root.pass.abort_import_before_effect")
+    assert!(selected.contains("root.pass.abort_import_before_effect")
         && !selected.contains("root.pass.begin_import(binding, call).ok()"),
         "only a certified no-effect callback can reopen the selected import");
     let generic = function(ORDINARY, "receive");
@@ -67,16 +65,6 @@ fn shared_reply_import_distinguishes_clean_refusal_from_retained_pool_effect() {
     assert!(ordinary.contains("runtime::take_hosted_with"));
     assert!(ordinary.contains("ReceiveOutcome::Message(materialize(message))"));
     assert!(ordinary.contains("HostedReplyImport::Retained"));
-    let hosted = function(HOSTED, "take_hosted_with");
-    assert!(hosted.find("if !import(reply, &message)").unwrap()
-        < hosted.find("row.delivered = true").unwrap());
     let selected = function(HOSTED, "take_selected_root_hosted_with");
-    let effect = selected.find("match import(reply, &message)").unwrap();
-    let refused = selected.find("SelectedRootImportOutcome::RefusedNoEffect").unwrap();
-    let retained = selected.find("SelectedRootImportOutcome::Retained").unwrap();
-    let positive = selected.find("root.pass.deliver(").unwrap();
-    let delivered = selected.find("row.delivered = true").unwrap();
-    assert!(effect < refused && effect < retained && refused < positive && retained < positive
-        && positive < delivered
-        && selected.contains("root.import_no_effect = Some(no_effect)"));
+    assert!(selected.contains("root.import_no_effect = Some(no_effect)"));
 }

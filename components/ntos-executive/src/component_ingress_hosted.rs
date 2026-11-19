@@ -3,6 +3,10 @@
 use super::*;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nt_component_suspension::{ExternalAdmissionKey, ExternalIngress, ReplyBindingObservation};
+use nt_user_host::root_handoff_readmission::{
+    HandoffKey, HandoffQuarantine, HandoffReadmission, HandoffRefusal, HeldRowState,
+    ReadmissionError, RefusedHandoff, RootPoolObservation,
+};
 type Binding = nt_user_host::thread_binding::ThreadBinding<crate::HostedThreadRole>;
 
 struct ReceiveSettlement {
@@ -67,6 +71,9 @@ struct HostedCall {
     released: bool,
     receive_settlement: Option<ReceiveSettlement>,
     root_ingress: Option<RootIngressOwner>,
+    /// Seal of a refused, never-delivered handoff. The row keeps its Call and Reply for its
+    /// owner's later settlement; no selector may deliver it again.
+    handoff_quarantine: Option<HandoffQuarantine<crate::HostedThreadRole>>,
 }
 static mut CALLS: Vec<Option<HostedCall>> = Vec::new();
 static BUSY_WIN32K_RETAIN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -288,7 +295,7 @@ pub(crate) enum SelectedRootReadRequestOutcome {
 /// Native's observed effect of importing the selected child Reply into the root pool.
 /// Only the exact rollback path may report a no-effect refusal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SelectedRootImportOutcome {
+pub(crate) enum RootReplyImportOutcome {
     Imported,
     RefusedNoEffect,
     Retained,
@@ -309,6 +316,9 @@ pub(super) unsafe fn oldest_pending_snapshot() -> Option<PendingSnapshot> {
     let index = nt_component_suspension::oldest_receive_external_ingress(
         rows.iter().enumerate().filter_map(|(index, row)| {
             let row = row.as_ref()?;
+            if row.handoff_quarantine.is_some() {
+                return None;
+            }
             row.call
                 .as_ref()
                 .map(|call| (index, call, nt_component_suspension::ExternalReceiveState {
@@ -532,13 +542,25 @@ pub(super) unsafe fn retain(
         released: false,
         receive_settlement: None,
         root_ingress: None,
+        handoff_quarantine: None,
     });
     Ok(())
 }
 
+/// A refused root delivery. `selected` names the exact row only once one was selected; that
+/// row still holds its Call and Reply. Without it there is no Call that could be quarantined.
+pub(crate) struct HostedHandoffRefused {
+    pub(crate) error: Error,
+    pub(crate) selected: Option<(HandoffKey<crate::HostedThreadRole>, HandoffRefusal)>,
+}
+
+impl From<Error> for HostedHandoffRefused {
+    fn from(error: Error) -> Self { Self { error, selected: None } }
+}
+
 pub(crate) unsafe fn take_hosted_with(
-    import: impl FnOnce(u64, &ReceivedMessage) -> bool,
-) -> Result<Option<(u64, ReceivedMessage)>, Error> {
+    import: impl FnOnce(u64, &ReceivedMessage) -> RootReplyImportOutcome,
+) -> Result<Option<(u64, ReceivedMessage)>, HostedHandoffRefused> {
     recycle_completed()?;
     if crate::writable_fs::registry_journal::owns_volume() {
         return Ok(None);
@@ -558,7 +580,7 @@ pub(crate) unsafe fn take_hosted_with(
                 if row.delivered || row.released || row.completion.is_some() {
                     return None;
                 }
-                if row.root_ingress.is_some() {
+                if row.root_ingress.is_some() || row.handoff_quarantine.is_some() {
                     return None;
                 }
                 let call = row.call.as_ref().filter(|call| call.can_park())?;
@@ -593,22 +615,118 @@ pub(crate) unsafe fn take_hosted_with(
         .as_mut()
         .ok_or(Error::Retain)?;
     let call = row.call.as_ref().ok_or(Error::Retain)?;
+    let key = HandoffKey::new(row.binding, call.admission_key());
+    let refused = |error, refusal| HostedHandoffRefused {
+        error, selected: key.map(|key| (key, refusal)),
+    };
     if crate::service_sec_image::hosted_ingress_binding(row.binding.badge) != Some(row.binding) {
-        return Err(Error::PhysicalIdentity);
+        return Err(refused(Error::PhysicalIdentity, HandoffRefusal::RetiredBinding));
     }
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     if crate::spawn_hosts::query_component_reply_binding(row.binding.tcb, call.reply())
         != Ok(ReplyBindingObservation::BoundToTarget)
     {
-        return Err(Error::Reply);
+        return Err(refused(Error::Reply, HandoffRefusal::ReplyUnbound));
     }
     let message = call.message().clone();
     let reply = call.reply();
-    if !import(reply, &message) {
-        return Err(Error::Retain);
+    match import(reply, &message) {
+        RootReplyImportOutcome::Imported => {}
+        RootReplyImportOutcome::RefusedNoEffect =>
+            return Err(refused(Error::Retain, HandoffRefusal::ImportNoEffect)),
+        RootReplyImportOutcome::Retained =>
+            return Err(refused(Error::Retain, HandoffRefusal::ImportUncertain)),
     }
     row.delivered = true;
     Ok(Some((reply, message)))
+}
+
+/// Seal a refused, never-delivered hosted Call in its own row and prove that to the root gate.
+/// The row keeps its ExternalIngress, and through it the original Reply, until its owner settles
+/// it once (thread rundown cancellation). This is memory-only: no Reply, Stop, cancel or pool
+/// effect. `import_entry` is the root selector observed immediately before the importer ran.
+pub(crate) unsafe fn quarantine_refused_handoff(
+    refused: RefusedHandoff<crate::HostedThreadRole>,
+    import_entry: Option<crate::root_reply_park::RootSelectorObservation>,
+) -> Result<
+    HandoffReadmission<crate::HostedThreadRole>,
+    (Option<ReadmissionError>, RefusedHandoff<crate::HostedThreadRole>),
+> {
+    let key = refused.key();
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.binding == key.binding()
+            && row.call.as_ref().is_some_and(|call| call.admission_key() == key.admission()))
+    else { return Err((None, refused)) };
+    let Some(call) = row.call.as_ref() else { return Err((None, refused)) };
+    let reply_recorded = crate::root_reply_park::root_pool_records_reply(call.reply());
+    let pool = match import_entry {
+        None => RootPoolObservation::NotEntered { reply_recorded },
+        Some(before) => RootPoolObservation::Entered {
+            reply_recorded,
+            selector_unchanged: crate::root_reply_park::observe_root_selector() == before,
+        },
+    };
+    let state = HeldRowState {
+        delivered: row.delivered,
+        settled: row.released || row.completion.is_some() || row.recycled.is_some(),
+        dependent: row.receive_settlement.is_some() || row.root_ingress.is_some(),
+        sealed: row.handoff_quarantine.is_some(),
+    };
+    match refused.seal(row.binding, call, state, pool) {
+        Ok((seal, receipt)) => {
+            row.handoff_quarantine = Some(seal);
+            Ok(receipt)
+        }
+        Err((error, refused)) => Err((Some(error), refused)),
+    }
+}
+
+/// Answer the live caller of a sealed, never-delivered native system service with the status NT
+/// returns when its resources could not be obtained, instead of leaving it blocked until thread
+/// rundown. Only a Call whose seal names such a status, whose binding is still current and whose
+/// Reply is still bound is answered; that one acknowledged Reply settles the row exactly once.
+/// Returns false, with the row still sealed, when this owner cannot answer it.
+pub(crate) unsafe fn fail_quarantined_native_call(
+    key: nt_user_host::root_handoff_readmission::HandoffKey<crate::HostedThreadRole>,
+) -> Result<bool, Error> {
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.handoff_quarantine.as_ref().is_some_and(|seal| seal.key() == key))
+    else { return Ok(false) };
+    let Some(status) = row.handoff_quarantine.as_ref().and_then(|seal| seal.failure_status())
+    else { return Ok(false) };
+    let Some(call) = row.call.as_ref() else { return Ok(false) };
+    if row.binding != key.binding() || call.admission_key() != key.admission()
+        || row.delivered || row.completion.is_some() || row.released
+        || row.receive_settlement.is_some() || row.root_ingress.is_some()
+        || !call.can_park() || call.executor() != row.binding.tcb
+        || (call.message().info() >> 12) != nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL
+        || crate::service_sec_image::hosted_ingress_binding(row.binding.badge) != Some(row.binding)
+    {
+        return Ok(false);
+    }
+    let saved = crate::ipc_message::SavedMessageBuffer::capture();
+    let observation = row.call.as_mut().expect("sealed hosted Call")
+        .reply_owned(
+            |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+            |reply| {
+                drop(saved);
+                if crate::reply_on(reply, 1, u64::from(status), 0, 0, 0) == 0 {
+                    IngressReplyObservation::Acknowledged
+                } else {
+                    IngressReplyObservation::Indeterminate
+                }
+            },
+        )
+        .map_err(|_| Error::Reply)?;
+    if observation != IngressReplyObservation::Acknowledged {
+        // An indeterminate send keeps the seal: neither replay nor redelivery is permitted.
+        return Err(Error::Reply);
+    }
+    // The caller has its answer; the row now settles like any acknowledged delivery.
+    row.handoff_quarantine = None;
+    row.delivered = true;
+    finish_acknowledged(row)?;
+    Ok(true)
 }
 
 /// Import only the selected ordinary root child after its dependent route is authenticated.
@@ -619,7 +737,7 @@ pub(crate) unsafe fn take_selected_root_hosted_with(
     snapshot: PendingSnapshot,
     admission: ExternalAdmissionKey,
     parent_identity: nt_component_suspension::NestedExecutionIdentity,
-    import: impl FnOnce(u64, &ReceivedMessage) -> SelectedRootImportOutcome,
+    import: impl FnOnce(u64, &ReceivedMessage) -> RootReplyImportOutcome,
 ) -> Result<(u64, ReceivedMessage), SelectedRootImportFailure> {
     let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
         .find(|row| row.binding == snapshot.binding
@@ -662,9 +780,9 @@ pub(crate) unsafe fn take_selected_root_hosted_with(
     let reply = call.reply();
     let attempt = root.pass.begin_import(row.binding, call).map_err(|_| Error::Admission)?;
     match import(reply, &message) {
-        SelectedRootImportOutcome::Imported => {}
-        SelectedRootImportOutcome::Retained => return Err(Error::Retain.into()),
-        SelectedRootImportOutcome::RefusedNoEffect => {
+        RootReplyImportOutcome::Imported => {}
+        RootReplyImportOutcome::Retained => return Err(Error::Retain.into()),
+        RootReplyImportOutcome::RefusedNoEffect => {
             let no_effect = attempt.after_no_effect_native_refusal();
             // The native importer certified no pool/main effect. Recheck the independent
             // Call, physical Reply and parent before consuming that one-shot receipt.

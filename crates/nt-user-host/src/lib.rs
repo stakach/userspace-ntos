@@ -44,6 +44,7 @@ mod returned_pump_owner_tests;
 #[cfg(test)]
 mod retained_owner_table_tests;
 pub mod root_ingress_handoff;
+pub mod root_handoff_readmission;
 pub mod root_ingress_result;
 pub mod root_ingress_read_request;
 
