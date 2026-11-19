@@ -62,6 +62,7 @@ pub mod crypto;
 pub mod csr;
 pub mod dbg;
 pub mod etw;
+pub mod etw_classic;
 pub mod handle_table;
 pub mod heap;
 pub mod ki;

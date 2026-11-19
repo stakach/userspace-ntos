@@ -6,6 +6,10 @@
 
 use alloc::vec::Vec;
 
+#[path = "native_sd_auto_inherit.rs"]
+mod auto_inherit;
+pub use auto_inherit::set_security_descriptor_bytes_ex;
+
 use crate::access::{
     validate_object_type_list, Ace, AceType, Acl, ObjectTypeEntry, SecurityDescriptor,
     ACCESS_MAX_LEVEL,

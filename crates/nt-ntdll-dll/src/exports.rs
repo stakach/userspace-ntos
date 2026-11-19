@@ -24,7 +24,7 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+pub(crate) use alloc::vec::Vec;
 use core::ffi::{c_void, VaList};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -9580,9 +9580,10 @@ pub unsafe extern "system" fn ldr_unlock_loader_lock(flags: u32, cookie: usize) 
 
 /// `LdrInitShimEngineDynamic(PVOID BaseAddress) -> BOOLEAN`.
 ///
-/// ReactOS apphelp calls this after loading dynamically. Record the shim module base once under the
-/// loader lock; the actual shim callback interface is not invoked until the loader has full shim
-/// policy support.
+/// ReactOS `ldrapi.c`: under the loader lock, adopt `BaseAddress` as the shim engine if none is
+/// set and resolve its `SE_*` interface (`LdrpGetShimEngineInterface`). The loader then calls
+/// `SE_DllLoaded`, `SE_DllUnloaded` and `SE_ProcessDying` at the points ReactOS does. An engine
+/// without the complete interface is not used.
 #[export_name = "LdrInitShimEngineDynamic"]
 pub unsafe extern "system" fn ldr_init_shim_engine_dynamic(base_address: *mut c_void) -> u8 {
     let mut cookie = 0usize;
@@ -9592,15 +9593,87 @@ pub unsafe extern "system" fn ldr_init_shim_engine_dynamic(base_address: *mut c_
     if status != STATUS_SUCCESS {
         return 0;
     }
-    let _ = LDR_SHIM_ENGINE_MODULE.compare_exchange(
-        0,
-        base_address as u64,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+    if LDR_SHIM_ENGINE_MODULE
+        .compare_exchange(0, base_address as u64, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        unsafe { load_shim_engine_interface(base_address) };
+    }
     // SAFETY: release the cookie from the matching lock call.
     let _ = unsafe { ldr_unlock_loader_lock(0, cookie) };
     1
+}
+
+/// The enabled shim engine's `SE_*` entry points (encoded with the system cookie), or zeros.
+static LDR_SHIM_ENGINE_INTERFACE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static LDR_SHIMS_ENABLED: AtomicU32 = AtomicU32::new(0);
+
+/// `LdrpGetShimEngineInterface`: resolve and publish the interface, or leave shims disabled.
+///
+/// # Safety
+/// `module` is a loaded module; the loader lock is held.
+unsafe fn load_shim_engine_interface(module: *mut c_void) {
+    let interface = nt_ntdll::loader::shim_engine::ShimEngineInterface::resolve(|name| {
+        let mut address: *mut c_void = core::ptr::null_mut();
+        // ANSI_STRING { Length, MaximumLength, Buffer @8 }.
+        let mut ansi = [0u64; 2];
+        ansi[0] = (name.len() as u64) | ((name.len() as u64) << 16);
+        ansi[1] = name.as_ptr() as u64;
+        let status = unsafe {
+            ldr_get_procedure_address(module, ansi.as_ptr().cast(), 0, &mut address)
+        };
+        if status == STATUS_SUCCESS { address as u64 } else { 0 }
+    });
+    let Some(interface) = interface else {
+        LDR_SHIMS_ENABLED.store(0, Ordering::Release);
+        return;
+    };
+    for (slot, address) in LDR_SHIM_ENGINE_INTERFACE.iter().zip([
+        interface.dll_loaded,
+        interface.dll_unloaded,
+        interface.install_before_init,
+        interface.install_after_init,
+        interface.process_dying,
+    ]) {
+        let encoded = unsafe { rtl_encode_system_pointer(address as *mut c_void) } as u64;
+        slot.store(encoded, Ordering::Release);
+    }
+    LDR_SHIMS_ENABLED.store(1, Ordering::Release);
+}
+
+fn shim_engine_routine(index: usize) -> Option<u64> {
+    if LDR_SHIMS_ENABLED.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let encoded = LDR_SHIM_ENGINE_INTERFACE[index].load(Ordering::Acquire);
+    Some(unsafe { rtl_decode_system_pointer(encoded as *mut c_void) } as u64)
+}
+
+/// `SE_DllLoaded(LdrEntry)` before a newly loaded module's initialization routines run.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn shim_engine_dll_loaded(entry: u64) {
+    if let Some(routine) = shim_engine_routine(0) {
+        let routine: unsafe extern "system" fn(u64) = unsafe { core::mem::transmute(routine as usize) };
+        unsafe { routine(entry) };
+    }
+}
+
+/// `SE_DllUnloaded(LdrEntry)` before an unloaded module leaves the loader lists.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn shim_engine_dll_unloaded(entry: u64) {
+    if let Some(routine) = shim_engine_routine(1) {
+        let routine: unsafe extern "system" fn(u64) = unsafe { core::mem::transmute(routine as usize) };
+        unsafe { routine(entry) };
+    }
+}
+
+/// `SE_ProcessDying()` at the start of process shutdown.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn shim_engine_process_dying() {
+    if let Some(routine) = shim_engine_routine(4) {
+        let routine: unsafe extern "system" fn() = unsafe { core::mem::transmute(routine as usize) };
+        unsafe { routine() };
+    }
 }
 
 /// `LdrDisableThreadCalloutsForDll(PVOID DllHandle) -> NTSTATUS` — persist thread-callout
@@ -24492,7 +24565,7 @@ fn etw_provider_guard() -> EtwProviderGuard {
     EtwProviderGuard
 }
 
-fn etw_provider_registered(handle: u64) -> bool {
+pub(crate) fn etw_provider_registered(handle: u64) -> bool {
     let _guard = etw_provider_guard();
     unsafe { (&*core::ptr::addr_of!(ETW_PROVIDER_REGISTRY)).contains(handle) }
 }
@@ -24779,80 +24852,6 @@ pub unsafe extern "system" fn etw_write(
 ) -> u32 {
     etw_validate_write(registration_handle, descriptor, count, data)
 }
-
-macro_rules! etw_ok {
-    ($export:literal, $fn:ident) => {
-        /// ETW trace API — tracing disabled; returns ERROR_SUCCESS (0).
-        ///
-        /// # Safety
-        /// Called with the corresponding Etw* ABI; ignores its args (no trace session).
-        #[export_name = $export]
-        pub unsafe extern "system" fn $fn(_a: u64, _b: u64, _c: u64, _d: u64) -> u32 {
-            0
-        }
-    };
-}
-etw_ok!("EtwControlTraceA", etw_control_trace_a);
-etw_ok!("EtwControlTraceW", etw_control_trace_w);
-etw_ok!("EtwCreateTraceInstanceId", etw_create_trace_instance_id);
-etw_ok!("EtwDeliverDataBlock", etw_deliver_data_block);
-etw_ok!("EtwEnableTrace", etw_enable_trace);
-etw_ok!(
-    "EtwEnumerateProcessRegGuids",
-    etw_enumerate_process_reg_guids
-);
-etw_ok!("EtwEnumerateTraceGuids", etw_enumerate_trace_guids);
-etw_ok!("EtwFlushTraceA", etw_flush_trace_a);
-etw_ok!("EtwFlushTraceW", etw_flush_trace_w);
-etw_ok!("EtwGetTraceEnableFlags", etw_get_trace_enable_flags);
-etw_ok!("EtwGetTraceEnableLevel", etw_get_trace_enable_level);
-etw_ok!("EtwGetTraceLoggerHandle", etw_get_trace_logger_handle);
-etw_ok!("EtwLogTraceEvent", etw_log_trace_event);
-etw_ok!("EtwNotificationRegister", etw_notification_register);
-etw_ok!(
-    "EtwNotificationRegistrationA",
-    etw_notification_registration_a
-);
-etw_ok!(
-    "EtwNotificationRegistrationW",
-    etw_notification_registration_w
-);
-etw_ok!("EtwNotificationUnregister", etw_notification_unregister);
-etw_ok!(
-    "EtwProcessPrivateLoggerRequest",
-    etw_process_private_logger_request
-);
-etw_ok!("EtwQueryAllTracesA", etw_query_all_traces_a);
-etw_ok!("EtwQueryAllTracesW", etw_query_all_traces_w);
-etw_ok!("EtwQueryTraceA", etw_query_trace_a);
-etw_ok!("EtwQueryTraceW", etw_query_trace_w);
-etw_ok!("EtwReceiveNotificationsA", etw_receive_notifications_a);
-etw_ok!("EtwReceiveNotificationsW", etw_receive_notifications_w);
-etw_ok!(
-    "EtwRegisterSecurityProvider",
-    etw_register_security_provider
-);
-etw_ok!("EtwRegisterTraceGuidsA", etw_register_trace_guids_a);
-etw_ok!("EtwRegisterTraceGuidsW", etw_register_trace_guids_w);
-etw_ok!("EtwReplyNotification", etw_reply_notification);
-etw_ok!("EtwSendNotification", etw_send_notification);
-etw_ok!("EtwSetMark", etw_set_mark);
-etw_ok!("EtwStartTraceA", etw_start_trace_a);
-etw_ok!("EtwStartTraceW", etw_start_trace_w);
-etw_ok!("EtwStopTraceA", etw_stop_trace_a);
-etw_ok!("EtwStopTraceW", etw_stop_trace_w);
-etw_ok!("EtwTraceEvent", etw_trace_event);
-etw_ok!("EtwTraceEventInstance", etw_trace_event_instance);
-etw_ok!("EtwTraceMessage", etw_trace_message);
-etw_ok!("EtwTraceMessageVa", etw_trace_message_va);
-etw_ok!("EtwUnregisterTraceGuids", etw_unregister_trace_guids);
-etw_ok!("EtwUpdateTraceA", etw_update_trace_a);
-etw_ok!("EtwUpdateTraceW", etw_update_trace_w);
-etw_ok!("EtwpCreateEtwThread", etwp_create_etw_thread);
-etw_ok!("EtwpGetCpuSpeed", etwp_get_cpu_speed);
-etw_ok!("EtwpGetTraceBuffer", etwp_get_trace_buffer);
-etw_ok!("EtwpNotificationThread", etwp_notification_thread);
-etw_ok!("EtwpSetHWConfigFunction", etwp_set_hw_config_function);
 
 // =================================================================================================
 // BATCH 4 — Zw* aliases. Zw* and Nt* are identical exports (same SSN, same ABI) — real ntdll
@@ -28623,28 +28622,37 @@ pub unsafe extern "system" fn wer_check_event_escalation(_event: u32, escalated:
     0
 }
 
-/// `WerReportSQMEvent(...)` — telemetry disabled; event accepted and dropped.
+// There is no Windows Error Reporting or SQM service. Queries answer truthfully (not opted in,
+// no event enabled, no escalation); operations that would hand data to the service fail with
+// STATUS_NOT_IMPLEMENTED, as Wine's `WinSqmEndSession` does, instead of dropping it.
+
+/// `WerReportSQMEvent(...)`: no WER service receives the event.
 #[export_name = "WerReportSQMEvent"]
 pub extern "system" fn wer_report_sqm_event(_a: usize, _b: usize, _c: usize) -> u32 {
-    0
+    STATUS_NOT_IMPLEMENTED
 }
 
-/// `WerReportWatsonEvent(...)` — telemetry disabled; event accepted and dropped.
+/// `WerReportWatsonEvent(...)`: no WER service receives the report.
 #[export_name = "WerReportWatsonEvent"]
 pub extern "system" fn wer_report_watson_event(_a: usize, _b: usize, _c: usize, _d: usize) -> u32 {
-    0
+    STATUS_NOT_IMPLEMENTED
 }
 
-/// `WinSqmStartSession(...)` — SQM telemetry disabled; no session handle.
+/// `WinSqmStartSession(GUID*, DWORD, DWORD) -> HANDLE`: no session; `INVALID_HANDLE_VALUE` as in
+/// Wine.
 #[export_name = "WinSqmStartSession"]
-pub extern "system" fn win_sqm_start_session(_session_name: *const c_void) -> *mut c_void {
-    core::ptr::null_mut()
+pub extern "system" fn win_sqm_start_session(
+    _session_guid: *const c_void,
+    _session_id: u32,
+    _unknown: u32,
+) -> *mut c_void {
+    usize::MAX as *mut c_void
 }
 
-/// `WinSqmEndSession(...)` — SQM telemetry disabled; no-op.
+/// `WinSqmEndSession(HANDLE) -> NTSTATUS`: no session can exist; Wine returns the same status.
 #[export_name = "WinSqmEndSession"]
 pub extern "system" fn win_sqm_end_session(_session: *mut c_void) -> u32 {
-    0
+    STATUS_NOT_IMPLEMENTED
 }
 
 /// `WinSqmIsOptedIn()` — telemetry opt-in is false.
@@ -28659,13 +28667,13 @@ pub extern "system" fn win_sqm_event_enabled(_event_id: u32, _session: *mut c_vo
     0
 }
 
-/// `WinSqmEventWrite(...)` — telemetry disabled; event accepted and dropped.
+/// `WinSqmEventWrite(...)`: no SQM service receives the event.
 #[export_name = "WinSqmEventWrite"]
 pub extern "system" fn win_sqm_event_write(_a: usize, _b: usize, _c: usize) -> u32 {
-    0
+    STATUS_NOT_IMPLEMENTED
 }
 
-/// `WinSqmAddToStream(...)` — telemetry disabled; event accepted and dropped.
+/// `WinSqmAddToStream(...)`: no SQM session exists to receive the data.
 #[export_name = "WinSqmAddToStream"]
 pub extern "system" fn win_sqm_add_to_stream(
     _session: *mut c_void,
@@ -28673,17 +28681,17 @@ pub extern "system" fn win_sqm_add_to_stream(
     _kind: u32,
     _value: usize,
 ) -> u32 {
-    0
+    STATUS_NOT_IMPLEMENTED
 }
 
-/// `WinSqmSetString(...)` — telemetry disabled; string accepted and dropped.
+/// `WinSqmSetString(...)`: no SQM session exists to receive the data.
 #[export_name = "WinSqmSetString"]
 pub extern "system" fn win_sqm_set_string(
     _session: *mut c_void,
     _id: u32,
     _value: *const u16,
 ) -> u32 {
-    0
+    STATUS_NOT_IMPLEMENTED
 }
 
 /// `__misaligned_access()` — x64 compatibility diagnostic hook; no-op.
@@ -29446,7 +29454,10 @@ pub unsafe extern "system" fn csr_new_thread() -> NtStatus {
 
 /// `CsrIdentifyAlertableThread() -> NTSTATUS`.
 ///
-/// Deprecated on the NT 5.2+ ReactOS target; returns success.
+/// The NT 5.2+ result. ReactOS `subsystems/csr/csrlib/api.c` sends `CsrpIdentifyAlertableThread`
+/// only before Server 2003 and otherwise returns success without a message, and its csrsrv
+/// (`server.c`, `CsrServerApiDispatchTable`) replaces that API with `CsrSrvUnusedFunction` from
+/// Server 2003 on. The pinned release targets 0xA00, so there is no server operation to request.
 #[export_name = "CsrIdentifyAlertableThread"]
 pub unsafe extern "system" fn csr_identify_alertable_thread() -> NtStatus {
     STATUS_SUCCESS
@@ -29767,9 +29778,14 @@ pub unsafe extern "system" fn rtl_convert_variant_to_property(
     property
 }
 
-/// `RtlSetUnicodeCallouts(UNICODECALLOUTS*)` — legacy compatibility no-op.
+/// `RtlSetUnicodeCallouts(UNICODECALLOUTS*)`: an NT 5.2-only hook whose callouts the Unicode
+/// routines here never consult; Wine and ReactOS declare it as a stub, and no installed release
+/// binary imports it. Accepting the table would claim an effect it cannot have, so this raises
+/// `STATUS_NOT_IMPLEMENTED` like the other declared stubs.
 #[export_name = "RtlSetUnicodeCallouts"]
-pub extern "system" fn rtl_set_unicode_callouts(_unicode_callouts: *mut c_void) {}
+pub unsafe extern "system" fn rtl_set_unicode_callouts(_unicode_callouts: *mut c_void) {
+    unsafe { rtl_raise_status(STATUS_NOT_IMPLEMENTED) };
+}
 
 unsafe fn write_parsed_propvariant(
     out: *mut RawPropVariant,
@@ -30851,13 +30867,13 @@ pub unsafe extern "C" fn export_anchor() {
     core::hint::black_box(anchors_heap);
     // BATCH 4 — Etw* trace client.
     let anchors_etw: &[usize] = &[
-        etw_control_trace_a as *const () as usize,
-        etw_control_trace_w as *const () as usize,
-        etw_create_trace_instance_id as *const () as usize,
-        etw_deliver_data_block as *const () as usize,
-        etw_enable_trace as *const () as usize,
-        etw_enumerate_process_reg_guids as *const () as usize,
-        etw_enumerate_trace_guids as *const () as usize,
+        crate::etw_classic_exports::etw_control_trace_a as *const () as usize,
+        crate::etw_classic_exports::etw_control_trace_w as *const () as usize,
+        crate::etw_classic_exports::etw_create_trace_instance_id as *const () as usize,
+        crate::etw_classic_exports::etw_deliver_data_block as *const () as usize,
+        crate::etw_classic_exports::etw_enable_trace as *const () as usize,
+        crate::etw_classic_exports::etw_enumerate_process_reg_guids as *const () as usize,
+        crate::etw_classic_exports::etw_enumerate_trace_guids as *const () as usize,
         etw_event_activity_id_control as *const () as usize,
         etw_event_enabled as *const () as usize,
         etw_event_provider_enabled as *const () as usize,
@@ -30872,49 +30888,49 @@ pub unsafe extern "C" fn export_anchor() {
         etw_event_write_start_scenario as *const () as usize,
         etw_event_write_string as *const () as usize,
         etw_event_write_transfer as *const () as usize,
-        etw_flush_trace_a as *const () as usize,
-        etw_flush_trace_w as *const () as usize,
-        etw_get_trace_enable_flags as *const () as usize,
-        etw_get_trace_enable_level as *const () as usize,
-        etw_get_trace_logger_handle as *const () as usize,
-        etw_log_trace_event as *const () as usize,
-        etw_notification_register as *const () as usize,
-        etw_notification_registration_a as *const () as usize,
-        etw_notification_registration_w as *const () as usize,
-        etw_notification_unregister as *const () as usize,
-        etw_process_private_logger_request as *const () as usize,
-        etw_query_all_traces_a as *const () as usize,
-        etw_query_all_traces_w as *const () as usize,
-        etw_query_trace_a as *const () as usize,
-        etw_query_trace_w as *const () as usize,
-        etw_receive_notifications_a as *const () as usize,
-        etw_receive_notifications_w as *const () as usize,
+        crate::etw_classic_exports::etw_flush_trace_a as *const () as usize,
+        crate::etw_classic_exports::etw_flush_trace_w as *const () as usize,
+        crate::etw_classic_exports::etw_get_trace_enable_flags as *const () as usize,
+        crate::etw_classic_exports::etw_get_trace_enable_level as *const () as usize,
+        crate::etw_classic_exports::etw_get_trace_logger_handle as *const () as usize,
+        crate::etw_classic_exports::etw_log_trace_event as *const () as usize,
+        crate::etw_classic_exports::etw_notification_register as *const () as usize,
+        crate::etw_classic_exports::etw_notification_registration_a as *const () as usize,
+        crate::etw_classic_exports::etw_notification_registration_w as *const () as usize,
+        crate::etw_classic_exports::etw_notification_unregister as *const () as usize,
+        crate::etw_classic_exports::etw_process_private_logger_request as *const () as usize,
+        crate::etw_classic_exports::etw_query_all_traces_a as *const () as usize,
+        crate::etw_classic_exports::etw_query_all_traces_w as *const () as usize,
+        crate::etw_classic_exports::etw_query_trace_a as *const () as usize,
+        crate::etw_classic_exports::etw_query_trace_w as *const () as usize,
+        crate::etw_classic_exports::etw_receive_notifications_a as *const () as usize,
+        crate::etw_classic_exports::etw_receive_notifications_w as *const () as usize,
         etw_register as *const () as usize,
-        etw_register_security_provider as *const () as usize,
-        etw_register_trace_guids_a as *const () as usize,
-        etw_register_trace_guids_w as *const () as usize,
-        etw_reply_notification as *const () as usize,
-        etw_send_notification as *const () as usize,
-        etw_set_mark as *const () as usize,
-        etw_start_trace_a as *const () as usize,
-        etw_start_trace_w as *const () as usize,
-        etw_stop_trace_a as *const () as usize,
-        etw_stop_trace_w as *const () as usize,
-        etw_trace_event as *const () as usize,
-        etw_trace_event_instance as *const () as usize,
-        etw_trace_message as *const () as usize,
-        etw_trace_message_va as *const () as usize,
+        crate::etw_classic_exports::etw_register_security_provider as *const () as usize,
+        crate::etw_classic_exports::etw_register_trace_guids_a as *const () as usize,
+        crate::etw_classic_exports::etw_register_trace_guids_w as *const () as usize,
+        crate::etw_classic_exports::etw_reply_notification as *const () as usize,
+        crate::etw_classic_exports::etw_send_notification as *const () as usize,
+        crate::etw_classic_exports::etw_set_mark as *const () as usize,
+        crate::etw_classic_exports::etw_start_trace_a as *const () as usize,
+        crate::etw_classic_exports::etw_start_trace_w as *const () as usize,
+        crate::etw_classic_exports::etw_stop_trace_a as *const () as usize,
+        crate::etw_classic_exports::etw_stop_trace_w as *const () as usize,
+        crate::etw_classic_exports::etw_trace_event as *const () as usize,
+        crate::etw_classic_exports::etw_trace_event_instance as *const () as usize,
+        crate::etw_classic_exports::etw_trace_message as *const () as usize,
+        crate::etw_classic_exports::etw_trace_message_va as *const () as usize,
         etw_unregister as *const () as usize,
-        etw_unregister_trace_guids as *const () as usize,
-        etw_update_trace_a as *const () as usize,
-        etw_update_trace_w as *const () as usize,
+        crate::etw_classic_exports::etw_unregister_trace_guids as *const () as usize,
+        crate::etw_classic_exports::etw_update_trace_a as *const () as usize,
+        crate::etw_classic_exports::etw_update_trace_w as *const () as usize,
         etw_write as *const () as usize,
         etw_write_um_security_event as *const () as usize,
-        etwp_create_etw_thread as *const () as usize,
-        etwp_get_cpu_speed as *const () as usize,
-        etwp_get_trace_buffer as *const () as usize,
-        etwp_notification_thread as *const () as usize,
-        etwp_set_hw_config_function as *const () as usize,
+        crate::etw_classic_exports::etwp_create_etw_thread as *const () as usize,
+        crate::etw_classic_exports::etwp_get_cpu_speed as *const () as usize,
+        crate::etw_classic_exports::etwp_get_trace_buffer as *const () as usize,
+        crate::etw_classic_exports::etwp_notification_thread as *const () as usize,
+        crate::etw_classic_exports::etwp_set_hw_config_function as *const () as usize,
     ];
     core::hint::black_box(anchors_etw);
     // BATCH 4 — Rtl* memory / bitmap / atom / encode / time / random / SList / misc.
@@ -31304,4 +31320,20 @@ pub unsafe extern "C" fn export_anchor() {
     #[cfg(target_arch = "x86_64")]
     core::hint::black_box(anchors2);
     core::hint::black_box(anchors);
+}
+
+/// Register a classic or manifest ETW provider (shared registry).
+pub(crate) fn etw_register_provider(
+    provider: nt_ntdll::etw::Guid,
+    callback: usize,
+    context: usize,
+) -> Result<u64, u32> {
+    let _guard = etw_provider_guard();
+    unsafe { &mut *core::ptr::addr_of_mut!(ETW_PROVIDER_REGISTRY) }.register(provider, callback, context)
+}
+
+/// Remove a provider registration.
+pub(crate) fn etw_unregister_provider(handle: u64) -> u32 {
+    let _guard = etw_provider_guard();
+    unsafe { &mut *core::ptr::addr_of_mut!(ETW_PROVIDER_REGISTRY) }.unregister(handle)
 }

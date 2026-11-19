@@ -903,6 +903,8 @@ unsafe fn rollback_process_attach(table: *mut ModuleTable, attached: &[u64]) {
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn ldr_shutdown_process() -> u32 {
     const DLL_PROCESS_DETACH: u32 = 0;
+    // LdrShutdownProcess: tell the shim engine first.
+    unsafe { crate::exports::shim_engine_process_dying() };
     let table = core::ptr::addr_of_mut!(MODULE_TABLE);
     let mut index = unsafe { (*table).attach_order.as_slice().len() };
     while index != 0 {
@@ -4139,6 +4141,12 @@ unsafe fn ldr_load_dll_inner(
             loaded
         };
         trace.bookkeeping_done();
+        if newly_loaded {
+            let entry = ldr_entry_for_base(base);
+            if entry != 0 {
+                crate::exports::shim_engine_dll_loaded(entry);
+            }
+        }
         let attach_status = run_process_attach_root(table_ptr, base);
         trace.attach_done();
         if attach_status != 0 {
@@ -4325,6 +4333,7 @@ unsafe fn teardown_unreferenced_modules(teardown: &[u64]) -> u32 {
         let entry = unsafe { ldr_entry_for_base(base) };
         if entry != 0 {
             unsafe {
+                crate::exports::shim_engine_dll_unloaded(entry);
                 crate::exports::ldr_record_unload_event_for_entry(entry);
                 crate::exports::ldr_send_dll_notifications_for_base(base, 2);
             }

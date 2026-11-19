@@ -56,6 +56,7 @@ pub mod registry;
 pub mod resource;
 pub mod rxact;
 pub mod security;
+pub mod security_grant;
 pub mod splay;
 pub mod status;
 pub mod strings;
@@ -66,6 +67,7 @@ pub mod trace_database;
 pub mod user_stack;
 pub mod vectored_handler;
 pub mod version;
+pub mod wow64_machines;
 pub mod wait_address;
 
 // Re-export the counted-string type at the `rtl` root (used across the surface).

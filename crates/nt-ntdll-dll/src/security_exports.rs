@@ -79,9 +79,6 @@ const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
 const SACL_SECURITY_INFORMATION: u32 = 0x0000_0008;
 
 // Well-known access/privilege constants.
-const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
-const SE_SECURITY_PRIVILEGE: u32 = 8;
-const SE_PRIVILEGE_USED_FOR_ACCESS: u32 = 0x8000_0000;
 const ACL_REVISION2: u32 = 2;
 const SECURITY_LOCAL_SYSTEM_RID: u32 = 18;
 const SECURITY_BUILTIN_DOMAIN_RID: u32 = 32;
@@ -3229,8 +3226,9 @@ pub unsafe extern "system" fn rtl_set_security_object(
 }
 
 /// `RtlSetSecurityObjectEx(...) -> NTSTATUS`.
-/// Auto-inherit flags are not yet represented in the local descriptor materializer, so this shares
-/// the base `RtlSetSecurityObject` behavior.
+/// `RtlSetSecurityObject` plus auto-inheritance: with `SEF_DACL_AUTO_INHERIT` /
+/// `SEF_SACL_AUTO_INHERIT` the object keeps the ACEs it inherited and the caller replaces only
+/// the explicit ones (`nt_security::set_security_descriptor_bytes_ex`).
 ///
 /// # Safety
 /// Same descriptor pointer contract as `RtlSetSecurityObject`.
@@ -3243,22 +3241,90 @@ pub unsafe extern "system" fn rtl_set_security_object_ex(
     generic_mapping: *const c_void,
     token: *mut c_void,
 ) -> NtStatus {
-    let _ = auto_inherit_flags;
-    // SAFETY: forwards the same descriptor/update contract.
+    const SEF_DACL_AUTO_INHERIT: u32 = 0x01;
+    const SEF_SACL_AUTO_INHERIT: u32 = 0x02;
+    if auto_inherit_flags & (SEF_DACL_AUTO_INHERIT | SEF_SACL_AUTO_INHERIT) == 0 {
+        // SAFETY: forwards the same descriptor/update contract.
+        return unsafe {
+            rtl_set_security_object(
+                security_information,
+                modification_descriptor,
+                object_descriptor,
+                generic_mapping,
+                token,
+            )
+        };
+    }
+    if object_descriptor.is_null() || modification_descriptor.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
     unsafe {
-        rtl_set_security_object(
+        let current = *object_descriptor;
+        if current.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let Some(current_bytes) = self_relative_copy(current) else {
+            return STATUS_INVALID_SECURITY_DESCR;
+        };
+        let Some(modification_bytes) = self_relative_copy(modification_descriptor) else {
+            return STATUS_INVALID_SECURITY_DESCR;
+        };
+        let updated = match nt_security::set_security_descriptor_bytes_ex(
+            &current_bytes,
             security_information,
-            modification_descriptor,
-            object_descriptor,
-            generic_mapping,
-            token,
-        )
+            &modification_bytes,
+            auto_inherit_flags,
+        ) {
+            Ok(updated) => updated,
+            Err(status) => return status,
+        };
+        let new_sd = crate::process_heap_alloc(updated.len());
+        if new_sd.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        core::ptr::copy_nonoverlapping(updated.as_ptr(), new_sd, updated.len());
+        crate::process_heap_free(current as *mut u8);
+        *object_descriptor = new_sd as *mut c_void;
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (security_information, generic_mapping, token);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// A self-relative copy of an absolute or self-relative descriptor, or `None` if it is invalid.
+///
+/// # Safety
+/// `descriptor` is a readable SECURITY_DESCRIPTOR.
+#[cfg(target_arch = "x86_64")]
+unsafe fn self_relative_copy(descriptor: *const c_void) -> Option<crate::exports::Vec<u8>> {
+    unsafe {
+        if rtl_valid_security_descriptor(descriptor) == 0 {
+            return None;
+        }
+        let mut length = rtl_length_security_descriptor(descriptor);
+        let mut bytes = crate::exports::Vec::new();
+        bytes.resize(length as usize, 0u8);
+        let status = rtl_make_self_relative_sd(
+            descriptor,
+            bytes.as_mut_ptr() as *mut c_void,
+            &mut length,
+        );
+        if status != STATUS_SUCCESS {
+            return None;
+        }
+        bytes.truncate(length as usize);
+        Some(bytes)
     }
 }
 
 /// `RtlNewSecurityGrantedAccess(...) -> NTSTATUS`.
-/// Maps generic bits, grants `ACCESS_SYSTEM_SECURITY` using the standard SeSecurityPrivilege record,
-/// and returns the remaining desired access mask.
+/// Maps generic bits and grants `ACCESS_SYSTEM_SECURITY` only when the caller's token (the given
+/// one, else the thread's impersonation token, else the primary token) holds
+/// `SeSecurityPrivilege`; the rest of the access is left for the security descriptor.
 ///
 /// # Safety
 /// `length` and `remaining_desired_access` are writable; `privileges` is writable when `*length`
@@ -3272,39 +3338,82 @@ pub unsafe extern "system" fn rtl_new_security_granted_access(
     generic_mapping: *const c_void,
     remaining_desired_access: *mut u32,
 ) -> NtStatus {
-    let _ = token;
+    use nt_ntdll::rtl::security_grant as grant;
     if length.is_null() || remaining_desired_access.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    const PRIVILEGE_SET_SIZE: u32 = 20;
     let mut mapped_access = desired_access;
     // SAFETY: rtl_map_generic_mask accepts a null mapping as a no-op; mapped_access is writable.
     unsafe { rtl_map_generic_mask(&mut mapped_access, generic_mapping) };
-    let granted = mapped_access & ACCESS_SYSTEM_SECURITY != 0;
-    if granted {
-        mapped_access &= !ACCESS_SYSTEM_SECURITY;
-    }
+    let caller_token = (!token.is_null()).then_some(token as u64);
+    let granted =
+        match grant::new_security_granted_access(&mut NativeTokens, mapped_access, caller_token) {
+            Ok(granted) => granted,
+            Err(status) => return status,
+        };
     // SAFETY: length/remaining_desired_access are writable per the contract.
     unsafe {
-        *remaining_desired_access = mapped_access;
-        if *length < PRIVILEGE_SET_SIZE {
-            *length = PRIVILEGE_SET_SIZE;
-            return STATUS_BUFFER_TOO_SMALL;
+        *remaining_desired_access = granted.remaining;
+        let status = grant::privilege_buffer_status(&mut *length);
+        if status != STATUS_SUCCESS {
+            return status;
         }
-        *length = PRIVILEGE_SET_SIZE;
         if privileges.is_null() {
             return STATUS_INVALID_PARAMETER;
         }
-        let p = privileges as *mut u8;
-        core::ptr::write_bytes(p, 0, PRIVILEGE_SET_SIZE as usize);
-        core::ptr::write_unaligned(p as *mut u32, u32::from(granted));
-        if granted {
-            core::ptr::write_unaligned(p.add(0x08) as *mut u32, SE_SECURITY_PRIVILEGE);
-            core::ptr::write_unaligned(p.add(0x0C) as *mut u32, 0);
-            core::ptr::write_unaligned(p.add(0x10) as *mut u32, SE_PRIVILEGE_USED_FOR_ACCESS);
-        }
+        let set = grant::privilege_set(granted.security_privilege_used);
+        core::ptr::copy_nonoverlapping(set.as_ptr(), privileges as *mut u8, set.len());
     }
     STATUS_SUCCESS
+}
+
+/// The calling thread's token services, through the executive.
+struct NativeTokens;
+
+impl nt_ntdll::rtl::security_grant::TokenAccess for NativeTokens {
+    fn open_thread_token(&mut self) -> Result<u64, u32> {
+        const TOKEN_QUERY: u64 = 0x8;
+        let mut handle = 0u64;
+        let status = unsafe {
+            nt_ntdll::trap_stubs::nt_open_thread_token(
+                u64::MAX - 1, // NtCurrentThread()
+                TOKEN_QUERY,
+                1, // OpenAsSelf
+                (&mut handle as *mut u64) as u64,
+            )
+        } as u32;
+        if (status as i32) < 0 { Err(status) } else { Ok(handle) }
+    }
+
+    fn open_process_token(&mut self) -> Result<u64, u32> {
+        const TOKEN_QUERY: u64 = 0x8;
+        let mut handle = 0u64;
+        let status = unsafe {
+            nt_ntdll::trap_stubs::nt_open_process_token(
+                u64::MAX, // NtCurrentProcess()
+                TOKEN_QUERY,
+                (&mut handle as *mut u64) as u64,
+            )
+        } as u32;
+        if (status as i32) < 0 { Err(status) } else { Ok(handle) }
+    }
+
+    fn holds_privilege(&mut self, token: u64, _privilege: u32) -> Result<bool, u32> {
+        let mut request = nt_ntdll::rtl::security_grant::security_privilege_request();
+        let mut result = 0u8;
+        let status = unsafe {
+            nt_ntdll::trap_stubs::nt_privilege_check(
+                token,
+                request.as_mut_ptr() as u64,
+                (&mut result as *mut u8) as u64,
+            )
+        } as u32;
+        if (status as i32) < 0 { Err(status) } else { Ok(result != 0) }
+    }
+
+    fn close(&mut self, handle: u64) {
+        let _ = unsafe { nt_ntdll::trap_stubs::nt_close(handle) };
+    }
 }
 
 /// `RtlQuerySecurityObject(...)` — extract SECURITY_INFORMATION from an object's SD into a caller

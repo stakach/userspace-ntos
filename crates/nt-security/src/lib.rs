@@ -77,6 +77,7 @@ pub use key_open::{authorize_key_open, authorize_key_backup_restore, prepare_key
 pub use key_creation::{prepare_key_creation_security, KeyCreationAudit, KeyHandleSecurityAudit, PreparedKeyCreationSecurity};
 pub use native_acl_inheritance::{inherit_native_acl, NativeAclInheritance};
 pub use native_sd::{
+    set_security_descriptor_bytes_ex,
     assign_registry_root_security, assign_object_directory_root_security, assign_security_directory_security,
     assign_dos_devices_directory_security, mounted_hive_root_security, KEY_GENERIC_MAPPING,
     assign_object_security, assign_object_security_with_audit, capture_object_type_list,

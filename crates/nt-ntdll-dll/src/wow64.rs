@@ -157,22 +157,39 @@ pub unsafe extern "system" fn rtl_wow64_get_shared_info_process(
     STATUS_SUCCESS
 }
 
-/// `RtlWow64IsWowGuestMachineSupported(USHORT, BOOLEAN*) -> NTSTATUS`.
-/// No guest-machine support has been registered with this kernel personality.
+/// `RtlWow64IsWowGuestMachineSupported(USHORT, BOOLEAN*) -> NTSTATUS`: whether the kernel
+/// reports `machine` as a supported non-native architecture
+/// (`NtQuerySystemInformationEx(SystemSupportedProcessorArchitectures)`, as Wine asks it).
 ///
 /// # Safety
 /// `supported` must be writable.
 #[export_name = "RtlWow64IsWowGuestMachineSupported"]
 pub unsafe extern "system" fn rtl_wow64_is_wow_guest_machine_supported(
-    _machine: u16,
+    machine: u16,
     supported: *mut u8,
 ) -> u32 {
     if supported.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    let process = 0u64;
+    let mut entries = [0u32; 8];
+    let status = unsafe {
+        nt_ntdll::trap_stubs::nt_query_system_information_ex(
+            0xb5, // SystemSupportedProcessorArchitectures
+            (&process as *const u64) as u64,
+            core::mem::size_of::<u64>() as u64,
+            entries.as_mut_ptr() as u64,
+            core::mem::size_of_val(&entries) as u64,
+            0,
+        )
+    } as u32;
+    if status != 0 {
+        return status;
+    }
+    let found = nt_ntdll::rtl::wow64_machines::guest_machine_supported(&entries, machine);
     // SAFETY: the caller provided a writable one-byte BOOLEAN.
-    unsafe { ptr::write(supported, 0) };
-    STATUS_SUCCESS
+    unsafe { ptr::write(supported, u8::from(found)) };
+    0
 }
 
 /// `RtlWow64GetCpuAreaInfo(WOW64_CPURESERVED*, ULONG, WOW64_CPU_AREA_INFO*)`.

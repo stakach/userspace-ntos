@@ -96,6 +96,22 @@ pub fn product_info(os_major: u32, os_minor: u32, product_type: u32) -> (u32, bo
     }
 }
 
+/// `DEVICEFAMILYINFOENUM_DESKTOP` and `DEVICEFAMILYINFOENUM_SERVER`.
+const DEVICE_FAMILY_DESKTOP: u32 = 0x3;
+const DEVICE_FAMILY_SERVER: u32 = 0x9;
+
+/// `RtlGetDeviceFamilyInfoEnum`: the OS version packed as `major.minor.build.revision` (16 bits
+/// each, revision 0), and the family from the product type: a workstation is the desktop
+/// family (as Wine reports), a server product the server family. The device form is not known
+/// to the kernel, so it stays `DEVICEFAMILYDEVICEFORM_UNKNOWN` (0).
+pub fn device_family_info(version: PebVersion, product_type: u32) -> (u64, u32, u32) {
+    let packed = (u64::from(version.major as u16) << 48)
+        | (u64::from(version.minor as u16) << 32)
+        | (u64::from(version.build) << 16);
+    let family = if product_type == NT_PRODUCT_WIN_NT { DEVICE_FAMILY_DESKTOP } else { DEVICE_FAMILY_SERVER };
+    (packed, family, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -155,6 +171,12 @@ mod tests {
         assert_eq!(nt_version_numbers(4, 0, 1381), (5, 1, 0xf000_0565));
         assert_eq!(nt_version_numbers(5, 0, 2195), (5, 1, 0xf000_0893));
         assert_eq!(nt_version_numbers(5, 2, 3790), (5, 2, 0xf000_0ece));
+    }
+
+    #[test]
+    fn device_family_follows_the_published_version_and_product() {
+        assert_eq!(device_family_info(LIBERNT, 1), (0x000a_0000_65f4_0000, 3, 0));
+        assert_eq!(device_family_info(LIBERNT, 3).1, 9);
     }
 
     #[test]

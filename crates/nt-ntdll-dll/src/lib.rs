@@ -99,6 +99,9 @@ pub mod remaining_misc_exports;
 /// Source-checked ALPC, WNF, CFG, heap flush, and fault-label ABI entries.
 pub mod release_tail_exports;
 
+/// Classic ETW: trace providers, sessions and notifications.
+pub mod etw_classic_exports;
+
 /// Query whether a process handle names the current process.
 pub mod current_process;
 

@@ -84,8 +84,8 @@ pub unsafe extern "system" fn rtl_is_valid_locale_name(name: *const u16, flags: 
     )
 }
 
-/// No device-family provider is registered yet. Report unknown family and form
-/// rather than inventing a desktop identity for the host.
+/// `RtlGetDeviceFamilyInfoEnum(ULONGLONG*, DWORD*, DWORD*)`: the published OS version and the
+/// family of the system's product type (`nt_ntdll::rtl::version::device_family_info`).
 ///
 /// # Safety
 /// Non-null outputs are writable for their scalar type.
@@ -95,14 +95,31 @@ pub unsafe extern "system" fn rtl_get_device_family_info_enum(
     family: *mut u32,
     form: *mut u32,
 ) {
-    if !version.is_null() {
-        unsafe { *version = 0 };
-    }
-    if !family.is_null() {
-        unsafe { *family = 0 };
-    }
-    if !form.is_null() {
-        unsafe { *form = 0 };
+    let (packed, device_family, device_form) = unsafe {
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags, readonly));
+        let peb = peb as *const u8;
+        nt_ntdll::rtl::version::device_family_info(
+            nt_ntdll::rtl::version::PebVersion {
+                major: core::ptr::read_unaligned(peb.add(0x118) as *const u32),
+                minor: core::ptr::read_unaligned(peb.add(0x11c) as *const u32),
+                build: core::ptr::read_unaligned(peb.add(0x120) as *const u16),
+                csd_version: 0,
+                platform: 2,
+            },
+            core::ptr::read_unaligned(0x7ffe_0264 as *const u32), // KUSER NtProductType
+        )
+    };
+    unsafe {
+        if !version.is_null() {
+            *version = packed;
+        }
+        if !family.is_null() {
+            *family = device_family;
+        }
+        if !form.is_null() {
+            *form = device_form;
+        }
     }
 }
 
@@ -269,12 +286,4 @@ mod tests {
         assert!(address.is_null());
     }
 
-    #[test]
-    fn desktop_family_matches_wine_contract() {
-        let mut version = u64::MAX;
-        let mut family = u32::MAX;
-        let mut form = u32::MAX;
-        unsafe { rtl_get_device_family_info_enum(&mut version, &mut family, &mut form) };
-        assert_eq!((version, family, form), (0, 3, 0));
-    }
 }

@@ -42,6 +42,7 @@ pub mod order;
 pub mod peb;
 pub mod reference_graph;
 pub mod resolve;
+pub mod shim_engine;
 pub mod thread;
 pub mod tls;
 
