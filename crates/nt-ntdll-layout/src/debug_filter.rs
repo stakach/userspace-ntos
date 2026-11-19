@@ -105,6 +105,84 @@ const _: () = assert!(HOSTED_DRIVER_VA + (PAGE_SIZE as u64) < (1u64 << 47));
 mod tests {
     use super::*;
     use core::sync::atomic::Ordering;
+    use nt_compat_exports::debug_filter::SetFilterError;
+
+    // ReactOS/LiberNT contract (ntoskrnl/kd64/kdapi.c NtQueryDebugFilterState /
+    // NtSetDebugFilterState, kd64/kddata.c KdComponentTable, Kd_WIN2000_Mask = 1).
+    const DPFLTR_DEFAULT_ID: u32 = 101;
+    const DPFLTR_ENDOFTABLE_ID: u32 = 155;
+    const DPFLTR_MASK: u32 = 0x8000_0000;
+    const WIN2000: u32 = u32::MAX;
+
+    #[test]
+    fn contract_levels_below_32_are_bit_indexes_and_wider_levels_are_raw_masks() {
+        let page = DebugFilterPage::new();
+        page.set(7, 3, true, true).unwrap();
+        assert_eq!(page.query(7, 3), Some(true));
+        assert_eq!(page.query(7, DPFLTR_MASK | 0b1000), Some(true));
+        assert_eq!(page.query(7, DPFLTR_MASK | 0b0100), Some(false));
+        // Level 31 converts to 0x8000_0000, which the DPFLTR_MASK strip removes.
+        page.set(7, 31, true, true).unwrap();
+        assert_eq!(page.query(7, 31), Some(false));
+        // A raw DPFLTR_MASK value of only the flag selects no level.
+        assert_eq!(page.query(7, DPFLTR_MASK), Some(false));
+    }
+
+    #[test]
+    fn contract_unknown_components_share_the_default_component_mask() {
+        let page = DebugFilterPage::new();
+        // Kd_DEFAULT_Mask is both KdComponentTable[DPFLTR_DEFAULT_ID] and the
+        // Vista+ fallback for IDs outside the table.
+        page.set(DPFLTR_DEFAULT_ID, 2, true, true).unwrap();
+        assert_eq!(page.query(DPFLTR_ENDOFTABLE_ID + 1, 2), Some(true));
+        assert_eq!(page.query(0x1234_5678, 2), Some(true));
+        page.set(0x1234_5678, 2, false, true).unwrap();
+        assert_eq!(page.query(DPFLTR_DEFAULT_ID, 2), Some(false));
+        // The last table entry (DPFLTR_ENDOFTABLE_ID) is a real, distinct mask.
+        page.set(DPFLTR_ENDOFTABLE_ID, 4, true, true).unwrap();
+        assert_eq!(page.query(DPFLTR_ENDOFTABLE_ID + 1, 4), Some(false));
+    }
+
+    #[test]
+    fn contract_win2000_mask_starts_at_error_and_enables_every_component() {
+        let page = DebugFilterPage::new();
+        for component in [0, DPFLTR_DEFAULT_ID, DPFLTR_ENDOFTABLE_ID, 4096, WIN2000] {
+            assert_eq!(page.query(component, 0), Some(true), "component {component}");
+            assert_eq!(page.query(component, 1), Some(false), "component {component}");
+        }
+        page.set(WIN2000, 1, true, true).unwrap();
+        assert_eq!(page.query(42, 1), Some(true));
+        page.set(WIN2000, 0, false, true).unwrap();
+        assert_eq!(page.query(42, 0), Some(false));
+        assert_eq!(page.query(WIN2000, 0), Some(false));
+    }
+
+    #[test]
+    fn contract_set_requires_the_debug_privilege_and_changes_nothing_without_it() {
+        let page = DebugFilterPage::new();
+        for component in [3, DPFLTR_DEFAULT_ID, 9999, WIN2000] {
+            assert_eq!(page.set(component, 2, true, false), Err(SetFilterError::AccessDenied));
+            assert_eq!(page.query(component, 2), Some(false));
+        }
+        assert_eq!(page.set(WIN2000, 0, false, false), Err(SetFilterError::AccessDenied));
+        assert_eq!(page.query(3, 0), Some(true));
+    }
+
+    #[test]
+    fn contract_a_privileged_set_is_visible_through_every_mapped_view() {
+        // The root's writable alias and each hosted process/driver read-only
+        // mapping are views of one frame; model them as aliases of one page.
+        let frame = DebugFilterPage::new();
+        let root_alias: &DebugFilterPage = &frame;
+        let process_a: &DebugFilterPage = unsafe { &*(&frame as *const DebugFilterPage) };
+        let process_b: &DebugFilterPage = unsafe { &*(&frame as *const DebugFilterPage) };
+        assert_eq!(process_a.query(12, 3), Some(false));
+        root_alias.set(12, 3, true, true).unwrap();
+        assert_eq!(process_a.query(12, 3), Some(true));
+        assert_eq!(process_b.query(12, 3), Some(true));
+        root_alias.set(12, 3, false, true).unwrap();
+        assert_eq!(process_b.query(12, 3), Some(false));
+    }
 
     #[test]
     fn initial_page_matches_reactos_masks_and_complete_frame_layout() {

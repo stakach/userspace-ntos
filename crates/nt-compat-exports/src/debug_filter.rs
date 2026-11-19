@@ -8,10 +8,14 @@ const DPFLTR_MASK: u32 = 0x8000_0000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaskSlot { System, Default, Component(usize) }
 
+/// `DPFLTR_DEFAULT_ID`. Its `KdComponentTable` entry is `&Kd_DEFAULT_Mask`, the same mask
+/// Vista+ uses for IDs outside the table (ReactOS kd64/kddata.c, kdapi.c).
+pub const DEFAULT_COMPONENT: u32 = 101;
+
 pub const fn mask_slot(component: u32) -> MaskSlot {
     if component == SYSTEM_WIDE_COMPONENT { MaskSlot::System }
-    else if component < COMPONENT_COUNT as u32 { MaskSlot::Component(component as usize) }
-    else { MaskSlot::Default }
+    else if component == DEFAULT_COMPONENT || component >= COMPONENT_COUNT as u32 { MaskSlot::Default }
+    else { MaskSlot::Component(component as usize) }
 }
 
 /// Convert a level index or raw `DPFLTR_MASK` value into mask bits.

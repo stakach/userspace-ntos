@@ -38,22 +38,6 @@ pub mod level {
     pub const MASK: u32 = 0x8000_0000;
 }
 
-/// A host-testable component mask paired with the initial system-wide mask.
-/// Default component mask zero still enables `ERROR` through the system-wide bit.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct ComponentFilter {
-    /// The component's enabled-level bit mask.
-    pub mask: u32,
-}
-
-impl ComponentFilter {
-    /// Query with the initial system-wide mask and this component mask.
-    /// Native mutable masks are owned by the executive.
-    pub fn should_print(&self, level: u32) -> bool {
-        debug_filter_state(1, self.mask, level)
-    }
-}
-
 pub use nt_compat_exports::debug_filter::{enabled as debug_filter_state,
     level_mask as debug_filter_level_mask};
 
@@ -134,22 +118,6 @@ pub fn render_application_verifier_stop(
     }
     out.extend_from_slice(BANNER);
     out
-}
-
-/// `DbgPrintEx(ComponentId, Level, Format, …)` decision + render: returns `Some(bytes)` if the
-/// component/level filter passes, else `None` (suppressed — NOT printed, and NOT faked). The caller
-/// emits `Some` via the debug service.
-pub fn print_ex(
-    filter: ComponentFilter,
-    level: u32,
-    fmt: &[u8],
-    args: &[FmtArg],
-) -> Option<Vec<u8>> {
-    if filter.should_print(level) {
-        Some(render(fmt, args))
-    } else {
-        None
-    }
 }
 
 /// The `DbgPrompt` response shape: the prompt string is written to the debug service, and up to
@@ -523,51 +491,12 @@ mod tests {
     }
 
     #[test]
-    fn error_level_always_prints() {
-        let f = ComponentFilter::default();
-        assert!(f.should_print(level::ERROR));
-        // Non-error levels suppressed with an all-zero mask.
-        assert!(!f.should_print(level::WARNING));
-        assert!(!f.should_print(level::INFO));
-    }
-
-    #[test]
-    fn level_bit_filtering() {
-        // Enable WARNING (bit 1) + INFO (bit 3).
-        let f = ComponentFilter {
-            mask: (1 << level::WARNING) | (1 << level::INFO),
-        };
-        assert!(f.should_print(level::WARNING));
-        assert!(f.should_print(level::INFO));
-        assert!(!f.should_print(level::TRACE));
-    }
-
-    #[test]
-    fn masked_raw_importance() {
-        let f = ComponentFilter { mask: 0b0100 };
-        assert!(f.should_print(level::MASK | 0b0100));
-        assert!(!f.should_print(level::MASK | 0b0010));
-    }
-
-    #[test]
     fn debug_filter_query_uses_system_or_component_mask() {
         assert_eq!(debug_filter_level_mask(level::ERROR), 1);
         assert_eq!(debug_filter_level_mask(level::MASK | 0b0100), 0b0100);
         assert!(debug_filter_state(1, 0, level::ERROR));
         assert!(debug_filter_state(0, 1 << level::WARNING, level::WARNING));
         assert!(!debug_filter_state(0, 0, level::TRACE));
-    }
-
-    #[test]
-    fn print_ex_suppresses_without_faking() {
-        let f = ComponentFilter::default();
-        // ERROR prints.
-        assert_eq!(
-            print_ex(f, level::ERROR, b"boom %d", &[FmtArg::Int(1)]),
-            Some(b"boom 1".to_vec())
-        );
-        // TRACE suppressed → None (NOT an empty "success").
-        assert_eq!(print_ex(f, level::TRACE, b"noisy", &[]), None);
     }
 
     #[test]
