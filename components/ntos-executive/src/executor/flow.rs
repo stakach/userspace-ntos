@@ -460,3 +460,46 @@ pub(super) unsafe fn park_queued_callback_root_receive(
     (msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3) = received;
     QueuedCallbackPark::Turn(Turn::Next)
 }
+
+/// A `Retained` settlement is an owner waiting on its own native completion (for example a hook
+/// File pump behind the lazy checkpoint's physical command). It is never a loop exit: the root
+/// waits for its next event with every retained turn kept, using the parking primitive of the
+/// turn that owns the root. Only a proven `Blocked` settlement may exit.
+pub(super) unsafe fn wait_retained_settlement(
+    msg: &mut Message,
+    ingress: &mut Ingress,
+    nt_handler: &mut ExecNtHandler,
+    exit: &mut LoopExit,
+    root_event_consumed: &mut bool,
+    retry: bool,
+) -> QueuedCallbackPark {
+    trace_retained_settlement_wait(
+        ingress.root_add_device_turn.is_some(),
+        !ingress.root_queued_callback_turn.is_empty(),
+    );
+    if ingress.root_add_device_turn.is_none()
+        && queued_callback_turn_can_park(&ingress.root_queued_callback_turn)
+    {
+        return park_queued_callback_root_receive(
+            msg, ingress, nt_handler, exit, root_event_consumed, retry,
+        );
+    }
+    if ingress.root_add_device_turn.is_some()
+        && !prepare_parked_add_device_receive(&mut ingress.root_add_device_turn)
+    {
+        exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+        exit.stop_ssn = 0;
+        exit.record(b"retained-add-device-receive-prepare");
+        return QueuedCallbackPark::Turn(Turn::Exit);
+    }
+    let fault_ep = ingress.fault_ep;
+    let received = match receive(
+        ingress, nt_handler, exit, fault_ep,
+        || local().reply_main_slot.load(Ordering::Relaxed),
+    ) {
+        ControlFlow::Continue(message) => message,
+        ControlFlow::Break(turn) => return QueuedCallbackPark::Turn(turn),
+    };
+    (msg.badge, msg.mi, msg.m0, msg.m1, msg.m2, msg.m3) = received;
+    QueuedCallbackPark::Turn(Turn::Next)
+}

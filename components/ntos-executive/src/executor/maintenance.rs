@@ -240,11 +240,17 @@ pub(super) unsafe fn maintain(
                 (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
                 return ControlFlow::Break(Turn::Next);
             }
-            // A retained owner is waiting on its own native completion (for example a
-            // mounted read behind the lazy checkpoint's physical command). Wait for the root
-            // event that settles it; only a blocked owner is a refusal.
-            ConnectPumpSettlement::RetryableRestore | ConnectPumpSettlement::Retained => {
+            ConnectPumpSettlement::RetryableRestore => {
                 match park_queued_callback_root_receive(
+                    &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, true,
+                ) {
+                    QueuedCallbackPark::Retry => continue 'queued_callback_settlement,
+                    QueuedCallbackPark::Turn(turn) => return ControlFlow::Break(turn),
+                };
+            }
+            // Retained waits for the next root event; only Blocked exits.
+            ConnectPumpSettlement::Retained => {
+                match wait_retained_settlement(
                     &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, true,
                 ) {
                     QueuedCallbackPark::Retry => continue 'queued_callback_settlement,
@@ -343,8 +349,17 @@ pub(super) unsafe fn maintain(
                 ConnectPumpSettlement::AwaitingLocalChild => {
                     awaiting_connect_child = true;
                 }
-                ConnectPumpSettlement::RetryableRestore | ConnectPumpSettlement::Retained => {
+                ConnectPumpSettlement::RetryableRestore => {
                     match park_queued_callback_root_receive(
+                        &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, true,
+                    ) {
+                        QueuedCallbackPark::Retry => continue 'queued_callback_settlement,
+                        QueuedCallbackPark::Turn(turn) => return ControlFlow::Break(turn),
+                    };
+                }
+                // Retained waits for the next root event; only Blocked exits.
+                ConnectPumpSettlement::Retained => {
+                    match wait_retained_settlement(
                         &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, true,
                     ) {
                         QueuedCallbackPark::Retry => continue 'queued_callback_settlement,
@@ -377,8 +392,17 @@ pub(super) unsafe fn maintain(
                     awaiting_connect_child = true;
                     true
                 }
-                ConnectPumpSettlement::RetryableRestore | ConnectPumpSettlement::Retained => {
+                ConnectPumpSettlement::RetryableRestore => {
                     match park_queued_callback_root_receive(
+                        &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, true,
+                    ) {
+                        QueuedCallbackPark::Retry => continue 'queued_callback_settlement,
+                        QueuedCallbackPark::Turn(turn) => return ControlFlow::Break(turn),
+                    };
+                }
+                // Retained waits for the next root event; only Blocked exits.
+                ConnectPumpSettlement::Retained => {
+                    match wait_retained_settlement(
                         &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, true,
                     ) {
                         QueuedCallbackPark::Retry => continue 'queued_callback_settlement,
@@ -667,9 +691,17 @@ pub(super) unsafe fn maintain(
                     QueuedCallbackPark::Turn(turn) => return ControlFlow::Break(turn),
                 };
             }
-            // A retained owner waits on its own native completion; only Blocked refuses.
-            ConnectPumpSettlement::RetryableRestore | ConnectPumpSettlement::Retained => {
+            ConnectPumpSettlement::RetryableRestore => {
                 match park_queued_callback_root_receive(
+                    &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, false,
+                ) {
+                    QueuedCallbackPark::Retry => unreachable!(),
+                    QueuedCallbackPark::Turn(turn) => return ControlFlow::Break(turn),
+                };
+            }
+            // Retained waits for the next root event; only Blocked exits.
+            ConnectPumpSettlement::Retained => {
+                match wait_retained_settlement(
                     &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit, &mut root_event_consumed, false,
                 ) {
                     QueuedCallbackPark::Retry => unreachable!(),

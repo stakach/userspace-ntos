@@ -13703,6 +13703,33 @@ unsafe fn prepare_parked_add_device_receive(
     delay_timer_program(deadline, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY)
 }
 
+/// Bounded evidence for `executor::flow::wait_retained_settlement`.
+fn trace_retained_settlement_wait(add_device_turn: bool, queued_turn: bool) {
+    static TRACED: AtomicU64 = AtomicU64::new(0);
+    let n = TRACED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() {
+        return;
+    }
+    print_str(b"[retained-settlement-wait] n=");
+    print_u64(n);
+    print_str(b" add-device-turn=");
+    print_u64(u64::from(add_device_turn));
+    print_str(b" queued-turn=");
+    print_u64(u64::from(queued_turn));
+    print_str(b"\n");
+}
+
+/// Whether the newest queued-callback turn is the owner of a parkable root action (a child it
+/// needs or a restore it may retry). Read-only; `prepare_parked_queued_callback_receive`
+/// re-checks under its own witness.
+unsafe fn queued_callback_turn_can_park(current: &[RootQueuedCallbackTurn]) -> bool {
+    let Some(turn) = current.last() else { return false };
+    use crate::driver_launch::QueuedCallbackRootAction as Action;
+    matches!(crate::driver_launch::queued_callback_root_action(),
+        Some(Action::NeedsChild(selector) | Action::RetryRestore(selector))
+            if selector == turn.owner())
+}
+
 /// The queued callback's physical parent owns the root until its selected child or restore
 /// completes. A short one-shot wakes the root without dispatching unrelated timer providers.
 unsafe fn prepare_parked_queued_callback_receive(
