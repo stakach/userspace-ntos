@@ -124,6 +124,10 @@ pub(crate) unsafe fn contains_loaded_writable_storage(body: u64, length: u64) ->
 }
 
 /// File discovery is shared FS policy, not a driver-name dispatch table.
+///
+/// This is the Boot inline route's synchronous reader. Once the native block handoff starts the
+/// registered mounted-volume Device owns installed names; a caller on that route acquires the
+/// bytes through retained CREATE/READ IRPs and maps them with `load_installed_from_catalog`.
 pub(crate) unsafe fn load_installed(name: &str, pml4: u64) -> Result<(u64, u32), LoadFailure> {
     let name = module_namespace::module_leaf(name).map_err(|_| LoadFailure::InvalidImage)?;
     if let Some(image) = loaded_name(&name, pml4) {
@@ -131,6 +135,11 @@ pub(crate) unsafe fn load_installed(name: &str, pml4: u64) -> Result<(u64, u32),
     }
     if module_namespace::core_role(&name).is_some() {
         return Err(LoadFailure::InvalidImage);
+    }
+    let route = crate::fs_loader::exec_fs_mount_identity()
+        .and_then(crate::fs_loader::exec_block_route_kind);
+    if nt_fs::installed_image_reader(route) != Some(nt_fs::InstalledImageReader::BootReader) {
+        return Err(LoadFailure::DeviceNotReady);
     }
     let fs = exec_fs().ok_or(LoadFailure::NativeFailure)?;
     let mut path = crate::installed_layout::SYSTEM32_PREFIX.to_vec();

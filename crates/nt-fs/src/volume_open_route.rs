@@ -83,6 +83,27 @@ pub fn absolute_file_routes_to_mounted_volume(
     name.target == ResolvedFileTarget::FilesystemChild
 }
 
+/// The reader that may supply an installed system image's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstalledImageReader {
+    /// The boot loader's synchronous FAT reader, on the Boot inline route.
+    BootReader,
+    /// The registered mounted-volume Device, through retained CREATE and READ IRPs.
+    MountedVolume,
+}
+
+/// Select the reader for an installed system image, or `None` when no installed volume is
+/// mounted. Image reads never consult the writable overlay, so the registry journal's ownership
+/// of that overlay leaves them where they are; the native block handoff moves them for good.
+pub fn installed_image_reader(block_route: Option<BlockSourceKind>) -> Option<InstalledImageReader> {
+    let route = block_route?;
+    Some(if mounted_volume_owns_installed_names(Some(route), false) {
+        InstalledImageReader::MountedVolume
+    } else {
+        InstalledImageReader::BootReader
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +183,18 @@ mod tests {
                     false, name(ResolvedFileTarget::FilesystemChild, false), phase, journal),
                     "device-spelled child must enter the mounted Device: {phase:?} {journal}");
             }
+        }
+    }
+
+    #[test]
+    fn installed_images_use_the_boot_reader_only_on_the_boot_inline_route() {
+        assert_eq!(installed_image_reader(None), None, "no installed volume is mounted");
+        assert_eq!(installed_image_reader(Some(BlockSourceKind::Boot)),
+            Some(InstalledImageReader::BootReader));
+        for phase in [BlockSourceKind::Draining, BlockSourceKind::Native] {
+            assert_eq!(installed_image_reader(Some(phase)),
+                Some(InstalledImageReader::MountedVolume),
+                "after the handoff starts only the mounted Device may read images: {phase:?}");
         }
     }
 

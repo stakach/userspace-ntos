@@ -120,9 +120,7 @@ impl ExecNtHandler {
                     &relative[..len],
                 )
             }
-            FileParseRoot::OverlayFile(_) | FileParseRoot::FatDirectory { .. } => {
-                return Err(nt_fs::STATUS_NOT_SAME_DEVICE)
-            }
+            FileParseRoot::OverlayFile(_) => return Err(nt_fs::STATUS_NOT_SAME_DEVICE),
             FileParseRoot::NonDirectoryFile => return Err(nt_fs::STATUS_NOT_A_DIRECTORY),
             FileParseRoot::ObjectDirectory { .. } => return Err(STATUS_INVALID_HANDLE),
         };

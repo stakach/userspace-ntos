@@ -941,11 +941,6 @@ pub enum HandleObject {
         size: u32,
         object_id: u32,
     },
-    /// A directory on the executive's mounted FAT volume.
-    Directory {
-        first_cluster: u32,
-        object_id: u32,
-    },
     /// A file OR directory on the executive's WRITABLE overlay volume (`nt-fs` `MemFs`, mounted
     /// over the writable namespace prefixes). The `u64` is that volume's own file-object id.
     OverlayFile(u64),

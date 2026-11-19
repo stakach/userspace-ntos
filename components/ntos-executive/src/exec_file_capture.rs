@@ -169,7 +169,6 @@ impl ExecNtHandler {
                 object @ (nt_process::HandleObject::RoutedFile { .. }
                 | nt_process::HandleObject::File(_)
                 | nt_process::HandleObject::DiskFile { .. }
-                | nt_process::HandleObject::Directory { .. }
                 | nt_process::HandleObject::OverlayFile(_)),
             ) => object,
             Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),

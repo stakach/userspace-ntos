@@ -39,7 +39,6 @@ fn notification(file: LocalFileObject) -> PendingFileIo {
 fn local_zero_is_valid_in_each_independent_file_object_namespace() {
     for file in [
         LocalFileObject::ReadonlyFile(0),
-        LocalFileObject::ReadonlyDirectory(0),
         LocalFileObject::Overlay(0),
     ] {
         let mut table = PendingFileIoTable::new();
@@ -78,11 +77,10 @@ fn default_and_zero_hosted_routes_are_invalid_without_consuming_reservations() {
 }
 
 #[test]
-fn same_numeric_hosted_file_readonly_file_directory_and_overlay_are_distinct() {
+fn same_numeric_hosted_file_readonly_file_and_overlay_are_distinct() {
     let routes = [
         PendingFileRoute::Hosted(7),
         PendingFileRoute::Local(LocalFileObject::ReadonlyFile(7)),
-        PendingFileRoute::Local(LocalFileObject::ReadonlyDirectory(7)),
         PendingFileRoute::Local(LocalFileObject::Overlay(7)),
     ];
     for (index, route) in routes.iter().enumerate() {
@@ -96,7 +94,6 @@ fn same_numeric_hosted_file_readonly_file_directory_and_overlay_are_distinct() {
 fn every_local_route_rejects_provider_completion_even_when_numbers_match() {
     for file in [
         LocalFileObject::ReadonlyFile(7),
-        LocalFileObject::ReadonlyDirectory(7),
         LocalFileObject::Overlay(7),
     ] {
         let mut table = PendingFileIoTable::new();
@@ -132,14 +129,10 @@ fn hosted_and_overlay_u64_identities_never_lose_high_bits() {
 
 #[test]
 fn readonly_object_numbers_preserve_the_entire_u32_range() {
-    for file in [
-        LocalFileObject::ReadonlyFile(u32::MAX),
-        LocalFileObject::ReadonlyDirectory(u32::MAX),
-    ] {
-        let mut table = PendingFileIoTable::new();
-        let slot = table.park(inline(file)).unwrap();
-        assert_eq!(table.get(slot).unwrap().local_file_object(), Some(file));
-    }
+    let file = LocalFileObject::ReadonlyFile(u32::MAX);
+    let mut table = PendingFileIoTable::new();
+    let slot = table.park(inline(file)).unwrap();
+    assert_eq!(table.get(slot).unwrap().local_file_object(), Some(file));
 }
 
 #[test]
@@ -166,10 +159,9 @@ fn route_and_operation_domains_must_agree_before_owner_publication() {
 }
 
 #[test]
-fn byte_lock_rejects_readonly_directory_but_accepts_file_and_overlay() {
+fn byte_lock_accepts_readonly_file_and_overlay() {
     for (file, allowed) in [
         (LocalFileObject::ReadonlyFile(0), true),
-        (LocalFileObject::ReadonlyDirectory(0), false),
         (LocalFileObject::Overlay(0), true),
     ] {
         let mut pending = inline(file);
@@ -185,10 +177,9 @@ fn byte_lock_rejects_readonly_directory_but_accepts_file_and_overlay() {
 }
 
 #[test]
-fn notification_rejects_readonly_file_but_accepts_directory_and_overlay() {
+fn notification_rejects_readonly_file_but_accepts_overlay() {
     for (file, allowed) in [
         (LocalFileObject::ReadonlyFile(0), false),
-        (LocalFileObject::ReadonlyDirectory(0), true),
         (LocalFileObject::Overlay(0), true),
     ] {
         assert_eq!(
@@ -206,7 +197,6 @@ fn buffered_read_and_directory_query_do_not_cross_readonly_object_tables() {
     ] {
         for file in [
             LocalFileObject::ReadonlyFile(0),
-            LocalFileObject::ReadonlyDirectory(0),
             LocalFileObject::Overlay(0),
         ] {
             let mut table = PendingFileIoTable::new();
@@ -221,9 +211,6 @@ fn buffered_read_and_directory_query_do_not_cross_readonly_object_tables() {
             table.reserve_local_output(claim, 0).unwrap();
             let allowed = match file {
                 LocalFileObject::ReadonlyFile(_) => major == nt_io_abi::major::IRP_MJ_READ,
-                LocalFileObject::ReadonlyDirectory(_) => {
-                    major == nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL
-                }
                 LocalFileObject::Overlay(_) => true,
             };
             assert_eq!(table.park_reserved(claim, pending).is_ok(), allowed);
@@ -235,7 +222,6 @@ fn buffered_read_and_directory_query_do_not_cross_readonly_object_tables() {
 fn retained_flush_requires_overlay_backing_and_keeps_zero_object_identity() {
     for (file, allowed) in [
         (LocalFileObject::ReadonlyFile(0), false),
-        (LocalFileObject::ReadonlyDirectory(0), false),
         (LocalFileObject::Overlay(0), true),
     ] {
         let mut table = PendingFileIoTable::new();
@@ -254,16 +240,15 @@ fn retained_flush_requires_overlay_backing_and_keeps_zero_object_identity() {
 
 #[test]
 fn apc_interruption_uses_full_owner_identity_not_only_its_route_object_number() {
-    let route = PendingFileRoute::Local(LocalFileObject::ReadonlyDirectory(7));
+    let route = PendingFileRoute::Local(LocalFileObject::Overlay(7));
     let mut table = PendingFileIoTable::new();
     let slot = table
-        .park(notification(LocalFileObject::ReadonlyDirectory(7)))
+        .park(notification(LocalFileObject::Overlay(7)))
         .unwrap();
     let identity = table.identity(slot).unwrap();
     for wrong in [
         PendingFileRoute::Hosted(7),
         PendingFileRoute::Local(LocalFileObject::ReadonlyFile(7)),
-        PendingFileRoute::Local(LocalFileObject::Overlay(7)),
     ] {
         let mut other = PendingFileIoTable::new();
         let mut pending = if wrong.hosted_file_id().is_some() {

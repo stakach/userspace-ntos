@@ -66,9 +66,6 @@ impl ExecNtHandler {
                         .current_offset = u64::from_le_bytes(payload[..8].try_into().unwrap());
                     nt_fs::STATUS_SUCCESS
                 }
-                LocalFileObject::ReadonlyDirectory(_) => {
-                    unreachable!("local SET admitted an unsupported File kind")
-                }
             },
         };
         assert_ne!(

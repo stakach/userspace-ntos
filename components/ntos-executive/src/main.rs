@@ -2423,7 +2423,6 @@ impl WaitObject {
     pub(crate) const KIND_THREAD: u64 = 2;
     pub(crate) const KIND_FILE: u64 = 4;
     pub(crate) const KIND_FAT_FILE: u64 = 5;
-    pub(crate) const KIND_FAT_DIRECTORY: u64 = 6;
     pub(crate) const KIND_OVERLAY_FILE: u64 = 7;
     pub(crate) const KIND_JOB: u64 = 8;
     pub(crate) const KIND_IO_COMPLETION: u64 = 9;
@@ -2448,10 +2447,6 @@ impl WaitObject {
 
     pub(crate) const fn fat_file(object_id: u32) -> Self {
         Self((Self::KIND_FAT_FILE << Self::KIND_SHIFT) | object_id as u64)
-    }
-
-    pub(crate) const fn fat_directory(object_id: u32) -> Self {
-        Self((Self::KIND_FAT_DIRECTORY << Self::KIND_SHIFT) | object_id as u64)
     }
 
     pub(crate) const fn overlay_file(file_id: u64) -> Self {
@@ -2493,7 +2488,6 @@ impl WaitObject {
             Self::KIND_THREAD => b"thread",
             Self::KIND_FILE => b"file",
             Self::KIND_FAT_FILE => b"fat-file",
-            Self::KIND_FAT_DIRECTORY => b"fat-directory",
             Self::KIND_OVERLAY_FILE => b"overlay-file",
             Self::KIND_JOB => b"job",
             Self::KIND_IO_COMPLETION => b"io-completion",
@@ -7891,13 +7885,6 @@ fn pfilled_work_stats() -> (usize, usize, u64) {
 /// overflow on the deep FAT walk path while the persistent per-process rows now live in a growable
 /// heap-backed slice.
 static mut FILLED_WORK: [u64; 512] = [0u64; 512];
-
-/// Persistent directory FILE_OBJECT state. `ExecNtHandler` is a local in
-/// `service_sec_image`; embedding this table there adds roughly 34 KiB and makes the
-/// service function's frame exceed the bounded rootserver stack. The executive loop
-/// is serialized, so one fixed table can be reset and exclusively borrowed by each
-/// successive handler instance.
-static mut DIRECTORY_OPEN_WORK: nt_fs::DirectoryOpenTable<64> = nt_fs::DirectoryOpenTable::new();
 
 /// Persistent read-only FAT FILE_OBJECT state. Read-only file data stays on the boot FAT volume,
 /// but synchronous `NtReadFile(NULL ByteOffset)`, `FilePositionInformation`, and duplicated handles
@@ -24162,9 +24149,6 @@ struct ExecNtHandler {
     /// Shared FILE_OBJECT completion associations. Backed by BSS for the same bounded-stack reason
     /// as the completion-port table.
     file_completion: ExecFileCompletion,
-    /// Shared FILE_OBJECT-style state for FAT directory handles, including enumeration cursors.
-    /// The backing table lives in BSS to keep it off the bounded rootserver stack.
-    directory_opens: ExecDirectoryOpens,
     /// Shared FILE_OBJECT-style state for read-only FAT file handles, including current byte
     /// offsets used by synchronous implicit-position reads.
     readonly_file_opens: ExecReadOnlyFileOpens,
@@ -24174,9 +24158,6 @@ struct ExecNtHandler {
     /// Registry notify sessions and their posted `NtNotifyChangeKey` requests.
     registry_change_notifications:
         crate::exec_handler::registry_change_notify::RegistryChangeNotifications,
-    /// One-shot directory watches for the read-only FAT owner. Writable MemFs notifications remain
-    /// inside its `nt-fs::FileSystem`; provider-backed watches remain inside the receiving FSD.
-    readonly_directory_notifications: nt_fs::DirectoryNotifyTable<u64>,
     /// Per-call context the dispatch loop refreshes before each `dispatch` (Workstream A: the
     /// converged table-driven path carries executive context on the handler rather than a parallel
     /// mechanism). `pi` = process index (0 = smss, 1 = csrss); `stop` = a side-signal a handler
@@ -25579,100 +25560,6 @@ impl ExecThreadMechanisms {
         unsafe { (&*self.table).get_by_tid(tid) }
     }
 
-}
-
-/// Exclusive pointer to the serialized executive's fixed directory-open table.
-///
-/// Keeping the forwarding API here makes it impossible for the large table value to
-/// become an `ExecNtHandler` field again by accident.
-struct ExecDirectoryOpens {
-    table: *mut nt_fs::DirectoryOpenTable<64>,
-}
-
-impl ExecDirectoryOpens {
-    fn reset() -> Self {
-        let table = core::ptr::addr_of_mut!(DIRECTORY_OPEN_WORK);
-        // SAFETY: service_sec_image is serialized. A previous handler has been
-        // dropped before a new one is constructed, so no other table reference exists.
-        unsafe { (&mut *table).clear() };
-        Self { table }
-    }
-
-    fn create(
-        &mut self,
-        physical_mount: u64,
-        first_cluster: u32,
-        volume_relative_path: &[u8],
-        desired_access: u32,
-        share_access: u32,
-        create_options: u32,
-        metadata: nt_fs::FileMetadata,
-        alternate_name: nt_fs::FatShortName,
-    ) -> Result<u32, u32> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe {
-            (&mut *self.table).create_for_mount(
-                physical_mount,
-                first_cluster,
-                volume_relative_path,
-                desired_access,
-                share_access,
-                create_options,
-                metadata,
-                alternate_name,
-            )
-        }
-    }
-
-    fn get(&self, id: u32) -> Result<&nt_fs::DirectoryOpen, u32> {
-        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
-        unsafe { (&*self.table).get(id) }
-    }
-
-    fn get_mut(&mut self, id: u32) -> Result<&mut nt_fs::DirectoryOpen, u32> {
-        // SAFETY: mutable access is bounded by the borrow of this sole-owner wrapper.
-        unsafe { (&mut *self.table).get_mut(id) }
-    }
-
-    fn retain(&mut self, id: u32) -> Result<(), u32> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).retain(id) }
-    }
-
-    fn retain_io(&mut self, id: u32) -> Result<(), u32> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).retain_io(id) }
-    }
-
-    fn retain_referenced_io(&mut self, id: u32) -> Result<(), u32> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).retain_referenced_io(id) }
-    }
-
-    fn set_signaled(&mut self, id: u32, signaled: bool) -> Result<(), u32> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).set_signaled(id, signaled) }
-    }
-
-    fn is_signaled(&self, id: u32) -> Result<bool, u32> {
-        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
-        unsafe { (&*self.table).is_signaled(id) }
-    }
-
-    fn is_final_reference(&self, id: u32) -> Result<bool, u32> {
-        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
-        unsafe { (&*self.table).is_final_reference(id) }
-    }
-
-    fn release(&mut self, id: u32) -> Result<(), u32> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).release(id) }
-    }
-
-    fn release_io(&mut self, id: u32) -> Result<(), u32> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).release_io(id) }
-    }
 }
 
 /// Exclusive pointer to the serialized executive's lazily growing read-only File table.

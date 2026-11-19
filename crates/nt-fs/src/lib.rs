@@ -119,8 +119,8 @@ pub use path::{
 };
 pub use query::*;
 pub use volume_open_route::{
-    absolute_file_routes_to_mounted_volume, mounted_volume_owns_installed_names, AbsoluteFileName,
-    ResolvedFileTarget,
+    absolute_file_routes_to_mounted_volume, installed_image_reader,
+    mounted_volume_owns_installed_names, AbsoluteFileName, InstalledImageReader, ResolvedFileTarget,
 };
 pub use snapshot_store::{
     AnchoredWalPublication, AsyncSnapshotCommit, AsyncSnapshotCommitError, AsyncSnapshotHeaderRecheck,

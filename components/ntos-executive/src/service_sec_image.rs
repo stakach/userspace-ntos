@@ -6463,13 +6463,13 @@ pub(crate) unsafe fn service_win32k_gdi_image_request(
     print_str(b"[gdi-image-ingress] admitted tcb=0x"); print_hex_u64(channel.tcb);
     print_str(b" packet=0x"); print_hex_u64(packet);
     print_str(b" length="); print_u64(length); print_str(b"\n");
-    match crate::fs_loader::exec_fs_mount_identity().and_then(
+    match nt_fs::installed_image_reader(crate::fs_loader::exec_fs_mount_identity().and_then(
         crate::fs_loader::exec_block_route_kind,
-    ) {
-        Some(nt_fs::BlockSourceKind::Boot) => SubmitResult::Ready(
+    )) {
+        Some(nt_fs::InstalledImageReader::BootReader) => SubmitResult::Ready(
             crate::driver_launch::service_win32k_gdi_image_request(packet, length, source),
         ),
-        Some(nt_fs::BlockSourceKind::Native | nt_fs::BlockSourceKind::Draining) => {
+        Some(nt_fs::InstalledImageReader::MountedVolume) => {
             crate::gdi_routed_image_work::submit_routed_gdi_image(
                 route, dispatch, reply_cap, caller, source, packet, length,
             )
@@ -15172,10 +15172,6 @@ pub(crate) fn print_pending_file_route(route: nt_io_manager::PendingFileRoute) {
         }
         PendingFileRoute::Local(LocalFileObject::ReadonlyFile(id)) => {
             print_str(b"readonly-file/");
-            print_u64(u64::from(id));
-        }
-        PendingFileRoute::Local(LocalFileObject::ReadonlyDirectory(id)) => {
-            print_str(b"readonly-directory/");
             print_u64(u64::from(id));
         }
         PendingFileRoute::Local(LocalFileObject::Overlay(id)) => {

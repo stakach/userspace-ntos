@@ -1301,10 +1301,6 @@ fn generic_native_close_returns_each_removed_object_to_its_host_owner() {
             size: 13,
             object_id: 14,
         },
-        HandleObject::Directory {
-            first_cluster: 15,
-            object_id: 16,
-        },
         HandleObject::OverlayFile(17),
         HandleObject::IoCompletion(18),
         HandleObject::RegistryKey(19),

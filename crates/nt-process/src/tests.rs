@@ -2193,36 +2193,18 @@ fn disk_file_handles_preserve_backing_extent() {
 }
 
 #[test]
-fn directory_handles_preserve_backing_identity_and_access() {
-    let mut pm = ProcessManager::new();
-    let pid = pm.create_process("walker.exe", None, None);
-    let object = HandleObject::Directory {
-        first_cluster: 0x2345,
-        object_id: 7,
-    };
-    let handle = pm.insert_handle(pid, object, 0x0010_0020).unwrap();
-    assert_eq!(pm.lookup_handle(pid, handle), Some(object));
-    assert_eq!(pm.handle_access(pid, handle), Some(0x0010_0020));
-    assert_eq!(pm.close_handle(pid, handle), Ok(()));
-    assert_eq!(pm.lookup_handle(pid, handle), None);
-}
-
-#[test]
 fn process_teardown_can_drain_typed_handles() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("owner.exe", None, None);
     let file = HandleObject::File(41);
-    let directory = HandleObject::Directory {
-        first_cluster: 0x2345,
-        object_id: 7,
-    };
+    let overlay = HandleObject::OverlayFile(7);
     pm.insert_handle(pid, file, 1).unwrap();
-    pm.insert_handle(pid, directory, 1).unwrap();
+    pm.insert_handle(pid, overlay, 1).unwrap();
     let snapshot = pm.snapshot_process_handle_objects(pid).unwrap();
-    assert_eq!(snapshot.as_slice(), &[file, directory]);
+    assert_eq!(snapshot.as_slice(), &[file, overlay]);
     assert_eq!(pm.handle_count(pid), 2);
     assert_eq!(pm.take_any_handle(pid), Some(file));
-    assert_eq!(pm.take_any_handle(pid), Some(directory));
+    assert_eq!(pm.take_any_handle(pid), Some(overlay));
     assert_eq!(pm.take_any_handle(pid), None);
     assert_eq!(pm.handle_count(pid), 0);
     assert_eq!(pm.snapshot_process_handle_objects(pid).unwrap(), Vec::new());

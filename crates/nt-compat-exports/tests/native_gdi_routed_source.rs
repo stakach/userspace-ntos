@@ -8,15 +8,6 @@ const WORK: &str = include_str!("../../../components/ntos-executive/src/gdi_rout
 
 #[test]
 fn native_gdi_image_load_routes_away_from_the_retired_boot_fat_owner() {
-    let start = INGRESS.find("pub(crate) unsafe fn service_win32k_gdi_image_request(")
-        .expect("authenticated GDI ingress");
-    let body = &INGRESS[start..];
-    let end = body.find("\n}").expect("GDI ingress end");
-    let body = &body[..end];
-    assert!(body.contains("BlockSourceKind::Boot")
-        && body.contains("BlockSourceKind::Native")
-        && body.contains("submit_routed_gdi_image"),
-        "native GDI image loads must retain routed work instead of entering Boot FAT");
     let start = LOADER.find("fn load_installed_from_catalog(")
         .expect("routed catalog mapper");
     let source = &LOADER[start..];

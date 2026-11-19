@@ -125,7 +125,6 @@ fn local_zero_file_namespaces_have_full_non_busy_owner_identity() {
     let mut table = PendingFileIoTable::new();
     for (index, file) in [
         LocalFileObject::ReadonlyFile(0),
-        LocalFileObject::ReadonlyDirectory(0),
         LocalFileObject::Overlay(0),
         LocalFileObject::Overlay(u64::MAX),
     ]
@@ -144,7 +143,7 @@ fn local_zero_file_namespaces_have_full_non_busy_owner_identity() {
         assert_eq!(table.get_exact(identity), Some(pending));
         assert!(table.get_exact(identity).unwrap().busy.is_none());
     }
-    assert_eq!(table.drain_exact().count(), 4);
+    assert_eq!(table.drain_exact().count(), 3);
 }
 
 #[test]

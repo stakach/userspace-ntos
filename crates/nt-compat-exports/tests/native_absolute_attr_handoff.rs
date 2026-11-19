@@ -30,7 +30,6 @@ const FILE_OBJECT_NAME_CAP: usize = 512;
 const STATUS_DEVICE_NOT_READY: u32 = 0xc000_00a3;
 
 mod nt_fs {
-    pub const DIRECTORY_OPEN_PATH_CAP: usize = 1024;
     pub const STATUS_SUCCESS: u32 = 0;
     pub const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xc000_0034;
     pub const FILE_BASIC_INFORMATION: u32 = 4;
@@ -83,17 +82,10 @@ mod fs_loader {
 #[derive(Clone, Copy)]
 enum FileParseRoot {
     Absolute,
-    FatDirectory { first_cluster: u32, object_id: u32 },
     OverlayFile(u64),
     HostedFile { file_id: u64, device_id: u64 },
     NonDirectoryFile,
     ObjectDirectory { index: usize },
-}
-struct DirectoryOpen;
-impl DirectoryOpen { fn volume_relative_path(&self) -> &[u8] { b"Windows" } }
-struct DirectoryOpens;
-impl DirectoryOpens {
-    fn get(&self, _: u32) -> Result<&DirectoryOpen, u32> { Err(0xc000_0008) }
 }
 struct CapturedFileObjectAttributes { name: Vec<u16>, attributes: u32 }
 impl CapturedFileObjectAttributes { fn name(&self) -> &[u16] { &self.name } }
@@ -109,7 +101,6 @@ fn debug_put_char(_: u8) {}
 
 struct ExecNtHandler {
     loop_ctx: Option<LoopCtx>,
-    directory_opens: DirectoryOpens,
     pi: usize,
     current_tid: u64,
 }
@@ -151,7 +142,6 @@ impl ExecNtHandler {
 fn handler() -> ExecNtHandler {
     ExecNtHandler {
         loop_ctx: Some(LoopCtx { reg: &REGISTRY }),
-        directory_opens: DirectoryOpens,
         pi: 3,
         current_tid: 17,
     }

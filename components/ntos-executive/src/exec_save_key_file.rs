@@ -51,9 +51,7 @@ impl ExecNtHandler {
                 }
                 Ok(SaveKeyFile::MountedVolume(file_id))
             }
-            nt_process::HandleObject::File(_)
-            | nt_process::HandleObject::DiskFile { .. }
-            | nt_process::HandleObject::Directory { .. } => {
+            nt_process::HandleObject::File(_) | nt_process::HandleObject::DiskFile { .. } => {
                 Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
             }
             _ => Err(STATUS_OBJECT_TYPE_MISMATCH),

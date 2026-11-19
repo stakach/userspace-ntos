@@ -29,7 +29,6 @@ impl ExecNtHandler {
             // Files of the executive's own volume backends have no device stack.
             nt_process::HandleObject::File(_)
             | nt_process::HandleObject::DiskFile { .. }
-            | nt_process::HandleObject::Directory { .. }
             | nt_process::HandleObject::OverlayFile(_) => None,
             _ => return None,
         };

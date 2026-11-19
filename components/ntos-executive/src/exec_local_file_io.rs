@@ -85,9 +85,6 @@ impl ExecNtHandler {
             LocalFileObject::ReadonlyFile(object_id) => {
                 self.readonly_file_opens.retain_referenced_io(object_id)?;
             }
-            LocalFileObject::ReadonlyDirectory(object_id) => {
-                self.directory_opens.retain_referenced_io(object_id)?;
-            }
         }
         if let Err(status) = self.set_local_file_object_signaled(reference.file_object, false) {
             self.release_local_file_io_reference(reference.file_object);
@@ -182,9 +179,6 @@ impl ExecNtHandler {
             LocalFileObject::ReadonlyFile(object_id) => {
                 self.readonly_file_opens.set_signaled(object_id, signaled)
             }
-            LocalFileObject::ReadonlyDirectory(object_id) => {
-                self.directory_opens.set_signaled(object_id, signaled)
-            }
             LocalFileObject::Overlay(file_id) => unsafe {
                 crate::writable_fs::set_file_signaled(file_id, signaled)
             },
@@ -214,9 +208,6 @@ impl ExecNtHandler {
             LocalFileObject::ReadonlyFile(object_id) => {
                 self.readonly_file_opens.retain_io(object_id)
             }
-            LocalFileObject::ReadonlyDirectory(object_id) => {
-                self.directory_opens.retain_io(object_id)
-            }
             LocalFileObject::Overlay(file_id) => unsafe {
                 crate::writable_fs::retain_io_reference(file_id)
             },
@@ -235,9 +226,6 @@ impl ExecNtHandler {
         match file_object {
             LocalFileObject::ReadonlyFile(object_id) => {
                 self.readonly_file_opens.release_io(object_id)
-            }
-            LocalFileObject::ReadonlyDirectory(object_id) => {
-                self.directory_opens.release_io(object_id)
             }
             LocalFileObject::Overlay(file_id) => unsafe {
                 crate::writable_fs::release_io_reference(file_id)

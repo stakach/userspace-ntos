@@ -6,7 +6,6 @@ use super::{PendingFileIo, PendingFileIoOperation};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalFileObject {
     ReadonlyFile(u32),
-    ReadonlyDirectory(u32),
     Overlay(u64),
 }
 
@@ -52,7 +51,7 @@ impl PendingFileIo {
     }
 
     pub(super) fn route_matches_operation(self) -> bool {
-        use LocalFileObject::{Overlay, ReadonlyDirectory, ReadonlyFile};
+        use LocalFileObject::{Overlay, ReadonlyFile};
         use PendingFileRoute::{Hosted, Local};
         match self.operation {
             PendingFileIoOperation::Transfer
@@ -63,9 +62,7 @@ impl PendingFileIo {
             PendingFileIoOperation::LocalByteLock(_) => {
                 matches!(self.route, Local(ReadonlyFile(_) | Overlay(_)))
             }
-            PendingFileIoOperation::LocalDirectoryNotify(_) => {
-                matches!(self.route, Local(ReadonlyDirectory(_) | Overlay(_)))
-            }
+            PendingFileIoOperation::LocalDirectoryNotify(_) => matches!(self.route, Local(Overlay(_))),
             PendingFileIoOperation::OwnedInline(_) => self.route.is_valid(),
             PendingFileIoOperation::OwnedModeInputCapture(_)
             | PendingFileIoOperation::OwnedModePrecommit(_) => matches!(self.route,
@@ -74,9 +71,7 @@ impl PendingFileIo {
                 nt_io_abi::major::IRP_MJ_READ => {
                     matches!(self.route, Local(ReadonlyFile(_) | Overlay(_)))
                 }
-                nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL => {
-                    matches!(self.route, Local(ReadonlyDirectory(_) | Overlay(_)))
-                }
+                nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL => matches!(self.route, Local(Overlay(_))),
                 _ => false,
             },
             PendingFileIoOperation::LocalFlush(_) => matches!(self.route, Local(Overlay(_))),

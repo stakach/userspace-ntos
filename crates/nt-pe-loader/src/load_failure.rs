@@ -7,6 +7,8 @@ pub enum LoadFailure {
     MissingExport,
     InsufficientResources,
     NativeFailure,
+    /// The requested reader does not own the installed volume (STATUS_DEVICE_NOT_READY).
+    DeviceNotReady,
 }
 
 #[cfg(test)]
@@ -22,6 +24,7 @@ mod tests {
             0xc000_009a
         );
         assert_eq!(LoadFailure::NativeFailure.ntstatus() as u32, 0xc000_0001);
+        assert_eq!(LoadFailure::DeviceNotReady.ntstatus() as u32, 0xc000_00a3);
         assert_eq!(
             LoadFailure::from_native_error(10),
             LoadFailure::InsufficientResources
@@ -41,6 +44,7 @@ impl LoadFailure {
             Self::MissingExport => 0xc000_007a,
             Self::InsufficientResources => 0xc000_009a,
             Self::NativeFailure => 0xc000_0001,
+            Self::DeviceNotReady => 0xc000_00a3,
         }) as i32
     }
     /// seL4 error 10 is NotEnoughMemory; other acknowledged native failures are not file absence.

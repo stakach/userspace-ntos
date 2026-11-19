@@ -76,7 +76,6 @@ fn trace_winlogon_open(
     print_str(b" root=");
     print_str(match root {
         FileParseRoot::Absolute => b"absolute",
-        FileParseRoot::FatDirectory { .. } => b"fat-directory",
         FileParseRoot::OverlayFile(_) => b"overlay-file",
         FileParseRoot::HostedFile { .. } => b"hosted-file",
         FileParseRoot::NonDirectoryFile => b"non-directory",
@@ -403,7 +402,6 @@ impl CapturedFileObjectAttributes {
 pub(crate) enum FileParseRoot {
     Absolute,
     ObjectDirectory { index: usize },
-    FatDirectory { first_cluster: u32, object_id: u32 },
     OverlayFile(u64),
     HostedFile { file_id: u64, device_id: u64 },
     NonDirectoryFile,
@@ -1489,7 +1487,6 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
             print_hex_u64(tag);
         }
         Some(nt_process::HandleObject::DiskFile { .. }) => print_str(b"disk-file"),
-        Some(nt_process::HandleObject::Directory { .. }) => print_str(b"directory"),
         Some(nt_process::HandleObject::ObjectDirectory(_)) => print_str(b"object-directory"),
         Some(nt_process::HandleObject::DynamicObject { body, generation }) => {
             print_str(b"dynamic-object body=0x");
@@ -3334,38 +3331,16 @@ struct LocalByteLockRoute {
     alertable: bool,
 }
 
-enum LocalDirectoryNotifyRoute {
-    Fat {
-        file_object: nt_io_manager::LocalFileObject,
-        directory: alloc::string::String,
-        synchronous: bool,
-        alertable: bool,
-    },
-    Overlay {
-        file_id: u64,
-        file_object: nt_io_manager::LocalFileObject,
-        synchronous: bool,
-        alertable: bool,
-    },
+/// A directory change notification served by the writable overlay volume's own File.
+struct LocalDirectoryNotifyRoute {
+    file_id: u64,
+    synchronous: bool,
+    alertable: bool,
 }
 
 impl LocalDirectoryNotifyRoute {
     fn file_object(&self) -> nt_io_manager::LocalFileObject {
-        match self {
-            Self::Fat { file_object, .. } | Self::Overlay { file_object, .. } => *file_object,
-        }
-    }
-
-    fn synchronous(&self) -> bool {
-        match self {
-            Self::Fat { synchronous, .. } | Self::Overlay { synchronous, .. } => *synchronous,
-        }
-    }
-
-    fn alertable(&self) -> bool {
-        match self {
-            Self::Fat { alertable, .. } | Self::Overlay { alertable, .. } => *alertable,
-        }
+        nt_io_manager::LocalFileObject::Overlay(self.file_id)
     }
 }
 
@@ -3373,16 +3348,14 @@ const LOCAL_FAT_FILE_OBJECT_TAG: u64 = 0x1000_0000_0000_0000;
 const LOCAL_OVERLAY_FILE_OBJECT_TAG: u64 = 0x2000_0000_0000_0000;
 const LOCAL_FAT_FILE_ID_TAG: u64 = 0x3000_0000_0000_0000;
 const LOCAL_OVERLAY_FILE_ID_TAG: u64 = 0x4000_0000_0000_0000;
-const LOCAL_FAT_DIRECTORY_OBJECT_TAG: u64 = 0x5000_0000_0000_0000;
 const LOCAL_ID_PAYLOAD_MASK: u64 = 0x0fff_ffff_ffff_ffff;
 
-/// Scalar keys remain confined to the byte-lock and readonly notification tables. Pending I/O
-/// carries the typed object instead; encoding must never truncate its canonical identity.
+/// Scalar keys remain confined to the byte-lock table. Pending I/O carries the typed object
+/// instead; encoding must never truncate its canonical identity.
 fn local_file_object_namespace_key(file: nt_io_manager::LocalFileObject) -> Result<u64, u32> {
     use nt_io_manager::LocalFileObject;
     match file {
         LocalFileObject::ReadonlyFile(id) => Ok(LOCAL_FAT_FILE_OBJECT_TAG | u64::from(id)),
-        LocalFileObject::ReadonlyDirectory(id) => Ok(LOCAL_FAT_DIRECTORY_OBJECT_TAG | u64::from(id)),
         LocalFileObject::Overlay(id) if id & !LOCAL_ID_PAYLOAD_MASK == 0 => {
             Ok(LOCAL_OVERLAY_FILE_OBJECT_TAG | id)
         }
@@ -4337,16 +4310,11 @@ impl ExecNtHandler {
         write_field!(global_atoms, None);
         write_field!(io_completion_ports, ExecIoCompletionPorts::reset());
         write_field!(file_completion, ExecFileCompletion::reset());
-        write_field!(directory_opens, ExecDirectoryOpens::reset());
         write_field!(readonly_file_opens, ExecReadOnlyFileOpens::reset());
         write_field!(byte_range_locks, nt_fs::ByteRangeLockTable::new());
         write_field!(
             registry_change_notifications,
             registry_change_notify::RegistryChangeNotifications::new()
-        );
-        write_field!(
-            readonly_directory_notifications,
-            nt_fs::DirectoryNotifyTable::new()
         );
         write_field!(pi, 0);
         write_field!(current_tid, 0);
@@ -10578,51 +10546,6 @@ impl ExecNtHandler {
         nt_fs::STATUS_OBJECT_PATH_NOT_FOUND
     }
 
-    /// Mint a process-local handle for a directory on the mounted FAT volume.
-    pub(crate) fn mint_directory_handle(
-        &mut self,
-        directory: crate::fs_loader::FatOpenMetadata,
-        volume_relative_path: &[u8],
-        access: u32,
-        share_access: u32,
-        create_options: u32,
-    ) -> Result<u64, u32> {
-        let pid = self
-            .pm_pid_for_pi(self.pi)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        let first_cluster = directory.first_cluster;
-        if !directory.metadata.is_directory {
-            return Err(nt_fs::STATUS_NOT_A_DIRECTORY);
-        }
-        let physical_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
-            .ok_or(STATUS_DEVICE_NOT_READY)?;
-        let object_id = self.directory_opens.create(
-            physical_mount.value(),
-            first_cluster,
-            volume_relative_path,
-            access,
-            share_access,
-            create_options,
-            directory.metadata,
-            directory.alternate_name,
-        )?;
-        let handle = match self.insert_process_handle(
-            pid,
-            nt_process::HandleObject::Directory {
-                first_cluster,
-                object_id,
-            },
-            access,
-        ) {
-            Ok(handle) => handle,
-            Err(status) => {
-                let _ = self.directory_opens.release(object_id);
-                return Err(status);
-            }
-        };
-        Ok(handle as u64)
-    }
-
     unsafe fn create_overlay_file_relative(
         &mut self,
         relative: &[u8],
@@ -10770,166 +10693,6 @@ impl ExecNtHandler {
                     options,
                 ),
             ),
-            FileParseRoot::FatDirectory {
-                first_cluster,
-                object_id,
-            } => {
-                let mut parent_path = [0u8; nt_fs::DIRECTORY_OPEN_PATH_CAP];
-                let parent_len = {
-                    let Ok(open) = self.directory_opens.get(object_id) else {
-                        return (STATUS_INVALID_HANDLE, 0, 0);
-                    };
-                    if open.first_cluster != first_cluster
-                        || open.volume_relative_path().len() > parent_path.len()
-                    {
-                        return (STATUS_INVALID_HANDLE, 0, 0);
-                    }
-                    let Some(mount) = (unsafe { crate::fs_loader::exec_fs_mount_identity() }) else {
-                        return (STATUS_DEVICE_NOT_READY, 0, 0);
-                    };
-                    if open.physical_mount() != Some(mount.value()) {
-                        return (STATUS_INVALID_HANDLE, 0, 0);
-                    }
-                    if crate::fs_loader::exec_block_route_kind(mount)
-                        != Some(nt_fs::BlockSourceKind::Boot)
-                    {
-                        return (STATUS_DEVICE_NOT_READY, 0, 0);
-                    }
-                    let length = open.volume_relative_path().len();
-                    parent_path[..length].copy_from_slice(open.volume_relative_path());
-                    length
-                };
-                let mut full_path = [0u8; nt_fs::DIRECTORY_OPEN_PATH_CAP];
-                let full_len = match Self::join_volume_relative_path(
-                    &parent_path[..parent_len],
-                    relative,
-                    &mut full_path,
-                ) {
-                    Ok(length) => length,
-                    Err(status) => return (status, 0, 0),
-                };
-                let full_path = &full_path[..full_len];
-                let overlay_lookup =
-                    crate::writable_fs::query_metadata_relative_if_mounted(full_path)
-                        .map(|info| info.is_some());
-                if let Err(status) = overlay_lookup {
-                    return (status, 0, 0);
-                }
-                let fat_entry = exec_fs().and_then(|fs| {
-                    crate::fs_loader::fat_open_path_metadata_from(&fs, first_cluster, relative)
-                });
-                if fat_entry.is_some_and(|entry| entry.metadata.is_directory) {
-                    if overlay_lookup == Ok(true) {
-                        return publish_overlay(
-                            self,
-                            crate::writable_fs::create(
-                                full_path,
-                                desired_access,
-                                file_attributes,
-                                share_access,
-                                disposition,
-                                options,
-                            ),
-                        );
-                    }
-                } else {
-                    let decision = nt_fs::layered_file_open_decision(
-                        overlay_lookup,
-                        fat_entry.is_some(),
-                        desired_access,
-                        disposition,
-                        options,
-                    );
-                    match decision {
-                        Ok(nt_fs::LayeredFileOpenDecision::UseOverlay) => {
-                            return publish_overlay(
-                                self,
-                                crate::writable_fs::create(
-                                    full_path,
-                                    desired_access,
-                                    file_attributes,
-                                    share_access,
-                                    disposition,
-                                    options,
-                                ),
-                            );
-                        }
-                        Ok(nt_fs::LayeredFileOpenDecision::Installed(_)) => {
-                            return self.open_installed_file(
-                                fat_entry.expect("installed file decision requires FAT metadata"),
-                                full_path,
-                                desired_access,
-                                file_attributes,
-                                share_access,
-                                disposition,
-                                options,
-                            );
-                        }
-                        Ok(nt_fs::LayeredFileOpenDecision::CreateOverlay) => {}
-                        Err(status) => return (status, 0, 0),
-                    }
-                }
-                if disposition == nt_fs::FILE_OPEN
-                    || (disposition == nt_fs::FILE_OPEN_IF && fat_entry.is_some())
-                {
-                    let Some(entry) = fat_entry else {
-                        return (nt_fs::STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
-                    };
-                    let is_directory = entry.metadata.is_directory;
-                    if options & nt_fs::FILE_DIRECTORY_FILE != 0 && !is_directory {
-                        return (nt_fs::STATUS_NOT_A_DIRECTORY, 0, 0);
-                    }
-                    if options & nt_fs::FILE_NON_DIRECTORY_FILE != 0 && is_directory {
-                        return (nt_fs::STATUS_FILE_IS_A_DIRECTORY, 0, 0);
-                    }
-                    let handle = if is_directory {
-                        self.mint_directory_handle(
-                            entry,
-                            full_path,
-                            desired_access,
-                            share_access,
-                            options,
-                        )
-                    } else if Self::readonly_disk_open_allowed(desired_access, options) {
-                        self.mint_disk_file_handle(
-                            entry,
-                            full_path,
-                            desired_access,
-                            share_access,
-                            options,
-                        )
-                    } else {
-                        return (nt_fs::STATUS_NOT_SUPPORTED, 0, 0);
-                    };
-                    return match handle {
-                        Ok(handle) => (nt_fs::STATUS_SUCCESS, nt_fs::FILE_OPENED as u64, handle),
-                        Err(status) => (status, 0, 0),
-                    };
-                }
-                if disposition == nt_fs::FILE_CREATE && fat_entry.is_some() {
-                    return (nt_fs::STATUS_OBJECT_NAME_COLLISION, 0, 0);
-                }
-                if let Some(parent) = Self::volume_relative_parent(full_path) {
-                    if Self::readonly_volume_relative_is_dir(parent) {
-                        match crate::writable_fs::ensure_installed_directory_relative(parent) {
-                            Ok(true) => self.writable_fs_dirty = true,
-                            Ok(false) => {}
-                            Err(status) => return (status, 0, 0),
-                        }
-                    }
-                }
-                publish_overlay(
-                    self,
-                    crate::writable_fs::create(
-                        full_path,
-                        desired_access,
-                        file_attributes,
-                        share_access,
-                        disposition,
-                        options,
-                    ),
-                )
-            }
             FileParseRoot::NonDirectoryFile => (nt_fs::STATUS_NOT_A_DIRECTORY, 0, 0),
             FileParseRoot::Absolute
             | FileParseRoot::ObjectDirectory { .. }
@@ -12195,17 +11958,6 @@ impl ExecNtHandler {
                 self.readonly_file_opens.is_signaled(object_id)?;
                 Ok(Some(WaitObject::fat_file(object_id)))
             }
-            Some(nt_process::HandleObject::Directory { object_id, .. }) => {
-                let granted = self
-                    .pm
-                    .handle_access(caller, handle as nt_process::Handle)
-                    .ok_or(STATUS_INVALID_HANDLE)?;
-                if required_access != 0 && granted & required_access != required_access {
-                    return Err(STATUS_ACCESS_DENIED);
-                }
-                self.directory_opens.is_signaled(object_id)?;
-                Ok(Some(WaitObject::fat_directory(object_id)))
-            }
             Some(nt_process::HandleObject::OverlayFile(file_id)) => {
                 let granted = self
                     .pm
@@ -12423,10 +12175,6 @@ impl ExecNtHandler {
                 .readonly_file_opens
                 .retain_io(object.id() as u32)
                 .map(|()| nt_kernel_exec::EventLeaseId::NULL),
-            WaitObject::KIND_FAT_DIRECTORY => self
-                .directory_opens
-                .retain_io(object.id() as u32)
-                .map(|()| nt_kernel_exec::EventLeaseId::NULL),
             WaitObject::KIND_OVERLAY_FILE => unsafe {
                 crate::writable_fs::retain_io_reference(object.id())
             }
@@ -12498,7 +12246,6 @@ impl ExecNtHandler {
                 Ok(())
             }
             WaitObject::KIND_FAT_FILE => self.readonly_file_opens.release_io(object.id() as u32),
-            WaitObject::KIND_FAT_DIRECTORY => self.directory_opens.release_io(object.id() as u32),
             WaitObject::KIND_OVERLAY_FILE => unsafe {
                 crate::writable_fs::release_io_reference(object.id())
             },
@@ -12526,10 +12273,6 @@ impl ExecNtHandler {
                 .unwrap_or(false),
             WaitObject::KIND_FAT_FILE => self
                 .readonly_file_opens
-                .is_signaled(object.id() as u32)
-                .unwrap_or(false),
-            WaitObject::KIND_FAT_DIRECTORY => self
-                .directory_opens
                 .is_signaled(object.id() as u32)
                 .unwrap_or(false),
             WaitObject::KIND_OVERLAY_FILE => unsafe {
@@ -12566,7 +12309,6 @@ impl ExecNtHandler {
             WaitObject::KIND_PROCESS | WaitObject::KIND_THREAD => Consumed,
             WaitObject::KIND_FILE
             | WaitObject::KIND_FAT_FILE
-            | WaitObject::KIND_FAT_DIRECTORY
             | WaitObject::KIND_OVERLAY_FILE
             | WaitObject::KIND_JOB
             | WaitObject::KIND_IO_COMPLETION => Consumed,
@@ -13077,7 +12819,6 @@ impl ExecNtHandler {
                 }
             }
             Some(nt_process::HandleObject::DiskFile { .. })
-            | Some(nt_process::HandleObject::Directory { .. })
             | Some(nt_process::HandleObject::OverlayFile(_)) => Ok(None),
             Some(_) => Err(STATUS_OBJECT_TYPE_MISMATCH),
             None => Err(STATUS_INVALID_HANDLE),
@@ -13651,7 +13392,7 @@ impl ExecNtHandler {
             local_route
                 .as_ref()
                 .expect("local notify lost its route")
-                .synchronous()
+                .synchronous
         };
         let event_obj_idx = match self.prepare_io_event_for_request(handle, event) {
             Ok(index) => index.map_or(u64::MAX, |index| index as u64),
@@ -13675,30 +13416,13 @@ impl ExecNtHandler {
             if let Err(status) = self.begin_local_file_io(file_object) {
                 return status;
             }
-            let registration = match &route {
-                LocalDirectoryNotifyRoute::Fat {
-                    file_object,
-                    directory,
-                    ..
-                } => self.readonly_directory_notifications.register(
-                    local_file_object_namespace_key(*file_object)
-                        .expect("readonly directory namespace key is always representable"),
-                    directory,
-                    completion_filter,
-                    watch_tree,
-                    buffer_length,
-                    request_id,
-                ),
-                LocalDirectoryNotifyRoute::Overlay { file_id, .. } => {
-                    crate::writable_fs::notify_change_directory(
-                        *file_id,
-                        completion_filter,
-                        watch_tree,
-                        buffer_length,
-                        request_id,
-                    )
-                }
-            };
+            let registration = crate::writable_fs::notify_change_directory(
+                route.file_id,
+                completion_filter,
+                watch_tree,
+                buffer_length,
+                request_id,
+            );
             let notify_id = match registration {
                 Ok(id) => id,
                 Err(status) => {
@@ -13729,7 +13453,7 @@ impl ExecNtHandler {
                         notify_id: notify_id.raw(),
                         status: STATUS_PENDING,
                         information: 0,
-                        alertable: route.alertable(),
+                        alertable: route.alertable,
                     },
                 ),
                 delivery_state: 0,
@@ -17286,7 +17010,6 @@ impl ExecNtHandler {
                 nt_process::HandleObject::File(_)
                 | nt_process::HandleObject::RoutedFile { .. }
                 | nt_process::HandleObject::DiskFile { .. }
-                | nt_process::HandleObject::Directory { .. }
                 | nt_process::HandleObject::OverlayFile(_) => b"File",
                 nt_process::HandleObject::IoCompletion(_) => b"IoCompletion",
                 nt_process::HandleObject::RegistryKey(_) => b"Key",
@@ -20877,9 +20600,6 @@ impl ExecNtHandler {
             | nt_process::HandleObject::RoutedFile { file_id, .. } => {
                 self.file_completion.retain_handle(file_id)
             }
-            nt_process::HandleObject::Directory { object_id, .. } => {
-                self.directory_opens.retain(object_id)
-            }
             nt_process::HandleObject::DiskFile { object_id, .. } => {
                 self.readonly_file_opens.retain(object_id)
             }
@@ -20930,9 +20650,6 @@ impl ExecNtHandler {
             | nt_process::HandleObject::RoutedFile { file_id, .. } => {
                 self.release_file_handle_reference(file_id);
             }
-            nt_process::HandleObject::Directory { object_id, .. } => {
-                let _ = self.directory_opens.release(object_id);
-            }
             nt_process::HandleObject::DiskFile { object_id, .. } => {
                 let _ = self.readonly_file_opens.release(object_id);
             }
@@ -20976,20 +20693,6 @@ impl ExecNtHandler {
             }
             nt_process::HandleObject::RoutedFile { file_id, .. } => {
                 self.release_file_handle_reference(file_id);
-            }
-            nt_process::HandleObject::Directory { object_id, .. } => {
-                if self.directory_opens.is_final_reference(object_id) == Ok(true) {
-                    let completed = self
-                        .readonly_directory_notifications
-                        .cleanup_file_object(local_file_object_namespace_key(
-                            LocalFileObject::ReadonlyDirectory(object_id),
-                        ).expect("readonly directory namespace key is always representable"));
-                    if completed != 0 {
-                        crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING
-                            .store(true, Ordering::Release);
-                    }
-                }
-                let _ = self.directory_opens.release(object_id);
             }
             nt_process::HandleObject::DiskFile { object_id, .. } => {
                 if self.readonly_file_opens.is_final_reference(object_id) == Ok(true) {
@@ -24445,19 +24148,6 @@ impl ExecNtHandler {
                 )?;
                 Ok(FileParseRoot::ObjectDirectory { index })
             }
-            nt_process::HandleObject::Directory {
-                first_cluster,
-                object_id,
-            } => {
-                let open = self.directory_opens.get(object_id)?;
-                if open.first_cluster != first_cluster {
-                    return Err(STATUS_INVALID_HANDLE);
-                }
-                Ok(FileParseRoot::FatDirectory {
-                    first_cluster,
-                    object_id,
-                })
-            }
             nt_process::HandleObject::OverlayFile(file_id) => {
                 // SAFETY: the executive service loop serializes every writable-volume access.
                 unsafe { crate::writable_fs::file_object_information(file_id) }?;
@@ -24511,26 +24201,6 @@ impl ExecNtHandler {
         relative: &mut [u8],
     ) -> Result<usize, u32> {
         nt_fs::nt_file_relative_path_into(name, folded, relative).ok_or(STATUS_OBJECT_NAME_INVALID)
-    }
-
-    fn join_volume_relative_path(
-        parent: &[u8],
-        child: &[u8],
-        output: &mut [u8],
-    ) -> Result<usize, u32> {
-        let separator = usize::from(!parent.is_empty());
-        let length = parent
-            .len()
-            .checked_add(separator)
-            .and_then(|length| length.checked_add(child.len()))
-            .filter(|length| *length <= output.len())
-            .ok_or(STATUS_OBJECT_NAME_INVALID)?;
-        output[..parent.len()].copy_from_slice(parent);
-        if separator != 0 {
-            output[parent.len()] = b'\\';
-        }
-        output[parent.len() + separator..length].copy_from_slice(child);
-        Ok(length)
     }
 
     fn decode_set_file_name_units(file_name: &[u8], output: &mut [u16]) -> Result<usize, u32> {
@@ -24599,34 +24269,6 @@ impl ExecNtHandler {
                     file_name.len(),
                 ))
             }
-            FileParseRoot::FatDirectory {
-                first_cluster,
-                object_id,
-            } => {
-                let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
-                let mut relative = [0u8; FILE_OBJECT_NAME_CAP];
-                let child_len = Self::capture_relative_file_path(name, &mut folded, &mut relative)?;
-                let mut parent = [0u8; nt_fs::DIRECTORY_OPEN_PATH_CAP];
-                let parent_len = {
-                    let open = self.directory_opens.get(object_id)?;
-                    if open.first_cluster != first_cluster
-                        || open.volume_relative_path().len() > parent.len()
-                    {
-                        return Err(nt_fs::STATUS_INVALID_HANDLE);
-                    }
-                    let length = open.volume_relative_path().len();
-                    parent[..length].copy_from_slice(open.volume_relative_path());
-                    length
-                };
-                let mut target = [0u8; FILE_VOLUME_RELATIVE_CAP];
-                let target_len = Self::join_volume_relative_path(
-                    &parent[..parent_len],
-                    &relative[..child_len],
-                    &mut target,
-                )?;
-                let encoded = Self::encode_ascii_path_utf16le(&target[..target_len], output)?;
-                Ok((nt_fs::FileRenameRoot::VolumeRoot, encoded))
-            }
             FileParseRoot::Absolute => {
                 let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
                 let mut relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
@@ -24678,42 +24320,6 @@ impl ExecNtHandler {
             FileParseRoot::OverlayFile(root_file_id) => unsafe {
                 crate::writable_fs::query_metadata_relative_to_directory(root_file_id, relative)
             },
-            FileParseRoot::FatDirectory {
-                first_cluster,
-                object_id,
-            } => {
-                let open = self.directory_opens.get(object_id)?;
-                if open.first_cluster != first_cluster {
-                    return Err(STATUS_INVALID_HANDLE);
-                }
-                let mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
-                    .ok_or(STATUS_DEVICE_NOT_READY)?;
-                if open.physical_mount() != Some(mount.value()) {
-                    return Err(STATUS_INVALID_HANDLE);
-                }
-                if crate::fs_loader::exec_block_route_kind(mount)
-                    != Some(nt_fs::BlockSourceKind::Boot)
-                {
-                    return Err(STATUS_DEVICE_NOT_READY);
-                }
-                let mut full_path = [0u8; nt_fs::DIRECTORY_OPEN_PATH_CAP];
-                let full_len = Self::join_volume_relative_path(
-                    open.volume_relative_path(),
-                    relative,
-                    &mut full_path,
-                )?;
-                if let Some(info) = crate::writable_fs::query_metadata_relative_if_mounted(
-                    &full_path[..full_len],
-                )? {
-                    return Ok(info);
-                }
-                let Some(entry) = exec_fs().and_then(|fs| {
-                    crate::fs_loader::fat_open_path_metadata_from(&fs, first_cluster, relative)
-                }) else {
-                    return Err(nt_fs::STATUS_OBJECT_NAME_NOT_FOUND);
-                };
-                Ok(entry.metadata)
-            }
             FileParseRoot::NonDirectoryFile => Err(nt_fs::STATUS_NOT_A_DIRECTORY),
             FileParseRoot::HostedFile { .. } => Err(STATUS_NOT_SUPPORTED),
             FileParseRoot::Absolute | FileParseRoot::ObjectDirectory { .. } => {
@@ -29058,7 +28664,6 @@ impl ExecNtHandler {
                 .map(|(device_id, _)| device_id)
                 .ok_or(STATUS_INVALID_HANDLE),
             nt_process::HandleObject::DiskFile { .. }
-            | nt_process::HandleObject::Directory { .. }
             | nt_process::HandleObject::OverlayFile(_) => Err(STATUS_INVALID_DEVICE_REQUEST),
             _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
         }
@@ -29098,10 +28703,6 @@ impl ExecNtHandler {
                 let open = self.readonly_file_opens.get(object_id)?;
                 (nt_fs::file_mode_from_create_options(open.create_options), 0)
             }
-            nt_process::HandleObject::Directory { object_id, .. } => {
-                let open = self.directory_opens.get(object_id)?;
-                (nt_fs::file_mode_from_create_options(open.create_options), 0)
-            }
             nt_process::HandleObject::OverlayFile(file_id) => (
                 crate::writable_fs::file_object_information(file_id)?.mode,
                 0,
@@ -29139,35 +28740,10 @@ impl ExecNtHandler {
             return Err(STATUS_ACCESS_DENIED);
         }
         match object {
-            nt_process::HandleObject::Directory { object_id, .. } => {
-                let open = self.directory_opens.get(object_id)?;
-                let path = open.volume_relative_path();
-                if path.iter().any(|byte| !byte.is_ascii()) {
-                    return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
-                }
-                let mut directory = alloc::string::String::new();
-                directory
-                    .try_reserve_exact(path.len().saturating_add(1))
-                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-                if path.first() != Some(&b'\\') {
-                    directory.push('\\');
-                }
-                directory.extend(path.iter().map(|byte| *byte as char));
-                let synchronous = open.create_options
-                    & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
-                    != 0;
-                Ok(Some(LocalDirectoryNotifyRoute::Fat {
-                    file_object: LocalFileObject::ReadonlyDirectory(object_id),
-                    directory,
-                    synchronous,
-                    alertable: open.create_options & nt_fs::FILE_SYNCHRONOUS_IO_ALERT != 0,
-                }))
-            }
             nt_process::HandleObject::OverlayFile(file_id) => {
                 let mode = crate::writable_fs::file_object_information(file_id)?.mode;
-                Ok(Some(LocalDirectoryNotifyRoute::Overlay {
+                Ok(Some(LocalDirectoryNotifyRoute {
                     file_id,
-                    file_object: LocalFileObject::Overlay(file_id),
                     synchronous: mode
                         & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                         != 0,
@@ -29193,9 +28769,6 @@ impl ExecNtHandler {
             .lookup_handle(pid, process_handle)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
         {
-            nt_process::HandleObject::Directory { object_id, .. } => {
-                Ok(Some(LocalFileObject::ReadonlyDirectory(object_id)))
-            }
             nt_process::HandleObject::DiskFile { object_id, .. } => {
                 Ok(Some(LocalFileObject::ReadonlyFile(object_id)))
             }
@@ -29218,10 +28791,6 @@ impl ExecNtHandler {
         let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         match file_object {
-            LocalFileObject::ReadonlyDirectory(_) => Ok(self
-                .readonly_directory_notifications
-                .completion_exact(notify_id, &irp_id)?
-                .map(|completion| (completion.status, completion.information))),
             LocalFileObject::Overlay(_) => {
                 crate::writable_fs::directory_notify_completion(notify_id, irp_id)
             }
@@ -29240,9 +28809,6 @@ impl ExecNtHandler {
         let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         match file_object {
-            LocalFileObject::ReadonlyDirectory(_) => self
-                .readonly_directory_notifications
-                .copy_completion_bytes(notify_id, &irp_id, offset, output),
             LocalFileObject::Overlay(_) => {
                 crate::writable_fs::copy_directory_notify_completion(notify_id, irp_id, offset, output)
             }
@@ -29259,9 +28825,6 @@ impl ExecNtHandler {
         let notify_id = nt_fs::DirectoryNotifyId::from_raw(notify_id)
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         match file_object {
-            LocalFileObject::ReadonlyDirectory(_) => self
-                .readonly_directory_notifications
-                .acknowledge_completion(notify_id, &irp_id),
             LocalFileObject::Overlay(_) => {
                 crate::writable_fs::acknowledge_directory_notify_completion(notify_id, irp_id)
             }
@@ -29278,9 +28841,6 @@ impl ExecNtHandler {
             return Err(nt_fs::STATUS_INVALID_HANDLE);
         };
         match file_object {
-            LocalFileObject::ReadonlyDirectory(_) => {
-                Ok(self.readonly_directory_notifications.cancel(notify_id))
-            }
             LocalFileObject::Overlay(_) => crate::writable_fs::cancel_directory_notify(notify_id),
             _ => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
@@ -29358,9 +28918,6 @@ impl ExecNtHandler {
             }
             nt_process::HandleObject::File(_) | nt_process::HandleObject::RoutedFile { .. } => {
                 return Ok(None)
-            }
-            nt_process::HandleObject::Directory { .. } => {
-                return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
             }
             _ => return Err(STATUS_OBJECT_TYPE_MISMATCH),
         };
@@ -29446,21 +29003,6 @@ impl ExecNtHandler {
                     name,
                     Some(open.alternate_name),
                 )
-            }
-            nt_process::HandleObject::Directory {
-                first_cluster,
-                object_id,
-            } => {
-                let open = match self.directory_opens.get(object_id) {
-                    Ok(open) if open.first_cluster == first_cluster => open,
-                    _ => return Err(nt_fs::STATUS_INVALID_HANDLE),
-                };
-                let name = if include_opened_name {
-                    Some(ascii_volume_relative_name(open.volume_relative_path())?)
-                } else {
-                    None
-                };
-                (open.metadata, 0, name, Some(open.alternate_name))
             }
             nt_process::HandleObject::OverlayFile(file_id) => {
                 let info = crate::writable_fs::file_object_information(file_id)?;
@@ -34250,8 +33792,7 @@ impl ExecNtHandler {
                         }
                         (name16, Some(file_id))
                     }
-                    FileParseRoot::FatDirectory { .. }
-                    | FileParseRoot::OverlayFile(_)
+                    FileParseRoot::OverlayFile(_)
                     | FileParseRoot::ObjectDirectory { .. }
                     | FileParseRoot::NonDirectoryFile => return STATUS_INVALID_HANDLE,
                 };
@@ -39379,14 +38920,10 @@ impl ExecNtHandler {
                     None => return nt_fs::STATUS_INVALID_HANDLE,
                 };
                 let handle = args[0] as nt_process::Handle;
-                let (first_cluster, object_id) = match self.pm.lookup_handle(pid, handle) {
-                    Some(nt_process::HandleObject::Directory {
-                        first_cluster,
-                        object_id,
-                    }) => (first_cluster, object_id),
+                match self.pm.lookup_handle(pid, handle) {
                     // ★ THE WRITABLE FILESYSTEM OVERLAY: enumerate what is really on the volume.
                     // The cursor lives in the volume's own FILE_OBJECT, so a resumed scan and a
-                    // RestartScan behave exactly as they do for the read-only FAT directories.
+                    // RestartScan resume from that File's own position.
                     Some(nt_process::HandleObject::OverlayFile(file_id)) => {
                         let granted = self.pm.handle_access(pid, handle).unwrap_or(0);
                         if granted & (FILE_LIST_DIRECTORY | GENERIC_READ | GENERIC_ALL) == 0 {
@@ -39480,90 +39017,7 @@ impl ExecNtHandler {
                         );
                         return nt_fs::STATUS_INVALID_HANDLE;
                     }
-                };
-                let granted = self.pm.handle_access(pid, handle).unwrap_or(0);
-                if granted & (FILE_LIST_DIRECTORY | GENERIC_READ | GENERIC_ALL) == 0 {
-                    return nt_fs::STATUS_ACCESS_DENIED;
                 }
-                let open = match self.directory_opens.get(object_id) {
-                    Ok(open) if open.first_cluster == first_cluster => *open,
-                    _ => return nt_fs::STATUS_INVALID_HANDLE,
-                };
-                let fs = match exec_fs() {
-                    Some(fs) => fs,
-                    None => return 0xC000_00A3, // STATUS_DEVICE_NOT_READY
-                };
-
-                let mut pattern = [0u16; nt_fs::MAX_DIRECTORY_NAME];
-                let pattern_len = match self.read_directory_pattern(args[9], &mut pattern) {
-                    Ok(length) => length,
-                    Err(status) => return status,
-                };
-                let pattern = (args[9] != 0).then_some(&pattern[..pattern_len]);
-                let event_index = match self.prepare_io_event_for_request(args[0], args[1]) {
-                    Ok(index) => index,
-                    Err(status) => return status,
-                };
-
-                let synchronous = open.create_options
-                    & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
-                    != 0;
-                let file_object = LocalFileObject::ReadonlyDirectory(object_id);
-                // Reserve durable table capacity before entering the transient entry allocator.
-                let request_id = match self.reserve_local_file_io_output(length) {
-                    Ok(request_id) => request_id,
-                    Err(status) => return status,
-                };
-                let result = {
-                    let _transient = allocator::enter_transient();
-                    let mut entry_count = 0usize;
-                    if let Err(status) = crate::fs_loader::fat_visit_directory_checked(
-                        &fs, first_cluster, |_, _first_cluster| {
-                            entry_count = entry_count.saturating_add(1);
-                            true
-                        },
-                    ) {
-                        return status;
-                    }
-                    let mut entries = alloc::vec::Vec::new();
-                    if entries.try_reserve_exact(entry_count).is_err() {
-                        return STATUS_INSUFFICIENT_RESOURCES;
-                    }
-                    if let Err(status) = crate::fs_loader::fat_visit_directory_checked(
-                        &fs, first_cluster, |entry, _first_cluster| {
-                            entries.push(entry);
-                            true
-                        },
-                    ) {
-                        return status;
-                    }
-                    if let Err(status) = self.begin_local_file_io(file_object) {
-                        return status;
-                    }
-                    let encoded = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                        .reserved_local_output_mut(self.pending_file_io_reservation
-                            .expect("FAT query lost its output reservation"))
-                        .expect("FAT query lost its reserved output");
-                    let directory = self.directory_opens.get_mut(object_id)
-                        .expect("retained FAT directory disappeared during query");
-                    nt_fs::query_directory(
-                        &mut directory.query,
-                        &entries,
-                        information_class,
-                        return_single_entry,
-                        pattern,
-                        restart_scan,
-                        encoded,
-                    )
-                };
-                self.complete_local_directory_query(
-                    args,
-                    request_id,
-                    file_object,
-                    synchronous,
-                    event_index.map_or(u64::MAX, |index| index as u64),
-                    result,
-                )
             },
             // NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
             // FileInformationClass). Resolve process-local ownership here; nt-fs owns the ABI layout.
