@@ -21,6 +21,17 @@ pub const fn classify_hosted_provider_export_completion(
     }
 }
 
+/// Whether a provider export runs on a provider worker lane instead of the primary lane.
+///
+/// DXG interface callbacks always do. Any other export does when the provider's primary lane
+/// cannot admit it because that lane is already running: the provider called out into this
+/// dependent and the dependent re-entered the provider (NDIS calls a miniport's
+/// MiniportInitialize, which calls NdisAllocateMemoryWithTag). In NT that is a nested call on
+/// the same thread; here it needs a second lane, since the primary's Reply is in use.
+pub const fn hosted_provider_export_needs_worker(dxg_callback: bool, primary_admits: bool) -> bool {
+    dxg_callback || !primary_admits
+}
+
 /// Pick the IRQL byte's containing bank only after native code has authenticated one exact
 /// physical lane. Provider workers cannot borrow the parked primary's IRQL state.
 pub const fn select_hosted_cr8_bank(primary_shared: u64, channel_shared: u64,
@@ -130,4 +141,19 @@ pub const fn select_hosted_provider_export_worker(
         return None;
     }
     Some(worker)
+}
+
+#[cfg(test)]
+mod reentry_tests {
+    use super::hosted_provider_export_needs_worker;
+
+    #[test]
+    fn a_reentrant_export_into_a_running_provider_uses_a_worker_lane() {
+        // Boot 44463332736: E1000's MiniportInitialize called ndis.sys while ndis's primary
+        // lane was running NdisIPnPStartDevice; the primary refused with reply-aliased BUSY
+        // and the adapter context allocation failed (STATUS_INSUFFICIENT_RESOURCES).
+        assert!(hosted_provider_export_needs_worker(false, false));
+        assert!(!hosted_provider_export_needs_worker(false, true));
+        assert!(hosted_provider_export_needs_worker(true, true));
+    }
 }

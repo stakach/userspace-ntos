@@ -33782,10 +33782,18 @@ where
     ) else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
-    let reentrant = if matches!(policy.side_effect,
+    let dxg_callback = matches!(policy.side_effect,
         HostedProviderExportSideEffect::DxgInterfaceCallback
             | HostedProviderExportSideEffect::DxgVidPnInterfaceQuery
-            | HostedProviderExportSideEffect::DxgVidPnMethod) {
+            | HostedProviderExportSideEffect::DxgVidPnMethod);
+    let primary_admits = hosted_ingress_sources::primary_route(singleton.instance)
+        .is_some_and(|route| matches!(
+            crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route),
+            Ok(true)
+        ));
+    let reentrant = if nt_hosted_runtime::hosted_provider_export_needs_worker(
+        dxg_callback, primary_admits,
+    ) {
         let Some(owner) = hosted_provider_object_owner_for_pair(singleton.instance, dependent_index)
         else {
             print_str(b"[provider-export] reject stage=dxg-worker-owner\n");
@@ -59975,6 +59983,21 @@ unsafe fn service_hosted_irq_event(
                 ));
             }
             HOSTED_IRQ_EVENTS_ACKNOWLEDGED.fetch_add(1, Ordering::Relaxed);
+            // An edge raised while this latched line was unacknowledged was lost. A claimed
+            // scan therefore schedules one more pass without a new hardware interrupt; an
+            // unclaimed pass ends the chain (nt_kernel_exec::rescan_after_acknowledgement).
+            let latched = leased.iter().any(|retained| {
+                retained.connection.route.tokens.mode == nt_hal_abi::INT_MODE_LATCHED
+            });
+            let rescan = nt_kernel_exec::rescan_after_acknowledgement(
+                if latched { KernelInterruptMode::Latched } else { KernelInterruptMode::LevelSensitive },
+                claimed != 0,
+            );
+            if rescan {
+                HOSTED_IRQ_PENDING_EVENTS.fetch_or(1u64 << line.event_bit, Ordering::AcqRel);
+                HOSTED_IRQ_RETRY_WAKE.publish(crate::monotonic_time_100ns());
+            }
+            trace_hosted_irq_line_outcome(line.event_bit, b"acknowledged", claimed, rescan);
             if complete_hosted_irq_connection_leases(&leased).is_err() {
                 for connection in hosted_irq_connections_mut()
                     .iter_mut()
@@ -60041,6 +60064,28 @@ unsafe fn service_hosted_irq_event(
     }
 }
 
+/// Bounded per-line evidence for every delivery outcome. Each line gets its own budget, so a
+/// busy storage line cannot exhaust the trace for the 8042's keyboard and mouse lines.
+fn trace_hosted_irq_line_outcome(event_bit: u8, outcome: &[u8], claimed: u64, rescan: bool) {
+    static PER_LINE: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+    let Some(counter) = PER_LINE.get(event_bit as usize) else { return; };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 32 && !n.is_power_of_two() {
+        return;
+    }
+    print_str(b"[hosted-irq-line] event=");
+    print_u64(event_bit as u64);
+    print_str(b" n=");
+    print_u64(n);
+    print_str(b" outcome=");
+    print_str(outcome);
+    print_str(b" claimed=");
+    print_u64(claimed);
+    print_str(b" rescan=");
+    print_u64(u64::from(rescan));
+    print_str(b"\n");
+}
+
 unsafe fn drain_pending_hosted_irqs_snapshot() -> u64 {
     let mut serviced = 0u64;
     let pending = HOSTED_IRQ_PENDING_EVENTS.swap(0, Ordering::AcqRel);
@@ -60065,6 +60110,7 @@ unsafe fn drain_pending_hosted_irqs_snapshot() -> u64 {
             Ok(HostedIrqServiceOutcome::DeferredBusy) => {
                 let count = HOSTED_IRQ_EVENTS_DEFERRED_BUSY.fetch_add(1, Ordering::Relaxed) + 1;
                 deferred |= event;
+                trace_hosted_irq_line_outcome(event_bit, b"deferred-busy", 0, true);
                 if count <= 16 {
                     print_str(b"[hosted-irq] deferred busy arena event=");
                     print_u64(event_bit as u64);
@@ -60072,6 +60118,7 @@ unsafe fn drain_pending_hosted_irqs_snapshot() -> u64 {
                 }
             }
             Err(status) => {
+                trace_hosted_irq_line_outcome(event_bit, b"failed", 0, false);
                 print_str(b"[hosted-irq] dispatch failed event=");
                 print_u64(event_bit as u64);
                 print_str(b" status=0x");

@@ -119,6 +119,7 @@ pub use hosted_dpc::{
 pub use interrupt::{
     InterruptConnectError, InterruptConnection, InterruptMode, InterruptScan,
     InterruptScanBuildError, InterruptScanProgress, InterruptTable, ReadyIsr, SYNTHETIC_DIRQL,
+    rescan_after_acknowledgement,
 };
 pub use interrupt_lock::{
     InterruptActualLockError, InterruptActualLockIdentity, InterruptActualLockLease,

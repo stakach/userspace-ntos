@@ -216,6 +216,18 @@ pub enum InterruptScanProgress {
     Complete { claimed: bool, passes: u64 },
 }
 
+/// Whether an acknowledged delivery needs one more ISR pass with no new hardware interrupt.
+///
+/// A latched (edge) line delivers nothing while it is unacknowledged: an edge raised after the
+/// scan's last unclaimed pass but before the handler acknowledgement is lost, and a device that
+/// keeps its line asserted (the 8042 with a full output buffer) never raises another edge. One
+/// post-acknowledgement pass finds that data; an edge after the acknowledgement is delivered
+/// normally. A claimed pass therefore always schedules another; an unclaimed one ends. A level
+/// line stays asserted while unserviced, so its next delivery is never lost.
+pub const fn rescan_after_acknowledgement(mode: InterruptMode, claimed: bool) -> bool {
+    matches!(mode, InterruptMode::Latched) && claimed
+}
+
 /// Borrow-free NT shared-line scan state.
 pub struct InterruptScan {
     entries: Vec<InterruptConnection>,
@@ -319,6 +331,33 @@ impl InterruptScan {
 #[cfg(test)]
 mod tests {
     extern crate std;
+
+    /// Boot 44463332736: the mouse burst ended with a claimed scan, then one unclaimed
+    /// ("Spurious i8042 mouse interrupt") pass and the acknowledgement. Bytes that arrived in
+    /// that window raised their edge while the line was unacknowledged, and IRQ12 (with IRQ1,
+    /// which shares the 8042 output buffer) never fired again.
+    #[test]
+    fn an_edge_lost_before_acknowledgement_is_recovered_by_one_post_ack_pass() {
+        use super::{rescan_after_acknowledgement, InterruptMode};
+        // Model: `buffered` bytes are waiting; an edge is delivered only after an ack and only
+        // when new data arrives then. The ISR consumes one byte per claimed call.
+        fn run(rescan: bool) -> u32 {
+            let mut buffered = 1u32; // arrived between the unclaimed pass and the ack
+            let mut deliveries = 0;
+            let mut pending = rescan_after_acknowledgement(InterruptMode::Latched, true) && rescan;
+            while pending && deliveries < 8 {
+                deliveries += 1;
+                let claimed = buffered != 0;
+                if claimed { buffered -= 1; }
+                pending = rescan && rescan_after_acknowledgement(InterruptMode::Latched, claimed);
+            }
+            buffered
+        }
+        assert_eq!(run(false), 1, "without the post-ack pass the byte is stranded forever");
+        assert_eq!(run(true), 0);
+        assert!(!rescan_after_acknowledgement(InterruptMode::Latched, false));
+        assert!(!rescan_after_acknowledgement(InterruptMode::LevelSensitive, true));
+    }
 
     use super::*;
 
