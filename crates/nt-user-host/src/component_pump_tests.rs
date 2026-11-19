@@ -371,3 +371,74 @@ fn the_resume_flush_word_names_one_returned_callback() {
     // No callback has id zero, so an unpublished word never matches one.
     assert_eq!(callback_resume_flush_word(returned, 3171, 0), 0);
 }
+
+/// A resumed lane as the root sees it after some resume path handed control back.
+struct ResumedLane {
+    running: Option<u64>,
+    /// Scheduler yields left before the continuation's receive collects the lane's message.
+    yields_left: u32,
+    /// Whether any retained owner holds this lane's continuation.
+    owned: bool,
+    lane_receives: u64,
+    idle_receives_while_running: u32,
+}
+
+impl ResumedLane {
+    fn root_turn(&mut self) -> RunningLaneGate {
+        let state = core::cell::RefCell::new(self);
+        let gate = drive_running_lane_before_idle_receive(
+            || state.borrow().running,
+            || state.borrow().lane_receives,
+            |_| {
+                let mut lane = state.borrow_mut();
+                if !lane.owned { return; }
+                // The owner's continuation services the scheduler work and runs the lane's
+                // own receive; the last one collects the message that parks the lane.
+                lane.lane_receives += 1;
+                if lane.yields_left == 0 { lane.running = None } else { lane.yields_left -= 1 }
+            },
+        );
+        let lane = state.into_inner();
+        if gate == RunningLaneGate::Idle && lane.running.is_some() {
+            lane.idle_receives_while_running += 1;
+        }
+        gate
+    }
+}
+
+/// Boot 44594159275: the AddDevice CONNECT resume gate (stages 40/8, 42/1, 20/259, 41/4)
+/// returned RetainedRefusal with primary lane 37 still running behind a scheduler-yielded
+/// child receive, and the root's idle receive was refused (ingress-retained site=522). Any
+/// resume path may return this way; the root drives the owner and never waits idle.
+#[test]
+fn a_resume_path_that_leaves_a_lane_running_never_reaches_the_idle_receive() {
+    for yields_left in 0..5 {
+        let mut lane = ResumedLane {
+            running: Some(37), yields_left, owned: true, lane_receives: 0,
+            idle_receives_while_running: 0,
+        };
+        assert_eq!(lane.root_turn(), RunningLaneGate::Idle);
+        assert_eq!(lane.running, None);
+        assert_eq!(lane.lane_receives, u64::from(yields_left) + 1);
+        assert_eq!(lane.idle_receives_while_running, 0);
+    }
+}
+
+#[test]
+fn a_running_lane_without_an_owner_is_reported_not_waited_on() {
+    let mut lane = ResumedLane {
+        running: Some(37), yields_left: 0, owned: false, lane_receives: 0,
+        idle_receives_while_running: 0,
+    };
+    assert_eq!(lane.root_turn(), RunningLaneGate::Undriven);
+    assert_eq!(lane.running, Some(37));
+    assert_eq!(lane.idle_receives_while_running, 0);
+}
+
+#[test]
+fn an_idle_root_receives_without_driving_any_owner() {
+    let mut driven = 0;
+    let gate = drive_running_lane_before_idle_receive(|| None::<u64>, || 0, |_| driven += 1);
+    assert_eq!(gate, RunningLaneGate::Idle);
+    assert_eq!(driven, 0);
+}

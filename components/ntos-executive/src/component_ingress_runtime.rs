@@ -59,7 +59,7 @@ pub(crate) use hosted::{
     HostedHandoffRefused, quarantine_refused_handoff, fail_quarantined_native_call,
     take_selected_root_hosted_with, reconcile_root_ingress_import_no_effect,
     reconcile_root_ingress_settlement_before_restore,
-    bind_receive_settlement, prepare_receive_settlement, take_outer_boundary,
+    bind_receive_settlement, prepare_receive_settlement, take_outer_boundary, outer_boundary_ready,
     bind_root_ingress_pass, prepare_root_ingress_pass,
     begin_undelivered_root_unwind, cancel_restored_undelivered_root_pass,
     prepared_root_ingress_snapshot, selected_root_read_request,
@@ -110,6 +110,13 @@ struct NativePeer {
 }
 
 static mut SOURCES: IngressSourceRegistry = IngressSourceRegistry::new();
+/// Native receives issued for a lane's own execution (a dispatch or a staged startup), never
+/// the root's idle receive. The root's running-lane gate reads it as owner progress.
+static LANE_RECEIVES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn lane_receives() -> u64 {
+    LANE_RECEIVES.load(core::sync::atomic::Ordering::Relaxed)
+}
 static mut NATIVE_PEERS: Vec<NativePeer> = Vec::new();
 static mut INITIAL_REPLIES: Vec<Option<ComponentIngress<ReceivedMessage>>> = Vec::new();
 
@@ -698,6 +705,9 @@ pub(crate) unsafe fn receive(
         let reply = owner.receiver.as_ref().ok_or(Error::Initialization)?.reply();
         match owner.receive(lanes, execution, probe_tcb, blocking) {
             Ok(sequence) => {
+                if execution != IngressExecutionOwner::Idle {
+                    LANE_RECEIVES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 owner.pending_receive = Some(PendingNativeReceive {
                     execution, probe_tcb, reply, sequence,
                     returned_message: None, classify_retry_allowed: true,

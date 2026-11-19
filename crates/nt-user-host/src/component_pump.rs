@@ -130,6 +130,35 @@ pub fn root_receive_disposition_after_yield<C, R, T>(
     }
 }
 
+/// The verdict of the root's running-lane gate before an idle receive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunningLaneGate {
+    /// No lane runs: the root may take its idle receive.
+    Idle,
+    /// A lane still runs and one owner pass ran no lane-owned receive. Nothing may wait.
+    Undriven,
+}
+
+/// The root's idle receive is never reached while any lane runs. A running lane's next
+/// message belongs to the pump continuation that resumed it, so whatever resume path handed
+/// the root back control, the root first drives the retained owners. Each pass must run a
+/// lane-owned receive (`lane_receives` advances) or retire the running lane; a pass that
+/// does neither has no owner for that lane and is reported, never waited on.
+pub fn drive_running_lane_before_idle_receive<L>(
+    mut running: impl FnMut() -> Option<L>,
+    mut lane_receives: impl FnMut() -> u64,
+    mut drive_owners: impl FnMut(&L),
+) -> RunningLaneGate {
+    while let Some(lane) = running() {
+        let before = lane_receives();
+        drive_owners(&lane);
+        if running().is_some() && lane_receives() == before {
+            return RunningLaneGate::Undriven;
+        }
+    }
+    RunningLaneGate::Idle
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PumpDepthDisposition {
     None,

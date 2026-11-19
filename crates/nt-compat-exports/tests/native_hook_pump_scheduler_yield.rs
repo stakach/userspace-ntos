@@ -54,9 +54,10 @@ fn the_native_mapping_drives_scheduler_yielded_continuations() {
     assert!(service.contains("| Progress::SchedulerYielded =>\n            FilePumpTurn::Progressed"));
     let scheduler = include_str!("../../../components/ntos-executive/src/component_scheduler.rs");
     assert!(scheduler.contains("self.retryable && self.mode == PendingReceiveMode::SchedulerYield"));
+    // The retained wait reaches its idle receive only through the executor's receive, whose
+    // running-lane gate (native_running_lane_receive_gate) drives a lane left running.
     let flow = include_str!("../../../components/ntos-executive/src/executor/flow.rs");
     let wait = flow.split("pub(super) unsafe fn wait_retained_settlement(").nth(1).unwrap();
-    let running = wait.find("hold_snapshot().running.is_some()").expect("running-lane guard");
-    let receive = wait.find("let received = match receive(").unwrap();
-    assert!(running < receive, "never an idle receive while a lane runs");
+    assert!(wait.contains("let received = match receive("));
+    assert!(!wait.contains("executive_ingress::receive"));
 }

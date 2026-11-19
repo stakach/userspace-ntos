@@ -86,6 +86,7 @@ pub(super) unsafe fn maintain(
                 }
             }
         }
+        super::loop_receive::drive_running_lane(&mut lp.ingress, nt_handler, &mut lp.exit)?;
         let received = crate::executive_ingress::receive(local().reply_main_slot.load(Ordering::Relaxed));
         let received = match received {
             crate::executive_ingress::ReceiveOutcome::Message(received) => received,

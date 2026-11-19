@@ -35,6 +35,26 @@ fn settle(
     }
 }
 
+/// The root's idle receive is never reached while a lane runs. Every receive passes through
+/// this gate first, so no resume path that left a lane running can make the root wait on it.
+#[track_caller]
+pub(super) unsafe fn drive_running_lane(
+    ingress: &mut Ingress,
+    nt_handler: &mut ExecNtHandler,
+    exit: &mut LoopExit,
+) -> ControlFlow<Turn, ()> {
+    let add_device = ingress.root_add_device_turn.as_ref().map(|turn| turn.owner());
+    match running_lane_gate(nt_handler, add_device) {
+        nt_user_host::component_pump::RunningLaneGate::Idle => ControlFlow::Continue(()),
+        nt_user_host::component_pump::RunningLaneGate::Undriven => {
+            exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+            exit.stop_ssn = 0;
+            exit.record(b"idle-receive-running-lane");
+            ControlFlow::Break(Turn::Exit)
+        }
+    }
+}
+
 /// Was `component_recv!`.
 #[track_caller]
 pub(super) unsafe fn receive(
@@ -45,6 +65,7 @@ pub(super) unsafe fn receive(
     reply: impl FnOnce() -> u64,
 ) -> ControlFlow<Turn, Received> {
     assert!(crate::executive_ingress::handles(ep));
+    drive_running_lane(ingress, nt_handler, exit)?;
     if root_add_device_exclusive_pending() {
         if !prepare_parked_add_device_receive(&mut ingress.root_add_device_turn) {
             exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -96,6 +117,7 @@ pub(super) unsafe fn reply_receive(
     reply_message: impl FnOnce() -> (u64, u64, u64, u64, u64, u64),
 ) -> ControlFlow<Turn, Received> {
     assert!(crate::executive_ingress::handles(ep));
+    drive_running_lane(ingress, nt_handler, exit)?;
     if root_add_device_exclusive_pending() {
         if !prepare_parked_add_device_receive(&mut ingress.root_add_device_turn) {
             exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;

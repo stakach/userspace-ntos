@@ -2143,6 +2143,14 @@ pub(crate) unsafe fn bind_receive_settlement(
     Ok(())
 }
 
+/// Read-only: whether `take_outer_boundary` would hand the root a receive settlement boundary.
+/// That boundary is the continuation the root drives next, before any native receive.
+pub(crate) unsafe fn outer_boundary_ready() -> bool {
+    (&*core::ptr::addr_of!(CALLS)).iter().flatten().any(|row| row.receive_settlement.as_ref()
+        .is_some_and(|receive| !receive.transferred)
+        && row.completion == Some(Completion::Acknowledged))
+}
+
 pub(crate) unsafe fn take_outer_boundary() -> Result<Option<ReceiveSettlementBoundary>, Error> {
     for row in (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten() {
         let Some(receive) = row.receive_settlement.as_mut() else {

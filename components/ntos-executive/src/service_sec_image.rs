@@ -13716,6 +13716,68 @@ unsafe fn prepare_parked_add_device_receive(
     delay_timer_program(deadline, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY)
 }
 
+/// The root's idle receive is never reached while a lane runs: that lane's next message
+/// belongs to the pump continuation that resumed it, whichever resume path returned. Drive the
+/// retained owners, in the root's settlement order, until the lane parks or terminates. A
+/// ready outer receive boundary is itself that continuation and is driven by the receive.
+unsafe fn running_lane_gate(
+    handler: &mut ExecNtHandler,
+    add_device: Option<RootAddDeviceOwner>,
+) -> nt_user_host::component_pump::RunningLaneGate {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let mut passes = 0u64;
+    let gate = nt_user_host::component_pump::drive_running_lane_before_idle_receive(
+        || if runtime::outer_boundary_ready() { None } else { runtime::hold_snapshot().running },
+        runtime::lane_receives,
+        |running| {
+            passes += 1;
+            trace_running_lane_gate(running, passes, add_device.is_some());
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            if !matches!(settle_queued_callbacks(), ConnectPumpSettlement::Settled) { return; }
+            crate::driver_launch::redrive_entered_hosted_connect_completions();
+            if !matches!(settle_suspended_connect_pumps(), ConnectPumpSettlement::Settled) {
+                return;
+            }
+            if let Some(owner) = add_device {
+                if root_add_device_retry_without_new_child(handler, owner) {
+                    redrive_flat_root_add_device_selected(handler, owner);
+                }
+            }
+        },
+    );
+    if gate == nt_user_host::component_pump::RunningLaneGate::Undriven {
+        if let Some(running) = runtime::hold_snapshot().running {
+            print_str(b"[running-lane-gate] undriven lane/gen/route=");
+            print_u64(running.lane.index as u64);
+            print_str(b"/");
+            print_u64(running.lane.generation);
+            print_str(b"/");
+            print_u64(running.route.map_or(0, |route| route.badge()));
+            print_str(b"\n");
+        }
+    }
+    gate
+}
+
+fn trace_running_lane_gate(
+    running: &crate::spawn_hosts::shared_ingress::owner::runtime::RunningSnapshot,
+    passes: u64,
+    add_device: bool,
+) {
+    static TRACED: AtomicU64 = AtomicU64::new(0);
+    let n = TRACED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() { return; }
+    print_str(b"[running-lane-gate] n=");
+    print_u64(n);
+    print_str(b" lane=");
+    print_u64(running.lane.index as u64);
+    print_str(b" pass=");
+    print_u64(passes);
+    print_str(b" add-device-turn=");
+    print_u64(u64::from(add_device));
+    print_str(b"\n");
+}
+
 /// Bounded evidence for `executor::flow::wait_retained_settlement`.
 fn trace_retained_settlement_wait(add_device_turn: bool, queued_turn: bool) {
     static TRACED: AtomicU64 = AtomicU64::new(0);

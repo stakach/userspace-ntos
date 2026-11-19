@@ -177,6 +177,7 @@ pub(super) unsafe fn admit<'a>(
             lp.exit.record(b"queued-callback-child-transfer");
             return ControlFlow::Break(Turn::Exit);
         }
+        super::loop_receive::drive_running_lane(&mut lp.ingress, nt_handler, &mut lp.exit)?;
         let outcome = crate::executive_ingress::reply_receive(
             local().reply_main_slot.load(Ordering::Relaxed), 0, 0, 0, 0, 0,
         );
