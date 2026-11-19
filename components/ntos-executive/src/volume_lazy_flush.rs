@@ -56,6 +56,12 @@ impl LazyFlush {
     }
 }
 
+/// Checkpoint episodes that get a trace line: every one of the first 16, then powers of two,
+/// so a long interactive run (where the lazy flush keeps publishing) still shows publications.
+pub(crate) const fn episode_traced(episode: u64) -> bool {
+    episode <= 16 || episode.is_power_of_two()
+}
+
 /// Whether the mounted volume's storage path can serve a checkpoint now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoragePath {

@@ -4653,8 +4653,7 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
 /// Success here therefore means "no durability refusal", not "the volume is clean".
 fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
     use crate::volume_checkpoint_deferral::Outcome;
-    /// Episodes whose deferral and publication each get one trace line.
-    const TRACED_EPISODES: u64 = 16;
+    use crate::volume_lazy_flush::episode_traced;
     let caller_required = nt_handler.writable_fs_commit_required;
     owe_lazy_volume_checkpoint(nt_handler);
     let checkpoint_status = match publish_required_dirty_volume(nt_handler) {
@@ -4681,9 +4680,12 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
         checkpoint_status, crate::writable_fs::checkpoint_progress, monotonic_time_100ns,
     ) {
         Outcome::Settled { episode, deferrals, waited_100ns } => {
-            if deferrals != 0 && episode <= TRACED_EPISODES {
+            let lazy = VOLUME_LAZY_FLUSH_OWED.swap(false, Ordering::AcqRel);
+            if (deferrals != 0 || lazy) && episode_traced(episode) {
                 print_str(b"[writable-fs-snapshot] service-loop checkpoint published episode=");
                 print_u64(episode);
+                print_str(b" lazy=");
+                print_u64(u64::from(lazy));
                 print_str(b" deferrals=");
                 print_u64(deferrals);
                 print_str(b" waited-100ns=");
@@ -4696,7 +4698,7 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
             }
         }
         Outcome::Deferred { episode, first } => {
-            if first && episode <= TRACED_EPISODES {
+            if first && episode_traced(episode) {
                 print_str(b"[writable-fs-snapshot] service-loop checkpoint deferred episode=");
                 print_u64(episode);
                 print_str(b" status=0x");
@@ -4727,6 +4729,8 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
 }
 
 /// Open interval of the lazy volume flush, as [`crate::volume_lazy_flush::LazyFlush`] raw.
+/// The lazy flush owed the checkpoint now in flight; its publication is traced as lazy.
+static VOLUME_LAZY_FLUSH_OWED: AtomicBool = AtomicBool::new(false);
 static VOLUME_LAZY_FLUSH: AtomicU64 =
     AtomicU64::new(crate::volume_lazy_flush::LazyFlush::new().into_raw());
 
@@ -4746,6 +4750,7 @@ fn owe_lazy_volume_checkpoint(nt_handler: &mut ExecNtHandler) {
     if due {
         nt_handler.writable_fs_dirty = true;
         nt_handler.writable_fs_commit_required = true;
+        VOLUME_LAZY_FLUSH_OWED.store(true, Ordering::Release);
     }
     if due || (opened && lazy.deadline().is_some()) {
         unsafe { rearm_registered_active_delay_timer() };

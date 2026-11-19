@@ -7,7 +7,7 @@
 #[path = "../../../components/ntos-executive/src/volume_lazy_flush.rs"]
 mod volume_lazy_flush;
 
-use volume_lazy_flush::{LazyFlush, LAZY_FLUSH_DELAY_100NS};
+use volume_lazy_flush::{episode_traced, LazyFlush, LAZY_FLUSH_DELAY_100NS};
 
 const SECOND: u64 = 10_000_000;
 
@@ -128,4 +128,38 @@ fn a_draining_route_is_busy_for_every_checkpoint_and_eligibility_uses_the_route(
         .next()
         .unwrap();
     assert!(boundary.contains("classify_failed_checkpoint("));
+}
+
+/// An idle desktop: the volume becomes dirty once, nothing else happens, and the root wakes
+/// only at the deadline the lazy flush registers. The checkpoint must be owed at that wake.
+#[test]
+fn an_idle_dirty_volume_is_published_by_its_lazy_deadline() {
+    let mut lazy = LazyFlush::new();
+    let dirty_at = 900 * SECOND; // long after the boot-progress seal
+    assert!(!lazy.observe(true, dirty_at)); // the write's own service boundary
+    let wake = lazy.deadline().expect("an idle loop has a timer to wake for");
+    assert_eq!(wake, dirty_at + LAZY_FLUSH_DELAY_100NS);
+    // The only later event is that timer; its boundary owes the checkpoint.
+    assert!(lazy.observe(true, wake), "published by the deadline without any other activity");
+    // The checkpoint began; the volume is clean and no further wake is armed.
+    assert!(!lazy.observe(false, wake + 1));
+    assert_eq!(lazy.deadline(), None);
+}
+
+/// Boot 44416320584: published lines stopped at episode 16, long before the desktop sealed,
+/// so post-seal lazy publications were invisible. Later episodes trace at powers of two.
+#[test]
+fn checkpoint_publications_stay_visible_after_sixteen_episodes() {
+    assert!((1..=16).all(episode_traced));
+    assert!(episode_traced(32) && episode_traced(1024));
+    assert!(!episode_traced(17) && !episode_traced(1000));
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    assert!(!service.contains("TRACED_EPISODES"));
+    let published = service
+        .split("service-loop checkpoint published episode=")
+        .next()
+        .unwrap();
+    let tail = &published[published.len().saturating_sub(200)..];
+    assert!(tail.contains("episode_traced(episode)"));
+    assert!(service.contains("print_str(b\" lazy=\");"));
 }
