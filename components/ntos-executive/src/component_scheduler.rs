@@ -91,6 +91,13 @@ impl ComponentSchedulerScope {
         crate::arm_hosted_irq_retry_before_nested_receive();
         clock.transition(SchedulerServicePhase::DpcDrain, crate::disk_census_ticks());
         let dpcs = drain_hosted_driver_dpcs();
+        // A background snapshot owner holding the reserve can otherwise progress only from the
+        // outer loop, which this frame is keeping out. Drive it here, with the parent parked,
+        // so a foreground registry write in this frame is never waiting on an owner that cannot
+        // move (#412).
+        if crate::driver_launch::mounted_native_background_holder_ready() {
+            let _ = crate::driver_launch::service_mounted_native_background_holder();
+        }
         clock.transition(SchedulerServicePhase::ReceivePrepare, crate::disk_census_ticks());
         // Nested exchanges may reconcile earlier requests before these effects publish new demand.
         crate::dispatcher_bootstrap::request_receive_checkpoint();

@@ -1046,6 +1046,29 @@ unsafe fn service_registry_exact(
     dispatch_claim(route, WorkClaim::Snapshot(claim), None).progress()
 }
 
+/// A background snapshot owner holds the reserve and has a command to enter or an entered
+/// command to settle. A nested frame then drives it in place (`service_background_holder`).
+pub(super) unsafe fn background_holder_ready() -> bool {
+    native_disk_relation::native_storage_route().is_some()
+        && crate::writable_fs::native_snapshot_io::background_owner_holds_reserve()
+        && ((&*core::ptr::addr_of!(PENDING)).is_some()
+            || crate::writable_fs::native_snapshot_io::background_outer_io_queued())
+}
+
+/// Under a parked nested parent, advance the background snapshot owner that holds the reserve:
+/// settle the one entered physical command through its exact completion/ACK, or enter the
+/// holder's next command. Foreground work waiting on that reserve can then be admitted.
+pub(super) unsafe fn service_background_holder() -> usize {
+    let Some(_guard) = NativeServiceGuard::enter() else { return 0; };
+    if (&*core::ptr::addr_of!(PENDING)).is_some() {
+        return poll_pending();
+    }
+    let Some(route) = native_disk_relation::native_storage_route() else { return 0; };
+    let Some(claim) = crate::writable_fs::native_snapshot_io::claim_background_snapshot_io()
+    else { return 0; };
+    dispatch_claim(route, WorkClaim::Snapshot(claim), None).progress()
+}
+
 pub(super) unsafe fn service_registry_recheck(id: u64) -> usize {
     service_registry_exact(id,
         crate::registry_mutation_work::pending_provider_header_recheck,

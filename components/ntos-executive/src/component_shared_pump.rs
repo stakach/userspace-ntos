@@ -823,6 +823,29 @@ unsafe fn inline_irq_work_pending() -> bool {
         || crate::dispatcher_bootstrap::timer_work_pending()
 }
 
+/// Bounded evidence for the in-frame background holder service, with the three gates that
+/// would otherwise have had to fire for the outer loop to drive it.
+fn trace_background_holder_service(ch: &PumpChannel, gates: (bool, bool, bool), serviced: usize) {
+    static TRACED: AtomicU64 = AtomicU64::new(0);
+    let n = TRACED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() {
+        return;
+    }
+    crate::print_str(b"[background-snapshot-nested] n=");
+    crate::print_u64(n);
+    crate::print_str(b" kind-irp=");
+    crate::print_u64(u64::from(ch.caps.kind == ReqKind::Irp));
+    crate::print_str(b" scheduler-yield=");
+    crate::print_u64(u64::from(gates.0));
+    crate::print_str(b" nested-ready=");
+    crate::print_u64(u64::from(gates.1));
+    crate::print_str(b" outer-io-queued=");
+    crate::print_u64(u64::from(gates.2));
+    crate::print_str(b" serviced=");
+    crate::print_u64(serviced as u64);
+    crate::print_str(b"\n");
+}
+
 unsafe fn nested_restore_refusal(
     ticket: Option<runtime::nested::NestedRestoreTicket>,
 ) -> PumpMessage {
@@ -1013,6 +1036,30 @@ pub(super) unsafe fn receive(
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
                 return nested_restore_refusal(ticket);
             }
+            if serviced != 0 { continue; }
+        }
+        // A background snapshot owner (lazy checkpoint or SYSTEM fold) holding the reserve can
+        // only otherwise progress from the outer loop, while foreground work in this frame (a
+        // provider registry write) waits on that reserve. Drive the holder here, with the exact
+        // parent parked, exactly as the registry recheck and WAL commands above are driven.
+        if crate::driver_launch::mounted_native_background_holder_ready() {
+            let _stage = StageScope::enter(ch, Stage::NestedWork);
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            let gates = (
+                pump_scheduler_work_bits(ch, false) != 0,
+                crate::driver_launch::mounted_native_block_nested_ready(),
+                crate::writable_fs::native_snapshot_io::background_outer_io_queued(),
+            );
+            let mut parent = match runtime::nested::park_current() {
+                Ok(parent) => parent,
+                Err(_) => return PumpMessage::transport_wall(),
+            };
+            let serviced = crate::driver_launch::service_mounted_native_background_holder();
+            let ticket = parent.as_ref().map(|parent| parent.ticket());
+            if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                return nested_restore_refusal(ticket);
+            }
+            trace_background_holder_service(ch, gates, serviced);
             if serviced != 0 { continue; }
         }
         let nested_file_ready = {

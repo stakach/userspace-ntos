@@ -221,6 +221,20 @@ pub(super) unsafe fn fold_system_wal_native() -> Result<bool, u32> {
     Err(snapshot_storage::BUSY)
 }
 
+/// The header recheck this fold is waiting on, while it is rechecking.
+pub(crate) unsafe fn recheck_id() -> Option<u64> {
+    match (&*core::ptr::addr_of!(WORK)).as_ref() {
+        Some(Work::Rechecking { id, .. }) => Some(*id),
+        _ => None,
+    }
+}
+
+/// This fold holds the snapshot reserve (rechecking or active).
+pub(crate) unsafe fn holds_reserve() -> bool {
+    matches!((&*core::ptr::addr_of!(WORK)).as_ref(),
+        Some(Work::Rechecking { .. } | Work::Active(_)))
+}
+
 /// This fold holds the snapshot reserve and has work only the outer owner may claim.
 pub(crate) unsafe fn outer_io_queued() -> bool {
     match (&*core::ptr::addr_of!(WORK)).as_ref() {

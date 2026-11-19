@@ -100,6 +100,22 @@ pub(crate) unsafe fn background_outer_io_queued() -> bool {
     super::native_checkpoint::outer_io_queued() || super::system_wal_fold::native::outer_io_queued()
 }
 
+/// A background snapshot owner holds the snapshot reserve.
+pub(crate) unsafe fn background_owner_holds_reserve() -> bool {
+    super::native_checkpoint::holds_reserve() || super::system_wal_fold::native::holds_reserve()
+}
+
+/// Claim the next command of a background snapshot owner that holds the reserve: its own
+/// header recheck read, or its next commit command. Used by a nested frame whose foreground
+/// work waits on that reserve, so the holder progresses from any nesting.
+pub(crate) unsafe fn claim_background_snapshot_io() -> Option<SnapshotClaim> {
+    let recheck = |id: Option<u64>| id.and_then(|id| snapshot_storage::claim_storage_io_for(id));
+    recheck(super::native_checkpoint::recheck_id())
+        .or_else(|| super::native_checkpoint::claim_next())
+        .or_else(|| recheck(super::system_wal_fold::native::recheck_id()))
+        .or_else(|| super::system_wal_fold::native::claim_next())
+}
+
 /// Claim at most one request from an owner already retained in the executive. No caller may
 /// create a physical command from a copied LBA or an unheld snapshot lease.
 pub(crate) unsafe fn claim_next_native_snapshot_io() -> Option<SnapshotClaim> {
