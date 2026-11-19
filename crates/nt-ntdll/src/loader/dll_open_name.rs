@@ -3,6 +3,7 @@
 use super::file_map_failure::FileMapFailureStage;
 
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xc000_0034;
+const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xc000_003a;
 
 fn leaf(name: &[u8]) -> &[u8] {
     let start = name
@@ -27,24 +28,56 @@ fn explicit_image_extension(name: &[u8]) -> bool {
         })
 }
 
-/// A dotted module stem can name a `.dll` file. Probe the exact name first and use the appended
-/// form only after an open returned a definitive name miss. Explicit PE file extensions and paths
-/// retain their requested spelling even when absent.
-pub fn retry_with_dll_extension(name: &[u8], stage: FileMapFailureStage, status: u32) -> bool {
-    matches!(stage, FileMapFailureStage::Open)
-        && status == STATUS_OBJECT_NAME_NOT_FOUND
-        && !name.is_empty()
+/// `name` is relative: neither an NT path nor a DOS drive path.
+fn is_relative(name: &[u8]) -> bool {
+    name.first() != Some(&b'\\') && name.get(1) != Some(&b':')
+}
+
+/// The default DLL search directories a relative name is tried in, in the standard order
+/// (System32, the 16-bit System directory, then the Windows directory). The application
+/// directory, current directory and PATH are not part of this loader's search.
+const SEARCH_DIRECTORIES: [&[u8]; 3] =
+    [b"\\SystemRoot\\System32\\", b"\\SystemRoot\\System\\", b"\\SystemRoot\\"];
+
+/// One file name to try for a requested DLL name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    /// Index into the search directories; ignored for an absolute name.
+    directory: usize,
+    /// Try the name with `.dll` appended.
+    dll_fallback: bool,
+}
+
+/// Every candidate for `name`, in the order the loader tries them. The first preserves the
+/// caller's spelling (with `.dll` added only when the leaf has no extension). A dotted module
+/// stem is retried as `<stem>.dll` in the same directory, and a relative name moves to the next
+/// search directory, each only after a definitive miss ([`is_definitive_miss`]).
+pub fn candidates(name: &[u8]) -> impl Iterator<Item = Candidate> {
+    let directories = if is_relative(name) { SEARCH_DIRECTORIES.len() } else { 1 };
+    let dll_retry = !name.is_empty()
         && !name.contains(&b'\\')
         && !name.contains(&b'/')
         && !name.contains(&b':')
         && has_extension(name)
         && !name.ends_with(b".")
-        && !explicit_image_extension(name)
+        && !explicit_image_extension(name);
+    (0..directories).flat_map(move |directory| {
+        [false, true]
+            .into_iter()
+            .filter(move |dll_fallback| !dll_fallback || dll_retry)
+            .map(move |dll_fallback| Candidate { directory, dll_fallback })
+    })
 }
 
-/// Build the exact NT path used by `NtOpenFile`. `dll_fallback` is valid only after
-/// [`retry_with_dll_extension`] accepted the preceding failed open.
-pub fn build_candidate(name: &[u8], dll_fallback: bool, output: &mut [u16]) -> Option<usize> {
+/// Only an open that proved the file or a directory on its path absent may move to the next
+/// candidate; any other failure is the answer for this name.
+pub fn is_definitive_miss(stage: FileMapFailureStage, status: u32) -> bool {
+    matches!(stage, FileMapFailureStage::Open)
+        && matches!(status, STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND)
+}
+
+/// Build the exact NT path used by `NtOpenFile` for one of [`candidates`]`(name)`.
+pub fn build_candidate(name: &[u8], candidate: Candidate, output: &mut [u16]) -> Option<usize> {
     if name.is_empty() {
         return None;
     }
@@ -53,9 +86,9 @@ pub fn build_candidate(name: &[u8], dll_fallback: bool, output: &mut [u16]) -> O
     } else if name.get(1) == Some(&b':') {
         b"\\??\\"
     } else {
-        b"\\SystemRoot\\System32\\"
+        SEARCH_DIRECTORIES.get(candidate.directory)?
     };
-    let append_dll = dll_fallback || !has_extension(name);
+    let append_dll = candidate.dll_fallback || !has_extension(name);
     let required = prefix
         .len()
         .checked_add(name.len())?
@@ -81,47 +114,61 @@ pub fn build_candidate(name: &[u8], dll_fallback: bool, output: &mut [u16]) -> O
 mod tests {
     use super::*;
     use alloc::string::String;
+    use alloc::vec::Vec;
 
-    fn decoded(candidate: &[u16]) -> String {
-        String::from_utf16(candidate).unwrap()
+    fn paths(name: &[u8]) -> Vec<String> {
+        candidates(name)
+            .map(|candidate| {
+                let mut path = [0u16; 180];
+                let len = build_candidate(name, candidate, &mut path).unwrap();
+                String::from_utf16(&path[..len]).unwrap()
+            })
+            .collect()
     }
 
     #[test]
-    fn dotted_module_stem_retries_with_dll_only_after_name_miss() {
-        let mut path = [0u16; 180];
-        let first = build_candidate(b"windows.storage", false, &mut path).unwrap();
-        assert_eq!(decoded(&path[..first]), r"\SystemRoot\System32\windows.storage");
-        assert!(retry_with_dll_extension(b"windows.storage", FileMapFailureStage::Open, 0xc000_0034));
-        let second = build_candidate(b"windows.storage", true, &mut path).unwrap();
-        assert_eq!(decoded(&path[..second]), r"\SystemRoot\System32\windows.storage.dll");
-        for status in [0, 0xc000_003a, 0xc000_0022, 0xc000_007b] {
-            assert!(!retry_with_dll_extension(b"windows.storage", FileMapFailureStage::Open, status));
-        }
-        for stage in [FileMapFailureStage::CreateSection, FileMapFailureStage::MapView] {
-            assert!(!retry_with_dll_extension(b"windows.storage", stage, 0xc000_0034));
-        }
+    fn dotted_module_stem_retries_with_dll_in_each_directory() {
+        assert_eq!(paths(b"windows.storage"), [
+            r"\SystemRoot\System32\windows.storage",
+            r"\SystemRoot\System32\windows.storage.dll",
+            r"\SystemRoot\System\windows.storage",
+            r"\SystemRoot\System\windows.storage.dll",
+            r"\SystemRoot\windows.storage",
+            r"\SystemRoot\windows.storage.dll",
+        ]);
     }
 
     #[test]
-    fn explicit_extensions_and_paths_retain_exact_names() {
-        let mut path = [0u16; 180];
-        for (name, expected) in [
-            (&b"syssetup.dll"[..], r"\SystemRoot\System32\syssetup.dll"),
-            (&b"winspool.drv"[..], r"\SystemRoot\System32\winspool.drv"),
-            (&b"control.ocx"[..], r"\SystemRoot\System32\control.ocx"),
-            (&br"c:\windows\system32\custom.dll"[..], r"\??\c:\windows\system32\custom.dll"),
-        ] {
-            let len = build_candidate(name, false, &mut path).unwrap();
-            assert_eq!(decoded(&path[..len]), expected);
-            assert!(!retry_with_dll_extension(name, FileMapFailureStage::Open, 0xc000_0034));
-        }
+    fn a_relative_path_is_found_under_the_windows_directory() {
+        // mpr loads a network provider by its registered ProviderPath, `System32\nfs41_np.dll`.
+        let found = paths(br"system32\nfs41_np.dll");
+        assert_eq!(found.last().map(String::as_str), Some(r"\SystemRoot\system32\nfs41_np.dll"));
+        assert_eq!(found.len(), 3, "a path keeps its spelling: no .dll retry");
+    }
+
+    #[test]
+    fn explicit_extensions_and_absolute_paths_retain_exact_names() {
+        assert_eq!(paths(b"winspool.drv")[0], r"\SystemRoot\System32\winspool.drv");
+        assert!(paths(b"winspool.drv").iter().all(|path| path.ends_with("winspool.drv")));
+        assert_eq!(paths(br"c:\windows\system32\custom.dll"), [r"\??\c:\windows\system32\custom.dll"]);
+        assert_eq!(paths(br"\SystemRoot\System32\x.dll"), [r"\SystemRoot\System32\x.dll"]);
     }
 
     #[test]
     fn extensionless_name_gets_default_extension_on_first_open() {
-        let mut path = [0u16; 180];
-        let len = build_candidate(b"kernel32", false, &mut path).unwrap();
-        assert_eq!(decoded(&path[..len]), r"\SystemRoot\System32\kernel32.dll");
-        assert!(!retry_with_dll_extension(b"kernel32", FileMapFailureStage::Open, 0xc000_0034));
+        assert_eq!(paths(b"kernel32")[0], r"\SystemRoot\System32\kernel32.dll");
+        assert_eq!(paths(b"kernel32").len(), 3, "the default extension is not retried");
+    }
+
+    #[test]
+    fn only_a_proven_absence_moves_on() {
+        assert!(is_definitive_miss(FileMapFailureStage::Open, 0xc000_0034));
+        assert!(is_definitive_miss(FileMapFailureStage::Open, 0xc000_003a));
+        for status in [0, 0xc000_0022, 0xc000_007b, 0xc000_0043] {
+            assert!(!is_definitive_miss(FileMapFailureStage::Open, status), "{status:#x}");
+        }
+        for stage in [FileMapFailureStage::CreateSection, FileMapFailureStage::MapView] {
+            assert!(!is_definitive_miss(stage, 0xc000_0034));
+        }
     }
 }

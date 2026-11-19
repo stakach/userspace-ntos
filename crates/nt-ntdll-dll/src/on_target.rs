@@ -2598,16 +2598,9 @@ unsafe fn resolve_export_addr(
 #[cfg(target_arch = "x86_64")]
 unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
     // Build an absolute NT object name for OBJECT_ATTRIBUTES.ObjectName. NtOpenFile cannot resolve
-    // a relative name when RootDirectory is null: static imports use System32, DOS drive paths use
-    // the \?? namespace, and already-absolute NT names pass through unchanged.
+    // a relative name when RootDirectory is null: a relative name is tried in the default search
+    // directories, DOS drive paths use the \?? namespace, and NT names pass through unchanged.
     let mut wname = [0u16; 180];
-    let Some(mut wn) = nt_ntdll::loader::dll_open_name::build_candidate(
-        open_name_lc,
-        false,
-        &mut wname,
-    ) else {
-        return 0;
-    };
     // UNICODE_STRING { Length, MaximumLength, Buffer } (x64: u16,u16,pad,ptr).
     #[repr(C)]
     struct UnicodeString {
@@ -2616,44 +2609,38 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
         _pad: u32,
         buffer: u64,
     }
-    let mut us = UnicodeString {
-        length: (wn * 2) as u16,
-        maximum_length: (wn * 2) as u16,
-        _pad: 0,
-        buffer: wname.as_ptr() as u64,
-    };
-
     // NtOpenFile(image) -> NtCreateSection(SEC_IMAGE): reuse rtlp_map_file (opens by name, closes
-    // the file, and returns the SEC_IMAGE handle until the map attempt consumes it).
-    // SAFETY: on-target; us points at the current owned name in `wname`.
-    let first = unsafe { rtlp_map_file(core::ptr::addr_of!(us) as *const u8, 0x40) };
-    let section = match first {
-        Ok(section) => section,
-        Err(error)
-            if nt_ntdll::loader::dll_open_name::retry_with_dll_extension(
-                open_name_lc,
-                error.stage,
-                error.status,
-            ) =>
-        {
-            let Some(fallback_len) = nt_ntdll::loader::dll_open_name::build_candidate(
-                open_name_lc,
-                true,
-                &mut wname,
-            ) else {
-                return 0;
-            };
-            wn = fallback_len;
-            us.length = (wn * 2) as u16;
-            us.maximum_length = us.length;
-            // SAFETY: the first open definitively missed; this is a different, exact file name.
-            match unsafe { rtlp_map_file(core::ptr::addr_of!(us) as *const u8, 0x40) } {
-                Ok(section) => section,
-                Err(_) => return 0,
+    // the file, and returns the SEC_IMAGE handle until the map attempt consumes it). Each further
+    // candidate is tried only after the previous open proved its file absent.
+    let mut section = 0;
+    for candidate in nt_ntdll::loader::dll_open_name::candidates(open_name_lc) {
+        let Some(wn) = nt_ntdll::loader::dll_open_name::build_candidate(
+            open_name_lc,
+            candidate,
+            &mut wname,
+        ) else {
+            return 0;
+        };
+        let us = UnicodeString {
+            length: (wn * 2) as u16,
+            maximum_length: (wn * 2) as u16,
+            _pad: 0,
+            buffer: wname.as_ptr() as u64,
+        };
+        // SAFETY: on-target; us points at the current owned name in `wname`.
+        match unsafe { rtlp_map_file(core::ptr::addr_of!(us) as *const u8, 0x40) } {
+            Ok(mapped) => {
+                section = mapped;
+                break;
             }
+            Err(error)
+                if nt_ntdll::loader::dll_open_name::is_definitive_miss(error.stage, error.status) =>
+            {
+                continue
+            }
+            Err(_) => return 0,
         }
-        Err(_) => return 0,
-    };
+    }
     if section == 0 {
         return 0;
     }
