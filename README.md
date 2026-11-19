@@ -4,6 +4,8 @@
 
 The hosted filesystem comes from a [pinned LiberNT AMD64 installed release](rust-micro/vendor/libernt/manifest.txt). Image generation verifies the downloaded archive and disk image, preserves LiberNT's released drivers including `acpi.sys`, and stages this repository's `ntdll.dll` at `Windows/system32/ntdll.dll`. The published release binaries are not edited. The build verifies that our DLL covers every named export of the pinned LiberNT DLL, and compiles the release's own api-set contract table (read from its `ntdll.dll`) into ours; live API behavior still requires boot validation.
 
+<img width="1024" height="768" alt="desktop" src="https://github.com/user-attachments/assets/613cc279-4403-4863-b313-f3d15e4bb36c" />
+
 ## Build and run
 
 Clone with the pinned kernel submodule, then build and run the desktop image:
