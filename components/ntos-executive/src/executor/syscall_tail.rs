@@ -1315,13 +1315,20 @@ pub(super) unsafe fn syscall_tail(
                         registers[0], registers, retry_ip, sp, flags)
                 })
         };
-        if retry.is_some_and(|retry| crate::native_image_pagein_work::submit_syscall_retry(
-            &mut nt_handler, input, retry, sc.result as u32))
+        if retry.is_some_and(|retry| match input.source {
+            nt_syscall::input_pagein::InputPageSource::Image =>
+                crate::native_image_pagein_work::submit_syscall_retry(
+                    &mut nt_handler, input, retry, sc.result as u32),
+            nt_syscall::input_pagein::InputPageSource::Mapped =>
+                crate::section_pagein_work::submit_syscall_retry(
+                    &mut nt_handler, input, retry, sc.result as u32),
+        })
         {
             thread_wait_state_park_badge_waiting(&mut nt_handler, lp.msg.badge);
             {
                 let _message = crate::ipc_message::SavedMessageBuffer::capture();
                 crate::native_image_pagein_work::redrive(&mut nt_handler, lp.dispatcher);
+                crate::section_pagein_work::redrive(&mut nt_handler);
             }
             let _ = finalize_service_loop_state(&mut nt_handler);
             let new_reply = local().reply_main_slot.load(Ordering::Relaxed);

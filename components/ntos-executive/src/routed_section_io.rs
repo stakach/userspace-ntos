@@ -36,6 +36,12 @@ fn query_information(
     class: u32,
     output: &mut [u8],
 ) -> Result<(u32, u64), u32> {
+    // Same contract as `read`: only the Boot inline route answers a synchronous query.
+    if !crate::mounted_volume::mount_id_for_live_device(device_id)
+        .is_some_and(crate::mounted_volume::boot_inline_read_admitted)
+    {
+        return Err(0xc000_0006);
+    }
     let result = unsafe {
         driver_launch::io_manager_mut().build_and_dispatch_external_to_device(
             ClientId(IO_MANAGER_COMPONENT_ID),
@@ -139,10 +145,22 @@ pub(crate) fn query_standard(file_id: u64, device_id: u64) -> Result<DataSection
     })
 }
 
+/// A synchronous routed READ. It dispatches only on the Boot inline route, whose provider
+/// completes reads inline. Every routed Section, image and copy caller that can run after the
+/// native block handoff owns a page-in continuation instead, so a Pending READ is never turned
+/// into an I/O error here.
 pub(crate) fn read(file_id: u64, device_id: u64, offset: u64, output: &mut [u8]) -> (u32, usize) {
+    const STATUS_IN_PAGE_ERROR: u32 = 0xc000_0006;
     let Ok(length) = u32::try_from(output.len()) else {
         return (STATUS_IO_DEVICE_ERROR, 0);
     };
+    if !crate::mounted_volume::mount_id_for_live_device(device_id)
+        .is_some_and(crate::mounted_volume::boot_inline_read_admitted)
+    {
+        trace_read_anomaly(b"not-inline-route", file_id, device_id, offset,
+            output.len(), STATUS_IN_PAGE_ERROR, 0);
+        return (STATUS_IN_PAGE_ERROR, 0);
+    }
     let result = unsafe {
         driver_launch::io_manager_mut().build_and_dispatch_external_to_device(
             ClientId(IO_MANAGER_COMPONENT_ID),
@@ -184,10 +202,12 @@ pub(crate) fn read(file_id: u64, device_id: u64, offset: u64, output: &mut [u8])
             (status.raw() as u32, information)
         }
         Ok(ExternalDispatchResult::Pending { irp_id }) => {
+            // The Boot inline route contract excludes this. The IRP's owner retains it; this
+            // caller learns only that no bytes arrived.
             let status = unsafe { driver_launch::abandon_pending_irp(irp_id.raw()) }
                 .err()
-                .unwrap_or(STATUS_IO_DEVICE_ERROR);
-            trace_read_anomaly(b"pending", file_id, device_id, offset,
+                .unwrap_or(STATUS_IN_PAGE_ERROR);
+            trace_read_anomaly(b"inline-route-pending", file_id, device_id, offset,
                 output.len(), status, 0);
             (status, 0)
         }

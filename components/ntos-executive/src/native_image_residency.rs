@@ -776,6 +776,7 @@ unsafe fn service_page_residency(
                     process_index: view.pi,
                     page,
                     write: access == FaultAccess::Write,
+                    source: nt_syscall::input_pagein::InputPageSource::Image,
                 });
             }
             return Err(status);

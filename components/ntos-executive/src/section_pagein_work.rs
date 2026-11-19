@@ -33,6 +33,14 @@ enum Purpose {
         irp_id: u64,
         token: u64,
     },
+    /// A returned NT dispatch whose input capture needed this mapped page. This row owns the
+    /// caller's Reply: a mapped page reissues the call; a failed page-in returns `status`, the
+    /// handler's own result. No effect of the original dispatch is replayed.
+    SyscallRetry {
+        caller_pi: usize,
+        retry: nt_syscall_abi::SyscallRetryReply,
+        status: u32,
+    },
 }
 
 enum Phase {
@@ -204,7 +212,8 @@ unsafe fn submit_owned(
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     let caller_pi = match purpose {
         Purpose::Fault => pi,
-        Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
+        Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. }
+        | Purpose::SyscallRetry { caller_pi, .. } => caller_pi,
         Purpose::RoutedFileModeInput { .. } => pi,
     };
     let logical = handler
@@ -227,7 +236,7 @@ unsafe fn submit_owned(
     if index.is_none() && rows.try_reserve(1).is_err() {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let park = if matches!(purpose, Purpose::Fault) {
+    let park = if matches!(purpose, Purpose::Fault | Purpose::SyscallRetry { .. }) {
         Some(root_reply_park::RootReplyPark::prepare()
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?)
     } else { None };
@@ -265,6 +274,43 @@ unsafe fn submit_owned(
     if let Some(park) = park { park.commit(); }
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
     Ok(crate::routed_pagein_source::RoutedPageInSource::Mapped { section, view, lease })
+}
+
+/// Park a returned NT dispatch on the routed mapped page its input capture needed. Returns false,
+/// with the Reply untouched, when no owned page-in can make that capture succeed; the caller
+/// then replies the handler's status as before.
+pub(crate) unsafe fn submit_syscall_retry(
+    handler: &mut ExecNtHandler,
+    input: nt_syscall::input_pagein::DeferredInputPage,
+    retry: nt_syscall_abi::SyscallRetryReply,
+    status: u32,
+) -> bool {
+    if input.source != nt_syscall::input_pagein::InputPageSource::Mapped
+        || input.caller_thread != handler.current_tid
+    {
+        return false;
+    }
+    let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let access = if input.write {
+        nt_address_space::FaultAccess::Write
+    } else {
+        nt_address_space::FaultAccess::Read
+    };
+    let purpose = Purpose::SyscallRetry { caller_pi: handler.pi, retry, status };
+    let parked = submit_owned(handler, input.process_index, input.page, access, purpose, reply).is_ok();
+    print_str(b"[syscall-input-pagein] mapped parked=");
+    print_u64(parked as u64);
+    print_str(b" caller_pi=");
+    print_u64(handler.pi as u64);
+    print_str(b" target_pi=");
+    print_u64(input.process_index as u64);
+    print_str(b" page=0x");
+    print_hex((input.page >> 32) as u32);
+    print_hex(input.page as u32);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+    parked
 }
 
 pub(crate) fn has_thread(tid: u64) -> bool {
@@ -848,7 +894,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                     Purpose::RoutedFileModeInput { identity, irp_id, token } =>
                         crate::service_sec_image::file_mode_input_page_completed(
                             identity, irp_id, token, work.pi, work.page, 0),
-                    Purpose::Fault => unreachable!(),
+                    Purpose::Fault | Purpose::SyscallRetry { .. } => unreachable!(),
                 };
                 if completed {
                     return true;
@@ -860,7 +906,11 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 return false;
             }
             work.phase = Phase::ReplyEntered;
-            if !client_reply_on(work.reply, 0, 0, 0, 0, 0) {
+            let sent = match work.purpose {
+                Purpose::SyscallRetry { retry, .. } => reply_parked_syscall_retry(work.reply, &retry),
+                _ => client_reply_on(work.reply, 0, 0, 0, 0, 0),
+            };
+            if !sent {
                 return false;
             }
             crate::note_boot_progress(crate::BootProgress::PageMappingPublished);
@@ -899,13 +949,31 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                     Purpose::RoutedFileModeInput { identity, irp_id, token } =>
                         crate::service_sec_image::file_mode_input_page_completed(
                             identity, irp_id, token, work.pi, work.page, status),
-                    Purpose::Fault => unreachable!(),
+                    Purpose::Fault | Purpose::SyscallRetry { .. } => unreachable!(),
                 };
                 if completed {
                     return true;
                 }
                 work.phase = Phase::Indeterminate;
                 return false;
+            }
+            if let Purpose::SyscallRetry { status, .. } = work.purpose {
+                // A page-in that could not complete answers with the handler's own status;
+                // a caller that is gone has its Reply cancelled below like a fault's.
+                let caller_gone = spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.reply)
+                    || handler.pm.thread(work.logical.thread().thread_id())
+                        .is_none_or(|thread| thread.state == nt_process::ThreadState::Terminated);
+                if !caller_gone {
+                    if parked_reply::validate_saved(work.reply).is_err() {
+                        return false;
+                    }
+                    work.phase = Phase::ReplyEntered;
+                    if !reply_parked_syscall(work.reply, u64::from(status)) {
+                        return false;
+                    }
+                    work.phase = Phase::ReplySent;
+                    return false;
+                }
             }
             if let Some(status) = work.failure.filter(|_| !work.failure_logged) {
                 print_str(b"[section] routed page-in failed pi=");
@@ -964,7 +1032,8 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         let is_fault = matches!(work.purpose, Purpose::Fault);
         let caller_pi = match work.purpose {
             Purpose::Fault => work.pi,
-            Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
+            Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. }
+            | Purpose::SyscallRetry { caller_pi, .. } => caller_pi,
             Purpose::RoutedFileModeInput { .. } => work.pi,
         };
         EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);

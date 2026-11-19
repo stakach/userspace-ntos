@@ -18408,24 +18408,49 @@ impl ExecNtHandler {
                     } else {
                         plan.access
                     },
-                    false,
+                    true,
                     false,
                 )? {
                     crate::service_sec_image::GenericSectionFaultResult::Mapped => Ok(()),
                     crate::service_sec_image::GenericSectionFaultResult::Unmapped => Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES),
-                    crate::service_sec_image::GenericSectionFaultResult::RoutedPageIn => Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES),
+                    crate::service_sec_image::GenericSectionFaultResult::RoutedPageIn => Err(
+                        self.defer_routed_input_page(target_pi, plan,
+                            nt_syscall::input_pagein::InputPageSource::Mapped)),
                 }
             }
             nt_address_space::VmResidencySource::Image => {
-                if self.service_native_image_page_residency(target_pi, plan.page, plan.access, nt_address_space::ImageFaultObservation::CopyAccess)?.is_some() {
-                    return Ok(());
+                // Admission maps a ready page; an unready routed source is never read here.
+                match self.admit_native_image_copy_page(target_pi, plan.page, plan.access)? {
+                    Some(false) => Ok(()),
+                    Some(true) => Err(self.defer_routed_input_page(target_pi, plan,
+                        nt_syscall::input_pagein::InputPageSource::Image)),
+                    None => crate::service_sec_image::service_legacy_image_page_residency(
+                        self, target_pi, plan.page, plan.access,
+                        nt_address_space::ImageFaultObservation::CopyAccess,
+                    ),
                 }
-                crate::service_sec_image::service_legacy_image_page_residency(
-                    self, target_pi, plan.page, plan.access,
-                    nt_address_space::ImageFaultObservation::CopyAccess,
-                )
             }
         }
+    }
+
+    /// A routed page needs a provider READ, which cannot complete inside this dispatch. Name the
+    /// page for the syscall tail, which parks a plain-status caller on the owned page-in worker
+    /// and reissues the call; any other caller receives the in-page error.
+    fn defer_routed_input_page(
+        &mut self,
+        target_pi: usize,
+        plan: nt_address_space::VmResidencyPagePlan,
+        source: nt_syscall::input_pagein::InputPageSource,
+    ) -> u32 {
+        const STATUS_IN_PAGE_ERROR: u32 = 0xC000_0006;
+        self.routed_input_pagein = Some(nt_syscall::input_pagein::DeferredInputPage {
+            caller_thread: self.current_tid,
+            process_index: target_pi,
+            page: plan.page,
+            write: plan.access == nt_address_space::FaultAccess::Write,
+            source,
+        });
+        STATUS_IN_PAGE_ERROR
     }
 
     pub(crate) unsafe fn capture_virtual_memory_lock_request(
