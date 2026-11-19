@@ -13467,6 +13467,7 @@ pub(crate) const WIN32K_REGISTRY_OP_SYNC_INVALIDATE_RELATIONS: u64 = 16;
 const WIN32K_REGISTRY_USE_PREVIOUS_MODE: u64 = 1 << 63;
 #[path = "win32k_subsystem/device_registry.rs"]
 mod device_registry;
+mod wddm_bridge;
 mod desktop_parse;
 #[path = "win32k_subsystem/device_relations.rs"]
 mod device_relations;

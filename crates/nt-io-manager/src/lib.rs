@@ -19,6 +19,7 @@ use nt_types::{ClientId, NtPath, ObjectId};
 
 mod banked_transfer;
 pub mod bus_interface;
+pub mod wddm_bridge_interface;
 mod bounded_file_read;
 mod buffered_set_information;
 mod cancel;

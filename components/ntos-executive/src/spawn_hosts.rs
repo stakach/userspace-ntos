@@ -1493,9 +1493,16 @@ unsafe fn pump_wall_state_diag(ch: &PumpChannel, outcome: PumpLoopOutcome) {
         crate::print_str(b" +");
         crate::print_u64(i * 8);
         crate::print_str(b"=0x");
-        if let Some(value) =
-            crate::driver_launch::hosted_component_stack_qword(ch.shared_va, rsp, i)
-        {
+        // Hosted-driver stacks have an executive alias per instance; win32k lanes are read
+        // through their retained physical lane's stack alias.
+        let value = crate::driver_launch::hosted_component_stack_qword(ch.shared_va, rsp, i)
+            .or_else(|| {
+                let route = ch.ingress_route?;
+                let address = rsp.checked_add(i * 8)?;
+                let alias = crate::win32k_glue::win32k_stack_alias_for_route(route, address, 8)?;
+                Some(core::ptr::read_volatile(alias as *const u64))
+            });
+        if let Some(value) = value {
             pump_print_hex64(value);
         } else {
             crate::print_str(b"?");
