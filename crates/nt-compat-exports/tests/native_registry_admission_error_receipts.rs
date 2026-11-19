@@ -54,7 +54,7 @@ fn repeated_miss_emits_one_record_and_counts_every_repeat() {
     registry_security_audit::print_admission_census();
     let census = take_output();
     assert_eq!(census,
-        "[census] registry-admission-error first/repeats/untracked/untracked-suppressed=5/1000/0/0\n");
+        "[census] registry-admission-error first/repeats/untracked/untracked-suppressed/first-suppressed=5/1000/0/0/0\n");
 
     // Exhaust the fixed fingerprint table: later distinct paths fall back to the bounded
     // receipt budget instead of either printing without bound or vanishing uncounted.
@@ -67,12 +67,17 @@ fn repeated_miss_emits_one_record_and_counts_every_repeat() {
     let census = take_output();
     let fields: Vec<u64> = census.trim_end().rsplit('=').next().unwrap()
         .split('/').map(|value| value.parse().unwrap()).collect();
-    let (first, repeats, untracked, suppressed) = (fields[0], fields[1], fields[2], fields[3]);
+    let (first, repeats, untracked, suppressed, first_suppressed) =
+        (fields[0], fields[1], fields[2], fields[3], fields[4]);
     assert_eq!(repeats, 1000);
     assert_eq!(first + untracked, 5 + 4096, "every observation is accounted for: {census}");
     assert!(untracked > 0 && first <= diagnostic_repeat_filter::REPEAT_FILTER_SLOTS as u64);
     assert_eq!(suppressed, untracked.saturating_sub(diagnostic_receipt_budget::RECEIPT_LIMIT));
-    assert_eq!(output.lines().count() as u64, (first - 5) + (untracked - suppressed));
+    // Distinct first sightings share their own receipt budget, so a shell probing thousands
+    // of absent keys prints a bounded number of records.
+    assert_eq!(first_suppressed, first.saturating_sub(diagnostic_receipt_budget::RECEIPT_LIMIT));
+    assert_eq!(output.lines().count() as u64,
+        (first - 5 - first_suppressed) + (untracked - suppressed));
     assert_eq!(output.matches("sighting=untracked").count() as u64, untracked - suppressed);
 }
 

@@ -930,3 +930,11 @@ diagnosis-free failure.
 
 ## Delete Invalidated Source-Text Checks, Never Repoint Them
 - When a change invalidates a source-text check, delete that check (or the whole test if nothing else is left in it). Do not repoint it at the new text. A repointed check pins the new implementation's spelling and proves nothing about the behaviour. The behaviour belongs in a policy test, such as a crate test of the rule itself.
+
+## Read The Test Output Before Every Push
+- 0aa3d266 was pushed with a failing nt-compat-exports test, because the test command and the push
+  were chained in one step and the output was only read afterwards. Run the suites, read their
+  result lines, and only then commit and push, as separate steps.
+- When a change alters what a behavioural test exercises (here the admission-error observer's
+  first-sighting budget), update that test's expectations. Delete it only if it is a source-text
+  check.
