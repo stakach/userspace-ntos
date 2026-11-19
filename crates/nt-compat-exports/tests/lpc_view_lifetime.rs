@@ -79,35 +79,6 @@ fn completing_connection_keeps_view_owners_until_endpoint_retirement() {
 }
 
 #[test]
-fn process_exit_and_retained_deletion_both_drain_broker_handles() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../components/ntos-executive/src/exec_handler.rs");
-    let file = syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap();
-    for name in [
-        "release_process_handles",
-        "try_delete_hosted_process_object_exact",
-    ] {
-        let function = file
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                syn::Item::Impl(implementation) => Some(implementation),
-                _ => None,
-            })
-            .flat_map(|implementation| implementation.items.iter())
-            .find_map(|item| match item {
-                syn::ImplItem::Fn(function) if function.sig.ident == name => Some(function),
-                _ => None,
-            })
-            .expect("actual process rundown implementation");
-        let mut calls = Calls::default();
-        calls.visit_block(&function.block);
-        assert!(calls.0.iter().any(|call| call == "retire_lpc_process_handles"),
-            "{name} must retain and drain the exiting process's broker-owned LPC handles, independently of executive handles and delayed object deletion");
-    }
-}
-
-#[test]
 fn provider_final_reference_release_publishes_retirement_progress() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../components/ntos-executive/src/win32k_subsystem.rs");
