@@ -138,3 +138,37 @@ fn read_rejects_wrong_device_source_generation_and_mutated_shape() {
         assert!(admit_source_device_read(wrong, auxiliary).is_none(), "{wrong:?}");
     }
 }
+
+#[test]
+fn filesystem_paging_and_noncached_reads_keep_their_request_flags() {
+    // A filesystem reads its volume non-cached, and passes a paging read down with
+    // IoPageRead's IRP_PAGING_IO|IRP_NOCACHE|IRP_SYNCHRONOUS_PAGING_IO (NT5 fastfat read.c).
+    let neither = auxiliary();
+    for (raw, expected) in [
+        (0x43, nt_io_manager::irp_request_flags::IrpRequestFlags::paging(
+            nt_io_manager::irp_request_flags::PagingTransfer::Read)),
+        (0x01, nt_io_manager::irp_request_flags::IrpRequestFlags::api(false, true)),
+    ] {
+        let admitted = admit_source_device_read(
+            SourceDeviceReadRequest { irp_flags: raw, ..request(neither) }, neither,
+        )
+        .unwrap_or_else(|| panic!("driver word {raw:#x}"));
+        assert_eq!(admitted.request_flags, expected);
+    }
+    let mut buffered = auxiliary();
+    buffered.system_buffer = Some(SourcePoolAllocationIdentity {
+        component_address: SYSTEM, capacity: 512, pool_generation: 8,
+    });
+    let admitted = admit_source_device_read(SourceDeviceReadRequest {
+        irp_flags: IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION | 0x03,
+        system_buffer: SYSTEM,
+        ..request(buffered)
+    }, buffered).unwrap();
+    assert!(admitted.request_flags.is_paging_io());
+    // Words NT never issues for READ, or I/O Manager completion state, are refused.
+    for raw in [0x02, 0x03, 0x08, 0x80, 0x800] {
+        assert!(admit_source_device_read(
+            SourceDeviceReadRequest { irp_flags: raw, ..request(neither) }, neither,
+        ).is_none(), "{raw:#x}");
+    }
+}

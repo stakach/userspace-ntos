@@ -131,6 +131,7 @@ fn read(f: &Fixture) -> ExternalFileIrpRequest {
             ..Default::default()
         }),
         stack_flags: StackFlags::empty(),
+        request_flags: crate::irp_request_flags::IrpRequestFlags::NONE,
         initial_information: 0,
     }
 }
@@ -201,6 +202,7 @@ fn create(f: &Fixture, file: FileId) -> ExternalFileIrpRequest {
         major: major::IRP_MJ_CREATE,
         parameters: IoParameters::Create(CreateParameters::default()),
         stack_flags: StackFlags::empty(),
+        request_flags: crate::irp_request_flags::IrpRequestFlags::NONE,
         initial_information: 0,
     }
 }

@@ -24,6 +24,8 @@ pub struct ExternalFileIrpRequest {
     pub major: u8,
     pub parameters: IoParameters,
     pub stack_flags: StackFlags,
+    /// Request-wide `IRP.Flags`, admitted for the major before dispatch.
+    pub request_flags: crate::irp_request_flags::IrpRequestFlags,
     /// Scalar progress for I/O Manager-initialized query output. Other majors require zero.
     pub initial_information: u64,
 }
@@ -655,6 +657,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 request.parameters,
             )?
         };
+        if !request.request_flags.admits(request.major, record.origin_minor) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        record.request_flags = request.request_flags;
         for stack in &mut record.stack {
             stack.flags = request.stack_flags;
         }

@@ -331,6 +331,7 @@ impl Work {
                 length: write.length(), key: write.key(), offset: write.byte_offset(),
             }),
             stack_flags: write.stack_flags(),
+            request_flags: write.request_flags(),
             initial_information: 0,
         };
         let result = hosted_file_owners::dispatch(

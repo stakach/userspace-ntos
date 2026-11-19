@@ -36,6 +36,7 @@ fn request(f: &Fixture, target: FileId) -> ExternalFileIrpRequest {
             ..Default::default()
         }),
         stack_flags: StackFlags::FORCE_ACCESS_CHECK | StackFlags::OPEN_TARGET_DIRECTORY,
+        request_flags: crate::irp_request_flags::IrpRequestFlags::NONE,
         ..create(f, target)
     }
 }

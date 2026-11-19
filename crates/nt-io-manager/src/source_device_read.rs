@@ -46,6 +46,8 @@ pub struct SourceDeviceRead {
     pub length: u32,
     pub byte_offset: u64,
     pub stack_flags: u8,
+    /// The request-wide part of the source `Irp->Flags`, carried to the forwarded IRP.
+    pub request_flags: crate::irp_request_flags::IrpRequestFlags,
     pub output: SourceMemoryIdentity,
     pub system_buffer: Option<SourcePoolAllocationIdentity>,
     pub mdl: Option<SourceMdlAllocationIdentity>,
@@ -82,23 +84,28 @@ pub fn admit_source_device_read(
     if output_bytes != u64::from(request.length) {
         return None;
     }
+    // The source packet's request-wide bits travel with the forward; only its transfer-method
+    // bits describe this output mode.
+    let flags = crate::irp_request_flags::IrpRequestFlags::from_driver_irp(
+        request.major, request.minor, request.irp_flags,
+    )?;
     let expected_buffered = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION;
     let valid_mode = match (auxiliary.system_buffer, auxiliary.mdl) {
         (Some(system), None) => {
-            request.irp_flags == expected_buffered
+            flags.buffer_method == expected_buffered
                 && request.system_buffer == system.component_address
                 && system.capacity >= u64::from(request.length)
                 && request.mdl == 0
                 && request.user_buffer == output_address
         }
         (None, Some(mdl)) => {
-            request.irp_flags == 0
+            flags.buffer_method == 0
                 && request.system_buffer == 0
                 && request.mdl == mdl.pool.component_address
                 && request.user_buffer == 0
         }
         (None, None) => {
-            request.irp_flags == 0
+            flags.buffer_method == 0
                 && request.system_buffer == 0
                 && request.mdl == 0
                 && request.user_buffer == output_address
@@ -115,6 +122,7 @@ pub fn admit_source_device_read(
         length: request.length,
         byte_offset: request.byte_offset,
         stack_flags: request.stack_flags,
+        request_flags: flags.request,
         output,
         system_buffer: auxiliary.system_buffer,
         mdl: auxiliary.mdl,

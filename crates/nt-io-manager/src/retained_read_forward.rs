@@ -20,16 +20,24 @@ pub struct CapturedRead {
     key: u32,
     byte_offset: u64,
     stack_flags: StackFlags,
+    request_flags: crate::irp_request_flags::IrpRequestFlags,
 }
 
 impl CapturedRead {
-    pub const fn new(length: u32, key: u32, byte_offset: u64, stack_flags: StackFlags) -> Self {
-        Self {
-            length,
-            key,
-            byte_offset,
-            stack_flags,
-        }
+    /// `irp_flags` is the source packet's `Irp->Flags`: its request-wide part (a filesystem's
+    /// paging or non-cached READ) is forwarded, and a word NT never issues is refused.
+    pub fn capture(
+        length: u32,
+        key: u32,
+        byte_offset: u64,
+        stack_flags: StackFlags,
+        irp_flags: u32,
+    ) -> Result<Self, NtStatus> {
+        let flags = crate::irp_request_flags::IrpRequestFlags::from_driver_irp(
+            nt_io_abi::major::IRP_MJ_READ, 0, irp_flags,
+        )
+        .ok_or(NtStatus::INVALID_PARAMETER)?;
+        Ok(Self { length, key, byte_offset, stack_flags, request_flags: flags.request })
     }
 
     pub const fn length(&self) -> u32 {
@@ -43,6 +51,9 @@ impl CapturedRead {
     }
     pub const fn stack_flags(&self) -> StackFlags {
         self.stack_flags
+    }
+    pub const fn request_flags(&self) -> crate::irp_request_flags::IrpRequestFlags {
+        self.request_flags
     }
 }
 
@@ -398,7 +409,7 @@ mod tests {
             .unwrap();
         let target = HostedForwardTarget::capture(&mut io, domain, 0x5000).unwrap();
         let source = SourceIrpTicket::new(domain, 17, 3).unwrap();
-        let read = CapturedRead::new(3, 9, 40, StackFlags::empty());
+        let read = CapturedRead::capture(3, 9, 40, StackFlags::empty(), 0).unwrap();
         (io, PreparedReadForward::new(source, target, file, read))
     }
 
@@ -408,9 +419,19 @@ mod tests {
 
     #[test]
     fn captures_provider_bytes_and_stack_scalars() {
-        let read = CapturedRead::new(3, 9, 40, StackFlags::empty());
+        let read = CapturedRead::capture(3, 9, 40, StackFlags::empty(), 0x70).unwrap();
         assert_eq!((read.length(), read.key(), read.byte_offset()), (3, 9, 40));
         assert_eq!(read.stack_flags(), StackFlags::empty());
+        assert_eq!(read.request_flags(), crate::irp_request_flags::IrpRequestFlags::NONE);
+        // A filter passing down the paging READ it received keeps IoPageRead's word.
+        let paging = CapturedRead::capture(3, 9, 40, StackFlags::empty(), 0x73).unwrap();
+        assert!(paging.request_flags().is_paging_io());
+        for illegal in [0x02, 0x08, 0x80, 0x800] {
+            assert_eq!(
+                CapturedRead::capture(3, 9, 40, StackFlags::empty(), illegal),
+                Err(NtStatus::INVALID_PARAMETER),
+            );
+        }
         let mut source = [1, 2, 3];
         let output = ReadCompletion::capture(0, 3, &source).unwrap();
         source[0] = 8;

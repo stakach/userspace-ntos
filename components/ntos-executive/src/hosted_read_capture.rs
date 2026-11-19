@@ -312,10 +312,12 @@ pub(super) unsafe fn capture(
             if irp != initial_irp || stack != initial_stack {
                 return Err(CaptureError::InvalidSourceIrp);
             }
-            Ok((buffer, CapturedRead::new(
+            // The packet's request-wide Irp->Flags (a filesystem's paging READ) are forwarded.
+            let read = CapturedRead::capture(
                 params.length, params.key, params.byte_offset,
-                StackFlags::from_bits_retain(initial_stack.flags),
-            )))
+                StackFlags::from_bits_retain(initial_stack.flags), initial_irp.flags,
+            ).map_err(|_| CaptureError::InvalidSourceIrp)?;
+            Ok((buffer, read))
         })();
         let (system_buffer, read) = match captured {
             Ok(value) => value,

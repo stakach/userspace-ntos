@@ -200,6 +200,7 @@ fn file_all_seed_reaches_peer_and_wdm_before_driver_completion() {
                     length: OUTPUT_LENGTH as u32,
                 }),
                 stack_flags: StackFlags::empty(),
+                request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
                 initial_information: initial_information as u64,
             },
             ExternalFileIrpBuffers::new(vec![], output),

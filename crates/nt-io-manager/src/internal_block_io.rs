@@ -417,6 +417,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 major,
                 parameters,
                 stack_flags: StackFlags::empty(),
+                request_flags: crate::irp_request_flags::IrpRequestFlags::NONE,
                 initial_information: 0,
             },
             buffers,

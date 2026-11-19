@@ -439,7 +439,7 @@ impl Work {
             self.terminal_status = Some(INVALID_DEVICE_REQUEST);
             return;
         }
-        let (major, parameters, stack_flags, initial_information, policy, input) =
+        let (major, parameters, stack_flags, request_flags, initial_information, policy, input) =
             match &self.source {
                 Source::Control(source) => {
                     let control = source.request();
@@ -451,6 +451,8 @@ impl Work {
                             output_len: control.output_len,
                         }),
                         StackFlags::empty(),
+                        // IoBuildDeviceIoControlRequest sets only its transfer method.
+                        nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
                         control.initial_information,
                         if control.output_len == 0 {
                             ExternalFileIrpDispatchPolicy::DeviceControlAtDevice
@@ -470,6 +472,7 @@ impl Work {
                             offset: read.byte_offset,
                         }),
                         StackFlags::from_bits_retain(read.stack_flags),
+                        read.request_flags,
                         0,
                         ExternalFileIrpDispatchPolicy::ReadAtDevice,
                         &[][..],
@@ -485,6 +488,7 @@ impl Work {
             major,
             parameters,
             stack_flags,
+            request_flags,
             initial_information,
         };
         let result = hosted_file_owners::dispatch(

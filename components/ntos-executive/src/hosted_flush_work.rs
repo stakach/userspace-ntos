@@ -411,6 +411,7 @@ impl Work {
             major: major::IRP_MJ_FLUSH_BUFFERS,
             parameters: IoParameters::FlushBuffers,
             stack_flags: self.source.stack_flags(),
+            request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
             initial_information: 0,
         };
         let result = hosted_file_owners::dispatch(

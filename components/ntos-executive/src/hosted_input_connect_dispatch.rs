@@ -254,6 +254,7 @@ impl PortLocalConnect {
                 output_len: 0,
             }),
             stack_flags: StackFlags::empty(),
+            request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
             initial_information: 0,
         };
         // Mark possible entry before invoking the detached owner. An uncertain transport result

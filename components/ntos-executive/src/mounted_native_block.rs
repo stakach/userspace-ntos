@@ -1214,6 +1214,7 @@ unsafe fn dispatch_claim(
         major: major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
         parameters: IoParameters::Scsi(parameters),
         stack_flags: StackFlags::empty(),
+        request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
         initial_information: 0,
     };
     let _authority_guard = if let Some(authority) = wal_authority {

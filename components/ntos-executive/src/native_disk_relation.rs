@@ -235,6 +235,7 @@ impl NativeDiskProof {
             major: major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
             parameters: IoParameters::Scsi(parameters),
             stack_flags: StackFlags::empty(),
+            request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
             initial_information: 0,
         };
         let Ok(_authority_guard) = activate_pending_scsi_proof_authority(self.pending_authority)

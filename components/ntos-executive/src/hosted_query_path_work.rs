@@ -387,6 +387,7 @@ impl Work {
                 output_len: 4,
             }),
             stack_flags: StackFlags::empty(),
+            request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
             initial_information: 0,
         };
         // `dispatch` returns Err only for a proven not-entered canonical IRP. The source

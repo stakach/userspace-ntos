@@ -58,19 +58,28 @@ pub struct CapturedWrite {
     key: u32,
     byte_offset: u64,
     stack_flags: StackFlags,
+    request_flags: crate::irp_request_flags::IrpRequestFlags,
 }
 
 impl CapturedWrite {
+    /// `irp_flags` is the source packet's `Irp->Flags`: its request-wide part (a filesystem's
+    /// paging or non-cached WRITE) is forwarded, and a word NT never issues is refused.
     pub fn capture(
         bytes: &[u8],
         length: u32,
         key: u32,
         byte_offset: u64,
         stack_flags: StackFlags,
+        irp_flags: u32,
     ) -> Result<Self, NtStatus> {
         if bytes.len() != length as usize {
             return Err(NtStatus::INVALID_PARAMETER);
         }
+        let request_flags = crate::irp_request_flags::IrpRequestFlags::from_driver_irp(
+            nt_io_abi::major::IRP_MJ_WRITE, 0, irp_flags,
+        )
+        .ok_or(NtStatus::INVALID_PARAMETER)?
+        .request;
         let mut owned = Vec::new();
         owned
             .try_reserve_exact(bytes.len())
@@ -81,6 +90,7 @@ impl CapturedWrite {
             key,
             byte_offset,
             stack_flags,
+            request_flags,
         })
     }
 
@@ -98,6 +108,9 @@ impl CapturedWrite {
     }
     pub fn stack_flags(&self) -> StackFlags {
         self.stack_flags
+    }
+    pub fn request_flags(&self) -> crate::irp_request_flags::IrpRequestFlags {
+        self.request_flags
     }
 }
 
@@ -428,22 +441,36 @@ mod tests {
             .unwrap();
         let target = HostedForwardTarget::capture(&mut io, domain, 0x5000).unwrap();
         let source = SourceIrpTicket::new(domain, 17, 3).unwrap();
-        let write = CapturedWrite::capture(&[1, 2, 3], 3, 9, 40, StackFlags::empty()).unwrap();
+        let write = CapturedWrite::capture(&[1, 2, 3], 3, 9, 40, StackFlags::empty(), 0).unwrap();
         (io, PreparedWriteForward::new(source, target, file, write))
     }
 
     #[test]
     fn captures_owned_bytes_and_exact_length() {
         let mut bytes = [1, 2, 3];
-        let captured = CapturedWrite::capture(&bytes, 3, 9, 40, StackFlags::empty()).unwrap();
+        let captured = CapturedWrite::capture(&bytes, 3, 9, 40, StackFlags::empty(), 0x30).unwrap();
         bytes[0] = 8;
         assert_eq!(captured.bytes(), &[1, 2, 3]);
         assert_eq!(captured.key(), 9);
         assert_eq!(captured.byte_offset(), 40);
         assert_eq!(
-            CapturedWrite::capture(&bytes, 4, 0, 0, StackFlags::empty()).unwrap_err(),
+            CapturedWrite::capture(&bytes, 4, 0, 0, StackFlags::empty(), 0).unwrap_err(),
             NtStatus::INVALID_PARAMETER
         );
+        assert_eq!(captured.request_flags(), crate::irp_request_flags::IrpRequestFlags::NONE);
+        // A filesystem's synchronous and asynchronous paging writes keep their words.
+        let sync = CapturedWrite::capture(&bytes, 3, 0, 0, StackFlags::empty(), 0x43).unwrap();
+        let lazy = CapturedWrite::capture(&bytes, 3, 0, 0, StackFlags::empty(), 0x03).unwrap();
+        assert_eq!(sync.request_flags().paging_transfer(),
+            Some(crate::irp_request_flags::PagingTransfer::SynchronousWrite));
+        assert_eq!(lazy.request_flags().paging_transfer(),
+            Some(crate::irp_request_flags::PagingTransfer::AsynchronousWrite));
+        for illegal in [0x02, 0x40, 0x08, 0x200] {
+            assert_eq!(
+                CapturedWrite::capture(&bytes, 3, 0, 0, StackFlags::empty(), illegal).unwrap_err(),
+                NtStatus::INVALID_PARAMETER
+            );
+        }
     }
 
     #[test]

@@ -1026,6 +1026,7 @@ mod initial_information_tests {
                             requestor_tid: 99,
                             major,
                             stack_flags: parameters.case_sensitive_stack_flags(major),
+                            request_flags: crate::irp_request_flags::IrpRequestFlags::NONE,
                             parameters: IoParameters::Create(parameters),
                             initial_information: 0,
                         },

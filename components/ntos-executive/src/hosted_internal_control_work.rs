@@ -278,6 +278,7 @@ impl Work {
                 output_len: 8,
             }),
             stack_flags: StackFlags::empty(),
+            request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
             initial_information: 0,
         };
         let result = hosted_file_owners::dispatch(

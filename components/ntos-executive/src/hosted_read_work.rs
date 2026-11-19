@@ -388,6 +388,7 @@ impl Work {
                 length: read.length(), key: read.key(), offset: read.byte_offset(),
             }),
             stack_flags: read.stack_flags(),
+            request_flags: read.request_flags(),
             initial_information: 0,
         };
         let result = hosted_file_owners::dispatch(

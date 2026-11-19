@@ -252,7 +252,7 @@ pub(super) unsafe fn capture(
             }
             CapturedWrite::capture(
                 &bytes, params.length, params.key, params.byte_offset,
-                StackFlags::from_bits_retain(initial_stack.flags),
+                StackFlags::from_bits_retain(initial_stack.flags), initial_irp.flags,
             ).map_err(|status| if status == nt_status::NtStatus::INSUFFICIENT_RESOURCES {
                 CaptureError::InsufficientResources
             } else { CaptureError::InvalidSourceBuffer })

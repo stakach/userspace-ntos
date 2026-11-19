@@ -43,3 +43,20 @@ fn routed_dirty_pages_are_paging_writes_owned_through_strict_acknowledgement() {
     assert!(INGRESS.contains("section_writeback_work::submit_vm_flush("));
     assert!(INGRESS.contains("section_writeback_work::submit_cache_flush("));
 }
+
+const READ_CAPTURE: &str = include_str!("../../../components/ntos-executive/src/hosted_read_capture.rs");
+const WRITE_CAPTURE: &str = include_str!("../../../components/ntos-executive/src/hosted_write_capture.rs");
+const READ_FORWARD: &str = include_str!("../../../components/ntos-executive/src/hosted_read_work.rs");
+const WRITE_FORWARD: &str = include_str!("../../../components/ntos-executive/src/hosted_write_work.rs");
+const DEVICE_FORWARD: &str = include_str!("../../../components/ntos-executive/src/hosted_device_forward_work.rs");
+
+#[test]
+fn driver_built_transfers_forward_their_own_irp_flags() {
+    // The split of Irp->Flags is proven in nt-io-manager (from_driver_irp); these bind the
+    // forwards of IRPs a driver built or passes down to the canonical request.
+    assert!(READ_CAPTURE.contains("StackFlags::from_bits_retain(initial_stack.flags), initial_irp.flags,"));
+    assert!(WRITE_CAPTURE.contains("StackFlags::from_bits_retain(initial_stack.flags), initial_irp.flags,"));
+    assert!(READ_FORWARD.contains("request_flags: read.request_flags(),"));
+    assert!(WRITE_FORWARD.contains("request_flags: write.request_flags(),"));
+    assert!(DEVICE_FORWARD.contains("read.request_flags,"));
+}

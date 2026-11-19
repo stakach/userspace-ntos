@@ -15,6 +15,8 @@ pub const IRP_MOUNT_COMPLETION: u32 = 0x0000_0002;
 pub const IRP_SYNCHRONOUS_API: u32 = 0x0000_0004;
 pub const IRP_SYNCHRONOUS_PAGING_IO: u32 = 0x0000_0040;
 
+use crate::kernel_irp_builder::{IRP_BUFFERED_IO, IRP_DEALLOCATE_BUFFER, IRP_INPUT_OPERATION};
+
 const IRP_MN_MOUNT_VOLUME: u8 = 0x01;
 const IRP_MN_VERIFY_VOLUME: u8 = 0x02;
 
@@ -118,20 +120,77 @@ impl IrpRequestFlags {
     /// Decode a transported word. Exactly the words [`bits`](Self::bits) produces for an
     /// admitted origin are accepted; the major function disambiguates the aliased bits.
     pub fn from_wire(major: u8, minor: u8, bits: u32) -> Option<Self> {
-        let candidates = [
-            Self::api(false, false),
-            Self::api(true, false),
-            Self::api(false, true),
-            Self::api(true, true),
-            Self::paging(PagingTransfer::Read),
-            Self::paging(PagingTransfer::SynchronousWrite),
-            Self::paging(PagingTransfer::AsynchronousWrite),
-            Self::mount_completion(),
-        ];
-        candidates
+        ORIGINS
             .into_iter()
             .find(|candidate| candidate.admits(major, minor) && candidate.bits() == bits)
     }
+
+    /// Split the `Irp->Flags` of an IRP a driver built itself (`IoAllocateIrp`,
+    /// `IoBuildSynchronousFsdRequest`, `IoBuildAsynchronousFsdRequest`,
+    /// `IoBuildDeviceIoControlRequest`) or received and passes down, before the I/O Manager
+    /// forwards it to another driver. The `IoBuild*` routines set only transfer-method bits
+    /// (ReactOS iomgr/irp.c); a driver may add request-wide bits, as `FsRtlSetFileSize` sets
+    /// `IRP_PAGING_IO|IRP_SYNCHRONOUS_PAGING_IO` (NT5 fsrtl/fastio.c) and a filesystem passes
+    /// its paging I/O down unchanged. The request-wide part must be a word NT issues for the
+    /// major ([`from_wire`](Self::from_wire)); any other bit is the I/O Manager's own
+    /// completion state and is refused.
+    ///
+    /// `IRP_INPUT_OPERATION` aliases `IRP_SYNCHRONOUS_PAGING_IO`. Under `IRP_BUFFERED_IO` it
+    /// is the buffer-method bit of a request that returns data (`IoBuildAsynchronousFsdRequest`
+    /// sets it for a buffered READ), so a buffered paging READ's synchronous bit is implied by
+    /// its origin; a buffered WRITE or SET never returns data, so the bit stays request-wide.
+    pub fn from_driver_irp(major: u8, minor: u8, raw: u32) -> Option<DriverIrpFlags> {
+        let buffered = raw & IRP_BUFFERED_IO != 0;
+        if raw & IRP_DEALLOCATE_BUFFER != 0 && !buffered {
+            return None;
+        }
+        let input_is_method = buffered && returns_buffered_data(major);
+        let method_mask = if buffered { IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER } else { 0 }
+            | if input_is_method { IRP_INPUT_OPERATION } else { 0 };
+        let request_bits = raw & !method_mask;
+        let shared = if input_is_method { IRP_INPUT_OPERATION } else { 0 };
+        let request = ORIGINS.into_iter().find(|candidate| {
+            candidate.admits(major, minor)
+                && candidate.bits() & !shared == request_bits
+                // The implied synchronous bit must be present.
+                && candidate.bits() & shared & !raw == 0
+        })?;
+        Some(DriverIrpFlags { request, buffer_method: raw & method_mask })
+    }
+}
+
+/// Every request-wide origin, in decode order.
+const ORIGINS: [IrpRequestFlags; 8] = [
+    IrpRequestFlags::api(false, false),
+    IrpRequestFlags::api(true, false),
+    IrpRequestFlags::api(false, true),
+    IrpRequestFlags::api(true, true),
+    IrpRequestFlags::paging(PagingTransfer::Read),
+    IrpRequestFlags::paging(PagingTransfer::SynchronousWrite),
+    IrpRequestFlags::paging(PagingTransfer::AsynchronousWrite),
+    IrpRequestFlags::mount_completion(),
+];
+
+/// Majors whose buffered system buffer carries output back to the caller.
+const fn returns_buffered_data(major: u8) -> bool {
+    use nt_io_abi::major::*;
+    !matches!(
+        major,
+        IRP_MJ_WRITE
+            | IRP_MJ_SET_INFORMATION
+            | IRP_MJ_SET_EA
+            | IRP_MJ_SET_VOLUME_INFORMATION
+            | IRP_MJ_SET_SECURITY
+            | IRP_MJ_SET_QUOTA
+    )
+}
+
+/// A driver-built IRP's flags: the request-wide origin, and the transfer-method bits the
+/// forwarding host re-derives from the target device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriverIrpFlags {
+    pub request: IrpRequestFlags,
+    pub buffer_method: u32,
 }
 
 #[cfg(test)]

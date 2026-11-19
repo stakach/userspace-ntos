@@ -444,6 +444,7 @@ impl Work {
                 length: self.source.length(),
             }),
             stack_flags: self.source.stack_flags(),
+            request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
             initial_information: 0,
         };
         let result = hosted_file_owners::dispatch(

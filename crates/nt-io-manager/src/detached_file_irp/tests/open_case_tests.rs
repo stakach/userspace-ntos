@@ -8,6 +8,7 @@ fn case_create(f: &Fixture, file: FileId, major: u8, sensitive: bool) -> Externa
     ExternalFileIrpRequest {
         major,
         stack_flags: parameters.case_sensitive_stack_flags(major),
+        request_flags: crate::irp_request_flags::IrpRequestFlags::NONE,
         parameters: IoParameters::Create(parameters),
         ..create(f, file)
     }
@@ -178,6 +179,7 @@ fn noncreate_stack_bits_never_overwrite_captured_case_policy() {
         let request = ExternalFileIrpRequest {
             file_id: Some(file),
             stack_flags: StackFlags::CASE_SENSITIVE,
+            request_flags: crate::irp_request_flags::IrpRequestFlags::NONE,
             ..read(&f)
         };
         let prepared =
