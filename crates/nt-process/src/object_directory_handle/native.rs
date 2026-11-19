@@ -20,6 +20,16 @@ impl ProcessManager {
         caller: NativeHandleCaller,
         attributes: u32,
     ) -> Result<ObjectDirectoryHandlePublication, u32> {
+        self.reserve_native_typed_handle(caller, attributes)
+    }
+
+    /// Reserve a typed handle in the system table (OBJ_KERNEL_HANDLE, kernel callers only) or
+    /// in the caller's effective process table.
+    pub fn reserve_native_typed_handle<K: HandleTargetKind>(
+        &mut self,
+        caller: NativeHandleCaller,
+        attributes: u32,
+    ) -> Result<TypedHandlePublication<K>, u32> {
         self.validate_native_handle_caller(caller)?;
         let kernel = attributes & OBJ_KERNEL_HANDLE != 0;
         if attributes & !(OBJ_KERNEL_HANDLE | OBJ_INHERIT) != 0
@@ -34,7 +44,7 @@ impl ProcessManager {
         } else {
             caller.effective_process()
         };
-        let mut publication = self.reserve_object_directory_handle(owner)?;
+        let mut publication = self.reserve_typed_handle::<K>(owner)?;
         if publication.value > 0x7fff_fffc {
             publication.abort(self)?;
             return Err(crate::STATUS_INSUFFICIENT_RESOURCES);

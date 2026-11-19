@@ -55,6 +55,7 @@ mod native_section_handle;
 pub mod native_alpc_port;
 mod registry_key_handle;
 mod object_directory_handle;
+pub mod user_object_handle;
 mod routed_file_handle;
 pub mod process_object_retirement;
 mod process_exit_notify;
@@ -69,7 +70,9 @@ pub use initial_system::InitialSystemIdentity;
 pub use native_section_file_source::NativeSectionFileSource;
 pub use native_section_handle::{NativeSectionHandle, NativeSectionHandlePublication};
 pub use registry_key_handle::RegistryKeyHandlePublication;
-pub use object_directory_handle::ObjectDirectoryHandlePublication;
+pub use object_directory_handle::{
+    HandleTargetKind, ObjectDirectoryHandlePublication, ObjectDirectoryKind, TypedHandlePublication,
+};
 pub use routed_file_handle::RoutedFileHandlePublication;
 
 use dbgk::{DbgKmMessage, DebugEvent, DebugObjectId, DebugObjectStore};
@@ -956,6 +959,9 @@ pub enum HandleObject {
     /// A native dynamic object body registered with Object Manager. The generation prevents a
     /// recycled pool address from inheriting an older handle's authority.
     DynamicObject { body: u64, generation: u64 },
+    /// A provider USER object (WindowStation, Desktop, ...). The provider domain owns the body;
+    /// each process-local handle owns only this typed target.
+    UserObject(user_object_handle::UserObjectTarget),
     /// A process primary access token. The id is the owning process id.
     Token(ProcessId),
     /// A stable, independently owned token object.

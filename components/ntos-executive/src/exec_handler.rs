@@ -1566,6 +1566,12 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
             print_str(b" generation=0x");
             print_hex_u64(generation);
         }
+        Some(nt_process::HandleObject::UserObject(target)) => {
+            print_str(b"user-object body=0x");
+            print_hex_u64(target.body);
+            print_str(b" generation=0x");
+            print_hex_u64(target.generation);
+        }
         Some(nt_process::HandleObject::IoCompletion(_)) => print_str(b"io-completion"),
         Some(nt_process::HandleObject::RegistryKey(_)) => print_str(b"registry-key"),
         Some(nt_process::HandleObject::Process(_)) => print_str(b"process"),
@@ -17365,7 +17371,9 @@ impl ExecNtHandler {
                 nt_process::HandleObject::IoCompletion(_) => b"IoCompletion",
                 nt_process::HandleObject::RegistryKey(_) => b"Key",
                 nt_process::HandleObject::ObjectDirectory(_) => b"Directory",
-                nt_process::HandleObject::DynamicObject { .. } => b"Object",
+                // The provider type's registered name is not yet projected for either.
+                nt_process::HandleObject::DynamicObject { .. }
+                | nt_process::HandleObject::UserObject(_) => b"Object",
                 nt_process::HandleObject::Token(_) | nt_process::HandleObject::TokenObject(_) => {
                     b"Token"
                 }
