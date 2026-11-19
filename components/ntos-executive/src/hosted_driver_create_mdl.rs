@@ -5,8 +5,7 @@ use super::*;
 const PAGE: u64 = 4096;
 
 /// `PMDL MmCreateMdl(PMDL, PVOID, SIZE_T)` allocates only the MDL and PFN-array
-/// capacity, as `MmInitializeMdl` does. `MmBuildMdlForNonPagedPool` or
-/// `MmProbeAndLockPages` later records the real PFNs.
+/// capacity. PFNs remain unset until a later page-lock/physical-page operation.
 /// The caller releases a newly allocated header with ExFreePool.
 pub(super) extern "win64" fn mm_create_mdl(mdl: u64, base: u64, length: u64) -> u64 {
     let Some(bytes) = nt_mdl::create_mdl::mdl_size_for_range(base, length) else { return 0; };

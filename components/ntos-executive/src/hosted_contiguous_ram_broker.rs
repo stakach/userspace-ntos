@@ -372,16 +372,6 @@ unsafe fn physical_address(requester: ContiguousRamOwner, address: u64) -> Optio
     })
 }
 
-/// The physical address behind one of this instance's published contiguous allocations.
-pub(super) unsafe fn instance_physical_address(
-    instance: usize,
-    inst: DriverInstance,
-    address: u64,
-) -> Option<u64> {
-    let _guard = lock();
-    physical_address(owner(instance, inst)?, address)
-}
-
 /// Pin a video provider's exact, generation-owned CPU projection and its source
 /// frames. The caller must release this only after revoking every copied alias.
 pub(super) unsafe fn pin_video_projection(
