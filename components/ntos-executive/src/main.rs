@@ -65,6 +65,7 @@ mod diagnostic_repeat_filter;
 mod registry_checkpoint_audit;
 mod registry_query_audit;
 mod hot_service_cost_census;
+mod io_lifecycle_trace;
 mod provider_registry_caller;
 mod provider_directory_broker;
 mod provider_user_object_broker;
@@ -7591,6 +7592,7 @@ pub(crate) fn census_tick_static(now: u64) {
     print_badge_ssn_census();
     hot_service_cost_census::print_census();
     registry_security_audit::print_admission_census();
+    io_lifecycle_trace::print_census();
     driver_launch::print_hosted_file_rpc_phase();
     driver_launch::print_hosted_pnp_relation_census();
     driver_launch::print_hosted_video_registry_set_census();

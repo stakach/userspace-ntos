@@ -3,7 +3,8 @@
 //! A serial record costs tens of thousands of TSC ticks per byte, so a guest that polls the
 //! same missing name must not pay for the same record on every call. The first sighting of
 //! each fingerprint is reported; repeats are only counted. A full probe window reports the
-//! observation as untracked so the caller can fall back to a bounded receipt budget.
+//! observation as untracked; `RepeatReceipts` then falls back to a bounded receipt budget.
+use crate::diagnostic_receipt_budget::ReceiptBudget;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const REPEAT_FILTER_SLOTS: usize = 1024;
@@ -83,5 +84,44 @@ impl RepeatFilter {
             repeats: self.repeats.load(Ordering::Relaxed),
             untracked: self.untracked.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// A first-sighting filter whose untracked overflow falls back to a bounded receipt budget,
+/// so every observation is either reported or counted, and serial output stays bounded.
+pub(crate) struct RepeatReceipts {
+    sightings: RepeatFilter,
+    untracked: ReceiptBudget,
+    suppressed: AtomicU64,
+}
+
+impl RepeatReceipts {
+    pub(crate) const fn new() -> Self {
+        Self {
+            sightings: RepeatFilter::new(),
+            untracked: ReceiptBudget::new(),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// The sighting to report, or `None` for a counted repeat or exhausted fallback. The
+    /// clock is read only for an untracked observation.
+    pub(crate) fn admit(&self, fingerprint: u64, now: impl FnOnce() -> Option<u64>)
+        -> Option<Sighting> {
+        match self.sightings.observe(fingerprint) {
+            Sighting::Repeat => None,
+            Sighting::Untracked if self.untracked.claim(now()).is_none() => {
+                self.suppressed.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            sighting => Some(sighting),
+        }
+    }
+
+    /// `first/repeats/untracked/untracked-suppressed`.
+    pub(crate) fn write_counts(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        let counts = self.sightings.counts();
+        write!(out, "{}/{}/{}/{}", counts.first, counts.repeats, counts.untracked,
+            self.suppressed.load(Ordering::Relaxed))
     }
 }

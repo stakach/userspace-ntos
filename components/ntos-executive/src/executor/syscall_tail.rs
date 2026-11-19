@@ -613,11 +613,7 @@ pub(super) unsafe fn syscall_tail(
             sc.park_io_completion_deadline,
         ) {
             delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
-            print_str(b"[io-completion] pi=");
-            print_u64(pi as u64);
-            print_str(b" port=");
-            print_u64(sc.park_io_completion_port as u64);
-            print_str(b" -> PARK remover\n");
+            crate::io_lifecycle_trace::io_completion_park(pi, sc.park_io_completion_port as u64);
             if !timed {
                 trace_indefinite_wait_park(
                     &nt_handler,

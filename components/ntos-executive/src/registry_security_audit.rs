@@ -1,7 +1,7 @@
 //! Shared instrumentation of actual registry security decisions, not an authorization source.
 
 use crate::diagnostic_receipt_budget::ReceiptBudget;
-use crate::diagnostic_repeat_filter::{fingerprint, RepeatFilter, Sighting};
+use crate::diagnostic_repeat_filter::{fingerprint, RepeatReceipts, Sighting};
 use core::sync::atomic::{AtomicU64, Ordering};
 use nt_security::{
     AccessCheckResult, KeyBackupRestoreAudit, KeyCreationAudit, KeyHandleSecurityAudit,
@@ -14,9 +14,7 @@ static PRIVILEGES_USED: AtomicU64 = AtomicU64::new(0);
 static PRIVILEGE_DENIALS: AtomicU64 = AtomicU64::new(0);
 static ASSIGNMENT_CHECKS: AtomicU64 = AtomicU64::new(0);
 /// A guest polling one missing key would otherwise pay a ~180-byte serial record per call.
-static ADMISSION_SIGHTINGS: RepeatFilter = RepeatFilter::new();
-static ADMISSION_UNTRACKED: ReceiptBudget = ReceiptBudget::new();
-static ADMISSION_UNTRACKED_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+static ADMISSION_SIGHTINGS: RepeatReceipts = RepeatReceipts::new();
 /// Distinct misses are bounded too: a shell enumerating ~1,000 absent CLSID keys would pay
 /// ~5.5M TSC ticks of serial output per record, more than the lookup itself.
 static ADMISSION_FIRST: ReceiptBudget = ReceiptBudget::new();
@@ -31,24 +29,14 @@ pub(crate) fn admission_error(operation: &[u8], path: &str, status: u32, pi: usi
     }
     // The first sighting of each process/operation/status/path is reported; repeats are
     // counted in the periodic census. The thread is reported, not part of the identity.
-    let sighting = ADMISSION_SIGHTINGS.observe(fingerprint(&[
+    let Some(sighting) = ADMISSION_SIGHTINGS.admit(fingerprint(&[
         operation, &status.to_le_bytes(), &(pi as u64).to_le_bytes(), path.as_bytes(),
-    ]));
-    match sighting {
-        Sighting::Repeat => return,
-        Sighting::Untracked
-            if ADMISSION_UNTRACKED.claim(crate::diagnostic_time_100ns()).is_none() =>
-        {
-            ADMISSION_UNTRACKED_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        Sighting::First
-            if ADMISSION_FIRST.claim(crate::diagnostic_time_100ns()).is_none() =>
-        {
-            ADMISSION_FIRST_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        Sighting::First | Sighting::Untracked => {}
+    ]), crate::diagnostic_time_100ns) else { return; };
+    if sighting == Sighting::First
+        && ADMISSION_FIRST.claim(crate::diagnostic_time_100ns()).is_none()
+    {
+        ADMISSION_FIRST_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
     }
     crate::print_str(b"[registry-admission-error] pi=");
     crate::print_u64(pi as u64);
@@ -67,17 +55,13 @@ pub(crate) fn admission_error(operation: &[u8], path: &str, status: u32, pi: usi
 }
 
 pub(crate) fn print_admission_census() {
-    let counts = ADMISSION_SIGHTINGS.counts();
-    crate::print_str(
-        b"[census] registry-admission-error first/repeats/untracked/untracked-suppressed/first-suppressed=");
-    for (index, value) in [counts.first, counts.repeats, counts.untracked,
-        ADMISSION_UNTRACKED_SUPPRESSED.load(Ordering::Relaxed),
-        ADMISSION_FIRST_SUPPRESSED.load(Ordering::Relaxed)].into_iter().enumerate()
-    {
-        if index != 0 { crate::print_str(b"/"); }
-        crate::print_u64(value);
-    }
-    crate::print_str(b"\n");
+    let mut record = nt_printf::record::RecordBuffer::<160>::new();
+    let _ = core::fmt::Write::write_str(&mut record,
+        "[census] registry-admission-error first/repeats/untracked/untracked-suppressed/first-suppressed=");
+    let _ = ADMISSION_SIGHTINGS.write_counts(&mut record);
+    let _ = core::fmt::Write::write_fmt(&mut record,
+        format_args!("/{}\n", ADMISSION_FIRST_SUPPRESSED.load(Ordering::Relaxed)));
+    crate::print_str(record.bytes());
 }
 
 pub(crate) fn access(result: &AccessCheckResult) {

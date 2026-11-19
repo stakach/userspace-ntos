@@ -76760,27 +76760,11 @@ pub(crate) fn abandon_unpublished_hosted_file(file_id: u64) -> Result<(), u32> {
 
 fn release_hosted_file_with_provenance(file_id: u64, provenance: &[u8]) -> Result<(), u32> {
     let io = io_manager_mut();
-    let before = io.file(FileId(file_id)).map(|file| {
-        (
-            hosted_file_state_code(file.state),
-            file.outstanding_irp_refs as u64,
-            file.close_deferred,
-        )
+    let before = io.file(FileId(file_id)).map(|file| crate::io_lifecycle_trace::FileReleaseShape {
+        state: hosted_file_state_code(file.state),
+        irp_refs: file.outstanding_irp_refs as u64,
+        deferred: file.close_deferred,
     });
-    print_str(b"[hosted-file-release] owner=");
-    print_str(provenance);
-    print_str(b" file=0x");
-    print_hex64(file_id);
-    if let Some((state, refs, deferred)) = before {
-        print_str(b" state=");
-        print_hex64(state);
-        print_str(b" irp-refs=");
-        print_hex64(refs);
-        print_str(b" deferred=");
-        print_hex64(deferred as u64);
-    } else {
-        print_str(b" state=missing");
-    }
     let client = ClientId(IO_MANAGER_COMPONENT_ID);
     let result = match io.queue_external_file_release(client, FileId(file_id)) {
         Err(nt_status::NtStatus::DELETE_PENDING)
@@ -76795,9 +76779,9 @@ fn release_hosted_file_with_provenance(file_id: u64, provenance: &[u8]) -> Resul
         result => result,
     }
     .map_err(|status| status.raw() as u32);
-    print_str(b" status=0x");
-    print_hex64(result.as_ref().err().copied().unwrap_or(0) as u64);
-    print_str(b"\n");
+    crate::io_lifecycle_trace::hosted_file_release(
+        provenance, file_id, before, result.as_ref().err().copied().unwrap_or(0),
+    );
     result
 }
 
