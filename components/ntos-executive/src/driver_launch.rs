@@ -458,6 +458,8 @@ mod hosted_driver_process_state;
 pub(crate) mod hosted_driver_ps_handle_reference;
 #[path = "hosted_driver_create_mdl.rs"]
 mod hosted_driver_create_mdl;
+#[path = "hosted_mdl_pfn.rs"]
+mod hosted_mdl_pfn;
 #[path = "hosted_driver_pci_root.rs"]
 pub(crate) mod hosted_driver_pci_root;
 pub(crate) const FSD_SERVICE_PCI_ROOT_LABEL: u64 = hosted_driver_pci_root::LABEL;
@@ -66394,8 +66396,29 @@ unsafe fn service_hosted_driver_mdl_for_instance(
             }
         }
         HOSTED_MDL_OP_BUILD_NONPAGED => {
-            if hosted_instance_pool_allocation_exec_if_live(inst, mdl, nt_mdl::MDL_SIZE as u64)
-            .is_none()
+            // MmBuildMdlForNonPagedPool / MmProbeAndLockPages: record the real PFN of every
+            // spanned page, from owned frames, before the registry marks the MDL built.
+            let registry = hosted_mdl_registry_mut();
+            let Some(allocated) = registry.allocated_bytes_for_key(key) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(id) = registry.id_for(key) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let (Some(address), Some(length)) = (registry.virtual_address(id), registry.byte_count(id))
+            else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(mdl_exec) =
+                hosted_instance_pool_allocation_exec_if_live(inst, mdl, u64::from(allocated))
+            else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64) != address & !0xfff
+                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32)
+                    != (address & 0xfff) as u32
+                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) != length
+                || hosted_mdl_pfn::populate(instance_index, inst, mdl_exec, allocated).is_err()
             {
                 return STATUS_INVALID_PARAMETER;
             }
@@ -66485,6 +66508,13 @@ unsafe fn service_hosted_driver_mdl_for_instance(
                     != source_process
                 || read_unaligned((target_exec + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *const u64)
                     != address
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            if hosted_mdl_pfn::copy_partial(
+                source_exec, source_allocated, target_exec, target_allocated,
+            )
+            .is_err()
             {
                 return STATUS_INVALID_PARAMETER;
             }
