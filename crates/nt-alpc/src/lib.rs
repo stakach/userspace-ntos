@@ -1010,15 +1010,9 @@ impl AlpcServer {
             || checked.send_receive._reserved2 != 0
             || checked.send_receive.flags
                 & !(send_flag::RECV_ATTRIBUTES | send_flag::REPLY_MESSAGE
-                    | send_flag::SYNC_REQUEST | send_flag::NO_RECEIVE) != 0
+                    | send_flag::SYNC_REQUEST) != 0
             || (checked.send_receive.flags & send_flag::REPLY_MESSAGE != 0
                 && checked.send_receive.message_len_bytes == 0)
-            || (checked.send_receive.flags & send_flag::NO_RECEIVE != 0
-                && (checked.send_receive.message_len_bytes == 0
-                    || checked.send_receive.flags
-                        & (send_flag::SYNC_REQUEST | send_flag::RECV_ATTRIBUTES) != 0
-                    || op != opcode::ALPC_OP_SEND_RECEIVE
-                    || !out_buf.is_empty()))
             || (checked.send_receive.flags & send_flag::SYNC_REQUEST != 0
                 && (checked.send_receive.flags & send_flag::REPLY_MESSAGE != 0
                     || checked.send_receive.message_len_bytes == 0
@@ -1228,12 +1222,6 @@ impl AlpcServer {
             } else {
                 core.send_message(req.port_handle, msg, attrs)?;
             }
-        }
-        // A call without a receive half completes with its send; a redrive of the same
-        // token never reaches here because the first terminal is retained.
-        if req.flags & send_flag::NO_RECEIVE != 0 {
-            return if send_allowed { Ok(reply(NtStatus::SUCCESS, 0, 0, 0)) }
-                else { Err(NtStatus::INVALID_PARAMETER) };
         }
 
         if let Some(identity) = sync_identity {

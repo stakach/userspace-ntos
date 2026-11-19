@@ -74,7 +74,6 @@ fn owned_smss_receive_wire_preserves_context_attributes_after_target_transfer() 
     let captured = capture_send_wait_receive([77, 0, 0, 0, 64, 32, 400, 0],
         |p, b| read_image(&image, p, b), |_, _| true).unwrap();
     let (wire, target) = captured.into_checked_wire_and_receive(caller(), (7, 12)).unwrap();
-    let target = target.unwrap();
     let header: nt_alpc_abi::AlpcSendReceiveCheckedRequest = bytemuck::pod_read_unaligned(
         &wire[..core::mem::size_of::<nt_alpc_abi::AlpcSendReceiveCheckedRequest>()]);
     assert_eq!(target.capacity, 328);
@@ -495,27 +494,4 @@ fn routed_capture_preflight_visits_exact_pages_before_copy() {
         |_| Routed), None);
     assert_eq!(super::first_routed_capture_page(name, 0, 0x8000_0000_0000,
         |_| Routed), None);
-}
-
-/// CSRSS's death-message reply: REPLY_MESSAGE with a send buffer and no ReceiveMessage.
-#[test]
-fn send_only_reply_wire_marks_no_receive_and_transfers_no_target() {
-    let mut image = [0u8; 512];
-    image[64..66].copy_from_slice(&28u16.to_le_bytes());
-    image[66..68].copy_from_slice(&68u16.to_le_bytes());
-    let captured = capture_send_wait_receive(
-        [77, u64::from(nt_alpc_abi::send_flag::REPLY_MESSAGE), 64, 0, 0, 0, 0, 0],
-        |p, b| read_image(&image, p, b), |_, _| false,
-    ).unwrap();
-    assert_eq!(captured.receive, None);
-    let (wire, target) = captured.into_checked_wire_and_receive(caller(), (7, 13)).unwrap();
-    assert_eq!(target, None);
-    let header: nt_alpc_abi::AlpcSendReceiveCheckedRequest = bytemuck::pod_read_unaligned(
-        &wire[..core::mem::size_of::<nt_alpc_abi::AlpcSendReceiveCheckedRequest>()]);
-    assert_eq!(header.send_receive.flags,
-        nt_alpc_abi::send_flag::REPLY_MESSAGE | nt_alpc_abi::send_flag::NO_RECEIVE);
-    assert_eq!(header.send_receive.message_len_bytes, 68);
-    assert_eq!(capture_send_wait_receive([77, 0, 0, 0, 0, 0, 0, 0],
-        |p, b| read_image(&image, p, b), |_, _| true), Err(STATUS_INVALID_PARAMETER),
-        "a call with neither a send nor a receive half is malformed");
 }

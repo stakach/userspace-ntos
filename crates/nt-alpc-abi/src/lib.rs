@@ -238,9 +238,6 @@ pub mod send_flag {
     /// `AllocatedAttributes` (which attributes it has buffer space for); the
     /// returned `ValidAttributes` = allocated & present.
     pub const RECV_ATTRIBUTES: u32 = 0x1;
-    /// Wire-only: the native call passed no `ReceiveMessage`, so the send half (a
-    /// reply, datagram or release) completes the call; nothing is received.
-    pub const NO_RECEIVE: u32 = 0x2;
 }
 
 /// True if `op` is an ALPC opcode.

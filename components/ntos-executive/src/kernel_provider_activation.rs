@@ -485,14 +485,7 @@ pub(crate) unsafe fn registry_caller(
             caller, pm, &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
             &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
         )?;
-        let native =
-            pm.capture_native_handle_caller(caller.thread(), nt_types::AccessMode::KernelMode)?;
-        // A Ps exit callout executes attached to its retained target: the exiting process is
-        // NT's current process, so its untagged handles resolve in that process's table.
-        match (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?.ps_retirement() {
-            Some((_, target)) => pm.attach_native_handle_caller(native, target.process().pid),
-            None => Ok(native),
-        }
+        pm.capture_native_handle_caller(caller.thread(), nt_types::AccessMode::KernelMode)
     })
 }
 

@@ -137,13 +137,13 @@ fn u32_len(len: usize) -> Result<u32, u32> { u32::try_from(len).map_err(|_| STAT
 impl CapturedSendWaitReceive {
     /// Build the checked request while receive metadata is still owned, then
     /// transfer the native output target. The wire's attribute flag and mask
-    /// must describe the same target that will receive the service output; a
-    /// call without a receive half carries `NO_RECEIVE` and transfers no target.
+    /// must describe the same target that will receive the service output.
     pub fn into_checked_wire_and_receive(self, caller: NativeCaller, token: (u64, u64))
-        -> Result<(Vec<u8>, Option<ReceiveTarget>), u32>
+        -> Result<(Vec<u8>, ReceiveTarget), u32>
     {
         let wire = self.checked_wire(caller, token)?;
-        Ok((wire, self.receive))
+        let target = self.receive.ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok((wire, target))
     }
 
     /// Copy-ready service request. Submission still requires retained Reply and
@@ -157,12 +157,9 @@ impl CapturedSendWaitReceive {
         let header = AlpcSendReceiveCheckedRequest {
             send_receive: AlpcSendReceiveRequest {
                 abi_size: u16::try_from(base).map_err(|_| STATUS_INVALID_PARAMETER)?,
-                flags: self.flags | match self.receive.as_ref() {
-                    Some(target) if target.attributes.is_some() =>
-                        nt_alpc_abi::send_flag::RECV_ATTRIBUTES,
-                    Some(_) => 0,
-                    None => nt_alpc_abi::send_flag::NO_RECEIVE,
-                },
+                flags: self.flags | if self.receive.as_ref().is_some_and(|target| target.attributes.is_some()) {
+                    nt_alpc_abi::send_flag::RECV_ATTRIBUTES
+                } else { 0 },
                 port_handle: self.port,
                 message_offset: if send.is_empty() { 0 } else { u32_len(base)? },
                 message_len_bytes: u32_len(send.len())?,
@@ -313,7 +310,6 @@ pub fn capture_send_wait_receive(
     if port == 0 || flags & !(nt_alpc_abi::send_flag::REPLY_MESSAGE
         | nt_alpc_abi::send_flag::SYNC_REQUEST) != 0
         || (flags != 0 && send == 0) || (send == 0 && send_attrs != 0)
-        || (send == 0 && receive == 0)
         || (flags & nt_alpc_abi::send_flag::SYNC_REQUEST != 0
             && (flags & nt_alpc_abi::send_flag::REPLY_MESSAGE != 0 || receive == 0))
         || (receive == 0) != (receive_size == 0)
