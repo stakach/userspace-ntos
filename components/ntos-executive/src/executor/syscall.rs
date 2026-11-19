@@ -496,15 +496,21 @@ pub(super) unsafe fn syscall(
                             callback_context,
                         } => {
                             let dispatch_id = pending.dispatch.dispatch_id;
-                            assert!(provider_wait_admit_current(
-                                &mut nt_handler,
-                                pending,
-                                Some(ComponentCallbackTransfer {
+                            let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
+                                panic!("callback provider wait must retain its original Reply");
+                            };
+                            // The Reply belongs to the admitted continuation or, on any other
+                            // outcome, to the retained callback-wait owner (#336).
+                            let _ = admit_callback_wait(&mut nt_handler, RetainedCallbackWait {
+                                wait: CallbackWait::Provider(pending),
+                                reply_cap: local().reply_main_slot.load(Ordering::Relaxed),
+                                transfer: ComponentCallbackTransfer {
                                     token: callback_token,
                                     context: callback_context,
-                                }),
-                                HostedContinuationDestination::Win32k,
-                            ) == RetainedWaitAdmission::Accepted);
+                                },
+                                destination: HostedContinuationDestination::Win32k,
+                            });
+                            reply_park.commit();
                             procs[pi].faults = lp.exit.faults;
                             procs[pi].first = lp.exit.first;
                             procs[pi].ntfaults = lp.exit.ntfaults;
@@ -535,15 +541,21 @@ pub(super) unsafe fn syscall(
                             callback_context,
                         } => {
                             let dispatch_id = pending.dispatch.dispatch_id;
-                            assert!(lpc_wait_admit_current(
-                                &mut nt_handler,
-                                pending,
-                                Some(ComponentCallbackTransfer {
+                            let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
+                                panic!("callback LPC wait must retain its original Reply");
+                            };
+                            // The Reply belongs to the admitted continuation or, on any other
+                            // outcome, to the retained callback-wait owner (#336).
+                            let _ = admit_callback_wait(&mut nt_handler, RetainedCallbackWait {
+                                wait: CallbackWait::Lpc(pending),
+                                reply_cap: local().reply_main_slot.load(Ordering::Relaxed),
+                                transfer: ComponentCallbackTransfer {
                                     token: callback_token,
                                     context: callback_context,
-                                }),
-                                HostedContinuationDestination::Win32k,
-                            ) == RetainedWaitAdmission::Accepted);
+                                },
+                                destination: HostedContinuationDestination::Win32k,
+                            });
+                            reply_park.commit();
                             procs[pi].faults = lp.exit.faults;
                             procs[pi].first = lp.exit.first;
                             procs[pi].ntfaults = lp.exit.ntfaults;
@@ -577,15 +589,15 @@ pub(super) unsafe fn syscall(
                             let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
                                 panic!("callback Receive must retain its original Reply");
                             };
-                            assert!(receive_admit_retained(
-                                pending,
-                                local().reply_main_slot.load(Ordering::Relaxed),
-                                Some(ComponentCallbackTransfer {
+                            let _ = admit_callback_wait(&mut nt_handler, RetainedCallbackWait {
+                                wait: CallbackWait::Receive(pending),
+                                reply_cap: local().reply_main_slot.load(Ordering::Relaxed),
+                                transfer: ComponentCallbackTransfer {
                                     token: callback_token,
                                     context: callback_context,
-                                }),
-                                HostedContinuationDestination::Win32k,
-                            ));
+                                },
+                                destination: HostedContinuationDestination::Win32k,
+                            });
                             reply_park.commit();
                             procs[pi].faults = lp.exit.faults;
                             procs[pi].first = lp.exit.first;
@@ -620,15 +632,15 @@ pub(super) unsafe fn syscall(
                             let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
                                 panic!("callback service wait must retain its original Reply");
                             };
-                            assert!(service_wait_admit_retained(
-                                pending,
-                                local().reply_main_slot.load(Ordering::Relaxed),
-                                Some(ComponentCallbackTransfer {
+                            let _ = admit_callback_wait(&mut nt_handler, RetainedCallbackWait {
+                                wait: CallbackWait::Service(pending),
+                                reply_cap: local().reply_main_slot.load(Ordering::Relaxed),
+                                transfer: ComponentCallbackTransfer {
                                     token: callback_token,
                                     context: callback_context,
-                                }),
-                                HostedContinuationDestination::Win32k,
-                            ));
+                                },
+                                destination: HostedContinuationDestination::Win32k,
+                            });
                             reply_park.commit();
                             procs[pi].faults = lp.exit.faults;
                             procs[pi].first = lp.exit.first;

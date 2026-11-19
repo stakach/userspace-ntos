@@ -804,7 +804,9 @@ unsafe fn repark_lpc(
         return RootMaintenanceResumeOutcome::DeferredRetry;
     };
     if root_maintenance_owner::retire_after_repark(ticket, next_key).is_none() {
-        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+        // The frame was not retired, so this reservation was never published. A stale release
+        // is named by the contract and the failure stays retained either way.
+        let _ = release_lpc_reservation(reservation, b"maintenance-retire");
         trace_root_refusal(ticket, b"lpc-retire", next_key.id);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }

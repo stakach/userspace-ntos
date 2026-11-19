@@ -794,8 +794,9 @@ unsafe fn finish_hosted_resume(
                     }
                 }
                 if let Some(reservation) = lpc_reservation {
-                    let _ =
-                        (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+                    // The terminal below retains the incomplete provider whether or not the
+                    // release proves no effect; an indeterminate release is named, not reused.
+                    let _ = release_lpc_reservation(reservation, b"resume-rearm-conflict");
                 }
                 component_terminal::retain_incomplete_provider(
                     lane,

@@ -539,12 +539,10 @@ impl NestedWaitTransfer {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum RetainedWaitAdmission {
-    Accepted,
-    RefusedNoEffect,
-    Indeterminate,
-}
+use crate::retained_admissions::RetainedWaitAdmission;
+#[path = "service_callback_wait_retention.rs"]
+mod callback_wait_retention;
+use callback_wait_retention::{admit_callback_wait, CallbackWait, RetainedCallbackWait};
 
 const COMPONENT_SUSPENSION_MAX_DEPTH: usize = 64;
 const COMPONENT_EXECUTION_LANE_CAPACITY: usize = 256;
@@ -1829,18 +1827,18 @@ unsafe fn lpc_wait_begin_after_stack_admission(
             );
         }
         Some(Ok(nt_lpc_client::BeginRequestWaitReply::Completed { message_id, reply })) => {
-            let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+            let _ = release_lpc_reservation(reservation, b"begin-completed");
             let completion = ComponentSuspensionCompletion::lpc(0, message_id, &reply)
                 .unwrap_or_else(|| ComponentSuspensionCompletion::provider(0xC000_000Du32 as i32));
             let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)).select(key, completion);
         }
         Some(Err(status)) => {
-            let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+            let _ = release_lpc_reservation(reservation, b"begin-refused");
             let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .select(key, ComponentSuspensionCompletion::provider(status.raw()));
         }
         None => {
-            let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+            let _ = release_lpc_reservation(reservation, b"begin-unavailable");
             let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)).select(
                 key,
                 ComponentSuspensionCompletion::provider(0xC000_0001u32 as i32),
@@ -2294,17 +2292,6 @@ unsafe fn receive_admit_current(
     true
 }
 
-unsafe fn service_wait_admit_retained(
-    pending: win32k_glue::PendingServiceWaitDispatch,
-    reply_cap: u64,
-    callback_transfer: Option<ComponentCallbackTransfer>,
-    destination: HostedContinuationDestination,
-) -> bool {
-    service_wait_admit_with_transfer(
-        pending, reply_cap, NestedWaitTransfer::from_completed(callback_transfer), destination,
-    ) == RetainedWaitAdmission::Accepted
-}
-
 unsafe fn service_wait_admit_with_transfer(
     pending: win32k_glue::PendingServiceWaitDispatch,
     reply_cap: u64,
@@ -2398,6 +2385,25 @@ unsafe fn service_wait_admit_current(
     else { RetainedWaitAdmission::Accepted }
 }
 
+/// The one release contract for an unpublished LPC wait reservation. Only `NoEffect` proves
+/// the slot stayed unpublished; an indeterminate release is named and left to its owner.
+pub(crate) unsafe fn release_lpc_reservation(
+    reservation: nt_lpc_continuation::Reservation,
+    site: &[u8],
+) -> nt_lpc_continuation::ReservationRelease {
+    let release = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS))
+        .release_unpublished(reservation);
+    if release == nt_lpc_continuation::ReservationRelease::Indeterminate {
+        static TRACED: AtomicU64 = AtomicU64::new(0);
+        if TRACED.fetch_add(1, Ordering::Relaxed) < 16 {
+            print_str(b"[lpc-wait-reservation] indeterminate release site=");
+            print_str(site);
+            print_str(b"\n");
+        }
+    }
+    release
+}
+
 unsafe fn lpc_wait_admit_retained(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingLpcWaitDispatch,
@@ -2425,14 +2431,11 @@ unsafe fn lpc_wait_admit_with_transfer(
     let Ok(reservation) = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() else {
         return RetainedWaitAdmission::RefusedNoEffect;
     };
-    let cancel = || {
-        if (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation).is_ok() {
-            RetainedWaitAdmission::RefusedNoEffect
-        } else {
-            // A changed reservation may already belong to another effect owner. The caller
-            // must retain and quarantine its original result, not reinsert it for replay.
-            RetainedWaitAdmission::Indeterminate
-        }
+    let cancel = || match release_lpc_reservation(reservation, b"admission") {
+        nt_lpc_continuation::ReservationRelease::NoEffect => RetainedWaitAdmission::RefusedNoEffect,
+        // A changed reservation may already belong to another effect owner. The caller
+        // must retain and quarantine its original result, not reinsert it for replay.
+        nt_lpc_continuation::ReservationRelease::Indeterminate => RetainedWaitAdmission::Indeterminate,
     };
     let Ok(return_target) = HostedReturnTarget::new(
         reply_cap, transfer.context(),
@@ -3632,6 +3635,7 @@ unsafe fn drain_deferred_user_callback_returns(
     pfilled: &mut [[u64; 512]],
     current_filled_pages: &mut [u64; 512],
 ) {
+    let _ = callback_wait_retention::retry_callback_waits(nt_handler);
     while let Some(deferred) = take_ready_deferred_user_callback_return() {
         let completion = win32k_glue::complete_controlled_user_callback(
             deferred.pi,
@@ -3713,16 +3717,15 @@ unsafe fn drain_deferred_user_callback_returns(
                     callback_token,
                     callback_context,
                 } => {
-                    assert!(provider_wait_admit_retained(
-                        nt_handler,
-                        pending,
-                        deferred.reply_cap,
-                        Some(ComponentCallbackTransfer {
+                    let _ = admit_callback_wait(nt_handler, RetainedCallbackWait {
+                        wait: CallbackWait::Provider(pending),
+                        reply_cap: deferred.reply_cap,
+                        transfer: ComponentCallbackTransfer {
                             token: callback_token,
                             context: callback_context,
-                        }),
-                        HostedContinuationDestination::Win32k,
-                    ) == RetainedWaitAdmission::Accepted);
+                        },
+                        destination: HostedContinuationDestination::Win32k,
+                    });
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }
@@ -3731,16 +3734,15 @@ unsafe fn drain_deferred_user_callback_returns(
                     callback_token,
                     callback_context,
                 } => {
-                    assert!(lpc_wait_admit_retained(
-                        nt_handler,
-                        pending,
-                        deferred.reply_cap,
-                        Some(ComponentCallbackTransfer {
+                    let _ = admit_callback_wait(nt_handler, RetainedCallbackWait {
+                        wait: CallbackWait::Lpc(pending),
+                        reply_cap: deferred.reply_cap,
+                        transfer: ComponentCallbackTransfer {
                             token: callback_token,
                             context: callback_context,
-                        }),
-                        HostedContinuationDestination::Win32k,
-                    ) == RetainedWaitAdmission::Accepted);
+                        },
+                        destination: HostedContinuationDestination::Win32k,
+                    });
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }
@@ -3749,15 +3751,15 @@ unsafe fn drain_deferred_user_callback_returns(
                     callback_token,
                     callback_context,
                 } => {
-                    assert!(receive_admit_retained(
-                        pending,
-                        deferred.reply_cap,
-                        Some(ComponentCallbackTransfer {
+                    let _ = admit_callback_wait(nt_handler, RetainedCallbackWait {
+                        wait: CallbackWait::Receive(pending),
+                        reply_cap: deferred.reply_cap,
+                        transfer: ComponentCallbackTransfer {
                             token: callback_token,
                             context: callback_context,
-                        }),
-                        HostedContinuationDestination::Win32k,
-                    ));
+                        },
+                        destination: HostedContinuationDestination::Win32k,
+                    });
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }
@@ -3766,15 +3768,15 @@ unsafe fn drain_deferred_user_callback_returns(
                     callback_token,
                     callback_context,
                 } => {
-                    assert!(service_wait_admit_retained(
-                        pending,
-                        deferred.reply_cap,
-                        Some(ComponentCallbackTransfer {
+                    let _ = admit_callback_wait(nt_handler, RetainedCallbackWait {
+                        wait: CallbackWait::Service(pending),
+                        reply_cap: deferred.reply_cap,
+                        transfer: ComponentCallbackTransfer {
                             token: callback_token,
                             context: callback_context,
-                        }),
-                        HostedContinuationDestination::Win32k,
-                    ));
+                        },
+                        destination: HostedContinuationDestination::Win32k,
+                    });
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }

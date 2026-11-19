@@ -58,6 +58,24 @@ pub enum TableError {
     StaleReservation,
 }
 
+/// Result of releasing an unpublished reservation. Only `NoEffect` proves the slot was never
+/// published, so only it permits a no-effect retry or a terminal reply. A stale reservation may
+/// already belong to another effect owner and must be retained, never retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservationRelease {
+    NoEffect,
+    Indeterminate,
+}
+
+impl From<Result<(), TableError>> for ReservationRelease {
+    fn from(result: Result<(), TableError>) -> Self {
+        match result {
+            Ok(()) => Self::NoEffect,
+            Err(_) => Self::Indeterminate,
+        }
+    }
+}
+
 enum Slot<T> {
     Empty,
     Reserved { generation: u64 },
@@ -548,6 +566,11 @@ impl<C> BrokerRequestWaitTable<C> {
 
     pub fn cancel(&mut self, reservation: Reservation) -> Result<(), TableError> {
         self.inner.cancel(reservation)
+    }
+
+    /// Release an unpublished reservation with the effect distinction its callers must keep.
+    pub fn release_unpublished(&mut self, reservation: Reservation) -> ReservationRelease {
+        self.inner.cancel(reservation).into()
     }
 
     pub fn publish(
@@ -1171,6 +1194,27 @@ mod tests {
         );
         table.cancel(reservation).unwrap();
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn stale_release_of_a_published_or_reused_reservation_is_indeterminate() {
+        let mut table = BrokerRequestWaitTable::with_initial_reserve(1);
+        table.reset().unwrap();
+        let unpublished = table.reserve().unwrap();
+        assert_eq!(table.release_unpublished(unpublished), ReservationRelease::NoEffect);
+        // A second release of the same reservation proves nothing.
+        assert_eq!(table.release_unpublished(unpublished), ReservationRelease::Indeterminate);
+
+        let published = table.reserve().unwrap();
+        table.publish(published, broker_request(9, 3)).unwrap();
+        assert_eq!(table.release_unpublished(published), ReservationRelease::Indeterminate);
+        // The published request is untouched: an indeterminate release consumed nothing.
+        assert_eq!(table.get(published.slot).unwrap().identity.message_id, 9);
+
+        let reused = table.reserve().unwrap();
+        assert_ne!(reused, unpublished);
+        assert_eq!(table.release_unpublished(unpublished), ReservationRelease::Indeterminate);
+        assert_eq!(table.release_unpublished(reused), ReservationRelease::NoEffect);
     }
 
     #[test]
