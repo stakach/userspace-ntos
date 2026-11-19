@@ -415,6 +415,12 @@ impl ExecNtHandler {
         if let Some(target) = Self::virtual_registry_root_target_from_canon(path) {
             return Ok(RegistryTargetStep::Key(target));
         }
+        // Volatile link keys outside SYSTEM live in the overlay.
+        if let Some(reparse) = self.overlay.link_reparse(path, open_link) {
+            return reparse
+                .map(RegistryTargetStep::Reparse)
+                .map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND);
+        }
         if let Some(index) = self.registry_overlay_index_for_canon_path(path) {
             return Ok(RegistryTargetStep::Key(OVERLAY_KEY_TAG | index as u32));
         }
@@ -425,8 +431,13 @@ impl ExecNtHandler {
         if is_system_registry_path(path) {
             return self.system_key_step(path, None, open_link);
         }
-        if let Some(key) = self.mutable_registry_key_by_path(path) {
-            return self.install_mutable_registry_key_target(key).map(RegistryTargetStep::Key);
+        match self.mutable_hives.resolve_key_following(path, open_link) {
+            Ok(Some(Ok(key))) => {
+                return self.install_mutable_registry_key_target(key).map(RegistryTargetStep::Key);
+            }
+            Ok(Some(Err(target))) => return Ok(RegistryTargetStep::Reparse(target)),
+            Ok(None) => {}
+            Err(_) => return Err(STATUS_OBJECT_NAME_NOT_FOUND),
         }
         if self.mutable_hive_owns_path(path) {
             return Err(STATUS_OBJECT_NAME_NOT_FOUND);
@@ -659,10 +670,11 @@ impl ExecNtHandler {
         let backup = options & REG_OPTION_BACKUP_RESTORE != 0;
         let volatile = options & REG_OPTION_VOLATILE != 0;
         let link = options & REG_OPTION_CREATE_LINK != 0;
-        // A durable link needs its key kind in the SYSTEM journal, which records none.
-        if link && !volatile {
-            return STATUS_NOT_SUPPORTED;
-        }
+        let kind = if link {
+            nt_hive_core::KeyKind::SymbolicLink
+        } else {
+            nt_hive_core::KeyKind::Ordinary
+        };
         let expected_generation =
             crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
         let (mut state, creator_pointer) =
@@ -743,8 +755,8 @@ impl ExecNtHandler {
                 return Err(status);
             }
             parent_retention = Some(parent_owner);
-            // Link keys live only in the CM-owned SYSTEM hive, where reparse is implemented.
-            if link && !is_system_registry_path(&state.path) {
+            // CM runtime keys (HARDWARE) are a separate in-memory registry without link keys.
+            if link && is_cm_runtime_registry_path(&state.path) {
                 return Err(STATUS_NOT_SUPPORTED);
             }
             let runtime_parent = if is_cm_runtime_registry_path(&state.path) {
@@ -872,6 +884,7 @@ impl ExecNtHandler {
                 &prepared.descriptor,
                 class.as_deref(),
                 volatile,
+                kind,
             )?;
             self.bind_hosted_registry_target(&mut state, target)?;
             let granted = if created {
@@ -885,6 +898,7 @@ impl ExecNtHandler {
             let owner = parent_retention.take().expect("SYSTEM create parent reservation");
             let mutation = if link {
                 nt_config_client::SystemHiveMutation::CreateLinkRelative {
+                    volatile,
                     parent: lease,
                     name: &leaf,
                     class_name: class.as_deref(),
@@ -923,7 +937,7 @@ impl ExecNtHandler {
             let owner = parent_retention.take().expect("mutable create parent reservation");
             match crate::mutable_hive_mutation_work::submit_hosted_create_child(
                 self, state, owner, parent, mutable, leaf, class,
-                prepared.descriptor, prepared.granted_access, backup,
+                prepared.descriptor, kind, prepared.granted_access, backup,
             ) {
                 Ok(()) => return 0x103,
                 Err((status, mut state, mut owner)) => {
@@ -979,7 +993,9 @@ impl ExecNtHandler {
         descriptor: &[u8],
         class: Option<&str>,
         volatile: bool,
+        kind: nt_hive_core::KeyKind,
     ) -> Result<(KeyRef, bool), u32> {
+        let link = kind == nt_hive_core::KeyKind::SymbolicLink;
         let (parent_path, name) = path.rsplit_once('\\').ok_or(STATUS_OBJECT_NAME_INVALID)?;
         if name.is_empty() || self.registry_target_path(parent).as_deref() != Some(parent_path) {
             return Err(STATUS_INVALID_HANDLE);
@@ -990,6 +1006,10 @@ impl ExecNtHandler {
             return Err(STATUS_NOT_SUPPORTED);
         }
         if let Some(index) = self.registry_overlay_index_for_canon_path(path) {
+            // A link is created, never opened (CmpDoOpen's collision).
+            if link {
+                return Err(STATUS_OBJECT_NAME_COLLISION);
+            }
             return Ok((OVERLAY_KEY_TAG | index as u32, false));
         }
         if let Some(mutable) = self.mutable_key_handle(parent) {
@@ -998,6 +1018,9 @@ impl ExecNtHandler {
                 .hive(mutable.hive)
                 .and_then(|hive| hive.open_subkey(mutable.key, name))
             {
+                if link {
+                    return Err(STATUS_OBJECT_NAME_COLLISION);
+                }
                 return self
                     .install_mutable_registry_key_target(ResolvedHiveKey {
                         hive: mutable.hive,
@@ -1006,8 +1029,9 @@ impl ExecNtHandler {
                     .map(|target| (target, false));
             }
             if !volatile {
-                let key =
-                    self.journal_create_secured_mutable_subkey(mutable, name, class, descriptor)?;
+                let key = self.journal_create_secured_mutable_subkey_of_kind(
+                    mutable, name, class, descriptor, kind,
+                )?;
                 return self
                     .install_mutable_registry_key_target(key)
                     .map(|target| (target, true));
@@ -1018,11 +1042,12 @@ impl ExecNtHandler {
         if self.overlay.len() >= OVERLAY_KEY_MAX as usize {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
-        let index = self.overlay.create_secured_owned(
+        let index = self.overlay.create_secured_owned_of_kind(
             path.into(),
             volatile,
             class.map(Into::into),
             descriptor.to_vec(),
+            link,
         )?;
         unsafe { self.registry_subkey_created(path) };
         Ok((OVERLAY_KEY_TAG | index as u32, true))
@@ -1035,8 +1060,22 @@ impl ExecNtHandler {
         class: Option<&str>,
         descriptor: &[u8],
     ) -> Result<ResolvedHiveKey, u32> {
-        let child =
-            self.journal_create_secured_mutable_subkey_unreported(parent, name, class, descriptor)?;
+        self.journal_create_secured_mutable_subkey_of_kind(
+            parent, name, class, descriptor, nt_hive_core::KeyKind::Ordinary,
+        )
+    }
+
+    /// As [`Self::journal_create_secured_mutable_subkey`], for a child of `kind`.
+    pub(crate) fn journal_create_secured_mutable_subkey_of_kind(
+        &mut self,
+        parent: ResolvedHiveKey,
+        name: &str,
+        class: Option<&str>,
+        descriptor: &[u8],
+        kind: nt_hive_core::KeyKind,
+    ) -> Result<ResolvedHiveKey, u32> {
+        let child = self
+            .journal_create_secured_mutable_subkey_unreported(parent, name, class, descriptor, kind)?;
         self.mutable_registry_subkey_created(child);
         Ok(child)
     }
@@ -1047,9 +1086,10 @@ impl ExecNtHandler {
         name: &str,
         class: Option<&str>,
         descriptor: &[u8],
+        kind: nt_hive_core::KeyKind,
     ) -> Result<ResolvedHiveKey, u32> {
         if self.boot_v2_mutable_hive_journal() {
-            return self.boot_v2_create_secured_mutable_subkey(parent, name, class, descriptor);
+            return self.boot_v2_create_secured_mutable_subkey(parent, name, class, descriptor, kind);
         }
         let parent_path = self
             .mutable_key_relative_path(parent)
@@ -1072,15 +1112,18 @@ impl ExecNtHandler {
                         name,
                         class_name: class,
                         descriptor,
+                        kind,
                     },
                     |hive| {
                         let mut transaction = hive.begin_transaction();
                         if transaction
-                            .try_create_child(
+                            .try_create_child_of_kind(
                                 parent.key,
                                 name.into(),
                                 class.map(Into::into),
                                 descriptor.to_vec(),
+                                false,
+                                kind,
                             )
                             .is_err()
                         {

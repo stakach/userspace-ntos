@@ -289,8 +289,8 @@ pub mod hive_mutation_flags {
     /// Create a memory-only child in the mounted hive. This is valid only for CREATE_CHILD and
     /// CREATE_CHILD_LEASED; the server owns durable filtering and sequence advancement.
     pub const VOLATILE: u16 = 1 << 1;
-    /// Create the child as a symbolic link key (REG_OPTION_CREATE_LINK). Valid only with
-    /// VOLATILE: the durable journal records no key kind.
+    /// Create the child as a symbolic link key (REG_OPTION_CREATE_LINK); a durable one is
+    /// journaled with its kind.
     pub const SYMBOLIC_LINK: u16 = 1 << 2;
 }
 

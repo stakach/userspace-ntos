@@ -322,7 +322,7 @@ fn owned_prepared_child_keeps_restored_hive_unchanged_until_durable_publication(
         .unwrap();
     assert_eq!(prepared.record(), encode_log_record(
         &HiveLogOp::CreateChild {
-            parent: "", name: "Policy", class_name: None, descriptor: &[1, 2, 3],
+            parent: "", name: "Policy", class_name: None, descriptor: &[1, 2, 3], kind: crate::KeyKind::Ordinary,
         },
         prepared.sequence(),
     ));

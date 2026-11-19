@@ -97,6 +97,16 @@ impl ExecNtHandler {
         STATUS_ACCESS_DENIED
     }
 
+    /// Whether `key` is a symbolic link key held by the executive (a mutable hive or the overlay).
+    fn registry_key_is_symbolic_link(&self, key: KeyRef) -> bool {
+        if let Some(mutable) = self.mutable_key_handle(key) {
+            return self.mutable_hives.hive(mutable.hive)
+                .and_then(|hive| hive.key_kind(mutable.key))
+                == Some(nt_hive_core::KeyKind::SymbolicLink);
+        }
+        overlay_key_idx(key).is_some_and(|index| self.overlay.is_symbolic_link(index as usize))
+    }
+
     pub(super) unsafe fn nt_set_value_key_admitted(&mut self, args: &[u64]) -> u32 {
         let _capture_scope = allocator::enter_scope(b"registry.set-value-capture");
         let key = match self.resolve_registry_key(args[0], 2) {
@@ -163,6 +173,13 @@ impl ExecNtHandler {
                 Ok(()) => 0x103,
                 Err(status) => status,
             };
+        }
+        // CmSetValueKey: a link key holds only its REG_LINK target (SYSTEM enforces this in CM).
+        if self.registry_key_is_symbolic_link(key)
+            && !(nt_ulong_arg(args[3]) == nt_hive_core::RegistryValueType::Link as u32
+                && name.eq_ignore_ascii_case(nt_hive_core::SYMBOLIC_LINK_VALUE))
+        {
+            return nt_security::STATUS_ACCESS_DENIED;
         }
         if let Some(mutable) = self.mutable_key_handle(key) {
             let route = crate::fs_loader::exec_fs_mount_identity()

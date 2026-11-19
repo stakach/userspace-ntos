@@ -162,9 +162,10 @@ pub enum SystemHiveMutation<'a> {
         class_name: Option<&'a str>,
         descriptor: &'a [u8],
     },
-    /// A volatile symbolic link key (REG_OPTION_CREATE_LINK) beneath the exact leased parent. Its
-    /// target is the `SymbolicLinkValue` the creator sets next.
+    /// A symbolic link key (REG_OPTION_CREATE_LINK) beneath the exact leased parent. Its target is
+    /// the `SymbolicLinkValue` the creator sets next.
     CreateLinkRelative {
+        volatile: bool,
         parent: SystemHiveKeyLease,
         name: &'a str,
         class_name: Option<&'a str>,
@@ -1239,8 +1240,8 @@ fn encode_hive_mutation_journal(mutations: &[SystemHiveMutation<'_>]) -> Result<
             SystemHiveMutation::CreateChildRelative { parent, name, class_name, descriptor, volatile } => {
                 child_creation::append_leased(&mut journal, parent, name, class_name, descriptor, volatile)?;
             }
-            SystemHiveMutation::CreateLinkRelative { parent, name, class_name, descriptor } => {
-                child_creation::append_leased_link(&mut journal, parent, name, class_name, descriptor)?;
+            SystemHiveMutation::CreateLinkRelative { parent, name, class_name, descriptor, volatile } => {
+                child_creation::append_leased_link(&mut journal, parent, name, class_name, descriptor, volatile)?;
             }
             SystemHiveMutation::CreateChild {
                 parent, name, class_name, descriptor, volatile,

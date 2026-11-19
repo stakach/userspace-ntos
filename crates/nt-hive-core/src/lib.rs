@@ -90,7 +90,7 @@ pub use hive::{
 mod hardware_profile;
 mod symbolic_link;
 pub use symbolic_link::{
-    symbolic_link_target, walk_following_links, walk_following_links_from, LinkWalk, SymbolicLinkError, MAX_REPARSE,
+    parse_symbolic_link_value, symbolic_link_target, walk_following_links, walk_following_links_from, LinkWalk, SymbolicLinkError, MAX_REPARSE,
     SYMBOLIC_LINK_VALUE,
 };
 #[cfg(test)]

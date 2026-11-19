@@ -309,7 +309,8 @@ fn child_wire_preserves_large_descriptor_and_class_presence() {
 fn child_wire_rejects_unknown_flags_types_names_and_invalid_utf16() {
     let data = data(&[], b"sd");
     for (flags, ty, name) in [
-        (4, 0, text("Child")),
+        // 1 = CLASS_PRESENT, 2 = VOLATILE, 4 = SYMBOLIC_LINK; 8 is unassigned.
+        (8, 0, text("Child")),
         (0, 1, text("Child")),
         (0, 0, text("")),
         (0, 0, text("a\\b")),

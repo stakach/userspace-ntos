@@ -2133,12 +2133,17 @@ impl CmServer {
             system_hive_relative_path(path, current_control_set).ok_or(STATUS_INVALID_PARAMETER)?;
         let operation = match mutation {
             HiveMutation::CreateChild {
-                name, class_name, descriptor, ..
+                name, class_name, descriptor, symbolic_link, ..
             } => HiveLogOp::CreateChild {
                 parent: &relative,
                 name,
                 class_name: class_name.as_deref(),
                 descriptor,
+                kind: if *symbolic_link {
+                    nt_hive_core::KeyKind::SymbolicLink
+                } else {
+                    nt_hive_core::KeyKind::Ordinary
+                },
             },
             HiveMutation::CreateKey { .. } => return Err(STATUS_INVALID_PARAMETER),
             HiveMutation::SetValue {

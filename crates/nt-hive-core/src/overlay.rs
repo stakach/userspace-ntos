@@ -70,6 +70,8 @@ struct OverlayKey {
     class_name: Option<String>,
     security_descriptor: Option<usize>,
     volatile: bool,
+    /// REG_OPTION_CREATE_LINK: the key's target is its `SymbolicLinkValue`.
+    symbolic_link: bool,
     detached: bool,
 }
 
@@ -78,6 +80,8 @@ struct OverlayKey {
 pub struct RegistryOverlay {
     keys: Vec<OverlayKey>,
     blobs: Vec<Vec<u8>>,
+    /// Live symbolic link keys; zero keeps path resolution free of link checks.
+    links: usize,
 }
 
 impl RegistryOverlay {
@@ -86,6 +90,7 @@ impl RegistryOverlay {
         Self {
             keys: Vec::new(),
             blobs: Vec::new(),
+            links: 0,
         }
     }
 
@@ -95,6 +100,7 @@ impl RegistryOverlay {
         Self {
             keys: Vec::with_capacity(n),
             blobs: Vec::new(),
+            links: 0,
         }
     }
 
@@ -185,6 +191,9 @@ impl RegistryOverlay {
             self.keys[i].class_name = None;
             self.keys[i].security_descriptor = None;
             self.keys[i].volatile = volatile;
+            if core::mem::replace(&mut self.keys[i].symbolic_link, false) {
+                self.links -= 1;
+            }
             return (i, true);
         }
         self.keys.push(OverlayKey {
@@ -193,6 +202,7 @@ impl RegistryOverlay {
             class_name: None,
             security_descriptor: None,
             volatile,
+            symbolic_link: false,
             detached: false,
         });
         (self.keys.len() - 1, true)
@@ -201,8 +211,17 @@ impl RegistryOverlay {
     /// Publish an absent key with already assigned security and class in one memory operation.
     /// Detached slots are never resurrected: retained KeyRefs must not name a replacement key.
     pub fn create_secured_owned(&mut self, canon: String, volatile: bool, class_name: Option<String>, descriptor: Vec<u8>) -> Result<usize, u32> {
+        self.create_secured_owned_of_kind(canon, volatile, class_name, descriptor, false)
+    }
+
+    /// As [`Self::create_secured_owned`]; `symbolic_link` creates a REG_OPTION_CREATE_LINK key.
+    pub fn create_secured_owned_of_kind(&mut self, canon: String, volatile: bool, class_name: Option<String>, descriptor: Vec<u8>, symbolic_link: bool) -> Result<usize, u32> {
         if descriptor.is_empty() { return Err(0xC000_0079); }
         if self.find(&canon).is_some() { return Err(0xC000_0035); }
+        // CmpDoCreate: a link key has no children.
+        if canon.rsplit_once('\\').and_then(|(parent, _)| self.find(parent)).is_some_and(|parent| self.keys[parent].symbolic_link) {
+            return Err(0xC000_0022);
+        }
         if !volatile && canon.rsplit_once('\\').and_then(|(parent, _)| self.find(parent)).is_some_and(|parent| self.is_volatile(parent) == Some(true)) {
             return Err(0xC000_0181);
         }
@@ -214,8 +233,49 @@ impl RegistryOverlay {
             None => { self.blobs.push(descriptor); self.blobs.len() - 1 },
         });
         let index = self.keys.len();
-        self.keys.push(OverlayKey { path: canon, values: Vec::new(), class_name, security_descriptor, volatile, detached: false });
+        self.keys.push(OverlayKey { path: canon, values: Vec::new(), class_name, security_descriptor, volatile, symbolic_link, detached: false });
+        self.links += usize::from(symbolic_link);
         Ok(index)
+    }
+
+    /// Whether the live key at `idx` is a symbolic link key.
+    pub fn is_symbolic_link(&self, idx: usize) -> bool {
+        self.keys.get(idx).is_some_and(|k| !k.detached && k.symbolic_link)
+    }
+
+    /// CmpParseKey over overlay keys: the first link key canonical `canon` crosses, as its target
+    /// plus the remaining components. A link as the last component is the key itself when
+    /// `open_link` is set. `None` when the path crosses no overlay link.
+    pub fn link_reparse(
+        &self,
+        canon: &str,
+        open_link: bool,
+    ) -> Option<Result<String, crate::SymbolicLinkError>> {
+        if self.links == 0 {
+            return None;
+        }
+        let mut end = 0;
+        let components: Vec<&str> = canon.split('\\').filter(|part| !part.is_empty()).collect();
+        for (index, part) in components.iter().enumerate() {
+            end = canon[end..].find(part).map(|at| end + at + part.len())?;
+            let last = index + 1 == components.len();
+            if last && open_link {
+                return None;
+            }
+            let Some(key) = self.find(&canon[..end]) else { continue };
+            if !self.keys[key].symbolic_link {
+                continue;
+            }
+            let target = match self.value(key, crate::SYMBOLIC_LINK_VALUE) {
+                Some((value_type, bytes)) => crate::parse_symbolic_link_value(value_type, bytes),
+                None => Err(crate::SymbolicLinkError::NoTarget),
+            };
+            return Some(target.and_then(|target| {
+                crate::symbolic_link::reparse_with_rest(
+                    target, components[index + 1..].iter().copied())
+            }));
+        }
+        None
     }
 
     /// The canonical path of an overlay key. `None` for a detached slot.

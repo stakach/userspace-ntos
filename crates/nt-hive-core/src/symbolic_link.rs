@@ -31,7 +31,12 @@ pub fn symbolic_link_target(hive: &Hive, key: CellId) -> Result<String, Symbolic
     let (kind, bytes) = hive
         .query_value(key, SYMBOLIC_LINK_VALUE)
         .ok_or(SymbolicLinkError::NoTarget)?;
-    if kind != RegistryValueType::Link {
+    parse_symbolic_link_value(kind as u32, bytes)
+}
+
+/// CmpGetSymbolicLink's checks on a `SymbolicLinkValue` of type `value_type` holding `bytes`.
+pub fn parse_symbolic_link_value(value_type: u32, bytes: &[u8]) -> Result<String, SymbolicLinkError> {
+    if value_type != RegistryValueType::Link as u32 {
         return Err(SymbolicLinkError::NoTarget);
     }
     if bytes.is_empty() || bytes.len() % 2 != 0 {
@@ -97,19 +102,27 @@ pub fn walk_following_links_from(
         };
         let last = components.peek().is_none();
         if hive.key_kind(child) == Some(KeyKind::SymbolicLink) && !(last && open_link) {
-            let mut target = symbolic_link_target(hive, child)?;
-            for rest in components {
-                target.push('\\');
-                target.push_str(rest);
-            }
-            if target.encode_utf16().count() * 2 > u16::MAX as usize {
-                return Err(SymbolicLinkError::TooLong);
-            }
-            return Ok(LinkWalk::Reparse(target));
+            let target = symbolic_link_target(hive, child)?;
+            return reparse_with_rest(target, components).map(LinkWalk::Reparse);
         }
         key = child;
     }
     Ok(LinkWalk::Found(key))
+}
+
+/// Append the components of `rest` to a link target, bounded as a UNICODE_STRING.
+pub(crate) fn reparse_with_rest<'a>(
+    mut target: String,
+    rest: impl Iterator<Item = &'a str>,
+) -> Result<String, SymbolicLinkError> {
+    for part in rest {
+        target.push('\\');
+        target.push_str(part);
+    }
+    if target.encode_utf16().count() * 2 > u16::MAX as usize {
+        return Err(SymbolicLinkError::TooLong);
+    }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -168,5 +181,50 @@ mod tests {
         assert_eq!(walk_following_links(&hive, path, false), Err(SymbolicLinkError::InvalidTarget));
         let (hive, _) = hive_with_link(Some((RegistryValueType::Link, link_data("\\a\0"))));
         assert_eq!(walk_following_links(&hive, path, false), Err(SymbolicLinkError::InvalidTarget));
+    }
+
+    #[test]
+    fn overlay_links_reparse_like_hive_links() {
+        let mut overlay = crate::RegistryOverlay::new();
+        let link = r"\registry\machine\software\link";
+        assert_eq!(overlay.link_reparse(link, false), None, "no links: no checks");
+        let index = overlay
+            .create_secured_owned_of_kind(link.into(), true, None, alloc::vec![1], true)
+            .unwrap();
+        assert!(overlay.is_symbolic_link(index));
+        assert_eq!(overlay.link_reparse(link, false), Some(Err(SymbolicLinkError::NoTarget)));
+        assert!(overlay.set_value(index, SYMBOLIC_LINK_VALUE, RegistryValueType::Link as u32,
+            &link_data(TARGET)));
+        assert_eq!(overlay.link_reparse(link, false), Some(Ok(TARGET.into())));
+        assert_eq!(overlay.link_reparse(&alloc::format!(r"{link}\a\b"), false),
+            Some(Ok(alloc::format!(r"{TARGET}\a\b"))));
+        assert_eq!(overlay.link_reparse(link, true), None, "OBJ_OPENLINK opens the link itself");
+        assert_eq!(overlay.link_reparse(r"\registry\machine\software\other", false), None);
+        assert_eq!(
+            overlay.create_secured_owned(alloc::format!(r"{link}\child"), true, None, alloc::vec![1]),
+            Err(0xC000_0022),
+            "a link key has no children"
+        );
+    }
+
+    #[test]
+    fn a_mutable_hive_resolves_through_its_links() {
+        let mut hive = Hive::new(HiveKind::Software);
+        let parent = hive.create_key("Print");
+        let mut tx = hive.begin_transaction();
+        let link = tx
+            .try_create_child_of_kind(parent, "Printers".into(), None, alloc::vec![1], false,
+                KeyKind::SymbolicLink)
+            .unwrap();
+        assert!(tx.set_value(link, SYMBOLIC_LINK_VALUE, RegistryValueType::Link, link_data(TARGET)));
+        tx.commit();
+        let mut set = crate::MutableHiveSet::new();
+        let id: crate::HiveId = 7;
+        set.mount(r"\Registry\Machine\SOFTWARE", id, hive).unwrap();
+        let path = r"\Registry\Machine\SOFTWARE\Print\Printers";
+        assert_eq!(set.resolve_key_following(path, false), Ok(Some(Err(TARGET.into()))));
+        assert_eq!(set.resolve_key_following(path, true),
+            Ok(Some(Ok(crate::ResolvedHiveKey { hive: id, key: link }))));
+        assert_eq!(set.resolve_key_following(r"\Registry\Machine\SOFTWARE\None", false), Ok(None));
     }
 }

@@ -493,20 +493,27 @@ fn create_child_record(flags: u16) -> Vec<u8> {
 }
 
 #[test]
-fn a_create_link_record_must_be_volatile_and_creates_a_link_key() {
+fn a_create_link_record_creates_a_volatile_or_durable_link_key() {
     use nt_config_abi::hive_mutation_flags::{SYMBOLIC_LINK, VOLATILE};
-    assert!(crate::mutation::decode_mutation_journal(&create_child_record(SYMBOLIC_LINK)).is_none(),
-        "a durable link has no journal representation");
-    let mutations = crate::mutation::decode_mutation_journal(&create_child_record(SYMBOLIC_LINK | VOLATILE))
-        .unwrap();
-    let mut server = server();
-    let mounted = server.system_hive.as_mut().unwrap();
-    mounted.hive.create_key(r"ControlSet001\Control");
-    let control_set = mounted.current_control_set.clone();
-    let mut tx = mounted.hive.begin_transaction();
-    assert_eq!(apply_system_hive_mutation(&mut tx, &control_set, &mutations[0]), Ok(()));
-    tx.commit();
-    let link = mounted.hive.open_key(r"ControlSet001\Control\Links").unwrap();
-    assert_eq!(mounted.hive.key_kind(link), Some(nt_hive_core::KeyKind::SymbolicLink));
-    assert!(mounted.hive.is_volatile(link));
+    for (flags, volatile) in [(SYMBOLIC_LINK | VOLATILE, true), (SYMBOLIC_LINK, false)] {
+        let mutations = crate::mutation::decode_mutation_journal(&create_child_record(flags)).unwrap();
+        let mut server = server();
+        let mounted = server.system_hive.as_mut().unwrap();
+        mounted.hive.create_key(r"ControlSet001\Control");
+        let control_set = mounted.current_control_set.clone();
+        let mut tx = mounted.hive.begin_transaction();
+        assert_eq!(apply_system_hive_mutation(&mut tx, &control_set, &mutations[0]), Ok(()));
+        tx.commit();
+        let link = mounted.hive.open_key(r"ControlSet001\Control\Links").unwrap();
+        assert_eq!(mounted.hive.key_kind(link), Some(nt_hive_core::KeyKind::SymbolicLink));
+        assert_eq!(mounted.hive.is_volatile(link), volatile);
+        // A durable link is journaled with its kind: replay recreates a link, not an ordinary key.
+        let record = CmServer::encode_system_hive_mutation_log_record(
+            &mutations[0], &control_set, 7).unwrap();
+        let mut replayed = nt_hive_core::Hive::new(nt_hive_core::HiveKind::System);
+        replayed.create_key(r"ControlSet001\Control");
+        nt_hive_core::try_replay_log_complete(&mut replayed, &record, 6).unwrap();
+        let replayed_link = replayed.open_key(r"ControlSet001\Control\Links").unwrap();
+        assert_eq!(replayed.key_kind(replayed_link), Some(nt_hive_core::KeyKind::SymbolicLink));
+    }
 }

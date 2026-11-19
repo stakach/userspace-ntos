@@ -18,6 +18,7 @@ impl ExecNtHandler {
         leaf: &str,
         class: Option<&str>,
         descriptor: &[u8],
+        kind: nt_hive_core::KeyKind,
     ) -> Result<ResolvedHiveKey, u32> {
         let relative = self
             .mutable_key_relative_path(parent)
@@ -31,13 +32,14 @@ impl ExecNtHandler {
         log_path.push_str(".LOG");
         let mut prepared = self
             .mutable_hives
-            .prepare_owned_create_child(
+            .prepare_owned_create_child_of_kind(
                 parent.hive,
                 parent.key,
                 &relative,
                 leaf,
                 class,
                 descriptor.to_vec(),
+                kind,
             )
             .map_err(|error| match error {
                 nt_hive_core::CreateChildError::InvalidName => 0xC000_0033,

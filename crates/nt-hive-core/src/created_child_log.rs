@@ -73,7 +73,11 @@ pub(super) fn decode(payload: &[u8]) -> Result<CreatedChild, HiveLogReplayError>
     })
 }
 
-pub(super) fn apply(hive: &mut Hive, payload: &[u8]) -> Result<(), HiveLogReplayError> {
+pub(super) fn apply(
+    hive: &mut Hive,
+    payload: &[u8],
+    kind: crate::KeyKind,
+) -> Result<(), HiveLogReplayError> {
     let child = decode(payload)?;
     let mut tx = hive.begin_transaction();
     let parent = tx
@@ -81,7 +85,7 @@ pub(super) fn apply(hive: &mut Hive, payload: &[u8]) -> Result<(), HiveLogReplay
         .ok_or(HiveLogReplayError::CreateChild(
             crate::CreateChildError::ParentNotFound,
         ))?;
-    tx.try_create_child(parent, child.name, child.class_name, child.descriptor)
+    tx.try_create_child_of_kind(parent, child.name, child.class_name, child.descriptor, false, kind)
         .map_err(HiveLogReplayError::CreateChild)?;
     tx.commit();
     Ok(())

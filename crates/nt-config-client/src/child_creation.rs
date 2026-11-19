@@ -19,13 +19,13 @@ pub(super) fn append_leased(
     append_inner(journal, "", parent.token, name, class_name, descriptor, volatile, false)
 }
 
-/// A volatile symbolic link key beneath the exact leased parent (REG_OPTION_CREATE_LINK).
+/// A symbolic link key beneath the exact leased parent (REG_OPTION_CREATE_LINK).
 pub(super) fn append_leased_link(
     journal: &mut Vec<u8>, parent: SystemHiveKeyLease, name: &str, class_name: Option<&str>,
-    descriptor: &[u8],
+    descriptor: &[u8], volatile: bool,
 ) -> Result<(), i32> {
     if parent.token == 0 || parent.opened_generation == 0 { return Err(STATUS_INVALID_PARAMETER); }
-    append_inner(journal, "", parent.token, name, class_name, descriptor, true, true)
+    append_inner(journal, "", parent.token, name, class_name, descriptor, volatile, true)
 }
 
 fn append_inner(
@@ -79,7 +79,7 @@ mod tests {
     fn a_link_child_is_a_volatile_leased_child_with_the_link_flag() {
         let mutation = SystemHiveMutation::CreateLinkRelative {
             parent: SystemHiveKeyLease { token: 17, opened_generation: 9 },
-            name: "Printers", class_name: None, descriptor: b"security",
+            name: "Printers", class_name: None, descriptor: b"security", volatile: true,
         };
         let encoded = encode_hive_mutation_journal(&[mutation]).unwrap();
         assert_eq!(u16::from_le_bytes(encoded[..2].try_into().unwrap()),

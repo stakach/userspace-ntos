@@ -25,7 +25,7 @@ pub(crate) enum HiveMutation {
         class_name: Option<String>,
         descriptor: Vec<u8>,
         volatile: bool,
-        /// REG_OPTION_CREATE_LINK; always volatile.
+        /// REG_OPTION_CREATE_LINK.
         symbolic_link: bool,
     },
     CreateKey {
@@ -256,8 +256,6 @@ pub(crate) fn decode_mutation_journal(bytes: &[u8]) -> Option<Vec<HiveMutation>>
             hive_mutation_kind::CREATE_CHILD | hive_mutation_kind::CREATE_CHILD_LEASED
                 if header.flags & !(hive_mutation_flags::CLASS_PRESENT | hive_mutation_flags::VOLATILE
                         | hive_mutation_flags::SYMBOLIC_LINK) == 0
-                    && (header.flags & hive_mutation_flags::SYMBOLIC_LINK == 0
-                        || header.flags & hive_mutation_flags::VOLATILE != 0)
                     && header.value_type == 0
                     && !name.is_empty()
                     && !name.contains('\\') =>

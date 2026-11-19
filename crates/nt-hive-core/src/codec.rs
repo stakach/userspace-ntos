@@ -42,6 +42,16 @@ const OP_DELETE_KEY: u16 = 4;
 const OP_SET_KEY_CLASS: u16 = 5;
 const OP_SET_KEY_SECURITY_DESCRIPTOR: u16 = 6;
 const OP_CREATE_CHILD: u16 = 7;
+/// [`OP_CREATE_CHILD`]'s payload for a symbolic link key (REG_OPTION_CREATE_LINK).
+const OP_CREATE_LINK_CHILD: u16 = 8;
+
+const fn is_create_child(op: u16) -> bool {
+    op == OP_CREATE_CHILD || op == OP_CREATE_LINK_CHILD
+}
+
+const fn created_child_kind(op: u16) -> KeyKind {
+    if op == OP_CREATE_LINK_CHILD { KeyKind::SymbolicLink } else { KeyKind::Ordinary }
+}
 
 /// Why decoding a hive image/log failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -852,6 +862,8 @@ pub enum HiveLogOp<'a> {
         name: &'a str,
         class_name: Option<&'a str>,
         descriptor: &'a [u8],
+        /// A symbolic link child is logged under its own operation code.
+        kind: KeyKind,
     },
     CreateKey {
         path: &'a str,
@@ -898,6 +910,7 @@ pub fn try_encode_log_record(op: &HiveLogOp, sequence: u64) -> Result<Vec<u8>, H
             name,
             class_name,
             descriptor,
+            kind,
         } => {
             p.str16(parent);
             p.str16(name);
@@ -906,7 +919,10 @@ pub fn try_encode_log_record(op: &HiveLogOp, sequence: u64) -> Result<Vec<u8>, H
                 p.str16(class_name);
             }
             p.blob(descriptor);
-            OP_CREATE_CHILD
+            match kind {
+                KeyKind::Ordinary => OP_CREATE_CHILD,
+                KeyKind::SymbolicLink => OP_CREATE_LINK_CHILD,
+            }
         }
         HiveLogOp::CreateKey { path } => {
             p.str16(path);
@@ -973,6 +989,7 @@ fn log_payload_len(op: &HiveLogOp<'_>) -> Result<usize, HiveEncodeError> {
             name,
             class_name,
             descriptor,
+            ..
         } => {
             let len = checked_add(str16_record_len(parent)?, str16_record_len(name)?)?;
             let len = checked_add(len, class_len(*class_name)?)?;
@@ -1103,7 +1120,7 @@ fn try_replay_log_with_tail_policy(
         }
         // Child application validates and owns all metadata before mutation. Avoid decoding it
         // twice, but still validate skipped records so strict replay rejects malformed history.
-        if op != OP_CREATE_CHILD || sequence <= last {
+        if !is_create_child(op) || sequence <= last {
             validate_log_payload(op, payload)?;
         }
         if sequence > last {
@@ -1217,7 +1234,7 @@ fn complete_log_sequence_span_inner(
 }
 
 fn validate_log_payload(op: u16, payload: &[u8]) -> Result<(), HiveLogReplayError> {
-    if op == OP_CREATE_CHILD {
+    if is_create_child(op) {
         return created_child_log::decode(payload).map(|_| ());
     }
     let mut r = Reader::new(payload);
@@ -1260,8 +1277,8 @@ fn validate_log_payload(op: u16, payload: &[u8]) -> Result<(), HiveLogReplayErro
 }
 
 fn apply_log(hive: &mut Hive, op: u16, payload: &[u8]) -> Result<(), HiveLogReplayError> {
-    if op == OP_CREATE_CHILD {
-        return created_child_log::apply(hive, payload);
+    if is_create_child(op) {
+        return created_child_log::apply(hive, payload, created_child_kind(op));
     }
     let mut r = Reader::new(payload);
     match op {

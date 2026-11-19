@@ -1668,6 +1668,23 @@ impl MutableHiveSet {
         self.mounts.owns_path(full_path)
     }
 
+    /// [`Self::resolve_key`] through symbolic link keys (CmpParseKey): the key, or the absolute
+    /// name a link on the path redirects to. A final link is the key itself with `open_link`.
+    /// `Ok(None)` when the path names no key in a mounted hive.
+    pub fn resolve_key_following(
+        &self,
+        full_path: &str,
+        open_link: bool,
+    ) -> Result<Option<Result<ResolvedHiveKey, String>>, crate::SymbolicLinkError> {
+        let Some((hive_id, rel_path)) = self.resolve_path(full_path) else { return Ok(None) };
+        let Some(hive) = self.hive(hive_id) else { return Ok(None) };
+        Ok(match crate::walk_following_links(hive, &rel_path, open_link)? {
+            crate::LinkWalk::Found(key) => Some(Ok(ResolvedHiveKey { hive: hive_id, key })),
+            crate::LinkWalk::Reparse(target) => Some(Err(target)),
+            crate::LinkWalk::NotFound => None,
+        })
+    }
+
     pub fn create_key(&mut self, full_path: &str) -> Option<ResolvedHiveKey> {
         let (hive_id, rel_path) = self.mounts.resolve(full_path)?;
         let hive = self.hive_mut(hive_id)?;

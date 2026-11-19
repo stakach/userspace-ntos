@@ -64,6 +64,22 @@ impl MutableHiveSet {
         class_name: Option<&str>,
         descriptor: Vec<u8>,
     ) -> Result<OwnedPreparedCreateChild, CreateChildError> {
+        self.prepare_owned_create_child_of_kind(
+            hive_id, parent, parent_path, name, class_name, descriptor, super::KeyKind::Ordinary,
+        )
+    }
+
+    /// As [`Self::prepare_owned_create_child`], for a child of `kind`.
+    pub fn prepare_owned_create_child_of_kind(
+        &mut self,
+        hive_id: HiveId,
+        parent: CellId,
+        parent_path: &str,
+        name: &str,
+        class_name: Option<&str>,
+        descriptor: Vec<u8>,
+        kind: super::KeyKind,
+    ) -> Result<OwnedPreparedCreateChild, CreateChildError> {
         if self.retained_value_owners.iter().any(|(id, _)| *id == hive_id) {
             return Err(CreateChildError::RetainedPublication);
         }
@@ -83,6 +99,9 @@ impl MutableHiveSet {
         if parent_cell.volatile {
             return Err(CreateChildError::ChildMustBeVolatile);
         }
+        if parent_cell.kind == super::KeyKind::SymbolicLink {
+            return Err(CreateChildError::ParentIsSymbolicLink);
+        }
         if hive.open_subkey(parent, name).is_some() {
             return Err(CreateChildError::NameCollision);
         }
@@ -98,10 +117,10 @@ impl MutableHiveSet {
             return Err(CreateChildError::InsufficientResources);
         }
         let record = try_encode_log_record(&HiveLogOp::CreateChild {
-            parent: parent_path, name, class_name, descriptor: &descriptor,
+            parent: parent_path, name, class_name, descriptor: &descriptor, kind,
         }, sequence).map_err(|_| CreateChildError::InsufficientResources)?;
         let child = KeyCell {
-            kind: super::KeyKind::Ordinary,
+            kind,
             id: CellId(hive.next_id),
             parent: Some(parent),
             name: copy_string(name)?,

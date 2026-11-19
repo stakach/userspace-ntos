@@ -32,7 +32,7 @@ enum Pending {
     Value { key: CellId, path: String, name: String,
         value_type: RegistryValueType, data: Vec<u8> },
     Child { parent: CellId, path: String, name: String,
-        class: Option<String>, descriptor: Vec<u8> },
+        class: Option<String>, descriptor: Vec<u8>, kind: nt_hive_core::KeyKind },
     Security { key: CellId, path: String, information: u32, modification: Vec<u8> },
 }
 
@@ -479,6 +479,7 @@ pub(crate) unsafe fn submit_hosted_create_child(
     leaf: String,
     class: Option<String>,
     descriptor: Vec<u8>,
+    kind: nt_hive_core::KeyKind,
     grant: u32,
     backup: bool,
 ) -> Result<(), (u32, HostedRegistryPublication, RegistryKeyHandlePublication)> {
@@ -530,7 +531,7 @@ pub(crate) unsafe fn submit_hosted_create_child(
     let work = Work {
         order, hive: parent_key.hive, reported: None, log_path,
         pending: Some(Pending::Child { parent: parent_key.key, path: relative,
-            name: leaf, class, descriptor }),
+            name: leaf, class, descriptor, kind }),
         prepared: None,
         journal_id: None, receipt: None, installation: None,
         caller: HostedCaller {
@@ -668,11 +669,14 @@ unsafe fn advance(
                         handler.mutable_hives.prepare_owned_set_value(
                             work.hive, key, &path, &name, value_type, data,
                         ).map(Prepared::Value).map_err(prepare_error),
-                    Pending::Child { parent, path, name, class, descriptor } =>
-                        match handler.mutable_hives.prepare_owned_create_child(
-                            work.hive, parent, &path, &name, class.as_deref(), descriptor,
+                    Pending::Child { parent, path, name, class, descriptor, kind } =>
+                        match handler.mutable_hives.prepare_owned_create_child_of_kind(
+                            work.hive, parent, &path, &name, class.as_deref(), descriptor, kind,
                         ) {
                             Ok(prepared) => Ok(Prepared::Child(prepared)),
+                            // A link is created, never opened (CmpDoOpen's collision).
+                            Err(CreateChildError::NameCollision)
+                                if kind == nt_hive_core::KeyKind::SymbolicLink => Err(0xC000_0035),
                             Err(CreateChildError::NameCollision) => {
                                 work.phase = Phase::OpenExistingChild;
                                 return Ok(false);

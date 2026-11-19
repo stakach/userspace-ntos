@@ -86,7 +86,7 @@ fn assigned_child_commit_and_single_record_recovery_have_identical_security() {
             parent: "",
             name: "Child",
             class_name: Some("test"),
-            descriptor: &prepared.descriptor,
+            descriptor: &prepared.descriptor, kind: nt_hive_core::KeyKind::Ordinary,
         },
         tx.hive().sequence + 1,
     )

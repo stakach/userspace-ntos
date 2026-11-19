@@ -72,10 +72,10 @@ fn opens_and_creates_restart_on_a_link_target() {
 }
 
 #[test]
-fn create_link_creates_a_volatile_system_link_and_collides_with_an_existing_key() {
+fn create_link_creates_a_link_and_collides_with_an_existing_key() {
     let create = callees(ADMISSION, "nt_create_key_admitted");
     for name in ["CreateLinkRelative", "STATUS_OBJECT_NAME_COLLISION", "REG_OPTION_CREATE_LINK",
-        "is_system_registry_path"] {
+        "SymbolicLink"] {
         assert!(create.iter().any(|callee| callee == name), "{name}");
     }
     assert!(uses(MUTATION_WORK, "submit_hosted", "CreateLinkRelative"),
@@ -83,4 +83,26 @@ fn create_link_creates_a_volatile_system_link_and_collides_with_an_existing_key(
     // The created key is published as itself, never followed (a new link has no target yet).
     assert!(uses(OWNERSHIP, "reserve_publication_open", "reserve_with_options"));
     assert!(OWNERSHIP.contains("reserve_with_options(path, Some(root), true)"));
+}
+
+const VALUE_MUTATION: &str =
+    include_str!("../../../components/ntos-executive/src/exec_registry_value_mutation.rs");
+const MUTABLE_WORK: &str =
+    include_str!("../../../components/ntos-executive/src/mutable_hive_mutation_work.rs");
+
+#[test]
+fn links_outside_system_are_created_followed_and_restricted_like_cm_links() {
+    // Durable mutable-hive links are journaled with their kind; volatile ones live in the overlay.
+    for name in ["journal_create_secured_mutable_subkey_of_kind", "create_secured_owned_of_kind"] {
+        assert!(uses(ADMISSION, "create_secured_registry_child", name), "{name}");
+    }
+    assert!(MUTABLE_WORK.contains("prepare_owned_create_child_of_kind"),
+        "the native mutable-hive create keeps the link kind");
+    // Both stores report the links a path crosses.
+    for name in ["link_reparse", "resolve_key_following"] {
+        assert!(uses(ADMISSION, "acquire_registry_target_step", name), "{name}");
+    }
+    // CmSetValueKey: a link key holds only SymbolicLinkValue (REG_LINK).
+    assert!(uses(VALUE_MUTATION, "nt_set_value_key_admitted", "registry_key_is_symbolic_link"));
+    assert!(uses(VALUE_MUTATION, "nt_set_value_key_admitted", "SYMBOLIC_LINK_VALUE"));
 }

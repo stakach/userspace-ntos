@@ -381,6 +381,7 @@ unsafe fn create_registry_path(
                     &prepared.descriptor,
                     class,
                     volatile,
+                    nt_hive_core::KeyKind::Ordinary,
                 )
                 .map_err(|status| status as i32)
         });

@@ -11,7 +11,7 @@ fn record() -> Vec<u8> {
             parent: "Parent",
             name: "Child",
             class_name: Some("class"),
-            descriptor: b"assigned security",
+            descriptor: b"assigned security", kind: crate::KeyKind::Ordinary,
         },
         10,
     )
@@ -90,7 +90,7 @@ fn malformed_complete_metadata_and_bad_checksum_publish_nothing() {
                 parent,
                 name,
                 class_name: None,
-                descriptor,
+                descriptor, kind: crate::KeyKind::Ordinary,
             },
             10,
         );
@@ -134,7 +134,7 @@ fn canonical_rooted_parent_journal_recovers_policy_attributes_and_child_metadata
                     parent: &canonical_parent,
                     name,
                     class_name: Some("policy attribute"),
-                    descriptor,
+                    descriptor, kind: crate::KeyKind::Ordinary,
                 },
                 |hive| {
                     let mut transaction = hive.begin_transaction();
@@ -208,7 +208,7 @@ fn child_journal_accepts_empty_and_explicit_hive_root_parents() {
                 parent,
                 name: "Policy",
                 class_name: None,
-                descriptor: b"assigned policy security",
+                descriptor: b"assigned policy security", kind: crate::KeyKind::Ordinary,
             },
             1,
         );
@@ -281,7 +281,7 @@ fn torn_second_child_preserves_the_complete_first_child_with_its_security() {
             parent: "Parent",
             name: "Second",
             class_name: None,
-            descriptor: b"second security",
+            descriptor: b"second security", kind: crate::KeyKind::Ordinary,
         },
         11,
     );
@@ -295,4 +295,40 @@ fn torn_second_child_preserves_the_complete_first_child_with_its_security() {
         assert_eq!(try_replay_log(&mut h, &records, 0), Ok(10));
         assert_eq!(encode_image(&h), image, "second prefix {end}");
     }
+}
+
+#[test]
+fn a_logged_link_child_replays_as_a_durable_link() {
+    let record = try_encode_log_record(
+        &HiveLogOp::CreateChild {
+            parent: "Parent",
+            name: "Link",
+            class_name: None,
+            descriptor: b"assigned security",
+            kind: KeyKind::SymbolicLink,
+        },
+        10,
+    )
+    .unwrap();
+    let ordinary = record_with_kind(KeyKind::Ordinary, "Link");
+    assert_ne!(record, ordinary, "a link child has its own operation code");
+    let mut h = hive();
+    assert_eq!(try_replay_log(&mut h, &record, 0), Ok(10));
+    let link = h.open_key(r"Parent\Link").unwrap();
+    assert_eq!(h.key_kind(link), Some(KeyKind::SymbolicLink));
+    assert!(!h.is_volatile(link));
+    // The kind survives the durable image.
+    let restored = crate::decode_image(&encode_image(&h)).unwrap();
+    let restored_link = restored.open_key(r"Parent\Link").unwrap();
+    assert_eq!(restored.key_kind(restored_link), Some(KeyKind::SymbolicLink));
+}
+
+fn record_with_kind(kind: KeyKind, name: &str) -> Vec<u8> {
+    try_encode_log_record(
+        &HiveLogOp::CreateChild {
+            parent: "Parent", name, class_name: None, descriptor: b"assigned security", kind,
+        },
+        10,
+    )
+    .unwrap()
 }
