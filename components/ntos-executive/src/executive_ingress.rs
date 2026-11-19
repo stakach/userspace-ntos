@@ -37,6 +37,7 @@ pub(crate) unsafe fn handles(endpoint: u64) -> bool {
 unsafe fn materialize(message: ReceivedMessage) -> (u64, u64, u64, u64, u64, u64) {
     crate::ipc_message::restore_received(&message);
     let [r0, r1, r2, r3] = message.registers();
+    crate::hot_service_latency_census::ingress(message.badge());
     (message.badge(), message.info(), r0, r1, r2, r3)
 }
 

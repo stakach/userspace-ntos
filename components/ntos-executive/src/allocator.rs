@@ -780,8 +780,10 @@ unsafe fn insert_free_block(start: usize, size: usize) {
         counter: CTR,
         head: FREE_HEAD,
     };
+    let started = crate::disk_census_ticks();
     match unsafe { list.insert(start, size) } {
-        Ok(visits) => INSERT_WALK.record(transient_heap_size() != 0, visits),
+        Ok(visits) => INSERT_WALK.record(transient_heap_size() != 0, visits,
+            crate::disk_census_ticks().wrapping_sub(started)),
         Err(corruption) => allocator_corruption(
             corruption.operation,
             start,
@@ -799,16 +801,19 @@ unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
         counter: CTR,
         head: FREE_HEAD,
     };
+    let started = crate::disk_census_ticks();
     match unsafe { list.take_fit(layout.align(), needed) } {
         Ok(taken) => {
+            // The split reinsertions run inside take_fit; their time is the alloc walk's.
+            let ticks = crate::disk_census_ticks().wrapping_sub(started);
             let root_heap = transient_heap_size() != 0;
             if let Some(visits) = taken.prefix_reinsert_visits {
-                INSERT_WALK.record(root_heap, visits);
+                INSERT_WALK.record(root_heap, visits, 0);
             }
             if let Some(visits) = taken.suffix_reinsert_visits {
-                INSERT_WALK.record(root_heap, visits);
+                INSERT_WALK.record(root_heap, visits, 0);
             }
-            ALLOC_WALK.record(root_heap, taken.inspected);
+            ALLOC_WALK.record(root_heap, taken.inspected, ticks);
             taken.address.map_or(null_mut(), |address| address as *mut u8)
         }
         Err(error) => allocator_corruption(
@@ -828,8 +833,10 @@ unsafe fn grow_in_place_from_adjacent_free(start: usize, old_size: usize, new_si
         counter: CTR,
         head: FREE_HEAD,
     };
+    let started = crate::disk_census_ticks();
     let result = unsafe { list.grow_adjacent(start, old_size, new_size) };
-    GROW_WALK.record(transient_heap_size() != 0, result.inspected);
+    GROW_WALK.record(transient_heap_size() != 0, result.inspected,
+        crate::disk_census_ticks().wrapping_sub(started));
     result.grown
 }
 

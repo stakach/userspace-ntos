@@ -65,6 +65,7 @@ mod diagnostic_repeat_filter;
 mod registry_checkpoint_audit;
 mod registry_query_audit;
 mod hot_service_cost_census;
+mod hot_service_latency_census;
 mod io_lifecycle_trace;
 mod provider_registry_caller;
 mod provider_directory_broker;
@@ -7203,6 +7204,12 @@ fn print_hot_ssn_field(who: &[u8], hist: &[AtomicU64; SSN_HIST_N]) {
     }
 }
 
+/// Ticks Root has spent blocked in its idle shared receive (no dispatch in progress).
+pub(crate) fn root_idle_receive_ticks() -> u64 {
+    spawn_hosts::shared_ingress::receive_census_snapshot()
+        .sample(nt_hosted_runtime::SharedReceiveOwner::Idle, true).total_ticks
+}
+
 fn print_shared_receive_census() {
     use nt_hosted_runtime::{SharedReceiveOwner, SharedReceiveReturn};
     let census = spawn_hosts::shared_ingress::receive_census_snapshot();
@@ -7534,8 +7541,10 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
         print_u64(sample.visited);
         print_str(b"/");
         print_u64(sample.max_visited);
+        print_str(b"/");
+        print_u64(sample.ticks / 1_000_000);
     }
-    print_str(b" ops/visits/max\n");
+    print_str(b" ops/visits/max/Mtick\n");
     driver_launch::print_mounted_native_block_census();
     service_sec_image::mounted_create_owner_trace::print_snapshot();
     print_shared_receive_census();
@@ -7591,6 +7600,7 @@ pub(crate) fn census_tick_static(now: u64) {
     print_native_ssn_time();
     print_badge_ssn_census();
     hot_service_cost_census::print_census();
+    hot_service_latency_census::print_census();
     registry_security_audit::print_admission_census();
     io_lifecycle_trace::print_census();
     driver_launch::print_hosted_file_rpc_phase();

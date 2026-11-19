@@ -1409,9 +1409,14 @@ pub(super) unsafe fn syscall_tail(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || reply_main,
             )?, delivered)
         } else {
+            let reply_badge = lp.msg.badge;
             let received =
                 reply_receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (reply_main, len, r0, 0, 0, 0),
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || {
+                        // The pre-reply receive preparation has run; the Reply is sent next.
+                        crate::hot_service_latency_census::replying(reply_badge);
+                        (reply_main, len, r0, 0, 0, 0)
+                    },
                 )?;
             let delivered = received.0 != COMPOSITE_SEND_ERROR_BADGE;
             (received, delivered)
