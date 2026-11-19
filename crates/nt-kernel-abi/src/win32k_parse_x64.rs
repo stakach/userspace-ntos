@@ -7,7 +7,10 @@ use crate::GuestAddr;
 use bytemuck::{Pod, Zeroable};
 use core::mem::{offset_of, size_of};
 
-pub const WIN32_PARSE_METHOD_PARAMETERS_SIZE: usize = 0x50;
+/// Natural x64 packing: `KPROCESSOR_MODE` is one byte, so `Attributes` follows at 0x1c. The pinned
+/// LiberNT `IntWinStaObjectParse` reads RemainingName at +0x28 and Object at +0x40 (boot
+/// 44471147330 faulted writing `*Object` when the block used a padded 0x50-byte layout).
+pub const WIN32_PARSE_METHOD_PARAMETERS_SIZE: usize = 0x48;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
@@ -15,10 +18,9 @@ pub struct Win32ParseMethodParameters {
     pub parse_object: GuestAddr,
     pub object_type: GuestAddr,
     pub access_state: GuestAddr,
-    pub access_mode: u32,
-    _access_mode_padding: u32,
+    pub access_mode: u8,
+    _access_mode_padding: [u8; 3],
     pub attributes: u32,
-    _attributes_padding: u32,
     pub complete_name: GuestAddr,
     pub remaining_name: GuestAddr,
     pub context: GuestAddr,
@@ -32,7 +34,7 @@ impl Win32ParseMethodParameters {
         parse_object: GuestAddr,
         object_type: GuestAddr,
         access_state: GuestAddr,
-        access_mode: u32,
+        access_mode: u8,
         attributes: u32,
         complete_name: GuestAddr,
         remaining_name: GuestAddr,
@@ -45,9 +47,8 @@ impl Win32ParseMethodParameters {
             object_type,
             access_state,
             access_mode,
-            _access_mode_padding: 0,
+            _access_mode_padding: [0; 3],
             attributes,
-            _attributes_padding: 0,
             complete_name,
             remaining_name,
             context,
@@ -60,12 +61,12 @@ impl Win32ParseMethodParameters {
 const _: () = {
     assert!(size_of::<Win32ParseMethodParameters>() == WIN32_PARSE_METHOD_PARAMETERS_SIZE);
     assert!(offset_of!(Win32ParseMethodParameters, access_mode) == 0x18);
-    assert!(offset_of!(Win32ParseMethodParameters, attributes) == 0x20);
-    assert!(offset_of!(Win32ParseMethodParameters, complete_name) == 0x28);
-    assert!(offset_of!(Win32ParseMethodParameters, remaining_name) == 0x30);
-    assert!(offset_of!(Win32ParseMethodParameters, context) == 0x38);
-    assert!(offset_of!(Win32ParseMethodParameters, security_qos) == 0x40);
-    assert!(offset_of!(Win32ParseMethodParameters, object_out) == 0x48);
+    assert!(offset_of!(Win32ParseMethodParameters, attributes) == 0x1c);
+    assert!(offset_of!(Win32ParseMethodParameters, complete_name) == 0x20);
+    assert!(offset_of!(Win32ParseMethodParameters, remaining_name) == 0x28);
+    assert!(offset_of!(Win32ParseMethodParameters, context) == 0x30);
+    assert!(offset_of!(Win32ParseMethodParameters, security_qos) == 0x38);
+    assert!(offset_of!(Win32ParseMethodParameters, object_out) == 0x40);
 };
 
 #[cfg(test)]
@@ -88,24 +89,24 @@ mod tests {
         );
         let bytes = bytemuck::bytes_of(&parameters);
         assert_eq!(bytes.len(), WIN32_PARSE_METHOD_PARAMETERS_SIZE);
+        // Offsets read by the pinned LiberNT IntWinStaObjectParse (win32k RVA 0xba6c0).
         for (offset, value) in [
             (0x00, 1),
             (0x08, 2),
             (0x10, 3),
-            (0x28, 6),
-            (0x30, 7),
-            (0x38, 8),
-            (0x40, 9),
-            (0x48, 10),
+            (0x20, 6),
+            (0x28, 7),
+            (0x30, 8),
+            (0x38, 9),
+            (0x40, 10),
         ] {
             assert_eq!(
                 u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()),
                 value
             );
         }
-        assert_eq!(u32::from_le_bytes(bytes[0x18..0x1c].try_into().unwrap()), 4);
-        assert_eq!(u32::from_le_bytes(bytes[0x20..0x24].try_into().unwrap()), 5);
-        assert_eq!(&bytes[0x1c..0x20], &[0; 4]);
-        assert_eq!(&bytes[0x24..0x28], &[0; 4]);
+        assert_eq!(bytes[0x18], 4);
+        assert_eq!(&bytes[0x19..0x1c], &[0; 3]);
+        assert_eq!(u32::from_le_bytes(bytes[0x1c..0x20].try_into().unwrap()), 5);
     }
 }

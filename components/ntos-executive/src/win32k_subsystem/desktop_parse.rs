@@ -134,7 +134,7 @@ pub(super) unsafe fn open(
         GuestAddr(window_station),
         GuestAddr(object_type),
         GuestAddr(access_state),
-        u32::from(access_mode),
+        access_mode,
         attributes,
         GuestAddr(&complete_name as *const UnicodeString as u64),
         GuestAddr(&mut remaining_name as *mut UnicodeString as u64),
