@@ -302,6 +302,8 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
     if runtime::nested::restore_or_retain(&mut parent).is_ok() {
         return startup_result;
     }
+    // The startup row keeps the exact ticket; take ownership from the handle.
+    let _owned = runtime::nested::claim_refused(&mut parent);
     retain_startup_restore(index, ticket, key, startup_result);
     Err(STATUS_INVALID_HANDLE as u32)
 }

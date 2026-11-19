@@ -2450,7 +2450,23 @@ pub(crate) struct HostedIrqExchangeResult {
     pub wall_code: u64,
     pub faults: u64,
     pub demand: u64,
+    pub parent: IrqExchangeParent,
 }
+
+/// What became of the invocation the IRQ exchange parked (#333). A refused restore is never a
+/// panic: the dropped handle hands the exact row to the root, which retries it before admitting
+/// new work while the refusal is proven free of native effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IrqExchangeParent {
+    /// No lane was running, or the parked parent was restored.
+    Restored,
+    /// The restore was refused; the root owns the parked row.
+    RootQueued,
+}
+
+/// The exchange could not park the current invocation; nothing was sent to the IRQ lane.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IrqExchangeParkRefused;
 
 /// Screen a bound executive notification without running ordinary scheduler work recursively from
 /// an interrupt lane. Hardware IRQs remain latched for the outer service loop. A timer tick is
@@ -2536,9 +2552,9 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
     action: HostedIrqExchangeAction,
     expected_badge: u64,
     completion_label: u64,
-) -> HostedIrqExchangeResult {
+) -> Result<HostedIrqExchangeResult, IrqExchangeParkRefused> {
     use shared_ingress::owner::runtime;
-    let mut parent = runtime::nested::park_current().expect("retain IRQ invocation parent");
+    let mut parent = runtime::nested::park_current().map_err(|_| IrqExchangeParkRefused)?;
     let route = runtime::channel_route(ch).expect("IRQ physical source").expect("enrolled IRQ source");
     let dispatch = runtime::admit(route).expect("admit retained IRQ completion Call");
     let mut channel = *ch;
@@ -2642,8 +2658,11 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
             .expect("authenticate IRQ arena-token completion");
     }
     pump_suspend_walled_component(ch, outcome);
-    runtime::nested::restore(&mut parent).expect("restore IRQ invocation parent");
-    HostedIrqExchangeResult {
+    let parent = match runtime::nested::restore(&mut parent) {
+        Ok(()) => IrqExchangeParent::Restored,
+        Err(_) => IrqExchangeParent::RootQueued,
+    };
+    Ok(HostedIrqExchangeResult {
         reply_cap: ch.reply_cap,
         message,
         wall_ip: outcome.wall_ip,
@@ -2654,7 +2673,8 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
         wall_code: outcome.wall_code,
         faults: outcome.accounting.faults(),
         demand: outcome.accounting.demand(),
-    }
+        parent,
+    })
 }
 
 /// Drive ONE request to a Family-A dispatch server: wake the parked server with `dispatch_label`,

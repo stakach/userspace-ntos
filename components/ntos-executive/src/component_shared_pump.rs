@@ -966,8 +966,8 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let progressed = crate::writable_fs::redrive_retained_system_wal_fold_after_native_completion();
-            let ticket = parent.as_ref().map(|parent| parent.ticket());
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                let ticket = runtime::nested::claim_refused(&mut parent);
                 return nested_restore_refusal(ticket);
             }
             if progressed { continue; }
@@ -988,8 +988,8 @@ pub(super) unsafe fn receive(
             };
             let result = crate::service_sec_image::service_due_system_wal_fold();
             trace_ps_create_event(b"fold-service-return", route, 0, 0);
-            let ticket = parent.as_ref().map(|parent| parent.ticket());
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                let ticket = runtime::nested::claim_refused(&mut parent);
                 return nested_restore_refusal(ticket);
             }
             trace_ps_create_event(b"fold-restore-return", route, 0, 0);
@@ -1020,8 +1020,8 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let serviced = crate::driver_launch::service_mounted_native_registry_recheck(id);
-            let ticket = parent.as_ref().map(|parent| parent.ticket());
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                let ticket = runtime::nested::claim_refused(&mut parent);
                 return nested_restore_refusal(ticket);
             }
             if serviced != 0 { continue; }
@@ -1038,8 +1038,8 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let serviced = crate::driver_launch::service_mounted_native_registry_wal(id);
-            let ticket = parent.as_ref().map(|parent| parent.ticket());
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                let ticket = runtime::nested::claim_refused(&mut parent);
                 return nested_restore_refusal(ticket);
             }
             if serviced != 0 { continue; }
@@ -1062,8 +1062,8 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let serviced = crate::driver_launch::service_mounted_native_background_holder();
-            let ticket = parent.as_ref().map(|parent| parent.ticket());
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                let ticket = runtime::nested::claim_refused(&mut parent);
                 return nested_restore_refusal(ticket);
             }
             trace_background_holder_service(ch, gates, serviced);
@@ -1097,14 +1097,14 @@ pub(super) unsafe fn receive(
                 // The File owner has already retained the move-only invocation and native bank.
                 // Keep this exact physical parent in its durable row before unwinding every
                 // pump/dispatch frame; root will run one certified child step outside them.
-                let ticket = parent.as_ref().map(|parent| parent.ticket());
                 let ticket = match runtime::nested::retain_child_work_parent(&mut parent) {
                     Ok(ticket) => ticket,
                     Err(_) => {
                         // Retention made no child effect. Restore this attempt before reporting
                         // the real transport refusal; an uncertain restore remains fenced.
                         if runtime::nested::restore_or_retain(&mut parent).is_err() {
-                            return nested_restore_refusal(ticket);
+                            return nested_restore_refusal(
+                                runtime::nested::claim_refused(&mut parent));
                         }
                         return PumpMessage::transport_wall();
                     }
@@ -1129,7 +1129,7 @@ pub(super) unsafe fn receive(
                 if source_sample { crate::print_str(b"[inline-source-work] stage=restore-refused\n"); }
                 trace_hook_nested_receive(44, ch, u64::from(parent.is_some()));
                 crate::driver_launch::trace_port_connect_outer_probe(44, ch, 0);
-                return nested_restore_refusal(ticket);
+                return nested_restore_refusal(runtime::nested::claim_refused(&mut parent));
             }
             if source_sample { crate::print_str(b"[inline-source-work] stage=restored\n"); }
             if !progressed && ticket.is_none() {

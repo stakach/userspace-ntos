@@ -939,6 +939,8 @@ pub(super) unsafe fn poll(
         row.phase = Phase::NestedRestore;
     }
     if runtime::nested::restore(&mut parent).is_err() {
+        // The lane row keeps the exact ticket; take ownership from the handle.
+        let _owned = runtime::nested::claim_refused(&mut parent);
         let retryable = runtime::nested::pending_ticket(ticket);
         let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
         let pending = row.nested_restore.as_mut().unwrap();

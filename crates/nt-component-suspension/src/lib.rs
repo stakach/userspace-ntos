@@ -131,6 +131,8 @@ pub use nested_restore_result::{
 };
 mod nested_restore_chain;
 pub use nested_restore_chain::NestedRestoreChain;
+mod root_restore_queue;
+pub use root_restore_queue::{drain_root_restores, QueuedRestoreState, RootRestoreDrain};
 pub use resume_pass::ResumePass;
 mod resume_wake;
 pub use resume_wake::{ResumeDemand, ResumeWake, ResumeWakeError, ResumeWakePass};

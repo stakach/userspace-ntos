@@ -815,6 +815,8 @@ unsafe fn settle_win32k_startup_parent(
         let ticket = handle.ticket();
         let key = runtime::nested::result_key(handle);
         if runtime::nested::restore_or_retain(parent).is_err() {
+            // The startup row keeps the exact ticket; take ownership from the handle.
+            let _owned = runtime::nested::claim_refused(parent);
             retain_win32k_startup_restore(index, ticket, key, ready);
             return false;
         }

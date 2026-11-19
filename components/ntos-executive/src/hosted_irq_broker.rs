@@ -1189,7 +1189,8 @@ impl HostedIrqRootSession {
         if lane.channel.tcb != retained.channel.tcb || lane.arena_va != retained.arena_va {
             return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
         }
-        let result = crate::spawn_hosts::component_hosted_irq_exchange(
+        // A refused park sent nothing to the lane; the caller keeps the line for a redrive.
+        let Ok(result) = crate::spawn_hosts::component_hosted_irq_exchange(
             &lane.channel,
             crate::spawn_hosts::HostedIrqExchangeAction::ReplyToken {
                 identity: lane.identity,
@@ -1197,7 +1198,13 @@ impl HostedIrqRootSession {
             },
             lane.badge,
             FSD_IRQ_LANE_COMPLETION_LABEL,
-        );
+        ) else {
+            print_str(b"[hosted-irq-exchange] parent-park-refused\n");
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        };
+        if result.parent == crate::spawn_hosts::IrqExchangeParent::RootQueued {
+            print_str(b"[hosted-irq-exchange] parent-restore-refused root-queued\n");
+        }
         let current_reply = lane_view_for_domain(
             lane.projection_instance,
             HostedDomainIdentity {

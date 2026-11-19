@@ -39,6 +39,9 @@ pub(super) unsafe fn maintain(
     let hosted_loaded_images_ptr = lp.images.hosted_loaded_images_ptr;
     let reg = &mut *lp.images.reg;
     let ntdll = lp.images.ntdll;
+    // Restores no continuation kept are root-owned (#333); retry them before admitting work.
+    trace_root_restore_drain(crate::spawn_hosts::shared_ingress::owner::runtime::nested::
+        drain_root_restore_queue());
     let queued_callback_fences_providers = root_queued_callback_exclusive_pending()
         || crate::driver_launch::unsettled_queued_callback();
     #[cfg(not(feature = "mup-provider-kernel-only"))]

@@ -113,7 +113,24 @@ impl NestedRestoreTicket {
     pub(crate) const fn identity(self) -> NestedExecutionIdentity { self.identity }
 }
 
+/// Ownership rule (#333): a continuation that keeps a refused restore takes it explicitly with
+/// [`ParkedParentHandle::into_ticket`]. A handle dropped while its ordinary row is still refused
+/// hands that row to the root, which retries it before admitting new work. A lost handle
+/// therefore always has an owner, and an owned ticket is never retried by two parties.
+impl Drop for ParkedParentHandle {
+    fn drop(&mut self) {
+        unsafe { queue_dropped_refusal(self.ticket()) }
+    }
+}
+
 impl ParkedParentHandle {
+    /// Transfer the exact row to the continuation that keeps this ticket.
+    pub(crate) fn into_ticket(self) -> NestedRestoreTicket {
+        let ticket = self.ticket();
+        core::mem::forget(self);
+        ticket
+    }
+
     pub(crate) fn identity(&self) -> NestedExecutionIdentity {
         self.identity
     }
@@ -176,6 +193,8 @@ struct Parent {
     undelivered_root:
         Option<nt_user_host::root_ingress_pass::UndeliveredRootIngress<crate::HostedThreadRole>>,
     source_ioctl: Option<SourceIoctlParent>,
+    /// No continuation kept this refused restore; the root owns it (#333).
+    root_queued: bool,
 }
 
 /// Retained with the physical Reply before a source terminal may borrow the singleton page.
@@ -587,6 +606,7 @@ unsafe fn park_current_attempt(
         root_lane_begun: false,
         undelivered_root: None,
         source_ioctl,
+        root_queued: false,
     });
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     // Suspend cancels IPC in the microkernel. Execution holds preserve the held Call, donated
@@ -1114,9 +1134,7 @@ pub(crate) unsafe fn retain_child_work_parent(
         return Err(Error::Admission);
     }
     parent.phase = ParentPhase::RestorePending;
-    let selector = ticket.ticket();
-    *handle = None;
-    Ok(Some(selector))
+    Ok(claim_refused(handle))
 }
 
 /// A successful physical restore creates a one-use receive receipt. A no-effect refusal stays
@@ -1246,7 +1264,9 @@ pub(crate) unsafe fn restore_pending_undelivered_root_ticket(
     let mut handle = Some(ParkedParentHandle {
         index: ticket.index, generation: ticket.generation, identity: ticket.identity,
     });
-    restore_undelivered_root(&mut handle)
+    let restored = restore_undelivered_root(&mut handle);
+    let _ = claim_refused(&mut handle);
+    restored
 }
 
 /// A retained root refusal has a distinct typed redrive because success must return its
@@ -1281,7 +1301,9 @@ pub(crate) unsafe fn restore_pending_root_ticket(
         generation: ticket.generation,
         identity: ticket.identity,
     });
-    restore_root_ingress(&mut handle)
+    let restored = restore_root_ingress(&mut handle);
+    let _ = claim_refused(&mut handle);
+    restored
 }
 
 /// Match an already authenticated pump route and its Reply against this retained parent.
@@ -1325,6 +1347,7 @@ pub(crate) unsafe fn retained_ticket_matches_channel(
 }
 
 /// Select one exact row for a bounded retry; the selector itself authorizes no native effect.
+/// The ticket's holder keeps ownership of a refusal.
 pub(crate) unsafe fn restore_pending_ticket(ticket: NestedRestoreTicket) -> Result<(), Error> {
     if !pending_ticket(ticket) { return Err(Error::Admission); }
     let mut handle = Some(ParkedParentHandle {
@@ -1332,5 +1355,64 @@ pub(crate) unsafe fn restore_pending_ticket(ticket: NestedRestoreTicket) -> Resu
         generation: ticket.generation,
         identity: ticket.identity,
     });
-    restore_or_retain(&mut handle)
+    let restored = restore_or_retain(&mut handle);
+    let _ = claim_refused(&mut handle);
+    restored
+}
+
+/// Take explicit ownership of a refused restore (see the ownership rule on the handle).
+pub(crate) fn claim_refused(handle: &mut Option<ParkedParentHandle>) -> Option<NestedRestoreTicket> {
+    handle.take().map(ParkedParentHandle::into_ticket)
+}
+
+/// An ordinary row has no root-ingress, undelivered-root or source-IOCTL owner of its own.
+fn ordinary_row(parent: &Parent) -> bool {
+    parent.root_admission.is_none() && parent.undelivered_root.is_none()
+        && parent.source_ioctl.is_none()
+}
+
+/// The `Drop` half of the ownership rule. A row still parked, restored, or owned elsewhere is
+/// left alone; only an ordinary refused or quarantined row becomes root-owned.
+unsafe fn queue_dropped_refusal(ticket: NestedRestoreTicket) {
+    let Some(parent) = (&mut *core::ptr::addr_of_mut!(PARENTS))
+        .get_mut(ticket.index).and_then(Option::as_mut) else { return };
+    if ticket_matches(ticket, parent) && ordinary_row(parent)
+        && matches!(parent.phase, ParentPhase::RestorePending | ParentPhase::Quarantined)
+    {
+        parent.root_queued = true;
+    }
+}
+
+/// Run at the root before any new admission: retry each root-owned no-effect refusal once.
+/// A quarantined row stays fenced with every resource held and is never replayed.
+pub(crate) unsafe fn drain_root_restore_queue() -> nt_component_suspension::RootRestoreDrain {
+    use nt_component_suspension::QueuedRestoreState as State;
+    if !(&*core::ptr::addr_of!(PARENTS)).iter().flatten().any(|parent| parent.root_queued) {
+        return Default::default();
+    }
+    let queued: Vec<NestedRestoreTicket> = (&*core::ptr::addr_of!(PARENTS)).iter().enumerate()
+        .filter_map(|(index, row)| {
+            let parent = row.as_ref().filter(|parent| parent.root_queued)?;
+            Some(NestedRestoreTicket {
+                index,
+                generation: parent.generation,
+                identity: parent.scope.as_ref()?.identity(),
+            })
+        })
+        .collect();
+    nt_component_suspension::drain_root_restores(
+        queued,
+        |ticket| {
+            let parent = (&*core::ptr::addr_of!(PARENTS)).get(ticket.index)
+                .and_then(Option::as_ref);
+            if parent.is_some_and(|parent| parent.phase == ParentPhase::Quarantined) {
+                State::Quarantined
+            } else if pending_ticket(ticket) {
+                State::NoEffectRefusal
+            } else {
+                State::Busy
+            }
+        },
+        |ticket| restore_pending_ticket(ticket).is_ok(),
+    )
 }

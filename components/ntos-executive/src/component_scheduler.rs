@@ -583,12 +583,15 @@ unsafe fn hosted_component_pump_inner(
             crate::disk_census_ticks());
     }
     let restore_key = parent.as_ref().and_then(|handle| runtime::nested::result_key(handle));
-    let restore_ticket = parent.as_ref().map(|handle| handle.ticket());
     if runtime::nested::restore(&mut parent).is_err() {
         crate::driver_launch::trace_port_connect_handoff_probe(54, channel, 0);
         // An impossible missing key is still a retained refusal. The physical row remains
         // discoverable in `runtime::nested`; never return an entered result as completed.
-        let (Some(key), Some(ticket)) = (restore_key, restore_ticket) else {
+        // Without a key no continuation can own the row; the dropped handle hands it to root.
+        let Some(key) = restore_key else {
+            return HostedPumpRestore::Unattributed(result)
+        };
+        let Some(ticket) = runtime::nested::claim_refused(&mut parent) else {
             return HostedPumpRestore::Unattributed(result)
         };
         return HostedPumpRestore::Retained {

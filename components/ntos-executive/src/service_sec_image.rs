@@ -13789,6 +13789,22 @@ fn trace_running_lane_gate(
     print_str(b"\n");
 }
 
+/// Bounded evidence for the root restore queue; silent while it is empty.
+fn trace_root_restore_drain(drain: nt_component_suspension::RootRestoreDrain) {
+    static TRACED: AtomicU64 = AtomicU64::new(0);
+    if drain == nt_component_suspension::RootRestoreDrain::default() { return; }
+    let n = TRACED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() { return; }
+    print_str(b"[root-restore-drain] n=");
+    print_u64(n);
+    print_str(b" restored/refused/quarantined/busy=");
+    print_u64(u64::from(drain.restored)); print_str(b"/");
+    print_u64(u64::from(drain.refused)); print_str(b"/");
+    print_u64(u64::from(drain.quarantined)); print_str(b"/");
+    print_u64(u64::from(drain.busy));
+    print_str(b"\n");
+}
+
 /// Bounded evidence for `executor::flow::wait_retained_settlement`.
 fn trace_retained_settlement_wait(add_device_turn: bool, queued_turn: bool) {
     static TRACED: AtomicU64 = AtomicU64::new(0);
