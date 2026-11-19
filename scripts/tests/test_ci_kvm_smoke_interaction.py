@@ -54,6 +54,14 @@ class ParseScriptTests(unittest.TestCase):
         self.assertEqual(script.steps[2].actions, (("type", "ver\n"), ("key", ("ctrl", "esc"))))
         self.assertEqual(script.steps[2].wait_seconds, 8.0)
         self.assertEqual(script.settle_seconds, 20.0)
+        self.assertEqual(script.arm, "seal")
+
+    def test_arm_mode_selects_seal_or_sealed_idle(self):
+        self.assertEqual(parse_script({**DOCUMENT, "arm": "idle"}).arm, "idle")
+        self.assertEqual(load_script(DEFAULT_SCRIPT).arm, "idle")
+        for bad in ("later", "", 1, None):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                parse_script({**DOCUMENT, "arm": bad})
 
     def test_invalid_documents_fail_before_boot(self):
         def mutate(change):

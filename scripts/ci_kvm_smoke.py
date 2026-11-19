@@ -906,6 +906,7 @@ def main():
         stationary_reason = None
         previous_sample = None
         interaction = seal_detector = None
+        desktop_sealed = False
         if interaction_script is not None:
             interaction = InteractionRunner(
                 interaction_script, send_input_batches,
@@ -963,11 +964,17 @@ def main():
                         for milestone in progress_watchdog.observe_serial(chunk, time.monotonic()):
                             print(f"Boot progress {time.monotonic() - started:.0f}s: {milestone}",
                                   flush=True)
-                if (interaction is not None and not interaction.armed
+                if (interaction is not None and not desktop_sealed
                         and seal_detector.poll() is not None):
-                    interaction.arm(time.monotonic())
-                    print(f"Interaction armed {time.monotonic() - started:.0f}s: desktop sealed; "
-                          f"first step after {interaction_script.settle_seconds:.0f}s", flush=True)
+                    desktop_sealed = True
+                    if interaction_script.arm == "seal":
+                        interaction.arm(time.monotonic())
+                        print(f"Interaction armed {time.monotonic() - started:.0f}s: desktop "
+                              f"sealed; first step after {interaction_script.settle_seconds:.0f}s",
+                              flush=True)
+                    else:
+                        print(f"Desktop sealed {time.monotonic() - started:.0f}s; interaction "
+                              "waits for the guest to go idle", flush=True)
                 if interaction is not None and interaction.in_progress and QMP_SOCKET.exists():
                     for name in interaction.advance(time.monotonic()):
                         print(f"Interaction {time.monotonic() - started:.0f}s: {name}", flush=True)
@@ -1002,6 +1009,15 @@ def main():
                         print(f"Boot progress {sample_time - started:.0f}s: "
                               f"{progress_watchdog.last_milestone}", flush=True)
                     next_blockstats = sample_time + 10
+                if (idle_reason and interaction is not None and not interaction.armed
+                        and desktop_sealed and interaction_script.arm == "idle"):
+                    # The sealed guest's first idle is when its startup work is done; that is
+                    # when the scripted input starts, not when the boot stops.
+                    interaction.arm(time.monotonic())
+                    print(f"Interaction armed {time.monotonic() - started:.0f}s: sealed desktop "
+                          f"idle ({idle_reason}); first step after "
+                          f"{interaction_script.settle_seconds:.0f}s", flush=True)
+                    idle_reason = None
                 if idle_reason:
                     stationary_reason = idle_reason
                     STATIONARY_MARKER.write_text(stationary_reason + "\n")

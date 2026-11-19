@@ -45,6 +45,12 @@ class Script:
     screen: tuple
     settle_seconds: float
     steps: tuple
+    # "seal" starts on the desktop seal; "idle" waits until the sealed guest first goes idle,
+    # which is after Explorer's RunOnce work and its desktop window exist.
+    arm: str = "seal"
+
+
+ARM_MODES = ("seal", "idle")
 
 
 def _seconds(value, field):
@@ -99,8 +105,12 @@ def _action(value, screen, field):
 
 def parse_script(document):
     """Validate a step document completely before the guest boots."""
-    if not isinstance(document, dict) or set(document) - {"screen", "settle_seconds", "steps"}:
-        raise ValueError("script must be an object with screen, settle_seconds and steps")
+    if (not isinstance(document, dict)
+            or set(document) - {"screen", "settle_seconds", "steps", "arm"}):
+        raise ValueError("script must be an object with screen, settle_seconds, steps and arm")
+    arm = document.get("arm", "seal")
+    if arm not in ARM_MODES:
+        raise ValueError(f"arm must be one of {', '.join(ARM_MODES)}")
     screen = document.get("screen")
     if (not isinstance(screen, list) or len(screen) != 2
             or any(isinstance(axis, bool) or not isinstance(axis, int) or not 1 <= axis <= 8192
@@ -126,7 +136,7 @@ def parse_script(document):
         steps.append(Step(name, tuple(_action(action, screen, f"{field}.actions[{number}]")
                                       for number, action in enumerate(actions, 1)),
                           _seconds(raw.get("wait_seconds"), f"{field}.wait_seconds")))
-    return Script(screen, settle, tuple(steps))
+    return Script(screen, settle, tuple(steps), arm)
 
 
 def load_script(path):

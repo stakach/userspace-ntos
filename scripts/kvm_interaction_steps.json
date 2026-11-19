@@ -1,11 +1,12 @@
 {
   "screen": [1024, 768],
-  "settle_seconds": 20,
+  "arm": "idle",
+  "settle_seconds": 10,
   "steps": [
     {"name": "baseline", "actions": [], "wait_seconds": 0},
-    {"name": "start-menu", "actions": [{"click": [28, 743]}], "wait_seconds": 5},
-    {"name": "start-menu-closed", "actions": [{"key": ["esc"]}], "wait_seconds": 3},
-    {"name": "command-prompt", "actions": [{"double_click": [37, 470]}], "wait_seconds": 20},
-    {"name": "ver", "actions": [{"type": "ver\n"}], "wait_seconds": 8}
+    {"name": "start-menu", "actions": [{"click": [28, 743]}], "wait_seconds": 60},
+    {"name": "start-menu-closed", "actions": [{"key": ["esc"]}], "wait_seconds": 5},
+    {"name": "command-prompt", "actions": [{"double_click": [37, 470]}], "wait_seconds": 30},
+    {"name": "ver", "actions": [{"type": "ver\n"}], "wait_seconds": 10}
   ]
 }
