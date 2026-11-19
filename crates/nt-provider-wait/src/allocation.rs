@@ -90,6 +90,8 @@ struct ProviderAllocationRecord {
     retiring: bool,
     base: u64,
     capacity: u64,
+    /// Diagnostic owner tag (pool tag or call site); never authority.
+    tag: u32,
     /// Stable record slot of the immediate live enclosing allocation.
     parent: Option<usize>,
 }
@@ -105,6 +107,7 @@ impl ProviderAllocationRecord {
         retiring: false,
         base: 0,
         capacity: 0,
+        tag: 0,
         parent: None,
     };
 
@@ -234,11 +237,47 @@ impl ProviderAllocationCatalog {
         seen
     }
 
+    /// Live allocations of one arena grouped by tag, as (tag, count, bytes) in first-seen order;
+    /// returns how many tags were seen. Allocation-free, for a periodic census.
+    pub fn live_by_tag(&self, arena: ProviderArenaIdentity, out: &mut [(u32, usize, u64)]) -> usize {
+        let mut seen = 0;
+        for &slot in &self.live_by_base {
+            let record = self.records[slot];
+            if record.arena != arena {
+                continue;
+            }
+            let known = seen.min(out.len());
+            match out[..known].iter_mut().find(|(tag, _, _)| *tag == record.tag) {
+                Some((_, count, bytes)) => {
+                    *count += 1;
+                    *bytes += record.capacity;
+                }
+                None => {
+                    if seen < out.len() {
+                        out[seen] = (record.tag, 1, record.capacity);
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        seen
+    }
+
     pub fn register(
         &mut self,
         arena: ProviderArenaIdentity,
         base: u64,
         capacity: u64,
+    ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
+        self.register_tagged(arena, base, capacity, 0)
+    }
+
+    pub fn register_tagged(
+        &mut self,
+        arena: ProviderArenaIdentity,
+        base: u64,
+        capacity: u64,
+        tag: u32,
     ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
         if !arena.is_valid() {
             return Err(ProviderAllocationError::InvalidArena);
@@ -313,6 +352,7 @@ impl ProviderAllocationCatalog {
             retiring: false,
             base,
             capacity,
+            tag,
             parent,
         };
         self.live_by_base.insert(first_inside, slot);
@@ -622,6 +662,26 @@ mod tests {
     /// Boot 44246316182: win32k held more than 65,536 live pool allocations, and every
     /// ExAllocatePool/ExFreePool walked the whole record table several times. Registering
     /// and retiring one allocation must cost a lookup, not a pass over every live allocation.
+    /// Boot 44463332736: shared-pool (arena 2) live allocations climbed without bound.
+    /// Attributing them needs live counts and bytes per allocation tag within one arena.
+    #[test]
+    fn live_by_tag_attributes_one_arenas_live_allocations() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let a = catalog.register_tagged(arena(2), 0x1000, 0x100, 0x6873_7355).unwrap();
+        catalog.register_tagged(arena(2), 0x2000, 0x40, 0x6873_7355).unwrap();
+        catalog.register_tagged(arena(2), 0x3000, 0x20, 0x6b73_6544).unwrap();
+        catalog.register_tagged(arena(3), 0x4000, 0x20, 0x6873_7355).unwrap();
+        catalog.register(arena(2), 0x5000, 0x10).unwrap();
+        let mut out = [(0u32, 0usize, 0u64); 4];
+        assert_eq!(catalog.live_by_tag(arena(2), &mut out), 3);
+        assert_eq!(&out[..3], &[(0x6873_7355, 2, 0x140), (0x6b73_6544, 1, 0x20), (0, 1, 0x10)]);
+        catalog.retire(a.identity).unwrap();
+        assert_eq!(catalog.live_by_tag(arena(2), &mut out), 3);
+        assert_eq!(out[0], (0x6873_7355, 1, 0x40));
+        let mut short = [(0u32, 0usize, 0u64); 1];
+        assert_eq!(catalog.live_by_tag(arena(2), &mut short), 3);
+    }
+
     #[test]
     fn live_by_arena_counts_only_live_allocations() {
         let mut catalog = ProviderAllocationCatalog::new();

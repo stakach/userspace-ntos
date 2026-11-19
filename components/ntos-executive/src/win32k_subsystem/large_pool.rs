@@ -77,7 +77,7 @@ pub(super) unsafe fn allocate(bytes: u64, zero: bool) -> u64 {
         let Ok(allocation) = ledger.reserve(bytes) else { return 0; };
         let snapshot = provider_allocations_unlocked(&mut guard).and_then(|catalog| {
             if !register_provider_allocation_observed(
-                catalog, arena, allocation.base, allocation.capacity,
+                catalog, arena, allocation.base, allocation.capacity, 0,
             ) { return None; }
             Some(catalog.active_exact_capacity(arena, allocation.base, allocation.capacity)
                 .unwrap_or_else(|_| {

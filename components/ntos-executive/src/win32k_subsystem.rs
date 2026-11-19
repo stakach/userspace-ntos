@@ -2015,6 +2015,30 @@ fn trace_provider_allocation_census(catalog: &nt_provider_wait::ProviderAllocati
         print_u64(*live as u64);
     }
     print_str(b"\n");
+    if let Some(pool) = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID) {
+        let mut tags = [(0u32, 0usize, 0u64); 96];
+        let seen = catalog.live_by_tag(pool, &mut tags).min(tags.len());
+        tags[..seen].sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        print_str(b"[provider-pool-tags] registered=");
+        print_u64(registered);
+        print_str(b" tags=");
+        print_u64(seen as u64);
+        for &(tag, live, bytes) in tags.iter().take(seen.min(24)) {
+            print_str(b" ");
+            let text = tag.to_le_bytes();
+            if tag & 0x8000_0000 == 0 && text.iter().all(|byte| (0x20..0x7f).contains(byte)) {
+                print_str(&text);
+            } else {
+                print_str(b"0x");
+                print_hex(tag);
+            }
+            print_str(b"=");
+            print_u64(live as u64);
+            print_str(b"/");
+            print_u64(bytes);
+        }
+        print_str(b"\n");
+    }
 }
 
 fn register_provider_allocation_observed(
@@ -2022,8 +2046,9 @@ fn register_provider_allocation_observed(
     arena: nt_provider_wait::ProviderArenaIdentity,
     payload: u64,
     capacity: u64,
+    tag: u32,
 ) -> bool {
-    match catalog.register(arena, payload, capacity) {
+    match catalog.register_tagged(arena, payload, capacity, tag) {
         Ok(_) => {
             trace_provider_allocation_census(catalog);
             true
@@ -2052,7 +2077,24 @@ fn register_provider_allocation_observed(
     }
 }
 
+/// Diagnostic tag for a host-internal allocation: high bit set, a 7-bit source-file hash and the
+/// line, so the census can name the call site that keeps allocating.
+#[track_caller]
+fn call_site_pool_tag() -> u32 {
+    let location = core::panic::Location::caller();
+    let file = location
+        .file()
+        .bytes()
+        .fold(0x811c_9dc5u32, |hash, byte| (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193));
+    0x8000_0000 | ((file & 0x7f) << 24) | (location.line() & 0x00ff_ffff)
+}
+
+#[track_caller]
 unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
+    provider_pool_alloc_tagged(size, zero, call_site_pool_tag())
+}
+
+unsafe fn provider_pool_alloc_tagged(size: u64, zero: bool, tag: u32) -> u64 {
     let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID) else {
         return 0;
     };
@@ -2072,7 +2114,7 @@ unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
                     && provider_allocations_unlocked(&mut metadata)
                     .is_some_and(|catalog| {
                         let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
-                        register_provider_allocation_observed(catalog, arena, payload, allocation.capacity)
+                        register_provider_allocation_observed(catalog, arena, payload, allocation.capacity, tag)
                     })
                 {
                     Ok(payload)
@@ -2532,8 +2574,9 @@ unsafe fn provider_pool_note_invalid_free() {
     }
 }
 
+#[track_caller]
 unsafe fn pool_alloc(size: u64) -> u64 {
-    provider_pool_alloc(size, true)
+    provider_pool_alloc_tagged(size, true, call_site_pool_tag())
 }
 
 /// A separate reclaiming arena for allocations with explicit lifetime. FreeType first required it
@@ -2641,7 +2684,7 @@ unsafe fn reclaiming_pool_alloc(size: u64) -> u64 {
     if provider_allocations_unlocked(&mut metadata)
         .is_some_and(|allocations| {
             let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
-            register_provider_allocation_observed(allocations, arena, payload, capacity)
+            register_provider_allocation_observed(allocations, arena, payload, capacity, 0)
         })
     {
         payload
@@ -8789,7 +8832,7 @@ unsafe fn heap_alloc_in(
     let registered = provider_allocations_unlocked(&mut metadata)
         .is_some_and(|allocations| {
             let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
-            register_provider_allocation_observed(allocations, arena, payload, capacity)
+            register_provider_allocation_observed(allocations, arena, payload, capacity, 0)
         });
     if registered {
         payload
@@ -10032,17 +10075,17 @@ extern "win64" fn s_ex_alloc_pool_with_tag(_pool: u64, size: u64, tag: u64) -> u
         } else if (tag as u32) as u64 == FTYP_TAG {
             reclaiming_pool_alloc(size)
         } else {
-            provider_pool_alloc(size, false)
+            provider_pool_alloc_tagged(size, false, tag as u32)
         }
     }
 }
-/// `PVOID ExAllocatePool(POOL_TYPE, SIZE_T NumberOfBytes)`.
+/// `PVOID ExAllocatePool(POOL_TYPE, SIZE_T NumberOfBytes)`; NT tags these 'None'.
 extern "win64" fn s_ex_alloc_pool(_pool: u64, size: u64) -> u64 {
-    unsafe { provider_pool_alloc(size, false) }
+    unsafe { provider_pool_alloc_tagged(size, false, u32::from_le_bytes(*b"None")) }
 }
 /// `PVOID ExAllocatePoolWithQuotaTag(POOL_TYPE, SIZE_T, ULONG Tag)`.
-extern "win64" fn s_ex_alloc_pool_quota(_pool: u64, size: u64, _tag: u64) -> u64 {
-    unsafe { provider_pool_alloc(size, false) }
+extern "win64" fn s_ex_alloc_pool_quota(_pool: u64, size: u64, tag: u64) -> u64 {
+    unsafe { provider_pool_alloc_tagged(size, false, tag as u32) }
 }
 
 /// `VOID RtlInitUnicodeString(PUNICODE_STRING Dest, PCWSTR Source)`.
