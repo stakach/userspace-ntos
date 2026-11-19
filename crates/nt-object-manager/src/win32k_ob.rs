@@ -347,6 +347,10 @@ pub const OB_PENDING_LEN: usize = OB_TABLE_LEN;
 
 /// Number of externally visible aliases created by `NtDuplicateObject` for USER objects.
 pub const OB_ALIASES_LEN: usize = 32;
+/// Number of named desktop links tracked under window-station directories.
+pub const OB_NAMED_DESKTOPS_LEN: usize = 32;
+/// Maximum ASCII desktop leaf name retained for open-by-name lookups.
+pub const OB_NAMED_DESKTOP_NAME_MAX: usize = 48;
 /// USER handles are above native 32-bit and virtual-registry handle ranges, but below the
 /// executive's 0x2_0000_0000 pseudo-object range.
 pub const OB_HANDLE_BASE: u64 = 0x1_0000_0000;
@@ -481,6 +485,40 @@ struct AliasEntry {
     handle_flags: [u8; 2],
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct NamedDesktopEntry {
+    root_body: u64,
+    leaf_len: u8,
+    leaf: [u8; OB_NAMED_DESKTOP_NAME_MAX],
+    handle: u64,
+}
+
+impl NamedDesktopEntry {
+    fn new(root_body: u64, leaf: &[u8], handle: u64) -> Option<Self> {
+        if root_body == 0
+            || leaf.is_empty()
+            || leaf.len() > OB_NAMED_DESKTOP_NAME_MAX
+            || handle == 0
+        {
+            return None;
+        }
+        let mut entry = Self {
+            root_body,
+            leaf_len: leaf.len() as u8,
+            leaf: [0; OB_NAMED_DESKTOP_NAME_MAX],
+            handle,
+        };
+        entry.leaf[..leaf.len()].copy_from_slice(leaf);
+        Some(entry)
+    }
+
+    fn matches(self, root_body: u64, leaf: &[u8]) -> bool {
+        self.root_body == root_body
+            && self.leaf_len as usize == leaf.len()
+            && self.leaf[..leaf.len()].eq_ignore_ascii_case(leaf)
+    }
+}
+
 /// A fixed-size handle → (type, body) registry for win32k's DESKTOP / WINDOWSTATION objects.
 ///
 /// Canonical handles are `OB_HANDLE_BASE + idx * 4`; aliases have their own bounded range. The
@@ -497,6 +535,9 @@ pub struct ObHandleTable {
     winsta_body: u64,
     /// USER-object aliases minted for `NtDuplicateObject`, indexed by a high-range external handle.
     aliases: [Option<AliasEntry>; OB_ALIASES_LEN],
+    /// Named DESKTOP objects under WINDOWSTATION directories. Real Ob lookup uses the root directory
+    /// handle and leaf name; this compact table preserves that semantic without allocating.
+    named_desktops: [Option<NamedDesktopEntry>; OB_NAMED_DESKTOPS_LEN],
 }
 
 impl Default for ObHandleTable {
@@ -537,6 +578,7 @@ impl ObHandleTable {
             winsta_handle: 0,
             winsta_body: 0,
             aliases: [None; OB_ALIASES_LEN],
+            named_desktops: [None; OB_NAMED_DESKTOPS_LEN],
         }
     }
 
@@ -839,6 +881,49 @@ impl ObHandleTable {
         location
     }
 
+    fn window_station_body_for_handle(&self, root_handle: u64) -> Option<u64> {
+        match self.lookup(root_handle) {
+            Some((ObKind::WindowStation, body)) if body != 0 => Some(body),
+            _ => None,
+        }
+    }
+
+    /// Resolve a named desktop under a window-station root handle.
+    pub fn desktop_handle_for_name(&self, root_handle: u64, leaf: &[u8]) -> Option<u64> {
+        let root_body = self.window_station_body_for_handle(root_handle)?;
+        let entry = self
+            .named_desktops
+            .iter()
+            .flatten()
+            .find(|entry| entry.matches(root_body, leaf))?;
+        matches!(self.lookup(entry.handle), Some((ObKind::Desktop, _))).then_some(entry.handle)
+    }
+
+    /// Record the name of a desktop created under a window-station root handle.
+    pub fn remember_desktop_name(&mut self, root_handle: u64, leaf: &[u8], handle: u64) -> bool {
+        if !matches!(self.lookup(handle), Some((ObKind::Desktop, _))) {
+            return false;
+        }
+        let Some(root_body) = self.window_station_body_for_handle(root_handle) else {
+            return false;
+        };
+        let Some(entry) = NamedDesktopEntry::new(root_body, leaf, handle) else {
+            return false;
+        };
+        for slot in self.named_desktops.iter_mut() {
+            if slot.is_some_and(|existing| existing.matches(root_body, leaf)) {
+                *slot = Some(entry);
+                return true;
+            }
+        }
+        if let Some(slot) = self.named_desktops.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(entry);
+            true
+        } else {
+            false
+        }
+    }
+
     fn canonical_slot_index(&self, handle: u64) -> Option<usize> {
         if let Some(index) = Self::alias_index(handle) {
             let AliasEntry { kind, body, .. } = self.aliases[index]?;
@@ -1091,6 +1176,51 @@ impl ObHandleTable {
     pub fn cached_winsta_body(&self) -> u64 {
         self.winsta_body
     }
+}
+
+/// Wire a freshly-allocated, zeroed DESKTOP body to its DESKTOPINFO block (`DESKTOP.pDeskInfo`).
+/// Mirrors the effect of win32k's desktop allocation; kept here so the body layout lives with the
+/// object-type definition rather than in host glue.
+///
+/// # Safety
+/// `desktop_body` must point to at least [`DESKTOP_BODY_SIZE`] writable bytes.
+pub unsafe fn init_desktop_body(desktop_body: *mut u8, desktop_info: u64) {
+    core::ptr::write_unaligned(
+        desktop_body.add(desktop::P_DESK_INFO) as *mut u64,
+        desktop_info,
+    );
+    // InitializeListHead the DESKTOP's list heads (Flink=Blink=&head), as real IntCreateDesktop does.
+    // The window-manager/paint path walks these (PtiList, ShellHookWindows); a zeroed (NULL Flink) head
+    // null-derefs on the first traversal.
+    for off in [desktop::PTI_LIST, desktop::SHELL_HOOK_WINDOWS] {
+        let head = desktop_body.add(off) as u64;
+        core::ptr::write_unaligned(desktop_body.add(off) as *mut u64, head); // Flink = &head
+        core::ptr::write_unaligned(desktop_body.add(off + 8) as *mut u64, head);
+        // Blink = &head
+    }
+}
+
+/// Bind a newly allocated desktop to its creator's session only when its exact parent station
+/// belongs to that same session. The native desktop parse callback makes this assignment before
+/// publishing the object; our hosted parse adapter must do likewise.
+///
+/// # Safety
+/// Both pointers must refer to live, readable bodies of the indicated types. `desktop_body`
+/// must be writable and must not yet be published.
+pub unsafe fn bind_desktop_session(
+    desktop_body: *mut u8,
+    parent_station_body: *const u8,
+    current_session_id: u32,
+) -> bool {
+    if desktop_body.is_null() || parent_station_body.is_null() {
+        return false;
+    }
+    let parent_session_id = core::ptr::read_unaligned(parent_station_body as *const u32);
+    if parent_session_id != current_session_id {
+        return false;
+    }
+    core::ptr::write_unaligned(desktop_body.add(desktop::SESSION_ID) as *mut u32, current_session_id);
+    true
 }
 
 /// Insert a THREADINFO into a DESKTOP's `PtiList`, matching `InsertTailList` in
@@ -1774,6 +1904,41 @@ mod tests {
     }
 
     #[test]
+    fn named_desktop_lookup_is_scoped_to_window_station_body() {
+        let mut t = ObHandleTable::new();
+        let interactive_winsta = t.register(ObKind::WindowStation, 0x5700_0000);
+        let service_winsta = t.register_uncached(ObKind::WindowStation, 0x5700_1000);
+        let interactive_default = t.register(ObKind::Desktop, 0xD00D_0000);
+        let service_default = t.register(ObKind::Desktop, 0xD00D_1000);
+
+        assert!(t.remember_desktop_name(interactive_winsta, b"Default", interactive_default));
+        assert!(t.remember_desktop_name(service_winsta, b"default", service_default));
+
+        assert_eq!(
+            t.desktop_handle_for_name(interactive_winsta, b"default"),
+            Some(interactive_default)
+        );
+        assert_eq!(
+            t.desktop_handle_for_name(service_winsta, b"Default"),
+            Some(service_default)
+        );
+    }
+
+    #[test]
+    fn named_desktop_lookup_accepts_root_aliases() {
+        let mut t = ObHandleTable::new();
+        let winsta = t.register(ObKind::WindowStation, 0x5700_0000);
+        let winsta_alias = t.duplicate(winsta).unwrap();
+        let desktop = t.register(ObKind::Desktop, 0xD00D_0000);
+
+        assert!(t.remember_desktop_name(winsta, b"Default", desktop));
+        assert_eq!(
+            t.desktop_handle_for_name(winsta_alias, b"Default"),
+            Some(desktop)
+        );
+    }
+
+    #[test]
     fn table_full_returns_null_handle() {
         let mut t = ObHandleTable::new();
         for i in 1..OB_TABLE_LEN {
@@ -1782,11 +1947,50 @@ mod tests {
         assert_eq!(t.register(ObKind::Desktop, 0xDEAD), 0); // full
     }
 
-    /// ReactOS `UserInitializeDesktop` leaves PtiList as an empty list head.
-    unsafe fn init_desktop_body(desktop_body: *mut u8, _desktop_info: u64) {
-        let head = desktop_body.add(desktop::PTI_LIST) as u64;
-        core::ptr::write_unaligned(head as *mut u64, head);
-        core::ptr::write_unaligned((head + 8) as *mut u64, head);
+    #[test]
+    fn desktop_body_wires_desk_info() {
+        let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
+        unsafe {
+            init_desktop_body(body.as_mut_ptr(), 0xDEC0_0000);
+            let p =
+                core::ptr::read_unaligned(body.as_ptr().add(desktop::P_DESK_INFO) as *const u64);
+            assert_eq!(p, 0xDEC0_0000);
+        }
+    }
+
+    #[test]
+    fn desktop_session_uses_current_process_only_for_its_exact_parent_station() {
+        let mut desktop = [0u8; DESKTOP_BODY_SIZE as usize];
+        let mut station = [0u8; 0x100];
+        station[..4].copy_from_slice(&1u32.to_le_bytes());
+        unsafe {
+            assert!(!bind_desktop_session(
+                desktop.as_mut_ptr(), station.as_ptr(), 0,
+            ));
+            assert_eq!(u32::from_le_bytes(desktop[..4].try_into().unwrap()), 0,
+                "a foreign session must not publish or mutate the desktop");
+            assert!(bind_desktop_session(
+                desktop.as_mut_ptr(), station.as_ptr(), 1,
+            ));
+            assert_eq!(u32::from_le_bytes(desktop[..4].try_into().unwrap()), 1);
+        }
+    }
+
+    #[test]
+    fn desktop_body_initializes_list_heads() {
+        // ShellHookWindows + PtiList must be self-referential empty list heads (Flink=Blink=&head),
+        // so win32k's list traversals (UserBuildShellHookHwndList) terminate immediately.
+        let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
+        let base = body.as_mut_ptr() as u64;
+        unsafe {
+            init_desktop_body(body.as_mut_ptr(), 0x1000);
+            for off in [desktop::PTI_LIST, desktop::SHELL_HOOK_WINDOWS] {
+                let flink = core::ptr::read_unaligned(body.as_ptr().add(off) as *const u64);
+                let blink = core::ptr::read_unaligned(body.as_ptr().add(off + 8) as *const u64);
+                assert_eq!(flink, base + off as u64);
+                assert_eq!(blink, base + off as u64);
+            }
+        }
     }
 
     #[test]
