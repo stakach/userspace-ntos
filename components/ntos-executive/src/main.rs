@@ -97,6 +97,7 @@ mod volume_lazy_flush;
 mod outer_native_io;
 mod retained_admissions;
 mod phase_slots;
+mod failed_launch_quarantine;
 mod volume_checkpoint_deferral;
 mod hosted_stack_growth;
 mod local_section_file;

@@ -42755,25 +42755,88 @@ pub(crate) unsafe fn load_driver(
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
 
+    // A previous launch of this service is retained until its physical cleanup finishes.
+    if (&*core::ptr::addr_of!(FAILED_LAUNCHES)).blocks_reload(driver_object_path.as_bytes()) {
+        print_str(b"[driver-launch] reload refused while a failed launch is retained ");
+        print_str(driver_object_path.as_bytes());
+        print_str(b"\n");
+        return Err(nt_status::NtStatus(0xC000_010Eu32 as i32)); // STATUS_IMAGE_ALREADY_LOADED
+    }
+
     let Some(instance) = reserve_instance_slot() else {
         print_str(b"[driver-launch] instance reservation failed\n");
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
 
     let loaded = load_driver_reserved(fs, path, driver_object_path, instance, caller);
-    if loaded.is_err() {
+    if let Err(load_status) = loaded {
         if let Err(status) = clear_instance(instance) {
-            print_str(b"[driver-launch] failed launch retained for retirement inst=");
-            print_u64(instance as u64);
-            print_str(b" status=0x");
-            print_hex(status.raw() as u32);
-            print_str(b"\n");
-            // The loader has already entered native effects. A failed rollback is an uncertain
-            // live driver, not the original terminal load error; no caller may retry it.
-            panic!("driver launch rollback indeterminate: instance={instance} status={:#x}", status.raw());
+            // The loader has already entered native effects. A refused rollback leaves an
+            // instance that is neither live nor free: retain it with its identity, report the
+            // original load status, and let a later retirement finish the physical cleanup.
+            quarantine_failed_launch(instance, driver_object_path, load_status, status);
         }
     }
     loaded
+}
+
+/// Failed launches whose rollback an owner refused (#361).
+static mut FAILED_LAUNCHES: crate::failed_launch_quarantine::FailedLaunchQuarantine =
+    crate::failed_launch_quarantine::FailedLaunchQuarantine::new();
+
+unsafe fn quarantine_failed_launch(
+    instance: usize,
+    driver_object_path: &str,
+    load_status: nt_status::NtStatus,
+    cleanup_status: nt_status::NtStatus,
+) {
+    let (domain_id, domain_cookie) = self::instance(instance)
+        .map_or((0, 0), |inst| (inst.hosted_domain_id, inst.hosted_domain_cookie));
+    if let Some(slot) = driver_instances_mut().get_mut(instance) {
+        // Never dispatched to or reported ready while retained.
+        slot.ready = false;
+        slot.faulted = true;
+    }
+    let mut service = Vec::new();
+    let _ = service.try_reserve_exact(driver_object_path.len());
+    service.extend_from_slice(driver_object_path.as_bytes());
+    let record = crate::failed_launch_quarantine::FailedLaunch {
+        instance,
+        service,
+        load_status: load_status.raw(),
+        cleanup_status: cleanup_status.raw(),
+        domain_id,
+        domain_cookie,
+    };
+    let recorded = (&mut *core::ptr::addr_of_mut!(FAILED_LAUNCHES)).quarantine(record).is_ok();
+    print_str(b"[driver-launch] failed launch retained for retirement inst=");
+    print_u64(instance as u64);
+    print_str(b" service=");
+    print_str(driver_object_path.as_bytes());
+    print_str(b" load=0x");
+    print_hex(load_status.raw() as u32);
+    print_str(b" cleanup=0x");
+    print_hex(cleanup_status.raw() as u32);
+    print_str(b" domain=");
+    print_u64(domain_id);
+    print_str(b" recorded=");
+    print_u64(u64::from(recorded));
+    print_str(b"\n");
+}
+
+/// Finish the physical cleanup of retained failed launches whose owners have released them.
+pub(crate) unsafe fn retire_quarantined_launches() -> usize {
+    let quarantine = &mut *core::ptr::addr_of_mut!(FAILED_LAUNCHES);
+    if quarantine.len() == 0 {
+        return 0;
+    }
+    let retired = quarantine.retire(|instance| clear_instance(instance).map_err(|status| status.raw()));
+    for instance in &retired {
+        print_str(b"[driver-launch] retained failed launch retired inst=");
+        print_u64(*instance as u64);
+        print_str(b"\n");
+    }
+    retired.len()
 }
 
 unsafe fn load_driver_reserved(

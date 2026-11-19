@@ -4637,6 +4637,8 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
         }
     }
     unsafe { crate::writable_fs::redrive_file_cleanup_work() };
+    // A failed launch whose rollback was refused finishes once its owners release it (#361).
+    let _ = unsafe { driver_launch::retire_quarantined_launches() };
     None
 }
 
