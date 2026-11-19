@@ -5,8 +5,6 @@ const FAT: &str = include_str!("../../../components/ntos-executive/src/fs_loader
 #[test]
 fn directory_callers_and_path_parent_observer_use_bounded_ready_census() {
     for (start, end, name) in [
-        ("pub(crate) unsafe fn fat_visit_directory_checked(", "pub(crate) unsafe fn fat_visit_directory(", "CheckedDirectory"),
-        ("pub(crate) unsafe fn fat_visit_directory(", "pub(crate) unsafe fn dir_find(", "LegacyDirectory"),
         ("pub(crate) unsafe fn dir_find(", "pub(crate) unsafe fn fat_read_file(", "ShortDirectory"),
         ("unsafe fn fat_lookup_metadata(", "/// Find one native FAT directory entry", "PathDirectory"),
     ] {

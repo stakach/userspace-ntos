@@ -66,7 +66,8 @@ pub(crate) fn retry_attribute_releases() -> usize {
 }
 
 impl ExecNtHandler {
-    /// Called only after the writable layer has missed. A `None` result keeps the Boot reader.
+    /// The first owner of every absolute attribute query. `None` keeps the boot loader's own
+    /// reader (writable overlay, then synchronous FAT) for a name the mounted Device does not own.
     pub(super) unsafe fn query_native_mounted_attributes(
         &mut self,
         name: &[u16],
@@ -77,10 +78,19 @@ impl ExecNtHandler {
         let route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
             .and_then(crate::fs_loader::exec_block_route_kind);
         let journal_owned = crate::writable_fs::registry_journal::owns_volume();
-        if route == Some(nt_fs::BlockSourceKind::Boot) && !journal_owned { return None; }
-        let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
-        let mut relative_path = [0u8; FILE_VOLUME_RELATIVE_CAP];
-        if crate::writable_fs::volume_path_into(name, &mut folded, &mut relative_path).is_none() {
+        let mounted_owns = nt_fs::mounted_volume_owns_installed_names(route, journal_owned);
+        let installed = nt_fs::nt_path_to_volume_relative(name, crate::installed_layout::ROOT)
+            .is_some();
+        if installed && !mounted_owns {
+            return None;
+        }
+        let resolved = driver_launch::resolve_hosted_device_file_name(
+            name, object_attributes & 0x40 != 0,
+        );
+        if !nt_fs::absolute_file_routes_to_mounted_volume(
+            false, Self::absolute_file_name(name, Some(&resolved)), route, journal_owned,
+        ) {
+            if !mounted_owns { return None; }
             smss_attribute_probe_trace::trace_smss_attribute_resolution(
                 self.pi, self.current_tid, name, None, nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
             );
@@ -95,9 +105,11 @@ impl ExecNtHandler {
                 return Some(STATUS_DEVICE_NOT_READY);
             }
         };
-        let (resolved_device, relative) = match driver_launch::resolve_kernel_directory_file_name(
-            name, object_attributes & 0x40 != 0,
-        ) {
+        let registered = resolved.and_then(|(device, relative)| {
+            driver_launch::require_registered_kernel_filesystem_device(device)?;
+            Ok((device, relative))
+        });
+        let (resolved_device, relative) = match registered {
             Ok(target) => target,
             Err(status) => {
                 smss_attribute_probe_trace::trace_smss_attribute_resolution(
@@ -122,7 +134,7 @@ impl ExecNtHandler {
     }
 
     /// Query a validated target on the exact mounted File device. The caller owns the
-    /// namespace or legacy-directory identity proof before entering this retained IRP path.
+    /// namespace identity proof before entering this retained IRP path.
     pub(super) unsafe fn query_mounted_attributes_on_target(
         &mut self,
         device_id: u64,

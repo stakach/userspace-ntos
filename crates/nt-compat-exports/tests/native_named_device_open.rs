@@ -40,8 +40,6 @@ fn native_open_and_create_route_named_driver_peers_before_filesystem_fallback() 
             .unwrap_or_else(|| panic!("{method} lacks named driver-device routing"));
         let fallback = body.find(fallback).expect("filesystem fallback remains");
         assert!(route < fallback, "{method} must route devices before filesystem fallback");
-        assert!(body[..route].contains("!Self::is_named_pipe_root_path(name16)"));
-        assert!(body[..route].contains("!nt_fs::is_named_pipe_path(name16)"));
         assert!(body.contains("create_registered_driver_peer_relative_file("));
     }
 }

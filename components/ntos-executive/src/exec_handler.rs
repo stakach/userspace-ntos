@@ -15,7 +15,6 @@ static PNP_DEVICE_STATUS_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PNP_DEVICE_STATUS_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // Diagnostic only: identify any legacy FAT lookup attempted after the boot route drains.
 // Each call site has its own small budget so a noisy query cannot hide an open.
-static SYNC_FAT_HANDOFF_TRACE_N: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 // Diagnostic only: one bounded trace of the failed DLL opens across the
 // namespace decision and the canonical File CREATE result.
 static WINLOGON_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -107,74 +106,6 @@ fn trace_winlogon_open(
     print_str(b" name=\"");
     print_sanitized_utf16_ascii(name, 128);
     print_str(b"\"\n");
-}
-
-fn print_exact_path_bytes(bytes: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = [0u8; 320];
-    let len = bytes.len().min(160);
-    for (i, &byte) in bytes[..len].iter().enumerate() {
-        out[i * 2] = HEX[(byte >> 4) as usize];
-        out[i * 2 + 1] = HEX[(byte & 0x0f) as usize];
-    }
-    print_str(&out[..len * 2]);
-}
-
-fn print_exact_path_units(units: &[u16]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = [0u8; 640];
-    let len = units.len().min(160);
-    for (i, &unit) in units[..len].iter().enumerate() {
-        out[i * 4] = HEX[((unit >> 12) & 0x0f) as usize];
-        out[i * 4 + 1] = HEX[((unit >> 8) & 0x0f) as usize];
-        out[i * 4 + 2] = HEX[((unit >> 4) & 0x0f) as usize];
-        out[i * 4 + 3] = HEX[(unit & 0x0f) as usize];
-    }
-    print_str(&out[..len * 4]);
-}
-
-fn trace_sync_fat_after_handoff(
-    site: usize,
-    label: &[u8],
-    pi: usize,
-    tid: u64,
-    parent: Option<(u32, u32, &[u8])>,
-    name: &[u16],
-) {
-    let route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
-        .and_then(crate::fs_loader::exec_block_route_kind);
-    let route_label: &[u8] = match route {
-        Some(nt_fs::BlockSourceKind::Draining) => b"draining",
-        Some(nt_fs::BlockSourceKind::Native) => b"native",
-        _ => return,
-    };
-    let count = SYNC_FAT_HANDOFF_TRACE_N[site].fetch_add(1, Ordering::Relaxed);
-    if count >= 4 { return; }
-    print_str(b"[sync-fat-after-handoff] site=");
-    print_str(label);
-    print_str(b" n=");
-    print_u64(count + 1);
-    print_str(b" route=");
-    print_str(route_label);
-    print_str(b" pi/tid=");
-    print_u64(pi as u64);
-    print_str(b"/");
-    print_u64(tid);
-    if let Some((object_id, first_cluster, path)) = parent {
-        print_str(b" parent-id/cluster=");
-        print_u64(object_id as u64);
-        print_str(b"/");
-        print_u64(first_cluster as u64);
-        print_str(b" parent-bytes=");
-        print_u64(path.len() as u64);
-        print_str(b" parent-hex=");
-        print_exact_path_bytes(path);
-    }
-    print_str(b" name-units=");
-    print_u64(name.len() as u64);
-    print_str(b" name16-hex=");
-    print_exact_path_units(name);
-    print_str(b"\n");
 }
 
 #[path = "native_job_bodies.rs"]
@@ -10523,23 +10454,32 @@ impl ExecNtHandler {
         Ok(handle as u64)
     }
 
-    // Once boot storage starts draining, or a registry journal owns the overlay, all opens on
-    // its physical volume must retain a mounted File request. An exact volume File retains the
-    // mounted filesystem owner even while the ordinary file route is still Boot/local.
+    /// Classify an absolute name for the shared nt-fs mounted-volume route contract.
+    fn absolute_file_name(
+        name16: &[u16],
+        resolved: Option<&Result<(u64, alloc::vec::Vec<u16>), u32>>,
+    ) -> nt_fs::AbsoluteFileName {
+        nt_fs::AbsoluteFileName {
+            target: nt_fs::ResolvedFileTarget::classify(resolved, |device_id| {
+                driver_launch::require_registered_kernel_filesystem_device(device_id).is_ok()
+            }),
+            installed_volume_spelling:
+                nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT).is_some(),
+        }
+    }
+
     fn route_absolute_open_to_kernel_file(
         name16: &[u16],
         open_options: u32,
         mount_route: Option<nt_fs::BlockSourceKind>,
         resolved: Option<&Result<(u64, alloc::vec::Vec<u16>), u32>>,
     ) -> bool {
-        open_options & nt_fs::FILE_DIRECTORY_FILE != 0
-            || crate::exec_volume_open_route::route_exact_volume_file_target(
-                resolved,
-                |device_id| driver_launch::require_registered_kernel_filesystem_device(device_id).is_ok(),
-            )
-            || ((matches!(mount_route, Some(nt_fs::BlockSourceKind::Draining | nt_fs::BlockSourceKind::Native))
-                || crate::writable_fs::registry_journal::owns_volume())
-                && nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT).is_some())
+        nt_fs::absolute_file_routes_to_mounted_volume(
+            open_options & nt_fs::FILE_DIRECTORY_FILE != 0,
+            Self::absolute_file_name(name16, resolved),
+            mount_route,
+            crate::writable_fs::registry_journal::owns_volume(),
+        )
     }
 
     fn readonly_disk_open_entry(
@@ -10875,8 +10815,6 @@ impl ExecNtHandler {
                 if let Err(status) = overlay_lookup {
                     return (status, 0, 0);
                 }
-                trace_sync_fat_after_handoff(6, b"relative-open-fat", self.pi,
-                    self.current_tid as u64, Some((object_id, first_cluster, &parent_path[..parent_len])), name16);
                 let fat_entry = exec_fs().and_then(|fs| {
                     crate::fs_loader::fat_open_path_metadata_from(&fs, first_cluster, relative)
                 });
@@ -24595,50 +24533,6 @@ impl ExecNtHandler {
         Ok(length)
     }
 
-    /// A legacy FAT directory has no mounted File id. Rebind its validated path to
-    /// the registered File device for the same physical mount after handoff.
-    fn mounted_target_for_legacy_fat_child(
-        &self,
-        root: FileParseRoot,
-        name: &[u16],
-        output: &mut [u16],
-    ) -> Result<Option<(u64, usize)>, u32> {
-        let FileParseRoot::FatDirectory { first_cluster, object_id } = root else {
-            return Ok(None);
-        };
-        let open = self.directory_opens.get(object_id)?;
-        if open.first_cluster != first_cluster {
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        let mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
-            .ok_or(STATUS_DEVICE_NOT_READY)?;
-        if open.physical_mount() != Some(mount.value()) {
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        let route = crate::fs_loader::exec_block_route_kind(mount)
-            .ok_or(STATUS_DEVICE_NOT_READY)?;
-        if route == nt_fs::BlockSourceKind::Boot {
-            return Ok(None);
-        }
-        let device_id = crate::mounted_volume::exec_volume_device()
-            .ok_or(STATUS_DEVICE_NOT_READY)?;
-        driver_launch::require_registered_kernel_filesystem_device(device_id)?;
-        let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
-        let mut relative = [0u8; FILE_OBJECT_NAME_CAP];
-        let length = Self::capture_relative_file_path(name, &mut folded, &mut relative)?;
-        let mut full_path = [0u8; nt_fs::DIRECTORY_OPEN_PATH_CAP];
-        let full_len = Self::join_volume_relative_path(
-            open.volume_relative_path(), &relative[..length], &mut full_path,
-        )?;
-        if full_len > output.len() {
-            return Err(STATUS_OBJECT_NAME_INVALID);
-        }
-        for (unit, &byte) in output[..full_len].iter_mut().zip(&full_path[..full_len]) {
-            *unit = byte as u16;
-        }
-        Ok(Some((device_id, full_len)))
-    }
-
     fn decode_set_file_name_units(file_name: &[u8], output: &mut [u16]) -> Result<usize, u32> {
         if file_name.is_empty() || file_name.len() & 1 != 0 || file_name.len() / 2 > output.len() {
             return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
@@ -24813,8 +24707,6 @@ impl ExecNtHandler {
                 )? {
                     return Ok(info);
                 }
-                trace_sync_fat_after_handoff(7, b"relative-query-fat", self.pi,
-                    self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name);
                 let Some(entry) = exec_fs().and_then(|fs| {
                     crate::fs_loader::fat_open_path_metadata_from(&fs, first_cluster, relative)
                 }) else {
@@ -32224,25 +32116,6 @@ impl ExecNtHandler {
             self.pi, self.current_tid, name16, matches!(parse_root, FileParseRoot::Absolute),
         );
         if !matches!(parse_root, FileParseRoot::Absolute) {
-            if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
-                let mut mounted_name = [0u16; nt_fs::DIRECTORY_OPEN_PATH_CAP];
-                match self.mounted_target_for_legacy_fat_child(
-                    parse_root, name16, &mut mounted_name,
-                ) {
-                    Ok(Some((device_id, length))) => {
-                        return self.query_mounted_attributes_on_target(
-                            device_id, &mounted_name[..length], captured.attributes,
-                            nt_fs::FILE_BASIC_INFORMATION, args[1],
-                        ).unwrap_or(STATUS_DEVICE_NOT_READY);
-                    }
-                    Ok(None) => {}
-                    Err(status) => return status,
-                }
-                if let Ok(open) = self.directory_opens.get(object_id) {
-                    trace_sync_fat_after_handoff(2, b"relative-attr-caller", self.pi,
-                        self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);
-                }
-            }
             let info = match unsafe { self.query_local_file_relative(parse_root, name16) } {
                 Ok(info) => info,
                 Err(status) => return status,
@@ -32253,18 +32126,13 @@ impl ExecNtHandler {
                 STATUS_ACCESS_VIOLATION
             };
         }
-        if crate::writable_fs::registry_journal::owns_volume() {
-            let folded = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
-            let relative = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_RELATIVE_SCRATCH) };
-            if crate::writable_fs::volume_path_into(name16, folded, relative).is_some() {
-                return self.query_native_mounted_attributes(
-                    name16, captured.attributes, nt_fs::FILE_BASIC_INFORMATION, args[1],
-                ).unwrap_or(STATUS_DEVICE_NOT_READY);
-            }
-        }
-        // The writable overlay wins for paths it owns. A miss is not enough to hide an installed
-        // read-only file that has not been modified yet, so unresolved prefix paths continue into
-        // the FAT lookup below.
+        // Once the mounted Device owns the name, its CREATE/QUERY is the only implementation.
+        if let Some(status) = self.query_native_mounted_attributes(
+            name16, captured.attributes, nt_fs::FILE_BASIC_INFORMATION, args[1],
+        ) { return status; }
+        // Boot loader reader: the writable overlay wins for paths it owns. A miss is not enough
+        // to hide an installed read-only file that has not been modified yet, so unresolved
+        // prefix paths continue into the FAT lookup below.
         let folded_scratch = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
         let relative_scratch =
             unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_RELATIVE_SCRATCH) };
@@ -32302,13 +32170,8 @@ impl ExecNtHandler {
                 };
             }
         }
-        if let Some(status) = self.query_native_mounted_attributes(
-            name16, captured.attributes, nt_fs::FILE_BASIC_INFORMATION, args[1],
-        ) { return status; }
         // General read-only namespace lookup. This is intentionally below the writable mount so
         // Profile paths stay overlay-backed; all remaining names resolve through mounted FAT.
-        trace_sync_fat_after_handoff(3, b"absolute-attr-fat", self.pi,
-            self.current_tid as u64, None, name16);
         if let Some(info) =
             crate::fs_loader::query_nt_path_metadata_into(name16, folded_scratch, relative_scratch)
         {
@@ -32381,25 +32244,6 @@ impl ExecNtHandler {
             self.pi, self.current_tid, name16, matches!(parse_root, FileParseRoot::Absolute),
         );
         if !matches!(parse_root, FileParseRoot::Absolute) {
-            if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
-                let mut mounted_name = [0u16; nt_fs::DIRECTORY_OPEN_PATH_CAP];
-                match self.mounted_target_for_legacy_fat_child(
-                    parse_root, name16, &mut mounted_name,
-                ) {
-                    Ok(Some((device_id, length))) => {
-                        return self.query_mounted_attributes_on_target(
-                            device_id, &mounted_name[..length], captured.attributes,
-                            nt_fs::FILE_NETWORK_OPEN_INFORMATION, args[1],
-                        ).unwrap_or(STATUS_DEVICE_NOT_READY);
-                    }
-                    Ok(None) => {}
-                    Err(status) => return status,
-                }
-                if let Ok(open) = self.directory_opens.get(object_id) {
-                    trace_sync_fat_after_handoff(4, b"relative-full-attr-caller", self.pi,
-                        self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);
-                }
-            }
             let info = match unsafe { self.query_local_file_relative(parse_root, name16) } {
                 Ok(info) => info,
                 Err(status) => return status,
@@ -32411,15 +32255,10 @@ impl ExecNtHandler {
             };
         }
 
-        if crate::writable_fs::registry_journal::owns_volume() {
-            let folded = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
-            let relative = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_RELATIVE_SCRATCH) };
-            if crate::writable_fs::volume_path_into(name16, folded, relative).is_some() {
-                return self.query_native_mounted_attributes(
-                    name16, captured.attributes, nt_fs::FILE_NETWORK_OPEN_INFORMATION, args[1],
-                ).unwrap_or(STATUS_DEVICE_NOT_READY);
-            }
-        }
+        // Once the mounted Device owns the name, its CREATE/QUERY is the only implementation.
+        if let Some(status) = self.query_native_mounted_attributes(
+            name16, captured.attributes, nt_fs::FILE_NETWORK_OPEN_INFORMATION, args[1],
+        ) { return status; }
 
         let folded_scratch = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
         let relative_scratch =
@@ -32459,11 +32298,6 @@ impl ExecNtHandler {
             }
         }
 
-        if let Some(status) = self.query_native_mounted_attributes(
-            name16, captured.attributes, nt_fs::FILE_NETWORK_OPEN_INFORMATION, args[1],
-        ) { return status; }
-        trace_sync_fat_after_handoff(5, b"absolute-full-attr-fat", self.pi,
-            self.current_tid as u64, None, name16);
         if let Some(info) =
             crate::fs_loader::query_nt_path_metadata_into(name16, folded_scratch, relative_scratch)
         {
@@ -32728,26 +32562,6 @@ impl ExecNtHandler {
                 );
                 return publication.status;
             }
-            if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
-                let mut mounted_name = [0u16; nt_fs::DIRECTORY_OPEN_PATH_CAP];
-                match self.mounted_target_for_legacy_fat_child(
-                    parse_root, name16, &mut mounted_name,
-                ) {
-                    Ok(Some((device_id, length))) => {
-                        return self.create_registered_file_from_target(
-                            Ok((device_id, None, Some(&mounted_name[..length]))),
-                            name16, captured.attributes, desired_access, share_access,
-                            nt_fs::FILE_OPEN, 0, open_options, &[], file_handle_out, args[3],
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(status) => return status,
-                }
-                if let Ok(open) = self.directory_opens.get(object_id) {
-                    trace_sync_fat_after_handoff(1, b"relative-open-caller", self.pi,
-                        self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);
-                }
-            }
             let (status, information, handle) = self.create_local_file_relative(
                 parse_root,
                 name16,
@@ -32785,11 +32599,13 @@ impl ExecNtHandler {
             );
             return status;
         }
-        if !Self::is_named_pipe_root_path(name16) && !nt_fs::is_named_pipe_path(name16) {
-            let owned_resolution = resolved.is_none().then(||
-                driver_launch::resolve_hosted_device_file_name(
-                    name16, captured.attributes & 0x40 != 0));
-            let resolved = resolved.unwrap_or_else(|| owned_resolution.as_ref().unwrap());
+        // One exact Object Manager resolution serves peer classification and the mounted route.
+        let named_pipe = Self::is_named_pipe_root_path(name16) || nt_fs::is_named_pipe_path(name16);
+        let owned_resolution = (!named_pipe && resolved.is_none()).then(||
+            driver_launch::resolve_hosted_device_file_name(
+                name16, captured.attributes & 0x40 != 0));
+        let resolved = resolved.or(owned_resolution.as_ref());
+        if let Some(resolved) = resolved.filter(|_| !named_pipe) {
             if let Some(status) = self.create_registered_driver_peer_file_from_resolved(
                 resolved,
                 name16,
@@ -32914,10 +32730,6 @@ impl ExecNtHandler {
                 print_sanitized_utf16_ascii(name16, 128);
                 print_str(b"\"\n");
             }
-            let owned_resolution = resolved.is_none().then(||
-                driver_launch::resolve_hosted_device_file_name(
-                    name16, captured.attributes & 0x40 != 0));
-            let resolved = resolved.or(owned_resolution.as_ref());
             let status = self.create_registered_kernel_file_from_resolved(
                 parse_root, resolved,
                 name16,
@@ -39705,18 +39517,26 @@ impl ExecNtHandler {
                 let result = {
                     let _transient = allocator::enter_transient();
                     let mut entry_count = 0usize;
-                    fat_visit_directory(&fs, first_cluster, |_, _first_cluster| {
-                        entry_count = entry_count.saturating_add(1);
-                        true
-                    });
+                    if let Err(status) = crate::fs_loader::fat_visit_directory_checked(
+                        &fs, first_cluster, |_, _first_cluster| {
+                            entry_count = entry_count.saturating_add(1);
+                            true
+                        },
+                    ) {
+                        return status;
+                    }
                     let mut entries = alloc::vec::Vec::new();
                     if entries.try_reserve_exact(entry_count).is_err() {
                         return STATUS_INSUFFICIENT_RESOURCES;
                     }
-                    fat_visit_directory(&fs, first_cluster, |entry, _first_cluster| {
-                        entries.push(entry);
-                        true
-                    });
+                    if let Err(status) = crate::fs_loader::fat_visit_directory_checked(
+                        &fs, first_cluster, |entry, _first_cluster| {
+                            entries.push(entry);
+                            true
+                        },
+                    ) {
+                        return status;
+                    }
                     if let Err(status) = self.begin_local_file_io(file_object) {
                         return status;
                     }

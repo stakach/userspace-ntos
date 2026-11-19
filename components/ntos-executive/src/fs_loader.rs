@@ -333,7 +333,6 @@ pub(crate) fn print_direct_read_census_once() {
     for (callsite, label) in [
         (nt_ahci::FatOneSectorCallsite::PathDirectory, b" path=".as_slice()),
         (nt_ahci::FatOneSectorCallsite::CheckedDirectory, b" checked=".as_slice()),
-        (nt_ahci::FatOneSectorCallsite::LegacyDirectory, b" legacy=".as_slice()),
         (nt_ahci::FatOneSectorCallsite::ShortDirectory, b" short=".as_slice()),
         (nt_ahci::FatOneSectorCallsite::Directory, b" other=".as_slice()),
     ] {
@@ -560,8 +559,8 @@ unsafe fn fat_next_checked(fs: &Fat32, cluster: u32) -> Result<u32, u32> {
     Ok(value & 0x0FFF_FFFF)
 }
 
-/// Checked directory traversal for provider queries. Unlike the legacy visitor, an unreadable
-/// sector or malformed cluster chain cannot be mistaken for a complete directory listing.
+/// Checked directory traversal, the executive's only FAT directory enumeration. An unreadable
+/// sector or malformed cluster chain is an error, never mistaken for a complete listing.
 pub(crate) unsafe fn fat_visit_directory_checked(
     fs: &Fat32,
     dir_cluster: u32,
@@ -585,64 +584,6 @@ pub(crate) unsafe fn fat_visit_directory_checked(
         |cluster| fat_next_checked(fs, cluster),
         |record| visit(record.entry, record.first_cluster),
     )
-}
-
-/// Visit native directory entries in stable FAT stream order. LFN fragments are decoded by the
-/// pure `nt-fs` parser after copying each DMA-backed slot to local storage.
-pub(crate) unsafe fn fat_visit_directory(
-    fs: &Fat32,
-    dir_cluster: u32,
-    mut visit: impl FnMut(nt_fs::DirectoryEntry, u32) -> bool,
-) {
-    let mut decoder = nt_fs::FatDirectoryDecoder::new();
-    let cluster_bytes = fs.bps.saturating_mul(fs.spc);
-    let mut file_index = 0u32;
-    let mut cluster = dir_cluster;
-    let max_clusters = if fs.spc == 0 {
-        0
-    } else {
-        (fs.total_sectors / fs.spc).min(4096)
-    };
-    let mut clusters_seen = 0u32;
-    while cluster >= 2 && cluster < 0x0fff_fff8 {
-        if clusters_seen >= max_clusters {
-            print_str(b"[fat-dir] visitor chain overrun cluster=");
-            print_u64(dir_cluster as u64);
-            print_str(b"\n");
-            return;
-        }
-        clusters_seen += 1;
-        for sector in 0..fs.spc {
-            let data = match fat_read_sector_checked(
-                fs,
-                fat_cluster_sector(fs, cluster) + sector,
-                nt_ahci::FatOneSectorCallsite::LegacyDirectory,
-            ) {
-                Some(data) => data,
-                None => return,
-            };
-            for index in 0..(fs.bps as usize / 32) {
-                let mut slot = [0u8; 32];
-                core::ptr::copy_nonoverlapping(data.add(index * 32), slot.as_mut_ptr(), slot.len());
-                match decoder.consume(&slot, file_index, cluster_bytes) {
-                    nt_fs::FatDirectorySlot::End => return,
-                    nt_fs::FatDirectorySlot::Skipped => {}
-                    nt_fs::FatDirectorySlot::Entry(record) => {
-                        let record = record.with_parent_cluster(dir_cluster);
-                        if !visit(record.entry, record.first_cluster) {
-                            return;
-                        }
-                    }
-                }
-                file_index = file_index.saturating_add(32);
-            }
-        }
-        let next = fat_next(fs, cluster);
-        if next == cluster {
-            return;
-        }
-        cluster = next;
-    }
 }
 
 fn component_has_separator(name: &[u8]) -> bool {
@@ -716,9 +657,10 @@ fn fat_names_equal_ignore_ascii_case(left: &[u16], right: &[u16]) -> bool {
         })
 }
 
-unsafe fn system32_cache_candidate_count(fs: &Fat32, system32_cluster: u32) -> usize {
+/// A partial directory listing is not a cache: any read or chain error fails the build.
+unsafe fn system32_cache_candidate_count(fs: &Fat32, system32_cluster: u32) -> Option<usize> {
     let mut count = 0usize;
-    fat_visit_directory(fs, system32_cluster, |record, _first_cluster| {
+    fat_visit_directory_checked(fs, system32_cluster, |record, _first_cluster| {
         let mut scratch = [0u8; SYSTEM32_CACHE_NAME_CAP];
         count = count.saturating_add(system32_cache_count_name(record.name(), &mut scratch));
         if !record.short_name().is_empty()
@@ -728,8 +670,9 @@ unsafe fn system32_cache_candidate_count(fs: &Fat32, system32_cluster: u32) -> u
                 count.saturating_add(system32_cache_count_name(record.short_name(), &mut scratch));
         }
         true
-    });
-    count
+    })
+    .ok()?;
+    Some(count)
 }
 
 unsafe fn system32_cache_build(fs: &Fat32) -> bool {
@@ -747,7 +690,9 @@ unsafe fn system32_cache_build(fs: &Fat32) -> bool {
     }
     let system32_cluster = system32.first_cluster;
 
-    let needed = system32_cache_candidate_count(fs, system32_cluster);
+    let Some(needed) = system32_cache_candidate_count(fs, system32_cluster) else {
+        return false;
+    };
     let Some(cache) = system32_cache_entries_mut(needed) else {
         return false;
     };
@@ -756,7 +701,7 @@ unsafe fn system32_cache_build(fs: &Fat32) -> bool {
     }
     system32_cache_state_write(SYSTEM32_CACHE_STATE_OVERFLOW, 0);
     let mut next = 0usize;
-    fat_visit_directory(fs, system32_cluster, |record, first_cluster| {
+    let walked = fat_visit_directory_checked(fs, system32_cluster, |record, first_cluster| {
         let file = FatOpenMetadata::from_record(nt_fs::FatDirectoryRecord {
             entry: record,
             first_cluster,
@@ -775,6 +720,9 @@ unsafe fn system32_cache_build(fs: &Fat32) -> bool {
         }
         true
     });
+    if walked.is_err() {
+        return false;
+    }
     system32_cache_state_write(SYSTEM32_CACHE_STATE_COUNT, next as u64);
     print_str(b"[fat-cache] system32 entries=");
     print_u64(next as u64);

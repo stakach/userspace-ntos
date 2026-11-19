@@ -185,7 +185,6 @@ pub enum FatOneSectorCallsite {
     Directory,
     PathDirectory,
     CheckedDirectory,
-    LegacyDirectory,
     ShortDirectory,
     FilePayload,
     Other,
@@ -196,7 +195,7 @@ impl FatOneSectorCallsite {
         match self {
             Self::FatLink => 0,
             Self::Directory | Self::PathDirectory | Self::CheckedDirectory
-                | Self::LegacyDirectory | Self::ShortDirectory => 1,
+                | Self::ShortDirectory => 1,
             Self::FilePayload => 2,
             Self::Other => 3,
         }
@@ -206,9 +205,8 @@ impl FatOneSectorCallsite {
         match self {
             Self::PathDirectory => Some(0),
             Self::CheckedDirectory => Some(1),
-            Self::LegacyDirectory => Some(2),
-            Self::ShortDirectory => Some(3),
-            Self::Directory => Some(4),
+            Self::ShortDirectory => Some(2),
+            Self::Directory => Some(3),
             _ => None,
         }
     }
@@ -275,7 +273,7 @@ pub struct DirectReadCensus {
     fat: [DirectReadCounters; 4],
     snapshot: [DirectReadCounters; 4],
     fat_one_sector: [AtomicU64; 4],
-    fat_directory: [AtomicU64; 5],
+    fat_directory: [AtomicU64; 4],
 }
 
 impl DirectReadCensus {
@@ -294,7 +292,7 @@ impl DirectReadCensus {
                 DirectReadCounters::new(),
             ],
             fat_one_sector: [const { AtomicU64::new(0) }; 4],
-            fat_directory: [const { AtomicU64::new(0) }; 5],
+            fat_directory: [const { AtomicU64::new(0) }; 4],
         }
     }
 

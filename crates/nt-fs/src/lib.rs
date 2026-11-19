@@ -58,6 +58,7 @@ mod file_delta_wal_payload;
 mod snapshot_test_device;
 mod status;
 mod volume;
+mod volume_open_route;
 
 pub use byte_lock::*;
 pub use boot_paths::*;
@@ -117,6 +118,10 @@ pub use path::{
     DOS_DRIVE_FIXED, MEMFS_VOLUME,
 };
 pub use query::*;
+pub use volume_open_route::{
+    absolute_file_routes_to_mounted_volume, mounted_volume_owns_installed_names, AbsoluteFileName,
+    ResolvedFileTarget,
+};
 pub use snapshot_store::{
     AnchoredWalPublication, AsyncSnapshotCommit, AsyncSnapshotCommitError, AsyncSnapshotHeaderRecheck,
     AsyncSnapshotIoKind, AsyncSnapshotRequest, AsyncWalSnapshotAnchorUpdate, AsyncWalEpochRollover,

@@ -281,27 +281,6 @@ impl ExecNtHandler {
                     Err(status) => status,
                 };
             }
-            if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
-                let mut mounted_name = [0u16; nt_fs::DIRECTORY_OPEN_PATH_CAP];
-                match self.mounted_target_for_legacy_fat_child(
-                    parse_root, name16, &mut mounted_name,
-                ) {
-                    Ok(Some((device_id, length))) => {
-                        return self.create_registered_file_from_target(
-                            Ok((device_id, None, Some(&mounted_name[..length]))),
-                            name16, captured.attributes, desired_access, share_access,
-                            create_disposition, file_attributes, create_options, &ea,
-                            file_handle_out, iosb,
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(status) => return status,
-                }
-                if let Ok(open) = self.directory_opens.get(object_id) {
-                    trace_sync_fat_after_handoff(0, b"relative-create-caller", self.pi,
-                        self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);
-                }
-            }
             let (status, information, handle) = self.create_local_file_relative(
                 parse_root,
                 name16,
@@ -316,11 +295,13 @@ impl ExecNtHandler {
                 Err(status) => status,
             };
         }
-        if !Self::is_named_pipe_root_path(name16) && !nt_fs::is_named_pipe_path(name16) {
-            let owned_resolution = resolved.is_none().then(||
-                driver_launch::resolve_hosted_device_file_name(
-                    name16, captured.attributes & 0x40 != 0));
-            let resolved = resolved.unwrap_or_else(|| owned_resolution.as_ref().unwrap());
+        // One exact Object Manager resolution serves peer classification and the mounted route.
+        let named_pipe = Self::is_named_pipe_root_path(name16) || nt_fs::is_named_pipe_path(name16);
+        let owned_resolution = (!named_pipe && resolved.is_none()).then(||
+            driver_launch::resolve_hosted_device_file_name(
+                name16, captured.attributes & 0x40 != 0));
+        let resolved = resolved.or(owned_resolution.as_ref());
+        if let Some(resolved) = resolved.filter(|_| !named_pipe) {
             if let Some(status) = self.create_registered_driver_peer_file_from_resolved(
                 resolved,
                 name16,
@@ -337,37 +318,13 @@ impl ExecNtHandler {
                 return status;
             }
         }
-        if create_options & nt_fs::FILE_DIRECTORY_FILE != 0
-            && !Self::is_named_pipe_root_path(name16)
-            && !nt_fs::is_named_pipe_path(name16)
-        {
-            let owned_resolution = resolved.is_none().then(||
-                driver_launch::resolve_hosted_device_file_name(
-                    name16, captured.attributes & 0x40 != 0));
-            return self.create_registered_kernel_file_from_resolved(
-                parse_root, resolved.or(owned_resolution.as_ref()),
-                name16,
-                captured.attributes,
-                desired_access,
-                share_access,
-                create_disposition,
-                file_attributes,
-                create_options,
-                &ea,
-                file_handle_out,
-                iosb,
-            );
-        }
         let mount_route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
             .and_then(crate::fs_loader::exec_block_route_kind);
-        if create_options & nt_fs::FILE_DIRECTORY_FILE == 0
+        if !named_pipe
             && Self::route_absolute_open_to_kernel_file(name16, create_options, mount_route, resolved)
         {
-            let owned_resolution = resolved.is_none().then(||
-                driver_launch::resolve_hosted_device_file_name(
-                    name16, captured.attributes & 0x40 != 0));
             return self.create_registered_kernel_file_from_resolved(
-                parse_root, resolved.or(owned_resolution.as_ref()),
+                parse_root, resolved,
                 name16,
                 captured.attributes,
                 desired_access,

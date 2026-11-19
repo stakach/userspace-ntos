@@ -44206,17 +44206,6 @@ pub(crate) fn registered_dos_drive_type(target: &[u8]) -> Option<u8> {
     )
 }
 
-/// Resolve an absolute native directory name through the Object Manager, then require a live
-/// kernel-backed file-system Device. The returned name is device-relative FILE_OBJECT.FileName.
-pub(crate) fn resolve_kernel_directory_file_name(
-    name: &[u16],
-    case_insensitive: bool,
-) -> Result<(u64, alloc::vec::Vec<u16>), u32> {
-    let (device_id, relative) = resolve_hosted_device_file_name(name, case_insensitive)?;
-    require_registered_kernel_filesystem_device(device_id)?;
-    Ok((device_id, relative))
-}
-
 /// Resolve a native file name through the Object Manager to its exact published device.
 /// Dispatch policy belongs to the caller; this does not imply a filesystem device.
 pub(crate) fn resolve_hosted_device_file_name(

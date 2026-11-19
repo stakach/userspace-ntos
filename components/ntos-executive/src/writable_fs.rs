@@ -3007,7 +3007,7 @@ pub(crate) unsafe fn default_hive_bytes() -> Option<&'static [u8]> {
 
 /// MATERIALISE the ISO's staged `\Profiles` tree onto the writable volume.
 ///
-/// This is a real recursive copy off the READ-ONLY FAT volume — the same `fat_visit_directory` /
+/// This is a real recursive copy off the READ-ONLY FAT volume — the same checked directory walk /
 /// `dir_find_lfn` / `fat_read_file` reader every hosted binary is loaded with — into the writable
 /// volume's ordinary create surface. Every directory and every file byte comes from the image;
 /// nothing is invented. The result is then read back the way a hosted process reads it (by path,
@@ -3050,6 +3050,7 @@ struct StagedTreeStats {
     bytes: u64,
     skipped_large_files: u64,
     deferred_boot_hives: u64,
+    unreadable_dirs: u64,
 }
 
 fn is_deferred_boot_hive_source(relative: &[u8]) -> bool {
@@ -3077,10 +3078,10 @@ unsafe fn provision_staged_tree(
     stack.push((root_cluster, volume_root_relative.to_vec(), 0));
     let mut stats = StagedTreeStats::default();
     while let Some((cluster, base, depth)) = stack.pop() {
-        // Collect this directory's children first: `fat_visit_directory` and `dir_find_lfn` both
+        // Collect this directory's children first: the directory walk and `dir_find_lfn` both
         // drive the sector cache, so the names are captured before any further reads.
         let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-        crate::fs_loader::fat_visit_directory(fat, cluster, |entry, _first_cluster| {
+        let walked = crate::fs_loader::fat_visit_directory_checked(fat, cluster, |entry, _first_cluster| {
             let mut name = alloc::string::String::new();
             for &unit in entry.name() {
                 if unit == 0 || unit > 0x7f {
@@ -3093,6 +3094,11 @@ unsafe fn provision_staged_tree(
             }
             true
         });
+        if walked.is_err() {
+            // A partial listing is not the staged tree; report it instead of copying a subset.
+            stats.unreadable_dirs += 1;
+            continue;
+        }
         for name in names {
             let Some((child, size, child_attr)) =
                 crate::fs_loader::dir_find_lfn(fat, cluster, name.as_bytes())
@@ -3172,6 +3178,8 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     print_u64(stats.files);
     print_str(b" bytes=");
     print_u64(stats.bytes);
+    print_str(b" unreadable-dirs=");
+    print_u64(stats.unreadable_dirs);
     print_str(b" `Default User` dir-entries=");
     print_u64(PROFILE_SOURCE_ENTRIES.load(Ordering::Relaxed));
     print_str(b" probe-file-content-ok=");
@@ -3213,6 +3221,8 @@ unsafe fn provision_staged_config(fs: &mut nt_fs::FileSystem) {
     print_u64(stats.files);
     print_str(b" bytes=");
     print_u64(stats.bytes);
+    print_str(b" unreadable-dirs=");
+    print_u64(stats.unreadable_dirs);
     print_str(b" skipped-large=");
     print_u64(stats.skipped_large_files);
     print_str(b" deferred-boot-hives=");

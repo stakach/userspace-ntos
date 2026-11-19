@@ -104,8 +104,6 @@ static REGISTRY: Registry = Registry;
 enum LoaderOp { QueryAttributesFile }
 unsafe fn loader_trace_record(_: usize, _: LoaderOp, _: u32, _: Option<usize>, _: u64,
     _: u64, _: &[u8]) {}
-fn trace_sync_fat_after_handoff(_: usize, _: &[u8], _: usize, _: u64,
-    _: Option<(u32, u32, &[u8])>, _: &[u16]) {}
 fn print_str(_: &[u8]) {}
 fn debug_put_char(_: u8) {}
 
@@ -116,10 +114,6 @@ struct ExecNtHandler {
     current_tid: u64,
 }
 impl ExecNtHandler {
-    fn mounted_target_for_legacy_fat_child(&self, _: FileParseRoot, _: &[u16], _: &mut [u16])
-        -> Result<Option<(u64, usize)>, u32> {
-        panic!("absolute attribute query reached legacy directory target")
-    }
     unsafe fn query_mounted_attributes_on_target(&mut self, _: u64, _: &[u16], _: u32,
         _: u32, _: u64) -> Option<u32> {
         panic!("absolute attribute query reached relative target")

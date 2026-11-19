@@ -54,8 +54,7 @@ fn both_smss_attribute_services_observe_the_normalized_absolute_candidate() {
 fn mounted_target_observation_follows_exact_object_manager_resolution() {
     let resolve = between(ATTR, "unsafe fn query_native_mounted_attributes(",
         "unsafe fn query_mounted_attributes_on_target(");
-    assert!(resolve.contains("resolve_kernel_directory_file_name")
-        && resolve.contains("resolved_device != device_id"),
+    assert!(resolve.contains("resolved_device != device_id"),
         "mounted target must retain exact Object Manager and physical device checks");
     assert!(resolve.contains("Err(status) => {")
         && resolve.contains("trace_smss_attribute_resolution("),
