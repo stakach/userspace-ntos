@@ -2,6 +2,7 @@
 
 pub mod stack_vad;
 pub mod amd64_context;
+pub mod user_exception;
 mod aligned_context;
 pub use aligned_context::AlignedAmd64Context;
 
