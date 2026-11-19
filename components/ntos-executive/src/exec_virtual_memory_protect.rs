@@ -138,6 +138,9 @@ impl ExecNtHandler {
         }) {
             return nt_process::STATUS_PROCESS_IS_TERMINATING;
         }
+        if let Err(status) = hosted_private_allocation_prefix::admit_process_change(self, target_pi) {
+            return status;
+        }
         let Some(ctx) = self.loop_ctx else {
             return nt_process::STATUS_INVALID_HANDLE;
         };

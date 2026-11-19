@@ -7,7 +7,10 @@ pub(crate) unsafe fn csrss_frame_drop_process_all(
     handler: &ExecNtHandler,
 ) -> Result<u64, u32> {
     hosted_private_page_installation::drain_for_process(handler, process)?;
-    if !hosted_private_page_installation::process_available(pi) {
+    hosted_private_allocation_prefix::drain_for_process(handler, process)?;
+    if !hosted_private_page_installation::process_available(pi)
+        || !hosted_private_allocation_prefix::process_available(pi)
+    {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     let lifetime = nt_memory_manager::MemoryLifetime::Process(process);

@@ -582,6 +582,7 @@ pub(super) unsafe fn maintain(
         print_hex(status);
         print_str(b"\n");
     }
+    crate::hosted_private_allocation_prefix::retry_pending(&*nt_handler);
     crate::client_frame_cleanup::retry_pending(&*nt_handler);
     crate::pagefile_retirement::retry_pending(&*nt_handler);
     // CM retries run only between hosted events, never inside a timer callback or nested pump.

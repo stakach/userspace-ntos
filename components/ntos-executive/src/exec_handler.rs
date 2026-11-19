@@ -18130,6 +18130,7 @@ impl ExecNtHandler {
         let target_process = self
             .capture_process_identity(target_pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        hosted_private_allocation_prefix::admit_allocation(self)?;
         if allocation_type & nt_address_space::MEM_LARGE_PAGES != 0 {
             if !lock_memory_privilege {
                 return Err(STATUS_PRIVILEGE_NOT_HELD);
@@ -18271,8 +18272,14 @@ impl ExecNtHandler {
         // extent boundary on either side. Advance a run at a time and do the per-page work only
         // inside runs that actually became committed (or changed protection). Behaviour per page is
         // identical — only the number of lookups changes.
+        // Each accepted page effect enters the retained prefix before the next one runs, so a
+        // later failure reverses exactly what took effect, and an unsettled reversal stays owned.
+        hosted_private_allocation_prefix::begin(hosted_private_allocation_prefix::Target {
+            pi: target_pi,
+            process: target_process,
+            pml4: target.pml4,
+        })?;
         let mut page = plan.base;
-        let mut changed_end = plan.base;
         let mut map_status = 0u32;
         'commit: while page < region_end {
             let old = before.extent_at(page);
@@ -18297,81 +18304,66 @@ impl ExecNtHandler {
             }
             // A run must always advance, or a boundary exactly at `page` would spin forever.
             let run_end = run_end.max(page + 0x1000).min(region_end);
-            if new.is_some_and(|extent| extent.state == nt_address_space::VmExtentState::Committed)
+            if let Some(new) =
+                new.filter(|extent| extent.state == nt_address_space::VmExtentState::Committed)
             {
-                if old
-                    .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
-                {
-                    while page < run_end {
-                        if let Err(status) = vm_map_private_page(
-                            self,
-                            target_pi,
-                            page,
-                            new.unwrap().protection,
-                            target.pml4,
-                            target.scratch_base,
-                        ) {
-                            map_status = status;
-                            break 'commit;
-                        }
-                        page += 0x1000;
-                        changed_end = page;
+                let effect = match old {
+                    Some(old) if old.state == nt_address_space::VmExtentState::Committed => {
+                        (old.protection != new.protection).then_some(
+                            nt_memory_manager::private_allocation_prefix::PrefixEffect::Reprotected {
+                                old: old.protection,
+                                new: new.protection,
+                            },
+                        )
                     }
-                    continue;
-                } else if old.unwrap().protection != new.unwrap().protection {
+                    _ => Some(nt_memory_manager::private_allocation_prefix::PrefixEffect::Mapped),
+                };
+                if let Some(effect) = effect {
                     while page < run_end {
-                        if let Err(status) = vm_reprotect_private_page(
-                            target_pi,
-                            target_process,
-                            page,
-                            old.unwrap().protection,
-                            new.unwrap().protection,
-                            target.pml4,
-                        ) {
+                        let result = hosted_private_allocation_prefix::apply(page, effect, || {
+                            match effect {
+                                nt_memory_manager::private_allocation_prefix::PrefixEffect::Mapped => {
+                                    vm_map_private_page(
+                                        self,
+                                        target_pi,
+                                        page,
+                                        new.protection,
+                                        target.pml4,
+                                        target.scratch_base,
+                                    )
+                                }
+                                nt_memory_manager::private_allocation_prefix::PrefixEffect::Reprotected {
+                                    old,
+                                    new,
+                                } => vm_reprotect_private_page(
+                                    target_pi,
+                                    target_process,
+                                    page,
+                                    old,
+                                    new,
+                                    target.pml4,
+                                ),
+                            }
+                        });
+                        if let Err(status) = result {
                             map_status = status;
                             break 'commit;
                         }
                         page += 0x1000;
-                        changed_end = page;
                     }
                     continue;
                 }
             }
             // Nothing to do across this whole run (reserved, unchanged, or outside any extent).
             page = run_end;
-            changed_end = page;
         }
         if map_status != 0 {
-            page = plan.base;
-            while page < changed_end {
-                let old = before.extent_at(page);
-                let new = after.extent_at(page);
-                if old
-                    .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
-                    && new.is_some_and(|extent| {
-                        extent.state == nt_address_space::VmExtentState::Committed
-                    })
-                {
-                    let _ = vm_unmap_private_page(target_pi, target_process, page, self);
-                } else if let (Some(old), Some(new)) = (old, new) {
-                    if old.state == nt_address_space::VmExtentState::Committed
-                        && new.state == nt_address_space::VmExtentState::Committed
-                        && old.protection != new.protection
-                    {
-                        let _ = vm_reprotect_private_page(
-                            target_pi,
-                            target_process,
-                            page,
-                            new.protection,
-                            old.protection,
-                            target.pml4,
-                        );
-                    }
-                }
-                page += 0x1000;
-            }
-            return Err(map_status);
+            // The VAD and commit charge remain those before this request. A rollback that has not
+            // settled stays retained and fences this process's VM changes and retirement.
+            let outcome = hosted_private_allocation_prefix::fail(self, map_status);
+            return Err(outcome.status());
         }
+        hosted_private_allocation_prefix::commit();
         *vm_map = *after;
         self.commit_process_commit_charge(prepared_commit);
         Ok((plan, created_vad))
@@ -18700,6 +18692,7 @@ impl ExecNtHandler {
         let Some(target_process) = self.capture_process_identity(target_pi) else {
             return Err(nt_process::STATUS_INVALID_HANDLE);
         };
+        hosted_private_allocation_prefix::admit_process_change(self, target_pi)?;
         let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
             return Err(nt_process::STATUS_INVALID_HANDLE);
         };

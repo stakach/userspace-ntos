@@ -8360,6 +8360,7 @@ fn client_frame_registry_stats() -> ClientFrameRegistryStats {
 fn client_frame_registry_process_is_empty(pi: u64) -> bool {
     temporary_frame_alias::process_available(pi)
         && hosted_private_page_installation::process_available(pi)
+        && hosted_private_allocation_prefix::process_available(pi)
         && exec_handler::private_residency::memory_available(pi, 0, USER_ADDRESS_LIMIT)
         && unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).is_process_empty(pi) }
 }
@@ -14712,6 +14713,7 @@ mod thread_mechanism_retirement;
 mod ps_object_backing;
 mod frame_acquisition;
 mod hosted_private_page_installation;
+mod hosted_private_allocation_prefix;
 mod native_image_residency;
 mod transition_page_restoration;
 mod user_image_paging;
