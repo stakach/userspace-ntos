@@ -84,6 +84,17 @@ pub unsafe fn bump(base: u64) -> u64 {
     unsafe { rd(base + hdr::BUMP).max(DATA_OFFSET) }
 }
 
+/// The arena offset the bump tail must reach for [`alloc`] to serve `size` from it. A heap
+/// over reserve-only memory passes its committed bytes as the arena size; when that refuses an
+/// allocation, the caller commits up to this offset and retries.
+///
+/// # Safety
+/// `base` must be an initialized heap.
+pub unsafe fn tail_end(base: u64, size: u64) -> Option<u64> {
+    let want = size.checked_add(15).map(|value| (value & !15).max(MIN_CAPACITY))?;
+    unsafe { bump(base) }.checked_add(HEADER_SIZE)?.checked_add(want)
+}
+
 /// Capacity of the allocated block whose payload is `p`, or `None` if `p` is not one.
 ///
 /// # Safety
@@ -290,6 +301,31 @@ mod tests {
         fn alloc(&self, size: u64) -> u64 { unsafe { alloc(self.base(), self.bytes(), size, false) } }
         fn free(&self, p: u64) -> bool { unsafe { free(self.base(), self.bytes(), p) } }
         fn bump(&self) -> u64 { unsafe { bump(self.base()) } }
+    }
+
+    /// A heap over a reserve-only view uses its committed bytes as its arena size. Free blocks
+    /// below the bump offset are served without growth; the tail asks for exactly the offset
+    /// it needs, and nothing past the committed limit is ever written.
+    #[test]
+    fn a_committed_limit_bounds_the_tail_until_the_caller_commits_more() {
+        let arena = Arena::new(64 << 10);
+        let mut committed = 0x2000;
+        let first = unsafe { alloc(arena.base(), committed, 0x800, false) };
+        assert_ne!(first, 0);
+        let canary = arena.base() + committed;
+        unsafe { wr(canary, 0x5151) };
+        assert_eq!(unsafe { alloc(arena.base(), committed, 0x1000, false) }, 0);
+        let needed = unsafe { tail_end(arena.base(), 0x1000) }.unwrap();
+        assert_eq!(needed, DATA_OFFSET + 16 + 0x800 + 16 + 0x1000);
+        assert!(needed > committed);
+        assert_eq!(unsafe { rd(canary) }, 0x5151, "a refused tail allocation wrote nothing");
+        committed = (needed + 0xfff) & !0xfff;
+        let second = unsafe { alloc(arena.base(), committed, 0x1000, false) };
+        assert_ne!(second, 0);
+        assert!(second + 0x1000 <= arena.base() + committed);
+        // A freed block below the tail is reused without needing another commit.
+        assert!(unsafe { free(arena.base(), committed, first) });
+        assert_eq!(unsafe { alloc(arena.base(), committed, 0x800, false) }, first);
     }
 
     /// Boot 44416320584: the previous allocator kept one address-ordered free list and

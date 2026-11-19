@@ -4028,6 +4028,17 @@ unsafe fn component_pump_loop(
             pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
                 acknowledgement[0], acknowledgement[1], acknowledgement[2], acknowledgement[3]);
             continue;
+        } else if label == crate::win32k_subsystem::W32_SESSION_VIEW_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let (status, out1, out2, out3) = unsafe {
+                crate::win32k_session_views::service(
+                    ch, *reply_cap, msg.badge, msg.mi, [msg.m0, msg.m1, msg.m2, msg.m3],
+                )
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
+                status as u32 as u64, out1, out2, out3);
+            continue;
         } else if label == crate::win32k_subsystem::W32_USER_OBJECT_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
@@ -5774,6 +5785,9 @@ pub(crate) unsafe fn pump_service_vm_fault(
     }
     if let Some(mapped) = crate::component_heap::service_fault(ch, addr, fsr) { return mapped; }
     if let Some(mapped) = crate::win32k_subsystem::large_pool::service_fault(ch, addr, fsr) {
+        return mapped;
+    }
+    if let Some(mapped) = crate::win32k_session_views::service_fault(addr, fsr) {
         return mapped;
     }
     if crate::win32k_subsystem::is_reserved_win32k_video_aperture(addr) { return false; }

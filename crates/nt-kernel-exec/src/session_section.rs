@@ -22,7 +22,7 @@
 /// `MM_SESSION_SECTION` descriptor field offsets (a compact section object; not a Windows-ABI
 /// struct — it is win32k-opaque, only round-tripped through the `Mm*` trampolines).
 pub mod section_object {
-    /// `SIZE_T SizeBytes` — the section's committed size (rounded up to a page).
+    /// `SIZE_T SizeBytes` — the section's maximum size (rounded up to a page), reserved, not committed.
     pub const SIZE: usize = 0x00;
     /// `PVOID MappedBase` — the VA the section is mapped at (0 = not yet mapped). Assigned on the
     /// first `MmMapView*` and reused thereafter so kernel + per-process views stay coherent.
@@ -39,8 +39,10 @@ pub mod section_object {
     pub const REFERENCES: usize = 0x28;
     /// Exact provider-pool allocation generation recorded at registration.
     pub const GENERATION: usize = 0x30;
+    /// Generation of the reserved view recorded in `BASE` (0 = no backing yet).
+    pub const BACKING_GENERATION: usize = 0x38;
     /// Total descriptor size the caller must allocate.
-    pub const SIZE_OF: usize = 0x38;
+    pub const SIZE_OF: usize = 0x40;
 }
 
 /// Descriptor magic ("MmSeSeCt" truncated) — a live section descriptor created by [`init_section`].
@@ -68,6 +70,7 @@ pub unsafe fn init_section(desc: *mut u8, size: u64) {
     core::ptr::write_unaligned(desc.add(o::NEXT) as *mut u64, 0);
     core::ptr::write_unaligned(desc.add(o::REFERENCES) as *mut u64, 1);
     core::ptr::write_unaligned(desc.add(o::GENERATION) as *mut u64, 0);
+    core::ptr::write_unaligned(desc.add(o::BACKING_GENERATION) as *mut u64, 0);
 }
 
 /// Bind the descriptor to its exact native allocation before publishing it in the host list.
@@ -136,7 +139,7 @@ pub unsafe fn is_section(desc: *const u8) -> bool {
         && core::ptr::read_unaligned(desc.add(section_object::MAGIC) as *const u64) == SECTION_MAGIC
 }
 
-/// The section's committed size in bytes.
+/// The section's maximum size in bytes.
 ///
 /// # Safety
 /// `desc` must be a valid section descriptor (see [`is_section`]).
@@ -194,35 +197,48 @@ unsafe fn increment_map_count(desc: *mut u8) {
     );
 }
 
-/// Resolve the base to hand back for a `MmMapView*` of this section. If the section is not yet
-/// mapped, `alloc()` is invoked once to allocate `section_size` bytes of backing, the result is
-/// recorded, and every subsequent map returns that same base (coherent kernel + per-process views).
-/// A successful map increments the logical map count. Returns 0 if `alloc` failed.
+/// The generation of the reservation that backs this section (0 = no backing yet).
 ///
 /// # Safety
-/// `desc` must be a valid section descriptor; `alloc(size)` must return a base for `size` writable
-/// bytes (or 0 on failure).
-pub unsafe fn map_section(desc: *mut u8, alloc: impl FnOnce(u64) -> u64) -> u64 {
-    let existing = section_base(desc);
-    if existing != 0 {
-        increment_map_count(desc);
-        return existing;
+/// `desc` must be a valid section descriptor.
+pub unsafe fn section_backing_generation(desc: *const u8) -> u64 {
+    core::ptr::read_unaligned(desc.add(section_object::BACKING_GENERATION) as *const u64)
+}
+
+/// Record the reserved view `(base, generation)` as this section's one backing. Every later map
+/// returns that base, so kernel and per-process views stay coherent. Refused once backed.
+///
+/// # Safety
+/// `desc` must be a valid section descriptor.
+pub unsafe fn bind_section_backing(desc: *mut u8, base: u64, generation: u64) -> bool {
+    if base == 0 || generation == 0 || section_base(desc) != 0 {
+        return false;
     }
-    let base = alloc(section_size(desc));
+    core::ptr::write_unaligned(desc.add(section_object::BASE) as *mut u64, base);
+    core::ptr::write_unaligned(desc.add(section_object::BACKING_GENERATION) as *mut u64, generation);
+    true
+}
+
+/// A `MmMapView*` of this section: the backing base, with the logical map count incremented.
+/// Returns 0, mapping nothing, while the section has no backing ([`bind_section_backing`]).
+///
+/// # Safety
+/// `desc` must be a valid section descriptor.
+pub unsafe fn map_section(desc: *mut u8) -> u64 {
+    let base = section_base(desc);
     if base != 0 {
-        core::ptr::write_unaligned(desc.add(section_object::BASE) as *mut u64, base);
         increment_map_count(desc);
     }
     base
 }
 
-/// Unmap a logical view containing `addr`. When this removes the final logical map, the stored
-/// backing base is handed to `free()` and the descriptor becomes unmapped again.
+/// Unmap a logical view containing `addr`. The backing belongs to the Section, not to its views:
+/// committed pages survive the final unmap and are released only when the descriptor retires
+/// (see [`section_may_retire`]), so a later map observes the same contents.
 ///
 /// # Safety
-/// `desc` must be a valid section descriptor; `free(base)` must release a backing base previously
-/// returned by the `alloc` closure passed to [`map_section`].
-pub unsafe fn unmap_section(desc: *mut u8, addr: u64, free: impl FnOnce(u64) -> bool) -> bool {
+/// `desc` must be a valid section descriptor.
+pub unsafe fn unmap_section(desc: *mut u8, addr: u64) -> bool {
     if !section_contains_addr(desc, addr) {
         return false;
     }
@@ -230,17 +246,7 @@ pub unsafe fn unmap_section(desc: *mut u8, addr: u64, free: impl FnOnce(u64) -> 
     if count == 0 {
         return false;
     }
-    if count > 1 {
-        core::ptr::write_unaligned(desc.add(section_object::MAP_COUNT) as *mut u64, count - 1);
-        return true;
-    }
-
-    let base = section_base(desc);
-    if !free(base) {
-        return false;
-    }
-    core::ptr::write_unaligned(desc.add(section_object::BASE) as *mut u64, 0);
-    core::ptr::write_unaligned(desc.add(section_object::MAP_COUNT) as *mut u64, 0);
+    core::ptr::write_unaligned(desc.add(section_object::MAP_COUNT) as *mut u64, count - 1);
     true
 }
 
@@ -280,70 +286,53 @@ mod tests {
     fn map_is_idempotent_and_coherent() {
         let mut buf = [0u8; o::SIZE_OF];
         let desc = buf.as_mut_ptr();
-        let mut alloc_calls = 0;
         unsafe {
             init_section(desc, 0x4000);
-            let kernel_view = map_section(desc, |sz| {
-                alloc_calls += 1;
-                assert_eq!(sz, 0x4000);
-                0x1_0000
-            });
-            assert_eq!(kernel_view, 0x1_0000);
-            // A second map (the per-process view) must return the SAME base without re-allocating.
-            let user_view = map_section(desc, |_| {
-                alloc_calls += 1;
-                0xDEAD_0000
-            });
-            assert_eq!(user_view, 0x1_0000);
-            assert_eq!(alloc_calls, 1);
+            // Nothing is mapped until the section has its one reserved backing.
+            assert_eq!(map_section(desc), 0);
+            assert_eq!(section_map_count(desc), 0);
+            assert!(bind_section_backing(desc, 0x1_0000, 7));
+            assert_eq!(map_section(desc), 0x1_0000);
+            // A second map (the per-process view) returns the SAME base; the backing is fixed.
+            assert!(!bind_section_backing(desc, 0xDEAD_0000, 8));
+            assert_eq!(map_section(desc), 0x1_0000);
             assert_eq!(section_base(desc), 0x1_0000);
+            assert_eq!(section_backing_generation(desc), 7);
             assert_eq!(section_map_count(desc), 2);
         }
     }
 
     #[test]
-    fn unmap_counts_logical_views_and_frees_final_backing() {
+    fn unmap_counts_logical_views_and_the_backing_outlives_them() {
         let mut buf = [0u8; o::SIZE_OF];
         let desc = buf.as_mut_ptr();
-        let mut alloc_calls = 0;
-        let mut free_calls = 0;
         unsafe {
             init_section(desc, 0x4000);
-            assert_eq!(
-                map_section(desc, |_| {
-                    alloc_calls += 1;
-                    0x2_0000
-                }),
-                0x2_0000
-            );
-            assert_eq!(map_section(desc, |_| 0xDEAD_0000), 0x2_0000);
-
+            assert!(bind_section_backing(desc, 0x2_0000, 1));
+            assert_eq!(map_section(desc), 0x2_0000);
+            assert_eq!(map_section(desc), 0x2_0000);
             assert!(section_contains_addr(desc, 0x2_0100));
-            assert!(unmap_section(desc, 0x2_0100, |_| {
-                free_calls += 1;
-                false
-            }));
+            assert!(unmap_section(desc, 0x2_0100));
             assert_eq!(section_map_count(desc), 1);
-            assert_eq!(section_base(desc), 0x2_0000);
-            assert_eq!(free_calls, 0);
-
-            assert!(unmap_section(desc, 0x2_0000, |base| {
-                free_calls += 1;
-                assert_eq!(base, 0x2_0000);
-                true
-            }));
+            assert!(unmap_section(desc, 0x2_0000));
             assert_eq!(section_map_count(desc), 0);
-            assert_eq!(section_base(desc), 0);
-            assert_eq!(free_calls, 1);
+            // NT keeps a Section's pages with the Section: the final unmap releases nothing.
+            assert_eq!(section_base(desc), 0x2_0000);
+            assert!(!unmap_section(desc, 0x2_0000), "no view is left to unmap");
+            assert_eq!(map_section(desc), 0x2_0000);
+            assert_eq!(section_backing_generation(desc), 1);
+        }
+    }
 
-            assert_eq!(
-                map_section(desc, |_| {
-                    alloc_calls += 1;
-                    0x3_0000
-                }),
-                0x3_0000
-            );
-            assert_eq!(alloc_calls, 2);
+    #[test]
+    fn a_backing_needs_a_base_and_a_generation() {
+        let mut buf = [0u8; o::SIZE_OF];
+        let desc = buf.as_mut_ptr();
+        unsafe {
+            init_section(desc, 0x1000);
+            assert!(!bind_section_backing(desc, 0, 1));
+            assert!(!bind_section_backing(desc, 0x1_0000, 0));
+            assert_eq!(section_base(desc), 0);
         }
     }
 
@@ -355,7 +344,8 @@ mod tests {
             init_section(desc, 0x1000);
             set_section_next(desc, 0xABCD);
             assert_eq!(section_next(desc), 0xABCD);
-            assert_eq!(map_section(desc, |_| 0x4_0000), 0x4_0000);
+            assert!(bind_section_backing(desc, 0x4_0000, 1));
+            assert_eq!(map_section(desc), 0x4_0000);
             assert_eq!(section_next(desc), 0xABCD);
         }
     }
@@ -379,14 +369,15 @@ mod tests {
             init_section(desc, 0x2000);
             assert_eq!(section_reference_count(desc), 1); // MmCreateSection owns one pointer.
             assert_eq!(retain_section(desc), Some(2));
-            assert_eq!(map_section(desc, |_| 0x20_000), 0x20_000);
+            assert!(bind_section_backing(desc, 0x20_000, 1));
+            assert_eq!(map_section(desc), 0x20_000);
             assert_eq!(release_section(desc), Some(1));
             assert_eq!(release_section(desc), Some(0));
             // The descriptor is still needed to unmap its outstanding view.
             assert!(!section_may_retire(desc));
             assert_eq!(retain_section(desc), None); // A dead pointer cannot be resurrected.
             assert_eq!(release_section(desc), None); // Underflow is rejected.
-            assert!(unmap_section(desc, 0x20_000, |_| true));
+            assert!(unmap_section(desc, 0x20_000));
             assert!(section_may_retire(desc));
         }
     }

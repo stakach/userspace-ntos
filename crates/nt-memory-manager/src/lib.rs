@@ -64,6 +64,7 @@ pub mod provider_large_arena;
 pub mod retained_alias;
 mod runtime_section;
 pub mod section_scratch;
+pub mod session_view_band;
 pub mod temporary_alias;
 mod working_set;
 

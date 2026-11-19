@@ -116,10 +116,6 @@ unsafe fn map_inner(request: ProviderAliasRequest) -> Result<ProviderAliasHandle
     slot.as_mut().unwrap().map(request, &mut Io)
 }
 
-pub(super) unsafe fn map(request: ProviderAliasRequest) -> Result<(), BankError> {
-    map_with_handle(request).map(|_| ())
-}
-
 pub(super) unsafe fn map_with_handle(
     request: ProviderAliasRequest,
 ) -> Result<ProviderAliasHandle, BankError> {
@@ -177,17 +173,6 @@ pub(super) fn page_is_unowned(pi: usize, page: u64) -> bool {
     }
 }
 
-pub(super) fn all_empty() -> bool {
-    let Ok(_borrow) = Borrow::acquire() else {
-        return false;
-    };
-    unsafe {
-        (&*core::ptr::addr_of!(BANK))
-            .as_ref()
-            .is_none_or(|bank| bank.is_empty())
-    }
-}
-
 pub(super) fn owns_root_cap(cap: u64) -> bool {
     if cap == 0 {
         return false;
@@ -222,22 +207,6 @@ pub(super) fn admit_process(pi: usize, process: ProcessIdentity) -> Result<(), B
         None if process.is_valid() => Ok(()),
         None => Err(BankError::InvalidRequest),
     }
-}
-
-pub(super) fn mapped_prefix(
-    pi: usize,
-    process: ProcessIdentity,
-    base: u64,
-    count: u64,
-    pml4: u64,
-    source_base: u64,
-    rights: u64,
-) -> bool {
-    let Ok(_borrow) = Borrow::acquire() else {
-        return false;
-    };
-    unsafe { (&*core::ptr::addr_of!(BANK)).as_ref() }
-        .is_some_and(|bank| bank.mapped_prefix(pi, process, base, count, pml4, source_base, rights))
 }
 
 unsafe fn release_inner(

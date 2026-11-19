@@ -44,6 +44,8 @@ mod source_irp_aux;
 mod push_lock;
 #[path = "win32k_subsystem/large_pool.rs"]
 pub(crate) mod large_pool;
+#[path = "win32k_subsystem/session_view.rs"]
+mod session_view;
 #[path = "win32k_source_irp_call.rs"]
 mod source_irp_call;
 #[path = "win32k_source_pnp_call.rs"]
@@ -247,14 +249,12 @@ fn current_w32thread_slot() -> u64 {
 const WIN32_CALLOUTS: u64 = WIN32K_DATA_VADDR + 0x4100; // recorded WIN32_CALLOUTS_FG table (copy)
 /// A synthetic process handle NtUserProcessConnect's ObReferenceObjectByHandle resolves.
 pub const FAKE_PROCESS_HANDLE: u64 = 0x0000_0000_5A5A_0100;
-/// The win32k session-heap arena that lookaside fallbacks, section descriptors, and section backing
+/// The win32k provider's private heap arena that lookaside fallbacks and section descriptors
 /// allocate from (counter at +0, free-list head at +8, data at +0x1000). Section-backed USER and
-/// desktop heaps then allocate inside their own section views, using the same block allocator.
+/// desktop heaps allocate inside their own reserve-only session views ([`session_view`]), using
+/// the same block allocator.
 pub const WIN32K_HEAP_VADDR: u64 = 0x0000_0100_0740_0000;
 pub const WIN32K_HEAP_FRAMES: u64 = 4096;
-// Shared with the executive. Unlike the allocator's mutable bump cursor, this
-// committed high-water is monotonic and may be read outside provider context.
-const WIN32K_HEAP_PUBLISHED_HIGH_WATER_OFF: u64 = 0x10;
 const PROVIDER_ARENA_ROOT_HEAP_ID: u64 = 1;
 const PROVIDER_ARENA_SHARED_POOL_ID: u64 = 2;
 const PROVIDER_ARENA_FTYP_POOL_ID: u64 = 3;
@@ -286,12 +286,16 @@ const WIN32K_STACK_BYTES: u64 = 32 * 0x1000;
 pub(crate) const WIN32K_PRIMARY_STACK_LANE_ID: u64 = 1;
 const WIN32K_STACK_ACTIVATION_DEPTH: usize = 64;
 
+/// A hosted `RtlCreateHeap` over a reserve-only session view. `bytes` is the heap's reserve;
+/// `committed` is the prefix whose Section pages it has committed, and bounds its tail.
 #[derive(Clone, Copy)]
 struct HostedHeapArena {
     base: u64,
     bytes: u64,
+    committed: u64,
     identity: nt_provider_wait::ProviderArenaIdentity,
-    backing: nt_provider_wait::ProviderAllocationIdentity,
+    section: u64,
+    section_generation: u64,
 }
 
 /// A provider lane that cannot continue safely stops here for good. It keeps yielding rather
@@ -661,29 +665,14 @@ pub const WIN32K_KUSER_SHARED_DATA_VA: u64 = nt_ntdll_layout::kuser::KERNEL_ALIA
 /// KUSER frame before aliasing it into the win32k component at the canonical high VA.
 pub const WIN32K_KUSER_SCRATCH_VA: u64 = WIN32K_AUX_PT_VADDR + 0x1B_0000;
 
-/// The GUI-client-side VA where win32k's global USER heap arena ([`WIN32K_HEAP_VADDR`] — where gpsi, the
-/// USER handle table `gHandleTable`, and the handle-entry array all live, being `UserHeapAlloc`ed)
-/// is RO-mapped so the Win32 client stack (user32/gdi32) can read the SHAREDINFO the USERCONNECT's
-/// `siClient` pointers name. A full 16 MiB window ([`WIN32K_HEAP_FRAMES`]), 2-MiB-aligned, sitting
-/// immediately above the bounded compact DLL arena and below the NLS section (0xA000_0000).
-/// **Was 0x9000_0000, where the former fixed-slot DLL layout collided with it and made lsass execute
-/// win32k-heap NX pages.** 0x9800_0000 is now the explicit DLL-arena end and stays inside the shared
-/// 0x8000_0000..0xC000_0000 1 GiB PD. Delta-relative: the
-/// connect marshaling rewrites `siClient`/`ulSharedDelta` by `WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA`,
-/// so moving the base is behavior-preserving for every GUI client.
+/// The GUI-client-side VA where win32k's session views (the global USER heap, where gpsi, the USER
+/// handle table `gHandleTable` and the handle-entry array live, and every desktop heap) are
+/// RO-mapped, so the Win32 client stack (user32/gdi32) can read the SHAREDINFO the USERCONNECT's
+/// `siClient` pointers name and the desktop objects `ulClientDelta` translates. The window spans
+/// the whole session-view band (`win32k_session_views::BYTES`), immediately above the bounded
+/// compact DLL arena and below the NLS section (0xA000_0000), inside the shared
+/// 0x8000_0000..0xC000_0000 1 GiB PD. Only committed pages are aliased.
 pub const CSRSS_W32_SHARED_VA: u64 = 0x0000_0000_9800_0000;
-
-/// The GUI-client-side VA where win32k's POOL arena ([`WIN32K_POOL_VADDR`] — where DESKTOP bodies and
-/// other session-lifetime object bodies live) is RO-mapped. DESKTOPINFO lives in the per-desktop heap;
-/// this pool window remains needed for object bodies referenced by USER/desktop structures. Sits
-/// immediately ABOVE the 16 MiB USER-heap window (0x9800_0000..0x9900_0000) and below the NLS section
-/// (0xA000_0000), inside the shared 0x8000_0000..0xC000_0000 1 GiB PD. The client VA of a pool object =
-/// its server VA - ([`WIN32K_POOL_VADDR`] - `CSRSS_W32_POOL_VA`).
-pub const CSRSS_W32_POOL_VA: u64 = 0x0000_0000_9900_0000;
-// The USER-heap window (16 MiB) must end at or below the POOL window base so the two client windows
-// never overlap; the POOL window (8 MiB) must end below the NLS section (0xA000_0000).
-const _: () = assert!(CSRSS_W32_SHARED_VA + WIN32K_HEAP_FRAMES * 0x1000 <= CSRSS_W32_POOL_VA);
-const _: () = assert!(CSRSS_W32_POOL_VA + WIN32K_POOL_FRAMES * 0x1000 <= 0x0000_0000_A000_0000);
 
 // ★ DIALOG BATCH 3 — CLIENT-GDI HANDLE TABLE. gdi32's client-side validity check indexes
 // `GdiSharedHandleTable[handle & 0xffff]` (0x18-byte GDI_TABLE_ENTRY each; ntgdihdl.h). The base
@@ -711,7 +700,6 @@ pub const UC_SI_PDISPINFO: u64 = 0x20; // SHAREDINFO.pDispInfo
 pub const UC_SI_DELTA: u64 = 0x28; // SHAREDINFO.ulSharedDelta
 
 const POOL_DATA_OFF: u64 = 0x1000;
-const _: () = assert!(WIN32K_HEAP_PUBLISHED_HIGH_WATER_OFF + 8 <= POOL_DATA_OFF);
 
 // shared-page offsets
 pub const SH_ENTRY_RVA: u64 = 0x00; // in:  DriverEntry RVA (u64)
@@ -1207,28 +1195,21 @@ fn mint_hosted_heap_arena_identity() -> Option<nt_provider_wait::ProviderArenaId
     }
 }
 
+/// Register a heap over `[base, base + bytes)` of the Section view `section`, whose first
+/// `committed` bytes are committed.
 unsafe fn register_hosted_heap_arena_unlocked(
-    guard: &mut ProviderMetadataGuard,
+    _guard: &mut ProviderMetadataGuard,
     base: u64,
     bytes: u64,
+    committed: u64,
+    (section, section_generation): (u64, u64),
 ) -> bool {
-    let Some(root) = root_heap_arena_identity() else {
-        return false;
-    };
-    let Some(allocations) = provider_allocations_unlocked(guard) else {
-        return false;
-    };
-    let Ok(backing) = allocations.exact(root, base) else {
-        return false;
-    };
-    if backing.capacity < bytes || allocations.snapshot_active(backing.identity).is_err() {
-        return false;
-    }
     let Some(arenas) = (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS)).as_mut() else {
         return false;
     };
     if let Some(existing) = arenas.iter().find(|arena| arena.base == base) {
-        return existing.bytes == bytes && existing.backing == backing.identity;
+        return existing.bytes == bytes && existing.section == section
+            && existing.section_generation == section_generation;
     }
     if arenas.try_reserve(1).is_err() {
         return false;
@@ -1239,10 +1220,22 @@ unsafe fn register_hosted_heap_arena_unlocked(
     arenas.push(HostedHeapArena {
         base,
         bytes,
+        committed,
         identity,
-        backing: backing.identity,
+        section,
+        section_generation,
     });
     true
+}
+
+/// The Section that owned these heaps is deleted; its pages are about to be released.
+unsafe fn retire_hosted_heap_arenas_of_section(section: u64, section_generation: u64) {
+    let _guard = ProviderMetadataGuard::acquire();
+    if let Some(arenas) = (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS)).as_mut() {
+        arenas.retain(|arena| {
+            arena.section != section || arena.section_generation != section_generation
+        });
+    }
 }
 
 pub fn registered_win32k_callouts() -> Option<nt_process::Win32Callouts> {
@@ -1673,6 +1666,8 @@ pub const W32_LARGE_POOL_RETIRE_LABEL: u64 = 0x7ae;
 /// Process-owned USER object handles: publish, look up, close, search and the root's ledger
 /// of copied and removed handles ([`nt_user_host::user_object_handle_wire`]).
 pub const W32_USER_OBJECT_LABEL: u64 = 0x7af;
+/// Reserve, commit and release reserve-only session views ([`session_view`]).
+pub const W32_SESSION_VIEW_LABEL: u64 = 0x7b0;
 pub const W32_ATTACH_PLAIN: u64 = 1;
 pub const W32_ATTACH_DETACH: u64 = 2;
 pub const W32_ATTACH_STACK: u64 = 3;
@@ -4976,13 +4971,21 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
     }
     if provider_pool_contains(object) {
         unsafe {
-            let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
-            if registered_section_descriptor(object) {
-                let remaining = release_section(object as *mut u8)
-                    .unwrap_or_else(|| panic!("session Section pointer reference underflow"));
-                if section_may_retire(object as *const u8) {
-                    assert!(unlink_section_descriptor(object));
-                    assert!(provider_pool_free(object), "session Section descriptor retirement failed");
+            let released = {
+                let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
+                registered_section_descriptor(object).then(|| {
+                    let remaining = release_section(object as *mut u8)
+                        .unwrap_or_else(|| panic!("session Section pointer reference underflow"));
+                    let retire = section_may_retire(object as *const u8);
+                    if retire {
+                        assert!(unlink_section_descriptor(object));
+                    }
+                    (remaining, retire)
+                })
+            };
+            if let Some((remaining, retire)) = released {
+                if retire {
+                    finish_session_section_retirement(object);
                 }
                 return remaining;
             }
@@ -9076,12 +9079,7 @@ unsafe fn heap_alloc_in_raw(
     size: u64,
     zero: bool,
 ) -> u64 {
-    let payload = nt_kernel_exec::arena_heap::alloc(arena_base, arena_bytes, size, zero);
-    if payload != 0 && arena_base == WIN32K_HEAP_VADDR {
-        (&*((arena_base + WIN32K_HEAP_PUBLISHED_HIGH_WATER_OFF) as *const AtomicU64))
-            .fetch_max(nt_kernel_exec::arena_heap::bump(arena_base), Ordering::Release);
-    }
-    payload
+    nt_kernel_exec::arena_heap::alloc(arena_base, arena_bytes, size, zero)
 }
 
 unsafe fn heap_alloc_in(
@@ -9184,11 +9182,6 @@ unsafe fn heap_free_in_reserved(
         .is_none_or(|catalog| catalog.retire(allocation.identity) != Ok(allocation))
     {
         return false;
-    }
-    if let Some(arenas) = (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS)).as_mut() {
-        if let Some(index) = arenas.iter().position(|arena| arena.backing == allocation.identity) {
-            arenas.swap_remove(index);
-        }
     }
     true
 }
@@ -9319,19 +9312,23 @@ unsafe fn heap_free(p: u64) -> bool {
     heap_free_in(WIN32K_HEAP_VADDR, WIN32K_HEAP_FRAMES * 0x1000, p)
 }
 
+/// `RtlCreateHeap(HeapBase)` over a reserve-only Section view. The heap header occupies the first
+/// page, which IntUserHeapCreate commits before creating the heap; the heap commits further Section
+/// pages only as its tail grows into them ([`hosted_heap_commit_for`]).
 unsafe fn hosted_heap_init(base: u64, reserve_size: u64) -> u64 {
-    let arena_start = WIN32K_HEAP_VADDR + POOL_DATA_OFF;
-    let arena_bytes = WIN32K_HEAP_FRAMES * 0x1000;
-    let arena_end = WIN32K_HEAP_VADDR + arena_bytes;
     let reserve_size = (reserve_size + 0xFFF) & !0xFFF;
+    if base & 0xfff != 0 || reserve_size < POOL_DATA_OFF + HEAP_HDR_SIZE {
+        return 0;
+    }
+    let Some(section) = session_section_for_view(base, reserve_size) else {
+        return 0;
+    };
+    // MEM_COMMIT is idempotent: this is the heap's InitialCommit.
+    let Ok((_, committed)) = session_view::commit(base, POOL_DATA_OFF) else {
+        return 0;
+    };
     let mut metadata = ProviderMetadataGuard::acquire();
-    if base < arena_start
-        || reserve_size < POOL_DATA_OFF + HEAP_HDR_SIZE
-        || base.checked_add(reserve_size).is_none_or(|end| end > arena_end)
-        || heap_block_capacity_in(WIN32K_HEAP_VADDR, arena_bytes, base)
-            .is_none_or(|capacity| capacity < reserve_size)
-        || !register_hosted_heap_arena_unlocked(&mut metadata, base, reserve_size)
-    {
+    if !register_hosted_heap_arena_unlocked(&mut metadata, base, reserve_size, committed, section) {
         return 0;
     }
     nt_kernel_exec::arena_heap::init(base);
@@ -9343,14 +9340,36 @@ unsafe fn hosted_heap_init(base: u64, reserve_size: u64) -> u64 {
     base
 }
 
+/// The committed prefix of a hosted heap, after committing enough Section pages for its tail to
+/// serve `size`. Pages already committed are kept; a heap never commits past its reserve.
+unsafe fn hosted_heap_commit_for(heap: u64, size: u64) -> Option<u64> {
+    let (base, reserve, committed) = {
+        let metadata = ProviderMetadataGuard::acquire();
+        let (base, reserve) = hosted_heap_bounds_unlocked(&metadata, heap)?;
+        let arena = (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS)).as_ref()?
+            .iter().find(|arena| arena.base == base)?;
+        (base, reserve, arena.committed)
+    };
+    let needed = nt_kernel_exec::arena_heap::tail_end(base, size)?
+        .checked_add(0xfff)? & !0xfff;
+    if needed <= committed {
+        return Some(committed);
+    }
+    let needed = needed.min(reserve);
+    let (page, bytes) = session_view::commit(base + committed, needed - committed).ok()?;
+    let grown = page.checked_add(bytes)?.checked_sub(base)?;
+    let _metadata = ProviderMetadataGuard::acquire();
+    let arena = (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS)).as_mut()?
+        .iter_mut().find(|arena| arena.base == base)?;
+    arena.committed = arena.committed.max(grown.min(reserve));
+    Some(arena.committed)
+}
+
+/// Bounds of a hosted heap from its own header, for callers outside provider context. The heap
+/// lies inside the session-view band and its header page is committed while the heap exists.
 unsafe fn shared_hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
-    let arena_start = WIN32K_HEAP_VADDR + POOL_DATA_OFF;
-    let arena_bytes = WIN32K_HEAP_FRAMES * 0x1000;
-    let arena_end = WIN32K_HEAP_VADDR + arena_bytes;
-    if heap < arena_start
-        || heap
-            .checked_add(HEAP_HANDLE_SIZE_OFF + 8)
-            .is_none_or(|end| end > arena_end)
+    if !session_view::contains(heap)
+        || !session_view::contains(heap.checked_add(HEAP_HANDLE_SIZE_OFF + 8)? - 1)
     {
         return None;
     }
@@ -9359,9 +9378,7 @@ unsafe fn shared_hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
     }
     let size = read_volatile((heap + HEAP_HANDLE_SIZE_OFF) as *const u64);
     if size < POOL_DATA_OFF + HEAP_HDR_SIZE
-        || heap.checked_add(size).is_none_or(|end| end > arena_end)
-        || heap_block_capacity_in(WIN32K_HEAP_VADDR, arena_bytes, heap)
-            .is_none_or(|capacity| capacity < size)
+        || heap.checked_add(size).is_none_or(|end| !session_view::contains(end - 1))
     {
         return None;
     }
@@ -9389,45 +9406,18 @@ unsafe fn hosted_heap_bounds_unlocked(
         .then_some(bounds)
 }
 
+/// Server address minus client address for every session view (the USER and desktop heaps).
 pub(crate) fn win32k_user_heap_delta() -> u64 {
-    WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA
-}
-
-pub(crate) unsafe fn win32k_user_heap_committed_frames() -> u64 {
-    let used = (&*((WIN32K_HEAP_VADDR + WIN32K_HEAP_PUBLISHED_HIGH_WATER_OFF) as *const AtomicU64))
-        .load(Ordering::Acquire)
-        .max(POOL_DATA_OFF);
-    ((used + 0xfff) / 0x1000).clamp(1, WIN32K_HEAP_FRAMES)
+    session_view::BASE - CSRSS_W32_SHARED_VA
 }
 
 pub(crate) fn win32k_heap_server_to_client(addr: u64) -> Option<u64> {
-    let heap_lo = WIN32K_HEAP_VADDR;
-    let heap_hi = heap_lo + WIN32K_HEAP_FRAMES * 0x1000;
-    if addr >= heap_lo && addr < heap_hi {
-        addr.checked_sub(win32k_user_heap_delta())
-    } else {
-        None
-    }
+    session_view::contains(addr).then(|| addr - win32k_user_heap_delta())
 }
 
 fn win32k_heap_client_to_server(addr: u64) -> Option<u64> {
-    let client_lo = CSRSS_W32_SHARED_VA;
-    let client_hi = client_lo + WIN32K_HEAP_FRAMES * 0x1000;
-    if addr >= client_lo && addr < client_hi {
-        addr.checked_add(win32k_user_heap_delta())
-    } else {
-        None
-    }
-}
-
-/// The page-rounded range `[base, base + size)` when it lies entirely in the client view of the
-/// USER heap window, whose Section pages are backed for every heap the window holds.
-fn win32k_heap_client_view_pages(base: u64, size: u64) -> Option<(u64, u64)> {
-    let page = base & !0xfff;
-    let end = base.checked_add(size)?.checked_add(0xfff)? & !0xfff;
-    let client_end = CSRSS_W32_SHARED_VA + WIN32K_HEAP_FRAMES * 0x1000;
-    (size != 0 && win32k_heap_client_to_server(page).is_some() && end <= client_end)
-        .then_some((page, end - page))
+    let server = addr.checked_add(win32k_user_heap_delta())?;
+    (addr >= CSRSS_W32_SHARED_VA && session_view::contains(server)).then_some(server)
 }
 
 unsafe fn desktop_heap_client_mapping(desk_body: u64) -> Option<(u64, u64, u64)> {
@@ -9472,9 +9462,7 @@ unsafe fn ensure_process_desktop_heap_mapping(ppi: u64, desk_body: u64) -> Optio
                 let (mapped_base, mapped_size) = section_view(section, limit);
                 if mapped_base != kernel_base || mapped_size < limit {
                     if mapped_base != 0 {
-                        let _ = unmap_section(section as *mut u8, mapped_base, |base| {
-                            heap_free(base)
-                        });
+                        let _ = unmap_section_view_addr(mapped_base);
                     }
                     return None;
                 }
@@ -9496,14 +9484,14 @@ unsafe fn ensure_process_desktop_heap_mapping(ppi: u64, desk_body: u64) -> Optio
     let (mapped_base, mapped_size) = section_view(section, limit);
     if mapped_base != kernel_base || mapped_size < limit {
         if mapped_base != 0 {
-            let _ = unmap_section(section as *mut u8, mapped_base, |base| heap_free(base));
+            let _ = unmap_section_view_addr(mapped_base);
         }
         return None;
     }
     let user_heap = read_volatile((head + W32HEAP_MAPPING_KERNEL_OFF) as *const u64);
     let mapping = s_rtl_allocate_heap(user_heap, HEAP_ZERO_MEMORY, W32HEAP_MAPPING_SIZE);
     if mapping == 0 {
-        let _ = unmap_section(section as *mut u8, mapped_base, |base| heap_free(base));
+        let _ = unmap_section_view_addr(mapped_base);
         return None;
     }
     write_volatile((mapping + W32HEAP_MAPPING_NEXT_OFF) as *mut u64, 0);
@@ -9959,8 +9947,9 @@ extern "win64" fn s_ex_init_npaged_lookaside(
 }
 
 /// `PVOID RtlCreateHeap(Flags, HeapBase, ReserveSize, CommitSize, Lock, Parameters)`. win32k creates
-/// the global USER heap and every desktop heap over a section view; return that view as the heap
-/// handle and keep subsequent allocations inside the section-backed arena.
+/// the global USER heap and every desktop heap over a reserve-only Section view; return that view
+/// as the heap handle. The heap commits the view's Section pages as it grows, which is what
+/// `Parameters->CommitRoutine` (IntUserHeapCommitRoutine) does through the caller's own view.
 extern "win64" fn s_rtl_create_heap(
     _flags: u64,
     heap_base: u64,
@@ -9979,12 +9968,12 @@ extern "win64" fn s_rtl_create_heap(
 /// `PVOID RtlAllocateHeap(HeapHandle, Flags, Size)`.
 extern "win64" fn s_rtl_allocate_heap(heap: u64, flags: u64, size: u64) -> u64 {
     unsafe {
-        let Some((base, bytes)) = hosted_heap_bounds(heap) else {
+        let Some(committed) = hosted_heap_commit_for(heap, size) else {
             return 0;
         };
         heap_alloc_in(
-            base,
-            bytes,
+            heap,
+            committed,
             size,
             flags & HEAP_ZERO_MEMORY != 0,
             b"RTL_HEAP",
@@ -10051,18 +10040,18 @@ extern "win64" fn s_rtl_size_heap(heap: u64, _flags: u64, base: u64) -> u64 {
 /// `PVOID RtlReAllocateHeap(HeapHandle, Flags, Base, Size)`.
 extern "win64" fn s_rtl_reallocate_heap(heap: u64, flags: u64, base: u64, size: u64) -> u64 {
     unsafe {
-        let Some((arena_base, arena_bytes)) = hosted_heap_bounds(heap) else {
+        let Some(committed) = hosted_heap_commit_for(heap, size) else {
             return 0;
         };
-        heap_realloc_in(arena_base, arena_bytes, flags, base, size, b"RTL_HEAP")
+        heap_realloc_in(heap, committed, flags, base, size, b"RTL_HEAP")
     }
 }
 
 use nt_kernel_exec::session_section::{
-    bind_section_allocation_generation, init_section, is_section, map_section, release_section,
-    retain_section, section_allocation_generation, section_contains_addr, section_may_retire,
-    section_next, section_object, section_reference_count, section_size, set_section_next,
-    unmap_section,
+    bind_section_allocation_generation, bind_section_backing, init_section, is_section,
+    map_section, release_section, retain_section, section_allocation_generation, section_base,
+    section_backing_generation, section_contains_addr, section_may_retire, section_next,
+    section_object, section_reference_count, section_size, set_section_next, unmap_section,
 };
 
 const STATUS_NO_MEMORY: i32 = 0xC000_0017u32 as i32;
@@ -10152,49 +10141,120 @@ unsafe fn try_unmap_section_view_addr(addr: u64) -> Option<i32> {
         return Some(STATUS_INVALID_PARAMETER_I32);
     }
     let backing_addr = win32k_heap_client_to_server(addr).unwrap_or(addr);
-    let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
-    let mut section = WIN32K_SECTION_LIST_HEAD.load(Ordering::Acquire);
-    let mut scanned = 0usize;
-    while section != 0 && scanned < 4096 {
-        if registered_section_descriptor(section)
-            && section_contains_addr(section as *const u8, backing_addr)
-        {
-            break;
+    let retired = {
+        let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
+        let mut section = WIN32K_SECTION_LIST_HEAD.load(Ordering::Acquire);
+        let mut scanned = 0usize;
+        while section != 0 && scanned < 4096 {
+            if registered_section_descriptor(section)
+                && section_contains_addr(section as *const u8, backing_addr)
+            {
+                break;
+            }
+            section = section_next(section as *const u8);
+            scanned += 1;
         }
-        section = section_next(section as *const u8);
-        scanned += 1;
-    }
-    if section == 0 || scanned >= 4096 {
-        return None;
-    }
-    if unmap_section(section as *mut u8, backing_addr, |base| heap_free(base)) {
+        if section == 0 || scanned >= 4096 {
+            return None;
+        }
+        if !unmap_section(section as *mut u8, backing_addr) {
+            return Some(STATUS_INVALID_PARAMETER_I32);
+        }
         if section_may_retire(section as *const u8) {
             assert!(unlink_section_descriptor(section));
-            assert!(provider_pool_free(section), "unmapped session Section retirement failed");
+            Some(section)
+        } else {
+            None
         }
-        Some(0)
-    } else {
-        Some(STATUS_INVALID_PARAMETER_I32)
+    };
+    if let Some(section) = retired {
+        finish_session_section_retirement(section);
     }
+    Some(0)
+}
+
+/// Delete an unlinked SEC_RESERVE Section: its heaps go first, then the root releases every
+/// committed page and the view's addresses, and finally the descriptor itself. Runs without
+/// the descriptor lock, since the release is a synchronous root request.
+unsafe fn finish_session_section_retirement(section: u64) {
+    let base = section_base(section as *const u8);
+    let generation = section_backing_generation(section as *const u8);
+    if base != 0 {
+        retire_hosted_heap_arenas_of_section(section, generation);
+        let status = session_view::release(base, generation);
+        if status != 0 {
+            print_str(b"[win32k-host] session view release failed base=0x");
+            crate::print_hex_u64(base);
+            print_str(b" status=0x");
+            print_hex(status as u32);
+            print_str(b"\n");
+            // The view stays quarantined in the root; this descriptor must never be reused.
+            return;
+        }
+    }
+    assert!(provider_pool_free(section), "session Section descriptor retirement failed");
 }
 
 unsafe fn unmap_section_view_addr(addr: u64) -> i32 {
     try_unmap_section_view_addr(addr).unwrap_or(STATUS_INVALID_PARAMETER_I32)
 }
 
-/// Resolve (allocating once, from the heap arena) the coherent backing base + size for a section
-/// map. The section must be one of our [`init_section`] descriptors, so the kernel session view and
-/// every per-process view share one backing. Unknown section pointers fail instead of receiving a
-/// synthetic private mapping.
-unsafe fn try_section_view(section: u64) -> Option<(u64, u64)> {
+/// The registered Section whose reserved view holds `[base, base + bytes)`: `(descriptor,
+/// backing generation)`.
+unsafe fn session_section_for_view(base: u64, bytes: u64) -> Option<(u64, u64)> {
+    let end = base.checked_add(bytes)?;
     let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
-    if !registered_section_descriptor(section)
-        || section_reference_count(section as *const u8) == 0
-    {
-        return None;
+    let mut section = WIN32K_SECTION_LIST_HEAD.load(Ordering::Acquire);
+    let mut scanned = 0usize;
+    while section != 0 && scanned < 4096 {
+        let view = section_base(section as *const u8);
+        if registered_section_descriptor(section) && view != 0 && view <= base
+            && view.checked_add(section_size(section as *const u8)).is_some_and(|limit| end <= limit)
+        {
+            return Some((section, section_backing_generation(section as *const u8)));
+        }
+        section = section_next(section as *const u8);
+        scanned += 1;
     }
-    let sz = section_size(section as *const u8);
-    Some((map_section(section as *mut u8, |s| heap_alloc(s, true)), sz))
+    None
+}
+
+/// Map a view of one of our [`init_section`] descriptors: the Section's one coherent base, so the
+/// kernel session view and every per-process view share it. The first map reserves the view in
+/// the session-view band; reserving consumes addresses only. Unknown Section pointers fail
+/// instead of receiving a synthetic private mapping.
+unsafe fn try_section_view(section: u64) -> Option<(u64, u64)> {
+    let size = {
+        let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
+        if !registered_section_descriptor(section)
+            || section_reference_count(section as *const u8) == 0
+        {
+            return None;
+        }
+        let size = section_size(section as *const u8);
+        if section_base(section as *const u8) != 0 {
+            return Some((map_section(section as *mut u8), size));
+        }
+        size
+    };
+    // A null view result is still ours: it is STATUS_NO_MEMORY, never another broker's Section.
+    let Some((base, generation)) = session_view::reserve(size) else {
+        return Some((0, size));
+    };
+    let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
+    if registered_section_descriptor(section)
+        && section_reference_count(section as *const u8) != 0
+        && bind_section_backing(section as *mut u8, base, generation)
+    {
+        return Some((map_section(section as *mut u8), size));
+    }
+    drop(_guard);
+    // Another lane backed the Section first, or it retired meanwhile: return this reservation.
+    if session_view::release(base, generation) != 0 {
+        print_str(b"[win32k-host] fatal unused session view release failure\n");
+        park();
+    }
+    try_section_view(section)
 }
 
 unsafe fn section_view(section: u64, _size_hint: u64) -> (u64, u64) {
@@ -10245,6 +10305,23 @@ extern "win64" fn s_mm_create_section(
     0
 }
 
+/// The size of a session view whose caller asked for `requested` bytes (0 = the whole Section).
+/// A view maps the requested page-rounded prefix: IntUserHeapCreate maps and commits exactly the
+/// heap's first page. A request beyond the Section unmaps the view it just took.
+unsafe fn session_view_size(base: u64, size: u64, requested: u64) -> Result<u64, i32> {
+    if base == 0 || requested == 0 {
+        return Ok(size);
+    }
+    let rounded = requested.checked_add(0xfff).map(|end| end & !0xfff);
+    match rounded {
+        Some(rounded) if rounded <= size => Ok(rounded),
+        _ => {
+            let _ = unmap_section_view_addr(base);
+            Err(0xC000_001Fu32 as i32)
+        }
+    }
+}
+
 /// `NTSTATUS MmUnmapViewOfSection(PEPROCESS Process, PVOID BaseAddress)`. Reserved USER/desktop
 /// heaps use logical aliases; committed Sections retire an exact process view and its page caps.
 extern "win64" fn s_mm_unmap_view_of_section(process: u64, base: u64) -> i32 {
@@ -10274,8 +10351,11 @@ extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut 
             read_volatile(size_io)
         };
         let local_view = try_section_view(section);
-        let (base, size) = if let Some(view) = local_view {
-            view
+        let (base, size) = if let Some((base, size)) = local_view {
+            match session_view_size(base, size, hint) {
+                Ok(view_size) => (base, view_size),
+                Err(status) => return status,
+            }
         } else {
             match mm_section::map(section, hint) {
                 Ok(view) => view,
@@ -10329,7 +10409,10 @@ extern "win64" fn s_mm_map_view_of_section(
         }
         if read_volatile(base_out) != 0 { return STATUS_INVALID_PARAMETER_I32; }
         let (base, size, local_heap_view) = if let Some((base, size)) = try_section_view(section) {
-            (base, size, true)
+            match session_view_size(base, size, hint) {
+                Ok(view_size) => (base, view_size, true),
+                Err(status) => return status,
+            }
         } else {
             match mm_section::map_client(section, process, hint, protection) {
                 Ok((base, size)) => (base, size, false),
@@ -10524,8 +10607,8 @@ const NT_CURRENT_PROCESS: u64 = u64::MAX;
 /// client it is attached to: GDI attribute pool sections (`GdiPoolAllocateSection`), bitmap bits
 /// (`EngAllocUserMem`) and window-station, desktop and security buffers. The executive performs
 /// the native private-VAD allocation in that client, so the memory is the client's own and can be
-/// secured. `IntUserHeapCommitRoutine` commits inside a USER heap view instead; that view projects
-/// a heap Section whose pages are already backed, so the commit only reports the page range.
+/// secured. `IntUserHeapCommitRoutine` commits inside a client view of a USER heap Section
+/// instead: as in NT, `MEM_COMMIT` there commits the Section's pages, for every view of it.
 extern "win64" fn s_zw_allocate_virtual_memory(
     process: u64,
     base_io: *mut u64,
@@ -10547,10 +10630,15 @@ extern "win64" fn s_zw_allocate_virtual_memory(
         let base = read_unaligned(base_io);
         let size = read_unaligned(size_io);
         if alloc_type == MEM_COMMIT {
-            if let Some((page, bytes)) = win32k_heap_client_view_pages(base, size) {
-                write_unaligned(base_io, page);
-                write_unaligned(size_io, bytes);
-                return 0;
+            if let Some(server) = win32k_heap_client_to_server(base) {
+                return match session_view::commit(server, size) {
+                    Ok((page, bytes)) => {
+                        write_unaligned(base_io, page - win32k_user_heap_delta());
+                        write_unaligned(size_io, bytes);
+                        0
+                    }
+                    Err(status) => status,
+                };
             }
         }
         let (status, base, size) = win32k_mm_broker_call(VirtualMemoryRequest::Allocate {

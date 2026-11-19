@@ -9277,8 +9277,8 @@ unsafe fn complete_ntuser_process_connect_copyout(
         }
         return false;
     };
-    let heap_lo = win32k_subsystem::WIN32K_HEAP_VADDR;
-    let heap_hi = heap_lo + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000;
+    let heap_lo = crate::win32k_session_views::BASE;
+    let heap_hi = heap_lo + crate::win32k_session_views::BYTES;
     let handler_delta = userconnect_read_u64(buffer, win32k_subsystem::UC_SI_DELTA);
     let psi_client = userconnect_read_u64(buffer, win32k_subsystem::UC_SI_PSI);
     let ahe_client = userconnect_read_u64(buffer, win32k_subsystem::UC_SI_AHELIST);

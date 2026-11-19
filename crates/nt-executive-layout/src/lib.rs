@@ -84,6 +84,11 @@ pub mod root {
     /// Root aliases of win32k lane stacks.
     pub const WIN32K_STACK_ALIASES: Region =
         Region::new("win32k stack aliases", PE_SCRATCH.end(), 8 * MIB);
+    /// Reserve-only session views of win32k's `SEC_RESERVE` Sections: the global USER heap and
+    /// every desktop heap. The win32k provider maps the same pages at the same addresses, and
+    /// a page is backed only once it is committed.
+    pub const WIN32K_SESSION_VIEWS: Region =
+        Region::new("win32k session views", 0x0000_0100_4a00_0000, 96 * MIB);
     /// Root views of hosted driver images and their private windows.
     pub const DRIVER_HOST_VIEWS: Region =
         Region::spanning("driver host views", 0x0000_0100_5000_0000, 0x0000_0101_5000_0000);
@@ -142,6 +147,7 @@ pub mod root {
         PROVIDER_BULK_ARENA,
         PE_SCRATCH,
         WIN32K_STACK_ALIASES,
+        WIN32K_SESSION_VIEWS,
         DRIVER_HOST_VIEWS,
         DIAGNOSTIC_ALIASES,
         DRIVER_WORKER_ALIASES,

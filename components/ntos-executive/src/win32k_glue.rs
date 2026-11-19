@@ -1445,74 +1445,10 @@ pub(crate) fn provider_client_page_is_unowned(pi: usize, page: u64) -> bool {
     client_cap_bank::page_is_unowned(pi, page)
 }
 static WIN32K_CLIENT_CAP_BANK_FAILS: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CLIENT_PROCESS_ROW_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
-static mut WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();
-static mut WIN32K_POOL_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
     nt_user_callback::ActiveCallbackStack::new();
-
-unsafe fn reset_win32k_atomic_process_rows(rows: &mut Vec<AtomicU64>, slots: usize) -> bool {
-    rows.clear();
-    if rows.try_reserve(slots).is_err() {
-        WIN32K_CLIENT_PROCESS_ROW_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    while rows.len() < slots {
-        rows.push(AtomicU64::new(0));
-    }
-    for row in rows.iter() {
-        row.store(0, Ordering::Relaxed);
-    }
-    true
-}
-
-pub(crate) fn reset_win32k_client_process_rows(slots: usize) -> bool {
-    if !client_cap_bank::all_empty() { return false; }
-    unsafe {
-        let heap_rows = reset_win32k_atomic_process_rows(
-            &mut *core::ptr::addr_of_mut!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES),
-            slots,
-        );
-        let pool_rows = reset_win32k_atomic_process_rows(
-            &mut *core::ptr::addr_of_mut!(WIN32K_POOL_CLIENT_MAPPED_FRAMES),
-            slots,
-        );
-        heap_rows && pool_rows
-    }
-}
-
-unsafe fn win32k_user_heap_mapped_row(pi: usize) -> Option<&'static AtomicU64> {
-    (&*core::ptr::addr_of!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES)).get(pi)
-}
-
-unsafe fn win32k_pool_mapped_row(pi: usize) -> Option<&'static AtomicU64> {
-    (&*core::ptr::addr_of!(WIN32K_POOL_CLIENT_MAPPED_FRAMES)).get(pi)
-}
-
-unsafe fn win32k_user_heap_mapped_rows() -> &'static [AtomicU64] {
-    (&*core::ptr::addr_of!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES)).as_slice()
-}
-
-unsafe fn win32k_pool_mapped_rows() -> &'static [AtomicU64] {
-    (&*core::ptr::addr_of!(WIN32K_POOL_CLIENT_MAPPED_FRAMES)).as_slice()
-}
-
-pub(crate) fn win32k_client_process_row_stats(
-) -> (usize, usize, usize, usize, u64) {
-    unsafe {
-        let heap_rows = &*core::ptr::addr_of!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES);
-        let pool_rows = &*core::ptr::addr_of!(WIN32K_POOL_CLIENT_MAPPED_FRAMES);
-        (
-            heap_rows.len(),
-            heap_rows.capacity(),
-            pool_rows.len(),
-            pool_rows.capacity(),
-            WIN32K_CLIENT_PROCESS_ROW_ALLOCATION_FAILURES.load(Ordering::Relaxed),
-        )
-    }
-}
 
 type Win32kDispatchClients = nt_user_host::provider_dispatch_clients::ProviderDispatchClients<crate::spawn_hosts::UserCallbackClient>;
 use nt_user_host::provider_dispatch_clients::DispatchClientIdentity;
@@ -3458,14 +3394,7 @@ unsafe fn bind_client_callback_window(
     }
 
     let server_pwnd = crate::winlogon_pwnd_for_hwnd(hwnd);
-    let client_pwnd = if server_pwnd >= win32k_subsystem::WIN32K_HEAP_VADDR
-        && server_pwnd
-            < win32k_subsystem::WIN32K_HEAP_VADDR + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000
-    {
-        server_pwnd - (win32k_subsystem::WIN32K_HEAP_VADDR - win32k_subsystem::CSRSS_W32_SHARED_VA)
-    } else {
-        0
-    };
+    let client_pwnd = win32k_subsystem::win32k_heap_server_to_client(server_pwnd).unwrap_or(0);
     let activation_context = if server_pwnd != 0 {
         core::ptr::read_volatile((server_pwnd + WND_ACTCTX_OFFSET) as *const u64)
     } else {
@@ -3553,7 +3482,7 @@ unsafe fn restore_client_callback_window(frame: nt_user_callback::ActiveCallback
 /// The bridge exists because win32k's OWN `IntSetTebWndCallback` writes
 /// `DesktopHeapAddressToUser(pwnd)` there, and in our split-VSpace topology that translation cannot
 /// produce a valid client pointer: the executive publishes the correct
-/// `server_pwnd - (WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA)` instead. But win32k keeps writing that
+/// session-view client address of the pwnd instead. But win32k keeps writing that
 /// field on its own schedule — its `IntSetTebWndCallback`/`IntRestoreTebWndCallback` pair straddles
 /// every callback (and `co_IntCallWindowProc` skips the restore entirely when the callback returns an
 /// error, `callback.c:404`). So the executive's one-shot write at redirect time is NOT sufficient:
@@ -6459,94 +6388,6 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     })
 }
 
-unsafe fn map_win32k_arena_prefix_into_client(
-    handler: &mut ExecNtHandler,
-    pml4: u64,
-    pi: usize,
-    frame_base: u64,
-    client_base: u64,
-    max_frames: u64,
-    target_frames: u64,
-    mapped_frames: &[AtomicU64],
-    mapped_guard: &AtomicU64,
-    rights: u64,
-    label: &[u8],
-) -> bool {
-    if frame_base == 0 || pi >= MAX_PI || pi >= 64 || max_frames == 0 {
-        return false;
-    }
-    let Some(mapped_row) = mapped_frames.get(pi) else {
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
-
-    let target_frames = target_frames.min(max_frames);
-    if target_frames == 0 {
-        return false;
-    }
-    let Some(process) = handler.capture_process_identity(pi) else { return false; };
-    let generation = match process.generation {
-        nt_user_host::process_identity::ProcessGeneration::Hosted(generation)
-        | nt_user_host::process_identity::ProcessGeneration::Temporary(generation) => generation,
-    };
-    if pml4 == 0 || handler.process_vspaces.get(pi).copied() != Some(pml4)
-        || handler.process_vspace_caps.get(pi).flatten()
-            .is_none_or(|owner| owner.pml4 != pml4 || owner.generation != generation)
-    {
-        return false;
-    }
-    let Some(bytes) = target_frames.checked_mul(0x1000) else { return false; };
-    if client_base & 0xfff != 0 || client_base.checked_add(bytes).is_none()
-        || frame_base.checked_add(target_frames).is_none()
-        || hosted_thread_memory_access(pi as u64, client_base, bytes).is_err()
-        || client_cap_bank::admit_process(pi, process).is_err()
-    {
-        return false;
-    }
-    let bit = 1u64 << pi;
-    let already_mapped = mapped_row.load(Ordering::Relaxed).min(max_frames);
-    if already_mapped != 0 && !client_cap_bank::mapped_prefix(
-        pi, process, client_base, already_mapped, pml4, frame_base, rights,
-    ) { return false; }
-    if already_mapped >= target_frames {
-        mapped_guard.fetch_or(bit, Ordering::Relaxed);
-        return true;
-    }
-
-    for p in (already_mapped + 511) / 512..(target_frames + 511) / 512 {
-        if !win32k_client_cap_bank_map_page_table(
-            handler,
-            pml4,
-            pi,
-            client_base + p * 0x20_0000,
-            label,
-            p,
-        ) {
-            return false;
-        }
-    }
-    for i in already_mapped..target_frames {
-        let request = nt_user_host::provider_alias_bank::ProviderAliasRequest {
-            pi, process, page: client_base + i * 0x1000, pml4,
-            source_frame: frame_base + i, rights,
-        };
-        if client_cap_bank::map(request).is_err() {
-            print_str(b"[win32k-svc] failed to retain ");
-            print_str(label);
-            print_str(b" mapping cap for pi=");
-            print_u64(pi as u64);
-            print_str(b" index=0x");
-            print_hex(i as u32);
-            print_str(b"\n");
-            return false;
-        }
-        mapped_row.store(i + 1, Ordering::Relaxed);
-    }
-
-    mapped_guard.fetch_or(bit, Ordering::Relaxed);
-    true
-}
-
 unsafe fn win32k_client_cap_bank_map_page_table(
     handler: &mut ExecNtHandler,
     pml4: u64,
@@ -6612,98 +6453,141 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(candidate: nt_user_host::Pro
     let pi = candidate.pi;
     if pi < 64 {
         let bit = !(1u64 << pi);
-        WIN32K_CLIENT_MAPPED.fetch_and(bit, Ordering::Relaxed);
-        WIN32K_POOL_CLIENT_MAPPED.fetch_and(bit, Ordering::Relaxed);
         GDI_SHARED_TABLE_MAPPED.fetch_and(bit, Ordering::Relaxed);
+        crate::win32k_session_views::forget_client(pi);
+        (&mut *core::ptr::addr_of_mut!(SESSION_VIEW_CLIENTS))[pi] = None;
     }
-    if let Some(row) = win32k_user_heap_mapped_row(pi) { row.store(0, Ordering::Relaxed); }
-    if let Some(row) = win32k_pool_mapped_row(pi) { row.store(0, Ordering::Relaxed); }
     true
 }
 
-/// RO-map win32k's global USER heap arena ([`win32k_subsystem::WIN32K_HEAP_VADDR`], where gpsi,
-/// gHandleTable, handle entries, desktop-heap data, and live WND/CLS objects can live) into the GUI
-/// client `pi`'s VSpace at [`win32k_subsystem::CSRSS_W32_SHARED_VA`]. Returns the server→client delta
-/// (`WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA`) only after the mapping is actually installed.
+/// The process each client's session-view aliases were made for. A release must name the exact
+/// alias request, so the identity is fixed when the client is admitted.
+static mut SESSION_VIEW_CLIENTS: [Option<(nt_user_host::process_identity::ProcessIdentity, u64)>; 64] =
+    [None; 64];
+static SESSION_VIEW_CLIENTS_ANNOUNCED: AtomicU64 = AtomicU64::new(0);
+
+/// Project win32k's session views (the global USER heap, where gpsi, gHandleTable and the handle
+/// entries live, and every desktop heap) read-only into GUI client `pi` at
+/// [`win32k_subsystem::CSRSS_W32_SHARED_VA`]. Every committed page is aliased before this
+/// returns the server-to-client delta; later commits are pushed to the client as they happen.
 pub(crate) unsafe fn map_win32k_user_heap_into_client(
     handler: &mut ExecNtHandler,
     pml4: u64,
     pi: usize,
 ) -> Option<u64> {
-    let delta = win32k_subsystem::WIN32K_HEAP_VADDR - win32k_subsystem::CSRSS_W32_SHARED_VA;
-    let heap_base = WIN32K_HEAP_FRAME_BASE.load(Ordering::Relaxed);
-    let already_mapped = win32k_user_heap_mapped_row(pi)
-        .is_some_and(|row| row.load(Ordering::Relaxed) != 0)
-        || (pi < 64 && WIN32K_CLIENT_MAPPED.load(Ordering::Relaxed) & (1u64 << pi) != 0);
-    if !map_win32k_arena_prefix_into_client(
-        handler,
-        pml4,
-        pi,
-        heap_base,
-        win32k_subsystem::CSRSS_W32_SHARED_VA,
-        win32k_subsystem::WIN32K_HEAP_FRAMES,
-        win32k_subsystem::win32k_user_heap_committed_frames(),
-        win32k_user_heap_mapped_rows(),
-        &WIN32K_CLIENT_MAPPED,
-        2 | PAGE_EXECUTE_NEVER,
-        b"win32k USER heap",
-    ) {
+    if pi >= 64 || pml4 == 0 || handler.process_vspaces.get(pi).copied() != Some(pml4) {
         return None;
     }
-    if !already_mapped {
-        print_str(b"[win32k-svc] RO-mapped win32k USER heap into pi 0x");
+    let process = session_view_client_target(handler, pi)?;
+    let clients = &mut *core::ptr::addr_of_mut!(SESSION_VIEW_CLIENTS);
+    match clients[pi] {
+        Some(admitted) if admitted != (process, pml4) => return None,
+        Some(_) => {}
+        None => {
+            client_cap_bank::admit_process(pi, process).ok()?;
+            clients[pi] = Some((process, pml4));
+        }
+    }
+    let delta = crate::win32k_session_views::map_into_client(handler, pi)?;
+    let bit = 1u64 << pi;
+    if SESSION_VIEW_CLIENTS_ANNOUNCED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        print_str(b"[win32k-svc] RO-mapped win32k session views into pi 0x");
         print_hex(pi as u32);
         print_str(b" @0x");
         print_hex(win32k_subsystem::CSRSS_W32_SHARED_VA as u32);
         print_str(b" (delta=0x");
         print_hex((delta >> 32) as u32);
         print_hex(delta as u32);
-        print_str(b")\n");
+        print_str(b") committed-pages=");
+        print_u64(crate::win32k_session_views::committed_pages());
+        print_str(b"\n");
     }
     Some(delta)
 }
 
-/// RO-map win32k's POOL arena ([`win32k_subsystem::WIN32K_POOL_VADDR`], where session-lifetime object
-/// bodies can live) into the GUI client `pi`'s VSpace at [`win32k_subsystem::CSRSS_W32_POOL_VA`].
-/// DESKTOPINFO is translated by the arena that actually owns the pointer; the current ReactOS desktop
-/// heap path places it in the USER heap, but pool-resident objects still need this window. Returns the
-/// pool server→client delta only after the mapping is actually installed.
-pub(crate) unsafe fn map_win32k_pool_into_client(
+/// The live process identity of client `pi`, when its VSpace is the one recorded for it.
+unsafe fn session_view_client_target(
     handler: &mut ExecNtHandler,
-    pml4: u64,
     pi: usize,
-) -> Option<u64> {
-    let delta = win32k_subsystem::WIN32K_POOL_VADDR - win32k_subsystem::CSRSS_W32_POOL_VA;
-    let pool_base = WIN32K_POOL_FRAME_BASE.load(Ordering::Relaxed);
-    let already_mapped = win32k_pool_mapped_row(pi)
-        .is_some_and(|row| row.load(Ordering::Relaxed) != 0)
-        || (pi < 64 && WIN32K_POOL_CLIENT_MAPPED.load(Ordering::Relaxed) & (1u64 << pi) != 0);
-    if !map_win32k_arena_prefix_into_client(
-        handler,
-        pml4,
-        pi,
-        pool_base,
-        win32k_subsystem::CSRSS_W32_POOL_VA,
-        win32k_subsystem::WIN32K_POOL_FRAMES,
-        win32k_subsystem::WIN32K_POOL_FRAMES,
-        win32k_pool_mapped_rows(),
-        &WIN32K_POOL_CLIENT_MAPPED,
-        2 | PAGE_EXECUTE_NEVER,
-        b"win32k POOL",
-    ) {
+) -> Option<nt_user_host::process_identity::ProcessIdentity> {
+    let process = handler.capture_process_identity(pi)?;
+    let generation = match process.generation {
+        nt_user_host::process_identity::ProcessGeneration::Hosted(generation)
+        | nt_user_host::process_identity::ProcessGeneration::Temporary(generation) => generation,
+    };
+    let pml4 = handler.process_vspaces.get(pi).copied()?;
+    if pml4 == 0 || handler.process_vspace_caps.get(pi).flatten()
+        .is_none_or(|owner| owner.pml4 != pml4 || owner.generation != generation)
+    {
         return None;
     }
-    if !already_mapped {
-        print_str(b"[win32k-svc] RO-mapped win32k POOL into pi 0x");
-        print_hex(pi as u32);
-        print_str(b" @0x");
-        print_hex(win32k_subsystem::CSRSS_W32_POOL_VA as u32);
-        print_str(b" (pool-delta=0x");
-        print_hex((delta >> 32) as u32);
-        print_hex(delta as u32);
-        print_str(b")\n");
+    Some(process)
+}
+
+fn session_view_alias_request(
+    pi: usize,
+    process: nt_user_host::process_identity::ProcessIdentity,
+    pml4: u64,
+    page: nt_memory_manager::session_view_band::CommittedPage,
+) -> nt_user_host::provider_alias_bank::ProviderAliasRequest {
+    nt_user_host::provider_alias_bank::ProviderAliasRequest {
+        pi,
+        process,
+        page: page.address - crate::win32k_session_views::CLIENT_DELTA,
+        pml4,
+        source_frame: page.frame,
+        rights: 2 | PAGE_EXECUTE_NEVER,
     }
-    Some(delta)
+}
+
+/// Alias one committed session-view page read-only in admitted client `pi`.
+pub(crate) unsafe fn map_session_view_page_into_client(
+    handler: &mut ExecNtHandler,
+    pi: usize,
+    page: nt_memory_manager::session_view_band::CommittedPage,
+) -> bool {
+    let Some(Some((process, pml4))) = (&*core::ptr::addr_of!(SESSION_VIEW_CLIENTS)).get(pi).copied()
+    else {
+        return false;
+    };
+    if session_view_client_target(handler, pi) != Some(process)
+        || handler.process_vspaces.get(pi).copied() != Some(pml4)
+    {
+        return false;
+    }
+    let request = session_view_alias_request(pi, process, pml4, page);
+    if hosted_thread_memory_access(pi as u64, request.page, 0x1000).is_err()
+        || !win32k_client_cap_bank_map_page_table(
+            handler, pml4, pi, request.page & !0x1f_ffff, b"win32k session view",
+            (request.page - win32k_subsystem::CSRSS_W32_SHARED_VA) >> 21,
+        )
+    {
+        return false;
+    }
+    if client_cap_bank::map_with_handle(request).is_err() {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[win32k-svc] failed to alias session view page for pi=");
+        print_u64(pi as u64);
+        print_str(b" page=0x");
+        print_hex_u64(request.page);
+        print_str(b"\n");
+        return false;
+    }
+    true
+}
+
+/// Remove client `pi`'s alias of a session-view page whose Section is being deleted.
+pub(crate) unsafe fn release_session_view_page_from_client(
+    pi: usize,
+    page: nt_memory_manager::session_view_band::CommittedPage,
+) -> bool {
+    let Some(Some((process, pml4))) = (&*core::ptr::addr_of!(SESSION_VIEW_CLIENTS)).get(pi).copied()
+    else {
+        return false;
+    };
+    let request = session_view_alias_request(pi, process, pml4, page);
+    client_cap_bank::handle_for_exact_request(request)
+        .is_some_and(|handle| client_cap_bank::release_page_exact(request, handle).is_ok())
 }
 
 /// Resolve the real `GDI_MapHandleTable` result from the target PEB and verify that it names a

@@ -80,6 +80,7 @@ mod provider_section_receipts;
 mod registry_query_diagnostics;
 mod process_terminal_receipt;
 mod provider_mm_section_objects;
+mod win32k_session_views;
 mod provider_section_map_broker;
 mod provider_section_unmap_broker;
 mod provider_win32k_subject;
@@ -1980,8 +1981,7 @@ const _: () = assert!(DLL_ARENA_END == win32k_subsystem::CSRSS_W32_SHARED_VA);
 const _: () = assert!(DLL_ARENA_PT_COUNT == 192);
 const _: () = assert!(DLL_ARENA_START >= 0x8000_0000 && DLL_ARENA_END <= 0xC000_0000);
 const _: () = assert!(
-    win32k_subsystem::CSRSS_W32_SHARED_VA + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000
-        <= 0xA000_0000
+    win32k_subsystem::CSRSS_W32_SHARED_VA + win32k_session_views::BYTES <= 0xA000_0000
 );
 
 #[derive(Clone, Copy)]
@@ -9868,23 +9868,6 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(w32_bank_segments);
     print_str(b" w32-bank-fails=");
     print_u64(w32_bank_fails);
-    let (
-        w32_row_heap_len,
-        w32_row_heap_cap,
-        w32_row_pool_len,
-        w32_row_pool_cap,
-        w32_row_fails,
-    ) = win32k_glue::win32k_client_process_row_stats();
-    print_str(b" w32-rows=");
-    print_u64(w32_row_heap_len as u64);
-    print_str(b"/");
-    print_u64(w32_row_heap_cap as u64);
-    print_str(b":");
-    print_u64(w32_row_pool_len as u64);
-    print_str(b"/");
-    print_u64(w32_row_pool_cap as u64);
-    print_str(b"/");
-    print_u64(w32_row_fails);
     let (
         teb_frame_rows,
         teb_frame_cap,
@@ -28051,22 +28034,10 @@ static WIN32K_DISP_BT_PT: AtomicU64 = AtomicU64::new(0);
 static WIN32K_FAULT_EP: AtomicU64 = AtomicU64::new(0);
 static WIN32K_HOST_PML4: AtomicU64 = AtomicU64::new(0);
 static WIN32K_ROOT_IMAGE_MAP_OWNER: AtomicU64 = AtomicU64::new(0);
-/// The frame-cap cptr base of win32k's global USER heap arena (`heap_base`, WIN32K_HEAP_FRAMES
-/// consecutive caps). Retained so the connect marshaling can copy_cap + RO-map the arena into a
-/// GUI client's VSpace (the gSharedInfo client-mapping).
-static WIN32K_HEAP_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
-/// Frame-cap base of win32k's POOL arena (WIN32K_POOL_VADDR, where session-lifetime object bodies can
-/// live). Retained so pool-resident win32k pointers can be copy_cap + RO-mapped into a GUI client's
-/// VSpace. DESKTOPINFO is translated by the arena that actually owns the live pointer.
+/// Frame-cap base of win32k's POOL arena (WIN32K_POOL_VADDR, where session-lifetime object bodies
+/// live), retained for exact provider pool aliases.
 static WIN32K_POOL_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WIN32K_POOL_EXHAUSTIONS: AtomicU64 = AtomicU64::new(0);
-/// Per-pi bit set once win32k's USER heap arena has been RO-mapped into that GUI client's VSpace
-/// (gSharedInfo plus desktop-heap objects and any DESKTOPINFO allocated from that arena).
-static WIN32K_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
-/// Per-pi bit set once win32k's POOL arena has been RO-mapped into that GUI client's VSpace (the
-/// session-object client window; DESKTOPINFO is translated through POOL only when the live pointer is
-/// actually pool-resident).
-static WIN32K_POOL_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// Per-pi bit set once win32k's canonical GDI handle-table Section has an exact client alias
 /// named by that process's `PEB->GdiSharedHandleTable`.
 static GDI_SHARED_TABLE_MAPPED: AtomicU64 = AtomicU64::new(0);
@@ -29859,9 +29830,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     }
     if !reset_teb_tail_process_rows(MAX_PI) {
         panic!("TEB-tail process row allocation failed");
-    }
-    if !win32k_glue::reset_win32k_client_process_rows(MAX_PI) {
-        panic!("win32k client process row allocation failed");
     }
     print_str(b"[ntos-exec] P3: demand-loading a PE via SEC_IMAGE (pages fault in by RVA)\n");
     let sec_magic = 0x5EC1_1A6E_D15C_0DE5u64;
@@ -32086,7 +32054,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // their server VAs: callback policy must resolve HWND through gSharedInfo's handle table
             // without dereferencing an unmapped raw component address.
             let heap_base = alloc_frame_run(win32k_subsystem::WIN32K_HEAP_FRAMES);
-            WIN32K_HEAP_FRAME_BASE.store(heap_base, Ordering::Relaxed);
             for page_table in 0..(win32k_subsystem::WIN32K_HEAP_FRAMES + 511) / 512 {
                 let pt = alloc_slot();
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
