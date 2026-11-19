@@ -983,6 +983,13 @@ pub struct SyscallOrigin {
 }
 
 impl SyscallOrigin {
+    /// The fixed origin of the executive's post-boot diagnostic self-tests. They run in the
+    /// root on behalf of no hosted thread; live dispatch always passes the authenticated
+    /// caller to [`Self::new`] instead.
+    pub fn diagnostic_self_test() -> Self {
+        Self::new(1, 1, ProcessorMode::UserMode)
+    }
+
     /// A caller origin for a thread at a given previous mode (IP/SP unset).
     pub fn new(process_id: u32, thread_id: u32, previous_mode: ProcessorMode) -> Self {
         SyscallOrigin {

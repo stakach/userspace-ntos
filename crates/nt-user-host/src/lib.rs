@@ -106,6 +106,7 @@ mod services;
 pub mod sched_context;
 pub mod slot_recycle;
 pub mod frame_recycle;
+pub mod syscall_caller;
 pub mod thread_binding;
 pub mod hosted_priority;
 pub mod thread_priority_transition;

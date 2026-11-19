@@ -36,7 +36,24 @@ pub(super) unsafe fn syscall_nt_route(
         native_call_transport, resume_ip, sp, flags, syscall_reply_context, current_tid,
         table_entry, ..
     } = *call;
-    let origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
+    // Revalidate immediately before dispatch: deferred work since ingress may have retired
+    // or rebound the caller. The origin carries its real PID/TID, never a placeholder.
+    let caller = match super::loop_syscall::revalidated_syscall_caller(
+        &nt_handler, event_runtime, lp.msg.badge,
+    ) {
+        Ok(caller) if caller == call.caller => caller,
+        Ok(_) => {
+            super::loop_syscall::trace_syscall_caller_refused(b"dispatch", lp.msg.badge, lp.msg.m0,
+                nt_user_host::syscall_caller::SyscallCallerRefusal::Changed);
+            return ControlFlow::Break(lp.reject_hosted_ingress());
+        }
+        Err(refusal) => {
+            super::loop_syscall::trace_syscall_caller_refused(b"dispatch", lp.msg.badge, lp.msg.m0,
+                refusal);
+            return ControlFlow::Break(lp.reject_hosted_ingress());
+        }
+    };
+    let origin = SyscallOrigin::new(caller.process_id, caller.thread_id, ProcessorMode::UserMode);
     // x64 native syscall args: arg1=R10 (the stub's `mov r10,rcx`; RCX itself is the
     // syscall return address), arg2=RDX, arg3=R8, arg4=R9, then arg5+ on the caller's
     // stack at [rsp+0x28], [rsp+0x30], … RDX rides in m3; R8/R9/R10 + the stack come

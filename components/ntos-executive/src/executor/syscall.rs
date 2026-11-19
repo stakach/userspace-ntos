@@ -15,7 +15,52 @@ pub(super) struct Syscall {
     pub(super) lsa_logon_trace_seq: Option<u64>,
     pub(super) syscall_reply_context: SyscallReplyContext,
     pub(super) current_tid: u64,
+    /// The authenticated caller, revalidated against a fresh admission of its badge.
+    pub(super) caller: nt_user_host::syscall_caller::SyscallCaller,
     pub(super) table_entry: Option<nt_syscall::NativeServiceEntry>,
+}
+
+fn admitted_syscall_thread(runtime: HostedThreadRuntime)
+    -> nt_user_host::syscall_caller::AdmittedSyscallThread<HostedThreadRole>
+{
+    nt_user_host::syscall_caller::AdmittedSyscallThread {
+        binding: runtime.binding(),
+        sched_context: runtime.mechanism.sched_context,
+    }
+}
+
+/// Re-admit the Call's badge and require exactly the binding captured at ingress.
+pub(super) fn revalidated_syscall_caller(
+    nt_handler: &ExecNtHandler,
+    captured: HostedThreadRuntime,
+    badge: u64,
+) -> Result<nt_user_host::syscall_caller::SyscallCaller,
+    nt_user_host::syscall_caller::SyscallCallerRefusal>
+{
+    nt_user_host::syscall_caller::revalidate_syscall_caller(
+        admitted_syscall_thread(captured),
+        nt_handler.admit_hosted_thread_ingress(badge).ok().map(admitted_syscall_thread),
+    )
+}
+
+pub(super) fn trace_syscall_caller_refused(
+    stage: &[u8],
+    badge: u64,
+    ssn: u64,
+    refusal: nt_user_host::syscall_caller::SyscallCallerRefusal,
+) {
+    print_str(b"[syscall-caller] refused stage=");
+    print_str(stage);
+    print_str(b" badge=");
+    print_u64(badge);
+    print_str(b" ssn=0x");
+    print_hex_u64(ssn);
+    print_str(match refusal {
+        nt_user_host::syscall_caller::SyscallCallerRefusal::Missing => b" reason=missing\n",
+        nt_user_host::syscall_caller::SyscallCallerRefusal::Changed => b" reason=changed\n",
+        nt_user_host::syscall_caller::SyscallCallerRefusal::Unrepresentable =>
+            b" reason=unrepresentable\n",
+    });
 }
 
 /// What one syscall decides: its result, whether the NT or win32k route handled it, and the
@@ -191,21 +236,19 @@ pub(super) unsafe fn syscall(
     // before admission and dispatch, after preserving the original fault/reply frame.
     let raw_external_ssn = lp.msg.m0;
     lp.msg.m0 = nt_syscall_abi::normalize_external_raw_ssn(lp.msg.m0, native_call_transport);
-    let current_tid = nt_handler
-        .hosted_thread_tid_for_badge(lp.msg.badge)
-        .unwrap_or_else(|| {
-            print_str(b"[hosted-thread] missing runtime TID for syscall badge=");
-            print_u64(lp.msg.badge);
-            print_str(b" pi=");
-            print_u64(pi as u64);
-            print_str(b"\n");
-            0
-        });
-    if current_tid == event_runtime.tid {
-        crate::registry_mutation_work::trace_next_hosted_syscall(
-            event_runtime.binding(), raw_external_ssn, lp.msg.m0,
-        );
-    }
+    // The admitted binding is the only caller identity; a missing or changed thread is
+    // refused rather than dispatched as a placeholder TID.
+    let caller = match revalidated_syscall_caller(&nt_handler, event_runtime, lp.msg.badge) {
+        Ok(caller) => caller,
+        Err(refusal) => {
+            trace_syscall_caller_refused(b"ingress", lp.msg.badge, lp.msg.m0, refusal);
+            return ControlFlow::Break(lp.reject_hosted_ingress());
+        }
+    };
+    let current_tid = caller.tid;
+    crate::registry_mutation_work::trace_next_hosted_syscall(
+        event_runtime.binding(), raw_external_ssn, lp.msg.m0,
+    );
     if {
         let waiters = &*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS);
         waiters.has_retry_delivery_for_thread(current_tid)
@@ -819,7 +862,7 @@ pub(super) unsafe fn syscall(
     let table_entry = nt_dispatcher.table().lookup(lp.msg.m0 as u32);
     let call = Syscall {
         native_call_transport, resume_ip, sp, flags, lsa_logon_trace_seq,
-        syscall_reply_context, current_tid, table_entry,
+        syscall_reply_context, current_tid, caller, table_entry,
     };
     if let Some(route) = nt_syscall_abi::NativeIngressRoute::select(
         lp.msg.m0, native_call_transport, table_entry.is_some()) {

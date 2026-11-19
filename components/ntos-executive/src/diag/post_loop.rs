@@ -789,7 +789,7 @@ pub(super) unsafe fn report(
             nt_handler.pi = 0;
 
             let mut sc_ok = 0u64;
-            let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
+            let dbg_origin = SyscallOrigin::diagnostic_self_test();
             // Every service below goes through THIS — the dispatcher, by SSN. An unregistered number
             // returns STATUS_INVALID_SYSTEM_SERVICE and never reaches a handler; a wrong argument
             // count returns STATUS_INVALID_PARAMETER before the handler.
@@ -1223,7 +1223,7 @@ pub(super) unsafe fn report(
 
             let mut ex_ok = 0u64;
             nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(0));
-            let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
+            let dbg_origin = SyscallOrigin::diagnostic_self_test();
             macro_rules! sysc {
                 ($ssn:expr, $args:expr) => {
                     nt_dispatcher
@@ -1659,7 +1659,7 @@ pub(super) unsafe fn report(
 
             let mut md_ok = 0u64;
             nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(0));
-            let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
+            let dbg_origin = SyscallOrigin::diagnostic_self_test();
             macro_rules! sysc {
                 ($ssn:expr, $args:expr) => {
                     nt_dispatcher
@@ -2109,7 +2109,7 @@ pub(super) unsafe fn report(
 
             let mut bk_ok = 0u64;
             nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(0));
-            let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
+            let dbg_origin = SyscallOrigin::diagnostic_self_test();
             macro_rules! sysc {
                 ($ssn:expr, $args:expr) => {
                     nt_dispatcher
@@ -3356,7 +3356,7 @@ pub(super) unsafe fn report(
 
             let mut br_ok = 0u64;
             nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(0));
-            let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
+            let dbg_origin = SyscallOrigin::diagnostic_self_test();
             // Every dispatch through the real route, with the out-param write queue drained exactly
             // as the service loop drains it (`xas_write_u64` per queued write).
             macro_rules! sysc {
