@@ -63,9 +63,24 @@ pub(crate) struct HostedRegistryPublication {
     pub disposition_output: u64,
     pub desired: u32,
     pub bound_target: Option<KeyRef>,
+    /// OBJ_OPENLINK / REG_OPTION_OPEN_LINK: a final symbolic link key is opened itself.
+    pub open_link: bool,
     root: Option<(KeyRef, RegistryKeyHandlePublication)>,
     relative: Option<alloc::string::String>,
 }
+
+/// One registry name resolution step: the key, or the absolute name a symbolic link key
+/// redirects the open to (CmpParseKey's reparse).
+pub(crate) enum RegistryTargetStep {
+    Key(KeyRef),
+    Reparse(alloc::string::String),
+}
+
+const OBJ_OPENLINK: u32 = 0x100;
+const REG_OPTION_VOLATILE: u32 = 0x1;
+const REG_OPTION_CREATE_LINK: u32 = 0x2;
+const REG_OPTION_BACKUP_RESTORE: u32 = 0x4;
+const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 
 impl ExecNtHandler {
     pub(super) unsafe fn read_registry_name_checked(
@@ -111,7 +126,7 @@ impl ExecNtHandler {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let flags = u32::from_le_bytes(attributes[24..28].try_into().unwrap());
-        if flags & !(0x2 | 0x40 | 0x80 | 0x200 | 0x400) != 0 {
+        if flags & !(0x2 | 0x40 | 0x80 | OBJ_OPENLINK | 0x200 | 0x400) != 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let lifetime = self
@@ -196,6 +211,7 @@ impl ExecNtHandler {
                 disposition_output: if create { args[6] } else { 0 },
                 desired: nt_ulong_arg(args[1]),
                 bound_target: None,
+                open_link: flags & OBJ_OPENLINK != 0,
                 root: retained_root,
                 relative: (root != 0).then_some(name),
             },
@@ -232,38 +248,98 @@ impl ExecNtHandler {
     unsafe fn acquire_hosted_registry_target(
         &mut self,
         state: &HostedRegistryPublication,
-    ) -> Result<KeyRef, u32> {
+        open_link: bool,
+    ) -> Result<RegistryTargetStep, u32> {
         match &state.root {
-            Some((root, _)) => self.acquire_relative_registry_target(
+            Some((root, _)) => self.acquire_relative_registry_target_step(
                 *root,
                 state.relative.as_deref().expect("relative registry name"),
+                open_link,
             ),
-            None => self.acquire_registry_target(&state.path),
+            None => self.acquire_registry_target_step(&state.path, open_link),
         }
     }
 
+    /// ObpLookupObjectName's reparse: the open restarts on the link's absolute target, which
+    /// may be in another hive. The captured root no longer applies.
+    unsafe fn reparse_hosted_registry_publication(
+        &mut self,
+        state: &mut HostedRegistryPublication,
+        target: &str,
+        reparses: &mut usize,
+    ) -> Result<(), u32> {
+        *reparses += 1;
+        if *reparses > nt_hive_core::MAX_REPARSE {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        let path = self.registry_storage_canon(target)?;
+        self.release_hosted_registry_root(state);
+        state.relative = None;
+        state.path = path;
+        Ok(())
+    }
+
     /// The caller retains a canonical reference to root across the target service exchange.
+    /// Symbolic links on the way are followed to wherever they lead.
     pub(crate) unsafe fn acquire_relative_registry_target(
         &mut self,
         root: KeyRef,
         name: &str,
     ) -> Result<KeyRef, u32> {
+        match self.acquire_relative_registry_target_step(root, name, false)? {
+            RegistryTargetStep::Key(target) => Ok(target),
+            RegistryTargetStep::Reparse(target) => {
+                let path = self.registry_storage_canon(&target)?;
+                self.acquire_registry_target(&path)
+            }
+        }
+    }
+
+    unsafe fn install_opened_system_key(
+        &mut self,
+        opened: nt_config_client::OpenedSystemHiveKey,
+    ) -> Result<KeyRef, u32> {
+        match self.install_cm_system_key_target(CmSystemKeyTarget {
+            lease: opened.lease,
+            physical_path: nt_hive_core::canon_path(&opened.physical_path),
+        }) {
+            Ok(target) => Ok(target),
+            Err(status) => {
+                let _ = crate::config_manager_retire_system_hive_key(opened.lease);
+                Err(status)
+            }
+        }
+    }
+
+    unsafe fn system_key_step(
+        &mut self,
+        path: &str,
+        root: Option<nt_config_client::SystemHiveKeyLease>,
+        open_link: bool,
+    ) -> Result<RegistryTargetStep, u32> {
+        match crate::cm_key_ownership::open_step(path, root, open_link)
+            .map_err(|status| status as u32)?
+        {
+            crate::cm_key_ownership::SystemKeyOpen::Opened(opened) => {
+                self.install_opened_system_key(opened).map(RegistryTargetStep::Key)
+            }
+            crate::cm_key_ownership::SystemKeyOpen::Reparse(target) => {
+                Ok(RegistryTargetStep::Reparse(target))
+            }
+        }
+    }
+
+    unsafe fn acquire_relative_registry_target_step(
+        &mut self,
+        root: KeyRef,
+        name: &str,
+        open_link: bool,
+    ) -> Result<RegistryTargetStep, u32> {
         if name.starts_with('\\') || name.contains('\0') {
             return Err(0xC000_003B);
         }
         if let Some(target) = self.cm_system_key_target(root) {
-            let opened = crate::config_manager_open_relative_system_hive_key(target.lease, name)
-                .map_err(|status| status as u32)?;
-            return match self.install_cm_system_key_target(CmSystemKeyTarget {
-                lease: opened.lease,
-                physical_path: nt_hive_core::canon_path(&opened.physical_path),
-            }) {
-                Ok(target) => Ok(target),
-                Err(status) => {
-                    let _ = crate::config_manager_retire_system_hive_key(opened.lease);
-                    Err(status)
-                }
-            };
+            return self.system_key_step(name, Some(target.lease), open_link);
         }
         if let Some(target) = crate::registry_key_targets::runtime(root) {
             let (reply, _) = crate::config_manager_runtime_key_operation(
@@ -281,7 +357,8 @@ impl ExecNtHandler {
                 path.push_str(name);
             }
             return self
-                .install_cm_runtime_key_target(nt_hive_core::canon_path(&path), reply.detail0);
+                .install_cm_runtime_key_target(nt_hive_core::canon_path(&path), reply.detail0)
+                .map(RegistryTargetStep::Key);
         }
         // Local hive and overlay resolution has no IPC between validation and lookup. Virtual
         // namespace roots cannot be deleted and may cross into a separately owned CM mount.
@@ -293,7 +370,7 @@ impl ExecNtHandler {
             path.push('\\');
             path.push_str(name);
         }
-        self.acquire_registry_target(&path)
+        self.acquire_registry_target_step(&path, open_link)
     }
 
     fn bind_hosted_registry_target(
@@ -316,38 +393,45 @@ impl ExecNtHandler {
         Ok(())
     }
 
+    /// The key at canonical `path`, following symbolic links to wherever they lead.
     pub(crate) unsafe fn acquire_registry_target(&mut self, path: &str) -> Result<KeyRef, u32> {
+        let mut path = alloc::string::String::from(path);
+        for _ in 0..=nt_hive_core::MAX_REPARSE {
+            match self.acquire_registry_target_step(&path, false)? {
+                RegistryTargetStep::Key(target) => return Ok(target),
+                RegistryTargetStep::Reparse(target) => path = self.registry_storage_canon(&target)?,
+            }
+        }
+        Err(STATUS_OBJECT_NAME_NOT_FOUND)
+    }
+
+    /// Resolve canonical `path` in its owning hive. Only the CM-owned SYSTEM hive holds symbolic
+    /// link keys; crossing one yields its target instead of a key.
+    unsafe fn acquire_registry_target_step(
+        &mut self,
+        path: &str,
+        open_link: bool,
+    ) -> Result<RegistryTargetStep, u32> {
         if let Some(target) = Self::virtual_registry_root_target_from_canon(path) {
-            return Ok(target);
+            return Ok(RegistryTargetStep::Key(target));
         }
         if let Some(index) = self.registry_overlay_index_for_canon_path(path) {
-            return Ok(OVERLAY_KEY_TAG | index as u32);
+            return Ok(RegistryTargetStep::Key(OVERLAY_KEY_TAG | index as u32));
         }
         if is_cm_runtime_registry_path(path) {
             let key = crate::config_manager_open_key_id(path).map_err(|status| status as u32)?;
-            return self.install_cm_runtime_key_target(path.into(), key);
+            return self.install_cm_runtime_key_target(path.into(), key).map(RegistryTargetStep::Key);
         }
         if is_system_registry_path(path) {
-            let opened =
-                crate::config_manager_open_system_hive_key(path).map_err(|status| status as u32)?;
-            return match self.install_cm_system_key_target(CmSystemKeyTarget {
-                lease: opened.lease,
-                physical_path: nt_hive_core::canon_path(&opened.physical_path),
-            }) {
-                Ok(target) => Ok(target),
-                Err(status) => {
-                    let _ = crate::config_manager_retire_system_hive_key(opened.lease);
-                    Err(status)
-                }
-            };
+            return self.system_key_step(path, None, open_link);
         }
         if let Some(key) = self.mutable_registry_key_by_path(path) {
-            return self.install_mutable_registry_key_target(key);
+            return self.install_mutable_registry_key_target(key).map(RegistryTargetStep::Key);
         }
         if self.mutable_hive_owns_path(path) {
             return Err(STATUS_OBJECT_NAME_NOT_FOUND);
         }
-        self.resolve_key(path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
+        self.resolve_key(path).map(RegistryTargetStep::Key).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
     }
 
     fn trace_key_access_denied(&self, state: &HostedRegistryPublication, status: u32) {
@@ -493,18 +577,23 @@ impl ExecNtHandler {
     }
 
     pub(super) unsafe fn nt_open_key_admitted(&mut self, args: &[u64]) -> u32 {
-        self.nt_open_key_with_options(args, false)
+        self.nt_open_key_with_options(args, nt_config_manager::KeyOpenOptions::default())
     }
 
     pub(super) unsafe fn nt_open_key_ex_admitted(&mut self, args: &[u64]) -> u32 {
-        let backup = match nt_config_manager::validate_key_open_options(nt_ulong_arg(args[3])) {
-            Ok(backup) => backup,
+        let options = match nt_config_manager::validate_key_open_options(nt_ulong_arg(args[3])) {
+            Ok(options) => options,
             Err(status) => return status,
         };
-        self.nt_open_key_with_options(args, backup)
+        self.nt_open_key_with_options(args, options)
     }
 
-    unsafe fn nt_open_key_with_options(&mut self, args: &[u64], backup: bool) -> u32 {
+    unsafe fn nt_open_key_with_options(
+        &mut self,
+        args: &[u64],
+        options: nt_config_manager::KeyOpenOptions,
+    ) -> u32 {
+        let backup = options.backup;
         let _durable = allocator::enter_durable();
         let (mut state, _) = match self.capture_hosted_registry_publication(args, false) {
             Ok(state) => state,
@@ -513,9 +602,17 @@ impl ExecNtHandler {
                 return status;
             }
         };
+        state.open_link |= options.open_link;
         trace_computer_name_registry(b"open-ingress", &state.path, 0, self.pi, self.current_tid);
         let result = (|| {
-            let target = self.acquire_hosted_registry_target(&state)?;
+            let mut reparses = 0;
+            let target = loop {
+                match self.acquire_hosted_registry_target(&state, state.open_link)? {
+                    RegistryTargetStep::Key(target) => break target,
+                    RegistryTargetStep::Reparse(target) => self
+                        .reparse_hosted_registry_publication(&mut state, &target, &mut reparses)?,
+                }
+            };
             self.bind_hosted_registry_target(&mut state, target)?;
             let granted = match self.registry_open_grant(&state, target, backup) {
                 Ok(granted) => granted,
@@ -556,11 +653,16 @@ impl ExecNtHandler {
     pub(super) unsafe fn nt_create_key_admitted(&mut self, args: &[u64]) -> u32 {
         let _durable = allocator::enter_durable();
         let options = nt_ulong_arg(args[5]);
-        if options & !(1 | 4) != 0 {
+        if options & !(REG_OPTION_VOLATILE | REG_OPTION_CREATE_LINK | REG_OPTION_BACKUP_RESTORE) != 0 {
             return STATUS_NOT_SUPPORTED;
         }
-        let backup = options & 4 != 0;
-        let volatile = options & 1 != 0;
+        let backup = options & REG_OPTION_BACKUP_RESTORE != 0;
+        let volatile = options & REG_OPTION_VOLATILE != 0;
+        let link = options & REG_OPTION_CREATE_LINK != 0;
+        // A durable link needs its key kind in the SYSTEM journal, which records none.
+        if link && !volatile {
+            return STATUS_NOT_SUPPORTED;
+        }
         let expected_generation =
             crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
         let (mut state, creator_pointer) =
@@ -572,12 +674,20 @@ impl ExecNtHandler {
                 }
             };
         trace_computer_name_registry(b"create-ingress", &state.path, 0, self.pi, self.current_tid);
+        let mut reparses = 0;
+        loop {
         let mut parent_retention = None;
         let mut durable_create = None;
         let mut mutable_create = None;
+        let mut reparse = None;
         let result = (|| {
-            match self.acquire_hosted_registry_target(&state) {
-                Ok(target) => {
+            // CmpDoOpen: with CREATE_LINK an existing final key is a collision, never followed.
+            match self.acquire_hosted_registry_target(&state, state.open_link || link) {
+                Ok(RegistryTargetStep::Key(target)) if link => {
+                    self.release_registry_key_target(target);
+                    return Err(STATUS_OBJECT_NAME_COLLISION);
+                }
+                Ok(RegistryTargetStep::Key(target)) => {
                     self.bind_hosted_registry_target(&mut state, target)?;
                     let granted = match self.registry_open_grant(&state, target, backup) {
                         Ok(granted) => granted,
@@ -585,6 +695,10 @@ impl ExecNtHandler {
                     };
                     return self
                         .finish_hosted_registry_publication(&mut state, target, granted, false);
+                }
+                Ok(RegistryTargetStep::Reparse(target)) => {
+                    reparse = Some(target);
+                    return Err(nt_config_abi::CM_STATUS_REPARSE as u32);
                 }
                 Err(STATUS_OBJECT_NAME_NOT_FOUND) => {}
                 Err(status) => return Err(status),
@@ -600,12 +714,20 @@ impl ExecNtHandler {
                 Some((root, _)) => {
                     let relative = state.relative.as_deref().expect("relative registry name");
                     let relative_parent = relative.rsplit_once('\\').map_or("", |(path, _)| path);
-                    self.acquire_relative_registry_target(*root, relative_parent)
+                    self.acquire_relative_registry_target_step(*root, relative_parent, false)
                 }
-                None => self.acquire_registry_target(parent_path),
+                None => self.acquire_registry_target_step(parent_path, false),
             };
             let parent = match parent_result {
-                Ok(parent) => parent,
+                Ok(RegistryTargetStep::Key(parent)) => parent,
+                Ok(RegistryTargetStep::Reparse(target)) => {
+                    // The parent is reached through a link: create beneath its target instead.
+                    parent_owner
+                        .abort(&mut self.pm)
+                        .expect("parent reservation");
+                    reparse = Some(alloc::format!("{target}\\{leaf}"));
+                    return Err(nt_config_abi::CM_STATUS_REPARSE as u32);
+                }
                 Err(status) => {
                     parent_owner
                         .abort(&mut self.pm)
@@ -621,6 +743,10 @@ impl ExecNtHandler {
                 return Err(status);
             }
             parent_retention = Some(parent_owner);
+            // Link keys live only in the CM-owned SYSTEM hive, where reparse is implemented.
+            if link && !is_system_registry_path(&state.path) {
+                return Err(STATUS_NOT_SUPPORTED);
+            }
             let runtime_parent = if is_cm_runtime_registry_path(&state.path) {
                 let runtime = self
                     .cm_runtime_key_target(parent)
@@ -757,12 +883,21 @@ impl ExecNtHandler {
         })();
         if let Some((parent, lease, leaf, class, prepared)) = durable_create {
             let owner = parent_retention.take().expect("SYSTEM create parent reservation");
-            let mutation = nt_config_client::SystemHiveMutation::CreateChildRelative {
-                parent: lease,
-                name: &leaf,
-                class_name: class.as_deref(),
-                descriptor: &prepared.descriptor,
-                volatile,
+            let mutation = if link {
+                nt_config_client::SystemHiveMutation::CreateLinkRelative {
+                    parent: lease,
+                    name: &leaf,
+                    class_name: class.as_deref(),
+                    descriptor: &prepared.descriptor,
+                }
+            } else {
+                nt_config_client::SystemHiveMutation::CreateChildRelative {
+                    parent: lease,
+                    name: &leaf,
+                    class_name: class.as_deref(),
+                    descriptor: &prepared.descriptor,
+                    volatile,
+                }
             };
             trace_computer_name_registry(b"create-submit-enter", &state.path, 0, self.pi, self.current_tid);
             match crate::registry_mutation_work::submit_hosted(
@@ -808,7 +943,16 @@ impl ExecNtHandler {
                 self.release_registry_key_target(target);
             }
         }
-        match result {
+        if let Some(target) = reparse {
+            match self.reparse_hosted_registry_publication(&mut state, &target, &mut reparses) {
+                Ok(()) => continue,
+                Err(status) => {
+                    self.abort_hosted_registry_publication(&mut state);
+                    return status;
+                }
+            }
+        }
+        return match result {
             Ok(()) => {
                 trace_computer_name_registry(b"create-return", &state.path, 0, self.pi, self.current_tid);
                 0
@@ -822,6 +966,7 @@ impl ExecNtHandler {
                 self.abort_hosted_registry_publication(&mut state);
                 status
             }
+        };
         }
     }
 

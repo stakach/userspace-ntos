@@ -1199,6 +1199,7 @@ pub(crate) unsafe fn submit_hosted(
         let parent_target = registry_key_targets::system(parent).ok_or(0xC000_0008u32)?;
         match &mutation {
             SystemHiveMutation::CreateChildRelative { parent: lease, name, .. }
+            | SystemHiveMutation::CreateLinkRelative { parent: lease, name, .. }
                 if *lease == parent_target.lease && *name == leaf.as_str() => {}
             _ => return Err(0xC000_0008u32),
         }

@@ -400,3 +400,113 @@ fn reconstructed_server_shares_source_without_reusing_any_open_or_lease_identity
         Err(SystemKeyLeaseError::Invalid)
     );
 }
+
+const PRINTERS_TARGET: &str = r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers";
+
+/// localspl's volatile `Control\Print\Printers` link into SOFTWARE.
+fn server_with_printers_link() -> CmServer {
+    let mut server = server();
+    let hive = &mut server.system_hive.as_mut().unwrap().hive;
+    let print = hive.create_key(r"ControlSet001\Control\Print");
+    let mut tx = hive.begin_transaction();
+    let link = tx
+        .try_create_child_of_kind(print, "Printers".into(), None, alloc::vec![1], true,
+            nt_hive_core::KeyKind::SymbolicLink)
+        .unwrap();
+    let target: Vec<u8> = PRINTERS_TARGET.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert!(tx.set_value(link, nt_hive_core::SYMBOLIC_LINK_VALUE,
+        nt_config_manager::RegistryValueType::Link, target));
+    tx.commit();
+    server
+}
+
+const PRINTERS: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Print\Printers";
+
+#[test]
+fn opening_through_a_link_reparses_to_its_target_without_a_lease() {
+    let mut server = server_with_printers_link();
+    let nonce = authority(&mut server);
+    let (reply, outcome, payload) = run(&mut server, &begin(nonce, 0, 1, &alloc::format!(r"{PRINTERS}\HP")));
+    assert_eq!(reply.status, STATUS_SUCCESS);
+    assert_eq!(outcome.outcome_status, nt_config_abi::CM_STATUS_REPARSE);
+    assert_eq!((outcome.lease_token, outcome.opened_generation), (0, 0));
+    assert_eq!(&payload[CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES..],
+        alloc::format!(r"{PRINTERS_TARGET}\HP").as_bytes());
+}
+
+#[test]
+fn open_link_opens_the_final_link_itself_and_is_part_of_the_replay_identity() {
+    let mut server = server_with_printers_link();
+    let nonce = authority(&mut server);
+    let mut input = begin(nonce, 0, 1, PRINTERS);
+    let mut request = CmHiveKeyOpenRequest::from_bytes(&input).unwrap();
+    request.flags = hive_key_open_flags::OPEN_LINK;
+    input[..core::mem::size_of::<CmHiveKeyOpenRequest>()].copy_from_slice(request.as_bytes());
+    let (_, outcome, _) = run(&mut server, &input);
+    assert_eq!(outcome.outcome_status, STATUS_SUCCESS);
+    let key = server.system_key_leases.get(outcome.lease_token).unwrap().key;
+    assert_eq!(server.system_hive.as_ref().unwrap().hive.key_kind(key),
+        Some(nt_hive_core::KeyKind::SymbolicLink));
+    // The same request identity without OPEN_LINK is a different request.
+    assert_eq!(run(&mut server, &begin(nonce, 0, 1, PRINTERS)).0.status, STATUS_INVALID_PARAMETER);
+    // Unknown flags are refused.
+    let mut unknown = begin(nonce, 1, 1, PRINTERS);
+    let mut request = CmHiveKeyOpenRequest::from_bytes(&unknown).unwrap();
+    request.flags = 2;
+    unknown[..core::mem::size_of::<CmHiveKeyOpenRequest>()].copy_from_slice(request.as_bytes());
+    assert_eq!(run(&mut server, &unknown).0.status, STATUS_INVALID_PARAMETER);
+}
+
+#[test]
+fn only_the_link_target_may_be_set_on_a_link_key() {
+    let mut server = server_with_printers_link();
+    let mounted = server.system_hive.as_mut().unwrap();
+    let control_set = mounted.current_control_set.clone();
+    let mut tx = mounted.hive.begin_transaction();
+    let set = |name: &str, value_type| HiveMutation::SetValue {
+        path: PRINTERS.into(), name: name.into(), value_type, data: alloc::vec![0x5c, 0],
+    };
+    assert_eq!(apply_system_hive_mutation(&mut tx, &control_set, &set("Other", 6)),
+        Err(STATUS_ACCESS_DENIED));
+    assert_eq!(apply_system_hive_mutation(&mut tx, &control_set, &set("SymbolicLinkValue", 1)),
+        Err(STATUS_ACCESS_DENIED));
+    assert_eq!(apply_system_hive_mutation(&mut tx, &control_set, &set("symboliclinkvalue", 6)), Ok(()));
+}
+
+fn create_child_record(flags: u16) -> Vec<u8> {
+    use nt_config_abi::{hive_create_child_metadata as metadata, hive_mutation_kind, CmHiveMutationRecord};
+    let parent: Vec<u8> = r"\Registry\Machine\System\CurrentControlSet\Control"
+        .encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let name: Vec<u8> = "Links".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut data = metadata::header(0, 1).to_vec();
+    data.push(1);
+    let record = CmHiveMutationRecord {
+        kind: hive_mutation_kind::CREATE_CHILD,
+        flags,
+        value_type: 0,
+        path_len_bytes: parent.len() as u32,
+        name_len_bytes: name.len() as u32,
+        data_len_bytes: data.len() as u32,
+        _reserved: 0,
+    };
+    [record.as_bytes(), &parent, &name, &data].concat()
+}
+
+#[test]
+fn a_create_link_record_must_be_volatile_and_creates_a_link_key() {
+    use nt_config_abi::hive_mutation_flags::{SYMBOLIC_LINK, VOLATILE};
+    assert!(crate::mutation::decode_mutation_journal(&create_child_record(SYMBOLIC_LINK)).is_none(),
+        "a durable link has no journal representation");
+    let mutations = crate::mutation::decode_mutation_journal(&create_child_record(SYMBOLIC_LINK | VOLATILE))
+        .unwrap();
+    let mut server = server();
+    let mounted = server.system_hive.as_mut().unwrap();
+    mounted.hive.create_key(r"ControlSet001\Control");
+    let control_set = mounted.current_control_set.clone();
+    let mut tx = mounted.hive.begin_transaction();
+    assert_eq!(apply_system_hive_mutation(&mut tx, &control_set, &mutations[0]), Ok(()));
+    tx.commit();
+    let link = mounted.hive.open_key(r"ControlSet001\Control\Links").unwrap();
+    assert_eq!(mounted.hive.key_kind(link), Some(nt_hive_core::KeyKind::SymbolicLink));
+    assert!(mounted.hive.is_volatile(link));
+}

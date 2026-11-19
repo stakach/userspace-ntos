@@ -2,7 +2,7 @@
 
 use super::*;
 use nt_config_abi::{
-    hive_key_open_disposition as disposition, hive_key_open_operation as operation,
+    hive_key_open_disposition as disposition, hive_key_open_flags, hive_key_open_operation as operation,
     CmHiveKeyOpenReply, CmHiveKeyOpenRequest, CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES,
     CM_HIVE_KEY_OPEN_REPLY_MAX_BYTES,
 };
@@ -28,6 +28,7 @@ impl OpenOutcome {
 struct PendingOpen {
     generation: u64,
     root_lease_token: u64,
+    flags: u32,
     path: Vec<u16>,
     outcome: Option<OpenOutcome>,
 }
@@ -88,7 +89,9 @@ impl OpenJournal {
                 if pending.generation != request.request_generation {
                     return Err(STATUS_INVALID_HANDLE);
                 }
-                if pending.path != path || pending.root_lease_token != request.root_lease_token {
+                if pending.path != path || pending.root_lease_token != request.root_lease_token
+                    || pending.flags != request.flags
+                {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
                 if pending.outcome.is_none() {
@@ -128,6 +131,7 @@ impl OpenJournal {
         self.slots[index].pending = Some(PendingOpen {
             generation: request.request_generation,
             root_lease_token: request.root_lease_token,
+            flags: request.flags,
             path: captured,
             outcome: None,
         });
@@ -180,16 +184,49 @@ fn decoded_path(units: &[u16]) -> Result<String, i32> {
     Ok(path)
 }
 
+/// CmpParseKey's answer for one walk: the key, or the absolute name to reparse to.
+fn walk(
+    mounted: &MountedSystemHive,
+    start: nt_hive_core::CellId,
+    relative: &str,
+    open_link: bool,
+) -> Result<Result<nt_hive_core::CellId, String>, i32> {
+    match nt_hive_core::walk_following_links_from(&mounted.hive, start, relative, open_link) {
+        Ok(nt_hive_core::LinkWalk::Found(key)) => Ok(Ok(key)),
+        Ok(nt_hive_core::LinkWalk::Reparse(target)) => Ok(Err(target)),
+        Ok(nt_hive_core::LinkWalk::NotFound) => Err(STATUS_OBJECT_NAME_NOT_FOUND),
+        Err(nt_hive_core::SymbolicLinkError::Capacity) => Err(STATUS_INSUFFICIENT_RESOURCES),
+        // CmpGetSymbolicLink failure: the open fails as a missing name.
+        Err(_) => Err(STATUS_OBJECT_NAME_NOT_FOUND),
+    }
+}
+
+fn reparse(target: String) -> Result<OpenOutcome, i32> {
+    if target.len() > CM_HIVE_KEY_OPEN_REPLY_MAX_BYTES - CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+    Ok(OpenOutcome {
+        status: nt_config_abi::CM_STATUS_REPARSE,
+        lease: 0,
+        opened_generation: 0,
+        physical_path: target,
+    })
+}
+
 fn acquire(
     mounted: Option<&MountedSystemHive>,
     leases: &mut SystemKeyLeaseBank,
     root_lease_token: u64,
     path: &str,
+    open_link: bool,
 ) -> Result<OpenOutcome, i32> {
     let mounted = mounted.ok_or(STATUS_DEVICE_NOT_READY)?;
     let (relative, key) = if root_lease_token == 0 {
         let relative = mounted.resolve_relative_path(path)?;
-        let key = mounted.hive.open_key(&relative).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let key = match walk(mounted, mounted.hive.root(), &relative, open_link)? {
+            Ok(key) => key,
+            Err(target) => return reparse(target),
+        };
         (relative, key)
     } else {
         if path.starts_with('\\') { return Err(STATUS_INVALID_PARAMETER); }
@@ -209,10 +246,10 @@ fn acquire(
                 .strip_prefix('\\').or_else(|| (resolved == root_path).then_some(""))
                 .ok_or(STATUS_INVALID_HANDLE)?
         };
-        let mut key = root.key;
-        for component in descendants.split('\\').filter(|part| !part.is_empty()) {
-            key = mounted.hive.open_subkey(key, component).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-        }
+        let key = match walk(mounted, root.key, descendants, open_link)? {
+            Ok(key) => key,
+            Err(target) => return reparse(target),
+        };
         let relative = mounted.hive.key_path(key).ok_or(0xc000_017cu32 as i32)?;
         (relative, key)
     };
@@ -272,6 +309,8 @@ impl CmServer {
                     || request.path_offset != 0
                     || request.path_len_bytes != 0
                     || request.root_lease_token != 0
+                    || request.flags != 0
+                    || request.reserved != 0
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
@@ -279,6 +318,8 @@ impl CmServer {
             }
             operation::BEGIN => {
                 if request.path_offset as usize != header
+                    || request.flags & !hive_key_open_flags::OPEN_LINK != 0
+                    || request.reserved != 0
                     || (request.path_len_bytes == 0 && request.root_lease_token == 0)
                     || request.path_len_bytes % 2 != 0
                     || request.path_len_bytes as usize > CM_MAX_HIVE_PATH_UNITS * 2
@@ -298,6 +339,7 @@ impl CmServer {
             }
             operation::ACKNOWLEDGE => {
                 if input.len() != header || request.path_offset != 0 || request.path_len_bytes != 0 || request.root_lease_token != 0
+                    || request.flags != 0 || request.reserved != 0
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
@@ -350,6 +392,7 @@ impl CmServer {
                                 &mut self.system_key_leases,
                                 request.root_lease_token,
                                 &decoded,
+                                request.flags & hive_key_open_flags::OPEN_LINK != 0,
                             )
                         })
                         .unwrap_or_else(OpenOutcome::failed);

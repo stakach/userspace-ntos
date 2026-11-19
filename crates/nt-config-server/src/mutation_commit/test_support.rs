@@ -51,6 +51,7 @@ pub(super) fn prepare(server: &mut CmServer, name: &str) -> CmHiveMutationCommit
     let expected = server.system_hive.as_ref().unwrap().generation;
     let mutations = alloc::vec![HiveMutation::CreateChild {
         volatile: false,
+        symbolic_link: false,
         authority: crate::mutation::ChildParentAuthority::Path,
         parent: String::from(r"\Registry\Machine\System\ControlSet001\Services"),
         name: String::from(name),

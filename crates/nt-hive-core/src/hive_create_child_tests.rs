@@ -247,3 +247,22 @@ fn arena_capacity_overflow_is_a_checked_error_before_publication() {
     tx.commit();
     assert_eq!(encode_image(&hive), before);
 }
+
+#[test]
+fn a_symbolic_link_child_is_created_as_a_link_and_has_no_children() {
+    let mut hive = Hive::new(HiveKind::System);
+    let root = hive.root();
+    let mut tx = hive.begin_transaction();
+    let link = tx
+        .try_create_child_of_kind(
+            root, "Printers".into(), None, vec![1], true, crate::KeyKind::SymbolicLink,
+        )
+        .unwrap();
+    assert_eq!(
+        tx.try_create_child_with_options(link, "Child".into(), None, vec![1], true),
+        Err(CreateChildError::ParentIsSymbolicLink)
+    );
+    tx.commit();
+    assert_eq!(hive.key_kind(link), Some(crate::KeyKind::SymbolicLink));
+    assert!(hive.is_volatile(link));
+}

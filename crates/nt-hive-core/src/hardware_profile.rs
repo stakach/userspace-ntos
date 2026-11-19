@@ -137,23 +137,10 @@ impl HardwareProfileAlias {
 fn capture_link(hive: &Hive, key: crate::CellId, control_set: &str)
     -> Result<String, HardwareProfileError>
 {
-    let (kind, bytes) = hive.query_value(key, "SymbolicLinkValue")
-        .ok_or(HardwareProfileError::LinkInvalid)?;
-    if kind != RegistryValueType::Link || bytes.is_empty() || bytes.len() % 2 != 0
-        || bytes.len() > u16::MAX as usize - 2 {
-        return Err(HardwareProfileError::LinkInvalid);
-    }
-    let mut target = String::new();
-    target.try_reserve_exact(bytes.len().checked_mul(2)
-        .ok_or(HardwareProfileError::Capacity)?)
-        .map_err(|_| HardwareProfileError::Capacity)?;
-    for character in char::decode_utf16(bytes.chunks_exact(2)
-        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))) {
-        let character = character.map_err(|_| HardwareProfileError::LinkInvalid)?;
-        if character == '\0' { return Err(HardwareProfileError::LinkInvalid); }
-        target.push(character);
-    }
-    if !target.starts_with('\\') { return Err(HardwareProfileError::LinkInvalid); }
+    let target = crate::symbolic_link_target(hive, key).map_err(|error| match error {
+        crate::SymbolicLinkError::Capacity => HardwareProfileError::Capacity,
+        _ => HardwareProfileError::LinkInvalid,
+    })?;
     let prefix = target.get(..SYSTEM_HIVE_PATH.len())
         .ok_or(HardwareProfileError::CrossHiveTarget)?;
     if !prefix.eq_ignore_ascii_case(SYSTEM_HIVE_PATH) {

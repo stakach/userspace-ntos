@@ -35,7 +35,7 @@ pub use registry::{
     RegistryValueType,
 };
 pub use filter_policy::{DeviceFilterPolicy, DeviceFilterPolicyError};
-pub use key_open_options::validate_key_open_options;
+pub use key_open_options::{validate_key_open_options, KeyOpenOptions};
 pub use registry_security::{inherit_generated_key_security, validate_generated_key_security};
 
 /// The NT root-bus pseudo-devnode exposed through user-mode PnP relations.

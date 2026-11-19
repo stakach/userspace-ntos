@@ -24,12 +24,13 @@ fn bytes(value: &[u8]) -> Result<Vec<u8>, i32> {
 fn copy_mutation(mutation: &HiveMutation) -> Result<HiveMutation, i32> {
     Ok(match mutation {
         HiveMutation::CreateKey { .. } => return Err(STATUS_INVALID_PARAMETER),
-        HiveMutation::CreateChild { authority, parent, name, class_name, descriptor, volatile } =>
-            HiveMutation::CreateChild {
-                authority: authority.clone(), parent: string(parent)?, name: string(name)?,
-                class_name: class_name.as_deref().map(string).transpose()?,
-                descriptor: bytes(descriptor)?, volatile: *volatile,
-            },
+        HiveMutation::CreateChild {
+            authority, parent, name, class_name, descriptor, volatile, symbolic_link,
+        } => HiveMutation::CreateChild {
+            authority: authority.clone(), parent: string(parent)?, name: string(name)?,
+            class_name: class_name.as_deref().map(string).transpose()?,
+            descriptor: bytes(descriptor)?, volatile: *volatile, symbolic_link: *symbolic_link,
+        },
         HiveMutation::SetValue { path, name, value_type, data } => HiveMutation::SetValue {
             path: string(path)?, name: string(name)?, value_type: *value_type, data: bytes(data)?,
         },
@@ -100,7 +101,7 @@ pub(super) fn apply(
             let child = HiveMutation::CreateChild {
                 authority: ChildParentAuthority::Path,
                 parent: string(&parent_path)?, name: string(name)?, class_name: None,
-                descriptor, volatile: false,
+                descriptor, volatile: false, symbolic_link: false,
             };
             append(tx, control_set, child, normalized, journal)?;
             parent = tx.hive().open_subkey(parent, name).ok_or(STATUS_INVALID_PARAMETER)?;

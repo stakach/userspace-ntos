@@ -157,6 +157,16 @@ pub mod hive_key_open_operation {
     pub const ACKNOWLEDGE: u16 = 3;
 }
 
+/// [`CmHiveKeyOpenRequest::flags`], valid only on BEGIN.
+pub mod hive_key_open_flags {
+    /// OBJ_OPENLINK: a symbolic link key as the final component is opened itself, not followed.
+    pub const OPEN_LINK: u32 = 1;
+}
+
+/// OUTCOME status for a path that crossed a symbolic link key: no lease is acquired and the path
+/// payload is the absolute name to open instead (the link target plus the remaining components).
+pub const CM_STATUS_REPARSE: i32 = 0x0000_0104;
+
 pub mod hive_key_open_disposition {
     pub const AUTHORITY: u16 = 1;
     pub const OUTCOME: u16 = 2;
@@ -264,7 +274,7 @@ pub mod hive_mutation_kind {
     /// carries one [`device_action_kind`] value; it does not directly mutate registry cells.
     pub const PUBLISH_DEVICE_ACTION: u16 = 7;
     /// Exact-parent child creation: path=parent, name=child, value_type=0. Data uses
-    /// hive_create_child_metadata; CLASS_PRESENT and VOLATILE are the only valid flags.
+    /// hive_create_child_metadata; valid flags are CLASS_PRESENT, VOLATILE and SYMBOLIC_LINK.
     pub const CREATE_CHILD: u16 = 8;
     /// Exact leased parent, empty path. Data begins with a nonzero u64 lease token,
     /// followed by the same metadata as CREATE_CHILD. Tokens never enter the disk journal.
@@ -279,6 +289,9 @@ pub mod hive_mutation_flags {
     /// Create a memory-only child in the mounted hive. This is valid only for CREATE_CHILD and
     /// CREATE_CHILD_LEASED; the server owns durable filtering and sequence advancement.
     pub const VOLATILE: u16 = 1 << 1;
+    /// Create the child as a symbolic link key (REG_OPTION_CREATE_LINK). Valid only with
+    /// VOLATILE: the durable journal records no key kind.
+    pub const SYMBOLIC_LINK: u16 = 1 << 2;
 }
 
 /// Operation carried by [`CmLaunchPlanRequest::operation`].
@@ -752,6 +765,9 @@ pub struct CmHiveKeyOpenRequest {
     pub path_len_bytes: u32,
     /// Zero for an absolute path; otherwise BEGIN resolves from this exact live lease.
     pub root_lease_token: u64,
+    /// [`hive_key_open_flags`]; zero except on BEGIN.
+    pub flags: u32,
+    pub reserved: u32,
 }
 
 /// Protocol SUCCESS delivers this envelope, not necessarily a successful OPEN. OUTCOME contains
@@ -1260,7 +1276,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<CmHivePathRequest>(), 16);
         assert_eq!(core::mem::size_of::<CmHiveKeyCloseRequest>(), 40);
         assert_eq!(core::mem::size_of::<CmHiveKeyCloseReply>(), 40);
-        assert_eq!(core::mem::size_of::<CmHiveKeyOpenRequest>(), 56);
+        assert_eq!(core::mem::size_of::<CmHiveKeyOpenRequest>(), 64);
         assert_eq!(core::mem::size_of::<CmHiveKeyOpenReply>(), CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES);
         assert_eq!(core::mem::size_of::<CmLeasedHiveKeyRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmLeasedHiveRecordRequest>(), 48);

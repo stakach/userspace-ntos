@@ -54,6 +54,7 @@ fn volatile_child_leases_and_absolute_aliases_share_one_namespace() {
         class_name: None,
         descriptor: vec![1],
         volatile: true,
+        symbolic_link: false,
     };
     let mut mutations = vec![child("Transient")];
     server
@@ -153,6 +154,7 @@ fn volatile_only_and_mixed_preparations_keep_durable_sequence_and_replay_exact()
         class_name: None,
         descriptor: vec![1],
         volatile,
+        symbolic_link: false,
     };
     let volatile = vec![
         child("Transient", true),
@@ -204,6 +206,7 @@ fn volatile_only_and_mixed_preparations_keep_durable_sequence_and_replay_exact()
         class_name: None,
         descriptor: vec![1],
         volatile: false,
+        symbolic_link: false,
     };
     assert_eq!(
         server
@@ -291,6 +294,7 @@ fn child_wire_preserves_large_descriptor_and_class_presence() {
             decoded,
             vec![HiveMutation::CreateChild {
                 volatile: false,
+                symbolic_link: false,
                 authority: crate::mutation::ChildParentAuthority::Path,
                 parent: r"\Registry\Machine\System\ControlSet001\Services".into(),
                 name: "Child".into(),

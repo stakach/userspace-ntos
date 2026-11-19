@@ -88,6 +88,11 @@ pub use hive::{
     SYSTEM_HIVE_PATH,
 };
 mod hardware_profile;
+mod symbolic_link;
+pub use symbolic_link::{
+    symbolic_link_target, walk_following_links, walk_following_links_from, LinkWalk, SymbolicLinkError, MAX_REPARSE,
+    SYMBOLIC_LINK_VALUE,
+};
 #[cfg(test)]
 mod hive_retained_mutation_tests;
 pub use hardware_profile::{HardwareProfileAlias, HardwareProfileError};

@@ -45,6 +45,7 @@ impl ExecNtHandler {
                 nt_hive_core::CreateChildError::NameCollision => 0xC000_0035,
                 nt_hive_core::CreateChildError::EmptySecurityDescriptor => 0xC000_0079,
                 nt_hive_core::CreateChildError::ChildMustBeVolatile => 0xC000_0181,
+                nt_hive_core::CreateChildError::ParentIsSymbolicLink => 0xC000_0022,
                 nt_hive_core::CreateChildError::InsufficientResources => {
                     nt_fs::STATUS_INSUFFICIENT_RESOURCES
                 }

@@ -7,7 +7,8 @@ use crate::{Backend, ConfigClient, OpenedSystemHiveKey, SystemHiveKeyLease,
     STATUS_SUCCESS, STATUS_INVALID_PARAMETER, STATUS_INSUFFICIENT_RESOURCES, STATUS_DEVICE_NOT_READY};
 use nt_config_abi::{CmReply, CmHiveKeyOpenRequest, CmHiveKeyOpenReply, CM_ABI_VERSION,
     CM_MAX_HIVE_PATH_UNITS, CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES, CM_HIVE_KEY_OPEN_REPLY_MAX_BYTES,
-    hive_mount, hive_key_open_operation as operation, hive_key_open_disposition as disposition, opcode};
+    hive_mount, hive_key_open_operation as operation, hive_key_open_disposition as disposition, opcode,
+    hive_key_open_flags, CM_STATUS_REPARSE};
 
 static LAST_REQUESTER: AtomicU64 = AtomicU64::new(0);
 const REQUEST_MAX: usize = core::mem::size_of::<CmHiveKeyOpenRequest>() + CM_MAX_HIVE_PATH_UNITS * 2;
@@ -36,6 +37,7 @@ pub struct SystemHiveKeyOpenAttempt {
     submitted: bool,
     request_path: Vec<u8>,
     root_lease_token: u64,
+    open_link: bool,
     physical_path: String,
     outcome: Option<i32>,
     validation: Option<i32>,
@@ -51,6 +53,11 @@ impl SystemHiveKeyOpenAttempt {
     pub fn server_nonce(&self) -> Option<u64> { (self.server != 0).then_some(self.server) }
     pub fn has_outcome(&self) -> bool { self.outcome.is_some() }
     pub fn outcome_status(&self) -> Option<i32> { self.outcome }
+    /// The absolute name a validated reparse OUTCOME directs the open to.
+    pub fn reparse_target(&self) -> Option<&str> {
+        (self.outcome == Some(CM_STATUS_REPARSE) && self.validation == Some(STATUS_SUCCESS))
+            .then_some(self.physical_path.as_str())
+    }
     pub fn validation_status(&self) -> Option<i32> { self.validation }
     /// An immutable cleanup identity, not an ownership transfer or permission to publish a handle.
     pub fn known_lease(&self) -> Option<SystemHiveKeyLease> { self.lease }
@@ -107,7 +114,21 @@ impl SystemHiveKeyOpenAttempts {
     pub const fn new() -> Self { Self { requester: 0, slots: Vec::new() } }
 
     pub fn reserve(&mut self, path: &str) -> Result<SystemHiveKeyOpenAttempt, i32> {
-        self.reserve_rooted(0, path)
+        self.reserve_rooted(0, path, false)
+    }
+
+    /// As `reserve`/`reserve_relative`; `open_link` opens a final symbolic link key itself.
+    pub fn reserve_with_options(&mut self, root: Option<SystemHiveKeyLease>, path: &str, open_link: bool)
+        -> Result<SystemHiveKeyOpenAttempt, i32>
+    {
+        match root {
+            Some(root) => {
+                let mut attempt = self.reserve_relative(root, path)?;
+                attempt.open_link = open_link;
+                Ok(attempt)
+            }
+            None => self.reserve_rooted(0, path, open_link),
+        }
     }
 
     /// The caller retains the root lease until BEGIN has a confirmed outcome.
@@ -115,10 +136,10 @@ impl SystemHiveKeyOpenAttempts {
         if root.token == 0 || root.opened_generation == 0 || path.starts_with('\\') {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        self.reserve_rooted(root.token, path)
+        self.reserve_rooted(root.token, path, false)
     }
 
-    fn reserve_rooted(&mut self, root_lease_token: u64, path: &str) -> Result<SystemHiveKeyOpenAttempt, i32> {
+    fn reserve_rooted(&mut self, root_lease_token: u64, path: &str, open_link: bool) -> Result<SystemHiveKeyOpenAttempt, i32> {
         let units = path.encode_utf16().count();
         if (units == 0 && root_lease_token == 0) || units > CM_MAX_HIVE_PATH_UNITS || path.contains('\0') { return Err(STATUS_INVALID_PARAMETER); }
         let mut request_path = Vec::new();
@@ -139,7 +160,7 @@ impl SystemHiveKeyOpenAttempts {
         if vacant.is_some() { self.slots[index] = slot; } else { self.slots.push(slot); }
         Ok(SystemHiveKeyOpenAttempt {
             identity: Identity { requester, slot: index as u64, sequence }, server: 0, epoch: 0,
-            inflight: None, submitted: false, request_path, root_lease_token, physical_path, outcome: None,
+            inflight: None, submitted: false, request_path, root_lease_token, open_link, physical_path, outcome: None,
             validation: None, lease: None, receipt: None, acknowledged: false,
             lease_closed: false, transferred: false, released: false,
         })
@@ -184,6 +205,7 @@ impl SystemHiveKeyOpenAttempts {
         let mut bytes = [0; REQUEST_MAX];
         let len = if op == SystemHiveKeyOpenOperation::Begin {
             request.root_lease_token = attempt.root_lease_token;
+            request.flags = if attempt.open_link { hive_key_open_flags::OPEN_LINK } else { 0 };
             request.path_offset = header_size as u32;
             request.path_len_bytes = attempt.request_path.len() as u32;
             bytes[header_size..header_size + attempt.request_path.len()].copy_from_slice(&attempt.request_path);
@@ -250,6 +272,15 @@ impl SystemHiveKeyOpenAttempts {
                     let path = core::str::from_utf8(&response.bytes[CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES..CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES + path_len])
                         .map_err(|_| STATUS_INVALID_PARAMETER)?;
                     if path.contains('\0') { return Err(STATUS_INVALID_PARAMETER); }
+                    if already_validated && path != attempt.physical_path { return Err(STATUS_INVALID_PARAMETER); }
+                    attempt.physical_path.clear();
+                    attempt.physical_path.push_str(path);
+                } else if body.outcome_status == CM_STATUS_REPARSE {
+                    // No lease; the payload is the absolute name to open instead.
+                    if body.lease_token != 0 || body.opened_generation != 0 || path_len == 0 { return Err(STATUS_INVALID_PARAMETER); }
+                    let path = core::str::from_utf8(&response.bytes[CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES..CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES + path_len])
+                        .map_err(|_| STATUS_INVALID_PARAMETER)?;
+                    if path.contains('\0') || !path.starts_with('\\') { return Err(STATUS_INVALID_PARAMETER); }
                     if already_validated && path != attempt.physical_path { return Err(STATUS_INVALID_PARAMETER); }
                     attempt.physical_path.clear();
                     attempt.physical_path.push_str(path);

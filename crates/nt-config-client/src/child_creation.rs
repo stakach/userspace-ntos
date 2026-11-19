@@ -8,7 +8,7 @@ pub(super) fn append(
     descriptor: &[u8],
     volatile: bool,
 ) -> Result<(), i32> {
-    append_inner(journal, parent, 0, name, class_name, descriptor, volatile)
+    append_inner(journal, parent, 0, name, class_name, descriptor, volatile, false)
 }
 
 pub(super) fn append_leased(
@@ -16,12 +16,21 @@ pub(super) fn append_leased(
     class_name: Option<&str>, descriptor: &[u8], volatile: bool,
 ) -> Result<(), i32> {
     if parent.token == 0 || parent.opened_generation == 0 { return Err(STATUS_INVALID_PARAMETER); }
-    append_inner(journal, "", parent.token, name, class_name, descriptor, volatile)
+    append_inner(journal, "", parent.token, name, class_name, descriptor, volatile, false)
+}
+
+/// A volatile symbolic link key beneath the exact leased parent (REG_OPTION_CREATE_LINK).
+pub(super) fn append_leased_link(
+    journal: &mut Vec<u8>, parent: SystemHiveKeyLease, name: &str, class_name: Option<&str>,
+    descriptor: &[u8],
+) -> Result<(), i32> {
+    if parent.token == 0 || parent.opened_generation == 0 { return Err(STATUS_INVALID_PARAMETER); }
+    append_inner(journal, "", parent.token, name, class_name, descriptor, true, true)
 }
 
 fn append_inner(
     journal: &mut Vec<u8>, parent: &str, lease: u64, name: &str,
-    class_name: Option<&str>, descriptor: &[u8], volatile: bool,
+    class_name: Option<&str>, descriptor: &[u8], volatile: bool, symbolic_link: bool,
 ) -> Result<(), i32> {
     use nt_config_abi::hive_create_child_metadata as metadata;
     if name.is_empty() || name.contains(['\\', '\0']) || descriptor.is_empty() {
@@ -53,7 +62,8 @@ fn append_inner(
             hive_mutation_flags::CLASS_PRESENT
         } else {
             0
-        }) | if volatile { hive_mutation_flags::VOLATILE } else { 0 },
+        }) | if volatile { hive_mutation_flags::VOLATILE } else { 0 }
+            | if symbolic_link { hive_mutation_flags::SYMBOLIC_LINK } else { 0 },
         0,
         parent,
         name,
@@ -64,6 +74,19 @@ fn append_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_child_is_a_volatile_leased_child_with_the_link_flag() {
+        let mutation = SystemHiveMutation::CreateLinkRelative {
+            parent: SystemHiveKeyLease { token: 17, opened_generation: 9 },
+            name: "Printers", class_name: None, descriptor: b"security",
+        };
+        let encoded = encode_hive_mutation_journal(&[mutation]).unwrap();
+        assert_eq!(u16::from_le_bytes(encoded[..2].try_into().unwrap()),
+            hive_mutation_kind::CREATE_CHILD_LEASED);
+        assert_eq!(u16::from_le_bytes(encoded[2..4].try_into().unwrap()),
+            hive_mutation_flags::VOLATILE | hive_mutation_flags::SYMBOLIC_LINK);
+    }
 
     #[test]
     fn volatility_is_explicit_for_path_and_leased_child_creation() {

@@ -94,6 +94,7 @@ const MAX_RETAINED_RAW_VALUE_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
+const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
@@ -300,14 +301,20 @@ fn apply_system_hive_mutation(
     };
     match mutation {
         HiveMutation::CreateChild {
-            authority, parent, name, class_name, descriptor, volatile,
+            authority, parent, name, class_name, descriptor, volatile, symbolic_link,
         } => {
+            let kind = if *symbolic_link {
+                nt_hive_core::KeyKind::SymbolicLink
+            } else {
+                nt_hive_core::KeyKind::Ordinary
+            };
             match authority {
                 mutation::ChildParentAuthority::Path => child_creation::apply(
-                    transaction, &relative(parent)?, name, class_name.as_deref(), descriptor, *volatile,
+                    transaction, &relative(parent)?, name, class_name.as_deref(), descriptor,
+                    *volatile, kind,
                 ),
                 mutation::ChildParentAuthority::Cell(cell) => child_creation::apply_cell(
-                    transaction, *cell, name, class_name.as_deref(), descriptor, *volatile,
+                    transaction, *cell, name, class_name.as_deref(), descriptor, *volatile, kind,
                 ),
                 mutation::ChildParentAuthority::Lease(_) => Err(STATUS_INVALID_HANDLE),
             }
@@ -325,6 +332,13 @@ fn apply_system_hive_mutation(
             let key = transaction
                 .open_key(&relative(&path)?)
                 .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+            // CmSetValueKey: a link key holds only its REG_LINK target.
+            if transaction.hive().key_kind(key) == Some(nt_hive_core::KeyKind::SymbolicLink)
+                && !(value_type == RegistryValueType::Link
+                    && name.eq_ignore_ascii_case(nt_hive_core::SYMBOLIC_LINK_VALUE))
+            {
+                return Err(STATUS_ACCESS_DENIED);
+            }
             transaction
                 .set_value(key, name, value_type, data.clone())
                 .then_some(())

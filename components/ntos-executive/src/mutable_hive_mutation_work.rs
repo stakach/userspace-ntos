@@ -148,6 +148,7 @@ fn create_error(error: CreateChildError) -> u32 {
         CreateChildError::NameCollision => 0xC000_0035,
         CreateChildError::EmptySecurityDescriptor => 0xC000_0079,
         CreateChildError::ChildMustBeVolatile => 0xC000_0181,
+        CreateChildError::ParentIsSymbolicLink => 0xC000_0022,
         CreateChildError::InsufficientResources => 0xC000_009A,
         CreateChildError::RetainedPublication => 0xC000_00A3,
     }

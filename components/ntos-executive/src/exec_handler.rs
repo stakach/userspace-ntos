@@ -842,7 +842,7 @@ impl OwnedSystemHiveMutation {
     }
 }
 
-fn is_system_registry_path(path: &str) -> bool {
+pub(crate) fn is_system_registry_path(path: &str) -> bool {
     let canonical = nt_hive_core::canon_path(path);
     canonical == r"\registry\machine\system" || canonical.starts_with(r"\registry\machine\system\")
 }

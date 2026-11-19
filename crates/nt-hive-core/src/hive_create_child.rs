@@ -11,6 +11,8 @@ pub enum CreateChildError {
     EmptySecurityDescriptor,
     InsufficientResources,
     ChildMustBeVolatile,
+    /// A symbolic link key has no children (CmpDoCreate: STATUS_ACCESS_DENIED).
+    ParentIsSymbolicLink,
     RetainedPublication,
 }
 
@@ -239,6 +241,23 @@ impl HiveTransaction<'_> {
         security_descriptor: Vec<u8>,
         volatile: bool,
     ) -> Result<CellId, CreateChildError> {
+        self.try_create_child_of_kind(
+            parent, name, class_name, security_descriptor, volatile, super::KeyKind::Ordinary,
+        )
+    }
+
+    /// As [`Self::try_create_child_with_options`], creating a key of `kind`. A
+    /// `KeyKind::SymbolicLink` child is REG_OPTION_CREATE_LINK's key: its target is the
+    /// `SymbolicLinkValue` the creator sets next.
+    pub fn try_create_child_of_kind(
+        &mut self,
+        parent: CellId,
+        name: String,
+        class_name: Option<String>,
+        security_descriptor: Vec<u8>,
+        volatile: bool,
+        kind: super::KeyKind,
+    ) -> Result<CellId, CreateChildError> {
         if self.hive.pending_value_journal.is_some() {
             return Err(CreateChildError::RetainedPublication);
         }
@@ -251,6 +270,9 @@ impl HiveTransaction<'_> {
             .ok_or(CreateChildError::ParentNotFound)?;
         if self.hive.open_subkey(parent, &name).is_some() {
             return Err(CreateChildError::NameCollision);
+        }
+        if parent_cell.kind == super::KeyKind::SymbolicLink {
+            return Err(CreateChildError::ParentIsSymbolicLink);
         }
         if parent_cell.volatile && !volatile {
             return Err(CreateChildError::ChildMustBeVolatile);
@@ -311,7 +333,7 @@ impl HiveTransaction<'_> {
         let id = CellId(self.hive.next_id);
         self.hive.cells.resize_with(new_len, || None);
         self.hive.cells[index] = Some(Cell::Key(KeyCell {
-            kind: super::KeyKind::Ordinary,
+            kind,
             id,
             parent: Some(parent),
             name,

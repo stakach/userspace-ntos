@@ -1,6 +1,7 @@
 //! Cleanup ownership for executive CM leases, independent of every NT handle namespace.
 
 use super::*;
+use alloc::string::String;
 use nt_config_client::{
     OpenedSystemHiveKey, SystemHiveKeyCloseReceipt, SystemHiveKeyLease, SystemHiveKeyOpenAttempt,
     SystemHiveKeyOpenAttempts, SystemHiveKeyOpenOperation,
@@ -42,17 +43,18 @@ unsafe fn row(index: usize) -> &'static mut Row {
     &mut (&mut *core::ptr::addr_of_mut!(ROWS))[index]
 }
 
-unsafe fn reserve(path: &str, root: Option<SystemHiveKeyLease>) -> Result<usize, i32> {
+unsafe fn reserve_with_options(
+    path: &str,
+    root: Option<SystemHiveKeyLease>,
+    open_link: bool,
+) -> Result<usize, i32> {
     let rows = &mut *core::ptr::addr_of_mut!(ROWS);
     let vacant = rows.iter().position(|row| row.phase == Phase::Closed);
     if vacant.is_none() {
         rows.try_reserve(1).map_err(|_| NO_MEMORY)?;
     }
     let attempts = &mut *core::ptr::addr_of_mut!(ATTEMPTS);
-    let attempt = match root {
-        Some(root) => attempts.reserve_relative(root, path)?,
-        None => attempts.reserve(path)?,
-    };
+    let attempt = attempts.reserve_with_options(root, path, open_link)?;
     let entry = Row {
         phase: Phase::Opening,
         attempt: Some(attempt),
@@ -123,15 +125,50 @@ fn opened_read_generation(attempt: &nt_config_client::SystemHiveKeyOpenAttempt) 
     )
 }
 
+/// One CM OPEN step: the leased key, or the absolute name a symbolic link key redirects the
+/// open to (CmpParseKey's STATUS_REPARSE). No lease is held for a reparse.
+pub(crate) enum SystemKeyOpen {
+    Opened(OpenedSystemHiveKey),
+    Reparse(String),
+}
+
+/// Open `path` (relative to `root` when given), reporting a link crossed on the way instead of
+/// following it. `open_link` opens a final link key itself (OBJ_OPENLINK).
+pub(crate) unsafe fn open_step(
+    path: &str,
+    root: Option<SystemHiveKeyLease>,
+    open_link: bool,
+) -> Result<SystemKeyOpen, i32> {
+    open_target(path, root, open_link)
+}
+
+/// A SYSTEM key lease at `path`, following links that stay inside the SYSTEM hive. A link out of
+/// SYSTEM cannot yield a SYSTEM lease and fails with the reparse status; NT opens that resolve
+/// any hive use [`open_step`].
 pub(crate) unsafe fn open(path: &str) -> Result<OpenedSystemHiveKey, i32> {
-    open_target(path, None)
+    follow(open_target(path, None, false)?)
 }
 
 pub(crate) unsafe fn open_relative(
     root: SystemHiveKeyLease,
     path: &str,
 ) -> Result<OpenedSystemHiveKey, i32> {
-    open_target(path, Some(root))
+    follow(open_target(path, Some(root), false)?)
+}
+
+unsafe fn follow(mut step: SystemKeyOpen) -> Result<OpenedSystemHiveKey, i32> {
+    for _ in 0..nt_hive_core::MAX_REPARSE {
+        match step {
+            SystemKeyOpen::Opened(opened) => return Ok(opened),
+            SystemKeyOpen::Reparse(target) => {
+                if !crate::exec_handler::is_system_registry_path(&nt_hive_core::canon_path(&target)) {
+                    return Err(nt_config_abi::CM_STATUS_REPARSE);
+                }
+                step = open_target(&target, None, false)?;
+            }
+        }
+    }
+    Err(0xc000_0034u32 as i32)
 }
 
 /// A publication keeps its exact OPEN rather than abandoning an uncertain acquisition.
@@ -144,7 +181,9 @@ pub(crate) unsafe fn reserve_publication_open(
     root: SystemHiveKeyLease,
     path: &str,
 ) -> Result<PublicationOpen, i32> {
-    let index = reserve(path, Some(root))?;
+    // The publication names the key just created: never follow it, even when it is a new
+    // symbolic link whose target is not set yet (CmpDoCreate returns the link key itself).
+    let index = reserve_with_options(path, Some(root), true)?;
     OPEN_REQUESTS.fetch_add(1, Ordering::Relaxed);
     Ok(PublicationOpen { index })
 }
@@ -199,13 +238,14 @@ pub(crate) unsafe fn resume_publication_open(
 unsafe fn open_target(
     path: &str,
     root: Option<SystemHiveKeyLease>,
-) -> Result<OpenedSystemHiveKey, i32> {
+    open_link: bool,
+) -> Result<SystemKeyOpen, i32> {
     let _durable = allocator::enter_durable();
     let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     if generation == 0 || CONFIG_CLIENT_PTR.is_null() {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
-    let index = reserve(path, root)?;
+    let index = reserve_with_options(path, root, open_link)?;
     OPEN_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let result = (|| {
         resolve_open(index)?;
@@ -222,12 +262,16 @@ unsafe fn open_target(
                 .expect("transferred CM OPEN retained an unexpected obligation");
             entry.attempt = None;
             entry.phase = Phase::Active;
-            Ok(opened)
+            Ok(SystemKeyOpen::Opened(opened))
         }
         Err(status) => {
             // The failed caller can never receive a late publication. Keep both the OPEN
             // acknowledgement and any acquired lease until maintenance has retired them.
             let attempt = row(index).attempt.as_ref().unwrap();
+            // A validated, acknowledged reparse acquired nothing: its target is the answer.
+            let reparse = (status == nt_config_abi::CM_STATUS_REPARSE && attempt.is_acknowledged())
+                .then(|| attempt.reparse_target().map(String::from))
+                .flatten();
             if !attempt.was_submitted()
                 || (attempt.is_acknowledged() && attempt.known_lease().is_none())
             {
@@ -240,7 +284,10 @@ unsafe fn open_target(
             } else {
                 retain_failure(index, Phase::RetryOpen);
             }
-            Err(status)
+            match reparse {
+                Some(target) => Ok(SystemKeyOpen::Reparse(target)),
+                None => Err(status),
+            }
         }
     }
 }
