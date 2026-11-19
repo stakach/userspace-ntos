@@ -30,6 +30,8 @@ mod floating_point;
 mod register_publication;
 mod native_continuation;
 mod user_apc;
+mod user_exception_dispatch;
+pub use user_exception_dispatch::{prepare_user_exception, PreparedUserException, UserExceptionError};
 pub use user_apc::{
     prepare_user_apc, PreparedUserApc, UserApcContinuation, UserApcPayload,
 };
