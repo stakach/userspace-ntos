@@ -113,6 +113,16 @@ class EventGenerationTests(unittest.TestCase):
         self.assertEqual(batches[-4:], buttons)
         self.assertLess(sum(pause for _events, pause in buttons), 0.5)
 
+    def test_a_click_waits_for_motion_to_drain_and_holds_the_press(self):
+        # Boot 44559273509 lost a press sent 10 ms behind undrained motion packets.
+        batches = action_batches(("click", (28, 743)), (1024, 768))
+        last_move, press, release = batches[-3], batches[-2], batches[-1]
+        self.assertEqual(last_move[0][0]["type"], "rel")
+        self.assertGreaterEqual(last_move[1], 0.3)
+        self.assertTrue(press[0][0]["data"]["down"])
+        self.assertGreaterEqual(press[1], 0.15)
+        self.assertFalse(release[0][0]["data"]["down"])
+
     def test_chords_release_in_reverse(self):
         self.assertEqual(keys(chord_batches(("ctrl", "esc"))),
                          [("ctrl", True), ("esc", True), ("esc", False), ("ctrl", False)])

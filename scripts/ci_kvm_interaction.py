@@ -24,6 +24,8 @@ POINTER_STEP = 4  # pixels per relative packet while aiming
 PIN_STEP = 64  # pixels per relative packet while pinning; overshoot clamps at the edge
 MOVE_PAUSE = 0.04  # slow enough that the guest never merges packets into accelerated moves
 BUTTON_PAUSE = 0.06  # four of these stay well inside the 500 ms double-click time
+POINTER_SETTLE = 0.3  # let the guest drain queued motion before a button changes state
+CLICK_HOLD = 0.15  # a lone click holds long enough for the guest to read the press
 KEY_PAUSE = 0.05
 POINTER_ACTIONS = ("move", "click", "double_click")
 CHAR_QCODES = {" ": "spc", "\n": "ret", "\t": "tab", ".": "dot", ",": "comma",
@@ -192,8 +194,14 @@ def action_batches(action, screen):
     if kind in POINTER_ACTIONS:
         batches = pointer_batches(argument, screen)
         clicks = {"move": 0, "click": 1, "double_click": 2}[kind]
+        if clicks and batches:
+            # QEMU's PS/2 mouse merges unread packets, keeping only the latest button
+            # state, so a press sent behind undrained motion can be lost.
+            events, _pause = batches[-1]
+            batches[-1] = (events, POINTER_SETTLE)
+        hold = CLICK_HOLD if clicks == 1 else BUTTON_PAUSE
         for _ in range(clicks):
-            batches += [(_button(True), BUTTON_PAUSE), (_button(False), BUTTON_PAUSE)]
+            batches += [(_button(True), hold), (_button(False), BUTTON_PAUSE)]
         return batches
     if kind == "key":
         return chord_batches(argument)
