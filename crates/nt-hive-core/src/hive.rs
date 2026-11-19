@@ -25,6 +25,8 @@ pub use create_child::{CreateChildError, OwnedPreparedCreateChild};
 #[path = "hive_set_key_security.rs"]
 mod set_key_security;
 pub use set_key_security::{OwnedPreparedSetKeySecurity, SetKeySecurityError};
+#[path = "hive_key_name.rs"]
+mod key_name;
 #[path = "hive_delete.rs"]
 mod delete;
 pub use delete::{
@@ -1380,10 +1382,10 @@ impl HiveMountTable {
             }
         }
         let entry = best?;
-        let relative = &full_path[entry.root.len()..];
+        let relative = path_after_prefix(full_path, &entry.root)?;
         Some((
             entry.hive,
-            apply_mount_current_control_set_alias(relative, entry.current_control_set.as_ref())?,
+            apply_mount_current_control_set_alias(&relative, entry.current_control_set.as_ref())?,
         ))
     }
 
@@ -1824,6 +1826,23 @@ fn apply_mount_current_control_set_alias(
 }
 
 /// Case-insensitive path-prefix test on `\`-delimited components.
+/// The components of `path` after those of `prefix`, each preceded by one separator. The mount
+/// is matched by components, so its remainder is split by components too, never by byte length.
+fn path_after_prefix(path: &str, prefix: &str) -> Option<String> {
+    let mut path_components = path.split('\\').filter(|c| !c.is_empty());
+    for prefix_component in prefix.split('\\').filter(|c| !c.is_empty()) {
+        if !prefix_component.eq_ignore_ascii_case(path_components.next()?) {
+            return None;
+        }
+    }
+    let mut relative = String::new();
+    for component in path_components {
+        relative.push('\\');
+        relative.push_str(component);
+    }
+    Some(relative)
+}
+
 fn path_starts_with(path: &str, prefix: &str) -> bool {
     let mut path_components = path.split('\\').filter(|c| !c.is_empty());
     for prefix_component in prefix.split('\\').filter(|c| !c.is_empty()) {

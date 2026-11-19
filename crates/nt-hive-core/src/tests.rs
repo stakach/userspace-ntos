@@ -2238,3 +2238,25 @@ fn try_flush_reports_io_fault_and_preserves_replay_log() {
     let key = booted.open_key(r"ControlSet001\Services\Net").unwrap();
     assert_eq!(booted.query_dword(key, "Start"), Some(2));
 }
+
+#[test]
+fn mount_resolution_splits_the_relative_path_by_components_not_root_bytes() {
+    // The mount is chosen by path components, so the remainder must be split the same way: a
+    // doubled or trailing separator inside the mount root must not shift the relative path.
+    let mut mt = HiveMountTable::new();
+    let mut system = mountable_system_hive();
+    system.create_key(r"ControlSet001\Services");
+    mt.mount_with_current_control_set(SYSTEM_HIVE_PATH, 1, system.current_control_set().unwrap());
+    mt.mount(r"\Registry\Machine\Software", 2);
+    for path in [
+        r"\Registry\\Machine\System\CurrentControlSet\Services\Foo",
+        r"\\Registry\Machine\System\\CurrentControlSet\Services\Foo",
+        r"\Registry\Machine\System\\\CurrentControlSet\Services\Foo",
+    ] {
+        assert_eq!(mt.resolve(path), Some((1, r"\ControlSet001\Services\Foo".into())), "{path}");
+    }
+    assert_eq!(mt.resolve(r"\Registry\Machine\\Software\\Classes"),
+        Some((2, r"\Classes".into())));
+    assert_eq!(mt.resolve(r"\Registry\Machine\Software\\"), Some((2, String::new())));
+    assert_eq!(mt.resolve(r"\Registry\Machine\Software"), Some((2, String::new())));
+}

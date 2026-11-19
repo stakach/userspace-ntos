@@ -275,6 +275,7 @@ version = "0.1.0"
 dependencies = [
  "nt-config-abi",
  "nt-config-manager",
+ "nt-config-notify",
  "nt-config-server",
  "nt-fs",
  "nt-hive-core",
@@ -292,6 +293,9 @@ dependencies = [
 [[package]]
 name = "nt-config-notify"
 version = "0.1.0"
+dependencies = [
+ "nt-hive-core",
+]
 
 [[package]]
 name = "nt-config-server"

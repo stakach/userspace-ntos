@@ -166,6 +166,7 @@ nt-wdf-queue = { path = "crates/nt-wdf-queue" }
 nt-wdf-interrupt = { path = "crates/nt-wdf-interrupt" }
 nt-wdf-dma = { path = "crates/nt-wdf-dma" }
 nt-config-manager = { path = "crates/nt-config-manager" }
+nt-config-notify = { path = "crates/nt-config-notify" }
 nt-config-server = { path = "crates/nt-config-server" }
 nt-config-abi = { path = "crates/nt-config-abi" }
 nt-config-store = { path = "crates/nt-config-store" }

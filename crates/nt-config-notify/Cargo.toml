@@ -9,5 +9,8 @@ authors.workspace = true
 
 [dependencies]
 
+[dev-dependencies]
+nt-hive-core = { workspace = true }
+
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

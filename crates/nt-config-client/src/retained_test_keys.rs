@@ -4,7 +4,25 @@ use super::*;
 
 pub(crate) fn open<B: Backend>(client: &mut ConfigClient<B>, path: &str) -> OpenedSystemHiveKey {
     let mut manager = SystemHiveKeyOpenAttempts::new();
-    let mut attempt = manager.reserve(path).unwrap();
+    let attempt = manager.reserve(path).unwrap();
+    complete_open(client, manager, attempt)
+}
+
+pub(crate) fn open_relative<B: Backend>(
+    client: &mut ConfigClient<B>,
+    root: SystemHiveKeyLease,
+    path: &str,
+) -> OpenedSystemHiveKey {
+    let mut manager = SystemHiveKeyOpenAttempts::new();
+    let attempt = manager.reserve_relative(root, path).unwrap();
+    complete_open(client, manager, attempt)
+}
+
+fn complete_open<B: Backend>(
+    client: &mut ConfigClient<B>,
+    mut manager: SystemHiveKeyOpenAttempts,
+    mut attempt: SystemHiveKeyOpenAttempt,
+) -> OpenedSystemHiveKey {
     for operation in [SystemHiveKeyOpenOperation::Query, SystemHiveKeyOpenOperation::Begin, SystemHiveKeyOpenOperation::Acknowledge] {
         let mut exchange = manager.begin_exchange(&mut attempt, operation).unwrap();
         let response = client.exchange_system_hive_key_open(&exchange);

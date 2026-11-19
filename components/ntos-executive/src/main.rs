@@ -15961,10 +15961,7 @@ unsafe fn initial_system_driver_caller() -> nt_process::native_handle::NativeHan
 }
 
 pub(crate) unsafe fn config_manager_create_key(path: &str) -> Result<u64, i32> {
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    client.create_key(path)
+    config_manager_create_key_with_options(path, false).map(|(key, _created)| key)
 }
 
 pub(crate) unsafe fn config_manager_create_key_with_options(
@@ -15974,7 +15971,13 @@ pub(crate) unsafe fn config_manager_create_key_with_options(
     let client = CONFIG_CLIENT_PTR
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    client.create_key_with_options(path, volatile)
+    let created = client.create_key_with_options(path, volatile)?;
+    // A new key is a name change of its parent for registry change notification.
+    if created.1 {
+        registry_mutation_work::queue_path_committed_change(
+            path, registry_mutation_work::CommittedChange::KeyCreated);
+    }
+    Ok(created)
 }
 
 pub(crate) unsafe fn config_manager_open_key(path: &str) -> bool {
@@ -16008,7 +16011,10 @@ pub(crate) unsafe fn config_manager_set_dword(
     let client = CONFIG_CLIENT_PTR
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    client.set_dword(key_path, name, value)
+    client.set_dword(key_path, name, value)?;
+    registry_mutation_work::queue_path_committed_change(
+        key_path, registry_mutation_work::CommittedChange::Values);
+    Ok(())
 }
 
 pub(crate) unsafe fn config_manager_set_value(
@@ -16020,7 +16026,10 @@ pub(crate) unsafe fn config_manager_set_value(
     let client = CONFIG_CLIENT_PTR
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    client.set_value(key_path, name, value_type, data)
+    client.set_value(key_path, name, value_type, data)?;
+    registry_mutation_work::queue_path_committed_change(
+        key_path, registry_mutation_work::CommittedChange::Values);
+    Ok(())
 }
 
 pub(crate) unsafe fn config_manager_query_value_owned(

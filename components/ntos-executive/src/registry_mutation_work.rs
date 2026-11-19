@@ -41,7 +41,7 @@ enum HostedCompletion {
 
 /// What a committed SYSTEM mutation changed, named by the affected key's physical path.
 #[derive(Clone, Copy)]
-enum CommittedChange {
+pub(crate) enum CommittedChange {
     Values,
     Security,
     KeyDeleted,
@@ -109,6 +109,27 @@ unsafe fn note_committed(context: &mut HostedContext<'_>, change: Option<(String
                 NEXT.store(monotonic_time_100ns(), Ordering::Release);
             }
         }
+    }
+}
+
+/// A path-addressed CM write committed without a handler (a provider or the executive's own
+/// configuration). Name it as the notify sessions do: a SYSTEM path by the physical path its
+/// mounted CurrentControlSet selects, any other path as written. The next hosted redrive reports
+/// it in commit order, like a provider pump's SYSTEM commit.
+pub(crate) unsafe fn queue_path_committed_change(path: &str, change: CommittedChange) {
+    let physical = match crate::config_manager_resolve_system_hive_path(path) {
+        Ok(resolved) => resolved.physical_path,
+        Err(_) => match owned_key(path) {
+            Some(path) => path,
+            None => return,
+        },
+    };
+    let _durable = allocator::enter_durable();
+    let queue = &mut *core::ptr::addr_of_mut!(COMMITTED_CHANGES);
+    if queue.try_reserve(1).is_ok() {
+        queue.push((physical, change));
+        COMMITTED_CHANGES_READY.store(true, Ordering::Release);
+        NEXT.store(monotonic_time_100ns(), Ordering::Release);
     }
 }
 

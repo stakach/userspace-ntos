@@ -4036,6 +4036,7 @@ mod tests {
     mod key_creation;
     mod secured_child_cm;
     mod mutation_generation;
+    mod change_notify_names;
     use super::*;
     use alloc::format;
     use alloc::string::String;

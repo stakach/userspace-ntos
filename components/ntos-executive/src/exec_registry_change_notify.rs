@@ -162,6 +162,7 @@ impl ExecNtHandler {
                 let status = completion.status;
                 let synchronous = matches!(completion.request.surface, Surface::Synchronous);
                 if synchronous {
+                    self.trace_registry_notify_completion(&completion, true);
                     let _ = self.write_registry_notify_iosb(self.pi, iosb, status);
                     status
                 } else {
@@ -329,30 +330,17 @@ impl ExecNtHandler {
         completions: Vec<Completion<RegistryNotifyRequest>>,
     ) {
         for completion in completions {
-            let Completion { post, thread, status, request, .. } = completion;
+            let request = &completion.request;
             let process_live = self.pm_pid_for_pi(request.pi) == Some(request.pid)
                 && self.pm.process(request.pid)
                     .is_some_and(|process| process.state != nt_process::ProcessState::Terminated);
-            let thread_id = nt_process::ThreadId::try_from(thread).ok();
+            let thread_id = nt_process::ThreadId::try_from(completion.thread).ok();
             let thread_live = process_live && thread_id
                 .and_then(|thread| self.pm.thread(thread))
                 .is_some_and(|thread| thread.process_id == request.pid
                     && thread.state != nt_process::ThreadState::Terminated);
-            if self.registry_change_notifications.traced < TRACE_LIMIT {
-                self.registry_change_notifications.traced += 1;
-                print_str(b"[cm-notify] complete pi=");
-                print_u64(request.pi as u64);
-                print_str(b" tid=");
-                print_u64(thread);
-                print_str(b" status=0x");
-                print_hex(status);
-                print_str(match request.surface {
-                    Surface::Synchronous => b" sync",
-                    Surface::Asynchronous { event: Some(_), .. } => b" event",
-                    Surface::Asynchronous { .. } => b" async",
-                });
-                print_str(if thread_live { b"\n" } else { b" owner-gone\n" });
-            }
+            self.trace_registry_notify_completion(&completion, thread_live);
+            let Completion { post, thread, status, request, .. } = completion;
             match request.surface {
                 Surface::Synchronous => {
                     if !thread_live {
@@ -394,6 +382,30 @@ impl ExecNtHandler {
                 }
             }
         }
+    }
+
+    /// One `[cm-notify] complete` line per finished request, for the first `TRACE_LIMIT`.
+    fn trace_registry_notify_completion(
+        &mut self,
+        completion: &Completion<RegistryNotifyRequest>,
+        thread_live: bool,
+    ) {
+        if self.registry_change_notifications.traced >= TRACE_LIMIT {
+            return;
+        }
+        self.registry_change_notifications.traced += 1;
+        print_str(b"[cm-notify] complete pi=");
+        print_u64(completion.request.pi as u64);
+        print_str(b" tid=");
+        print_u64(completion.thread);
+        print_str(b" status=0x");
+        print_hex(completion.status);
+        print_str(match completion.request.surface {
+            Surface::Synchronous => b" sync",
+            Surface::Asynchronous { event: Some(_), .. } => b" event",
+            Surface::Asynchronous { .. } => b" async",
+        });
+        print_str(if thread_live { b"\n" } else { b" owner-gone\n" });
     }
 
     /// The status of a parked synchronous request, once.

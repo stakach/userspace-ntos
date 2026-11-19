@@ -5403,18 +5403,7 @@ impl ExecNtHandler {
     /// Canonical physical path for a full NT key path, matching the selected identity stored on
     /// its mutable hive mount so overlay and borrowed-hive views agree on one key.
     pub(crate) fn overlay_canon(&self, full: &str) -> alloc::string::String {
-        let physical = self
-            .mutable_hives
-            .resolve_path(full)
-            .map(|(hive, relative)| {
-                let mut path = self
-                    .hive_mount_path(hive)
-                    .expect("mounted hive selector has a namespace path");
-                path.push_str(&relative);
-                path
-            })
-            .unwrap_or_else(|| alloc::string::String::from(full));
-        nt_hive_core::canon_path(&physical)
+        self.mutable_hives.canonical_name(full)
     }
 
     /// Resolve a registry path to the identity used for overlay storage. SYSTEM identity belongs
@@ -5507,18 +5496,9 @@ impl ExecNtHandler {
         }
     }
 
+    /// The key's namespace name: the name its handles and its change notifications use.
     fn mutable_key_path(&self, key: ResolvedHiveKey) -> Option<alloc::string::String> {
-        let relative = self.mutable_hives.hive(key.hive)?.key_path(key.key)?;
-        let mut full = self.hive_mount_path(key.hive)?;
-        if !relative.is_empty() {
-            if relative.as_bytes().first() == Some(&b'\\') {
-                full.push_str(&relative);
-            } else {
-                full.push('\\');
-                full.push_str(&relative);
-            }
-        }
-        Some(self.overlay_canon(&full))
+        self.mutable_hives.key_name(key)
     }
 
     pub(crate) fn mutable_key_relative_path(&self, key: ResolvedHiveKey) -> Option<alloc::string::String> {
@@ -7630,10 +7610,12 @@ impl ExecNtHandler {
     ) -> Result<(), u32> {
         if target == MACHINE_ROOT_KEY {
             self.registry_machine_root_security_descriptor = descriptor.to_vec();
+            self.registry_target_security_changed(target);
             return Ok(());
         }
         if target == USER_ROOT_KEY {
             self.registry_user_root_security_descriptor = descriptor.to_vec();
+            self.registry_target_security_changed(target);
             return Ok(());
         }
         // An explicit overlay handle retains overlay identity. A native CM lease likewise retains
