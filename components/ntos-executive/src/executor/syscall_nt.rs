@@ -541,7 +541,7 @@ pub(super) unsafe fn syscall_nt_route(
             nt_dispatcher.dispatch(lp.msg.m0 as u32, &argv[..n], &origin, &mut nt_handler);
         sc.current_apc_handoff = nt_handler.current_apc_handoff.take();
         let elapsed_ticks = crate::disk_census_ticks().wrapping_sub(dispatch_started);
-        crate::record_native_dispatch_ticks(lp.msg.m0, elapsed_ticks);
+        crate::record_native_dispatch_ticks(lp.msg.badge, lp.msg.m0, elapsed_ticks);
         crate::hot_service_cost_census::record_dispatch(
             table_entry.map(|entry| entry.service), res.status, elapsed_ticks,
             crate::serial_records::root_serial_bytes().wrapping_sub(dispatch_serial),

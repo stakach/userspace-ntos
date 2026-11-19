@@ -246,6 +246,7 @@ pub(super) unsafe fn syscall(
         }
     };
     let current_tid = caller.tid;
+    crate::record_badge_ssn_call(lp.msg.badge, lp.msg.m0);
     crate::registry_mutation_work::trace_next_hosted_syscall(
         event_runtime.binding(), raw_external_ssn, lp.msg.m0,
     );

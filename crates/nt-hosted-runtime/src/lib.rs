@@ -13,6 +13,7 @@ mod hosted_irq_bank;
 mod hosted_irq_cr8_source;
 mod hosted_irq_call_stack;
 mod badge_census;
+pub mod badge_ssn_census;
 mod shared_receive_census;
 mod timer_deadline_census;
 mod boot_milestone_watch;

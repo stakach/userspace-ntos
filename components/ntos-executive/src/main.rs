@@ -6848,8 +6848,60 @@ pub(crate) static NATIVE_SSN_TICKS: [AtomicU64; SSN_HIST_N] =
 pub(crate) static NATIVE_SSN_CALLS: [AtomicU64; SSN_HIST_N] =
     [const { AtomicU64::new(0) }; SSN_HIST_N];
 
+/// Per-badge syscall attribution (top badges and, for each, its top SSNs). Diagnostic only;
+/// a contended update is dropped rather than waited for.
+static BADGE_SSN_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static mut BADGE_SSN_CENSUS: nt_hosted_runtime::badge_ssn_census::BadgeSsnCensus =
+    nt_hosted_runtime::badge_ssn_census::BadgeSsnCensus::new();
+
+fn with_badge_ssn_census(update: impl FnOnce(&mut nt_hosted_runtime::badge_ssn_census::BadgeSsnCensus)) {
+    if BADGE_SSN_BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        update(unsafe { &mut *core::ptr::addr_of_mut!(BADGE_SSN_CENSUS) });
+        BADGE_SSN_BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// One admitted syscall (native or win32k) from `badge`.
+pub(crate) fn record_badge_ssn_call(badge: u64, ssn: u64) {
+    with_badge_ssn_census(|census| census.record_call(badge, ssn as u32));
+}
+
+/// `[census] badge-ssn`: the four busiest badges by calls, each with its six busiest SSNs as
+/// ssn=calls/Mtick(/inherited when a space-saving eviction attributed earlier calls).
+pub(crate) fn print_badge_ssn_census() {
+    with_badge_ssn_census(|census| {
+        for row in census.top_badges().take(4) {
+            print_str(b"[census] badge-ssn badge=");
+            print_u64(row.badge);
+            print_str(b" calls=");
+            print_u64(row.calls);
+            print_str(b" native-Mtick=");
+            print_u64(row.ticks / 1_000_000);
+            if row.error != 0 {
+                print_str(b" inherited=");
+                print_u64(row.error);
+            }
+            print_str(b" top:");
+            for entry in row.top_ssns().take(6) {
+                print_str(b" 0x");
+                print_hex(entry.ssn);
+                print_str(b"=");
+                print_u64(entry.calls);
+                print_str(b"/");
+                print_u64(entry.ticks / 1_000_000);
+                if entry.error != 0 {
+                    print_str(b"/~");
+                    print_u64(entry.error);
+                }
+            }
+            print_str(b"\n");
+        }
+    });
+}
+
 /// Fold one completed native dispatch into the executive-time census.
-pub(crate) fn record_native_dispatch_ticks(ssn: u64, ticks: u64) {
+pub(crate) fn record_native_dispatch_ticks(badge: u64, ssn: u64, ticks: u64) {
+    with_badge_ssn_census(|census| census.record_ticks(badge, ssn as u32, ticks));
     EXEC_DISPATCH_CALLS.fetch_add(1, Ordering::Relaxed);
     EXEC_DISPATCH_TICKS.fetch_add(ticks, Ordering::Relaxed);
     // Name the INDIVIDUAL pathological dispatches. The per-SSN totals showed a handful of early
@@ -7536,6 +7588,7 @@ pub(crate) fn census_tick_static(now: u64) {
     spawn_hosts::print_active_syscall_receive_census();
     service_sec_image::trace_csrss_post_resume_census(n);
     print_native_ssn_time();
+    print_badge_ssn_census();
     hot_service_cost_census::print_census();
     registry_security_audit::print_admission_census();
     driver_launch::print_hosted_file_rpc_phase();

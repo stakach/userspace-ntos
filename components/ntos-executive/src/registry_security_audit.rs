@@ -17,6 +17,10 @@ static ASSIGNMENT_CHECKS: AtomicU64 = AtomicU64::new(0);
 static ADMISSION_SIGHTINGS: RepeatFilter = RepeatFilter::new();
 static ADMISSION_UNTRACKED: ReceiptBudget = ReceiptBudget::new();
 static ADMISSION_UNTRACKED_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+/// Distinct misses are bounded too: a shell enumerating ~1,000 absent CLSID keys would pay
+/// ~5.5M TSC ticks of serial output per record, more than the lookup itself.
+static ADMISSION_FIRST: ReceiptBudget = ReceiptBudget::new();
+static ADMISSION_FIRST_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn admission_error(operation: &[u8], path: &str, status: u32, pi: usize, tid: u64) {
     if !matches!(status, 0xc000_0034 | 0xc000_003a
@@ -36,6 +40,12 @@ pub(crate) fn admission_error(operation: &[u8], path: &str, status: u32, pi: usi
             if ADMISSION_UNTRACKED.claim(crate::diagnostic_time_100ns()).is_none() =>
         {
             ADMISSION_UNTRACKED_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        Sighting::First
+            if ADMISSION_FIRST.claim(crate::diagnostic_time_100ns()).is_none() =>
+        {
+            ADMISSION_FIRST_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         Sighting::First | Sighting::Untracked => {}
@@ -59,9 +69,10 @@ pub(crate) fn admission_error(operation: &[u8], path: &str, status: u32, pi: usi
 pub(crate) fn print_admission_census() {
     let counts = ADMISSION_SIGHTINGS.counts();
     crate::print_str(
-        b"[census] registry-admission-error first/repeats/untracked/untracked-suppressed=");
+        b"[census] registry-admission-error first/repeats/untracked/untracked-suppressed/first-suppressed=");
     for (index, value) in [counts.first, counts.repeats, counts.untracked,
-        ADMISSION_UNTRACKED_SUPPRESSED.load(Ordering::Relaxed)].into_iter().enumerate()
+        ADMISSION_UNTRACKED_SUPPRESSED.load(Ordering::Relaxed),
+        ADMISSION_FIRST_SUPPRESSED.load(Ordering::Relaxed)].into_iter().enumerate()
     {
         if index != 0 { crate::print_str(b"/"); }
         crate::print_u64(value);
