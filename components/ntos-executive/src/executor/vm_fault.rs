@@ -49,6 +49,13 @@ pub(super) unsafe fn vm_fault(
         {
             return ControlFlow::Break(Turn::Next);
         }
+        if deliver_to_user(
+            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
+            page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::AccessViolation),
+            lp.msg.m0, ntdll, &mut lp.msg,
+        )? {
+            return ControlFlow::Break(Turn::Next);
+        }
         return ControlFlow::Break(lp.park_and_log(pi, b"pending-memory", lp.msg.m0, addr));
     }
     if lp.exit.faults == 0 {
@@ -342,6 +349,13 @@ pub(super) unsafe fn vm_fault(
             // `DBG_CONTINUE` replies length-0 → the faulting instruction is RETRIED.
             return ControlFlow::Break(Turn::Next);
         }
+        if deliver_to_user(
+            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
+            page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::AccessViolation),
+            lp.msg.m0, ntdll, &mut lp.msg,
+        )? {
+            return ControlFlow::Break(Turn::Next);
+        }
         if pi == 2
             && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
             && !pre_user_shell_frontier_pending(
@@ -472,6 +486,13 @@ pub(super) unsafe fn vm_fault(
             return ControlFlow::Break(Turn::Next);
         }
         Ok(Some(_)) => {
+            if deliver_to_user(
+                &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
+                page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::StackOverflow),
+                lp.msg.m0, ntdll, &mut lp.msg,
+            )? {
+                return ControlFlow::Break(Turn::Next);
+            }
             print_str(b"[stack-guard] overflow; retaining fault Reply\n");
             return ControlFlow::Break(lp.park_and_log(pi, b"stack-overflow", lp.msg.m0, addr));
         }
@@ -590,22 +611,19 @@ pub(super) unsafe fn vm_fault(
         vm_fault_access_from_x86_error(lp.msg.m3),
     ) {
         Ok(true) => {
+            // MmAccessFault: touching a guard page outside the thread's stack clears the
+            // guard and raises STATUS_GUARD_PAGE_VIOLATION; it is not retried silently.
             note_boot_progress(BootProgress::PageMappingPublished);
             lp.exit.faults += 1;
-            procs[pi].faults = lp.exit.faults;
-            procs[pi].first = lp.exit.first;
-            procs[pi].ntfaults = lp.exit.ntfaults;
-            pfilled[pi] = *filled_pages;
-            let (nb, nmi, nm0, nm1, nm2, nm3) = reply_receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (local().reply_main_slot.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
-            )?;
-            lp.msg.badge = nb;
-            lp.msg.mi = nmi;
-            lp.msg.m0 = nm0;
-            lp.msg.m1 = nm1;
-            lp.msg.m2 = nm2;
-            lp.msg.m3 = nm3;
-            return ControlFlow::Break(Turn::Next);
+            if deliver_to_user(
+                &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
+                page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::GuardPage),
+                lp.msg.m0, ntdll, &mut lp.msg,
+            )? {
+                return ControlFlow::Break(Turn::Next);
+            }
+            print_str(b"[guard-page] violation not delivered; retaining fault Reply\n");
+            return ControlFlow::Break(lp.park_and_log(pi, b"guard-page-violation", lp.msg.m0, addr));
         }
         Ok(false) => {}
         Err(status) => {
@@ -935,6 +953,13 @@ pub(super) unsafe fn vm_fault(
             // `DBG_CONTINUE` replies length-0 → the faulting instruction is RETRIED.
             return ControlFlow::Break(Turn::Next);
         }
+        if deliver_to_user(
+            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
+            page_fault(lp.msg.m3, addr, nt_thread_start::user_exception::PageFaultOutcome::AccessViolation),
+            lp.msg.m0, ntdll, &mut lp.msg,
+        )? {
+            return ControlFlow::Break(Turn::Next);
+        }
         if hosted_owner_has_role(
             &nt_handler,
             lp.msg.badge,
@@ -1226,4 +1251,17 @@ pub(super) unsafe fn vm_fault(
     lp.msg.m2 = nm2;
     lp.msg.m3 = nm3;
     return ControlFlow::Break(Turn::Next);
+}
+
+/// The page fault at `addr` with processor error code `error_code`, resolved to `outcome`.
+fn page_fault(
+    error_code: u64,
+    addr: u64,
+    outcome: nt_thread_start::user_exception::PageFaultOutcome,
+) -> nt_thread_start::user_exception::HardwareFault {
+    nt_thread_start::user_exception::HardwareFault::PageFault {
+        error_code: error_code as u32,
+        address: addr,
+        outcome,
+    }
 }

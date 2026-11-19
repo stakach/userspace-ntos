@@ -25,6 +25,19 @@ pub(crate) enum NotDelivered {
     Restart,
 }
 
+impl NotDelivered {
+    pub(crate) fn label(self) -> &'static [u8] {
+        match self {
+            Self::UnknownThread => b"thread",
+            Self::ThreadState => b"state",
+            Self::NoDispatcher => b"dispatcher",
+            Self::Frame => b"frame",
+            Self::StackWrite(_) => b"stack-write",
+            Self::Restart => b"restart",
+        }
+    }
+}
+
 static DELIVERY_TRACE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Whether this delivery is among the first 16, which are traced.
@@ -32,7 +45,7 @@ pub(crate) fn trace_delivery() -> bool {
     DELIVERY_TRACE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16
 }
 
-/// Deliver `fault` raised by the thread behind `badge` in process `pi` at `ip`/`sp`/`flags`.
+/// Deliver `fault` raised at `ip` by the thread behind `badge` in process `pi`.
 /// On success the thread has been restarted at the dispatcher and its fault Call retired.
 pub(crate) unsafe fn deliver_user_exception(
     handler: &mut ExecNtHandler,
@@ -40,8 +53,6 @@ pub(crate) unsafe fn deliver_user_exception(
     badge: u64,
     fault: HardwareFault,
     ip: u64,
-    sp: u64,
-    flags: u64,
     reply: u64,
     ntdll: (u64, &nt_pe_loader::PeFile<'_>),
 ) -> Result<u32, NotDelivered> {
@@ -57,10 +68,9 @@ pub(crate) unsafe fn deliver_user_exception(
     let (record, delivered_ip) = nt_thread_start::user_exception::classify(fault, ip);
     let snapshot =
         crate::thread_context::LegacyThreadContext::read(tcb).map_err(|_| NotDelivered::ThreadState)?;
+    // The fault saved the thread's full user state; only the reported RIP can differ.
     let mut live = snapshot.registers;
     live[0] = delivered_ip;
-    live[1] = sp;
-    live[2] = flags;
     let (ntdll_base, ntdll_pe) = ntdll;
     let dispatcher = ntdll_pe
         .export_rva_by_name("KiUserExceptionDispatcher")
