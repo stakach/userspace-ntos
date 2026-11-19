@@ -29,16 +29,14 @@ unsafe fn driver_projection_alias(
     identity: nt_io_manager::HostedFileIdentity,
     guards: &mut Vec<PoolGuard>,
 ) -> Result<u64, PreparationError> {
-    let lock_address = instance.exec_pool_va.checked_add(COMPONENT_POOL_LOCK_OFF)
+    instance.exec_pool_va.checked_add(COMPONENT_POOL_LOCK_OFF)
         .filter(|_| instance.exec_pool_va != 0).ok_or(STATUS_INVALID_HANDLE as u32)?;
     if !guards.iter().any(|guard| guard.pool == instance.exec_pool_va) {
-        let lock = &*(lock_address as *const AtomicU64);
-        lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .map_err(|_| PreparationError::Busy)?;
+        let guard = hosted_instance_pool_lock(instance.exec_pool_va)
+            .ok_or(PreparationError::Busy)?;
         // Storage was reserved before acquiring any guard. Keep one physical pool lock
         // through the complete non-reentrant commit, including all aliases of that pool.
-        guards.push(PoolGuard { pool: instance.exec_pool_va,
-            _guard: ExecutivePoolLockGuard(lock as *const AtomicU64) });
+        guards.push(PoolGuard { pool: instance.exec_pool_va, _guard: guard });
     }
     if hosted_instance_pool_allocation_is_free_unlocked(instance, identity.address()) != Some(false) {
         return Err(PreparationError::Status(STATUS_INVALID_HANDLE as u32));

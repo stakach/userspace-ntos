@@ -933,10 +933,15 @@ pub(super) unsafe fn acknowledge(
         || work.terminal.is_none()
         || work.source.validate_pin().is_err()
         || !work.source.caller_terminal_ready()
-        || !start_fdo_terminal_evidence(source_index, source_irp_address, token,
-            if held_completion { 8 } else { 7 })
     {
         return Some(INVALID);
+    }
+    match start_fdo_terminal_evidence(source_index, source_irp_address, token,
+        if held_completion { 8 } else { 7 })
+    {
+        Some(true) => {}
+        Some(false) => return Some(INVALID),
+        None => return Some(BUSY),
     }
     if !matches!(
         runtime::reconcile_retained_service_reply(

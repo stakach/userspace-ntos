@@ -2303,6 +2303,13 @@ unsafe fn dispatch_next_dpc(
     lanes
         .try_reserve_exact(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    // The DPC stays queued while a stopped holder owns its instance's pool: at DISPATCH_LEVEL
+    // the lane's allocator could otherwise only wait on a thread that cannot run.
+    if instance(lane.projection_instance)
+        .is_some_and(|inst| !super::hosted_instance_pool_quiescent(inst.exec_pool_va))
+    {
+        return Ok(HostedDpcRootDispatchOutcome::DeferredBusy);
+    }
     let arena = lane.arena();
     let transaction = match arena.control.root_begin_transaction(
         lane.identity,

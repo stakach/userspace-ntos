@@ -44,6 +44,7 @@ mod rpc_op6_trace;
 mod rpc_op6_client_capture;
 mod wait_owner_latency;
 mod root_receive_idle_probe;
+mod hosted_pool_lock;
 
 pub use win32k_bulk_stage::{
     Win32kBulkDispatchIdentity, Win32kBulkLayout, Win32kBulkLease, Win32kBulkLeaseState,
@@ -116,6 +117,10 @@ pub use wait_owner_latency::{
     WaitLatencyRole, WaitLatencySample, WaitLatencyThreadIdentity,
 };
 pub use root_receive_idle_probe::{RootReceiveIdleObservation, RootReceiveIdleProbe};
+pub use hosted_pool_lock::{
+    release_hosted_pool_lock, try_acquire_hosted_pool_lock, HostedPoolLockHolder,
+    HOSTED_POOL_LOCK_FREE,
+};
 
 pub use hosted_irq_arena::{
     decode_hosted_irq_transport_message, HostedIrqArena, HostedIrqArenaConfig,

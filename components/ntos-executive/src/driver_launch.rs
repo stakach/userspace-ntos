@@ -164,6 +164,10 @@ pub(crate) fn hosted_seh_linkage(
     instance.seh_linkage
 }
 
+#[path = "hosted_pool_lock.rs"]
+mod hosted_pool_lock;
+use hosted_pool_lock::{component_pool_lock, hosted_instance_pool_lock,
+    hosted_instance_pool_quiescent, ExecutivePoolLockGuard};
 #[path = "component_scheduler.rs"]
 mod component_scheduler;
 #[path = "hosted_dpc_scheduler.rs"]
@@ -3321,32 +3325,6 @@ pub(crate) static FSD_POOL_DOUBLE_FREES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_POOL_LIST_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_POOL_INVALID_FREES: AtomicU64 = AtomicU64::new(0);
 
-struct ComponentPoolLockGuard;
-
-impl Drop for ComponentPoolLockGuard {
-    fn drop(&mut self) {
-        unsafe {
-            (&*((FSD_POOL_VADDR + COMPONENT_POOL_LOCK_OFF) as *const AtomicU64))
-                .store(0, Ordering::Release);
-        }
-    }
-}
-
-unsafe fn component_pool_lock() -> ComponentPoolLockGuard {
-    let lock = &*((FSD_POOL_VADDR + COMPONENT_POOL_LOCK_OFF) as *const AtomicU64);
-    while lock
-        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        // Hosted driver threads share one physical CPU. A contended raw spin would prevent the
-        // owner from ever being scheduled, especially when it is parked across an executive
-        // callback. Yielding preserves real mutual exclusion while giving the owner a chance to
-        // finish the bounded allocator mutation and release the lock.
-        crate::yield_now();
-    }
-    ComponentPoolLockGuard
-}
-
 /// Called with the shared pool lock held by either address-space view. A reused address must
 /// receive a new identity before it leaves the free list.
 unsafe fn next_component_pool_generation(pool_va: u64) -> Option<u64> {
@@ -4557,28 +4535,7 @@ fn exec_pool_to_component_va(exec_pool_va: u64, exec_va: u64) -> Option<u64> {
     Some(FSD_POOL_VADDR + off)
 }
 
-struct ExecutivePoolLockGuard(*const AtomicU64);
-
-impl Drop for ExecutivePoolLockGuard {
-    fn drop(&mut self) {
-        unsafe { (&*self.0).store(0, Ordering::Release) }
-    }
-}
-
-unsafe fn hosted_instance_pool_lock(exec_pool_va: u64) -> Option<ExecutivePoolLockGuard> {
-    let lock_address = exec_pool_va.checked_add(COMPONENT_POOL_LOCK_OFF)?;
-    let lock = &*(lock_address as *const AtomicU64);
-    while lock
-        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        // The lock is shared with hosted component threads. The executive must not monopolize the
-        // only CPU while waiting for a component owner to run and release it.
-        crate::yield_now();
-    }
-    Some(ExecutivePoolLockGuard(lock as *const AtomicU64))
-}
-
+#[track_caller]
 unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<u64> {
     if inst.exec_pool_va == 0 || size == 0 {
         return None;
@@ -4732,6 +4689,7 @@ unsafe fn release_hosted_instance_pool_allocation_if_live(inst: DriverInstance, 
     }
 }
 
+#[track_caller]
 unsafe fn free_hosted_instance_pool_allocation_exact(inst: DriverInstance, p: u64) -> bool {
     if p == 0 {
         return false;
@@ -4746,6 +4704,7 @@ unsafe fn free_hosted_instance_pool_allocation_exact(inst: DriverInstance, p: u6
     }
 }
 
+#[track_caller]
 unsafe fn hosted_instance_pool_allocation_exec_if_live(
     inst: DriverInstance,
     component_va: u64,
@@ -14209,21 +14168,21 @@ unsafe fn acknowledge_held_scsi_on_reuse(irp: u64) {
 
 /// Inspect the source component's own terminal event while its private table is locked.
 /// READY in the source-IRP ledger is only a pending-node packet, not completion-unwind proof.
+/// `None` means a component thread holds the table: root attempts once, because that holder
+/// cannot run until root returns.
 pub(super) unsafe fn start_fdo_terminal_evidence(
     instance_index: usize, irp: u64, token: u64, operation: u64,
-) -> bool {
-    let Some(window) = ExecVaWindow::try_for_instance(instance_index) else { return false; };
+) -> Option<bool> {
+    let Some(window) = ExecVaWindow::try_for_instance(instance_index) else { return Some(false); };
     let Some(address) = window.data_va.checked_add(FSD_DATA_HELD_PNP_COMPLETIONS_OFF) else {
-        return false;
+        return Some(false);
     };
     let state = address as *const HostedHeldPnpCompletions;
     let lock = &(*state).lock;
-    while lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        core::hint::spin_loop();
-    }
+    lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).ok()?;
     let proven = (*state).table.start_terminal_evidence(HeldPnpIdentity { irp, token }, operation);
     lock.store(false, Ordering::Release);
-    proven
+    Some(proven)
 }
 
 unsafe fn mark_direct_start_terminal(irp: u64, token: u64) {
@@ -14258,13 +14217,24 @@ unsafe fn cancel_unbound_pnp_completion(irp: u64) {
 }
 
 unsafe fn acknowledge_pnp_fdo_completion(irp: u64, token: u64, operation: u64) {
-    let (label, status, _, _, _) = call_on4(
-        (FSD_SERVICE_LOWER_PNP_FORWARD_LABEL << 12) | 4,
-        operation,
-        irp,
-        token,
-        0,
-    );
+    let (label, status) = loop {
+        let (label, status, _, _, _) = call_on4(
+            (FSD_SERVICE_LOWER_PNP_FORWARD_LABEL << 12) | 4,
+            operation,
+            irp,
+            token,
+            0,
+        );
+        // A start-FDO acknowledgement refuses with no effects while this component's held
+        // table is owned by another of its threads, which root never waits for.
+        if label == 0 && matches!(operation, 7 | 8)
+            && status as u32 as i32 == nt_status::NtStatus::DEVICE_BUSY.raw()
+        {
+            crate::yield_now();
+            continue;
+        }
+        break (label, status);
+    };
     if label != 0 || status as u32 as i32 != STATUS_SUCCESS {
         crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_LOWER_PNP_FORWARD_LABEL, operation, irp, status]);
     }

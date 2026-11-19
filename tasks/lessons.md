@@ -126,6 +126,13 @@
 - Root lease revalidation must defer on contention without dropping ownership. For packet
   effects, distinguish known zero-effect Busy from uncertainty; after a committed ACK,
   retain readback/retirement phases and never replay the original command to retry cleanup.
+- Every hosted thread has CPU0 affinity below root's priority, so a plain root yield never runs
+  a preempted component holder either: any root wait on a component-held word is a permanent
+  hang. Root attempts once, hands the processor only to the exact registered holder TCB
+  (`tcb_yield_to`, which the kernel refuses for held/suspended/blocked threads), and otherwise
+  returns a no-effects refusal. Tag shared lock words with their holder so a refusal names it.
+- Executive image `.data`/`.bss` statics are physically shared by every hosted VSpace; a
+  "component-private" static lock is one word across all drivers.
 
 ## Build / verification
 - **build.sh silently leaves a STALE rootserver.elf if `cargo build` fails** (documented in
