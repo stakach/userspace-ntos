@@ -5,7 +5,7 @@
 //! until every holder has released it. No provider pointer crosses executive IPC.
 
 use nt_compat_exports::DriverExportRegistry;
-use nt_kernel_exec::{ExCacheAwareRundownRef, ExRundownRef};
+use nt_kernel_exec::{ExCacheAwareRundownRef, ExRundownExport, ExRundownRef};
 
 const CACHE_AWARE_ALIGNMENT: usize = 64;
 
@@ -97,16 +97,23 @@ pub(crate) extern "win64" fn ex_wait_for_rundown_protection_release<D: RundownWa
     unsafe { (&*run_ref).wait_for_release_with(D::delay) };
 }
 
+/// Bind every [`ExRundownExport`]; the exhaustive match keeps names and implementations paired.
 pub(crate) fn bind_ex_rundown_exports<D: RundownWaitDelay>(reg: &mut DriverExportRegistry) {
-    reg.bind("ExAcquireRundownProtectionCacheAware", ex_acquire_rundown_protection_cache_aware as *const () as usize as u64);
-    reg.bind("ExInitializeRundownProtectionCacheAware", ex_initialize_rundown_protection_cache_aware as *const () as usize as u64);
-    reg.bind("ExReInitializeRundownProtectionCacheAware", ex_reinitialize_rundown_protection_cache_aware as *const () as usize as u64);
-    reg.bind("ExReleaseRundownProtectionCacheAware", ex_release_rundown_protection_cache_aware as *const () as usize as u64);
-    reg.bind("ExSizeOfRundownProtectionCacheAware", ex_size_of_rundown_protection_cache_aware as *const () as usize as u64);
-    reg.bind("ExWaitForRundownProtectionReleaseCacheAware", ex_wait_for_rundown_protection_release_cache_aware::<D> as *const () as usize as u64);
-    reg.bind("ExAcquireRundownProtection", ex_acquire_rundown_protection as *const () as usize as u64);
-    reg.bind("ExInitializeRundownProtection", ex_initialize_rundown_protection as *const () as usize as u64);
-    reg.bind("ExReInitializeRundownProtection", ex_reinitialize_rundown_protection as *const () as usize as u64);
-    reg.bind("ExReleaseRundownProtection", ex_release_rundown_protection as *const () as usize as u64);
-    reg.bind("ExWaitForRundownProtectionRelease", ex_wait_for_rundown_protection_release::<D> as *const () as usize as u64);
+    for export in ExRundownExport::ALL {
+        let va = match export {
+            ExRundownExport::AcquireCacheAware => ex_acquire_rundown_protection_cache_aware as *const (),
+            ExRundownExport::InitializeCacheAware => ex_initialize_rundown_protection_cache_aware as *const (),
+            ExRundownExport::ReInitializeCacheAware => ex_reinitialize_rundown_protection_cache_aware as *const (),
+            ExRundownExport::ReleaseCacheAware => ex_release_rundown_protection_cache_aware as *const (),
+            ExRundownExport::SizeOfCacheAware => ex_size_of_rundown_protection_cache_aware as *const (),
+            ExRundownExport::WaitForReleaseCacheAware =>
+                ex_wait_for_rundown_protection_release_cache_aware::<D> as *const (),
+            ExRundownExport::Acquire => ex_acquire_rundown_protection as *const (),
+            ExRundownExport::Initialize => ex_initialize_rundown_protection as *const (),
+            ExRundownExport::ReInitialize => ex_reinitialize_rundown_protection as *const (),
+            ExRundownExport::Release => ex_release_rundown_protection as *const (),
+            ExRundownExport::WaitForRelease => ex_wait_for_rundown_protection_release::<D> as *const (),
+        };
+        reg.bind(export.name(), va as usize as u64);
+    }
 }

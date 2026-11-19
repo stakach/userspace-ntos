@@ -38,8 +38,9 @@ fn pinned_drivers_resolve_rundown_through_generic_export_registry() {
 
     let source = include_str!("../../../components/ntos-executive/src/ex_rundown_exports.rs");
     assert!(source.matches("extern \"win64\" fn ex_").count() >= 5, "the basic direct exports must use the native Win64 ABI");
+    let bound = nt_kernel_exec::ExRundownExport::ALL.map(nt_kernel_exec::ExRundownExport::name);
     for name in RUNDOWN_IMPORTS {
-        assert!(source.contains(&format!("reg.bind(\"{name}\",")), "generic driver registry lacks {name}");
+        assert!(bound.contains(&name), "the rundown export table lacks {name}");
     }
 }
 
@@ -77,12 +78,10 @@ fn pinned_classpnp_cache_aware_rundown_imports_have_real_native_bindings() {
         }
     }
 
-    // The generic driver resolver enters this registry before DriverEntry. A source check runs
-    // on CI hosts without the staged image and stays red until each real direct export is bound.
-    let exports = include_str!("../../../components/ntos-executive/src/ex_rundown_exports.rs");
+    // The binder maps every entry of this table exhaustively to its implementation.
+    let bound = nt_kernel_exec::ExRundownExport::ALL.map(nt_kernel_exec::ExRundownExport::name);
     for name in CLASS_PNP_CACHE_AWARE_IMPORTS {
-        assert!(exports.contains(&format!("reg.bind(\"{name}\","))
-            || exports.contains(&format!("reg.bind(\n        \"{name}\",")),
+        assert!(bound.contains(&name),
             "classpnp.sys cannot load: missing live cache-aware rundown export {name}");
     }
 }

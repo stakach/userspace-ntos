@@ -64,9 +64,7 @@ fn pinned_win32k_native_imports_are_all_bound() {
             .0;
         bound.extend(binding_names(body));
     }
-    bound.extend(binding_names(include_str!(
-        "../../../components/ntos-executive/src/ex_rundown_exports.rs"
-    )));
+    bound.extend(nt_kernel_exec::ExRundownExport::ALL.map(nt_kernel_exec::ExRundownExport::name));
     assert!(register.contains("crate::rtl_avl_exports::bind_rtl_avl_exports(reg);"));
     bound.extend(binding_names(include_str!(
         "../../../components/ntos-executive/src/rtl_avl_exports.rs"

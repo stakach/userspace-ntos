@@ -145,10 +145,6 @@ fn pinned_disk_native_imports_are_all_bound() {
     // deliberately excluded: its bindings do not resolve disk's native driver IAT.
     for (call, source) in [
         (
-            "crate::ex_rundown_exports::bind_ex_rundown_exports::<HostedRundownDelay>(reg);",
-            include_str!("../../../components/ntos-executive/src/ex_rundown_exports.rs"),
-        ),
-        (
             "io_paging_priority_exports::bind(reg);",
             include_str!("../../../components/ntos-executive/src/io_paging_priority_exports.rs"),
         ),
@@ -231,6 +227,8 @@ fn pinned_disk_native_imports_are_all_bound() {
             bound.extend(binding_names(source));
         }
     }
+    // Rundown names come from the export table its binder maps exhaustively.
+    bound.extend(nt_kernel_exec::ExRundownExport::ALL.map(nt_kernel_exec::ExRundownExport::name));
     for helper in ["bind_debug_exports", "bind_kd_debug_export"] {
         if register.contains(&format!("{helper}(reg);")) {
             let body = launch

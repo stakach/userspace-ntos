@@ -39,12 +39,8 @@ fn pinned_win32k_rundown_imports_have_native_export_bindings() {
         }
     }
 
-    let source = include_str!("../../../components/ntos-executive/src/ex_rundown_exports.rs");
+    let bound = nt_kernel_exec::ExRundownExport::ALL.map(nt_kernel_exec::ExRundownExport::name);
     for name in RUNDOWN_IMPORTS {
-        assert!(
-            source.contains(&format!("reg.bind(\"{name}\","))
-                || source.contains(&format!("reg.bind(\n        \"{name}\",")),
-            "win32k export registry must bind native {name}"
-        );
+        assert!(bound.contains(&name), "the rundown export table lacks native {name}");
     }
 }
