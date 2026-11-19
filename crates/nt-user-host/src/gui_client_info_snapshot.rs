@@ -159,7 +159,8 @@ impl DesktopClientMapping {
 mod tests {
     use super::*;
     use alloc::vec::Vec;
-    use nt_object_manager::win32k_ob::{ObHandleTable, ObKind};
+    use nt_object_manager::win32k_ob::ObKind;
+    use nt_object_manager::win32k_user_objects::{UserObjectName, UserObjectRelease, UserObjectStore};
     use nt_process::ProcessManager;
     use nt_provider_wait::{
         ProviderAllocationCatalog, ProviderAllocationError, ProviderArenaIdentity,
@@ -347,24 +348,29 @@ mod tests {
         }
 
         let desktop_body = 0x3000;
-        let mut objects = ObHandleTable::new();
-        let desktop_handle = objects.register(ObKind::Desktop, desktop_body);
-        assert_ne!(desktop_handle, 0);
-        assert_eq!(objects.reference_by_body(desktop_body), Some(2));
+        let mut objects = UserObjectStore::new();
+        objects
+            .create(ObKind::Desktop, 0xD000, desktop_body, None, UserObjectName::Unnamed, 0)
+            .unwrap();
+        objects.insert(desktop_body).unwrap();
+        assert_eq!(objects.reference(desktop_body), Ok(2));
         let snapshot = GuiClientInfoSnapshot::capture(owner, owner, 0x1234, mapping(), None)
             .unwrap();
 
         for (identity, _) in &pins {
             assert_eq!(allocations.begin_retirement(*identity), Err(ProviderAllocationError::Pinned));
         }
-        assert_eq!(objects.counts_by_body(desktop_body), Some((2, 1)));
+        assert_eq!(objects.counts(desktop_body), Some((2, 1)));
         assert_eq!(snapshot.values_for(owner).unwrap().client_deskinfo, 0x4000_0100);
 
         // The synchronous component Reply acknowledges the root copyout before these owners go.
         for (_, pin) in pins.iter().rev() {
             allocations.release_pin(*pin).unwrap();
         }
-        assert_eq!(objects.dereference_by_body(desktop_body), Some(1));
+        assert_eq!(
+            objects.dereference(desktop_body),
+            Ok(UserObjectRelease::Retained { pointers: 1, handles: 1 })
+        );
         for (identity, _) in pins {
             allocations.begin_retirement(identity).unwrap();
         }

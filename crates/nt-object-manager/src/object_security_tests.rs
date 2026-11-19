@@ -1,5 +1,6 @@
 use super::*;
-use crate::win32k_ob::{ObHandleTable, ObKind};
+use crate::win32k_ob::ObKind;
+use crate::win32k_user_objects::{UserObjectName, UserObjectStore, OB_SECURITY_DESCRIPTOR_MAX};
 use alloc::collections::BTreeMap;
 
 #[derive(Default)]
@@ -273,15 +274,24 @@ fn one_failed_retirement_does_not_starve_others_or_touch_active_entries() {
     cache.release(c, &mut io).unwrap();
 }
 
+const DESKTOP_TYPE: u64 = 0xD000;
+
+fn create(table: &mut UserObjectStore, kind: ObKind, body: u64, descriptor: Option<&[u8]>) -> u64 {
+    table
+        .create(kind, DESKTOP_TYPE, body, descriptor, UserObjectName::Unnamed, 0)
+        .unwrap()
+}
+
 #[test]
 fn cache_snapshot_survives_descriptor_replacement_and_object_table_destruction() {
-    let mut table = ObHandleTable::new();
-    let handle = table.register_with_security(ObKind::Desktop, 0x7000, Some(&[1, 2]));
+    let mut table = UserObjectStore::new();
+    let generation = create(&mut table, ObKind::Desktop, 0x7000, Some(&[1, 2]));
+    table.insert(0x7000).unwrap();
     let mut cache = ObjectSecurityCache::new();
     let mut io = Io::default();
     let (_, descriptor) = table.security_descriptor_by_body(0x7000).unwrap();
     let old = cache.acquire(descriptor, &mut io).unwrap();
-    assert!(table.set_security_descriptor(handle, &[3, 4]));
+    assert!(table.set_security_descriptor_for(0x7000, generation, &[3, 4]));
     let (_, descriptor) = table.security_descriptor_by_body(0x7000).unwrap();
     let new = cache.acquire(descriptor, &mut io).unwrap();
     drop(table);
@@ -294,9 +304,9 @@ fn cache_snapshot_survives_descriptor_replacement_and_object_table_destruction()
 
 #[test]
 fn body_lookup_distinguishes_unknown_null_and_descriptor() {
-    let mut table = ObHandleTable::new();
-    table.register(ObKind::Desktop, 0x7000);
-    table.register_with_security(ObKind::WindowStation, 0x8000, Some(&[1, 2]));
+    let mut table = UserObjectStore::new();
+    create(&mut table, ObKind::Desktop, 0x7000, None);
+    create(&mut table, ObKind::WindowStation, 0x8000, Some(&[1, 2]));
     assert_eq!(table.security_descriptor_by_body(0), None);
     assert_eq!(table.security_descriptor_by_body(0x9000), None);
     assert_eq!(
@@ -307,54 +317,30 @@ fn body_lookup_distinguishes_unknown_null_and_descriptor() {
         table.security_descriptor_by_body(0x8000),
         Some((ObKind::WindowStation, Some([1, 2].as_slice())))
     );
-    table.register(ObKind::Other, 0);
-    assert_eq!(table.security_descriptor_by_body(0), None);
 }
 
 #[test]
-fn pending_body_exposes_kind_and_security_before_handle_publication() {
-    let mut table = ObHandleTable::new();
-    assert!(table.latch_pending_with_security(ObKind::Desktop, 0x7000, Some(&[1, 2])));
-    assert_eq!(
-        table.security_descriptor_by_body(0x7000),
-        Some((ObKind::Desktop, Some([1, 2].as_slice())))
-    );
-    let handle = table.insert_pending(0x7000);
-    assert_ne!(handle, 0);
-    assert_eq!(
-        table.security_descriptor_by_body(0x7000),
-        Some((ObKind::Desktop, Some([1, 2].as_slice())))
-    );
-    table.latch_pending(ObKind::WindowStation, 0x8000);
-    assert_eq!(
-        table.security_descriptor_by_body(0x8000),
-        Some((ObKind::WindowStation, None))
-    );
-}
-
-#[test]
-fn assigned_pending_desktop_security_survives_handle_publication() {
-    let mut table = ObHandleTable::new();
-    table.latch_pending(ObKind::Desktop, 0x7000);
+fn pending_body_security_survives_insertion() {
+    let mut table = UserObjectStore::new();
+    let generation = create(&mut table, ObKind::Desktop, 0x7000, None);
     assert!(table.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[1, 2, 3]));
     assert_eq!(
         table.security_descriptor_by_body(0x7000),
         Some((ObKind::Desktop, Some([1, 2, 3].as_slice())))
     );
-    let handle = table.insert_pending(0x7000);
-    assert_ne!(handle, 0);
+    table.insert(0x7000).unwrap();
     assert_eq!(
-        table.security_descriptor(handle),
-        Some([1, 2, 3].as_slice())
+        table.security_descriptor_for(0x7000, generation),
+        Some(Some([1, 2, 3].as_slice()))
     );
 }
 
 #[test]
-fn body_security_assignment_rejects_wrong_kind_ambiguity_and_oversize_atomically() {
-    let mut table = ObHandleTable::new();
-    table.latch_pending(ObKind::Desktop, 0x7000);
+fn body_security_assignment_rejects_wrong_kind_unknown_and_oversize_atomically() {
+    let mut table = UserObjectStore::new();
+    create(&mut table, ObKind::Desktop, 0x7000, None);
     assert!(table.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[1, 2]));
-    let oversized = [3; crate::win32k_ob::OB_SECURITY_DESCRIPTOR_MAX + 1];
+    let oversized = [3; OB_SECURITY_DESCRIPTOR_MAX + 1];
     for (body, kind, descriptor) in [
         (0, ObKind::Desktop, &[3][..]),
         (0x7000, ObKind::WindowStation, &[3][..]),
@@ -367,62 +353,4 @@ fn body_security_assignment_rejects_wrong_kind_ambiguity_and_oversize_atomically
             Some((ObKind::Desktop, Some([1, 2].as_slice())))
         );
     }
-
-    table.register(ObKind::Desktop, 0x7000);
-    assert!(!table.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[4]));
-    table.latch_pending(ObKind::Other, 0x9000);
-    let handle = table.insert_pending(0x9000);
-    assert_ne!(handle, 0);
-    assert!(!table.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[4]));
-
-    let mut unique = ObHandleTable::new();
-    unique.register(ObKind::Desktop, 0x7000);
-    assert!(unique.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[4]));
-    unique.register(ObKind::WindowStation, 0x7000);
-    assert!(!unique.set_security_descriptor_by_body(0x7000, ObKind::Desktop, &[5]));
-}
-
-#[test]
-fn aliases_resolve_only_one_canonical_body_and_observe_security_replacement() {
-    let mut table = ObHandleTable::new();
-    let handle = table.register(ObKind::Desktop, 0x7000);
-    let alias = table.duplicate(handle).unwrap();
-    assert!(table.set_security_descriptor(alias, &[3, 4]));
-    assert_eq!(
-        table.security_descriptor_by_body(0x7000),
-        Some((ObKind::Desktop, Some([3, 4].as_slice())))
-    );
-    assert!(table.close(alias));
-    assert_eq!(
-        table.security_descriptor_by_body(0x7000),
-        Some((ObKind::Desktop, Some([3, 4].as_slice())))
-    );
-    assert!(table.set_security_descriptor(handle, &[]));
-    assert_eq!(
-        table.security_descriptor_by_body(0x7000),
-        Some((ObKind::Desktop, None))
-    );
-}
-
-#[test]
-fn duplicate_canonical_or_pending_bodies_are_rejected_as_ambiguous() {
-    let mut table = ObHandleTable::new();
-    table.register(ObKind::Desktop, 0x7000);
-    table.register(ObKind::WindowStation, 0x7000);
-    assert_eq!(table.security_descriptor_by_body(0x7000), None);
-    table.register(ObKind::Desktop, 0x8000);
-    assert!(!table.latch_pending(ObKind::Desktop, 0x8000));
-    assert_eq!(
-        table.security_descriptor_by_body(0x8000),
-        Some((ObKind::Desktop, None))
-    );
-    assert!(table.latch_pending(ObKind::Other, 0x9000));
-    assert_eq!(
-        table.security_descriptor_by_body(0x8000),
-        Some((ObKind::Desktop, None))
-    );
-    assert_eq!(
-        table.security_descriptor_by_body(0x9000),
-        Some((ObKind::Other, None))
-    );
 }

@@ -6389,7 +6389,7 @@ pub(crate) unsafe fn validate_provider_logical_caller(
     handler.as_ref().is_some_and(|handler| handler.validate_provider_logical_caller(caller))
 }
 
-unsafe fn authenticate_win32k_service_request(
+pub(crate) unsafe fn authenticate_win32k_service_request(
     channel: &spawn_hosts::PumpChannel,
     reply_cap: u64,
     badge: u64,

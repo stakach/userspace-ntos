@@ -37,6 +37,16 @@ fn fixture() -> Fixture {
     Fixture { pm, first, second, first_kernel }
 }
 
+fn lookup(
+    pm: &ProcessManager,
+    caller: NativeHandleCaller,
+    value: u64,
+    access: u32,
+    expected: Option<u64>,
+) -> Result<UserObjectTarget, u32> {
+    pm.lookup_native_user_object_handle(caller, value, access, expected).map(|(target, _)| target)
+}
+
 fn publish(pm: &mut ProcessManager, caller: NativeHandleCaller, target: UserObjectTarget, grant: u32) -> u64 {
     let mut publication = pm.reserve_native_user_object_handle(caller, 0).unwrap();
     publication.bind(pm, target, grant).unwrap();
@@ -50,21 +60,21 @@ fn equal_handle_values_in_two_processes_name_their_own_user_objects() {
     let b = publish(&mut f.pm, f.second, target(0x2000, 1), 0x1ff);
     assert_eq!(a, b, "both processes allocate the same first slot");
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.first, a, 0, Some(DESKTOP_TYPE)),
+        lookup(&f.pm, f.first, a, 0, Some(DESKTOP_TYPE)),
         Ok(target(0x1000, 1))
     );
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.second, b, 0, Some(DESKTOP_TYPE)),
+        lookup(&f.pm, f.second, b, 0, Some(DESKTOP_TYPE)),
         Ok(target(0x2000, 1))
     );
     // Closing one process's handle leaves the other's equal value intact.
     assert_eq!(f.pm.close_native_user_object_handle(f.first, a), Ok(target(0x1000, 1)));
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.first, a, 0, None),
+        lookup(&f.pm, f.first, a, 0, None),
         Err(STATUS_INVALID_HANDLE)
     );
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.second, b, 0, None),
+        lookup(&f.pm, f.second, b, 0, None),
         Ok(target(0x2000, 1))
     );
 }
@@ -75,12 +85,12 @@ fn reserved_and_bound_user_handles_are_invisible_until_published() {
     let mut publication = f.pm.reserve_native_user_object_handle(f.first, 0).unwrap();
     let value = publication.value();
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.first, value, 0, None),
+        lookup(&f.pm, f.first, value, 0, None),
         Err(STATUS_INVALID_HANDLE)
     );
     publication.bind(&mut f.pm, target(0x3000, 2), 1).unwrap();
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.first, value, 0, None),
+        lookup(&f.pm, f.first, value, 0, None),
         Err(STATUS_INVALID_HANDLE)
     );
     let caller_pid = f.first.effective_process();
@@ -93,20 +103,20 @@ fn user_lookup_enforces_type_generation_and_user_mode_access() {
     let mut f = fixture();
     let value = publish(&mut f.pm, f.first, target(0x4000, 3), 0x1);
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.first, value, 0, Some(WINDOW_STATION_TYPE)),
+        lookup(&f.pm, f.first, value, 0, Some(WINDOW_STATION_TYPE)),
         Err(STATUS_OBJECT_TYPE_MISMATCH)
     );
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.first, value, 0x2, None),
+        lookup(&f.pm, f.first, value, 0x2, None),
         Err(crate::STATUS_ACCESS_DENIED)
     );
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.first_kernel, value, 0x2, None),
+        lookup(&f.pm, f.first_kernel, value, 0x2, None),
         Ok(target(0x4000, 3))
     );
     let other = f.pm.insert_handle(f.first.effective_process(), HandleObject::Opaque(9), 0).unwrap();
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.first, u64::from(other), 0, None),
+        lookup(&f.pm, f.first, u64::from(other), 0, None),
         Err(STATUS_OBJECT_TYPE_MISMATCH)
     );
     assert_eq!(
@@ -127,11 +137,11 @@ fn kernel_user_handles_live_in_the_system_table() {
     assert_ne!(value & KERNEL_HANDLE_TAG, 0);
     assert!(f.pm.reserve_native_user_object_handle(f.first, OBJ_KERNEL_HANDLE).is_err());
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.first_kernel, value, 0, None),
+        lookup(&f.pm, f.first_kernel, value, 0, None),
         Ok(target(0x5000, 1))
     );
     assert_eq!(
-        f.pm.lookup_native_user_object_handle(f.first, value, 0, None),
+        lookup(&f.pm, f.first, value, 0, None),
         Err(STATUS_INVALID_HANDLE)
     );
 }
@@ -171,5 +181,39 @@ fn find_searches_only_the_named_process_and_honours_every_filter() {
         f.pm.find_native_user_object_handle(f.first, second_pid, None, None, None),
         Err(crate::STATUS_ACCESS_DENIED),
         "ObFindHandleForObject is a kernel-mode search"
+    );
+}
+
+#[test]
+fn a_kernel_caller_restricted_to_user_mode_gets_user_mode_checks_only() {
+    let mut f = fixture();
+    let handle = publish(&mut f.pm, f.first_kernel, target(0x1000, 1), 0x1);
+    let user = f.first_kernel.restricted_to(AccessMode::UserMode);
+    assert_eq!(user.mode(), AccessMode::UserMode);
+    assert_eq!(user.effective_process(), f.first_kernel.effective_process());
+    assert_eq!(
+        lookup(&f.pm, user, handle, 0x2, None),
+        Err(crate::STATUS_ACCESS_DENIED)
+    );
+    assert_eq!(
+        lookup(&f.pm, f.first_kernel, handle, 0x2, None),
+        Ok(target(0x1000, 1))
+    );
+    assert_eq!(f.first.restricted_to(AccessMode::KernelMode).mode(), AccessMode::UserMode,
+        "restriction never gains kernel mode");
+}
+
+#[test]
+fn lookup_reports_the_exact_handle_information() {
+    let mut f = fixture();
+    let mut publication = f.pm.reserve_native_user_object_handle(f.first, 2).unwrap();
+    publication.bind(&mut f.pm, target(0x1000, 1), 0x1ff).unwrap();
+    let handle = publication.publish(&mut f.pm).unwrap();
+    assert_eq!(
+        f.pm.lookup_native_user_object_handle(f.first, handle, 0, None),
+        Ok((
+            target(0x1000, 1),
+            NativeHandleInformation { attributes: 2, granted_access: Some(0x1ff) }
+        ))
     );
 }

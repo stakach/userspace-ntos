@@ -4028,6 +4028,23 @@ unsafe fn component_pump_loop(
             pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
                 acknowledgement[0], acknowledgement[1], acknowledgement[2], acknowledgement[3]);
             continue;
+        } else if label == crate::win32k_subsystem::W32_USER_OBJECT_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let (status, out1, out2, out3) = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::provider_user_object_broker::service(
+                    ch,
+                    *reply_cap,
+                    msg.badge,
+                    msg.mi,
+                    [msg.m0, msg.m1, msg.m2, msg.m3],
+                )
+            } else {
+                (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
+                status as u32 as u64, out1, out2, out3);
+            continue;
         } else if label == crate::win32k_subsystem::W32_PS_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {

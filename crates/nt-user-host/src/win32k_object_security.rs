@@ -1,13 +1,14 @@
 //! Bounded, pointer-free descriptor transfer for win32k object-security assignment.
 
-use nt_object_manager::win32k_ob::{ObHandleTable, ObKind};
+use nt_object_manager::win32k_ob::ObKind;
+use nt_object_manager::win32k_user_objects::UserObjectStore;
 use nt_security::{
     assign_object_security_with_audit, CapturedSubjectTokens, GenericMapping,
     ObjectSecurityAssignment, ProcessorMode, SecurityAssignmentAudit, SecurityAssignmentClient,
     SecurityAssignmentInheritance,
 };
 
-pub const MAX_DESCRIPTOR_LEN: usize = nt_object_manager::win32k_ob::OB_SECURITY_DESCRIPTOR_MAX;
+pub const MAX_DESCRIPTOR_LEN: usize = nt_object_manager::win32k_user_objects::OB_SECURITY_DESCRIPTOR_MAX;
 pub const HEADER_LEN: usize = 32;
 const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
@@ -90,7 +91,7 @@ pub fn decode_assignment_packet(bytes: &[u8]) -> Result<AssignmentPacket<'_>, u3
 /// Evaluate with retained canonical tokens, deliver privilege decisions, then publish to the
 /// uniquely owned Desktop body. Neither a failed policy nor an ambiguous body mutates security.
 pub fn assign_exact_desktop(
-    table: &mut ObHandleTable,
+    table: &mut UserObjectStore,
     packet: AssignmentPacket<'_>,
     subject: &CapturedSubjectTokens<'_>,
     mapping: &GenericMapping,
@@ -131,6 +132,7 @@ pub fn assign_exact_desktop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nt_object_manager::win32k_user_objects::UserObjectName;
     use nt_security::AccessToken;
 
     #[test]
@@ -182,9 +184,9 @@ mod tests {
             client: None,
             process_audit_id: 7,
         };
-        let mut table = ObHandleTable::new();
-        assert!(table.latch_pending(ObKind::WindowStation, 0x1000));
-        assert!(table.latch_pending(ObKind::Desktop, 0x2000));
+        let mut table = UserObjectStore::new();
+        assert!(table.create(ObKind::WindowStation, 0x5000, 0x1000, None, UserObjectName::Unnamed, 0).is_ok());
+        assert!(table.create(ObKind::Desktop, 0xD000, 0x2000, None, UserObjectName::Unnamed, 0).is_ok());
         let packet = AssignmentPacket {
             object: 0x2000,
             object_type: 0x3000,
@@ -205,9 +207,8 @@ mod tests {
         assert!(audited);
         assert_eq!(table.security_descriptor_by_body(0x1000), Some((ObKind::WindowStation, None)));
         assert!(table.security_descriptor_by_body(0x2000).unwrap().1.is_some());
-        let handle = table.insert_pending(0x2000);
-        assert_ne!(handle, 0);
-        assert!(table.security_descriptor(handle).is_some());
+        let (identity, _) = table.insert(0x2000).unwrap();
+        assert!(table.security_descriptor_for(0x2000, identity.generation).unwrap().is_some());
     }
 
     #[test]
@@ -218,8 +219,8 @@ mod tests {
             client: None,
             process_audit_id: 7,
         };
-        let mut table = ObHandleTable::new();
-        assert!(table.latch_pending_with_security(ObKind::Desktop, 0x2000, Some(&[1, 2])));
+        let mut table = UserObjectStore::new();
+        assert!(table.create(ObKind::Desktop, 0xD000, 0x2000, Some(&[1, 2]), UserObjectName::Unnamed, 0).is_ok());
         let packet = AssignmentPacket {
             object: 0x2000,
             object_type: 0x3000,
@@ -239,7 +240,7 @@ mod tests {
         .is_err());
         assert!(audited);
         assert_eq!(table.security_descriptor_by_body(0x2000), Some((ObKind::Desktop, Some(&[1, 2][..]))));
-        assert!(table.latch_pending(ObKind::WindowStation, 0x3000));
+        assert!(table.create(ObKind::WindowStation, 0x5000, 0x3000, None, UserObjectName::Unnamed, 0).is_ok());
         let wrong = AssignmentPacket { object: 0x3000, ..packet };
         assert_eq!(assign_exact_desktop(
             &mut table,

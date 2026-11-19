@@ -84,6 +84,8 @@ mod yield_handoff_tests;
 pub mod native_caller_subject;
 pub mod win32k_subject_lease;
 pub mod win32k_object_security;
+pub mod user_object_handles;
+pub mod user_object_handle_wire;
 pub mod routed_section_owner;
 pub mod section_view_retirement;
 pub mod provider_section_unmap;

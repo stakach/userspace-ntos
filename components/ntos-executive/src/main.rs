@@ -65,6 +65,7 @@ mod registry_checkpoint_audit;
 mod registry_query_audit;
 mod provider_registry_caller;
 mod provider_directory_broker;
+mod provider_user_object_broker;
 mod canonical_directory_port;
 mod native_directory_open_work;
 mod native_file_target_open_work;

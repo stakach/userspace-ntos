@@ -40,6 +40,14 @@ impl NativeHandleCaller {
     pub const fn mode(self) -> AccessMode {
         self.mode
     }
+    /// The same caller acting for a request whose previous mode is `mode`. A user-mode caller
+    /// never gains kernel mode.
+    pub const fn restricted_to(mut self, mode: AccessMode) -> Self {
+        if matches!(mode, AccessMode::UserMode) {
+            self.mode = AccessMode::UserMode;
+        }
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

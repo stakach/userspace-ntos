@@ -20983,6 +20983,10 @@ impl ExecNtHandler {
                 self.writable_fs_dirty = true;
                 unsafe { crate::writable_fs::retain(file_id) }
             }
+            // The provider counts this copy when it drains the root's ledger.
+            nt_process::HandleObject::UserObject(target) => {
+                crate::provider_user_object_broker::acquire(target)
+            }
             _ => Ok(()),
         }
     }
@@ -21025,12 +21029,19 @@ impl ExecNtHandler {
                 unsafe { crate::writable_fs::close(file_id) };
                 self.writable_fs_dirty = true;
             }
+            nt_process::HandleObject::UserObject(target) => {
+                crate::provider_user_object_broker::cancel_acquire(target);
+            }
             _ => {}
         }
     }
 
     pub(crate) fn release_handle_object(&mut self, object: nt_process::HandleObject) {
         match object {
+            // The provider releases the body reference when it drains the root's ledger.
+            nt_process::HandleObject::UserObject(target) => {
+                crate::provider_user_object_broker::release(target);
+            }
             nt_process::HandleObject::Event(id) => {
                 self.release_event_handle_reference(nt_kernel_exec::EventObjectId(id));
             }
@@ -33554,8 +33565,7 @@ impl ExecNtHandler {
             NativeService::NtClose => {
                 let tagged_kernel = args[0] & nt_process::native_handle::KERNEL_HANDLE_TAG
                     == nt_process::native_handle::KERNEL_HANDLE_TAG;
-                let native_table = tagged_kernel
-                    || args[0] < nt_object_manager::win32k_ob::OB_HANDLE_BASE;
+                let native_table = tagged_kernel || args[0] < nt_port_core::PORT_HANDLE_BASE;
                 let closed = if native_table {
                     let caller = match self.native_handle_caller(ctx.previous_mode) {
                         Ok(caller) => caller,
@@ -33588,16 +33598,6 @@ impl ExecNtHandler {
                         Ok(closed) => closed,
                         Err(status) => return status,
                     }
-                } else if nt_object_manager::win32k_ob::ObHandleTable::is_handle_namespace_value(
-                    args[0],
-                ) {
-                    let user_closed = unsafe {
-                        crate::win32k_subsystem::close_user_object_handle(args[0])
-                    };
-                    if user_closed {
-                        PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
-                    }
-                    user_closed
                 } else if args[0] >= nt_port_core::PORT_HANDLE_BASE {
                     match self.close_lpc_handle_for_current_process(args[0]) {
                         Ok(closed) => closed,
@@ -33746,7 +33746,6 @@ impl ExecNtHandler {
                 let options = nt_ulong_arg(args[6]);
                 let mut target_pid_for_peak = None;
                 let mut close_source_pid = source_pid;
-                let mut native_duplicate = false;
                 let mut recovered_source_from_csr_client = false;
                 let result = if args[2] == 0 {
                     if args[3] == 0 && options & DUPLICATE_CLOSE_SOURCE != 0 {
@@ -33761,55 +33760,18 @@ impl ExecNtHandler {
                     target_pid_for_peak = Some(target_pid);
                     let desired_access =
                         (options & DUPLICATE_SAME_ACCESS == 0).then_some(nt_ulong_arg(args[4]));
-                    let user_same_process_duplicate =
-                        source_pid == Some(target_pid) && options & DUPLICATE_SAME_ACCESS != 0;
-                    if user_same_process_duplicate {
-                        if let Some(handle) = unsafe {
-                            crate::win32k_subsystem::duplicate_user_object_handle(args[1])
-                        } {
-                            Ok(Some(handle))
-                        } else {
-                            match self.duplicate_process_handle_with_request_source(
-                                source_pid,
-                                source_handle,
-                                target_pid,
-                                desired_access,
-                            ) {
-                                Ok((handle, owner_pid, recovered)) => {
-                                    close_source_pid = Some(owner_pid);
-                                    native_duplicate = true;
-                                    recovered_source_from_csr_client = recovered;
-                                    Ok(Some(handle as u64))
-                                }
-                                Err(status) => Err(status),
-                            }
+                    match self.duplicate_process_handle_with_request_source(
+                        source_pid,
+                        source_handle,
+                        target_pid,
+                        desired_access,
+                    ) {
+                        Ok((handle, owner_pid, recovered)) => {
+                            close_source_pid = Some(owner_pid);
+                            recovered_source_from_csr_client = recovered;
+                            Ok(Some(handle as u64))
                         }
-                    } else {
-                        match self.duplicate_process_handle_with_request_source(
-                            source_pid,
-                            source_handle,
-                            target_pid,
-                            desired_access,
-                        ) {
-                            Ok((handle, owner_pid, recovered)) => {
-                                close_source_pid = Some(owner_pid);
-                                native_duplicate = true;
-                                recovered_source_from_csr_client = recovered;
-                                Ok(Some(handle as u64))
-                            }
-                            Err(status)
-                                if status == STATUS_INVALID_HANDLE
-                                    && source_pid == Some(target_pid)
-                                    && options & DUPLICATE_SAME_ACCESS != 0 =>
-                            {
-                                unsafe {
-                                    crate::win32k_subsystem::duplicate_user_object_handle(args[1])
-                                }
-                                .map(Some)
-                                .ok_or(STATUS_INVALID_HANDLE)
-                            }
-                            Err(status) => Err(status),
-                        }
+                        Err(status) => Err(status),
                     }
                 };
 
@@ -33817,15 +33779,8 @@ impl ExecNtHandler {
                     if close_source_pid.is_none() {
                         close_source_pid = self.csr_client_source_pid_for_handle(source_handle);
                     }
-                    let closed_native = close_source_pid
-                        .map(|pid| self.close_process_handle(pid, args[1]))
-                        .unwrap_or(false);
-                    if closed_native
-                        || unsafe { crate::win32k_subsystem::close_user_object_handle(args[1]) }
-                    {
-                        if !closed_native {
-                            PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
-                        }
+                    if let Some(pid) = close_source_pid {
+                        let _ = self.close_process_handle(pid, args[1]);
                     }
                 }
                 if self.current_badge == 12 {
@@ -33837,11 +33792,7 @@ impl ExecNtHandler {
                     print_hex(options);
                     match result {
                         Ok(Some(handle)) => {
-                            print_str(if native_duplicate {
-                                b" native=0x"
-                            } else {
-                                b" win32k=0x"
-                            });
+                            print_str(b" native=0x");
                             print_hex_u64(handle);
                             print_str(b"\n");
                         }
@@ -33872,14 +33823,7 @@ impl ExecNtHandler {
                 match result {
                     Ok(Some(handle)) => {
                         if !unsafe { self.xas_write_u64(args[3], handle) } {
-                            if native_duplicate {
-                                let _ =
-                                    self.close_process_handle(target_pid_for_peak.unwrap(), handle);
-                            } else {
-                                let _ = unsafe {
-                                    crate::win32k_subsystem::close_user_object_handle(handle)
-                                };
-                            }
+                            let _ = self.close_process_handle(target_pid_for_peak.unwrap(), handle);
                             return STATUS_ACCESS_VIOLATION;
                         }
                         0
@@ -38125,50 +38069,44 @@ impl ExecNtHandler {
                     }
                     return 0;
                 }
-                let native_handle_object = self.pm_pid_for_pi(self.pi).and_then(|pid| {
-                    (args[0] <= u32::MAX as u64)
-                        .then(|| self.pm.lookup_handle(pid, args[0] as nt_process::Handle))
-                        .flatten()
+                let user_object = self.pm_pid_for_pi(self.pi).and_then(|pid| {
+                    crate::provider_user_object_broker::handle_target(&self.pm, pid, args[0])
                 });
-                if !matches!(
-                    native_handle_object,
-                    Some(nt_process::HandleObject::RegistryKey(_))
-                ) {
-                    if let Some(granted) =
-                        unsafe { crate::win32k_subsystem::user_object_granted_access(args[0]) }
-                    {
-                        if granted & required_access != required_access {
-                            return nt_security::STATUS_ACCESS_DENIED;
-                        }
-                        let current = unsafe {
-                            crate::win32k_subsystem::user_object_security_descriptor(args[0])
-                        }
-                        .unwrap_or(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]);
-                        let descriptor = match nt_security::query_security_descriptor_bytes(
-                            current,
-                            security_information,
-                        ) {
-                            Ok(descriptor) => descriptor,
-                            Err(status) => return status,
-                        };
-                        if args[4] == 0
-                            || !self.xas_write_u32(
-                                args[4],
-                                descriptor.len().min(u32::MAX as usize) as u32,
-                            )
-                        {
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                        if args[2] == 0 || buffer_length < descriptor.len() {
-                            return STATUS_BUFFER_TOO_SMALL;
-                        }
-                        if !self.probe_user_output(args[2], descriptor.len())
-                            || !self.xas_try_write_buf(args[2], &descriptor)
-                        {
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                        return 0;
+                if let Some((target, granted)) = user_object {
+                    if granted & required_access != required_access {
+                        return nt_security::STATUS_ACCESS_DENIED;
                     }
+                    let Some(current) = (unsafe {
+                        crate::win32k_subsystem::user_object_security_descriptor_for(target)
+                    }) else {
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    };
+                    let current =
+                        current.unwrap_or(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]);
+                    let descriptor = match nt_security::query_security_descriptor_bytes(
+                        current,
+                        security_information,
+                    ) {
+                        Ok(descriptor) => descriptor,
+                        Err(status) => return status,
+                    };
+                    if args[4] == 0
+                        || !self.xas_write_u32(
+                            args[4],
+                            descriptor.len().min(u32::MAX as usize) as u32,
+                        )
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if args[2] == 0 || buffer_length < descriptor.len() {
+                        return STATUS_BUFFER_TOO_SMALL;
+                    }
+                    if !self.probe_user_output(args[2], descriptor.len())
+                        || !self.xas_try_write_buf(args[2], &descriptor)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    return 0;
                 }
                 let key = match self.resolve_registry_key(args[0], required_access) {
                     Ok(key) => key,
@@ -38407,49 +38345,43 @@ impl ExecNtHandler {
                     }
                     return nt_security::file_set_security_status(driver_status);
                 }
-                let native_handle_object = self.pm_pid_for_pi(self.pi).and_then(|pid| {
-                    (args[0] <= u32::MAX as u64)
-                        .then(|| self.pm.lookup_handle(pid, args[0] as nt_process::Handle))
-                        .flatten()
+                let user_object = self.pm_pid_for_pi(self.pi).and_then(|pid| {
+                    crate::provider_user_object_broker::handle_target(&self.pm, pid, args[0])
                 });
-                if !matches!(
-                    native_handle_object,
-                    Some(nt_process::HandleObject::RegistryKey(_))
-                ) {
-                    if let Some(granted) =
-                        unsafe { crate::win32k_subsystem::user_object_granted_access(args[0]) }
-                    {
-                        if granted & required_access != required_access {
-                            return nt_security::STATUS_ACCESS_DENIED;
-                        }
-                        let memory = ExecClientMemory { handler: self };
-                        let modification = match nt_security::capture_security_descriptor_bytes(
-                            &memory, args[2],
-                        ) {
-                            Ok(descriptor) => descriptor,
-                            Err(status) => return status,
-                        };
-                        let current = unsafe {
-                            crate::win32k_subsystem::user_object_security_descriptor(args[0])
-                        }
-                        .unwrap_or(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]);
-                        let updated = match nt_security::set_security_descriptor_bytes(
-                            current,
-                            security_information,
-                            &modification,
-                        ) {
-                            Ok(descriptor) => descriptor,
-                            Err(status) => return status,
-                        };
-                        if unsafe {
-                            crate::win32k_subsystem::set_user_object_security_descriptor(
-                                args[0], &updated,
-                            )
-                        } {
-                            return 0;
-                        }
-                        return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                if let Some((target, granted)) = user_object {
+                    if granted & required_access != required_access {
+                        return nt_security::STATUS_ACCESS_DENIED;
                     }
+                    let memory = ExecClientMemory { handler: self };
+                    let modification = match nt_security::capture_security_descriptor_bytes(
+                        &memory, args[2],
+                    ) {
+                        Ok(descriptor) => descriptor,
+                        Err(status) => return status,
+                    };
+                    let Some(current) = (unsafe {
+                        crate::win32k_subsystem::user_object_security_descriptor_for(target)
+                    }) else {
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    };
+                    let current =
+                        current.unwrap_or(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]);
+                    let updated = match nt_security::set_security_descriptor_bytes(
+                        current,
+                        security_information,
+                        &modification,
+                    ) {
+                        Ok(descriptor) => descriptor,
+                        Err(status) => return status,
+                    };
+                    if unsafe {
+                        crate::win32k_subsystem::set_user_object_security_descriptor_for(
+                            target, &updated,
+                        )
+                    } {
+                        return 0;
+                    }
+                    return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
                 }
                 let key = match self.resolve_registry_key(args[0], required_access) {
                     Ok(key) => key,

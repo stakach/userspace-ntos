@@ -46,14 +46,15 @@ impl ProcessManager {
     }
 
     /// ObReferenceObjectByHandle for a USER handle: the exact caller table, the optional
-    /// expected type and, for user-mode callers, the handle's granted access.
+    /// expected type and, for user-mode callers, the handle's granted access. Returns the
+    /// target and the handle's OBJECT_HANDLE_INFORMATION.
     pub fn lookup_native_user_object_handle(
         &self,
         caller: NativeHandleCaller,
         value: u64,
         desired_access: u32,
         expected_type: Option<u64>,
-    ) -> Result<UserObjectTarget, u32> {
+    ) -> Result<(UserObjectTarget, NativeHandleInformation), u32> {
         let NativeHandleScope::Table { owner, handle, .. } =
             self.decode_native_handle(caller, value)?
         else {
@@ -71,7 +72,12 @@ impl ProcessManager {
         if caller.mode() == AccessMode::UserMode && desired_access & !granted != 0 {
             return Err(crate::STATUS_ACCESS_DENIED);
         }
-        Ok(target)
+        let flags = self.handle_flags(owner, handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let information = NativeHandleInformation {
+            attributes: u32::from(flags.inherit) * 2 | u32::from(flags.protect_from_close),
+            granted_access: Some(granted),
+        };
+        Ok((target, information))
     }
 
     /// Remove the exact table entry and return the target for the provider's dereference.

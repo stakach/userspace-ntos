@@ -1670,6 +1670,9 @@ pub const W32_PROCESS_QUERY_LABEL: u64 = 0x7ac;
 /// Native frame-chain capture under the exact paused win32k physical lane.
 pub const W32_FRAME_CHAIN_LABEL: u64 = 0x7ad;
 pub const W32_LARGE_POOL_RETIRE_LABEL: u64 = 0x7ae;
+/// Process-owned USER object handles: publish, look up, close, search and the root's ledger
+/// of copied and removed handles ([`nt_user_host::user_object_handle_wire`]).
+pub const W32_USER_OBJECT_LABEL: u64 = 0x7af;
 pub const W32_ATTACH_PLAIN: u64 = 1;
 pub const W32_ATTACH_DETACH: u64 = 2;
 pub const W32_ATTACH_STACK: u64 = 3;
@@ -4659,18 +4662,17 @@ extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
 // IntCreateDesktop advances past the Ob early-return into the window-manager graph
 // (IntGetAndReferenceClass(WC_DESKTOP) etc.).
 //
-// The four trampolines below are THIN win64-ABI marshaling shims: they classify the type-object
-// pointer win32k passes into an `ObKind`, allocate bodies from the win32k pool, drive the shared
-// `ObHandleTable`, and write *Handle / *Context / *Object into win32k's memory. ALL object-manager
-// semantics (handle minting, the registry, the create→insert latch, the single-instance
-// window-station cache) live in the crate.
-use nt_object_manager::win32k_ob::{
-    bind_desktop_session, init_desktop_body, ObHandleTable, ObKind,
-    PendingObjectRelease, DESKTOP_BODY_SIZE,
+// The trampolines below are thin win64-ABI shims: they classify the type-object pointer win32k
+// passes into an `ObKind`, allocate bodies from the win32k pool and keep them in `OBJ_TABLE`
+// (bodies, counts, names, security). Handles live in each caller's ProcessManager table and are
+// published, resolved and closed through the root broker (`user_object_handle`).
+use nt_object_manager::win32k_ob::{bind_desktop_session, init_desktop_body, ObKind, DESKTOP_BODY_SIZE};
+use nt_object_manager::win32k_user_objects::{
+    UserObjectError, UserObjectName, UserObjectRelease, UserObjectStore,
 };
 
-/// The single win32k object registry (single-threaded host; handle→(type, body) lives in the crate).
-static mut OBJ_TABLE: ObHandleTable = ObHandleTable::new();
+/// The provider's USER object bodies. Win32k serializes access; no borrow spans a callout.
+static mut OBJ_TABLE: UserObjectStore = UserObjectStore::new();
 
 pub(crate) mod object_security;
 pub(crate) mod directory_object;
@@ -4688,37 +4690,28 @@ mod file_ioctl;
 pub(crate) mod file_ioctl_target;
 mod file_object_query;
 mod object_handle_flags;
+mod user_object_handle;
 #[path = "win32k_subsystem/process_information_query.rs"]
 mod process_information_query;
 pub(crate) use object_security::census as object_security_census;
 pub(crate) use object_security::print_assignment_stats as print_object_security_assignment_stats;
 
-/// Duplicate a handle owned by win32k's USER object table. Native `NtDuplicateObject` calls this
-/// after the caller's EPROCESS table reports `STATUS_INVALID_HANDLE`, because desktop/window-
-/// station handles are minted by win32k's Ob layer rather than the executive's native table.
-pub(crate) unsafe fn duplicate_user_object_handle(handle: u64) -> Option<u64> {
-    (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).duplicate(handle)
+/// The stored descriptor of exactly one USER body generation, for root NtQuerySecurityObject.
+/// The root reads the provider's store directly here: a synchronous root syscall has no channel
+/// into the provider.
+pub(crate) unsafe fn user_object_security_descriptor_for(
+    target: nt_process::user_object_handle::UserObjectTarget,
+) -> Option<Option<&'static [u8]>> {
+    (*core::ptr::addr_of!(OBJ_TABLE)).security_descriptor_for(target.body, target.generation)
 }
 
-/// Close one handle alias in win32k's USER object table. The session-pool object body remains live
-/// while any other handle aliases it.
-pub(crate) unsafe fn close_user_object_handle(handle: u64) -> bool {
-    (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).close(handle)
-}
-
-/// Return the access mask granted to a modeled USER object handle.
-pub(crate) unsafe fn user_object_granted_access(handle: u64) -> Option<u32> {
-    (*core::ptr::addr_of!(OBJ_TABLE)).granted_access(handle)
-}
-
-/// Return the stored self-relative security descriptor for a modeled USER object handle.
-pub(crate) unsafe fn user_object_security_descriptor(handle: u64) -> Option<&'static [u8]> {
-    (*core::ptr::addr_of!(OBJ_TABLE)).security_descriptor(handle)
-}
-
-/// Replace the stored self-relative security descriptor for a modeled USER object handle.
-pub(crate) unsafe fn set_user_object_security_descriptor(handle: u64, descriptor: &[u8]) -> bool {
-    (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).set_security_descriptor(handle, descriptor)
+/// Replace the descriptor of exactly one USER body generation (root NtSetSecurityObject).
+pub(crate) unsafe fn set_user_object_security_descriptor_for(
+    target: nt_process::user_object_handle::UserObjectTarget,
+    descriptor: &[u8],
+) -> bool {
+    (&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
+        .set_security_descriptor_for(target.body, target.generation, descriptor)
 }
 
 /// Classify the `OBJECT_TYPE` pointer win32k passed into an [`ObKind`] (`None` = an unrecognized
@@ -4769,7 +4762,7 @@ extern "win64" fn s_ob_reference_object_by_pointer(
         return STATUS_INVALID_PARAMETER_I32;
     }
 
-    let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
+    let table = user_object_handle::store();
     if let Some(kind) = table.kind_by_body(object) {
         if kind == ObKind::Other {
             return STATUS_OBJECT_TYPE_MISMATCH;
@@ -4778,7 +4771,7 @@ extern "win64" fn s_ob_reference_object_by_pointer(
             return STATUS_OBJECT_TYPE_MISMATCH;
         }
         return table
-            .reference_by_body(object)
+            .reference(object)
             .map(|_| 0)
             .unwrap_or(STATUS_INSUFFICIENT_RESOURCES_I32);
     }
@@ -4814,10 +4807,10 @@ extern "win64" fn s_ob_reference_object_by_pointer(
 }
 
 extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
-    if let Some(count) = unsafe {
-        (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).reference_by_body(object)
-    } {
-        return count as u64;
+    match user_object_handle::store().reference(object) {
+        Ok(count) => return count as u64,
+        Err(UserObjectError::Unknown) => {}
+        Err(error) => panic!("USER object pointer reference failed: {error:?}"),
     }
     if unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(object) } {
         return unsafe {
@@ -4935,44 +4928,21 @@ unsafe fn trace_user_object_reference_underflow(
 }
 
 extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
-    let pending = unsafe {
-        (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).release_pending_by_body(object)
-    };
-    match pending {
-        Some(PendingObjectRelease::Retained(count)) => return count as u64,
-        Some(PendingObjectRelease::Final(kind)) => unsafe {
-            let offset = match kind {
-                ObKind::Desktop => 10 * 8,
-                ObKind::WindowStation => 13 * 8,
-                ObKind::Other => panic!("pending USER object lacks a registered type delete method"),
-            };
-            let routine = read_volatile((WIN32_CALLOUTS + offset) as *const u64);
-            assert_ne!(routine, 0, "pending USER object delete method is unregistered");
-            let parameters = object;
-            let _ = call_win32k_pe(routine, &[(&parameters as *const u64) as u64]);
-            assert!(provider_pool_free(object), "pending USER object body retirement failed");
+    let counts = user_object_handle::store()
+        .counts(object)
+        .map(|counts| (user_object_handle::store().kind_by_body(object), counts));
+    match user_object_handle::store().dereference(object) {
+        Ok(UserObjectRelease::Retained { pointers, .. }) => return pointers as u64,
+        Ok(UserObjectRelease::Final(identity)) => {
+            unsafe { user_object_handle::finalize(identity) };
             return 0;
-        },
-        None => {}
-    }
-    let user_object = unsafe {
-        let table = &*core::ptr::addr_of!(OBJ_TABLE);
-        table
-            .counts_by_body(object)
-            .map(|counts| (table.kind_by_body(object), counts))
-    };
-    if let Some((kind, counts)) = user_object {
-        let remaining = unsafe {
-            (&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
-                .dereference_by_body(object)
-        };
-        return match remaining {
-            Some(count) => count as u64,
-            None => {
-                unsafe { trace_user_object_reference_underflow(object, kind, counts) };
-                panic!("USER object pointer reference underflow");
-            }
-        };
+        }
+        Err(UserObjectError::Unknown) => {}
+        Err(_) => {
+            let (kind, counts) = counts.expect("a refused USER release names a live body");
+            unsafe { trace_user_object_reference_underflow(object, kind, counts) };
+            panic!("USER object pointer reference underflow");
+        }
     }
     if unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(object) } {
         let remaining = unsafe {
@@ -5144,9 +5114,6 @@ extern "win64" fn s_zw_close(handle: u64) -> i32 {
         let (status, _, _) =
             unsafe { win32k_registry_broker_call(WIN32K_REGISTRY_OP_CLOSE, handle) };
         return status;
-    }
-    if ObHandleTable::is_handle_namespace_value(handle) {
-        return s_ob_close_handle(handle, 0);
     }
     let section_status = unsafe { section_close(handle, false) };
     if !matches!(section_status as u32, 0xC000_0008 | 0xC000_0024) {
@@ -7327,7 +7294,7 @@ unsafe fn object_attributes_root_directory(object_attributes: u64) -> u64 {
 unsafe fn object_attributes_name_leaf_ascii(
     object_attributes: u64,
 ) -> Option<(
-    [u8; nt_object_manager::win32k_ob::OB_NAMED_DESKTOP_NAME_MAX],
+    [u8; nt_object_manager::win32k_user_objects::DESKTOP_NAME_MAX],
     usize,
 )> {
     let Some((buffer, units)) = object_attributes_unicode_buffer(object_attributes) else {
@@ -7346,10 +7313,10 @@ unsafe fn object_attributes_name_leaf_ascii(
         index += 1;
     }
     let len = units - start;
-    if len == 0 || len > nt_object_manager::win32k_ob::OB_NAMED_DESKTOP_NAME_MAX {
+    if len == 0 || len > nt_object_manager::win32k_user_objects::DESKTOP_NAME_MAX {
         return None;
     }
-    let mut leaf = [0u8; nt_object_manager::win32k_ob::OB_NAMED_DESKTOP_NAME_MAX];
+    let mut leaf = [0u8; nt_object_manager::win32k_user_objects::DESKTOP_NAME_MAX];
     let mut offset = 0usize;
     while offset < len {
         let unit = read_unaligned((buffer + ((start + offset) * 2) as u64) as *const u16);
@@ -7382,16 +7349,15 @@ unsafe fn object_attributes_name_leaf_unicode(object_attributes: u64) -> Option<
     (len != 0).then_some((buffer + (start * 2) as u64, len))
 }
 
-unsafe fn desktop_root_from_handle(table: &ObHandleTable, handle: u64) -> Option<(u64, u64)> {
-    match table.lookup(handle) {
-        Some((ObKind::WindowStation, body)) if body != 0 => Some((handle, body)),
-        _ => None,
-    }
+/// The WindowStation body an exact caller-table handle names.
+unsafe fn desktop_root_from_handle(handle: u64) -> Option<(u64, u64)> {
+    let window_station = nt_object_manager::object_type::window_station_object_type_addr();
+    user_object_handle::body_for_handle(handle, window_station).map(|body| (handle, body))
 }
 
-unsafe fn effective_desktop_root(table: &ObHandleTable, requested_root: u64) -> Option<(u64, u64)> {
+unsafe fn effective_desktop_root(requested_root: u64) -> Option<(u64, u64)> {
     if requested_root != 0 {
-        return desktop_root_from_handle(table, requested_root);
+        return desktop_root_from_handle(requested_root);
     }
 
     let ppi = current_w32process();
@@ -7399,7 +7365,7 @@ unsafe fn effective_desktop_root(table: &ObHandleTable, requested_root: u64) -> 
         let h = read_volatile((ppi + PROCESSINFO_HWINSTA_OFF) as *const u64);
         let body = read_volatile((ppi + PROCESSINFO_PRPWINSTA_OFF) as *const u64);
         if h != 0 && body != 0 {
-            if let Some((_, table_body)) = desktop_root_from_handle(table, h) {
+            if let Some((_, table_body)) = desktop_root_from_handle(h) {
                 if table_body == body {
                     return Some((h, body));
                 }
@@ -7409,13 +7375,12 @@ unsafe fn effective_desktop_root(table: &ObHandleTable, requested_root: u64) -> 
 
     let h = s_ps_get_process_winsta(current_eprocess());
     if h != 0 {
-        return desktop_root_from_handle(table, h);
+        return desktop_root_from_handle(h);
     }
     None
 }
 
 unsafe fn desktop_heap_size_for(
-    table: &ObHandleTable,
     winsta_body: u64,
     object_attributes: u64,
 ) -> u64 {
@@ -7424,7 +7389,9 @@ unsafe fn desktop_heap_size_for(
         if global != 0 {
             global
         } else {
-            table.cached_winsta_body()
+            user_object_handle::store()
+                .named(UserObjectName::InteractiveWindowStation)
+                .map_or(0, |identity| identity.body)
         }
     };
     if winsta_body == input_winsta && winsta_body != 0 {
@@ -7486,7 +7453,6 @@ unsafe fn initialize_desktop_info(
 }
 
 unsafe fn initialize_desktop_heap(
-    table: &ObHandleTable,
     desk_body: u64,
     winsta_body: u64,
     object_attributes: u64,
@@ -7503,7 +7469,7 @@ unsafe fn initialize_desktop_heap(
             && hosted_heap_bounds(existing_heap).is_some();
     }
 
-    let heap_size = desktop_heap_size_for(table, winsta_body, object_attributes);
+    let heap_size = desktop_heap_size_for(winsta_body, object_attributes);
     let section = pool_alloc(section_object::SIZE_OF as u64);
     if section == 0 {
         return false;
@@ -7537,14 +7503,14 @@ unsafe fn initialize_desktop_heap(
 
 struct CapturedUserObjectSecurityDescriptor {
     len: usize,
-    bytes: [u8; nt_object_manager::win32k_ob::OB_SECURITY_DESCRIPTOR_MAX],
+    bytes: [u8; nt_object_manager::win32k_user_objects::OB_SECURITY_DESCRIPTOR_MAX],
 }
 
 impl CapturedUserObjectSecurityDescriptor {
     fn empty() -> Self {
         Self {
             len: 0,
-            bytes: [0; nt_object_manager::win32k_ob::OB_SECURITY_DESCRIPTOR_MAX],
+            bytes: [0; nt_object_manager::win32k_user_objects::OB_SECURITY_DESCRIPTOR_MAX],
         }
     }
 
@@ -7765,121 +7731,25 @@ unsafe fn current_token_authentication_id() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Copy)]
-struct ServiceWinstaRecord {
-    token_authentication_id: u64,
-    handle: u64,
-}
-
-unsafe fn service_winsta_record_ptr(base: u64, index: u64) -> *mut ServiceWinstaRecord {
-    (base + index * core::mem::size_of::<ServiceWinstaRecord>() as u64) as *mut ServiceWinstaRecord
-}
-
-unsafe fn ensure_service_winsta_record_capacity(required: u64) -> bool {
-    let cap = WIN32K_SERVICE_WINSTA_RECORDS_CAP.load(Ordering::Relaxed);
-    if cap >= required {
-        return true;
-    }
-    let mut new_cap = if cap == 0 {
-        WIN32K_SERVICE_WINSTA_INITIAL_CAP
+/// The name a created WindowStation resolves by: one noninteractive station per logon session,
+/// otherwise the interactive station.
+unsafe fn window_station_name(object_attributes: u64) -> UserObjectName {
+    if object_attributes_name_contains_ascii(object_attributes, b"service-") {
+        UserObjectName::ServiceWindowStation {
+            authentication_id: current_token_authentication_id(),
+        }
     } else {
-        cap.saturating_mul(2)
-    };
-    while new_cap < required {
-        let next = new_cap.saturating_mul(2);
-        if next <= new_cap {
-            return false;
-        }
-        new_cap = next;
+        UserObjectName::InteractiveWindowStation
     }
-    let Some(bytes) = (core::mem::size_of::<ServiceWinstaRecord>() as u64).checked_mul(new_cap)
-    else {
-        return false;
-    };
-    let new_base = pool_alloc(bytes);
-    if new_base == 0 {
-        return false;
-    }
-    let old_base = WIN32K_SERVICE_WINSTA_RECORDS_PTR.load(Ordering::Relaxed);
-    let len = WIN32K_SERVICE_WINSTA_RECORDS_LEN.load(Ordering::Relaxed);
-    if old_base != 0 {
-        for index in 0..len {
-            let rec = read_volatile(service_winsta_record_ptr(old_base, index));
-            write_volatile(service_winsta_record_ptr(new_base, index), rec);
-        }
-    }
-    WIN32K_SERVICE_WINSTA_RECORDS_PTR.store(new_base, Ordering::Relaxed);
-    WIN32K_SERVICE_WINSTA_RECORDS_CAP.store(new_cap, Ordering::Relaxed);
-    true
 }
 
-unsafe fn service_winsta_index_for_auth(token_authentication_id: u64) -> Option<usize> {
-    if token_authentication_id == 0 {
-        return None;
-    }
-    let base = WIN32K_SERVICE_WINSTA_RECORDS_PTR.load(Ordering::Relaxed);
-    let len = WIN32K_SERVICE_WINSTA_RECORDS_LEN.load(Ordering::Relaxed);
-    if base == 0 {
-        return None;
-    }
-    for index in 0..len {
-        let rec = read_volatile(service_winsta_record_ptr(base, index));
-        if rec.token_authentication_id == token_authentication_id {
-            return Some(index as usize);
-        }
-    }
-    None
-}
-
-unsafe fn record_service_window_station(handle: u64) {
-    let token_authentication_id = current_token_authentication_id();
-    if token_authentication_id == 0 || handle == 0 {
-        return;
-    }
-    if let Some(index) = service_winsta_index_for_auth(token_authentication_id) {
-        let base = WIN32K_SERVICE_WINSTA_RECORDS_PTR.load(Ordering::Relaxed);
-        if base != 0 {
-            write_volatile(
-                service_winsta_record_ptr(base, index as u64),
-                ServiceWinstaRecord {
-                    token_authentication_id,
-                    handle,
-                },
-            );
-        }
-        return;
-    }
-    let len = WIN32K_SERVICE_WINSTA_RECORDS_LEN.load(Ordering::Relaxed);
-    let Some(required) = len.checked_add(1) else {
-        return;
-    };
-    if !ensure_service_winsta_record_capacity(required) {
-        return;
-    }
-    let base = WIN32K_SERVICE_WINSTA_RECORDS_PTR.load(Ordering::Relaxed);
-    if base == 0 {
-        return;
-    }
-    write_volatile(
-        service_winsta_record_ptr(base, len),
-        ServiceWinstaRecord {
-            token_authentication_id,
-            handle,
-        },
-    );
-    WIN32K_SERVICE_WINSTA_RECORDS_LEN.store(required, Ordering::Relaxed);
-}
-
-unsafe fn service_window_station_handle_for_current_token() -> u64 {
-    let token_authentication_id = current_token_authentication_id();
-    let Some(index) = service_winsta_index_for_auth(token_authentication_id) else {
-        return 0;
-    };
-    let base = WIN32K_SERVICE_WINSTA_RECORDS_PTR.load(Ordering::Relaxed);
-    if base == 0 {
+/// OBJECT_ATTRIBUTES.Attributes bits a handle carries (OBJ_INHERIT, OBJ_KERNEL_HANDLE).
+unsafe fn object_attributes_handle_attributes(object_attributes: u64) -> u32 {
+    if object_attributes == 0 {
         return 0;
     }
-    read_volatile(service_winsta_record_ptr(base, index as u64)).handle
+    read_unaligned((object_attributes + 0x18) as *const u32)
+        & nt_user_host::user_object_handle_wire::PUBLISH_ATTRIBUTES
 }
 
 /// `NTSTATUS ObOpenObjectByName(POBJECT_ATTRIBUTES, POBJECT_TYPE, KPROCESSOR_MODE, PACCESS_STATE,
@@ -7965,36 +7835,43 @@ extern "win64" fn s_ob_open_object_by_name(
 fn ob_open_object_by_name_existing(
     object_attributes: u64,
     obj_type: u64,
-    _access_mode: u64,
+    access_mode: u64,
     _access_state: u64,
-    _desired_access: u64,
+    desired_access: u64,
     parse_context: u64,
     handle: *mut u64,
 ) -> i32 {
     unsafe {
         match classify_type(obj_type) {
             Some(ObKind::Desktop) => {
+                if handle.is_null() {
+                    return STATUS_ACCESS_VIOLATION_I32;
+                }
                 let requested_root = object_attributes_root_directory(object_attributes);
-                let Some((root, winsta_body)) = effective_desktop_root(
-                    &mut *core::ptr::addr_of_mut!(OBJ_TABLE),
-                    requested_root,
-                )
-                else {
+                let Some((_, winsta_body)) = effective_desktop_root(requested_root) else {
                     return STATUS_OBJECT_NAME_NOT_FOUND;
                 };
-                let named_leaf = object_attributes_name_leaf_ascii(object_attributes);
-                if let Some((leaf, len)) = named_leaf {
-                    if let Some(existing) = (&*core::ptr::addr_of!(OBJ_TABLE))
-                        .desktop_handle_for_name(root, &leaf[..len])
-                    {
-                        if !handle.is_null() {
-                            write_unaligned(handle, existing);
+                user_object_handle::drain();
+                let Some(window_station) = user_object_handle::store().identity(winsta_body) else {
+                    return STATUS_INVALID_HANDLE_I32;
+                };
+                let mode = user_object_handle::access_mode(access_mode);
+                let attributes = object_attributes_handle_attributes(object_attributes);
+                let name = object_attributes_name_leaf_ascii(object_attributes)
+                    .and_then(|(leaf, len)| UserObjectName::desktop(window_station, &leaf[..len]));
+                if let Some(existing) = name.and_then(|name| user_object_handle::store().named(name)) {
+                    let granted =
+                        user_object_granted_access(ObKind::Desktop, obj_type, desired_access as u32);
+                    return match user_object_handle::open(existing, attributes, granted, mode) {
+                        Ok(opened) => {
+                            write_unaligned(handle, opened);
+                            if parse_context != 0 {
+                                write_volatile(parse_context as *mut u8, 0);
+                            }
+                            0
                         }
-                        if parse_context != 0 {
-                            write_volatile(parse_context as *mut u8, 0);
-                        }
-                        return 0;
-                    }
+                        Err(status) => status,
+                    };
                 }
                 if parse_context == 0 {
                     return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -8005,7 +7882,7 @@ fn ob_open_object_by_name_existing(
                 };
                 let parent_security = {
                     let Some((ObKind::WindowStation, descriptor)) =
-                        (&*core::ptr::addr_of!(OBJ_TABLE)).security_descriptor_by_body(winsta_body)
+                        user_object_handle::store().security_descriptor_by_body(winsta_body)
                     else {
                         return STATUS_INVALID_HANDLE_I32;
                     };
@@ -8032,16 +7909,19 @@ fn ob_open_object_by_name_existing(
                     (body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64,
                     winsta_body,
                 );
-                if !initialize_desktop_heap(
-                    &mut *core::ptr::addr_of_mut!(OBJ_TABLE),
-                    body,
-                    winsta_body,
-                    object_attributes,
-                ) {
+                if !initialize_desktop_heap(body, winsta_body, object_attributes) {
                     return STATUS_INSUFFICIENT_RESOURCES_I32;
                 }
-                if !(&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
-                    .latch_pending_with_security(ObKind::Desktop, body, None)
+                if user_object_handle::store()
+                    .create(
+                        ObKind::Desktop,
+                        obj_type,
+                        body,
+                        None,
+                        name.unwrap_or(UserObjectName::Unnamed),
+                        attributes,
+                    )
+                    .is_err()
                 {
                     return STATUS_INSUFFICIENT_RESOURCES_I32;
                 }
@@ -8058,66 +7938,62 @@ fn ob_open_object_by_name_existing(
                     s_ob_dereference_object(body);
                     return status;
                 }
-                let Some((h, _)) = (&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
-                    .insert_pending_with_cache_policy(body)
-                else {
-                    s_ob_dereference_object(body);
-                    return STATUS_INSUFFICIENT_RESOURCES_I32;
+                let (identity, attributes) = match user_object_handle::store().insert(body) {
+                    Ok(inserted) => inserted,
+                    Err(_) => {
+                        s_ob_dereference_object(body);
+                        return STATUS_INSUFFICIENT_RESOURCES_I32;
+                    }
                 };
-                if let Some((leaf, len)) = named_leaf {
-                    let _ = (&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
-                        .remember_desktop_name(root, &leaf[..len], h);
-                }
-                if !handle.is_null() {
-                    write_unaligned(handle, h);
-                }
-                if parse_context != 0 {
-                    write_volatile(parse_context as *mut u8, 1); // Context = TRUE (object created)
-                }
+                let granted =
+                    user_object_granted_access(ObKind::Desktop, obj_type, desired_access as u32);
+                let published =
+                    match user_object_handle::publish_counted(identity, attributes, granted, mode) {
+                        Ok(published) => published,
+                        Err(status) => return status,
+                    };
+                write_unaligned(handle, published);
+                write_volatile(parse_context as *mut u8, 1); // Context = TRUE (object created)
                 0
             }
             Some(ObKind::WindowStation) => {
-                let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
-                let service = object_attributes_name_contains_ascii(object_attributes, b"service-");
-                if service {
-                    let handle_for_service = service_window_station_handle_for_current_token();
-                    if handle_for_service != 0 {
-                        if !handle.is_null() {
-                            write_unaligned(handle, handle_for_service);
-                        }
-                        if parse_context != 0 {
-                            write_volatile(parse_context as *mut u8, 0);
-                        }
-                        return 0;
-                    }
+                let name = if object_attributes_name_contains_ascii(object_attributes, b"service-") {
+                    window_station_name(object_attributes)
+                } else if object_attributes == 0
+                    || object_attributes_name_leaf_eq_ascii(object_attributes, b"winsta0")
+                {
+                    UserObjectName::InteractiveWindowStation
+                } else {
+                    // No matching winsta exists → IntCreateWindowStation's create path.
                     return STATUS_OBJECT_NAME_NOT_FOUND;
+                };
+                user_object_handle::drain();
+                let Some(identity) = user_object_handle::store().named(name) else {
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                };
+                if handle.is_null() {
+                    return STATUS_ACCESS_VIOLATION_I32;
                 }
-                if object_attributes_name_leaf_eq_ascii(object_attributes, b"winsta0") {
-                    let cached = table.cached_winsta_handle();
-                    if cached != 0 {
-                        if !handle.is_null() {
-                            write_unaligned(handle, cached);
-                        }
+                let granted = user_object_granted_access(
+                    identity.kind,
+                    identity.object_type,
+                    desired_access as u32,
+                );
+                match user_object_handle::open(
+                    identity,
+                    object_attributes_handle_attributes(object_attributes),
+                    granted,
+                    user_object_handle::access_mode(access_mode),
+                ) {
+                    Ok(opened) => {
+                        write_unaligned(handle, opened);
                         if parse_context != 0 {
-                            write_volatile(parse_context as *mut u8, 0); // opened existing, not created
+                            write_volatile(parse_context as *mut u8, 0); // opened, not created
                         }
-                        return 0;
+                        0
                     }
+                    Err(status) => status,
                 }
-                if object_attributes == 0 {
-                    let cached = table.cached_winsta_handle();
-                    if cached != 0 {
-                        if !handle.is_null() {
-                            write_unaligned(handle, cached);
-                        }
-                        if parse_context != 0 {
-                            write_volatile(parse_context as *mut u8, 0);
-                        }
-                        return 0;
-                    }
-                }
-                // No matching winsta exists → force IntCreateWindowStation's create path.
-                STATUS_OBJECT_NAME_NOT_FOUND
             }
             // Unknown object type: fail visibly; object-manager imports must be modeled by type.
             _ => STATUS_OBJECT_NAME_NOT_FOUND,
@@ -8129,11 +8005,11 @@ fn ob_open_object_by_name_existing(
 /// ACCESS_MASK DesiredAccess, POBJECT_TYPE ObjectType, KPROCESSOR_MODE AccessMode, PHANDLE Handle)`.
 extern "win64" fn s_ob_open_object_by_pointer(
     object: u64,
-    _handle_attributes: u64,
+    handle_attributes: u64,
     _access_state: u64,
-    _desired_access: u64,
+    desired_access: u64,
     obj_type: u64,
-    _access_mode: u64,
+    access_mode: u64,
     handle: *mut u64,
 ) -> i32 {
     if handle.is_null() {
@@ -8149,47 +8025,53 @@ extern "win64" fn s_ob_open_object_by_pointer(
         let Some(kind) = classify_type(obj_type) else {
             return STATUS_OBJECT_TYPE_MISMATCH;
         };
-        let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
-        match table.duplicate_by_body(kind, object) {
-            Some(alias) => {
-                write_unaligned(handle, alias);
+        user_object_handle::drain();
+        let Some(identity) = user_object_handle::store()
+            .identity(object)
+            .filter(|identity| identity.kind == kind)
+        else {
+            return STATUS_INVALID_HANDLE_I32;
+        };
+        let granted = user_object_granted_access(kind, obj_type, desired_access as u32);
+        match user_object_handle::open(
+            identity,
+            handle_attributes as u32,
+            granted,
+            user_object_handle::access_mode(access_mode),
+        ) {
+            Ok(opened) => {
+                write_unaligned(handle, opened);
                 0
             }
-            None if table.handle_for_body(kind, object).is_none() => 0xC000_0008u32 as i32,
-            None => 0xC000_009Au32 as i32,
+            Err(status) => status,
         }
     }
 }
 
-/// `BOOLEAN ObFindHandleForObject(PEPROCESS Process, PVOID Object, POBJECT_TYPE ObjectType,
-/// POBJECT_HANDLE_INFORMATION HandleInformation, PHANDLE Handle)` — this host does not synthesize
-/// inherited USER handles; it only resolves explicit object-body searches.
+/// `BOOLEAN ObFindHandleForObject(PEPROCESS Process, PVOID Object OPTIONAL, POBJECT_TYPE
+/// ObjectType OPTIONAL, POBJECT_HANDLE_INFORMATION MatchCriteria OPTIONAL, PHANDLE Handle)`:
+/// search the explicit target process's published handles. A NULL Object or ObjectType is a
+/// wildcard, MatchCriteria is an exact input filter, and only *Handle is written. No reference
+/// is taken (`ntoskrnl/ob/obhandle.c`).
 extern "win64" fn s_ob_find_handle_for_object(
-    _process: u64,
+    process: u64,
     object: u64,
     obj_type: u64,
     handle_info: *mut u8,
     handle: *mut u64,
 ) -> u8 {
     unsafe {
-        if !handle.is_null() {
-            write_unaligned(handle, 0);
-        }
-        let Some(kind) = classify_type(obj_type) else {
-            return 0;
-        };
-        if object == 0 {
-            return 0;
-        }
-        let Some(found) = (&*core::ptr::addr_of!(OBJ_TABLE)).handle_for_body(kind, object) else {
+        let information = (!handle_info.is_null()).then(|| {
+            (
+                read_unaligned(handle_info as *const u32),
+                read_unaligned(handle_info.add(4) as *const u32),
+            )
+        });
+        let Some(found) = user_object_handle::find(process, object, obj_type, information) else {
             return 0;
         };
         if !handle.is_null() {
             write_unaligned(handle, found);
-        }
-        if !handle_info.is_null() {
-            write_unaligned(handle_info as *mut u32, 0);
-            write_unaligned(handle_info.add(4) as *mut u32, u32::MAX);
         }
         1
     }
@@ -8197,10 +8079,10 @@ extern "win64" fn s_ob_find_handle_for_object(
 
 /// `NTSTATUS ObCreateObject(KPROCESSOR_MODE ProbeMode, POBJECT_TYPE ObjectType, POBJECT_ATTRIBUTES,
 /// KPROCESSOR_MODE OwnerMode, PVOID ParseContext, ULONG ObjectBodySize, ULONG PagedCharge,
-/// ULONG NonPagedCharge, PVOID *Object)` — allocate a zeroed object body of ObjectBodySize from the
-/// win32k pool, write *Object, and latch (kind, body) for the following ObInsertObject.
+/// ULONG NonPagedCharge, PVOID *Object)` — allocate a zeroed body of ObjectBodySize from the
+/// win32k pool and hold it with one creator reference until ObInsertObject.
 extern "win64" fn s_ob_create_object(
-    _probe_mode: u64,
+    probe_mode: u64,
     obj_type: u64,
     object_attributes: u64,
     _owner_mode: u64,
@@ -8228,21 +8110,24 @@ extern "win64" fn s_ob_create_object(
         } else {
             None
         };
-        let uncached_winsta = kind == ObKind::WindowStation
-            && object_attributes_name_contains_ascii(object_attributes, b"service-");
+        let name = if kind == ObKind::WindowStation {
+            window_station_name(object_attributes)
+        } else {
+            UserObjectName::Unnamed
+        };
+        // A user-mode creator cannot request a kernel handle.
+        let mut attributes = object_attributes_handle_attributes(object_attributes);
+        if user_object_handle::access_mode(probe_mode) == nt_types::AccessMode::UserMode {
+            attributes &= !0x200;
+        }
         let descriptor = security
             .as_ref()
             .map(CapturedUserObjectSecurityDescriptor::as_slice);
-        let latched = {
-            let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
-            if uncached_winsta {
-                table.latch_pending_uncached_with_security(kind, body, descriptor)
-            } else {
-                table.latch_pending_with_security(kind, body, descriptor)
-            }
-        };
-        if !latched {
-            assert!(provider_pool_free(body), "failed USER object latch leaked its body");
+        if user_object_handle::store()
+            .create(kind, obj_type, body, descriptor, name, attributes)
+            .is_err()
+        {
+            assert!(provider_pool_free(body), "failed USER object create leaked its body");
             return STATUS_INSUFFICIENT_RESOURCES_I32;
         }
         if !object_out.is_null() {
@@ -8253,33 +8138,47 @@ extern "win64" fn s_ob_create_object(
 }
 
 /// `NTSTATUS ObInsertObject(PVOID Object, PACCESS_STATE, ACCESS_MASK, ULONG ObjectPointerBias,
-/// PVOID *NewObject, PHANDLE Handle)` — register the (latched) object under a fresh handle, write
-/// *Handle (+ *NewObject if requested).
+/// PVOID *NewObject, PHANDLE Handle)` — the creator reference becomes the first handle's
+/// reference, published in the caller's table. A refused publication consumes the creator
+/// reference, as ObInsertObject does.
 extern "win64" fn s_ob_insert_object(
     object: u64,
     _access_state: u64,
-    _desired_access: u64,
+    desired_access: u64,
     _bias: u64,
     new_object: *mut u64,
     handle: *mut u64,
 ) -> i32 {
     unsafe {
-        let insertion = (&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
-            .insert_pending_with_cache_policy(object);
-        let Some((h, cache_window_station)) = insertion else {
-            let pending_owned = (&*core::ptr::addr_of!(OBJ_TABLE))
-                .counts_by_body(object)
-                .is_some_and(|(_, handles)| handles == 0);
-            if pending_owned {
-                // ObInsertObject consumes the creator reference even when handle publication fails.
-                s_ob_dereference_object(object);
-                return STATUS_INSUFFICIENT_RESOURCES_I32;
-            }
-            return STATUS_INVALID_HANDLE_I32;
-        };
-        if !cache_window_station {
-            record_service_window_station(h);
+        if handle.is_null() {
+            // This host inserts USER objects only with a handle; the creator reference is consumed.
+            s_ob_dereference_object(object);
+            return STATUS_INVALID_PARAMETER_I32;
         }
+        user_object_handle::drain();
+        let (identity, attributes) = match user_object_handle::store().insert(object) {
+            Ok(inserted) => inserted,
+            Err(UserObjectError::Unknown) => return STATUS_INVALID_HANDLE_I32,
+            Err(_) => {
+                // A created-but-uninsertable body still owns its creator reference.
+                if user_object_handle::store().counts(object).is_some_and(|(_, handles)| handles == 0) {
+                    s_ob_dereference_object(object);
+                    return STATUS_INSUFFICIENT_RESOURCES_I32;
+                }
+                return STATUS_INVALID_HANDLE_I32;
+            }
+        };
+        let granted =
+            user_object_granted_access(identity.kind, identity.object_type, desired_access as u32);
+        let h = match user_object_handle::publish_counted(
+            identity,
+            attributes,
+            granted,
+            nt_types::AccessMode::KernelMode,
+        ) {
+            Ok(h) => h,
+            Err(status) => return status,
+        };
         if !handle.is_null() {
             write_unaligned(handle, h);
         }
@@ -8396,24 +8295,43 @@ extern "win64" fn s_ob_reference_object_by_handle(
         }
         return 0;
     }
-    let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
-    let (obj, granted_access) = match table.lookup(handle) {
-        Some((kind, body)) => {
-            if !nt_object_manager::win32k_ob::object_type_matches(kind, obj_type) {
-                ob_type_mismatch_trace(handle, obj_type, b"win32k-obj");
-                return STATUS_OBJECT_TYPE_MISMATCH;
+    // A USER handle is an entry in the caller's own table; a polymorphic (NULL type) reference
+    // falls through to the other owners when the entry is not a USER object.
+    let user_type = obj_type == 0 || classify_type(obj_type).is_some();
+    let user = if user_type {
+        match unsafe {
+            user_object_handle::lookup(
+                handle,
+                access as u32,
+                obj_type,
+                user_object_handle::access_mode(mode),
+            )
+        } {
+            Ok(found) => Some(found),
+            Err(status)
+                if obj_type == 0
+                    && matches!(status as u32, 0xC000_0008 | 0xC000_0024) =>
+            {
+                None
             }
-            let access = match kind {
-                // winuser.h: WINSTA_ALL_ACCESS / DESKTOP_ALL_ACCESS. The modeled objects are
-                // created with MAXIMUM_ALLOWED, and duplicate aliases preserve the same grant.
-                ObKind::WindowStation => 0x000f_037f,
-                ObKind::Desktop => 0x000f_01ff,
-                ObKind::Other => u32::MAX,
-            };
-            if table.reference_by_body(body).is_none() {
+            Err(status) => {
+                if status == STATUS_OBJECT_TYPE_MISMATCH {
+                    ob_type_mismatch_trace(handle, obj_type, b"win32k-obj");
+                }
+                return status;
+            }
+        }
+    } else {
+        None
+    };
+    let mut handle_attributes = 0;
+    let (obj, granted_access) = match user {
+        Some((identity, resolved)) => {
+            if user_object_handle::store().reference(identity.body).is_err() {
                 return STATUS_INSUFFICIENT_RESOURCES_I32;
             }
-            (body, access)
+            handle_attributes = resolved.attributes;
+            (identity.body, resolved.granted_access)
         }
         None => {
             let process_ty = nt_object_manager::object_type::process_object_type_addr();
@@ -8498,7 +8416,6 @@ extern "win64" fn s_ob_reference_object_by_handle(
             }
         }
     };
-    let handle_attributes = table.handle_attributes(handle).unwrap_or(0);
     if unsafe { ps_projection_object_type(obj).is_some() } {
         let (status, _, _, _) =
             unsafe { win32k_ps_broker_call(W32_PS_OP_RETAIN_POINTER, obj, 0) };
@@ -8995,34 +8912,100 @@ extern "win64" fn s_ps_set_process_winsta(process: u64, handle: u64) {
     }
 }
 
-/// `ZwDuplicateObject`: duplicate a modeled USER handle into an independently closeable alias.
-extern "win64" fn s_zw_duplicate_object(
-    _source_process: u64,
-    source_handle: u64,
-    _target_process: u64,
-    target_handle: *mut u64,
-    _desired_access: u64,
-    _handle_attributes: u64,
-    _options: u64,
-) -> i32 {
-    if target_handle.is_null() {
-        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
-    }
-    unsafe { write_unaligned(target_handle, 0) };
-    let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
-    match table.duplicate(source_handle) {
-        Some(alias) => {
-            unsafe { write_unaligned(target_handle, alias) };
-            0
+/// `RtlMapGenericMask` with the type's registered mapping, as `SeCreateAccessState`.
+unsafe fn map_generic(object_type: u64, access: u32) -> u32 {
+    let object_type = object_type as *const nt_object_manager::object_type::ObjectType;
+    let native = &(*object_type).type_info.generic_mapping;
+    let mut mapped = access & !0xF000_0000;
+    for (bit, field) in [
+        (0x8000_0000u32, core::ptr::addr_of!(native.generic_read)),
+        (0x4000_0000, core::ptr::addr_of!(native.generic_write)),
+        (0x2000_0000, core::ptr::addr_of!(native.generic_execute)),
+        (0x1000_0000, core::ptr::addr_of!(native.generic_all)),
+    ] {
+        if access & bit != 0 {
+            mapped |= read_volatile(field);
         }
-        None if table.lookup(source_handle).is_none() => 0xC000_0008u32 as i32,
-        None => 0xC000_009Au32 as i32,
     }
+    mapped
 }
 
-/// `ObCloseHandle`: duplicated aliases have handle lifetime; canonical pool-backed objects have
-/// session lifetime in this host and remain registered after a successful close.
-extern "win64" fn s_ob_close_handle(handle: u64, _mode: u64) -> i32 {
+/// The access a new USER handle is granted: the request mapped through the type's registered
+/// generic mapping, MAXIMUM_ALLOWED as GENERIC_ALL. The descriptor is not access-checked here.
+/// An unrecognized type has no mapping to apply.
+unsafe fn user_object_granted_access(kind: ObKind, object_type: u64, desired: u32) -> u32 {
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    if kind == ObKind::Other {
+        return desired;
+    }
+    let requested = if desired & MAXIMUM_ALLOWED != 0 {
+        (desired & !MAXIMUM_ALLOWED) | GENERIC_ALL
+    } else {
+        desired
+    };
+    map_generic(object_type, requested)
+}
+
+/// `ZwDuplicateObject` of a USER handle within the current process. The copy is a new
+/// ProcessManager handle that owns its own body reference.
+extern "win64" fn s_zw_duplicate_object(
+    source_process: u64,
+    source_handle: u64,
+    target_process: u64,
+    target_handle: *mut u64,
+    desired_access: u64,
+    handle_attributes: u64,
+    options: u64,
+) -> i32 {
+    const DUPLICATE_CLOSE_SOURCE: u32 = 1;
+    const DUPLICATE_SAME_ACCESS: u32 = 2;
+    const DUPLICATE_SAME_ATTRIBUTES: u32 = 4;
+    const STATUS_NOT_IMPLEMENTED: i32 = 0xC000_0002u32 as i32;
+    if target_handle.is_null() {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    unsafe { write_unaligned(target_handle, 0) };
+    // Cross-process duplication needs the root's process-handle resolution; win32k's callers
+    // fall back to a default object when it is refused.
+    if source_process != u64::MAX || target_process != u64::MAX {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    let options = options as u32;
+    let mode = nt_types::AccessMode::KernelMode;
+    unsafe {
+        let (identity, resolved) = match user_object_handle::lookup(source_handle, 0, 0, mode) {
+            Ok(found) => found,
+            Err(status) => return status,
+        };
+        let granted = if options & DUPLICATE_SAME_ACCESS != 0 {
+            resolved.granted_access
+        } else {
+            user_object_granted_access(identity.kind, identity.object_type, desired_access as u32)
+        };
+        let attributes = if options & DUPLICATE_SAME_ATTRIBUTES != 0 {
+            resolved.attributes & 2
+        } else {
+            handle_attributes as u32
+        };
+        let handle = match user_object_handle::open(identity, attributes, granted, mode) {
+            Ok(handle) => handle,
+            Err(status) => return status,
+        };
+        write_unaligned(target_handle, handle);
+        if options & DUPLICATE_CLOSE_SOURCE != 0 {
+            let status = user_object_handle::close(source_handle, mode);
+            if status != 0 {
+                return status;
+            }
+        }
+    }
+    0
+}
+
+/// `ObCloseHandle`: close the exact caller-table handle; the provider releases the body
+/// reference it owned when the root's change is drained.
+extern "win64" fn s_ob_close_handle(handle: u64, mode: u64) -> i32 {
     if handle == FAKE_PROCESS_HANDLE {
         return 0;
     }
@@ -9040,14 +9023,9 @@ extern "win64" fn s_ob_close_handle(handle: u64, _mode: u64) -> i32 {
             0xC000_0001u32 as i32
         };
     }
-    let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
-    if table.handle_flags(handle).is_some_and(|flags| flags[1] != 0) {
-        return 0xC000_0235u32 as i32; // STATUS_HANDLE_NOT_CLOSABLE
-    }
-    if table.close(handle) || table.lookup(handle).is_some() {
-        0
-    } else {
-        0xC000_0008u32 as i32 // STATUS_INVALID_HANDLE
+    match unsafe { user_object_handle::close(handle, user_object_handle::access_mode(mode)) } {
+        status if status as u32 == 0xC000_0024 => STATUS_INVALID_HANDLE_I32,
+        status => status,
     }
 }
 
@@ -10920,10 +10898,6 @@ static WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_WINDOW_DESTROY_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_TOKEN_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
-const WIN32K_SERVICE_WINSTA_INITIAL_CAP: u64 = 4;
-static WIN32K_SERVICE_WINSTA_RECORDS_PTR: AtomicU64 = AtomicU64::new(0);
-static WIN32K_SERVICE_WINSTA_RECORDS_LEN: AtomicU64 = AtomicU64::new(0);
-static WIN32K_SERVICE_WINSTA_RECORDS_CAP: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -18906,7 +18880,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
        // no-ops). a0 (the HDESK) is the switch target.
     if ssn == SSN_NT_USER_SWITCH_DESKTOP {
         let gpdesk = read_volatile((WIN32K_CODE_VA + GPDESK_INPUT_DESKTOP_RVA) as *const u64);
-        let target_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(a0);
+        let target_body = user_object_handle::body_for_handle(a0, nt_object_manager::object_type::desktop_object_type_addr()).unwrap_or(0);
         let ngui = read_volatile((WIN32K_CODE_VA + NR_GUI_APPS_RUNNING_RVA) as *const u32);
         print_str(b"[win32k-paint] PRE-SwitchDesktop hDesk=0x");
         print_hex(a0 as u32);
@@ -18972,7 +18946,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         print_str(b"\n");
     }
     if ssn == SSN_NT_USER_SWITCH_DESKTOP {
-        let target = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(a0);
+        let target = user_object_handle::body_for_handle(a0, nt_object_manager::object_type::desktop_object_type_addr()).unwrap_or(0);
         let info = if target != 0 { read_volatile((target + 8) as *const u64) } else { 0 };
         let wnd = if info != 0 { read_volatile((info + 0x10) as *const u64) } else { 0 };
         let hwnd = if wnd != 0 { read_volatile(wnd as *const u64) } else { 0 };
