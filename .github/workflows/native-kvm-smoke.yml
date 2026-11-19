@@ -29,6 +29,10 @@ on:
         description: Source run attempt; required with migrate_run_id and exclusive with resume_run_id
         type: string
         default: ''
+      interact:
+        description: After the sealed Explorer desktop, drive scripts/kvm_interaction_steps.json through QMP input and screenshot each step (evidence only)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -235,11 +239,15 @@ jobs:
           # QEMU leaves invariant TSC (CPUID 0x80000007 EDX[8]) out of `-cpu host` because
           # it blocks migration. Request it; QEMU drops it with a warning when KVM lacks it.
           QEMU_CPU_MODEL: host,invtsc=on
+          INTERACT: ${{ inputs.interact && '1' || '' }}
         run: |
           set -euo pipefail
+          # Interaction only adds evidence; it never changes the verdict or the saved-disk rule.
+          interact_args=()
+          if [ -n "$INTERACT" ]; then interact_args=(--interact); fi
           boot_status=0
           rm -f native-kvm-qemu-stopped
-          python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '300' }}" --trace-interrupts || boot_status=$?
+          python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '300' }}" --trace-interrupts "${interact_args[@]}" || boot_status=$?
           if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
           sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot1.sha256
           if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi
@@ -249,10 +257,15 @@ jobs:
                 cp "$path" "${path%.*}-boot1.${path##*.}"
               fi
             done
+            # The second boot clears interaction evidence, so keep the first boot's apart.
+            mkdir -p native-kvm-interact-boot1
+            for path in native-kvm-interact.jsonl native-kvm-interact-*.ppm; do
+              if [ -f "$path" ]; then mv "$path" native-kvm-interact-boot1/; fi
+            done
             # The probe has stopped and reaped QEMU; no image rebuild occurs between boots.
             boot_status=0
             rm -f native-kvm-qemu-stopped
-            python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '300' }}" --trace-interrupts || boot_status=$?
+            python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '300' }}" --trace-interrupts "${interact_args[@]}" || boot_status=$?
             if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
             sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot2.sha256
             if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi
@@ -309,6 +322,9 @@ jobs:
             native-kvm-stationary.txt
             native-kvm-stationary-boot1.txt
             native-kvm-post-setup-idle.txt
+            native-kvm-interact.jsonl
+            native-kvm-interact-*.ppm
+            native-kvm-interact-boot1/
             native-kvm-image.sha256
             native-kvm-image-after-boot1.sha256
             native-kvm-image-after-boot2.sha256

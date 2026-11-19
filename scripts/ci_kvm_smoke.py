@@ -12,6 +12,11 @@ import subprocess
 import threading
 import time
 
+if __package__:
+    from .ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script
+else:
+    from ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script
+
 
 ROOT = Path(__file__).resolve().parent.parent
 MICRO = ROOT / "rust-micro"
@@ -27,6 +32,7 @@ BLOCKSTATS = ROOT / "native-kvm-blockstats.jsonl"
 STOPPED_MARKER = ROOT / "native-kvm-qemu-stopped"
 STATIONARY_MARKER = ROOT / "native-kvm-stationary.txt"
 POST_SETUP_IDLE_MARKER = ROOT / "native-kvm-post-setup-idle.txt"
+INTERACTION_LOG = ROOT / "native-kvm-interact.jsonl"
 
 # Fixed 60-second QMP samples repeatedly hit the same clock-publication RIP,
 # while the guest's own cycle counter showed that path used only a few seconds.
@@ -72,6 +78,8 @@ USER_HIVE_LOADED = re.compile(
 DESKTOP_EPOCH_SEALED = re.compile(
     rb"\[quiesce\] Explorer runtime paint milestones complete; boot-progress epoch sealed"
 )
+# The same record as a capture group, so a serial detector can wait for the sealed desktop.
+DESKTOP_EPOCH_SEALED_RECORD = re.compile(b"(" + DESKTOP_EPOCH_SEALED.pattern + b")")
 SPEC_PASS = re.compile(rb" {0,2}PASS ([A-Za-z0-9_]+)")
 DIRECTORY_PUBLISH_REPLY = re.compile(
     rb"\[directory-publish\] token=([0-9]+) stage=reply status=(?:0x){1,2}0+"
@@ -454,7 +462,7 @@ def qmp_reply(stream, command_id):
         return reply
 
 
-def capture_framebuffer():
+def capture_framebuffer(path=SCREENSHOT):
     with socket.socket(socket.AF_UNIX) as connection:
         connection.settimeout(10)
         connection.connect(str(QMP_SOCKET))
@@ -466,13 +474,33 @@ def capture_framebuffer():
             qmp_reply(stream, "capabilities")
             command = {
                 "execute": "screendump",
-                "arguments": {"filename": str(SCREENSHOT), "format": "ppm"},
+                "arguments": {"filename": str(path), "format": "ppm"},
                 "id": "screendump",
             }
             stream.write((json.dumps(command) + "\n").encode())
             qmp_reply(stream, "screendump")
-    if not SCREENSHOT.is_file() or SCREENSHOT.stat().st_size == 0:
+    if not path.is_file() or path.stat().st_size == 0:
         raise RuntimeError("QMP did not write a framebuffer image")
+
+
+def send_input_batches(batches):
+    """Inject guest input over one QMP session, pausing after each batch's sync."""
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(10)
+        connection.connect(str(QMP_SOCKET))
+        with connection.makefile("rwb", buffering=0) as stream:
+            greeting = json.loads(stream.readline())
+            if "QMP" not in greeting:
+                raise RuntimeError("QMP greeting missing")
+            stream.write(b'{"execute":"qmp_capabilities","id":"capabilities"}\n')
+            qmp_reply(stream, "capabilities")
+            for number, (events, pause) in enumerate(batches):
+                command_id = f"input-{number}"
+                stream.write((json.dumps({"execute": "input-send-event",
+                                          "arguments": {"events": events},
+                                          "id": command_id}) + "\n").encode())
+                qmp_reply(stream, command_id)
+                time.sleep(pause)
 
 
 def read_cpu_state():
@@ -811,9 +839,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seconds", type=int, default=180)
     parser.add_argument("--trace-interrupts", action="store_true")
+    parser.add_argument("--interact", nargs="?", const=DEFAULT_SCRIPT, type=Path,
+                        metavar="STEPS_JSON",
+                        help="after the sealed Explorer desktop, drive guest input from a step "
+                             "list and capture a screenshot after each step (evidence only)")
     args = parser.parse_args()
     if not 1 <= args.seconds <= 3600:
         parser.error("--seconds must be between 1 and 3600")
+    interaction_script = None
+    if args.interact is not None:
+        try:
+            interaction_script = load_script(args.interact)
+        except (OSError, ValueError) as error:
+            parser.error(f"--interact {args.interact}: {error}")
     QMP_SOCKET.unlink(missing_ok=True)
     SCREENSHOT.unlink(missing_ok=True)
     INTERRUPT_TRACE.unlink(missing_ok=True)
@@ -825,6 +863,9 @@ def main():
     STOPPED_MARKER.unlink(missing_ok=True)
     STATIONARY_MARKER.unlink(missing_ok=True)
     POST_SETUP_IDLE_MARKER.unlink(missing_ok=True)
+    INTERACTION_LOG.unlink(missing_ok=True)
+    for stale in ROOT.glob("native-kvm-interact-*.ppm"):
+        stale.unlink()
     command = [
         "./scripts/run_specs.sh",
         "-qmp",
@@ -864,6 +905,12 @@ def main():
         terminal_reason = None
         stationary_reason = None
         previous_sample = None
+        interaction = seal_detector = None
+        if interaction_script is not None:
+            interaction = InteractionRunner(
+                interaction_script, send_input_batches,
+                lambda name: capture_framebuffer(ROOT / name), INTERACTION_LOG)
+            seal_detector = SerialPanicDetector(LOG, DESKTOP_EPOCH_SEALED_RECORD)
         def capture_terminal_evidence(reason):
             nonlocal captured, stall_captured
             if not QMP_SOCKET.exists():
@@ -916,6 +963,16 @@ def main():
                         for milestone in progress_watchdog.observe_serial(chunk, time.monotonic()):
                             print(f"Boot progress {time.monotonic() - started:.0f}s: {milestone}",
                                   flush=True)
+                if (interaction is not None and not interaction.armed
+                        and seal_detector.poll() is not None):
+                    interaction.arm(time.monotonic())
+                    print(f"Interaction armed {time.monotonic() - started:.0f}s: desktop sealed; "
+                          f"first step after {interaction_script.settle_seconds:.0f}s", flush=True)
+                if interaction is not None and interaction.in_progress and QMP_SOCKET.exists():
+                    for name in interaction.advance(time.monotonic()):
+                        print(f"Interaction {time.monotonic() - started:.0f}s: {name}", flush=True)
+                    if interaction.finished:
+                        print(f"Interaction finished: {interaction.summary()}", flush=True)
                 if time.monotonic() >= next_blockstats and QMP_SOCKET.exists():
                     try:
                         blockstats = read_bootdisk_blockstats()
@@ -926,7 +983,11 @@ def main():
                         print(f"Boot progress {time.monotonic() - started:.0f}s: "
                               f"{progress_watchdog.last_milestone}", flush=True)
                     next_blockstats = time.monotonic() + 10
-                idle_reason = progress_watchdog.idle_reason(time.monotonic())
+                # A scripted interaction holds the idle stop until its last screenshot; the
+                # guest is expected to be quiet between steps. The script is finite, so the
+                # ordinary idle rule (and its post-setup disk evidence) applies afterwards.
+                idle_reason = (None if interaction is not None and interaction.in_progress
+                               else progress_watchdog.idle_reason(time.monotonic()))
                 if idle_reason and QMP_SOCKET.exists():
                     # A scheduled sample can fall just before the idle boundary while disk
                     # traffic is still advancing. Take one fresh sample before stopping QEMU.
@@ -1016,6 +1077,10 @@ def main():
                     INTERRUPT_TRACE_TAIL.write_bytes(trace.read())
                 INTERRUPT_TRACE.unlink()
 
+    if interaction is not None:
+        # Interaction is evidence only; its outcome never changes the boot verdict.
+        print(f"Interaction outcome: {interaction.summary()}"
+              + ("" if interaction.armed else " (desktop seal never observed)"), flush=True)
     output = LOG.read_text(errors="replace")
     panic_site = panic_site or panic_detector.poll()
     terminal_reason = terminal_reason or terminal_detector.poll()
