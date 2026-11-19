@@ -6885,6 +6885,16 @@ extern "win64" fn s_ke_delay_execution_thread(wait_mode: u32, alertable: u8, int
     )
 }
 
+/// win32k sleeps between rundown release observations through its provider timed wait.
+pub(crate) struct Win32kRundownDelay;
+
+impl crate::ex_rundown_exports::RundownWaitDelay for Win32kRundownDelay {
+    fn delay() {
+        let interval = -crate::ex_rundown_exports::RUNDOWN_WAIT_POLL_100NS;
+        let _ = s_ke_delay_execution_thread(0, 0, &interval);
+    }
+}
+
 extern "win64" fn s_rtl_unicode_to_multibyte_n(
     destination: *mut u8,
     capacity: u32,
@@ -15559,7 +15569,7 @@ fn register_trampolines() -> bool {
     reg.bind("RtlMultiByteToUnicodeSize", s_rtl_multibyte_to_unicode_size as *const () as usize as u64);
     reg.bind("ExRaiseAccessViolation", seh.access_violation_va);
     reg.bind("ExRaiseStatus", seh.raise_va);
-    crate::ex_rundown_exports::bind_ex_rundown_exports(reg);
+    crate::ex_rundown_exports::bind_ex_rundown_exports::<Win32kRundownDelay>(reg);
     reg.bind("RtlUnwindEx", seh.unwind_entry_va);
     reg.bind("RtlUnwind", seh.legacy_unwind_va);
     reg.bind("PsDereferencePrimaryToken", s_ps_dereference_primary_token as *const () as usize as u64);

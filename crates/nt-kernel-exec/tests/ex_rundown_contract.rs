@@ -36,3 +36,29 @@ fn empty_wait_and_reinitialize_follow_nt_descriptor_lifecycle() {
     unsafe { reference.initialize() };
     assert!(reference.acquire());
 }
+
+/// #394: the rundown wait sleeps through the caller domain's own delay (a timed wait root
+/// can schedule) between observations, never an untimed yield. Each delay lets a holder run.
+#[test]
+fn rundown_wait_sleeps_through_the_caller_delay_until_holders_release() {
+    let reference = ExRundownRef::new();
+    for _ in 0..3 { assert!(reference.acquire()); }
+    let mut delays = 0;
+    reference.wait_for_release_with(|| {
+        delays += 1;
+        assert!(!reference.acquire(), "admission stays closed while the wait sleeps");
+        let _ = unsafe { reference.release() };
+    });
+    assert_eq!(delays, 3, "one delay per observation with a holder outstanding");
+    assert!(reference.is_completed());
+    assert!(!reference.acquire());
+}
+
+#[test]
+fn rundown_wait_with_no_holder_completes_without_a_delay() {
+    let reference = ExRundownRef::new();
+    let mut delays = 0;
+    reference.wait_for_release_with(|| delays += 1);
+    assert_eq!(delays, 0);
+    assert!(reference.is_completed());
+}

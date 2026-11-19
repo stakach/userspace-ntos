@@ -5,9 +5,19 @@
 //! until every holder has released it. No provider pointer crosses executive IPC.
 
 use nt_compat_exports::DriverExportRegistry;
-use nt_kernel_exec::{ExCacheAwareRundownRef, ExRundownRef, ExRundownWaitBlock};
+use nt_kernel_exec::{ExCacheAwareRundownRef, ExRundownRef};
 
 const CACHE_AWARE_ALIGNMENT: usize = 64;
+
+/// The caller domain's own `KeDelayExecutionThread`. A rundown wait sleeps through it between
+/// observations, so root sees a timed wait instead of an endless yield (#394).
+pub(crate) trait RundownWaitDelay {
+    /// One relative wait of [`RUNDOWN_WAIT_POLL_100NS`].
+    fn delay();
+}
+
+/// The release poll interval: 1 ms, NT's timer resolution.
+pub(crate) const RUNDOWN_WAIT_POLL_100NS: i64 = 10_000;
 
 fn cache_aware_processor_count() -> usize {
     let count = crate::SYSTEM_PROCESSOR_COUNT.load(core::sync::atomic::Ordering::Acquire) as usize;
@@ -45,11 +55,11 @@ pub(crate) extern "win64" fn ex_release_rundown_protection_cache_aware(
     unsafe { (&*run_ref).release(processor) };
 }
 
-pub(crate) extern "win64" fn ex_wait_for_rundown_protection_release_cache_aware(
+pub(crate) extern "win64" fn ex_wait_for_rundown_protection_release_cache_aware<D: RundownWaitDelay>(
     run_ref: *const ExCacheAwareRundownRef,
 ) {
     assert!(!run_ref.is_null(), "ExWaitForRundownProtectionReleaseCacheAware null descriptor");
-    unsafe { (&*run_ref).wait_for_release_with(crate::yield_now) };
+    unsafe { (&*run_ref).wait_for_release_with(D::delay) };
 }
 
 pub(crate) extern "win64" fn ex_reinitialize_rundown_protection_cache_aware(
@@ -80,28 +90,23 @@ pub(crate) extern "win64" fn ex_release_rundown_protection(run_ref: *const ExRun
     let _ = unsafe { (&*run_ref).release() };
 }
 
-pub(crate) extern "win64" fn ex_wait_for_rundown_protection_release(run_ref: *const ExRundownRef) {
+pub(crate) extern "win64" fn ex_wait_for_rundown_protection_release<D: RundownWaitDelay>(
+    run_ref: *const ExRundownRef,
+) {
     assert!(!run_ref.is_null(), "ExWaitForRundownProtectionRelease null descriptor");
-    let reference = unsafe { &*run_ref };
-    let waiter = ExRundownWaitBlock::new();
-    if unsafe { reference.begin_wait(&waiter) } {
-        while waiter.remaining() != 0 {
-            crate::yield_now();
-        }
-        unsafe { reference.finish_wait(&waiter) };
-    }
+    unsafe { (&*run_ref).wait_for_release_with(D::delay) };
 }
 
-pub(crate) fn bind_ex_rundown_exports(reg: &mut DriverExportRegistry) {
+pub(crate) fn bind_ex_rundown_exports<D: RundownWaitDelay>(reg: &mut DriverExportRegistry) {
     reg.bind("ExAcquireRundownProtectionCacheAware", ex_acquire_rundown_protection_cache_aware as *const () as usize as u64);
     reg.bind("ExInitializeRundownProtectionCacheAware", ex_initialize_rundown_protection_cache_aware as *const () as usize as u64);
     reg.bind("ExReInitializeRundownProtectionCacheAware", ex_reinitialize_rundown_protection_cache_aware as *const () as usize as u64);
     reg.bind("ExReleaseRundownProtectionCacheAware", ex_release_rundown_protection_cache_aware as *const () as usize as u64);
     reg.bind("ExSizeOfRundownProtectionCacheAware", ex_size_of_rundown_protection_cache_aware as *const () as usize as u64);
-    reg.bind("ExWaitForRundownProtectionReleaseCacheAware", ex_wait_for_rundown_protection_release_cache_aware as *const () as usize as u64);
+    reg.bind("ExWaitForRundownProtectionReleaseCacheAware", ex_wait_for_rundown_protection_release_cache_aware::<D> as *const () as usize as u64);
     reg.bind("ExAcquireRundownProtection", ex_acquire_rundown_protection as *const () as usize as u64);
     reg.bind("ExInitializeRundownProtection", ex_initialize_rundown_protection as *const () as usize as u64);
     reg.bind("ExReInitializeRundownProtection", ex_reinitialize_rundown_protection as *const () as usize as u64);
     reg.bind("ExReleaseRundownProtection", ex_release_rundown_protection as *const () as usize as u64);
-    reg.bind("ExWaitForRundownProtectionRelease", ex_wait_for_rundown_protection_release as *const () as usize as u64);
+    reg.bind("ExWaitForRundownProtectionRelease", ex_wait_for_rundown_protection_release::<D> as *const () as usize as u64);
 }

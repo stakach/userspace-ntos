@@ -126,6 +126,21 @@ impl ExRundownRef {
             .expect("EX_RUNDOWN_REF waiter identity changed");
     }
 
+    /// `ExWaitForRundownProtectionRelease`: close admission, then sleep through the caller's
+    /// own `delay` between observations until every outstanding holder has released. With no
+    /// holder the rundown completes at once and `delay` never runs.
+    pub fn wait_for_release_with(&self, mut delay: impl FnMut()) {
+        let waiter = ExRundownWaitBlock::new();
+        // SAFETY: the stack wait block stays at this address until finish_wait below.
+        if unsafe { self.begin_wait(&waiter) } {
+            while waiter.remaining() != 0 {
+                delay();
+            }
+            // SAFETY: this call installed `waiter`, which has drained and is still alive.
+            unsafe { self.finish_wait(&waiter) };
+        }
+    }
+
     /// Reopen a completed rundown reference. A live waiter cannot be reinitialized.
     pub fn reinitialize(&self) -> bool {
         self.state.compare_exchange(ACTIVE, 0, Ordering::AcqRel, Ordering::Acquire).is_ok()

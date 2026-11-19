@@ -16982,21 +16982,46 @@ extern "win64" fn s_ke_initialize_timer(timer: u64) {
 }
 
 /// `NTSTATUS KeDelayExecutionThread(KPROCESSOR_MODE, BOOLEAN, PLARGE_INTEGER)`.
+///
+/// A real timed wait, as in NT: the thread waits on a private, never-signaled notification
+/// event for the whole interval (relative or absolute) through the executive's dispatcher, so
+/// root sees and schedules the wait. It used to busy-stall for at most 1 ms (#394). A zero
+/// interval yields the rest of the quantum.
 extern "win64" fn s_ke_delay_execution_thread(
-    _wait_mode: u32,
-    _alertable: u8,
+    wait_mode: u32,
+    alertable: u8,
     interval: u64,
 ) -> i32 {
-    unsafe {
-        if interval != 0 {
-            let ticks = read_unaligned(interval as *const i64);
-            if ticks < 0 {
-                let micros = ((ticks.wrapping_neg() as u64) / 10).min(1000) as u32;
-                s_ke_stall_execution_processor(micros);
-            }
-        }
+    if interval == 0 {
+        return STATUS_INVALID_PARAMETER;
     }
-    STATUS_SUCCESS
+    let requested = unsafe { read_unaligned(interval as *const i64) };
+    nt_kernel_exec::delay_execution::delay_execution_thread(
+        requested,
+        Some(|interval_100ns: i64| {
+            // KEVENT: DISPATCHER_HEADER plus its wait list head, never signaled.
+            let mut event = [0u64; 3];
+            let event_va = event.as_mut_ptr() as u64;
+            s_ke_initialize_event(event_va, 0, 0);
+            let status = s_ke_wait_for_single_object(
+                event_va, 0, wait_mode, alertable, &interval_100ns as *const i64 as u64,
+            );
+            core::hint::black_box(&mut event);
+            status
+        }),
+        crate::yield_now,
+        |_| STATUS_SUCCESS,
+    )
+}
+
+/// Hosted drivers sleep between rundown release observations through their own delay.
+pub(crate) struct HostedRundownDelay;
+
+impl crate::ex_rundown_exports::RundownWaitDelay for HostedRundownDelay {
+    fn delay() {
+        let interval = -crate::ex_rundown_exports::RUNDOWN_WAIT_POLL_100NS;
+        let _ = s_ke_delay_execution_thread(0, 0, &interval as *const i64 as u64);
+    }
 }
 
 /// `VOID KeQuerySystemTime(PLARGE_INTEGER)`.
@@ -36824,7 +36849,7 @@ fn register_fsd_trampolines() -> bool {
     );
     bind_kd_debug_export(reg);
     reg.bind("RtlAssert", crate::hosted_driver_assertion::rtl_assert as *const () as usize as u64);
-    crate::ex_rundown_exports::bind_ex_rundown_exports(reg);
+    crate::ex_rundown_exports::bind_ex_rundown_exports::<HostedRundownDelay>(reg);
     io_paging_priority_exports::bind(reg);
     hosted_driver_frame_capture::bind(reg);
     hosted_driver_remove_lock::bind_remove_lock_exports(reg);

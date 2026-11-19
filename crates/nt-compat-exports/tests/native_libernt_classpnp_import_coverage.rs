@@ -87,7 +87,7 @@ fn pinned_classpnp_native_imports_are_all_bound() {
     // deliberately excluded: its bindings do not resolve classpnp's native driver IAT.
     for (call, source) in [
         (
-            "crate::ex_rundown_exports::bind_ex_rundown_exports(reg);",
+            "crate::ex_rundown_exports::bind_ex_rundown_exports::<HostedRundownDelay>(reg);",
             include_str!("../../../components/ntos-executive/src/ex_rundown_exports.rs"),
         ),
         (

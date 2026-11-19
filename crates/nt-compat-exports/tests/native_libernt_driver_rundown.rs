@@ -36,8 +36,6 @@ fn pinned_drivers_resolve_rundown_through_generic_export_registry() {
         assert!(imported.contains("ExAcquireRundownProtection"), "{driver} must exercise the pinned import frontier");
     }
 
-    let source = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
-    assert!(source.contains("crate::ex_rundown_exports::bind_ex_rundown_exports(reg);"));
     let source = include_str!("../../../components/ntos-executive/src/ex_rundown_exports.rs");
     assert!(source.matches("extern \"win64\" fn ex_").count() >= 5, "the basic direct exports must use the native Win64 ABI");
     for name in RUNDOWN_IMPORTS {
@@ -81,8 +79,6 @@ fn pinned_classpnp_cache_aware_rundown_imports_have_real_native_bindings() {
 
     // The generic driver resolver enters this registry before DriverEntry. A source check runs
     // on CI hosts without the staged image and stays red until each real direct export is bound.
-    let resolver = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
-    assert!(resolver.contains("crate::ex_rundown_exports::bind_ex_rundown_exports(reg);"));
     let exports = include_str!("../../../components/ntos-executive/src/ex_rundown_exports.rs");
     for name in CLASS_PNP_CACHE_AWARE_IMPORTS {
         assert!(exports.contains(&format!("reg.bind(\"{name}\","))

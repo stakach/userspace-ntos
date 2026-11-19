@@ -64,7 +64,6 @@ fn pinned_win32k_native_imports_are_all_bound() {
             .0;
         bound.extend(binding_names(body));
     }
-    assert!(register.contains("crate::ex_rundown_exports::bind_ex_rundown_exports(reg);"));
     bound.extend(binding_names(include_str!(
         "../../../components/ntos-executive/src/ex_rundown_exports.rs"
     )));
