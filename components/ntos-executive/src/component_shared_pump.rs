@@ -1017,6 +1017,8 @@ pub(super) unsafe fn receive(
         }
         let registry_stage = StageScope::enter(ch, Stage::Registry);
         let progressed = crate::registry_mutation_work::redrive_provider();
+        // A parked driver or win32k lane may wait on a mutable-hive edit (#424).
+        if crate::mutable_hive_mutation_work::redrive_nested() { drop(registry_stage); continue; }
         drop(registry_stage);
         // A retained CM mutation can use all sixteen steps and still have a local terminal
         // phase to run. Take another fair, bounded pass before entering a blocking Receive.
@@ -1054,6 +1056,26 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let serviced = crate::driver_launch::service_mounted_native_registry_wal(id);
+            if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                let ticket = runtime::nested::claim_refused(&mut parent);
+                return nested_restore_refusal(ticket);
+            }
+            if serviced != 0 { continue; }
+        }
+        // The mutable-hive journal a parked provider's edit (or the hosted edit ahead of it)
+        // waits on: drive its exact commands here, as the SYSTEM WAL commands above (#424).
+        let hive_wal = {
+            let _stage = StageScope::enter(ch, Stage::RegistryWalReady);
+            crate::mutable_hive_mutation_work::pending_nested_hive_wal_io()
+        };
+        if let Some(id) = hive_wal {
+            let _stage = StageScope::enter(ch, Stage::NestedWork);
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            let mut parent = match runtime::nested::park_current() {
+                Ok(parent) => parent,
+                Err(_) => return PumpMessage::transport_wall(),
+            };
+            let serviced = crate::driver_launch::service_mounted_native_mutable_hive_wal(id);
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
                 let ticket = runtime::nested::claim_refused(&mut parent);
                 return nested_restore_refusal(ticket);

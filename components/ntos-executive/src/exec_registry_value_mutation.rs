@@ -1,13 +1,7 @@
 //! Exact-Key mutation shared by hosted syscalls and kernel provider requests.
 
 use super::*;
-use crate::mutable_hive_edit_route::{hosted_edit_owner, HostedEditOwner, STATUS_DEVICE_NOT_READY};
-
-/// The owner of a hosted mutable-hive edit on the mounted volume's current block route.
-fn hosted_mutable_edit_owner() -> HostedEditOwner {
-    hosted_edit_owner(unsafe { crate::fs_loader::exec_fs_mount_identity() }
-        .and_then(crate::fs_loader::exec_block_route_kind))
-}
+use crate::mutable_hive_edit_route::{EditOwner, STATUS_DEVICE_NOT_READY};
 
 impl ExecNtHandler {
     pub(crate) unsafe fn registry_target_set_value(
@@ -189,9 +183,9 @@ impl ExecNtHandler {
             return nt_security::STATUS_ACCESS_DENIED;
         }
         if let Some(mutable) = self.mutable_key_handle(key) {
-            match hosted_mutable_edit_owner() {
-                HostedEditOwner::NotReady => return STATUS_DEVICE_NOT_READY,
-                HostedEditOwner::NativeWal => {
+            match self.mutable_edit_owner() {
+                EditOwner::NotReady => return STATUS_DEVICE_NOT_READY,
+                EditOwner::NativeWal => {
                     let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(nt_ulong_arg(args[3]))
                         else { return STATUS_INVALID_PARAMETER; };
                     return match crate::mutable_hive_mutation_work::submit_hosted_set_value(
@@ -201,7 +195,7 @@ impl ExecNtHandler {
                         Err(status) => status,
                     };
                 }
-                HostedEditOwner::Synchronous => {}
+                EditOwner::BootWal | EditOwner::LegacyJournal => {}
             }
         }
         self.registry_target_set_value(key, &name, nt_ulong_arg(args[3]), &data)
@@ -253,9 +247,9 @@ impl ExecNtHandler {
             };
         }
         if let Some(mutable) = self.mutable_key_handle(key) {
-            match hosted_mutable_edit_owner() {
-                HostedEditOwner::NotReady => return STATUS_DEVICE_NOT_READY,
-                HostedEditOwner::NativeWal => {
+            match self.mutable_edit_owner() {
+                EditOwner::NotReady => return STATUS_DEVICE_NOT_READY,
+                EditOwner::NativeWal => {
                     return match crate::mutable_hive_mutation_work::submit_hosted_delete_value(
                         self, key, mutable, name,
                     ) {
@@ -263,7 +257,7 @@ impl ExecNtHandler {
                         Err(status) => status,
                     };
                 }
-                HostedEditOwner::Synchronous => {}
+                EditOwner::BootWal | EditOwner::LegacyJournal => {}
             }
         }
         self.registry_target_delete_value(key, &name)
@@ -326,9 +320,9 @@ impl ExecNtHandler {
             if mutable_key.hive == HIVE_SEL_SYSTEM {
                 return STATUS_INVALID_HANDLE;
             }
-            match hosted_mutable_edit_owner() {
-                HostedEditOwner::NotReady => return STATUS_DEVICE_NOT_READY,
-                HostedEditOwner::NativeWal => {
+            match self.mutable_edit_owner() {
+                EditOwner::NotReady => return STATUS_DEVICE_NOT_READY,
+                EditOwner::NativeWal => {
                     return match crate::mutable_hive_mutation_work::submit_hosted_delete_key(
                         self, key, mutable_key,
                     ) {
@@ -336,7 +330,7 @@ impl ExecNtHandler {
                         Err(status) => status,
                     };
                 }
-                HostedEditOwner::Synchronous => {}
+                EditOwner::BootWal | EditOwner::LegacyJournal => {}
             }
             return match self.journal_delete_mutable_key(mutable_key) {
                 Ok(()) => {

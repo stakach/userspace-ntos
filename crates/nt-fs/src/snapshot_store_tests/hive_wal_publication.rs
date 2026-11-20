@@ -422,3 +422,46 @@ fn anchored_run_once_deletions_stay_deleted_after_volume_reload() {
     assert_eq!(rebooted.open_key(FINALIZE), None);
     assert!(rebooted.open_key(RUN_ONCE_EX).is_some());
 }
+
+// #424: a kernel driver's `ZwSetValueKey` and win32k's writes reach the same hive log as a
+// hosted caller's, and a delete made on the Boot route of a WAL volume is anchored as an exact
+// record too. Both must survive the volume reload and hive log replay of the next boot.
+#[test]
+fn driver_written_value_and_boot_route_delete_survive_volume_reload() {
+    let mut set = MutableHiveSet::new();
+    set.mount(r"\Registry\Machine\SOFTWARE", 2, installed_software()).unwrap();
+    let mut volume = crate::FileSystem::new(crate::MemFs::new());
+    assert!(volume.provision_file(SOFTWARE_LOG, b""));
+    let mut log_len = 0;
+    let run_once = set.hive(2).unwrap().open_key(RUN_ONCE).unwrap();
+
+    // The Boot-route delete: anchored first, before the volume moves to the native stack.
+    let prepared = set.prepare_owned_delete_value(2, run_once, RUN_ONCE, "GuiRunOnce").unwrap();
+    let (_disk, receipt, file_id, expected) =
+        anchor_into_volume(&mut volume, &mut log_len, prepared.record());
+    let (continuation, pair) =
+        publish_anchored_hive_delete_value(&mut set, prepared, receipt, file_id, expected, SOFTWARE_LOG).ok().unwrap();
+    assert_eq!(continuation.anchor(), pair.anchor());
+
+    // The driver's value, anchored later on the native stack.
+    let data = alloc::vec![1, 0, 0, 0];
+    let prepared = set.prepare_owned_set_value(
+        2, run_once, RUN_ONCE, "DriverWritten", RegistryValueType::Dword, data.clone(),
+    ).unwrap();
+    let (_disk, receipt, file_id, expected) =
+        anchor_into_volume(&mut volume, &mut log_len, prepared.record());
+    let (_, continuation, pair) =
+        publish_anchored_hive_value(&mut set, prepared, receipt, file_id, expected, SOFTWARE_LOG).ok().unwrap();
+    assert_eq!(continuation.anchor(), pair.anchor());
+
+    let snapshot = volume.export_volume_snapshot().unwrap();
+    let restored = crate::FileSystem::from_volume_snapshot(&snapshot).unwrap();
+    let log = restored.file_bytes_owned(SOFTWARE_LOG).unwrap();
+    let mut rebooted = installed_software();
+    let base = rebooted.sequence;
+    assert_eq!(nt_hive_core::try_replay_log(&mut rebooted, &log, base), Ok(base + 2));
+    let run_once = rebooted.open_key(RUN_ONCE).expect("RunOnce key stays");
+    assert_eq!(rebooted.query_value(run_once, "GuiRunOnce"), None);
+    assert_eq!(rebooted.query_value(run_once, "DriverWritten"),
+        Some((RegistryValueType::Dword, &data[..])));
+}

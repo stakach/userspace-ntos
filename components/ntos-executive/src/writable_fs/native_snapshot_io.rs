@@ -167,6 +167,11 @@ pub(crate) unsafe fn claim_registry_wal_for(id: u64) -> Option<SnapshotClaim> {
     crate::registry_mutation_work::claim_native_wal_io_for(id)
 }
 
+/// Claim only a command of the mutable-hive journal whose retained edit a nested frame awaits.
+pub(crate) unsafe fn claim_mutable_hive_wal_for(id: u64) -> Option<SnapshotClaim> {
+    super::hive_wal::claim_native_hive_io_for(id)
+}
+
 pub(crate) unsafe fn claim_retained_relation_wal_io() -> Option<SnapshotClaim> {
     crate::driver_launch::claim_native_relation_wal_io()
 }

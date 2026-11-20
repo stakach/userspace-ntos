@@ -302,6 +302,7 @@ unsafe fn drive_kernel_job(
         }
         crate::service_sec_image::drain_root_restores();
         crate::registry_mutation_work::redrive_provider();
+        crate::mutable_hive_mutation_work::redrive_nested();
         if ingress::resume_acknowledged_retained_services()
             .map_err(|_| nt_process::STATUS_UNSUCCESSFUL)? { continue; }
         if !crate::writable_fs::registry_journal::owns_volume()

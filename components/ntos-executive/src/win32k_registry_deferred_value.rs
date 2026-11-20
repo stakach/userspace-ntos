@@ -2,6 +2,9 @@
 
 use super::*;
 use alloc::string::String;
+use crate::mutable_hive_mutation_work::{
+    provider_edit_admission, submit_provider_edit, ProviderEditAdmission, PROVIDER_EDIT_NOT_READY,
+};
 use crate::registry_mutation_work::{
     DeferredRegistryExisting, ProviderRegistryResult, ProviderValueMutation,
 };
@@ -39,9 +42,17 @@ pub(super) unsafe fn route(
         Ok(slot) => slot,
         Err(status) => return Some(ProviderRegistryResult::Ready((status, 0, 0))),
     };
-    if !matches!(slot.target, crate::driver_launch::DriverRegistryHandleTarget::System { .. }) {
-        return None;
-    }
+    // A mutable-hive Key takes the same route policy as a hosted caller's edit (#424).
+    let mutable = match slot.target {
+        crate::driver_launch::DriverRegistryHandleTarget::System { .. } => None,
+        crate::driver_launch::DriverRegistryHandleTarget::Hosted { key, .. } =>
+            match provider_edit_admission(key) {
+                ProviderEditAdmission::NativeWal(mutable) => Some((key, mutable)),
+                ProviderEditAdmission::NotReady => return Some(PROVIDER_EDIT_NOT_READY),
+                ProviderEditAdmission::Inline => return None,
+            },
+        crate::driver_launch::DriverRegistryHandleTarget::Generic { .. } => return None,
+    };
     let dispatch = match crate::driver_launch::driver_registry_handles::RegistryPublicationDispatch::capture(channel) {
         Ok(dispatch) => dispatch,
         Err(status) => return Some(ProviderRegistryResult::Ready((status as i32, 0, 0))),
@@ -56,9 +67,6 @@ pub(super) unsafe fn route(
             Ok(transfer) => transfer,
             Err(status) => return Some(ProviderRegistryResult::Ready((status, 0, 0))),
         };
-        if !matches!(transfer.target, crate::driver_launch::DriverRegistryHandleTarget::System { .. }) {
-            return Some(ProviderRegistryResult::Ready((STATUS_INVALID_HANDLE_I32, 0, 0)));
-        }
         (
             ProviderValueMutation::Set {
                 name: transfer.name, value_type: transfer.value_type, data: transfer.data,
@@ -75,11 +83,16 @@ pub(super) unsafe fn route(
         };
         (ProviderValueMutation::Delete { name }, None)
     };
-    let admission = match DeferredRegistryExisting::admit(caller, dispatch, handle, mutation) {
-        Ok(admission) => admission,
-        Err(status) => return Some(ProviderRegistryResult::Ready((status, 0, 0))),
+    let result = match mutable {
+        Some((key, mutable)) => submit_provider_edit(caller, dispatch, key, mutable, mutation),
+        None => {
+            let admission = match DeferredRegistryExisting::admit(caller, dispatch, handle, mutation) {
+                Ok(admission) => admission,
+                Err(status) => return Some(ProviderRegistryResult::Ready((status, 0, 0))),
+            };
+            crate::registry_mutation_work::submit_provider_existing(channel, admission)
+        }
     };
-    let result = crate::registry_mutation_work::submit_provider_existing(channel, admission);
     if matches!(result, ProviderRegistryResult::Deferred) {
         if let Some(identity) = transfer {
             crate::driver_launch::driver_registry_value_transfers::retire_completed(identity);

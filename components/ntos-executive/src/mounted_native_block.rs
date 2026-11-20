@@ -1107,6 +1107,12 @@ pub(super) unsafe fn service_registry_wal(id: u64) -> usize {
         crate::writable_fs::native_snapshot_io::claim_registry_wal_for)
 }
 
+pub(super) unsafe fn service_mutable_hive_wal(id: u64) -> usize {
+    service_registry_exact(id,
+        crate::mutable_hive_mutation_work::pending_nested_hive_wal_io,
+        crate::writable_fs::native_snapshot_io::claim_mutable_hive_wal_for)
+}
+
 unsafe fn dispatch_claim(
     route: native_disk_relation::NativeStorageRoute,
     claim: WorkClaim,

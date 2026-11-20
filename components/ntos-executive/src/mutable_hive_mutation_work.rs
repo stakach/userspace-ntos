@@ -6,9 +6,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_hive_core::{CellId, CreateChildError, DeleteKeyEditError, DeleteValueEditError,
-    OwnedPreparedCreateChild, OwnedPreparedDeleteKey, OwnedPreparedDeleteValue,
-    OwnedPreparedSetKeySecurity, OwnedPreparedSetValue,
     RegistryValueType, ResolvedHiveKey, SetKeySecurityError, SetValueError};
+use crate::mutable_hive_prepared_edit::{AnchoredRecord, PreparedEdit as Prepared};
 use nt_process::native_handle::NativeThreadProcessReference;
 use nt_process::RegistryKeyHandlePublication;
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
@@ -37,33 +36,6 @@ enum Pending {
     Security { key: CellId, path: String, information: u32, modification: Vec<u8> },
     DeleteValue { key: CellId, path: String, name: String },
     DeleteKey { key: CellId, path: String },
-}
-
-enum Prepared {
-    Value(OwnedPreparedSetValue),
-    Child(OwnedPreparedCreateChild),
-    Security(OwnedPreparedSetKeySecurity),
-    DeleteValue(OwnedPreparedDeleteValue),
-    DeleteKey(OwnedPreparedDeleteKey),
-}
-
-impl Prepared {
-    fn record(&self) -> &[u8] {
-        match self {
-            Self::Value(value) => value.record(), Self::Child(child) => child.record(),
-            Self::Security(security) => security.record(),
-            Self::DeleteValue(delete) => delete.record(), Self::DeleteKey(delete) => delete.record(),
-        }
-    }
-
-    unsafe fn mark_entered(&mut self) {
-        match self {
-            Self::Value(value) => value.mark_entered(), Self::Child(child) => child.mark_entered(),
-            Self::Security(security) => security.mark_entered(),
-            Self::DeleteValue(delete) => delete.mark_entered(),
-            Self::DeleteKey(delete) => delete.mark_entered(),
-        }
-    }
 }
 
 enum Completion {
@@ -98,6 +70,37 @@ struct HostedCaller {
     _continuation: UserApcContinuation,
 }
 
+#[path = "mutable_hive_provider_caller.rs"]
+mod provider;
+pub(crate) use provider::{provider_edit_admission, submit_provider_edit, ProviderEditAdmission,
+    PROVIDER_EDIT_NOT_READY};
+
+/// Who waits for the edit: a hosted thread with its parked Reply, or a kernel provider (a
+/// driver or win32k) with its parked service lane.
+enum Caller {
+    Hosted(HostedCaller),
+    Provider(provider::ProviderCaller),
+}
+
+impl Caller {
+    /// Hosted-only phases (Reply, durability, notify, child publication) never see a provider.
+    fn hosted(&mut self) -> &mut HostedCaller {
+        match self {
+            Self::Hosted(caller) => caller,
+            Self::Provider(_) => unreachable!("provider edit in a hosted-only phase"),
+        }
+    }
+
+    fn hosted_tid(&self) -> u64 {
+        match self { Self::Hosted(caller) => caller.tid, Self::Provider(_) => 0 }
+    }
+
+    fn creates_child(&self) -> bool {
+        matches!(self, Self::Hosted(HostedCaller {
+            completion: Some(Completion::CreateChild { .. }), .. }))
+    }
+}
+
 /// What a published edit of an existing key changed, for registry change notification.
 enum Reported {
     Values(CellId),
@@ -116,7 +119,7 @@ struct Work {
     journal_id: Option<u64>,
     receipt: Option<writable_fs::hive_wal::NativeHiveJournalReceipt>,
     installation: Option<(nt_fs::RegistryWalContinuation, nt_fs::VerifiedPairedWalSnapshot)>,
-    caller: HostedCaller,
+    caller: Caller,
     phase: Phase,
     status: u32,
     cancelled: bool,
@@ -165,7 +168,7 @@ fn create_error(error: CreateChildError) -> u32 {
 
 const STATUS_KEY_DELETED: u32 = 0xC000_017C;
 
-fn delete_value_error(error: DeleteValueEditError) -> u32 {
+pub(crate) fn delete_value_error(error: DeleteValueEditError) -> u32 {
     match error {
         DeleteValueEditError::KeyNotFound => STATUS_KEY_DELETED,
         DeleteValueEditError::ValueNotFound => 0xC000_0034,
@@ -175,7 +178,7 @@ fn delete_value_error(error: DeleteValueEditError) -> u32 {
     }
 }
 
-fn delete_key_error(error: DeleteKeyEditError) -> u32 {
+pub(crate) fn delete_key_error(error: DeleteKeyEditError) -> u32 {
     match error {
         DeleteKeyEditError::NotFound => STATUS_KEY_DELETED,
         DeleteKeyEditError::CannotDelete => 0xC000_0121,
@@ -244,10 +247,10 @@ enum ExistingEdit {
     DeleteKey,
 }
 
-unsafe fn submit_hosted_existing_edit(
-    handler: &mut ExecNtHandler, key_ref: KeyRef, key: ResolvedHiveKey, edit: ExistingEdit,
-) -> Result<(), u32> {
-    let _durable = allocator::enter_durable();
+/// The queued edit of an existing Key and the log its record is anchored for.
+fn pending_existing_edit(handler: &ExecNtHandler, key: ResolvedHiveKey, edit: ExistingEdit)
+    -> Result<(Pending, String), u32>
+{
     let path = handler.mutable_key_relative_path(key).ok_or(STATUS_INVALID_HANDLE)?;
     let pending = match edit {
         ExistingEdit::SetValue { name, value_type, data } =>
@@ -261,6 +264,14 @@ unsafe fn submit_hosted_existing_edit(
         .ok_or(STATUS_INVALID_HANDLE)?;
     log_path.try_reserve(4).map_err(|_| 0xC000_009Au32)?;
     log_path.push_str(".LOG");
+    Ok((pending, log_path))
+}
+
+unsafe fn submit_hosted_existing_edit(
+    handler: &mut ExecNtHandler, key_ref: KeyRef, key: ResolvedHiveKey, edit: ExistingEdit,
+) -> Result<(), u32> {
+    let _durable = allocator::enter_durable();
+    let (pending, log_path) = pending_existing_edit(handler, key, edit)?;
     let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(STATUS_INVALID_HANDLE)?;
     let logical = handler.capture_provider_logical_caller(
         handler.pi, handler.current_tid, handler.current_badge, tcb,
@@ -313,7 +324,7 @@ unsafe fn submit_hosted_existing_edit(
         pending: Some(pending),
         prepared: None, journal_id: None, receipt: None,
         installation: None,
-        caller: HostedCaller {
+        caller: Caller::Hosted(HostedCaller {
             pi: handler.pi,
             tid: handler.current_tid, badge: handler.current_badge, reply, logical,
             reference, completion: Some(Completion::ExistingKey { key_owner }),
@@ -326,7 +337,7 @@ unsafe fn submit_hosted_existing_edit(
                     resume_flags: handler.current_flags,
                 }
             },
-        },
+        }),
         phase: Phase::Prepare, status: 0, cancelled: false,
     };
     match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
@@ -389,7 +400,7 @@ pub(crate) unsafe fn submit_hosted_durability(
     let work = Work {
         order, hive: NO_HIVE, reported: None, log_path: String::new(),
         pending: None, prepared: None, journal_id: None, receipt: None, installation: None,
-        caller: HostedCaller {
+        caller: Caller::Hosted(HostedCaller {
             pi: handler.pi,
             tid: handler.current_tid, badge: handler.current_badge, reply, logical, reference,
             completion: Some(Completion::Durable { request, deferral }),
@@ -402,7 +413,7 @@ pub(crate) unsafe fn submit_hosted_durability(
                     resume_flags: handler.current_flags,
                 }
             },
-        },
+        }),
         phase: Phase::Durable, status: 0, cancelled: false,
     };
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
@@ -448,7 +459,7 @@ pub(crate) unsafe fn submit_hosted_change_notify(
     let work = Work {
         order, hive: NO_HIVE, reported: None, log_path: String::new(),
         pending: None, prepared: None, journal_id: None, receipt: None, installation: None,
-        caller: HostedCaller {
+        caller: Caller::Hosted(HostedCaller {
             pi: handler.pi,
             tid: handler.current_tid, badge: handler.current_badge, reply, logical, reference,
             completion: Some(Completion::ChangeNotify { post }),
@@ -461,7 +472,7 @@ pub(crate) unsafe fn submit_hosted_change_notify(
                     resume_flags: handler.current_flags,
                 }
             },
-        },
+        }),
         phase: Phase::Notify, status: 0, cancelled: false,
     };
     match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
@@ -582,7 +593,7 @@ pub(crate) unsafe fn submit_hosted_create_child(
             name: leaf, class, descriptor, kind }),
         prepared: None,
         journal_id: None, receipt: None, installation: None,
-        caller: HostedCaller {
+        caller: Caller::Hosted(HostedCaller {
             pi: handler.pi,
             tid: handler.current_tid, badge: handler.current_badge, reply, logical, reference,
             completion: Some(Completion::CreateChild {
@@ -598,7 +609,7 @@ pub(crate) unsafe fn submit_hosted_create_child(
                     resume_flags: handler.current_flags,
                 }
             },
-        },
+        }),
         phase: Phase::Prepare, status: 0, cancelled: false,
     };
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
@@ -619,7 +630,7 @@ pub(crate) fn next_deadline() -> Option<u64> {
 pub(crate) fn has_thread(tid: u64) -> bool {
     EXECUTING_TID.load(Ordering::Acquire) == tid || unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten()
         .any(|work| !matches!(work.phase, Phase::ReconcileRuntime)
-            && work.caller.tid == tid) }
+            && work.caller.hosted_tid() == tid) }
 }
 
 /// Called only when the exact HiveTicket's native WAL command physically entered.
@@ -642,37 +653,9 @@ unsafe fn release_pre_entry(handler: &mut ExecNtHandler, work: &mut Work, status
         writable_fs::hive_wal::abort_unentered_native_hive_journal(id)?;
     }
     if let Some(prepared) = work.prepared.take() {
-        match prepared {
-            Prepared::Value(prepared) => {
-                if let Err((_, prepared)) = handler.mutable_hives.release_unentered_owned_set_value(prepared) {
-                    work.prepared = Some(Prepared::Value(prepared));
-                    return Err(status);
-                }
-            }
-            Prepared::Child(prepared) => {
-                if let Err((_, prepared)) = handler.mutable_hives.release_unentered_owned_create_child(prepared) {
-                    work.prepared = Some(Prepared::Child(prepared));
-                    return Err(status);
-                }
-            }
-            Prepared::Security(prepared) => {
-                if let Err((_, prepared)) = handler.mutable_hives.release_unentered_owned_set_key_security(prepared) {
-                    work.prepared = Some(Prepared::Security(prepared));
-                    return Err(status);
-                }
-            }
-            Prepared::DeleteValue(prepared) => {
-                if let Err((_, prepared)) = handler.mutable_hives.release_unentered_owned_delete_value(prepared) {
-                    work.prepared = Some(Prepared::DeleteValue(prepared));
-                    return Err(status);
-                }
-            }
-            Prepared::DeleteKey(prepared) => {
-                if let Err((_, prepared)) = handler.mutable_hives.release_unentered_owned_delete_key(prepared) {
-                    work.prepared = Some(Prepared::DeleteKey(prepared));
-                    return Err(status);
-                }
-            }
+        if let Err(prepared) = prepared.release_unentered(&mut handler.mutable_hives) {
+            work.prepared = Some(prepared);
+            return Err(status);
         }
     }
     work.status = status;
@@ -705,10 +688,13 @@ fn release_completion(handler: &mut ExecNtHandler, caller: &mut HostedCaller) {
 }
 
 unsafe fn advance(
-    handler: &mut ExecNtHandler, queue: &mut nt_delay_execution::Queue, work: &mut Work,
+    handler: &mut ExecNtHandler, queue: Option<&mut nt_delay_execution::Queue>, work: &mut Work,
     earlier_unpublished: bool,
 ) -> Result<bool, u32> {
-    work.cancelled |= caller_cancelled(handler, &work.caller);
+    work.cancelled |= match &work.caller {
+        Caller::Hosted(caller) => caller_cancelled(handler, caller),
+        Caller::Provider(caller) => caller.cancelled(),
+    };
     match work.phase {
         Phase::Prepare => {
             if work.cancelled {
@@ -794,76 +780,21 @@ unsafe fn advance(
         Phase::Publish => {
             let receipt = work.receipt.take().expect("anchored hive receipt");
             let prepared = work.prepared.take().expect("retained hive edit");
-            let (child, continuation, pair) = match prepared {
-                Prepared::Value(prepared) => match nt_fs::publish_anchored_hive_value(
-                    &mut handler.mutable_hives, prepared, receipt.anchored,
-                    receipt.file_id, receipt.expected_log_len, &receipt.log_path,
-                ) {
-                    Ok((_, continuation, pair)) => (None, continuation, pair),
-                    Err((_, prepared, anchored)) => {
-                        work.prepared = Some(Prepared::Value(prepared));
-                        work.receipt = Some(writable_fs::hive_wal::NativeHiveJournalReceipt {
-                            anchored, ..receipt
-                        });
-                        return Err(0xC000_003Eu32);
-                    }
-                },
-                Prepared::Child(prepared) => match nt_fs::publish_anchored_hive_child(
-                    &mut handler.mutable_hives, prepared, receipt.anchored,
-                    receipt.file_id, receipt.expected_log_len, &receipt.log_path,
-                ) {
-                    Ok((child, continuation, pair)) => (Some(child), continuation, pair),
-                    Err((_, prepared, anchored)) => {
-                        work.prepared = Some(Prepared::Child(prepared));
-                        work.receipt = Some(writable_fs::hive_wal::NativeHiveJournalReceipt {
-                            anchored, ..receipt
-                        });
-                        return Err(0xC000_003Eu32);
-                    }
-                },
-                Prepared::Security(prepared) => match nt_fs::publish_anchored_hive_security(
-                    &mut handler.mutable_hives, prepared, receipt.anchored,
-                    receipt.file_id, receipt.expected_log_len, &receipt.log_path,
-                ) {
-                    Ok((continuation, pair)) => (None, continuation, pair),
-                    Err((_, prepared, anchored)) => {
-                        work.prepared = Some(Prepared::Security(prepared));
-                        work.receipt = Some(writable_fs::hive_wal::NativeHiveJournalReceipt {
-                            anchored, ..receipt
-                        });
-                        return Err(0xC000_003Eu32);
-                    }
-                },
-                Prepared::DeleteValue(prepared) => match nt_fs::publish_anchored_hive_delete_value(
-                    &mut handler.mutable_hives, prepared, receipt.anchored,
-                    receipt.file_id, receipt.expected_log_len, &receipt.log_path,
-                ) {
-                    Ok((continuation, pair)) => (None, continuation, pair),
-                    Err((_, prepared, anchored)) => {
-                        work.prepared = Some(Prepared::DeleteValue(prepared));
-                        work.receipt = Some(writable_fs::hive_wal::NativeHiveJournalReceipt {
-                            anchored, ..receipt
-                        });
-                        return Err(0xC000_003Eu32);
-                    }
-                },
-                Prepared::DeleteKey(prepared) => match nt_fs::publish_anchored_hive_delete_key(
-                    &mut handler.mutable_hives, prepared, receipt.anchored,
-                    receipt.file_id, receipt.expected_log_len, &receipt.log_path,
-                ) {
-                    Ok((continuation, pair)) => (None, continuation, pair),
-                    Err((_, prepared, anchored)) => {
-                        work.prepared = Some(Prepared::DeleteKey(prepared));
-                        work.receipt = Some(writable_fs::hive_wal::NativeHiveJournalReceipt {
-                            anchored, ..receipt
-                        });
-                        return Err(0xC000_003Eu32);
-                    }
-                },
+            let record = AnchoredRecord { anchored: receipt.anchored, file_id: receipt.file_id,
+                expected_log_len: receipt.expected_log_len, log_path: &receipt.log_path };
+            let (child, continuation, pair) = match prepared.publish(&mut handler.mutable_hives, record) {
+                Ok(published) => published,
+                Err((prepared, anchored)) => {
+                    work.prepared = Some(prepared);
+                    work.receipt = Some(writable_fs::hive_wal::NativeHiveJournalReceipt {
+                        anchored, ..receipt
+                    });
+                    return Err(0xC000_003Eu32);
+                }
             };
             if let Some(child) = child {
                 let Some(Completion::CreateChild { child: destination, .. }) =
-                    work.caller.completion.as_mut() else { unreachable!("child completion") };
+                    work.caller.hosted().completion.as_mut() else { unreachable!("child completion") };
                 *destination = Some(child);
             }
             // The edit is now what every reader of the hive sees.
@@ -892,7 +823,7 @@ unsafe fn advance(
                 Ok(()) => {
                     handler.note_mutable_hive_journal_record(work.hive);
                     work.status = 0;
-                    work.phase = if matches!(&work.caller.completion, Some(Completion::CreateChild { .. })) {
+                    work.phase = if work.caller.creates_child() {
                         Phase::PublishChild
                     } else {
                         Phase::ReadyReply
@@ -906,14 +837,15 @@ unsafe fn advance(
         }
         Phase::PublishChild => {
             if !work.cancelled {
+                let caller = work.caller.hosted();
                 let Some(Completion::CreateChild { publication, parent_key, child,
-                    grant, published, .. }) = work.caller.completion.as_mut()
+                    grant, published, .. }) = caller.completion.as_mut()
                 else { unreachable!("retained child completion") };
-                if !handler.validate_provider_logical_caller(work.caller.logical) {
+                if !handler.validate_provider_logical_caller(caller.logical) {
                     work.cancelled = true;
                 } else {
                     let saved_pi = handler.pi;
-                    handler.pi = work.caller.pi;
+                    handler.pi = caller.pi;
                     let result = handler.finish_anchored_mutable_child(
                         publication, *parent_key, child.expect("anchored child"), *grant,
                     );
@@ -926,14 +858,15 @@ unsafe fn advance(
         }
         Phase::OpenExistingChild => {
             if !work.cancelled {
+                let caller = work.caller.hosted();
                 let Some(Completion::CreateChild { publication, parent_key, backup,
-                    published, .. }) = work.caller.completion.as_mut()
+                    published, .. }) = caller.completion.as_mut()
                 else { unreachable!("retained child completion") };
-                if !handler.validate_provider_logical_caller(work.caller.logical) {
+                if !handler.validate_provider_logical_caller(caller.logical) {
                     work.cancelled = true;
                 } else {
                     let saved_pi = handler.pi;
-                    handler.pi = work.caller.pi;
+                    handler.pi = caller.pi;
                     let result = handler.finish_existing_mutable_child(
                         publication, *parent_key, *backup,
                     );
@@ -948,13 +881,13 @@ unsafe fn advance(
             if work.cancelled {
                 work.status = 0xC000_0120;
                 work.phase = Phase::ReadyReply;
-            } else if let Some(status) = advance_durable(handler, &mut work.caller) {
+            } else if let Some(status) = advance_durable(handler, work.caller.hosted()) {
                 work.status = status;
                 work.phase = Phase::ReadyReply;
             }
         }
         Phase::Notify => {
-            let Some(Completion::ChangeNotify { post }) = work.caller.completion.as_ref()
+            let Some(Completion::ChangeNotify { post }) = work.caller.hosted().completion.as_ref()
                 else { unreachable!("retained change-notify request") };
             let post = *post;
             if work.cancelled {
@@ -970,20 +903,25 @@ unsafe fn advance(
             work.phase = Phase::ReadyReply;
         }
         Phase::ReadyReply => {
+            if let Caller::Provider(caller) = &mut work.caller {
+                // The provider's parked service lane completes with the real status.
+                caller.finish(work.status)?;
+                return Ok(true);
+            }
             if work.cancelled {
                 work.phase = Phase::RevokeReply;
                 return Ok(false);
             }
-            parked_reply::validate_saved(work.caller.reply).map_err(|status| status as u32)?;
+            parked_reply::validate_saved(work.caller.hosted().reply).map_err(|status| status as u32)?;
             work.phase = Phase::ReplyEntered;
             if !crate::service_sec_image::complete_mutable_hive_mutation_reply(
-                handler, work.caller.tid, work.caller.reply, work.status,
+                handler, work.caller.hosted().tid, work.caller.hosted().reply, work.status,
             ) { return Err(0xC000_00A3); }
             work.phase = Phase::ReplySent;
         }
         Phase::ReplyEntered => {
             if spawn_hosts::shared_ingress::owner::runtime::finish_acknowledged_hosted_reply(
-                work.caller.reply,
+                work.caller.hosted().reply,
             ).map_err(|_| 0xC000_00A3u32)? {
                 work.phase = Phase::ReplySent;
             } else if work.cancelled {
@@ -991,33 +929,34 @@ unsafe fn advance(
             } else { return Err(0xC000_00A3); }
         }
         Phase::ReplySent => {
-            parked_reply::retire_sent(work.caller.reply).map_err(|status| status as u32)?;
+            parked_reply::retire_sent(work.caller.hosted().reply).map_err(|status| status as u32)?;
             if work.cancelled {
                 work.phase = Phase::ReconcileRuntime;
                 return Ok(false);
             }
-            release_completion(handler, &mut work.caller);
-            thread_wait_state_clear_badge_ready(handler, work.caller.badge);
-            work.caller.reference.release(&mut handler.pm)
+            release_completion(handler, work.caller.hosted());
+            thread_wait_state_clear_badge_ready(handler, work.caller.hosted().badge);
+            work.caller.hosted().reference.release(&mut handler.pm)
                 .expect("retained mutable caller reference");
             return Ok(true);
         }
         Phase::RevokeReply => {
-            if !spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.caller.reply) {
-                parked_reply::revoke(work.caller.reply).map_err(|status| status as u32)?;
+            if !spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.caller.hosted().reply) {
+                parked_reply::revoke(work.caller.hosted().reply).map_err(|status| status as u32)?;
             }
             work.phase = Phase::RetypeReply;
         }
         Phase::RetypeReply => {
-            parked_reply::retype(work.caller.reply).map_err(|status| status as u32)?;
+            parked_reply::retype(work.caller.hosted().reply).map_err(|status| status as u32)?;
             work.phase = Phase::ReconcileRuntime;
         }
         Phase::ReconcileRuntime => {
-            if !hosted_termination::reconcile(handler, queue, work.caller.logical) {
+            let queue = queue.expect("hosted runtime reconciles only at the outer loop");
+            if !hosted_termination::reconcile(handler, queue, work.caller.hosted().logical) {
                 return Err(0xC000_00A3);
             }
-            release_completion(handler, &mut work.caller);
-            work.caller.reference.release(&mut handler.pm)
+            release_completion(handler, work.caller.hosted());
+            work.caller.hosted().reference.release(&mut handler.pm)
                 .expect("retired mutable caller reference");
             return Ok(true);
         }
@@ -1030,14 +969,44 @@ fn blocks_later_preparation(phase: &Phase) -> bool {
         Phase::Publish | Phase::Install)
 }
 
-/// Advance only at the outer service loop. No nested provider pump owns this Reply.
+/// The outer service loop advances every row, including each hosted Reply.
 pub(crate) unsafe fn redrive(
     handler: &mut ExecNtHandler, queue: &mut nt_delay_execution::Queue,
+) {
+    redrive_rows(handler, Some(queue));
+}
+
+/// A nested provider pump may be waiting on a provider row: a driver or win32k whose service
+/// lane is parked here. Advance every provider row, and every hosted row only through its
+/// journal phases, so the single native hive journal is never held by a row this frame cannot
+/// move. No nested frame owns a hosted Reply, so hosted rows stop before their reply phases.
+pub(crate) unsafe fn redrive_nested() -> bool {
+    if PENDING.load(Ordering::Acquire) == 0
+        || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
+        || ACTIVE.load(Ordering::Acquire) { return false; }
+    let Ok(handler) = crate::service_sec_image::registry_live_handler() else { return false; };
+    let before = PENDING.load(Ordering::Acquire);
+    redrive_rows(handler, None);
+    PENDING.load(Ordering::Acquire) != before
+}
+
+/// The native hive journal a nested frame may drive: one held by a row in its WAL phase.
+/// The numeric id alone authorizes nothing; the exact retained row and phase are checked here.
+pub(crate) fn pending_nested_hive_wal_io() -> Option<u64> {
+    if ACTIVE.load(Ordering::Acquire) { return None; }
+    unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten()
+        .find_map(|work| matches!(work.phase, Phase::Poll).then_some(work.journal_id).flatten()
+            .filter(|&id| writable_fs::hive_wal::native_hive_journal_io_active(id))) }
+}
+
+unsafe fn redrive_rows(
+    handler: &mut ExecNtHandler, mut queue: Option<&mut nt_delay_execution::Queue>,
 ) {
     if PENDING.load(Ordering::Acquire) == 0
         || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
         || ACTIVE.swap(true, Ordering::AcqRel) { return; }
-    NOTIFY_READY.store(false, Ordering::Release);
+    let outer = queue.is_some();
+    if outer { NOTIFY_READY.store(false, Ordering::Release); }
     let mut failed = false;
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     for index in 0..rows.len() {
@@ -1045,15 +1014,17 @@ pub(crate) unsafe fn redrive(
         EXECUTING_INDEX.store(index as u64, Ordering::Relaxed);
         let mut completed = false;
         for _ in 0..8 {
+            if !outer && matches!(work.caller, Caller::Hosted(_))
+                && !blocks_later_preparation(&work.phase) { break; }
             let earlier_unpublished = rows.iter().flatten().any(|other|
                 other.hive == work.hive && other.order < work.order
                     && blocks_later_preparation(&other.phase));
             EXECUTING_TID.store(if matches!(work.phase, Phase::ReconcileRuntime) {
                 0
             } else {
-                work.caller.tid
+                work.caller.hosted_tid()
             }, Ordering::Release);
-            match advance(handler, queue, &mut work, earlier_unpublished) {
+            match advance(handler, queue.as_deref_mut(), &mut work, earlier_unpublished) {
                 Ok(true) => { completed = true; break; },
                 // Still in flight: one attempt per turn.
                 Ok(false) if matches!(work.phase, Phase::Durable | Phase::Notify) => break,

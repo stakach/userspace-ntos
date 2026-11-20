@@ -45030,6 +45030,10 @@ pub(crate) fn service_mounted_native_registry_wal(id: u64) -> usize {
     unsafe { mounted_native_block::service_registry_wal(id) }
 }
 
+pub(crate) fn service_mounted_native_mutable_hive_wal(id: u64) -> usize {
+    unsafe { mounted_native_block::service_mutable_hive_wal(id) }
+}
+
 pub(crate) fn print_mounted_native_block_census() {
     mounted_native_block::print_census();
 }

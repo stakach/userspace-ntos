@@ -5545,6 +5545,17 @@ impl ExecNtHandler {
         key: ResolvedHiveKey,
         name: &str,
     ) -> Result<(), u32> {
+        match self.mutable_edit_owner() {
+            crate::mutable_hive_edit_route::EditOwner::BootWal => {
+                self.boot_v2_delete_mutable_value(key, name)?;
+                self.mutable_registry_key_values_changed(key);
+                return Ok(());
+            }
+            crate::mutable_hive_edit_route::EditOwner::NativeWal
+            | crate::mutable_hive_edit_route::EditOwner::NotReady =>
+                return Err(nt_fs::STATUS_NOT_SUPPORTED),
+            crate::mutable_hive_edit_route::EditOwner::LegacyJournal => {}
+        }
         let relative = self
             .mutable_key_relative_path(key)
             .ok_or(STATUS_INVALID_HANDLE)?;
@@ -5577,6 +5588,19 @@ impl ExecNtHandler {
     fn journal_delete_mutable_key(&mut self, key: ResolvedHiveKey) -> Result<(), u32> {
         // The name is gone once the key is.
         let deleted = self.mutable_key_path(key);
+        match self.mutable_edit_owner() {
+            crate::mutable_hive_edit_route::EditOwner::BootWal => {
+                self.boot_v2_delete_mutable_key(key)?;
+                if let Some(deleted) = deleted {
+                    unsafe { self.registry_key_deleted(&deleted) };
+                }
+                return Ok(());
+            }
+            crate::mutable_hive_edit_route::EditOwner::NativeWal
+            | crate::mutable_hive_edit_route::EditOwner::NotReady =>
+                return Err(nt_fs::STATUS_NOT_SUPPORTED),
+            crate::mutable_hive_edit_route::EditOwner::LegacyJournal => {}
+        }
         let relative = self
             .mutable_key_relative_path(key)
             .ok_or(STATUS_INVALID_HANDLE)?;
@@ -7412,7 +7436,7 @@ impl ExecNtHandler {
         self.journal_create_mutable_subkey(parent, leaf)
     }
 
-    fn mutable_registry_key(&self, target: KeyRef) -> Option<nt_hive_core::ResolvedHiveKey> {
+    pub(crate) fn mutable_registry_key(&self, target: KeyRef) -> Option<nt_hive_core::ResolvedHiveKey> {
         self.mutable_key_handle(target)
     }
 

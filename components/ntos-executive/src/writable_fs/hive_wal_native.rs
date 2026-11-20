@@ -297,6 +297,27 @@ pub(crate) unsafe fn abort_unentered_native_hive_journal(id: u64) -> Result<(), 
     Ok(())
 }
 
+/// Journal `id` has a header recheck, WAL or anchor command to enter or settle.
+pub(crate) unsafe fn native_hive_journal_io_active(id: u64) -> bool {
+    (&*core::ptr::addr_of!(JOURNAL)).as_ref().is_some_and(|journal| journal.id == id
+        && journal.failed.is_none()
+        && matches!(journal.phase, Phase::Rechecking { .. } | Phase::Wal { .. } | Phase::Anchor { .. }))
+}
+
+/// Claim the next command of exactly journal `id`: its header recheck read, or its next WAL or
+/// anchor command. A nested frame whose provider waits on this journal drives it this way.
+pub(crate) unsafe fn claim_native_hive_io_for(id: u64)
+    -> Option<super::native_snapshot_io::SnapshotClaim>
+{
+    let journal = (&*core::ptr::addr_of!(JOURNAL)).as_ref()?;
+    if journal.id != id || journal.failed.is_some() { return None; }
+    if let Phase::Rechecking { recheck_id } = journal.phase {
+        return snapshot_storage::claim_storage_io_for(recheck_id);
+    }
+    claim_next_native_hive_io().map(|(ticket, mount, operation, input)|
+        super::native_snapshot_io::SnapshotClaim::from_hive(mount, operation, input, ticket))
+}
+
 pub(crate) unsafe fn claim_next_native_hive_io()
     -> Option<(HiveTicket, SectionMountId, BlockOperation, Vec<u8>)>
 {

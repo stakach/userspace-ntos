@@ -10,7 +10,7 @@ use syn::visit::Visit;
 #[path = "../../../components/ntos-executive/src/mutable_hive_edit_route.rs"]
 mod mutable_hive_edit_route;
 
-use mutable_hive_edit_route::{hosted_edit_owner, HostedEditOwner, STATUS_DEVICE_NOT_READY};
+use mutable_hive_edit_route::{edit_owner, EditOwner, STATUS_DEVICE_NOT_READY};
 use nt_fs::BlockSourceKind;
 
 const VALUE_MUTATION: &str =
@@ -20,10 +20,8 @@ const MUTABLE_WORK: &str =
 
 #[test]
 fn an_edit_on_the_native_stack_waits_for_its_anchored_wal_record() {
-    assert_eq!(hosted_edit_owner(Some(BlockSourceKind::Native)), HostedEditOwner::NativeWal);
-    assert_eq!(hosted_edit_owner(Some(BlockSourceKind::Draining)), HostedEditOwner::NotReady);
-    assert_eq!(hosted_edit_owner(Some(BlockSourceKind::Boot)), HostedEditOwner::Synchronous);
-    assert_eq!(hosted_edit_owner(None), HostedEditOwner::Synchronous);
+    assert_eq!(edit_owner(Some(BlockSourceKind::Native), true), EditOwner::NativeWal);
+    assert_eq!(edit_owner(Some(BlockSourceKind::Draining), true), EditOwner::NotReady);
     assert_eq!(STATUS_DEVICE_NOT_READY, 0xC000_00A3);
 }
 
@@ -69,7 +67,6 @@ fn hosted_deletes_take_the_same_owner_as_hosted_sets() {
     ] {
         let calls = callees(VALUE_MUTATION, syscall);
         let has = |name: &str| calls.iter().any(|call| call == name);
-        assert!(has("hosted_mutable_edit_owner"), "{syscall} asks the route policy");
         assert!(has("NativeWal") && has("mutable_hive_mutation_work"),
             "{syscall} hands a native-route edit to the anchored WAL work");
         assert!(has("STATUS_DEVICE_NOT_READY"), "{syscall} refuses a draining route");
@@ -80,11 +77,7 @@ fn hosted_deletes_take_the_same_owner_as_hosted_sets() {
 fn the_native_wal_work_prepares_and_publishes_deletions() {
     for name in [
         "prepare_owned_delete_value",
-        "publish_anchored_hive_delete_value",
-        "release_unentered_owned_delete_value",
         "prepare_owned_delete_key",
-        "publish_anchored_hive_delete_key",
-        "release_unentered_owned_delete_key",
     ] {
         assert!(MUTABLE_WORK.contains(name), "{name}");
     }

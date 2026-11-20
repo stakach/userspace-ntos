@@ -13862,6 +13862,7 @@ pub(crate) unsafe fn root_progress_pass() -> Result<(), RootPassError> {
     }
     drain_root_restores();
     crate::registry_mutation_work::redrive_provider();
+    crate::mutable_hive_mutation_work::redrive_nested();
     if ingress::resume_acknowledged_retained_services().map_err(|_| RootPassError::Transport)? {
         return Ok(());
     }
