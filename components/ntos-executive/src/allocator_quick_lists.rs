@@ -48,6 +48,10 @@ impl QuickLists {
     fn head_addr(&self, class: usize) -> usize { self.meta + class * 2 * WORD }
     fn count_addr(&self, class: usize) -> usize { self.head_addr(class) + WORD }
 
+    /// Whether a block of exactly `size` bytes has a cache. A realloc that grows to such a size
+    /// moves through the caches instead of walking the list for an adjacent free block.
+    pub(super) fn serves(size: usize) -> bool { Self::class(size).is_some() }
+
     /// Cache a released block. `false` leaves it for the address-ordered list.
     pub(super) unsafe fn push(&self, start: usize, size: usize) -> bool {
         let Some(class) = Self::class(size) else { return false; };

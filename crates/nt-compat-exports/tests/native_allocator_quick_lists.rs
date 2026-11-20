@@ -130,3 +130,24 @@ fn a_misaligned_head_is_left_for_the_list_and_a_damaged_node_is_refused() {
     assert!(unsafe { heap.quick.push(heap.data + 4096 - 32, 32) });
     assert!(unsafe { heap.quick.pop(32, WORD, heap.data + 1024) }.is_err());
 }
+
+/// Boot 44717077667 spent 262,949 Mtick in 57.4 M grow-in-place walks (~300 nodes each).
+/// Growth to a cached size moves through the caches instead.
+#[test]
+fn growth_to_a_cached_size_moves_through_the_caches() {
+    for size in [16, 24, 128, QUICK_MAX_BLOCK] {
+        assert!(QuickLists::serves(size), "{size}");
+    }
+    for size in [8, 20, QUICK_MAX_BLOCK + 8, 4096] {
+        assert!(!QuickLists::serves(size), "{size}");
+    }
+    // A 64 -> 128 byte growth: one pop and one push, no address-ordered walk.
+    let heap = fragmented(200, 48);
+    let old = heap.data + 200 * 64 + 2048;
+    let new = heap.data + 200 * 64 + 3072;
+    assert!(unsafe { heap.quick.push(new, 128) });
+    let moved = unsafe { heap.quick.pop(128, WORD, heap.top()) }.unwrap().unwrap();
+    assert_eq!(moved, new);
+    assert!(unsafe { heap.quick.push(old, 64) });
+    assert_eq!(unsafe { heap.quick.cached() }, (64, 64));
+}

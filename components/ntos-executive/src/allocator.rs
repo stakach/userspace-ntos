@@ -1086,7 +1086,12 @@ impl Bump {
             }
         }
 
-        if unsafe { grow_in_place_from_adjacent_free(start, old_block_size, new_block_size) } {
+        // A small grown block is reallocated from its exact-size cache and its old block cached;
+        // both are O(1) and the copy is at most QUICK_MAX_BLOCK bytes. Only larger growth walks
+        // the address-ordered list for an adjacent free block.
+        if !QuickLists::serves(new_block_size)
+            && unsafe { grow_in_place_from_adjacent_free(start, old_block_size, new_block_size) }
+        {
             return ptr;
         }
 
