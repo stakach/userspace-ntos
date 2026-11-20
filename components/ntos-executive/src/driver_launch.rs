@@ -438,6 +438,8 @@ mod hosted_driver_hal_idt_irql;
 pub(crate) mod hosted_driver_process_attach;
 #[path = "hosted_driver_spin_lock.rs"]
 mod hosted_driver_spin_lock;
+#[path = "hosted_driver_ex_spin_lock.rs"]
+mod hosted_driver_ex_spin_lock;
 #[path = "hosted_driver_hal_target_info.rs"]
 mod hosted_driver_hal_target_info;
 #[path = "hosted_driver_hal_cache.rs"]
@@ -37952,6 +37954,7 @@ fn register_fsd_trampolines() -> bool {
         "KeTryToAcquireSpinLockAtDpcLevel",
         hosted_driver_spin_lock::try_acquire_at_dpc as *const () as usize as u64,
     );
+    hosted_driver_ex_spin_lock::bind(reg);
     reg.bind(
         "KeGetCurrentIrql",
         s_ke_get_current_irql as *const () as usize as u64,
@@ -38308,6 +38311,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "PsGetProcessSessionId",
         hosted_driver_process_state::ps_get_process_session_id as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessInheritedFromUniqueProcessId",
+        hosted_driver_process_state::ps_get_process_inherited_from_unique_process_id as *const () as usize as u64,
     );
     reg.bind(
         "PsIsSystemProcess",

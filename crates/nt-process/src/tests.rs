@@ -2056,7 +2056,8 @@ fn kernel_provider_state_uses_canonical_process_and_thread_objects() {
     const EPROCESS: u64 = 0xFFFF_8000_1000_0000;
     const ETHREAD: u64 = 0xFFFF_8000_2000_0000;
     let mut pm = ProcessManager::new();
-    let pid = pm.create_process("provider.exe", None, None);
+    let parent = pm.create_process("console-host.exe", None, None);
+    let pid = pm.create_process("provider.exe", Some(parent), None);
     let tid = pm.create_thread(pid, 0x1000, 0, true).unwrap();
     assert!(pm.publish_process_kernel_object(pid, EPROCESS));
     assert!(pm.publish_thread_kernel_object(tid, ETHREAD));
@@ -2068,6 +2069,7 @@ fn kernel_provider_state_uses_canonical_process_and_thread_objects() {
             exit_status: STATUS_PENDING,
             exit_process_called: false,
             session_id: 3,
+            inherited_from_unique_process_id: parent,
         })
     );
     assert_eq!(
@@ -2114,6 +2116,7 @@ fn kernel_provider_state_uses_canonical_process_and_thread_objects() {
             exit_status: 0xC000_0123,
             exit_process_called: true,
             session_id: 3,
+            inherited_from_unique_process_id: parent,
         })
     );
     let thread = pm.kernel_thread_state(ETHREAD).unwrap();

@@ -93,3 +93,12 @@ pub(super) extern "win64" fn ps_is_thread_terminating(thread: u64) -> u8 {
     }
     value as u8
 }
+
+/// `HANDLE PsGetProcessInheritedFromUniqueProcessId(PEPROCESS)` reads the exact
+/// process body's creator id. A process created without a parent reports NULL.
+pub(super) extern "win64" fn ps_get_process_inherited_from_unique_process_id(process: u64) -> u64 {
+    hosted_driver_process_identity::query_state(
+        hosted_driver_process_identity::QUERY_PROCESS_INHERITED_FROM,
+        process,
+    )
+}

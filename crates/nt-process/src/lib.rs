@@ -558,6 +558,8 @@ pub struct KernelProcessState {
     pub exit_status: u32,
     pub exit_process_called: bool,
     pub session_id: u32,
+    /// `PsGetProcessInheritedFromUniqueProcessId`: the creator recorded at process creation.
+    pub inherited_from_unique_process_id: ProcessId,
 }
 
 /// Canonical thread state exposed to kernel-mode providers that hold an `ETHREAD` pointer.
@@ -2473,6 +2475,7 @@ impl ProcessManager {
                 ProcessState::Exiting | ProcessState::Terminated
             ),
             session_id: process.session_id,
+            inherited_from_unique_process_id: process.parent.unwrap_or(0),
         })
     }
 

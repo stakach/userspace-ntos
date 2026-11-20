@@ -27,6 +27,7 @@ mod event;
 mod event_deferred_signal;
 mod event_object;
 mod event_wait;
+pub mod ex_spin_lock;
 mod ex_rundown;
 mod ex_rundown_export;
 mod ex_cache_aware_rundown;
