@@ -10,7 +10,7 @@ use super::*;
 const OTHER_LABEL: usize = 0x900;
 const BUCKETS: usize = OTHER_LABEL + 1;
 const TOP_LABELS: usize = 6;
-const STAGES: usize = 18;
+const STAGES: usize = 24;
 
 static LABEL_COUNTS: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
 static LABEL_TICKS: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
@@ -27,7 +27,8 @@ fn bucket(label: u64) -> usize {
 
 #[derive(Clone, Copy)]
 pub(super) enum Stage {
-    NestedWork,
+    /// Nested owner work run with the File pump's parent parked, one stage per owner site.
+    NestedWalAck,
     Registry,
     RetainedService,
     RouteResume,
@@ -45,7 +46,21 @@ pub(super) enum Stage {
     RegistryHeaderReady,
     RegistryWalReady,
     NestedFileReady,
+    NestedWalFold,
+    NestedRegistryRecheck,
+    NestedRegistryWal,
+    NestedHiveWal,
+    NestedBackgroundHolder,
+    NestedFileWork,
 }
+
+const NESTED_SITES: [(Stage, &[u8]); 7] = [
+    (Stage::NestedWalAck, b"wal-ack"), (Stage::NestedWalFold, b"wal-fold"),
+    (Stage::NestedRegistryRecheck, b"registry-recheck"),
+    (Stage::NestedRegistryWal, b"registry-wal"), (Stage::NestedHiveWal, b"hive-wal"),
+    (Stage::NestedBackgroundHolder, b"background-holder"),
+    (Stage::NestedFileWork, b"file-work"),
+];
 
 pub(super) struct StageScope {
     stage: Stage,
@@ -150,18 +165,34 @@ pub(super) fn print_census() {
     }
     crate::print_str(b"\n");
     crate::print_str(b"[census] file-recv-stage count/ticks-M:");
-    for (index, name) in [b"nested".as_slice(), b"registry", b"retained", b"route",
+    let nested = |values: &[AtomicU64; STAGES]| NESTED_SITES.iter()
+        .map(|(stage, _)| values[*stage as usize].load(Ordering::Relaxed)).sum::<u64>();
+    crate::print_str(b" nested=");
+    crate::print_u64(nested(&STAGE_COUNTS));
+    crate::print_str(b"/");
+    crate::print_u64(nested(&STAGE_TICKS) / 1_000_000);
+    for (index, name) in [b"nested-wal-ack".as_slice(), b"registry", b"retained", b"route",
         b"next-message", b"autonomous-select", b"autonomous-service", b"census-tick",
         b"event-badge", b"call-adoption", b"yield-preflight", b"timer-irq-preflight",
         b"receive-owner", b"wal-ack-ready", b"wal-fold-ready",
         b"registry-header-ready", b"registry-wal-ready", b"nested-file-ready"]
-        .iter().enumerate() {
+        .iter().enumerate().skip(1) {
         crate::print_str(b" ");
         crate::print_str(name);
         crate::print_str(b"=");
         crate::print_u64(STAGE_COUNTS[index].load(Ordering::Relaxed));
         crate::print_str(b"/");
         crate::print_u64(STAGE_TICKS[index].load(Ordering::Relaxed) / 1_000_000);
+    }
+    crate::print_str(b"\n");
+    crate::print_str(b"[census] file-recv-nested count/ticks-M:");
+    for (stage, name) in NESTED_SITES {
+        crate::print_str(b" ");
+        crate::print_str(name);
+        crate::print_str(b"=");
+        crate::print_u64(STAGE_COUNTS[stage as usize].load(Ordering::Relaxed));
+        crate::print_str(b"/");
+        crate::print_u64(STAGE_TICKS[stage as usize].load(Ordering::Relaxed) / 1_000_000);
     }
     crate::print_str(b"\n");
 }

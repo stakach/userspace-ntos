@@ -976,7 +976,7 @@ pub(super) unsafe fn receive(
             crate::writable_fs::system_wal_fold_ack_pending()
         };
         if wal_ack_pending {
-            let _stage = StageScope::enter(ch, Stage::NestedWork);
+            let _stage = StageScope::enter(ch, Stage::NestedWalAck);
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
                 Err(_) => return PumpMessage::transport_wall(),
@@ -996,7 +996,7 @@ pub(super) unsafe fn receive(
             crate::service_sec_image::system_wal_fold_work_pending()
         };
         if wal_fold_pending {
-            let _stage = StageScope::enter(ch, Stage::NestedWork);
+            let _stage = StageScope::enter(ch, Stage::NestedWalFold);
             trace_ps_create_event(b"fold-enter", route, 0, 0);
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
@@ -1031,7 +1031,7 @@ pub(super) unsafe fn receive(
             crate::registry_mutation_work::pending_provider_header_recheck()
         };
         if let Some(id) = header_recheck {
-            let _stage = StageScope::enter(ch, Stage::NestedWork);
+            let _stage = StageScope::enter(ch, Stage::NestedRegistryRecheck);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
@@ -1049,7 +1049,7 @@ pub(super) unsafe fn receive(
             crate::registry_mutation_work::pending_provider_native_wal_io()
         };
         if let Some(id) = registry_wal {
-            let _stage = StageScope::enter(ch, Stage::NestedWork);
+            let _stage = StageScope::enter(ch, Stage::NestedRegistryWal);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
@@ -1069,7 +1069,7 @@ pub(super) unsafe fn receive(
             crate::mutable_hive_mutation_work::pending_nested_hive_wal_io()
         };
         if let Some(id) = hive_wal {
-            let _stage = StageScope::enter(ch, Stage::NestedWork);
+            let _stage = StageScope::enter(ch, Stage::NestedHiveWal);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
@@ -1087,7 +1087,7 @@ pub(super) unsafe fn receive(
         // provider registry write) waits on that reserve. Drive the holder here, with the exact
         // parent parked, exactly as the registry recheck and WAL commands above are driven.
         if crate::driver_launch::mounted_native_background_holder_ready() {
-            let _stage = StageScope::enter(ch, Stage::NestedWork);
+            let _stage = StageScope::enter(ch, Stage::NestedBackgroundHolder);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let gates = (
                 pump_scheduler_work_bits(ch, false) != 0,
@@ -1125,7 +1125,7 @@ pub(super) unsafe fn receive(
                 crate::print_u64(u64::from(ch.child_work_capable));
                 crate::print_str(b"\n");
             }
-            let _stage = StageScope::enter(ch, Stage::NestedWork);
+            let _stage = StageScope::enter(ch, Stage::NestedFileWork);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
