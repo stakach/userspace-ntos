@@ -604,3 +604,36 @@ fn queued_packet_preserves_receipts_when_deferred_next_is_also_ready() {
     assert!(!m.dropped.borrow().contains(&packet_id));
     assert!(m.memory.entry(B + 0x78).unwrap().inserted);
 }
+
+#[test]
+fn beep_cancel_routine_removing_a_queued_packet_leaves_a_selectable_queue() {
+    // beep.sys: IoStartPacket(Device, Irp, NULL, BeepCancel) for each IOCTL_BEEP_SET.
+    let mut m = Memory::new();
+    let lock = |token| Some(CancelLock { token, previous_irql: 0 });
+    let out = match start_packet(&mut m, D, A + 0x78, None, Some(0xa000), lock(1)) { Ok(v) => v, Err(_) => panic!() };
+    assert!(matches!(out.action, Action::Start { packet: Packet { irp: A, .. }, .. }));
+    assert_eq!(out.release_lock.unwrap().token, 1, "released before BeepStartIo");
+    assert_eq!(m.u64(A + 0x68), 0xa000, "without NO_CANCEL the started IRP keeps its routine");
+    for (irp, token) in [(B, 2), (C, 3)] {
+        let out = match start_packet(&mut m, D, irp + 0x78, None, Some(0xa000), lock(token)) { Ok(v) => v, Err(_) => panic!() };
+        assert!(matches!(out.action, Action::Queued { next: None, .. }));
+        assert_eq!(out.release_lock.unwrap().token, token);
+        assert_eq!(m.u64(irp + 0x68), 0xa000);
+    }
+    // IoCancelIrp(B) runs BeepCancel: not CurrentIrp, so KeRemoveEntryDeviceQueue under the lock.
+    assert_eq!(device_queue::remove_entry_device_queue(&mut m, D + 0xa0, B + 0x78), Ok(true));
+    assert_eq!(device_queue::entry_detached(&m, D + 0xa0, B + 0x78), Ok(true));
+    // BeepStartIo's IoStartNextPacket(TRUE) selects C, never the removed B.
+    let out = match start_next(&mut m, D, None, true, lock(4)) { Ok(v) => v, Err(_) => panic!() };
+    assert!(matches!(out.action, Action::Start { packet: Packet { irp: C, .. }, .. }));
+    assert_eq!(out.release_lock.unwrap().token, 4);
+    assert_eq!(m.u64(D + 0x20), C);
+    // C's StartIo drains the queue: CurrentIrp is cleared and the queue goes idle.
+    let out = match start_next(&mut m, D, None, true, lock(5)) { Ok(v) => v, Err(_) => panic!() };
+    assert!(matches!(out.action, Action::Retained { .. }));
+    assert_eq!(m.u64(D + 0x20), 0);
+    assert!(!m.queue(D + 0xa0).unwrap().busy);
+    // Cancelable Next demands the caller's real lock.
+    assert!(matches!(start_next(&mut m, D, None, true, None::<CancelLock<u64>>),
+        Err(Refusal { error: Error::MissingCancelLock, .. })));
+}

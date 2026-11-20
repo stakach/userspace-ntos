@@ -276,3 +276,20 @@ fn next_packet_accepts_exact_ready_terminal_before_root_poll() {
     assert!(adapter.contains("owner.retain_source(packet)"),
         "a displaced live packet must remain pinned by its exact callback fence");
 }
+
+#[test]
+fn cancelable_start_packet_serializes_with_the_driver_cancel_lock() {
+    let adapter = native("hosted_start_io.rs");
+    let memory = native("hosted_start_io_packet.rs");
+    let start = adapter.split("extern \"win64\" fn s_io_start_packet(").nth(1).unwrap()
+        .split("extern \"win64\" fn s_io_start_next_packet(").next().unwrap();
+    let lock = start.find("s_io_acquire_cancel_spin_lock").expect("IoStartPacket takes the cancel lock");
+    let call = start.find("call_on4_raw").unwrap();
+    let release = start.find("s_io_release_cancel_spin_lock").unwrap();
+    let start_io = start.find("call_hosted_pe(callback").unwrap();
+    assert!(lock < call && call < release && release < start_io,
+        "the root insertion runs under the cancel lock, released before StartIo");
+    assert!(start.contains("HOSTED_DEVICE_OP_START_PACKET_CANCELABLE"));
+    assert!(memory.contains("device_queue::entry_detached(&memory, queue, entry)"),
+        "terminal settlement accepts an entry its driver's cancel routine already removed");
+}

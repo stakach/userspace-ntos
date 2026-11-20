@@ -23,6 +23,7 @@ struct LockedFirstPacketMemory {
     current_irp: u64,
     current_phase: CurrentPhase,
     start_io: u64,
+    image_end: u64,
 }
 
 struct LockedQueueEntry {
@@ -98,15 +99,20 @@ fn locked_first_packet_memory(
     }
     .ok_or(STATUS_INVALID_HANDLE)?;
     let current_irp = unsafe { read_unaligned((device.device_exec + 0x20) as *const u64) };
+    // IoStartNextPacket clears CurrentIrp itself (ReactOS IopStartNextPacket), so a driver that
+    // already cleared it (for example a cancel routine for the current IRP) still names the
+    // root's exact current packet. Only the root's retained receipt identifies that packet.
+    let driver_cleared = terminal_ready && current_irp == 0;
+    let expected_current = if driver_cleared { observed.raw_irp } else { current_irp };
     let current_phase = first_packet_current().iter()
         .find(|slot| slot.registration == registration)
         .map(|slot| {
             let snapshot = slot.current.snapshot();
             if snapshot.packet.map_or(0, |source|
-                source.allocation().component_address) == current_irp
+                source.allocation().component_address) == expected_current
             { Some(snapshot.phase) } else { None }
-        }).unwrap_or_else(|| (current_irp == 0).then_some(CurrentPhase::Empty));
-    if (terminal_ready && current_irp != observed.raw_irp)
+        }).unwrap_or_else(|| (current_irp == 0 && !driver_cleared).then_some(CurrentPhase::Empty));
+    if (terminal_ready && expected_current != observed.raw_irp)
         || current_phase.is_none()
     {
         return Err(STATUS_INVALID_HANDLE);
@@ -201,7 +207,7 @@ fn locked_first_packet_memory(
     Ok(LockedFirstPacketMemory {
         registration, source, _pool, device, device_capacity,
         irp: irp.component_address, irp_exec, irp_capacity, queue_entries,
-        current_irp, current_phase, start_io,
+        current_irp, current_phase, start_io, image_end,
     })
 }
 
@@ -215,13 +221,33 @@ pub(super) struct FirstPacketCommit {
 
 pub(super) enum PacketCommit {
     Started(FirstPacketCommit),
-    Queued(PreparedFirstProjectedPacket),
+    /// Linked in the WDM queue. `Some(routine)` is an already-cancelled packet whose cancel
+    /// routine IoStartPacket must call with the cancel lock held.
+    Queued(PreparedFirstProjectedPacket, Option<u64>),
+}
+
+/// The caller's held cancel lock and its stored CancelFunction, read back from the exact
+/// incoming IRP under the pool lock. The root never manufactures a lock it cannot see.
+fn cancel_request(
+    memory: &LockedFirstPacketMemory,
+    cancelable: bool,
+) -> Result<(Option<u64>, Option<start_io::CancelLock<()>>), ()> {
+    if !cancelable { return Ok((None, None)); }
+    let routine = unsafe {
+        read_unaligned((memory.irp_exec + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const u64)
+    };
+    let previous_irql = unsafe {
+        read_unaligned((memory.irp_exec + WDM_X64_IRP_CANCEL_IRQL_OFFSET) as *const u8)
+    };
+    if routine == 0 { return Err(()); }
+    Ok((Some(routine), Some(start_io::CancelLock { token: (), previous_irql })))
 }
 
 /// No foreign call occurs here. The CurrentReceipt update is prepared before the WDM queue
 /// effect, then published under the same pool lock. Refusal returns both original owners.
 pub(super) fn commit_first_projected_packet(
     prepared: PreparedFirstProjectedPacket,
+    cancelable: bool,
 ) -> Result<PacketCommit, PreparedFirstProjectedPacket> {
     let PreparedFirstProjectedPacket {
         instance_index, instance, registration, node, mut current, incoming,
@@ -251,17 +277,34 @@ pub(super) fn commit_first_projected_packet(
                 instance_index, instance, registration, node, current, incoming,
             });
         }
+        let Ok((cancel, lock)) = cancel_request(&memory, cancelable) else {
+            return Err(PreparedFirstProjectedPacket {
+                instance_index, instance, registration, node, current, incoming,
+            });
+        };
         let outcome = start_io::start_packet::<_, ()>(
             &mut memory, registration.address(), identity.allocation().component_address + 0x78,
-            None, None, None,
+            None, cancel, lock,
         );
         return match outcome {
             Ok(outcome) if matches!(outcome.action, Action::Queued { next: None, .. })
-                && outcome.release_lock.is_none() => Ok(PacketCommit::Queued(
+                && outcome.release_lock.is_some() == cancelable => Ok(PacketCommit::Queued(
                     PreparedFirstProjectedPacket {
                         instance_index, instance, registration, node, current, incoming,
                     },
+                    None,
                 )),
+            Ok(outcome) if outcome.release_lock.is_none() && matches!(outcome.action,
+                Action::Cancel { finish_deferred: false, .. }) =>
+            {
+                let Action::Cancel { routine, .. } = outcome.action else { unreachable!() };
+                Ok(PacketCommit::Queued(
+                    PreparedFirstProjectedPacket {
+                        instance_index, instance, registration, node, current, incoming,
+                    },
+                    Some(routine),
+                ))
+            }
             Ok(_) => panic!("busy unkeyed StartIo insertion changed policy under pool lock"),
             Err(_) => Err(PreparedFirstProjectedPacket {
                 instance_index, instance, registration, node, current, incoming,
@@ -283,13 +326,22 @@ pub(super) fn commit_first_projected_packet(
         }),
     };
     let callback_target = memory.start_io;
+    let Ok((cancel, lock)) = cancel_request(&memory, cancelable) else {
+        let incoming = prepared_update.abort()
+            .expect("first packet refusal retains incoming owner");
+        return Err(PreparedFirstProjectedPacket {
+            instance_index, instance, registration, node, current, incoming,
+        });
+    };
     let outcome = start_io::start_packet::<_, ()>(
         &mut memory, registration.address(), identity.allocation().component_address + 0x78,
-        None, None, None,
+        None, cancel, lock,
     );
     match outcome {
         Ok(outcome) => {
-            assert!(matches!(outcome.action, Action::Start { .. }) && outcome.release_lock.is_none(),
+            // The caller releases its own held cancel lock before invoking StartIo.
+            assert!(matches!(outcome.action, Action::Start { .. })
+                && outcome.release_lock.is_some() == cancelable,
                 "idle first-packet queue changed under its lock");
             assert!(prepared_update.commit().is_none(), "empty current displaced a live packet");
             Ok(PacketCommit::Started(FirstPacketCommit {
@@ -316,6 +368,7 @@ pub(super) fn advance_empty_next_packet(
     observed: PendingStartIoNodeIdentity,
     source: SourceIrpForwardIdentity,
     current: &mut CurrentReceipt<nt_io_manager::HostedDeviceProjectionReference, StartIoSourcePin>,
+    cancelable: bool,
 ) -> Result<Option<LivePacket<StartIoSourcePin>>, i32> {
     let mut memory = locked_first_packet_memory(
         instance_index, inst, registration, observed, source, true,
@@ -328,12 +381,20 @@ pub(super) fn advance_empty_next_packet(
     let update = current.prepare_update(registration, observed.raw_irp, None)
         .map_err(|_| STATUS_INVALID_HANDLE)?;
     let outcome = start_io::start_next::<_, ()>(
-        &mut memory, registration.address(), None, false, None,
+        &mut memory, registration.address(), None, cancelable, held_cancel_lock(cancelable),
     ).map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?;
-    if !matches!(outcome.action, Action::Retained { .. }) || outcome.release_lock.is_some() {
+    if !matches!(outcome.action, Action::Retained { .. })
+        || outcome.release_lock.is_some() != cancelable
+    {
         panic!("empty StartIo queue selected a packet under its physical lock");
     }
     Ok(update.commit())
+}
+
+/// IoStartNextPacket(Cancelable=TRUE) holds the driver-domain cancel lock across this call and
+/// releases it itself before StartIo; this token stands for that held lock.
+fn held_cancel_lock(cancelable: bool) -> Option<start_io::CancelLock<()>> {
+    cancelable.then_some(start_io::CancelLock { token: (), previous_irql: 0 })
 }
 
 /// A zero-write view of the same locked WDM queue. Selection authority remains the real
@@ -370,7 +431,8 @@ pub(super) fn advance_selected_next_packet(
     registration: nt_io_manager::HostedDevicePointerRegistration,
     old_node: PendingStartIoNodeIdentity,
     old_source: SourceIrpForwardIdentity,
-) -> Result<SelectedNextPacket, i32> {
+    cancelable: bool,
+) -> Result<Option<SelectedNextPacket>, i32> {
     let mut memory = locked_first_packet_memory(
         instance_index, inst, registration, old_node, old_source, true,
     )?;
@@ -379,9 +441,12 @@ pub(super) fn advance_selected_next_packet(
     if device.flags & start_io::DEFERRED != 0 && device.count != 0 {
         return Err(STATUS_INVALID_DEVICE_REQUEST);
     }
-    let selected_entry = device_queue::remove_device_queue(&mut PreviewQueueMemory(&memory),
+    // The real intrusive queue, not the root's linked rows, decides. A row whose entry its
+    // driver already removed (a cancel routine's KeRemoveEntryDeviceQueue) is not selectable;
+    // an empty queue takes the empty Next path.
+    let Some(selected_entry) = device_queue::remove_device_queue(&mut PreviewQueueMemory(&memory),
         queue, None).map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?
-        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    else { return Ok(None); };
     let selected_irp = selected_entry.checked_sub(0x78).ok_or(STATUS_INVALID_HANDLE)?;
     let row = first_packet_queued().iter().find(|row| {
         row.registration == registration
@@ -409,16 +474,16 @@ pub(super) fn advance_selected_next_packet(
         .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
     let callback_target = memory.start_io;
     let outcome = start_io::start_next::<_, ()>(
-        &mut memory, registration.address(), None, false, None,
+        &mut memory, registration.address(), None, cancelable, held_cancel_lock(cancelable),
     ).map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?;
     claim.effect_committed();
     if !matches!(outcome.action, Action::Start { packet, .. } if packet.irp == selected_irp)
-        || outcome.release_lock.is_some()
+        || outcome.release_lock.is_some() != cancelable
     {
         panic!("WDM Next selected a different IRP after exact locked preview");
     }
-    Ok(SelectedNextPacket { source: selected_source, node: selected_node,
-        callback_target, claim })
+    Ok(Some(SelectedNextPacket { source: selected_source, node: selected_node,
+        callback_target, claim }))
 }
 
 impl LockedDeviceQueueMemory for LockedFirstPacketMemory {
@@ -464,8 +529,12 @@ impl LockedStartIoMemory for LockedFirstPacketMemory {
             && retained.owner == self.registration).then_some(()).ok_or(())
     }
     fn packet(&self, entry: u64, cancel: Option<u64>) -> Result<Packet<Self::Owner>, Self::Error> {
-        if cancel.is_some() { return Err(()); }
         let irp = entry.checked_sub(0x78).ok_or(())?;
+        // A CancelFunction is admitted only for the incoming packet and only inside the
+        // provider's own loaded image, like its DriverStartIo callback.
+        if cancel.is_some_and(|routine| irp != self.irp
+            || routine < FSD_CODE_VA || routine >= self.image_end)
+        { return Err(()); }
         if irp != self.irp && !self.queue_entries.iter().any(|row| row.address == irp) {
             return Err(());
         }
@@ -563,8 +632,8 @@ impl LockedDeviceQueueMemory for LockedQueuedUnlinkMemory {
 }
 
 /// The caller owns FIRST, source ledger and physical pool locks in that order. A successful
-/// return commits exactly one WDM unlink; the caller must immediately advance its retained row
-/// to Unlinked before attempting checked source release.
+/// return commits exactly one WDM unlink, or proves the packet's driver already unlinked it; the
+/// caller must immediately advance its retained row to Unlinked before checked source release.
 pub(super) fn unlink_queued_terminal_locked(
     instance_index: usize,
     inst: DriverInstance,
@@ -604,10 +673,15 @@ pub(super) fn unlink_queued_terminal_locked(
         },
         entries,
     };
-    match device_queue::remove_entry_device_queue(
-        &mut memory, registration.address() + 0xa0, observed.raw_irp + 0x78,
-    ) {
+    let queue = registration.address() + 0xa0;
+    let entry = observed.raw_irp + 0x78;
+    match device_queue::remove_entry_device_queue(&mut memory, queue, entry) {
         Ok(true) => Ok(()),
+        // The packet's own driver already unlinked it under its lock (a cancel routine's
+        // KeRemoveEntryDeviceQueue, or KeRemoveDeviceQueue in cleanup), then completed it.
+        // A not-inserted entry absent from the validated list needs no further WDM write.
+        Ok(false) | Err(device_queue::DeviceQueueError::InvalidQueue)
+            if device_queue::entry_detached(&memory, queue, entry) == Ok(true) => Ok(()),
         _ => Err(STATUS_INVALID_HANDLE),
     }
 }

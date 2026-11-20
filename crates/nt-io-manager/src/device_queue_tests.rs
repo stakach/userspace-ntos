@@ -292,3 +292,24 @@ fn null_unaligned_overflow_overlap_and_uninitialized_queues_are_denied() {
     assert_eq!(memory.bytes, before);
     assert_eq!(memory.applications, applications);
 }
+
+#[test]
+fn entry_detached_only_after_the_driver_unlinked_it_itself() {
+    // A busy queue with B and C linked behind active A.
+    let mut memory = Memory::active();
+    assert!(insert_device_queue(&mut memory, Q, B, None).unwrap());
+    assert!(insert_device_queue(&mut memory, Q, C, None).unwrap());
+    assert_eq!(entry_detached(&memory, Q, B), Ok(false), "linked entries are not detached");
+    // The driver's cancel routine (KeRemoveEntryDeviceQueue) unlinks B under its own lock.
+    assert_eq!(remove_entry_device_queue(&mut memory, Q, B), Ok(true));
+    assert_eq!(entry_detached(&memory, Q, B), Ok(true));
+    assert_eq!(entry_detached(&memory, Q, C), Ok(false));
+    // KeRemoveDeviceQueue drains C, then the empty busy queue goes idle.
+    assert_eq!(remove_device_queue(&mut memory, Q, None), Ok(Some(C)));
+    assert_eq!(remove_device_queue(&mut memory, Q, None), Ok(None));
+    assert!(!memory.queue(Q).unwrap().busy);
+    assert_eq!(entry_detached(&memory, Q, C), Ok(true), "an idle queue holds no entries");
+    // A still-marked entry absent from the list is corrupt, not detached.
+    memory.bytes[D as usize + 20] = 1;
+    assert_eq!(entry_detached(&memory, Q, D), Err(DeviceQueueError::MalformedList));
+}

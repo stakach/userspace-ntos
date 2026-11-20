@@ -6457,6 +6457,11 @@ const HOSTED_DEVICE_OP_CONTIGUOUS_PHYSICAL: u64 = 36;
 const HOSTED_DEVICE_OP_CONTIGUOUS_MAP: u64 = 37;
 const HOSTED_DEVICE_OP_CONTIGUOUS_UNMAP: u64 = 38;
 const HOSTED_DEVICE_OP_REFERENCE_BY_POINTER: u64 = 40;
+/// IoStartPacket with a CancelFunction: the caller holds the cancel lock and has stored
+/// Irp->CancelRoutine and Irp->CancelIrql before the root's insertion.
+const HOSTED_DEVICE_OP_START_PACKET_CANCELABLE: u64 = 41;
+/// Reply generation that tells IoStartPacket to call its CancelFunction with the lock held.
+const START_PACKET_REPLY_CANCEL: u64 = u64::MAX;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -9540,6 +9545,9 @@ extern "win64" fn s_io_cancel_irp(irp: u64) -> u8 {
             .is_err()
         {
             core::hint::spin_loop();
+            // IoStartPacket/IoStartNextPacket hold this lock across their root call. On one
+            // hosted CPU the holder must be scheduled; keep this caller's DISPATCH_LEVEL state.
+            crate::yield_now();
         }
         write_unaligned((irp + WDM_X64_IRP_CANCEL_OFFSET) as *mut u8, 1);
         write_unaligned((irp + WDM_X64_IRP_CANCEL_IRQL_OFFSET) as *mut u8, old);
@@ -9660,6 +9668,9 @@ extern "win64" fn s_io_acquire_cancel_spin_lock(old_irql_out: u64) {
             .is_err()
         {
             core::hint::spin_loop();
+            // IoStartPacket/IoStartNextPacket hold this lock across their root call. On one
+            // hosted CPU the holder must be scheduled; keep this caller's DISPATCH_LEVEL state.
+            crate::yield_now();
         }
         if old_irql_out != 0 {
             write_unaligned(old_irql_out as *mut u8, old);
@@ -61386,6 +61397,7 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_REPORT_POWER_STATE
             | HOSTED_DEVICE_OP_SET_START_IO_ATTRIBUTES
             | HOSTED_DEVICE_OP_START_PACKET
+            | HOSTED_DEVICE_OP_START_PACKET_CANCELABLE
             | HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED
             | HOSTED_DEVICE_OP_START_NEXT_PACKET
             | HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED
@@ -61531,8 +61543,11 @@ pub(crate) fn service_hosted_device(
             active_reply_cap,
         );
     }
-    if op == HOSTED_DEVICE_OP_START_PACKET {
-        return hosted_start_io::service_start_packet(ch, pdo_object, arg2, arg3, active_reply_cap);
+    if op == HOSTED_DEVICE_OP_START_PACKET || op == HOSTED_DEVICE_OP_START_PACKET_CANCELABLE {
+        return hosted_start_io::service_start_packet(
+            ch, pdo_object, arg2, arg3, op == HOSTED_DEVICE_OP_START_PACKET_CANCELABLE,
+            active_reply_cap,
+        );
     }
     if op == HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED {
         return hosted_start_io::service_start_packet_callback_returned(

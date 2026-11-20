@@ -261,8 +261,9 @@ fn release_first_packet_commit_refusal(
 /// No Reply or callback is issued here; that separate edge must use begin_first_packet_reply.
 fn commit_first_projected_packet(
     prepared: PreparedFirstProjectedPacket,
+    cancelable: bool,
 ) -> Result<(Option<StartIoTransactionId>,
-    Option<nt_io_manager::HostedDeviceProjectionReference>), FirstPacketCommitRefusal> {
+    Option<nt_io_manager::HostedDeviceProjectionReference>, Option<u64>), FirstPacketCommitRefusal> {
     let _guard = lock_first_packets();
     if first_packet_transactions().try_reserve(1).is_err()
         || first_packet_queued().try_reserve(1).is_err()
@@ -285,7 +286,7 @@ fn commit_first_projected_packet(
         Ok(owner) => owner,
         Err(_) => return Err(FirstPacketCommitRefusal { prepared, callback_owner: None }),
     };
-    let committed = match packet::commit_first_projected_packet(prepared) {
+    let committed = match packet::commit_first_projected_packet(prepared, cancelable) {
         Ok(committed) => committed,
         Err(prepared) => {
             if callback_owner.release(io_manager_mut()).is_err() {
@@ -297,7 +298,7 @@ fn commit_first_projected_packet(
         }
     };
     let committed = match committed {
-        packet::PacketCommit::Queued(prepared) => {
+        packet::PacketCommit::Queued(prepared, cancel_routine) => {
             let PreparedFirstProjectedPacket {
                 instance_index, instance, registration, node, current, incoming,
             } = prepared;
@@ -313,7 +314,7 @@ fn commit_first_projected_packet(
                     QueuedStartIo::new(identity, owner)), source_released: false,
                 registration, node,
             });
-            return Ok((None, None));
+            return Ok((None, None, cancel_routine));
         }
         packet::PacketCommit::Started(committed) => committed,
     };
@@ -337,7 +338,7 @@ fn commit_first_projected_packet(
         owner: FirstPacketOwnerState::Committed(owner), terminal_pin: None,
         next_performed: false,
     });
-    Ok((Some(id), stale_device))
+    Ok((Some(id), stale_device, None))
 }
 
 /// Mark Reply uncertain before yielding its scalar callback command. A lost or failed Reply
@@ -593,6 +594,11 @@ unsafe fn component_first_packet_node(irp: u64) -> Option<u64> {
     None
 }
 
+/// `VOID IoStartPacket(PDEVICE_OBJECT, PIRP, PULONG Key, PDRIVER_CANCEL)`, following ReactOS
+/// device.c. With a CancelFunction the driver-domain cancel spin lock is held, and
+/// Irp->CancelRoutine/CancelIrql are stored, before the root inserts the packet; the root's
+/// queue edit therefore serializes with every cancel routine's own queue removal. The lock is
+/// released before StartIo, or transferred to the cancel routine for an already-cancelled packet.
 pub(super) extern "win64" fn s_io_start_packet(
     device: u64,
     irp: u64,
@@ -600,24 +606,48 @@ pub(super) extern "win64" fn s_io_start_packet(
     cancel: u64,
 ) {
     unsafe {
-        if key != 0 || cancel != 0 {
+        if key != 0 {
             crate::provider_bugcheck::report(0xc4, [HOSTED_DEVICE_OP_START_PACKET, device, key, cancel]);
         }
         let Some(node) = component_first_packet_node(irp) else {
             crate::provider_bugcheck::report(0xc4, [HOSTED_DEVICE_OP_START_PACKET, device, irp, 0]);
         };
+        let cancel_irql = if cancel != 0 {
+            let mut irql = 0u8;
+            s_io_acquire_cancel_spin_lock((&mut irql as *mut u8) as u64);
+            write_unaligned((irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *mut u64, cancel);
+            write_unaligned((irp + WDM_X64_IRP_CANCEL_IRQL_OFFSET) as *mut u8, irql);
+            Some(irql)
+        } else {
+            None
+        };
+        let op = if cancel_irql.is_some() {
+            HOSTED_DEVICE_OP_START_PACKET_CANCELABLE
+        } else {
+            HOSTED_DEVICE_OP_START_PACKET
+        };
         let (words, status, callback, serial, generation) = call_on4_raw(
             (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
-            HOSTED_DEVICE_OP_START_PACKET,
+            op,
             device,
             irp,
             node,
         );
+        if words == 4 && status == STATUS_SUCCESS as u32 as u64 && cancel != 0
+            && callback == cancel && serial == 0 && generation == START_PACKET_REPLY_CANCEL
+        {
+            // The queued packet was already cancelled: its cancel routine owns the held lock.
+            call_hosted_pe(cancel, &[device, irp]);
+            return;
+        }
         if words != 4 || status != STATUS_SUCCESS as u32 as u64
             || (callback == 0 && (serial != 0 || generation != 0))
             || (callback != 0 && (serial == 0 || generation == 0))
         {
             crate::provider_bugcheck::report(0xc4, [HOSTED_DEVICE_OP_START_PACKET, device, status, words]);
+        }
+        if let Some(irql) = cancel_irql {
+            s_io_release_cancel_spin_lock(irql);
         }
         if callback == 0 { return; }
         call_hosted_pe(callback, &[device, irp]);
@@ -636,17 +666,29 @@ pub(super) extern "win64" fn s_io_start_packet(
     }
 }
 
+/// `VOID IoStartNextPacket(PDEVICE_OBJECT, BOOLEAN Cancelable)`. A cancelable request holds the
+/// cancel spin lock across the root's dequeue and releases it before StartIo, as ReactOS does.
 pub(super) extern "win64" fn s_io_start_next_packet(device: u64, cancelable: u8) {
     unsafe {
+        let cancel_irql = if cancelable != 0 {
+            let mut irql = 0u8;
+            s_io_acquire_cancel_spin_lock((&mut irql as *mut u8) as u64);
+            Some(irql)
+        } else {
+            None
+        };
         let (words, status, callback, serial, selected_irp) = call_on4_raw(
             (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
             HOSTED_DEVICE_OP_START_NEXT_PACKET,
             device,
-            u64::from(cancelable),
+            u64::from(cancelable != 0),
             0,
         );
         if words != 4 || status != STATUS_SUCCESS as u32 as u64 {
             crate::provider_bugcheck::report(0xc4, [HOSTED_DEVICE_OP_START_NEXT_PACKET, device, status, words]);
+        }
+        if let Some(irql) = cancel_irql {
+            s_io_release_cancel_spin_lock(irql);
         }
         if callback == 0 && serial == 0 && selected_irp == 0 { return; }
         if callback == 0 || serial == 0 || selected_irp == 0 {
@@ -675,9 +717,10 @@ pub(super) fn service_start_next_packet(
     reserved: u64,
     active_reply_cap: u64,
 ) -> (i32, u64, u64, u64) {
-    if cancelable != 0 || reserved != 0 {
+    if cancelable > 1 || reserved != 0 {
         return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
     }
+    let cancelable = cancelable != 0;
     let (index, inst, device_id) = match authenticated_hosted_device(ch, device, active_reply_cap) {
         Ok(identity) => identity,
         Err(status) => return (status.raw(), 0, 0, 0),
@@ -696,7 +739,7 @@ pub(super) fn service_start_next_packet(
         Ok(id) => id,
         Err(status) => return (status, 0, 0, 0),
     };
-    let result = service_start_next_packet_locked(index, inst, registration, cleanup);
+    let result = service_start_next_packet_locked(index, inst, registration, cleanup, cancelable);
     // A selected packet uses the reserved row for its extra device projection ref. All other
     // paths remove the unused reservation; checked cleanup never replays the WDM queue effect.
     {
@@ -713,6 +756,7 @@ fn service_start_next_packet_locked(
     inst: DriverInstance,
     registration: nt_io_manager::HostedDevicePointerRegistration,
     cleanup: u64,
+    cancelable: bool,
 ) -> (i32, u64, u64, u64) {
     let _guard = lock_first_packets();
     let Some(slot) = first_packet_current().iter().find(|slot| slot.registration == registration)
@@ -736,10 +780,10 @@ fn service_start_next_packet_locked(
     }) {
         return (STATUS_INVALID_HANDLE, 0, 0, 0);
     }
-    let Some(slot) = first_packet_current().iter_mut().find(|slot| {
+    if !first_packet_current().iter().any(|slot| {
         slot.registration == registration && slot.node.matches(observed)
             && slot.current.snapshot().packet == Some(source)
-    }) else { return (STATUS_INVALID_HANDLE, 0, 0, 0); };
+    }) { return (STATUS_INVALID_HANDLE, 0, 0, 0); }
     if first_packet_queued().iter().any(|row| row.registration == registration
         && matches!(&row.owner, QueuedPacketState::Linked(_)))
     {
@@ -755,9 +799,12 @@ fn service_start_next_packet_locked(
         };
         // Verify the old live callback fence before a WDM dequeue can displace its source pin.
         let selected = match packet::advance_selected_next_packet(
-            index, inst, registration, observed, source,
+            index, inst, registration, observed, source, cancelable,
         ) {
-            Ok(selected) => selected,
+            Ok(Some(selected)) => selected,
+            Ok(None) => return advance_empty_locked(
+                index, inst, registration, observed, source, row_index, cancelable,
+            ),
             Err(status) => return (status, 0, 0, 0),
         };
         let queued_index = first_packet_queued().iter().position(|row|
@@ -807,8 +854,26 @@ fn service_start_next_packet_locked(
         return (STATUS_SUCCESS, selected.callback_target, serial,
             selected.source.allocation().component_address);
     }
+    advance_empty_locked(index, inst, registration, observed, source, row_index, cancelable)
+}
+
+/// IoStartNextPacket on a queue whose real WDM list is empty: withdraw the current packet and
+/// leave the queue idle. Caller holds FIRST; `row_index` is the preflighted live callback fence.
+fn advance_empty_locked(
+    index: usize,
+    inst: DriverInstance,
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+    observed: PendingStartIoNodeIdentity,
+    source: SourceIrpForwardIdentity,
+    row_index: Option<usize>,
+    cancelable: bool,
+) -> (i32, u64, u64, u64) {
+    let Some(slot) = first_packet_current().iter_mut().find(|slot| {
+        slot.registration == registration && slot.node.matches(observed)
+            && slot.current.snapshot().packet == Some(source)
+    }) else { return (STATUS_INVALID_HANDLE, 0, 0, 0); };
     match packet::advance_empty_next_packet(
-        index, inst, registration, observed, source, &mut slot.current,
+        index, inst, registration, observed, source, &mut slot.current, cancelable,
     ) {
         Ok(displaced) => {
             if let Some(packet) = displaced {
@@ -868,6 +933,7 @@ pub(super) fn service_start_packet(
     device: u64,
     irp: u64,
     node: u64,
+    cancelable: bool,
     active_reply_cap: u64,
 ) -> (i32, u64, u64, u64) {
     let (index, inst, _) = match authenticated_hosted_device(ch, device, active_reply_cap) {
@@ -895,7 +961,7 @@ pub(super) fn service_start_packet(
         finish_first_packet_cleanup(cleanup, refused);
         return (STATUS_INVALID_HANDLE, 0, 0, 0);
     }
-    let (id, stale_device) = match commit_first_projected_packet(prepared) {
+    let (id, stale_device, cancel_routine) = match commit_first_projected_packet(prepared, cancelable) {
         Ok(result) => result,
         Err(refused) => {
             let refused = release_first_packet_commit_refusal(refused).err();
@@ -908,6 +974,12 @@ pub(super) fn service_start_packet(
             .map(|_| FirstPacketCommitReleaseRefusal::Device(device))
     });
     finish_first_packet_cleanup(cleanup, stale_cleanup);
+    if let Some(routine) = cancel_routine {
+        // ReactOS IoStartPacket: a queued packet whose Cancel flag is already set has its cancel
+        // routine called with the cancel lock still held. It stays a linked queued packet until
+        // that routine removes and completes it.
+        return (STATUS_SUCCESS, routine, 0, START_PACKET_REPLY_CANCEL);
+    }
     let Some(id) = id else { return (STATUS_SUCCESS, 0, 0, 0); };
     let (callback, registered_device, source_irp) = match begin_first_packet_reply(id) {
         Ok(command) => command,

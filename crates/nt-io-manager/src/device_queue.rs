@@ -366,6 +366,31 @@ pub fn remove_entry_device_queue<M: LockedDeviceQueueMemory>(
     Ok(true)
 }
 
+/// Whether `entry` was already unlinked by its owning driver (KeRemoveEntryDeviceQueue or
+/// KeRemoveDeviceQueue under the queue's own lock): it is marked not inserted and is absent from
+/// the validated list. An entry still marked inserted but unreachable is a corrupt queue.
+pub fn entry_detached<M: LockedDeviceQueueMemory>(
+    memory: &M,
+    queue: u64,
+    entry: u64,
+) -> Result<bool, DeviceQueueError<M::Error>> {
+    let state = validated(memory, queue)?;
+    entry_address(queue, entry)?;
+    let packet = memory.entry(entry).map_err(DeviceQueueError::Memory)?;
+    let head = queue + DEVICE_QUEUE_LIST_OFFSET;
+    let mut next = state.flink;
+    while next != head {
+        if next == entry {
+            return Ok(false);
+        }
+        next = memory.entry(next).map_err(DeviceQueueError::Memory)?.flink;
+    }
+    if packet.inserted {
+        return Err(DeviceQueueError::MalformedList);
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 #[path = "device_queue_tests.rs"]
 mod tests;
