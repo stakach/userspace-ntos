@@ -138,7 +138,7 @@ pub use scheduler_yield_restore::{RestoreRetry, SchedulerServiceEnd, SchedulerYi
 mod deferred_reply;
 pub use deferred_reply::{DeferralCapacity, DeferredReplies};
 mod root_pump_wait;
-pub use root_pump_wait::{await_root_pump, RootPumpWait};
+pub use root_pump_wait::{await_root_pump, await_root_pump_refusable, RootPass, RootPumpWait};
 mod kept_tail_chain;
 pub use kept_tail_chain::{run_tails, ChainEnd, TailRun};
 mod service_continuation;

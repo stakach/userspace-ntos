@@ -438,44 +438,54 @@ unsafe fn await_at_root(pump: HostedPumpRestore) -> ServicePump {
     if crate::dispatcher_bootstrap::is_owned() {
         let mut pump = Some(pump);
         let mut finished = None;
+        let mut fenced = false;
         let waited = crate::bootstrap_receive::drive((), || {
             match retry(pump.take().expect("kept root pump")) {
                 PumpProgress::Finished(result) => { finished = Some(result); Ok(Some(true)) }
                 PumpProgress::Unfinished(next) => { pump = Some(next); Ok(None) }
                 PumpProgress::Fenced(next) => {
                     pump = Some(next);
+                    fenced = true;
                     Err(STATUS_UNSUCCESSFUL as u32)
                 }
             }
         });
-        return match (waited, finished) {
-            (Ok(_), Some(result)) => { trace_root(b"boot-finished"); ServicePump::Finished(result) }
-            // The bootstrap owner refused a receive transition, or the pump entered an
-            // uncertain effect: both keep their entered state, and nothing is replayed.
-            _ => ServicePump::Fenced(fence_pump(pump.take().expect("unfinished root pump"),
-                b"boot-uncertain")),
+        let pump = pump.take();
+        return match (waited, finished, pump) {
+            (Ok(_), Some(result), _) => { trace_root(b"boot-finished"); ServicePump::Finished(result) }
+            (_, _, Some(pump)) if fenced => ServicePump::Fenced(fence_pump(pump, b"boot-uncertain")),
+            // The bootstrap owner refused a receive transition: a refusal, not an effect. The
+            // pump stays owned and unchanged for the caller's retained owner.
+            (_, _, Some(pump)) => { trace_root(b"boot-refused"); ServicePump::RootTurn(RootTurnPump { pump }) }
+            (_, Some(result), None) => ServicePump::Finished(result),
+            (_, None, None) => unreachable!("a root wait always keeps its pump or its result"),
         };
     }
     if !crate::service_sec_image::root_wait_may_block() {
         trace_root(b"root-turn");
         return ServicePump::RootTurn(RootTurnPump { pump });
     }
-    let transport = core::cell::Cell::new(false);
-    let waited = nt_component_suspension::await_root_pump(
+    let waited = nt_component_suspension::await_root_pump_refusable(
         pump,
-        || if !transport.get() && crate::service_sec_image::root_progress_pass().is_err() {
-            transport.set(true);
+        || match crate::service_sec_image::root_progress_pass() {
+            Ok(()) => nt_component_suspension::RootPass::Ran,
+            Err(crate::service_sec_image::RootPassError::Transport) =>
+                nt_component_suspension::RootPass::Refused,
         },
-        |pump| if transport.get() { PumpProgress::Fenced(pump) } else { retry(pump) },
+        |pump| retry(pump),
     );
-    let transport = transport.get();
     match waited {
         nt_component_suspension::RootPumpWait::Finished(result) => {
             trace_root(b"finished");
             ServicePump::Finished(result)
         }
-        nt_component_suspension::RootPumpWait::Fenced(pump) => ServicePump::Fenced(fence_pump(
-            pump, if transport { b"root-transport" } else { b"root-uncertain" })),
+        nt_component_suspension::RootPumpWait::Fenced(pump) =>
+            ServicePump::Fenced(fence_pump(pump, b"root-uncertain")),
+        // A root pass stopped before its receive; its owner keeps that step's entered state.
+        nt_component_suspension::RootPumpWait::Retained(pump) => {
+            trace_root(b"root-pass-refused");
+            ServicePump::RootTurn(RootTurnPump { pump })
+        }
     }
 }
 
