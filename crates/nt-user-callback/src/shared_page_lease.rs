@@ -481,6 +481,76 @@ impl<const N: usize> SharedPageAuthority<N> {
     }
 }
 
+/// What [`SharedPageAuthority`] held before an audit-mode repair: the evidence for a violation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedPageAuditHolder {
+    None,
+    Reserved(u64),
+    Active(u64),
+    Restoring(u64),
+    Uncertain(u64),
+}
+
+impl<const N: usize> SharedPageAuthority<N> {
+    /// The dispatch currently holding the page, for audit reports.
+    pub fn audit_holder(&self) -> SharedPageAuditHolder {
+        match self.current {
+            None => SharedPageAuditHolder::None,
+            Some(PageAuthorityState::Reserved(owner))
+            | Some(PageAuthorityState::UncertainReservation(owner)) => {
+                SharedPageAuditHolder::Reserved(owner.dispatch_id)
+            }
+            Some(PageAuthorityState::Active(owner)) => {
+                SharedPageAuditHolder::Active(owner.dispatch.dispatch_id)
+            }
+            Some(PageAuthorityState::Restoring(owner, _)) => {
+                SharedPageAuditHolder::Restoring(owner.dispatch.dispatch_id)
+            }
+            Some(PageAuthorityState::Uncertain(owner, _)) => {
+                SharedPageAuditHolder::Uncertain(owner.dispatch.dispatch_id)
+            }
+        }
+    }
+
+    /// Audit-mode repair after a refused transition: `identity` becomes the active writer and any
+    /// parked entry of its dispatch is dropped. Enforcing mode never calls this.
+    pub fn audit_force_active(&mut self, identity: SharedPageLeaseIdentity) {
+        self.audit_drop_parked(identity.dispatch.dispatch_id);
+        self.current = Some(PageAuthorityState::Active(identity));
+    }
+
+    /// Audit-mode repair: `identity` is parked (replacing any parked entry of its dispatch) and
+    /// the page has no writer. A full table drops the oldest entry.
+    pub fn audit_force_park(&mut self, identity: SharedPageLeaseIdentity, snapshot: SharedPageSnapshot) {
+        self.audit_drop_parked(identity.dispatch.dispatch_id);
+        let slot = match self.parked.iter().position(Option::is_none) {
+            Some(slot) => slot,
+            None => 0,
+        };
+        self.parked[slot] = Some((identity, snapshot));
+        self.current = None;
+    }
+
+    /// Audit-mode repair: the page has no writer, and `dispatch_id` holds no parked entry.
+    pub fn audit_force_clear(&mut self, dispatch_id: u64) {
+        self.audit_drop_parked(dispatch_id);
+        self.current = None;
+    }
+
+    fn audit_drop_parked(&mut self, dispatch_id: u64) {
+        for slot in self.parked.iter_mut() {
+            if slot.as_ref().is_some_and(|(owner, _)| owner.dispatch.dispatch_id == dispatch_id) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Whether a writer holds the page (reserved, active, restoring or pinned).
+    pub fn is_held(&self) -> bool {
+        self.current.is_some()
+    }
+}
+
 impl<const N: usize> Default for SharedPageAuthority<N> {
     fn default() -> Self { Self::new() }
 }

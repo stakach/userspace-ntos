@@ -10,7 +10,8 @@ pub use private_arg_stage::{ArgStageError, DirtyArgSpan, PrivateArgStage};
 pub use shared_page_lease::{
     SharedPageClientIdentity, SharedPageLeaseError, SharedPageLeaseIdentity,
     SharedPageProvisionalIdentity, SharedPageReservationEffect,
-    SharedPageAuthority, SharedPageLeaseStack, SharedPageRestoreEffect, SharedPageSnapshot,
+    SharedPageAuditHolder, SharedPageAuthority, SharedPageLeaseStack, SharedPageRestoreEffect,
+    SharedPageSnapshot,
 };
 pub use dispatch_return::{DispatchReturn, DispatchReturnError, DispatchReturnReceipt};
 mod windowproc;

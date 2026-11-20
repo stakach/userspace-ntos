@@ -461,6 +461,36 @@ pub(crate) unsafe fn try_capture_exact_shared_resume_snapshot(
     Some(snapshot)
 }
 
+/// #419: a resumed dispatch yields again; its captured page is parked with the authority.
+pub(crate) unsafe fn reparked(
+    snapshot: SharedResumeSnapshot,
+    dispatch: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+    site: &[u8],
+) -> SharedResumeSnapshot {
+    crate::win32k_shared_page_authority::audit_park(
+        nt_user_callback::SharedPageLeaseIdentity { dispatch, client: shared_page_client_identity(client) },
+        snapshot.lease_snapshot(client),
+        site,
+    );
+    snapshot
+}
+
+/// As [`reparked`], for an exact capture that may have found the page changed.
+pub(crate) unsafe fn reparked_exact(
+    snapshot: Option<SharedResumeSnapshot>,
+    dispatch: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+    site: &[u8],
+) -> Option<SharedResumeSnapshot> {
+    crate::win32k_shared_page_authority::audit_park(
+        nt_user_callback::SharedPageLeaseIdentity { dispatch, client: shared_page_client_identity(client) },
+        snapshot.as_ref().and_then(|snapshot| snapshot.lease_snapshot(client)),
+        site,
+    );
+    snapshot
+}
+
 #[track_caller]
 pub(crate) unsafe fn capture_shared_resume_snapshot(
     dispatch: nt_user_callback::DispatchContext,
@@ -615,8 +645,23 @@ pub(crate) unsafe fn select_and_restore_shared_resume_snapshot(
     dispatch: nt_user_callback::DispatchContext,
     client: Win32kClientContext,
 ) -> (bool, bool) {
+    let identity = nt_user_callback::SharedPageLeaseIdentity {
+        dispatch, client: shared_page_client_identity(client),
+    };
+    // #419: the parked dispatch takes the page back before restoring its publication.
+    crate::win32k_shared_page_authority::audit_reacquire(identity, b"resume");
     let selected = super::select_win32k_client_window(client);
-    let restored = selected && restore_shared_resume_snapshot(snapshot, dispatch, client);
+    let restored = selected && match restore_shared_resume_snapshot_effect(snapshot, dispatch, client) {
+        SharedResumeRestoreEffect::Applied(page) => {
+            crate::win32k_shared_page_authority::audit_restored(
+                identity, page.lease_snapshot(client), b"resume");
+            true
+        }
+        SharedResumeRestoreEffect::NoPageWrite | SharedResumeRestoreEffect::Uncertain => {
+            crate::win32k_shared_page_authority::audit_restored(identity, None, b"resume");
+            false
+        }
+    };
     (selected, restored)
 }
 

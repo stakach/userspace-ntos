@@ -209,7 +209,7 @@ pub(crate) unsafe fn settle_nested_restore_result(
             request,
             dispatch: snapshot.dispatch,
             client: snapshot.client,
-            shared_resume: try_capture_exact_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+            shared_resume: reparked_exact(try_capture_exact_shared_resume_snapshot(snapshot.dispatch, snapshot.client), snapshot.dispatch, snapshot.client, b"receive-repark:212"),
             nested_user_callback: pending.origin.nested_user_callback,
             arg_snapshot_len: snapshot.arg_snapshot_len,
             arg_snapshot: snapshot.arg_snapshot,
@@ -1097,9 +1097,9 @@ pub(crate) unsafe fn resume_suspended_root_maintenance_component(
             yielded,
             snapshot: SuspendedPumpSnapshot {
                 pump, channel, callback_token: None,
-                shared_resume: capture_shared_resume_snapshot(
+                shared_resume: reparked(capture_shared_resume_snapshot(
                     pending.snapshot.dispatch, pending.snapshot.client,
-                ),
+                ), pending.snapshot.dispatch, pending.snapshot.client, b"receive-repark:1100"),
                 ..pending.snapshot
             },
         }) };
@@ -1121,9 +1121,9 @@ pub(crate) unsafe fn resume_suspended_root_maintenance_component(
             yielded,
             snapshot: SuspendedPumpSnapshot {
                 pump, channel, callback_token: None,
-                shared_resume: capture_shared_resume_snapshot(
+                shared_resume: reparked(capture_shared_resume_snapshot(
                     pending.snapshot.dispatch, pending.snapshot.client,
-                ),
+                ), pending.snapshot.dispatch, pending.snapshot.client, b"receive-repark:1124"),
                 ..pending.snapshot
             },
         }) };
@@ -1157,7 +1157,7 @@ unsafe fn classify_returned_win32k_pump(
             request,
             dispatch: snapshot.dispatch,
             client: snapshot.client,
-            shared_resume: try_capture_exact_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+            shared_resume: reparked_exact(try_capture_exact_shared_resume_snapshot(snapshot.dispatch, snapshot.client), snapshot.dispatch, snapshot.client, b"receive-repark:1160"),
             nested_user_callback: false,
             arg_snapshot_len: snapshot.arg_snapshot_len,
             arg_snapshot: snapshot.arg_snapshot,
@@ -1200,7 +1200,7 @@ pub(crate) unsafe fn classify_root_ingress_unwind_result(
             yielded,
             snapshot: SuspendedPumpSnapshot {
                 pump, callback_token: None,
-                shared_resume: capture_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+                shared_resume: reparked(capture_shared_resume_snapshot(snapshot.dispatch, snapshot.client), snapshot.dispatch, snapshot.client, b"receive-repark:1203"),
                 ..snapshot
             },
         }));
@@ -1218,7 +1218,7 @@ pub(crate) unsafe fn classify_root_ingress_unwind_result(
             yielded,
             snapshot: SuspendedPumpSnapshot {
                 pump, callback_token: None,
-                shared_resume: capture_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+                shared_resume: reparked(capture_shared_resume_snapshot(snapshot.dispatch, snapshot.client), snapshot.dispatch, snapshot.client, b"receive-repark:1221"),
                 ..snapshot
             },
         }));
@@ -1325,7 +1325,7 @@ pub(crate) unsafe fn resume_suspended_receive_component(
                 dispatch: pending.snapshot.dispatch,
                 client: pending.snapshot.client,
                 callback_token: None,
-                shared_resume: capture_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),
+                shared_resume: reparked(capture_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client), pending.snapshot.dispatch, pending.snapshot.client, b"receive-repark:1328"),
                 arg_snapshot_len: pending.snapshot.arg_snapshot_len,
                 arg_snapshot: pending.snapshot.arg_snapshot,
             },
@@ -1344,7 +1344,7 @@ pub(crate) unsafe fn resume_suspended_receive_component(
             request,
             dispatch: pending.snapshot.dispatch,
             client: pending.snapshot.client,
-            shared_resume: try_capture_exact_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),
+            shared_resume: reparked_exact(try_capture_exact_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client), pending.snapshot.dispatch, pending.snapshot.client, b"receive-repark:1347"),
             nested_user_callback: false,
             arg_snapshot_len: pending.snapshot.arg_snapshot_len,
             arg_snapshot: pending.snapshot.arg_snapshot,
@@ -1491,7 +1491,7 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
             yielded,
             snapshot: SuspendedPumpSnapshot {
                 pump, channel, callback_token: pending.snapshot.callback_token,
-                shared_resume: capture_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),
+                shared_resume: reparked(capture_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client), pending.snapshot.dispatch, pending.snapshot.client, b"receive-repark:1494"),
                 ..pending.snapshot
             },
         });

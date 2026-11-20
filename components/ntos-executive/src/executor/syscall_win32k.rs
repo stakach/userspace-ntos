@@ -288,6 +288,10 @@ pub(super) unsafe fn syscall_win32k_route(
     trace_cursor_lookup_owner(
         "dispatch-id", dispatch_client, lp.msg.m0, dispatch_id, None, false, false, false,
     );
+    // #419: nothing else may hold the shared page when a fresh call stages into it.
+    crate::win32k_shared_page_authority::audit_root_free(
+        dispatch_id, win32k_glue::shared_page_client_identity(dispatch_client), b"root-ingress",
+    );
     // CROSS-AS ARG MARSHALING. NtUserProcessConnect(handle, USERCONNECT* buf, size): the
     // buffer is a client user pointer (usually its stack) NOT mapped in win32k's VSpace.
     // Passing it raw makes win32k's handler fault/spin on an address win32k_dispatch can't

@@ -6950,6 +6950,11 @@ pub(crate) fn ssn_hist_bucket(ssn: u64) -> Option<usize> {
 pub(crate) fn print_native_ssn_time() {
     let total = EXEC_DISPATCH_TICKS.load(Ordering::Relaxed);
     let calls = EXEC_DISPATCH_CALLS.load(Ordering::Relaxed);
+    print_str(b"[census] w32k-page-authority enforcing=");
+    print_u64(win32k_shared_page_authority::ENFORCING as u64);
+    print_str(b" violations=");
+    print_u64(win32k_shared_page_authority::violations());
+    print_str(b"\n");
     print_str(b"[census] native-time total_Mtick=");
     print_u64(total / 1_000_000);
     print_str(b" dispatches=");

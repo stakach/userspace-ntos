@@ -369,3 +369,26 @@ fn wrong_applied_restore_quarantines_both_page_owners() {
         .err().expect("wrong applied bytes fence all future publication");
     assert_eq!(reply.0.get(), 92);
 }
+
+#[test]
+fn audit_repairs_leave_the_authority_consistent_for_the_next_transition() {
+    let mut authority = SharedPageAuthority::<4>::new();
+    let first = identity(10, 1);
+    let second = identity(11, 1);
+    assert_eq!(authority.audit_holder(), SharedPageAuditHolder::None);
+    authority.enter(first, ()).unwrap();
+    assert_eq!(authority.audit_holder(), SharedPageAuditHolder::Active(10));
+    // A missed park: the second dispatch is refused, then audit forces it active.
+    assert_eq!(authority.enter(second, ()).err().map(|(error, _)| error), Some(SharedPageLeaseError::NotTop));
+    authority.audit_force_active(second);
+    assert_eq!(authority.audit_holder(), SharedPageAuditHolder::Active(11));
+    // A forced park is reacquirable and a forced clear forgets the dispatch.
+    authority.audit_force_park(second, snapshot(second, 7));
+    assert!(!authority.is_held());
+    assert_eq!(authority.reacquire(second), Ok(snapshot(second, 7)));
+    authority.audit_force_clear(11);
+    assert!(!authority.is_held());
+    assert_eq!(authority.reacquire(second), Err(SharedPageLeaseError::Empty));
+    authority.enter(first, ()).unwrap();
+    authority.finish_active(first).unwrap();
+}

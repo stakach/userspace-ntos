@@ -59,7 +59,7 @@ pub(crate) use pending_dispatch::{
 };
 use pending_dispatch::{
     capture_initial_arg_snapshot, capture_lpc_wait_repark, capture_provider_wait_repark,
-    capture_shared_resume_snapshot,
+    capture_shared_resume_snapshot, reparked, reparked_exact,
     SuspendedPumpSnapshot,
     LPC_WAIT_LAST_PUMP_SUSPENDED, LPC_WAIT_PENDING_DISPATCH, PROVIDER_WAIT_LAST_PUMP_SUSPENDED,
     PROVIDER_WAIT_PENDING_DISPATCH,
@@ -5050,7 +5050,7 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
             yielded,
             snapshot: SuspendedPumpSnapshot {
                 pump, channel, dispatch: pending.dispatch, client: pending.client,
-                shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
+                shared_resume: reparked(capture_shared_resume_snapshot(pending.dispatch, pending.client), pending.dispatch, pending.client, b"glue-repark:5053"),
                 callback_token: None,
                 arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
             },
@@ -5106,6 +5106,13 @@ unsafe fn complete_resumed_dispatch(
     arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
     pump: crate::spawn_hosts::PumpResult,
 ) -> ProviderWaitPumpCompletion {
+    // #419: a resumed dispatch returned; the page has no writer.
+    crate::win32k_shared_page_authority::audit_finish(
+        nt_user_callback::SharedPageLeaseIdentity {
+            dispatch, client: shared_page_client_identity(client),
+        },
+        b"resumed-return",
+    );
     if !complete_wait_resumed_user_callback_dispatch(
         client,
         dispatch.dispatch_id,
@@ -5285,7 +5292,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
             yielded,
             snapshot: SuspendedPumpSnapshot {
                 pump, channel, dispatch: pending.dispatch, client: pending.client,
-                shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
+                shared_resume: reparked(capture_shared_resume_snapshot(pending.dispatch, pending.client), pending.dispatch, pending.client, b"glue-repark:5288"),
                 callback_token: None,
                 arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
             },
@@ -5301,7 +5308,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
             request,
             dispatch: pending.dispatch,
             client: pending.client,
-            shared_resume: try_capture_exact_shared_resume_snapshot(pending.dispatch, pending.client),
+            shared_resume: reparked_exact(try_capture_exact_shared_resume_snapshot(pending.dispatch, pending.client), pending.dispatch, pending.client, b"glue-repark:5304"),
             nested_user_callback: pending.nested_user_callback,
             arg_snapshot_len: pending.arg_snapshot_len,
             arg_snapshot: pending.arg_snapshot,
@@ -6202,7 +6209,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             snapshot: SuspendedPumpSnapshot {
                 pump: component, channel, dispatch: dispatch_context,
                 client: completed_context, callback_token: Some(callback_token),
-                shared_resume: capture_shared_resume_snapshot(dispatch_context, completed_context),
+                shared_resume: reparked(capture_shared_resume_snapshot(dispatch_context, completed_context), dispatch_context, completed_context, b"glue-repark:6205"),
                 arg_snapshot_len, arg_snapshot,
             },
         };
@@ -6225,7 +6232,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             request: wait_request,
             dispatch: dispatch_context,
             client: completed_context,
-            shared_resume: try_capture_exact_shared_resume_snapshot(dispatch_context, completed_context),
+            shared_resume: reparked_exact(try_capture_exact_shared_resume_snapshot(dispatch_context, completed_context), dispatch_context, completed_context, b"glue-repark:6228"),
             nested_user_callback,
             arg_snapshot_len,
             arg_snapshot,
@@ -8002,6 +8009,13 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
         }
     }
+    // #419: the page's writer from here until this dispatch parks or completes.
+    crate::win32k_shared_page_authority::audit_enter(
+        nt_user_callback::SharedPageLeaseIdentity {
+            dispatch, client: shared_page_client_identity(client),
+        },
+        b"funnel-publish",
+    );
     let previous_dispatch = publish_initial_win32k_request(
         dispatch, request_kind, client, [a0, a1, a2, a3], stack_args,
         nested_user_callback, dispatch_context_out,
@@ -8038,8 +8052,17 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch,
         );
+        let job_settled = result.as_ref().is_ok_and(|(_, completed)| *completed);
+        if job_settled {
+            crate::win32k_shared_page_authority::audit_finish(
+                nt_user_callback::SharedPageLeaseIdentity {
+                    dispatch, client: shared_page_client_identity(client),
+                },
+                b"kernel-job-complete",
+            );
+        }
         if let Some(ticket) = displaced_parent {
-            let terminal = result.as_ref().is_ok_and(|(_, completed)| *completed);
+            let terminal = job_settled;
             if !crate::nested_restore_owner::finish_displacing_child(
                 ticket, dispatch, client, terminal, None,
             ) {
@@ -8433,6 +8456,27 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             || pr.maintenance_yield.is_some()
             || pr.nested_restore_yield.is_some()
             || pr.nested_restore_quarantined.is_some();
+    }
+    {
+        // #419: a yielding dispatch parks its exact page; a returned one leaves the page free.
+        let yielded = pr.callback_suspended || pr.provider_wait_suspended()
+            || pr.lpc_wait_suspended || pr.receive_yield().is_some()
+            || pr.root_ingress_yield().is_some() || pr.service_wait_yield.is_some()
+            || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
+            || pr.nested_restore_quarantined.is_some();
+        let identity = nt_user_callback::SharedPageLeaseIdentity {
+            dispatch, client: shared_page_client_identity(client),
+        };
+        if yielded {
+            crate::win32k_shared_page_authority::audit_park(
+                identity,
+                try_capture_exact_shared_resume_snapshot(dispatch, client)
+                    .and_then(|snapshot| snapshot.lease_snapshot(client)),
+                b"funnel-yield",
+            );
+        } else {
+            crate::win32k_shared_page_authority::audit_finish(identity, b"funnel-return");
+        }
     }
     if let Some(ticket) = displaced_parent {
         let child_suspended = pr.callback_suspended || pr.provider_wait_suspended()

@@ -196,7 +196,7 @@ fn receive_and_service_wait_restore_their_own_shared_publication_before_receivin
     .unwrap();
     let helper = function(&pending, "select_and_restore_shared_resume_snapshot");
     assert!(call_position(helper, "select_win32k_client_window").unwrap()
-        < call_position(helper, "restore_shared_resume_snapshot").unwrap(),
+        < call_position(helper, "restore_shared_resume_snapshot_effect").unwrap(),
         "the selected client must own the page before its publication is restored");
     for (name, continuation) in [
         ("resume_suspended_receive_component", "component_pump_continue_receive"),

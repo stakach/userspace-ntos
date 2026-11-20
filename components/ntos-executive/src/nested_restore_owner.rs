@@ -338,6 +338,8 @@ pub(crate) unsafe fn capture_displaced_shared_resume(
             let _ = row.frame.quarantine_receive(key);
             return Some(Err(()));
         }
+        // #419: the parent yields the page to its nested child.
+        crate::win32k_shared_page_authority::audit_park(identity, Some(page), b"nested-displace");
         row.displaced_shared_resume = Some(snapshot);
         return Some(Ok(ticket));
     }
