@@ -40,6 +40,9 @@ impl ServiceReply {
 pub(crate) enum ServiceStep {
     /// `ZwUnloadDriver` from a hosted driver: finish the unload and reply its status.
     ZwUnloadDriver(crate::driver_launch::hosted_zw_load_driver::PendingZwUnload),
+    /// `ZwLoadDriver` from a hosted driver: the rest of DriverEntry's load (publication,
+    /// reinitialization callbacks, rollback) and its status.
+    ZwLoadDriver(crate::driver_launch::hosted_zw_load_driver::PendingZwLoad),
     /// A hosted dependent's provider export: the dispatch's finish and the export's tail.
     ProviderExport(crate::driver_launch::ProviderExportStep),
     /// A routed WDDM bridge call from win32k: the worker finish and the caller write-back.
@@ -71,6 +74,19 @@ impl ServiceStep {
     /// Run the step once at a root boundary, where X is parked: a CONNECT park is handed to
     /// X's restored receive instead of being made here.
     pub(crate) unsafe fn answer(self, result: crate::spawn_hosts::PumpResult) -> ServiceAnswer {
+        if let Self::ZwLoadDriver(pending) = self {
+            use crate::driver_launch::hosted_zw_load_driver::ZwLoadRun;
+            return match pending.complete(result) {
+                ZwLoadRun::Reply(status) => ServiceAnswer::Reply(ServiceReply::status(status)),
+                // A reinitialization callback stopped unfinished: it continues this same row.
+                ZwLoadRun::Kept(kept, pending) => match kept.register(
+                    continuing_slot(), Self::ZwLoadDriver(pending),
+                ) {
+                    Ok(()) => ServiceAnswer::Reply(ServiceReply::status(nt_status::NtStatus::PENDING.raw())),
+                    Err((uncertain, step)) => step.answer(uncertain),
+                },
+            };
+        }
         let Self::ConnectSubmit(pending) = self else {
             return ServiceAnswer::Reply(self.complete(result));
         };
@@ -105,6 +121,12 @@ impl ServiceStep {
                 },
             },
             Self::ZwUnloadDriver(pending) => ServiceReply::status(pending.finish(result)),
+            // Runs where the service runs: a further kept pump has no row of its own here, so
+            // it is answered on the uncertain result through `answer`.
+            Self::ZwLoadDriver(_) => match self.answer(result) {
+                ServiceAnswer::Reply(reply) => reply,
+                ServiceAnswer::ParkConnect(_) => unreachable!("a load never parks a CONNECT"),
+            },
             Self::ProviderExport(step) => ServiceReply::status(step.complete(result) as u32 as i32),
             Self::ProviderCallback(step) =>
                 ServiceReply { info: None, words: [step.complete(result), 0, 0, 0] },
@@ -277,6 +299,24 @@ pub(in crate::driver_launch) unsafe fn settle(pump: HostedPumpRestore) -> Servic
                 None => settle_parentless(unfinished),
             },
         },
+    }
+}
+
+/// Settle a `RecvFirst` pump whose caller parked lane X itself (DriverEntry). An unfinished
+/// pump keeps the caller's parent, which is therefore not restored early; a finished one
+/// leaves the parent with the caller, which restores it as before.
+pub(in crate::driver_launch) unsafe fn settle_parked(
+    pump: HostedPumpRestore, parent: &mut Option<nested::ParkedParentHandle>,
+) -> ServicePump {
+    let unfinished = !matches!(pump, HostedPumpRestore::Restored(_)
+        | HostedPumpRestore::Unattributed(_) | HostedPumpRestore::Retained { .. });
+    match parent.take() {
+        Some(handle) if unfinished =>
+            ServicePump::Kept(KeptPump { pump, parent: KeptParent::Parked(handle) }),
+        handle => {
+            *parent = handle;
+            settle(pump)
+        }
     }
 }
 

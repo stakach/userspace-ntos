@@ -43177,13 +43177,26 @@ unsafe fn load_hosted_auxiliary_image(
 ///
 /// Fault-contained: the component's DriverEntry faults land on ITS fault EP (this loop demand-maps
 /// benign pages + reports a wall) — a driver crash never brings down the executive root.
-pub(crate) unsafe fn load_driver(
+pub(crate) unsafe fn begin_load_driver(
     fs: &Fat32,
     path: &[u8],
     class: DriverClass,
     driver_object_path: &str,
     caller: nt_process::native_handle::NativeHandleCaller,
-) -> Result<DriverComponent, nt_status::NtStatus> {
+) -> DriverLoad {
+    match begin_load_driver_checked(fs, path, class, driver_object_path, caller) {
+        Ok(load) => load,
+        Err(status) => DriverLoad::Done(Err(status)),
+    }
+}
+
+unsafe fn begin_load_driver_checked(
+    fs: &Fat32,
+    path: &[u8],
+    class: DriverClass,
+    driver_object_path: &str,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> Result<DriverLoad, nt_status::NtStatus> {
     let (caps, _wants_device_caps) = caps_and_layout_for(class);
     if !caps.dispatch_server {
         // The GUI syscall server (win32k) is NOT routed through the general IRP path.
@@ -43209,13 +43222,103 @@ pub(crate) unsafe fn load_driver(
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
 
-    let loaded = load_driver_reserved(fs, path, driver_object_path, instance, caller);
-    if let Err(load_status) = loaded {
+    let progress = match load_driver_reserved(fs, path, driver_object_path, instance, caller) {
+        Ok(progress) => progress,
+        Err(status) => LoadProgress::Done(Err(status)),
+    };
+    Ok(PendingLoadRest::settle(progress, instance, driver_object_path))
+}
+
+/// Load one driver for a caller that owns no continuation: a root-level caller waits for the
+/// true result. A kept pump needs a lane's parked parent, which a root caller never has.
+pub(crate) unsafe fn load_driver(
+    fs: &Fat32,
+    path: &[u8],
+    class: DriverClass,
+    driver_object_path: &str,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> Result<DriverComponent, nt_status::NtStatus> {
+    match begin_load_driver(fs, path, class, driver_object_path, caller) {
+        DriverLoad::Done(result) => result,
+        DriverLoad::Kept(pending) => Err(pending.fence()),
+    }
+}
+
+/// How a driver load ended for its caller.
+pub(crate) enum DriverLoad {
+    Done(Result<DriverComponent, nt_status::NtStatus>),
+    /// A pump of the load is still running while the calling lane is parked for it; the
+    /// caller's service keeps [`PendingDriverLoad`].
+    Kept(PendingDriverLoad),
+}
+
+#[must_use = "an entered DriverEntry is owed its finish"]
+pub(crate) struct PendingDriverLoad {
+    pub(crate) kept: component_scheduler::service_continuation::KeptPump,
+    pub(crate) rest: PendingLoadRest,
+}
+
+impl PendingDriverLoad {
+    /// No service can keep this load: fence its pump and finish on the uncertain result.
+    unsafe fn fence(self) -> nt_status::NtStatus {
+        let mut pending = self;
+        loop {
+            let pr = pending.kept.fence();
+            match pending.rest.finish(pr) {
+                DriverLoad::Done(Ok(_)) => return nt_status::NtStatus::UNSUCCESSFUL,
+                DriverLoad::Done(Err(status)) => return status,
+                DriverLoad::Kept(next) => pending = next,
+            }
+        }
+    }
+}
+
+/// The rest of a load after a kept pump, including its rollback.
+pub(crate) struct PendingLoadRest {
+    stage: LoadStage,
+    instance: usize,
+    driver_object_path: alloc::string::String,
+}
+
+impl PendingLoadRest {
+    unsafe fn settle(
+        progress: LoadProgress, instance: usize, driver_object_path: &str,
+    ) -> DriverLoad {
+        match progress {
+            LoadProgress::Done(loaded) => DriverLoad::Done(rollback_failed_load(
+                instance, driver_object_path, loaded)),
+            LoadProgress::Kept(kept, stage) => {
+                let mut path = alloc::string::String::new();
+                if path.try_reserve_exact(driver_object_path.len()).is_err() {
+                    // Without its path the rest cannot be kept: finish on the uncertain result.
+                    let pr = kept.fence();
+                    return Self::settle(stage.finish(pr), instance, driver_object_path);
+                }
+                path.push_str(driver_object_path);
+                DriverLoad::Kept(PendingDriverLoad {
+                    kept, rest: Self { stage, instance, driver_object_path: path },
+                })
+            }
+        }
+    }
+
+    /// Continue the load on the kept pump's true result.
+    pub(crate) unsafe fn finish(self, pr: crate::spawn_hosts::PumpResult) -> DriverLoad {
+        let Self { stage, instance, driver_object_path } = self;
+        Self::settle(stage.finish(pr), instance, &driver_object_path)
+    }
+}
+
+unsafe fn rollback_failed_load(
+    instance: usize, driver_object_path: &str,
+    loaded: Result<DriverComponent, nt_status::NtStatus>,
+) -> Result<DriverComponent, nt_status::NtStatus> {
+    if let Err(load_status) = loaded.as_ref() {
         if let Err(status) = clear_instance(instance) {
             // The loader has already entered native effects. A refused rollback leaves an
             // instance that is neither live nor free: retain it with its identity, report the
             // original load status, and let a later retirement finish the physical cleanup.
-            quarantine_failed_launch(instance, driver_object_path, load_status, status);
+            quarantine_failed_launch(instance, driver_object_path, *load_status, status);
         }
     }
     loaded
@@ -43286,7 +43389,7 @@ unsafe fn load_driver_reserved(
     driver_object_path: &str,
     instance: usize,
     caller: nt_process::native_handle::NativeHandleCaller,
-) -> Result<DriverComponent, nt_status::NtStatus> {
+) -> Result<LoadProgress, nt_status::NtStatus> {
     let Some(win) = ExecVaWindow::try_for_instance(instance) else {
         print_str(b"[driver-launch] instance VA window exhausted inst=");
         print_u64(instance as u64);
@@ -43838,6 +43941,11 @@ unsafe fn load_driver_reserved(
             nt_status::NtStatus::DEVICE_BUSY
         }
     })?;
+    // Owned before the caller's lane is parked: the load's tail may outlive this frame.
+    let mut driver_object_path_owned = alloc::string::String::new();
+    driver_object_path_owned.try_reserve_exact(driver_object_path.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    driver_object_path_owned.push_str(driver_object_path);
     let mut parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     crate::spawn_hosts::shared_ingress::owner::runtime::start_bootstrap(
@@ -43885,168 +43993,273 @@ unsafe fn load_driver_reserved(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
+    let tail = LoadTail {
+        component: DriverComponent {
+            pml4,
+            fault_ep,
+            drvobj: 0,
+            add_device: 0,
+            driver_unload: 0,
+            verdict: 0,
+            finished: false,
+            exec_shared_va: win.shared_va,
+            exec_pool_va: win.pool_va,
+            exec_stack_va: win.stack_va,
+            exec_arg_va: win.arg_va,
+            image_frames: img_frames,
+            image_frame_base,
+            exception_snapshot_frame_base: 0,
+            exception_snapshot_frames: 0,
+            exception_snapshot_bytes: 0,
+            seh_linkage,
+            pool_frame_base: pool_base,
+            data_frame_base: data_base,
+            shared_frame_base: shared_base,
+            arg_frame_base: arg_base,
+            stack_frame_base,
+            stack_frame_count: sc.stack_frame_count,
+            exec_thunk_va,
+            run_thunk_va,
+            thunk_len,
+            thunk_next,
+            instance,
+            hosted_domain_id: domain.hosted_domain_id,
+            hosted_domain_cookie: domain.hosted_domain_cookie,
+            driver_id,
+            tcb,
+            main_thread_id,
+            cnode,
+            raw_cnode,
+            sched_context,
+            map_cap_bank,
+            reply_cap: 0,
+        },
+        domain,
+        provider: hosted_provider_leaf_from_path(path),
+        primary_singleton: planned_images.primary_offset == 0,
+        primary_offset: planned_images.primary_offset,
+        primary_exec_va,
+        primary_run_va,
+        image_len,
+        run_va,
+        support_count: support_images.count,
+        driver_object_path: driver_object_path_owned,
+    };
+    let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
+    use component_scheduler::service_continuation::ServicePump;
+    // A DriverEntry still running while the caller's lane is parked keeps that parent (#420):
+    // the caller's service owns the rest of the load, and nothing is published or rolled back.
+    let pr = match component_scheduler::service_continuation::settle_parked(pump, &mut parent) {
+        ServicePump::Kept(kept) => return Ok(LoadProgress::Kept(kept, LoadStage::DriverEntry(tail))),
+        ServicePump::Finished(pr) | ServicePump::Fenced(pr) => pr,
+        ServicePump::RootTurn(turn) => turn.fence_unowned(),
+    };
     crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(&mut parent)
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
-    let faults = pr.faults;
-    let demand = pr.demand;
-    let finished = pr.completed;
-    let active_reply_cap = pr.reply_cap;
-    let (wall_ip, wall_addr, wall_label) = (pr.wall_ip, pr.wall_addr, pr.wall_label);
+    Ok(tail.finish(pr))
+}
 
-    let verdict = read_volatile((win.shared_va + SH_VERDICT) as *const u32);
-    let de_status = read_volatile((win.shared_va + SH_DE_STATUS) as *const i32);
-    let support_status = read_volatile((win.shared_va + SH_SUPPORT_DE_STATUS) as *const i32);
-    let support_verdict = read_volatile((win.shared_va + SH_SUPPORT_VERDICT) as *const u32);
-    let drvobj = read_volatile((win.shared_va + SH_DRVOBJ) as *const u64);
-    let driver_unload = read_volatile((win.shared_va + SH_DRIVER_UNLOAD) as *const u64);
-    let add_device = read_volatile((win.shared_va + SH_ADD_DEVICE) as *const u64);
-    print_str(b"[npfs-svc] DriverEntry ");
-    if finished {
-        print_str(b"RETURNED status=0x");
-        print_hex(de_status as u32);
-    } else {
-        print_str(b"STOPPED label=");
-        print_u64(wall_label);
-        print_str(b" ip=0x");
-        print_hex(wall_ip as u32);
-        print_str(b" RVA=0x");
-        print_hex(wall_ip.wrapping_sub(run_va) as u32);
-        print_str(b" addr=0x");
-        print_hex((wall_addr >> 32) as u32);
-        print_hex(wall_addr as u32);
-    }
-    print_str(b" verdict=0x");
-    print_hex(verdict);
-    print_str(b" faults=");
-    print_u64(faults);
-    print_str(b" demand=");
-    print_u64(demand);
-    if support_images.count != 0 {
-        print_str(b" support_count=");
-        print_u64(support_images.count as u64);
-        print_str(b" support_status=0x");
-        print_hex(support_status as u32);
-        print_str(b" support_verdict=0x");
-        print_hex(support_verdict);
-    }
-    print_str(b" unload=0x");
-    print_hex((driver_unload >> 32) as u32);
-    print_hex(driver_unload as u32);
-    print_str(b"\n");
+/// Everything a load needs once its DriverEntry pump has returned (#420).
+pub(crate) struct LoadTail {
+    component: DriverComponent,
+    domain: DriverInstance,
+    provider: Option<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>,
+    primary_singleton: bool,
+    primary_offset: u64,
+    primary_exec_va: u64,
+    primary_run_va: u64,
+    image_len: u32,
+    run_va: u64,
+    support_count: u32,
+    driver_object_path: alloc::string::String,
+}
 
-    if !finished || !nt_status::NtStatus(de_status).is_success() {
-        print_str(b"[driver-launch] DriverEntry failed; removing ");
-        print_str(driver_object_path.as_bytes());
-        print_str(b"\n");
-        return Err(if finished {
-            nt_status::NtStatus(de_status)
-        } else {
-            nt_status::NtStatus::UNSUCCESSFUL
-        });
+/// A load's progress after one slice.
+pub(crate) enum LoadProgress {
+    Done(Result<DriverComponent, nt_status::NtStatus>),
+    /// A pump of this load is still running while the calling lane is parked for it.
+    Kept(component_scheduler::service_continuation::KeptPump, LoadStage),
+}
+
+/// Which pump of the load is kept.
+pub(crate) enum LoadStage {
+    DriverEntry(LoadTail),
+    /// DriverEntry returned and the driver is published; a reinitialization callback is kept.
+    Reinit(DriverComponent, hosted_driver_reinitialization::ReinitKept),
+}
+
+impl LoadStage {
+    /// Continue the load on the kept pump's true result.
+    pub(crate) unsafe fn finish(self, pr: crate::spawn_hosts::PumpResult) -> LoadProgress {
+        match self {
+            Self::DriverEntry(tail) => tail.finish(pr),
+            Self::Reinit(dc, kept) => continue_reinit(dc, kept.finish(pr)),
+        }
     }
-    if let Some(provider) = hosted_provider_leaf_from_path(path) {
-        record_hosted_provider_load(
-            provider,
-            HostedProviderLoadRole::PrimaryService,
-            instance,
-            image_len,
-        );
-        if planned_images.primary_offset == 0 {
-            let Some(singleton_image_frames) = frames_for_image_len(image_len as u64) else {
-                return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
-            };
-            if !register_hosted_provider_singleton(
-                provider,
-                instance,
-                primary_exec_va,
-                primary_run_va,
-                planned_images.primary_offset,
-                image_len,
-                singleton_image_frames,
-                pool_base,
-                FSD_POOL_FRAMES,
-            ) {
-                return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+}
+
+unsafe fn continue_reinit(
+    dc: DriverComponent, run: hosted_driver_reinitialization::ReinitRun,
+) -> LoadProgress {
+    match run {
+        hosted_driver_reinitialization::ReinitRun::Done(Ok(())) => LoadProgress::Done(Ok(dc)),
+        hosted_driver_reinitialization::ReinitRun::Done(Err(status)) => LoadProgress::Done(Err(status)),
+        hosted_driver_reinitialization::ReinitRun::Kept(kept, reinit) =>
+            LoadProgress::Kept(kept, LoadStage::Reinit(dc, reinit)),
+    }
+}
+
+impl LoadTail {
+    unsafe fn finish(self, pr: crate::spawn_hosts::PumpResult) -> LoadProgress {
+        match self.publish(pr) {
+            Ok(dc) => {
+                let run = hosted_driver_reinitialization::begin_pending_for_instance(
+                    dc.instance, initial_system_driver_caller());
+                continue_reinit(dc, run)
             }
+            Err(status) => LoadProgress::Done(Err(status)),
         }
     }
 
-    if let Err(status) = io_manager_mut().bind_hosted_driver_identity(
-        instance_domain_identity(domain).ok_or(nt_status::NtStatus::UNSUCCESSFUL)?,
-        drvobj,
-        DriverId(driver_id),
-    ) {
-        print_str(b"[driver-launch] hosted DriverObject publish failed status=0x");
-        print_hex(status.raw() as u32);
-        print_str(b" for ");
-        print_str(driver_object_path.as_bytes());
+    /// The post-DriverEntry tail: report, then publish the driver or fail the load.
+    unsafe fn publish(self, pr: crate::spawn_hosts::PumpResult) -> Result<DriverComponent, nt_status::NtStatus> {
+        let Self {
+            mut component, domain, provider, primary_singleton, primary_offset, primary_exec_va,
+            primary_run_va, image_len, run_va, support_count, driver_object_path,
+        } = self;
+        let instance = component.instance;
+        let driver_id = component.driver_id;
+        let shared_va = component.exec_shared_va;
+        let faults = pr.faults;
+        let demand = pr.demand;
+        let finished = pr.completed;
+        let active_reply_cap = pr.reply_cap;
+        let (wall_ip, wall_addr, wall_label) = (pr.wall_ip, pr.wall_addr, pr.wall_label);
+
+        let verdict = read_volatile((shared_va + SH_VERDICT) as *const u32);
+        let de_status = read_volatile((shared_va + SH_DE_STATUS) as *const i32);
+        let support_status = read_volatile((shared_va + SH_SUPPORT_DE_STATUS) as *const i32);
+        let support_verdict = read_volatile((shared_va + SH_SUPPORT_VERDICT) as *const u32);
+        let drvobj = read_volatile((shared_va + SH_DRVOBJ) as *const u64);
+        let driver_unload = read_volatile((shared_va + SH_DRIVER_UNLOAD) as *const u64);
+        let add_device = read_volatile((shared_va + SH_ADD_DEVICE) as *const u64);
+        print_str(b"[npfs-svc] DriverEntry ");
+        if finished {
+            print_str(b"RETURNED status=0x");
+            print_hex(de_status as u32);
+        } else {
+            print_str(b"STOPPED label=");
+            print_u64(wall_label);
+            print_str(b" ip=0x");
+            print_hex(wall_ip as u32);
+            print_str(b" RVA=0x");
+            print_hex(wall_ip.wrapping_sub(run_va) as u32);
+            print_str(b" addr=0x");
+            print_hex((wall_addr >> 32) as u32);
+            print_hex(wall_addr as u32);
+        }
+        print_str(b" verdict=0x");
+        print_hex(verdict);
+        print_str(b" faults=");
+        print_u64(faults);
+        print_str(b" demand=");
+        print_u64(demand);
+        if support_count != 0 {
+            print_str(b" support_count=");
+            print_u64(support_count as u64);
+            print_str(b" support_status=0x");
+            print_hex(support_status as u32);
+            print_str(b" support_verdict=0x");
+            print_hex(support_verdict);
+        }
+        print_str(b" unload=0x");
+        print_hex((driver_unload >> 32) as u32);
+        print_hex(driver_unload as u32);
         print_str(b"\n");
-        return Err(status);
-    }
-    driver_instances_mut()[instance].driver_object = drvobj;
-    let retained = driver_instances_mut()[instance];
-    let dc = DriverComponent {
-        pml4,
-        fault_ep,
-        drvobj,
-        add_device,
-        driver_unload,
-        verdict,
-        finished,
-        exec_shared_va: win.shared_va,
-        exec_pool_va: win.pool_va,
-        exec_stack_va: win.stack_va,
-        exec_arg_va: win.arg_va,
-        image_frames: img_frames,
-        image_frame_base,
-        exception_snapshot_frame_base: retained.exception_snapshot_frame_base,
-        exception_snapshot_frames: retained.exception_snapshot_frames,
-        exception_snapshot_bytes: retained.exception_snapshot_bytes,
-        seh_linkage,
-        pool_frame_base: pool_base,
-        data_frame_base: data_base,
-        shared_frame_base: shared_base,
-        arg_frame_base: arg_base,
-        stack_frame_base,
-        stack_frame_count: sc.stack_frame_count,
-        exec_thunk_va,
-        run_thunk_va,
-        thunk_len,
-        thunk_next,
-        instance,
-        hosted_domain_id: domain.hosted_domain_id,
-        hosted_domain_cookie: domain.hosted_domain_cookie,
-        driver_id,
-        tcb,
-        main_thread_id,
-        cnode,
-        raw_cnode,
-        sched_context,
-        map_cap_bank: retained.map_cap_bank,
-        reply_cap: active_reply_cap,
-    };
-    let device_count = match validate_hosted_driver_device_projections(&dc) {
-        Ok(device_count) => device_count,
-        Err(status) => {
-            print_str(b"[driver-launch] IoManager device validation failed status=0x");
+
+        match nt_hosted_runtime::driver_load_step(nt_hosted_runtime::DriverLoadSliceEnd::Returned {
+            completed: finished, status: de_status,
+        }) {
+            nt_hosted_runtime::DriverLoadStep::Publish => {}
+            nt_hosted_runtime::DriverLoadStep::RollBack(status) => {
+                print_str(b"[driver-launch] DriverEntry failed; removing ");
+                print_str(driver_object_path.as_bytes());
+                print_str(b"\n");
+                return Err(nt_status::NtStatus(status));
+            }
+            nt_hosted_runtime::DriverLoadStep::KeepParked =>
+                unreachable!("a returned DriverEntry is never kept"),
+        }
+        if let Some(provider) = provider {
+            record_hosted_provider_load(
+                provider,
+                HostedProviderLoadRole::PrimaryService,
+                instance,
+                image_len,
+            );
+            if primary_singleton {
+                let Some(singleton_image_frames) = frames_for_image_len(image_len as u64) else {
+                    return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+                };
+                if !register_hosted_provider_singleton(
+                    provider,
+                    instance,
+                    primary_exec_va,
+                    primary_run_va,
+                    primary_offset,
+                    image_len,
+                    singleton_image_frames,
+                    component.pool_frame_base,
+                    FSD_POOL_FRAMES,
+                ) {
+                    return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+                }
+            }
+        }
+
+        if let Err(status) = io_manager_mut().bind_hosted_driver_identity(
+            instance_domain_identity(domain).ok_or(nt_status::NtStatus::UNSUCCESSFUL)?,
+            drvobj,
+            DriverId(driver_id),
+        ) {
+            print_str(b"[driver-launch] hosted DriverObject publish failed status=0x");
             print_hex(status.raw() as u32);
             print_str(b" for ");
             print_str(driver_object_path.as_bytes());
             print_str(b"\n");
             return Err(status);
         }
-    };
-    print_str(b"[driver-launch] canonical devices=");
-    print_u64(device_count as u64);
-    print_str(b"\n");
-    // Record the live instance and publish canonical driver/device route ids for callers.
-    register_instance(&dc);
-    hosted_driver_reinitialization::run_pending_for_instance(
-        instance,
-        initial_system_driver_caller(),
-    )?;
-    Ok(dc)
+        driver_instances_mut()[instance].driver_object = drvobj;
+        let retained = driver_instances_mut()[instance];
+        component.drvobj = drvobj;
+        component.add_device = add_device;
+        component.driver_unload = driver_unload;
+        component.verdict = verdict;
+        component.finished = finished;
+        component.exception_snapshot_frame_base = retained.exception_snapshot_frame_base;
+        component.exception_snapshot_frames = retained.exception_snapshot_frames;
+        component.exception_snapshot_bytes = retained.exception_snapshot_bytes;
+        component.map_cap_bank = retained.map_cap_bank;
+        component.reply_cap = active_reply_cap;
+        let dc = component;
+        let device_count = match validate_hosted_driver_device_projections(&dc) {
+            Ok(device_count) => device_count,
+            Err(status) => {
+                print_str(b"[driver-launch] IoManager device validation failed status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b" for ");
+                print_str(driver_object_path.as_bytes());
+                print_str(b"\n");
+                return Err(status);
+            }
+        };
+        print_str(b"[driver-launch] canonical devices=");
+        print_u64(device_count as u64);
+        print_str(b"\n");
+        // Record the live instance and publish canonical driver/device route ids for callers.
+        register_instance(&dc);
+        Ok(dc)
+    }
 }
 
 /// Spawn the isolated FSD component: image W^X, pool, stack, IPC-buf, DATA/SHARED arena/ARG windows,
@@ -71159,6 +71372,54 @@ unsafe fn finish_device_projection_control(
     }
     nt_status::NtStatus(pr.status).to_result()?;
     Ok(read_volatile((sh + SH_REQ_INFO) as *const u64))
+}
+
+/// A projection-control dispatch for a lane's service that keeps its own continuation (#420).
+pub(crate) enum ProjectionDispatch {
+    Done(Result<u64, nt_status::NtStatus>),
+    /// Still running while the calling lane (or the step continuing for it) is parked.
+    Kept(component_scheduler::service_continuation::KeptPump, ProjectionFinish),
+}
+
+/// What a projection control needs once its kept pump has returned.
+#[derive(Clone, Copy)]
+pub(crate) struct ProjectionFinish {
+    index: usize,
+    sh: u64,
+}
+
+impl ProjectionFinish {
+    pub(crate) unsafe fn after(
+        self, pr: crate::spawn_hosts::PumpResult,
+    ) -> Result<u64, nt_status::NtStatus> {
+        finish_device_projection_control(self.index, self.sh, pr)
+    }
+}
+
+/// Dispatch one projection control; an unfinished pump comes back kept for the caller's
+/// service. A root-level caller waits for the true result.
+pub(crate) unsafe fn begin_device_projection_control(
+    index: usize,
+    driver_object: u64,
+    selector: u64,
+    pdo_object: u64,
+    previous_device_head: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> ProjectionDispatch {
+    use component_scheduler::service_continuation::ServicePump;
+    let (ch, sh) = match prepare_device_projection_control_for_instance(
+        index, driver_object, selector, pdo_object, previous_device_head, false, None,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => return ProjectionDispatch::Done(Err(status)),
+    };
+    let finish = ProjectionFinish { index, sh };
+    let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
+    match component_scheduler::service_continuation::settle(pump) {
+        ServicePump::Finished(pr) | ServicePump::Fenced(pr) => ProjectionDispatch::Done(finish.after(pr)),
+        ServicePump::Kept(kept) => ProjectionDispatch::Kept(kept, finish),
+        ServicePump::RootTurn(turn) => ProjectionDispatch::Done(finish.after(turn.fence_unowned())),
+    }
 }
 
 /// A projection-control dispatch issued from a root turn that may not block (#420).

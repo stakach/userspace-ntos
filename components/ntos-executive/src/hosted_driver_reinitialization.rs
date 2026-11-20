@@ -166,32 +166,70 @@ pub(super) unsafe fn component_dispatch_with_flag(flag: u32) -> (i32, u64) {
 
 /// Run the exact queued callbacks after successful DriverEntry publication. A fault, uncertain
 /// pump result, or count mismatch leaves its ticket Executing and blocks later replay/unload.
-pub(super) unsafe fn run_pending_for_instance(
+/// A load's pending reinitialization callbacks after one slice (#420).
+pub(super) enum ReinitRun {
+    Done(Result<(), nt_status::NtStatus>),
+    /// A callback is still running while the load's calling lane is parked; its ticket stays
+    /// Executing with the load's continuation.
+    Kept(crate::driver_launch::component_scheduler::service_continuation::KeptPump, ReinitKept),
+}
+
+#[must_use = "an executing reinitialization callback is owed its acknowledgement"]
+pub(crate) struct ReinitKept {
+    index: usize,
+    ticket: nt_io_manager::driver_reinitialization::DriverReinitializationTicket,
+    finish: crate::driver_launch::ProjectionFinish,
+    caller: nt_process::native_handle::NativeHandleCaller,
+}
+
+impl ReinitKept {
+    /// Acknowledge the kept callback on its true result, then run the remaining ones.
+    pub(super) unsafe fn finish(self, pr: crate::spawn_hosts::PumpResult) -> ReinitRun {
+        let acknowledged = self.finish.after(pr).and_then(|count| acknowledge(self.ticket, count));
+        match acknowledged {
+            Ok(()) => begin_pending_for_instance(self.index, self.caller),
+            Err(status) => ReinitRun::Done(Err(status)),
+        }
+    }
+}
+
+unsafe fn acknowledge(
+    ticket: nt_io_manager::driver_reinitialization::DriverReinitializationTicket, count: u64,
+) -> Result<(), nt_status::NtStatus> {
+    if count != u64::from(ticket.count) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    queue().acknowledge(ticket).map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+}
+
+pub(super) unsafe fn begin_pending_for_instance(
     index: usize,
     caller: nt_process::native_handle::NativeHandleCaller,
-) -> Result<(), nt_status::NtStatus> {
-    let inst = instance(index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::ACCESS_DENIED)?;
+) -> ReinitRun {
+    let Some(inst) = instance(index) else {
+        return ReinitRun::Done(Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED));
+    };
+    let Some(domain) = instance_domain_identity(inst) else {
+        return ReinitRun::Done(Err(nt_status::NtStatus::ACCESS_DENIED));
+    };
     loop {
         let Some(ticket) = queue().begin_next_for(
             inst.driver_id, domain.domain_id.raw(), domain.cookie,
         ) else {
-            return Ok(());
+            return ReinitRun::Done(Ok(()));
         };
-        let count = dispatch_device_projection_control_for_instance(
-            index,
-            ticket.identity.driver_object,
-            FSD_DISPATCH_DRIVER_REINIT,
-            ticket.identity.routine,
-            ticket.identity.context,
-            false,
-            None,
-            caller,
-        )?;
-        if count != u64::from(ticket.count) {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        match crate::driver_launch::begin_device_projection_control(
+            index, ticket.identity.driver_object, FSD_DISPATCH_DRIVER_REINIT,
+            ticket.identity.routine, ticket.identity.context, caller,
+        ) {
+            crate::driver_launch::ProjectionDispatch::Done(count) => {
+                if let Err(status) = count.and_then(|count| acknowledge(ticket, count)) {
+                    return ReinitRun::Done(Err(status));
+                }
+            }
+            crate::driver_launch::ProjectionDispatch::Kept(kept, finish) =>
+                return ReinitRun::Kept(kept, ReinitKept { index, ticket, finish, caller }),
         }
-        queue().acknowledge(ticket).map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     }
 }
 

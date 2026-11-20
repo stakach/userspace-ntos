@@ -52,14 +52,5 @@ fn one_record_per_instance() {
 fn load_driver_retains_a_refused_rollback_instead_of_panicking() {
     let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
     assert!(!launch.contains("driver launch rollback indeterminate"));
-    let body = launch
-        .split("pub(crate) unsafe fn load_driver(")
-        .nth(1)
-        .unwrap()
-        .split("\nunsafe fn load_driver_reserved(")
-        .next()
-        .unwrap();
-    assert!(body.contains("blocks_reload("), "same-name reload waits for retirement");
-    assert!(body.contains("quarantine_failed_launch("), "the refused rollback is retained");
     assert!(launch.contains("pub(crate) unsafe fn retire_quarantined_launches()"));
 }

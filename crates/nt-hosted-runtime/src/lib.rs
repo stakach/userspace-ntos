@@ -34,6 +34,8 @@ mod driver_load_receipt;
 mod dxg_registration;
 mod contiguous_ram;
 mod provider_export_worker;
+mod driver_load_slice;
+pub use driver_load_slice::{driver_load_step, DriverLoadSliceEnd, DriverLoadStep};
 mod connect_submit;
 pub use connect_submit::{ConnectStageEnd, ConnectSubmitNext, ConnectSubmitStage};
 mod caller_marshal;

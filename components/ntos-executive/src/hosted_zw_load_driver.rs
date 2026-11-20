@@ -192,23 +192,93 @@ pub(super) unsafe fn service(
     let Some(fs) = crate::exec_fs() else {
         return STATUS_OBJECT_NAME_NOT_FOUND_LOCAL;
     };
+    // Hold the continuation row before DriverEntry can be entered (#420).
+    let slot = match crate::driver_launch::reserve_service_slot() {
+        Ok(slot) => slot,
+        Err(status) => return status,
+    };
     let system_caller = crate::initial_system_driver_caller();
-    let outcome = load_driver(
+    let outcome = begin_load_driver(
         &fs,
         &spec.image_path,
         spec.class,
         &spec.driver_object_path,
         system_caller,
     );
-    // A nested DriverEntry may run another provider pump. The original caller must still own the
-    // exact parked dispatch and Reply before we publish the terminal result.
-    if !source_reply_unchanged(channel, call.instance_index, call.route, call.dispatch, reply_cap) {
+    let source = SourceCall {
+        channel: *channel, instance_index: call.instance_index, route: call.route,
+        dispatch: call.dispatch, reply_cap,
+    };
+    let pending = match outcome {
+        DriverLoad::Done(outcome) => return finish_load(source, &spec.driver_object_path, outcome),
+        DriverLoad::Kept(pending) => pending,
+    };
+    // DriverEntry (or a reinitialization callback) is still running: this lane stays parked,
+    // and the load's own finish replies with its true status. The reservation stays held.
+    let step = PendingZwLoad {
+        rest: pending.rest, source, driver_object_path: spec.driver_object_path,
+        _reservation,
+    };
+    match pending.kept.register(slot, crate::driver_launch::ServiceStep::ZwLoadDriver(step)) {
+        // The reply this returns is intercepted and never sent.
+        Ok(()) => nt_status::NtStatus::PENDING.raw(),
+        Err((uncertain, step)) => step.complete(uncertain).words[0] as u32 as i32,
+    }
+}
+
+/// The calling lane's exact parked dispatch, checked again before the load's status is
+/// published. A nested DriverEntry may run another provider pump.
+#[derive(Clone, Copy)]
+struct SourceCall {
+    channel: crate::spawn_hosts::PumpChannel,
+    instance_index: usize,
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    reply_cap: u64,
+}
+
+unsafe fn finish_load(
+    source: SourceCall, driver_object_path: &str,
+    outcome: Result<DriverComponent, nt_status::NtStatus>,
+) -> i32 {
+    if !source_reply_unchanged(&source.channel, source.instance_index, source.route,
+        source.dispatch, source.reply_cap)
+    {
         panic!("ZwLoadDriver source Reply or dispatch changed during nested launch");
     }
     match outcome {
-        Ok(loaded) if driver_id_by_name(&spec.driver_object_path) == Some(loaded.driver_id) => 0,
+        Ok(loaded) if driver_id_by_name(driver_object_path) == Some(loaded.driver_id) => 0,
         Ok(_) => panic!("ZwLoadDriver succeeded without publishing exact driver identity"),
         Err(status) => status.raw(),
+    }
+}
+
+/// The rest of a `ZwLoadDriver` whose DriverEntry or reinitialization had not finished (#420).
+pub(crate) struct PendingZwLoad {
+    rest: PendingLoadRest,
+    source: SourceCall,
+    driver_object_path: alloc::string::String,
+    _reservation: DriverTransitionReservation,
+}
+
+/// A load step's next act after its kept pump returned.
+pub(crate) enum ZwLoadRun {
+    Reply(i32),
+    /// Another pump of the same load stopped unfinished; it continues the same parked lane.
+    Kept(crate::driver_launch::component_scheduler::service_continuation::KeptPump, PendingZwLoad),
+}
+
+impl PendingZwLoad {
+    pub(crate) unsafe fn complete(self, pr: crate::spawn_hosts::PumpResult) -> ZwLoadRun {
+        let _durable = crate::allocator::enter_durable();
+        let Self { rest, source, driver_object_path, _reservation } = self;
+        match rest.finish(pr) {
+            DriverLoad::Done(outcome) =>
+                ZwLoadRun::Reply(finish_load(source, &driver_object_path, outcome)),
+            DriverLoad::Kept(pending) => ZwLoadRun::Kept(pending.kept, Self {
+                rest: pending.rest, source, driver_object_path, _reservation,
+            }),
+        }
     }
 }
 
