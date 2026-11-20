@@ -125,11 +125,12 @@ pub(in crate::driver_launch) unsafe fn service_recommendation_callback(
         terminal_no_mutation: false,
     });
     pdo_aliases_mut()[alias_index].blocked = true;
-    let result = match dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch, record, dependent_inst, exec_code_va,
         [provider_context, marshal_window.component_base, 0, 0],
         [0; PROVIDER_CALLBACK_STACK_QWORDS],
-    ) {
+    ), move |_dispatch, kept_result| {
+        let result = match kept_result {
         Ok(value) => value,
         Err(status) => {
             pdo_aliases_mut()[alias_index].recommendation.as_ref().unwrap().retain_uncertain();
@@ -155,4 +156,5 @@ pub(in crate::driver_launch) unsafe fn service_recommendation_callback(
     pdo_aliases_mut()[alias_index].recommendation = None;
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+    })
 }

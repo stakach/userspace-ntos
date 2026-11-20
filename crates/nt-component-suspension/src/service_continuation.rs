@@ -74,10 +74,59 @@ struct Row<K, T, S, P, E, R> {
 /// calls; no borrow of a row is held while the caller runs a pump or a step.
 pub struct ServiceContinuations<K, T, S, P, E, R> {
     rows: Vec<Row<K, T, S, P, E, R>>,
+    /// Rows promised to outstanding [`ServiceReservation`]s; their capacity is already held.
+    reserved: usize,
+}
+
+/// One row's capacity, held before a service enters its dispatch. Registering with it can
+/// never be refused for capacity, so no refusal can follow an entered effect.
+#[must_use = "a reservation is consumed by register_reserved or returned by release"]
+#[derive(Debug, Eq, PartialEq)]
+pub struct ServiceReservation {
+    _private: (),
+}
+
+/// What a step produced when it ran.
+#[derive(Debug, Eq, PartialEq)]
+pub enum Completion<S, P, R> {
+    /// The service's true reply.
+    Reply(R),
+    /// The step's own tail entered another pump that stopped unfinished: keep the remaining
+    /// step and that pump for the same parked parent.
+    Again(S, P),
 }
 
 impl<K: Copy + Eq, T, S, P, E, R> ServiceContinuations<K, T, S, P, E, R> {
-    pub const fn new() -> Self { Self { rows: Vec::new() } }
+    pub const fn new() -> Self { Self { rows: Vec::new(), reserved: 0 } }
+
+    /// Hold one row's capacity before the service enters anything.
+    pub fn reserve(&mut self) -> Result<ServiceReservation, RegistrationRefusal> {
+        // Capacity for every row, every outstanding reservation and this one.
+        self.rows.try_reserve(self.reserved + 1).map_err(|_| RegistrationRefusal::Capacity)?;
+        self.reserved += 1;
+        Ok(ServiceReservation { _private: () })
+    }
+
+    /// Return an unused reservation.
+    pub fn release(&mut self, reservation: ServiceReservation) {
+        let ServiceReservation { _private: () } = reservation;
+        self.reserved -= 1;
+    }
+
+    /// [`Self::register`] with capacity held since before entry; only a duplicate is refused.
+    pub fn register_reserved(
+        &mut self, reservation: ServiceReservation, key: K, parent: T, step: S, pump: P,
+    ) -> Result<(), RegistrationRefused<T, S, P>> {
+        self.release(reservation);
+        if self.rows.iter().any(|row| row.key == key) {
+            return Err(RegistrationRefused {
+                reason: RegistrationRefusal::Duplicate, parent, step, pump,
+            });
+        }
+        debug_assert!(self.rows.capacity() > self.rows.len() + self.reserved);
+        self.rows.push(Row { key, phase: Phase::Registered { parent, step, pump } });
+        Ok(())
+    }
 
     fn row(&mut self, key: K) -> Option<&mut Row<K, T, S, P, E, R>> {
         self.rows.iter_mut().find(|row| row.key == key)
@@ -90,7 +139,7 @@ impl<K: Copy + Eq, T, S, P, E, R> ServiceContinuations<K, T, S, P, E, R> {
     ) -> Result<(), RegistrationRefused<T, S, P>> {
         let reason = if self.rows.iter().any(|row| row.key == key) {
             Some(RegistrationRefusal::Duplicate)
-        } else if self.rows.try_reserve(1).is_err() {
+        } else if self.rows.try_reserve(self.reserved + 1).is_err() {
             Some(RegistrationRefusal::Capacity)
         } else {
             None
@@ -181,6 +230,18 @@ impl<K: Copy + Eq, T, S, P, E, R> ServiceContinuations<K, T, S, P, E, R> {
         Some(step)
     }
 
+    /// The step's tail kept another pump: drive that pump for the same parent and run the
+    /// remaining step when it finishes. Nothing is replied meanwhile.
+    pub fn continue_with(&mut self, key: K, step: S, pump: P) -> Result<(), (S, P)> {
+        let Some(row) = self.row(key).filter(|row| matches!(row.phase, Phase::Completing { .. }))
+        else { return Err((step, pump)) };
+        let Phase::Completing { parent, envelope } =
+            core::mem::replace(&mut row.phase, Phase::Moving)
+        else { unreachable!("matched above") };
+        row.phase = Phase::Awaiting { parent, step, pump, envelope };
+        Ok(())
+    }
+
     /// Store the step's reply, then hand back the parent for release.
     pub fn settle(&mut self, key: K, reply: R) -> Option<SettledParent<K, T>> {
         let row = self.row(key).filter(|row| matches!(row.phase, Phase::Completing { .. }))?;
@@ -227,7 +288,7 @@ pub fn drive_one<K: Copy + Eq, T, S, P, E, R, O, Owner>(
     services: impl Fn(&mut Owner) -> &mut ServiceContinuations<K, T, S, P, E, R>,
     key: K,
     progress: impl FnOnce(P) -> PumpProgress<P, O>,
-    complete: impl FnOnce(S, O) -> R,
+    complete: impl FnOnce(S, O) -> Completion<S, P, R>,
 ) -> Option<SettledParent<K, T>> {
     let pump = services(owner).take_pump(key)?;
     match progress(pump) {
@@ -235,8 +296,14 @@ pub fn drive_one<K: Copy + Eq, T, S, P, E, R, O, Owner>(
         PumpProgress::Fenced(pump) => { let _ = services(owner).fenced(key, pump); None }
         PumpProgress::Finished(outcome) => {
             let step = services(owner).finished(key)?;
-            let reply = complete(step, outcome);
-            services(owner).settle(key, reply)
+            match complete(step, outcome) {
+                Completion::Reply(reply) => services(owner).settle(key, reply),
+                Completion::Again(step, pump) => {
+                    // The row is Completing here, so this always succeeds.
+                    let _ = services(owner).continue_with(key, step, pump);
+                    None
+                }
+            }
         }
     }
 }
@@ -264,7 +331,8 @@ mod tests {
 
     fn drive(services: &mut Services, key: u32,
         complete: impl FnOnce(u8, i32) -> (u64, i32)) -> Option<SettledParent<u32, &'static str>> {
-        drive_one(services, |services| services, key, advance, complete)
+        drive_one(services, |services| services, key, advance,
+            |step, outcome| Completion::Reply(complete(step, outcome)))
     }
 
     #[test]
@@ -295,10 +363,10 @@ mod tests {
     fn a_fenced_inner_pump_never_replies() {
         let mut services = intercepted(3, 9);
         assert_eq!(drive_one(&mut services, |services| services, 3, PumpProgress::Fenced,
-            |_, _: i32| panic!("a fenced pump ran its step")), None);
+            |_, _: i32| -> Completion<u8, u8, (u64, i32)> { panic!("a fenced pump ran its step") }), None);
         assert_eq!(drive_one(&mut services, |services| services, 3,
             |_| -> PumpProgress<u8, i32> { panic!("a fenced pump is never driven again") },
-            |_, _| panic!("step")), None);
+            |_, _| -> Completion<u8, u8, (u64, i32)> { panic!("step") }), None);
         assert!(!services.awaiting(3), "the owner must fence the lane, not retry it");
         assert!(!services.has_drivable() && services.take_reply(3).is_none());
     }
@@ -365,5 +433,48 @@ mod tests {
         assert_eq!(refused, RegistrationRefused {
             reason: RegistrationRefusal::Duplicate, parent: "again", step: 8, pump: 1,
         });
+    }
+
+    #[test]
+    fn a_reserved_registration_is_never_refused_for_capacity() {
+        let mut services = Services::new();
+        let first = services.reserve().unwrap();
+        let second = services.reserve().unwrap();
+        // Unreserved registrations cannot consume the reserved rows' capacity.
+        services.register(9, "other", 1, 0).unwrap();
+        let capacity = services.rows.capacity();
+        services.register_reserved(first, 3, "parent", 7, 0).unwrap();
+        services.register_reserved(second, 4, "parent", 8, 0).unwrap();
+        assert_eq!(services.rows.capacity(), capacity, "a reserved row never allocates");
+        assert!(services.awaiting(3) && services.awaiting(4));
+    }
+
+    #[test]
+    fn a_released_reservation_returns_its_row() {
+        let mut services = Services::new();
+        let reservation = services.reserve().unwrap();
+        services.release(reservation);
+        assert_eq!(services.reserved, 0);
+        assert!(services.is_empty());
+    }
+
+    #[test]
+    fn a_step_that_keeps_another_pump_replies_only_after_that_pump_finishes() {
+        let mut services = intercepted(3, 0);
+        let mut runs = vec![];
+        // The first step's tail entered a second pump (2 drives left) and keeps step 8.
+        assert!(drive_one(&mut services, |services| services, 3, advance,
+            |step, outcome| { runs.push((step, outcome)); Completion::Again(8, 2) }).is_none());
+        assert!(services.awaiting(3), "the parent stays parked for the second pump");
+        assert!(services.take_reply(3).is_none());
+        let mut settled = None;
+        for _ in 0..3 {
+            if let Some(parent) = drive_one(&mut services, |services| services, 3, advance,
+                |step, outcome| { runs.push((step, outcome)); Completion::Reply((1, outcome)) })
+            { settled = Some(parent); }
+        }
+        assert_eq!(runs, vec![(7, 0x10), (8, 0x10)]);
+        assert_eq!(settled, Some(SettledParent { key: 3, parent: "parent" }));
+        assert_eq!(services.take_reply(3), Some((0xE, (1, 0x10))));
     }
 }

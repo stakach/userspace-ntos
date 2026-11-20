@@ -825,9 +825,12 @@ pub(super) unsafe fn service_add_device_callback(
         });
         index
     };
-    let dependent_pdo = create_hosted_pdo_projection(
+    // The dependent's PDO projection may be kept unfinished: everything after it, including
+    // the AddDevice callback's own dispatch, is its tail (#420).
+    with_tail(dispatch, |_| create_hosted_pdo_projection(
         record.dependent_instance, crate::initial_system_driver_caller())
-        .map_err(|status| status.raw())?;
+        .map_err(|status| status.raw()), move |dispatch, kept_result| {
+        let dependent_pdo = kept_result?;
     let alias_allocation = hosted_device_allocations::capture_allocation(
         dependent_inst, dependent_pdo).map_err(|status| status.raw())?;
     pdo_aliases_mut()[alias_index].alias_allocation = Some(alias_allocation);
@@ -855,11 +858,12 @@ pub(super) unsafe fn service_add_device_callback(
     }
     write_unaligned(marshal_window.exec_base as *mut u64, 0);
     pdo_aliases_mut()[alias_index].callback_entered = true;
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch, record, dependent_inst, exec_code_va,
         [dependent_pdo, marshal_window.component_base, 0, 0],
         [0; PROVIDER_CALLBACK_STACK_QWORDS],
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
     let status = result as u32 as i32;
     if status >= 0 {
         let current_provider = hosted_add_device_rollback::active_created_output(
@@ -890,6 +894,8 @@ pub(super) unsafe fn service_add_device_callback(
         pdo_aliases_mut()[alias_index].blocked = false;
     }
     Ok(result)
+    })
+    })
 }
 
 /// Project the exact provider-owned DXGK_CHILD_DESCRIPTOR array into the dependent miniport.
@@ -946,11 +952,12 @@ pub(super) unsafe fn service_query_child_relations_callback(
     copy_bytes(marshal_window.exec_base, provider_exec, layout.bytes());
     pdo_aliases_mut()[alias_index].child_relations_output = Some(guard);
     pdo_aliases_mut()[alias_index].blocked = true;
-    let dispatch_result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch, record, dependent_inst, exec_code_va,
         [provider_context, marshal_window.component_base, layout.bytes(), 0],
         [0; PROVIDER_CALLBACK_STACK_QWORDS],
-    );
+    ), move |_dispatch, kept_result| {
+        let dispatch_result = kept_result;
     let result = match dispatch_result {
         Ok(result) => result,
         Err(status) => {
@@ -975,6 +982,7 @@ pub(super) unsafe fn service_query_child_relations_callback(
     pdo_aliases_mut()[alias_index].child_relations_output = None;
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+    })
 }
 
 /// Stop the exact started adapter context once. The alias remains owned for RemoveDevice;
@@ -1022,15 +1030,17 @@ pub(super) unsafe fn service_stop_device_callback(
     { return Err(STATUS_INVALID_PARAMETER); }
     pdo_aliases_mut()[alias_index].stop_entered = true;
     pdo_aliases_mut()[alias_index].blocked = true;
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch, record, dependent_inst, exec_code_va,
         [provider_context, 0, 0, 0], [0; PROVIDER_CALLBACK_STACK_QWORDS],
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
     if (result as u32 as i32) >= 0 {
         pdo_aliases_mut()[alias_index].start_succeeded = false;
         pdo_aliases_mut()[alias_index].blocked = false;
     }
     Ok(result)
+    })
 }
 
 /// Project the typed fixed and segment query shapes implemented by the pinned
@@ -1162,10 +1172,11 @@ pub(super) unsafe fn service_query_adapter_info_callback(
     pdo_aliases_mut()[alias_index].query_output = Some(output_guard);
     pdo_aliases_mut()[alias_index].query_nested = nested_guard;
     pdo_aliases_mut()[alias_index].blocked = true;
-    let result = match dispatch_dependent_provider_callback(dispatch, record,
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(dispatch, record,
         dependent_inst, exec_code_va,
         [provider_context, marshal_window.component_base, 0, 0],
-        [0; PROVIDER_CALLBACK_STACK_QWORDS]) {
+        [0; PROVIDER_CALLBACK_STACK_QWORDS]), move |_dispatch, kept_result| {
+        let result = match kept_result {
         Ok(result) => result,
         Err(status) => {
             pdo_aliases_mut()[alias_index].query_output.as_ref().unwrap().retain_uncertain();
@@ -1212,6 +1223,7 @@ pub(super) unsafe fn service_query_adapter_info_callback(
     pdo_aliases_mut()[alias_index].query_output = None;
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+    })
 }
 
 pub(super) unsafe fn service_standard_allocation_callback(
@@ -1595,13 +1607,14 @@ pub(super) unsafe fn service_start_device_callback(
     pdo_aliases_mut()[alias_index].start_children_output = Some(child_output);
     pdo_aliases_mut()[alias_index].start_entered = true;
     pdo_aliases_mut()[alias_index].start_callback_active = true;
-    let dispatch_result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch, record, dependent_inst, exec_code_va,
         [provider_context, marshal_window.component_base,
             marshal_window.component_base + INTERFACE_OFFSET,
             marshal_window.component_base + SOURCES_OFFSET],
         [marshal_window.component_base + CHILDREN_OFFSET, 0, 0, 0, 0, 0, 0, 0],
-    );
+    ), move |_dispatch, kept_result| {
+        let dispatch_result = kept_result;
     pdo_aliases_mut()[alias_index].start_callback_active = false;
     let result = match dispatch_result {
         Ok(result) => result,
@@ -1648,6 +1661,7 @@ pub(super) unsafe fn service_start_device_callback(
     pdo_aliases_mut()[alias_index].start_succeeded = (result as u32 as i32) >= 0;
     pdo_aliases_mut()[alias_index].blocked = !pdo_aliases_mut()[alias_index].start_succeeded;
     Ok(result)
+    })
 }
 
 /// After clear_instance drains the dependency, remove only fully published

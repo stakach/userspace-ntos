@@ -185,6 +185,12 @@ pub(crate) use component_scheduler::{
 };
 pub(crate) use component_scheduler::handoff_exact_component_once;
 pub(crate) use component_scheduler::service_continuation::ServiceStep;
+
+/// Hold one service-continuation row before a lane's service enters any dispatch (#420).
+pub(crate) unsafe fn reserve_service_slot()
+    -> Result<component_scheduler::service_continuation::ServiceSlot, i32> {
+    component_scheduler::service_continuation::reserve_slot()
+}
 pub(crate) use component_scheduler::service_continuation::root_wait_owns_execution as root_pump_wait_owns_execution;
 
 #[path = "device_property.rs"]
@@ -33536,6 +33542,11 @@ unsafe fn service_hosted_provider_export_explicit(
             return hosted_provider_export_failure(status as i32);
         }
     };
+    // Hold the continuation row before the export can be entered (#420).
+    let slot = match component_scheduler::service_continuation::reserve_slot() {
+        Ok(slot) => slot,
+        Err(status) => return hosted_provider_export_failure(status),
+    };
     let service = service_hosted_provider_export_with_dispatch(
         dependent_channel,
         provider_export_rva,
@@ -33561,7 +33572,7 @@ unsafe fn service_hosted_provider_export_explicit(
     // The export is still running while the dependent stays parked. The step owns the marshal
     // window, the dependency lease and the dispatch's finish, and replies the true result.
     let PendingProviderExport { kept: KeptExport { kept, finish }, tail } = pending;
-    match kept.register(ServiceStep::ProviderExport(ProviderExportStep { finish, tail })) {
+    match kept.register(slot, ServiceStep::ProviderExport(ProviderExportStep { finish, tail })) {
         // The reply this returns is intercepted and never sent.
         Ok(()) => nt_status::NtStatus::PENDING.raw() as u32 as u64,
         Err((uncertain, step)) => step.complete(uncertain).words[0],
@@ -34308,7 +34319,14 @@ impl ProviderExportTail {
 enum HostedComponentDispatchError {
     Status(i32),
     Wall(crate::spawn_hosts::PumpResult),
+    /// The target is still running; its pump is kept in the callback chain (#420).
+    Kept,
 }
+
+#[path = "hosted_provider_callback_continuation.rs"]
+mod provider_callback_continuation;
+pub(crate) use provider_callback_continuation::ProviderCallbackStep;
+use provider_callback_continuation::{with_tail, CALLBACK_KEPT};
 
 type HostedProviderCallbackDispatcher<'a> = dyn FnMut(
         HostedProviderCallbackRecord,
@@ -34397,10 +34415,23 @@ unsafe fn dispatch_hosted_component_target(
     stack_args: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<u64, HostedComponentDispatchError> {
+    use component_scheduler::service_continuation::ServicePump;
     let (ch, shared) = prepare_hosted_component_target(
         instance_index, inst, exec_code_va, target, args, stack_args,
     );
-    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
+    let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
+    let pr = match component_scheduler::service_continuation::settle(pump) {
+        ServicePump::Finished(pr) | ServicePump::Fenced(pr) => pr,
+        // Only a provider-callback service keeps the target; its tails then wait for it.
+        ServicePump::Kept(kept) if provider_callback_continuation::keeps() => {
+            if provider_callback_continuation::keep_target(kept, instance_index, shared) {
+                return Err(HostedComponentDispatchError::Kept);
+            }
+            return Err(HostedComponentDispatchError::Status(STATUS_UNSUCCESSFUL));
+        }
+        ServicePump::Kept(kept) => kept.fence(),
+        ServicePump::RootTurn(turn) => turn.fence_unowned(),
+    };
     finish_hosted_component_target(instance_index, shared, pr)
 }
 
@@ -34481,6 +34512,12 @@ unsafe fn dispatch_dependent_provider_callback(
         Err(HostedComponentDispatchError::Wall(pr)) => {
             trace_hosted_provider_callback_wall(record, dependent_inst, pr);
             Err(STATUS_UNSUCCESSFUL)
+        }
+        Err(HostedComponentDispatchError::Kept) => {
+            // The refresh and wall mapping wait with the kept target.
+            provider_callback_continuation::attach_core(
+                record, dependent_inst, dependent_binding, dependent_shared);
+            Err(CALLBACK_KEPT)
         }
     }
 }
@@ -34686,6 +34723,11 @@ unsafe fn drain_hosted_work_queue_for_instance(
                     total.saturating_add(1),
                 );
             }
+            // A queued target settles through finish_hosted_component_target, which never
+            // keeps: only the provider-callback dispatcher does.
+            QueuedComponentTargetProgress::Returned(
+                Err(HostedComponentDispatchError::Kept)) =>
+                unreachable!("queued component target kept"),
             QueuedComponentTargetProgress::Returned(
                 Err(HostedComponentDispatchError::Status(status))) => {
                 if let Some(dispatch) = ndis_work_dispatch {
@@ -35076,7 +35118,7 @@ unsafe fn service_ndis_initialize_callback(
     let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
     stack_args[0] = miniport_block_mirror.dependent_component_va;
     stack_args[1] = provider_stack[1];
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
@@ -35088,7 +35130,8 @@ unsafe fn service_ndis_initialize_callback(
             arg3,
         ],
         stack_args,
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
     copy_bytes(provider_open_status_exec, dependent_open_status_exec, 4);
     copy_bytes(provider_selected_exec, dependent_selected_exec, 4);
     if result == STATUS_SUCCESS as u64 {
@@ -35099,6 +35142,7 @@ unsafe fn service_ndis_initialize_callback(
         )?;
     }
     Ok(result)
+    })
 }
 
 unsafe fn service_ndis_query_set_callback(
@@ -35157,20 +35201,22 @@ unsafe fn service_ndis_query_set_callback(
     let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
     stack_args[0] = dependent_bytes0_component;
     stack_args[1] = dependent_bytes1_component;
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
         exec_code_va,
         [arg0, arg1, dependent_info_component, arg3],
         stack_args,
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
     copy_bytes(provider_bytes0_exec, dependent_bytes0_exec, 4);
     copy_bytes(provider_bytes1_exec, dependent_bytes1_exec, 4);
     if output_buffer && result == STATUS_SUCCESS as u64 && arg3 != 0 {
         copy_bytes(provider_info_exec, dependent_info_exec, arg3);
     }
     Ok(result)
+    })
 }
 
 unsafe fn service_ndis_reset_callback(
@@ -35191,16 +35237,18 @@ unsafe fn service_ndis_reset_callback(
     let dependent_reset_component = marshal_window.component_base;
     let dependent_reset_exec = marshal_window.exec_base;
     provider_marshal_zero(dependent_reset_exec, 8);
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
         exec_code_va,
         [dependent_reset_component, arg1, 0, 0],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
     copy_bytes(provider_reset_exec, dependent_reset_exec, 1);
     Ok(result)
+    })
 }
 
 unsafe fn service_ndis_isr_callback(
@@ -35245,7 +35293,7 @@ unsafe fn service_ndis_isr_callback(
     let dependent_recognized_exec = marshal_window.exec_base;
     let dependent_queue_exec = dependent_recognized_exec + 8;
     provider_marshal_zero(dependent_recognized_exec, 0x10);
-    let result = match dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
@@ -35257,7 +35305,8 @@ unsafe fn service_ndis_isr_callback(
             0,
         ],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
-    ) {
+    ), move |_dispatch, kept_result| {
+        let result = match kept_result {
         Ok(result) => result,
         Err(status) => {
             trace_hosted_provider_callback_failure_stage(record, b"isr-dispatch", status);
@@ -35267,6 +35316,7 @@ unsafe fn service_ndis_isr_callback(
     copy_bytes(provider_recognized_exec, dependent_recognized_exec, 1);
     copy_bytes(provider_queue_exec, dependent_queue_exec, 1);
     Ok(result)
+    })
 }
 
 unsafe fn service_ndis_reconfigure_callback(
@@ -35288,16 +35338,18 @@ unsafe fn service_ndis_reconfigure_callback(
     let dependent_open_status_component = marshal_window.component_base;
     let dependent_open_status_exec = marshal_window.exec_base;
     provider_marshal_zero(dependent_open_status_exec, 8);
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
         exec_code_va,
         [dependent_open_status_component, arg1, arg2, 0],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
     copy_bytes(provider_open_status_exec, dependent_open_status_exec, 4);
     Ok(result)
+    })
 }
 
 unsafe fn provider_callback_packet_shadow(
@@ -35342,14 +35394,15 @@ unsafe fn service_ndis_send_callback(
         dependent_inst,
         shadow,
     )?;
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
         exec_code_va,
         [arg0, shadow.dependent_component_va, arg2, 0],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
     let Some((_index, refreshed)) = find_hosted_provider_ndis_packet_shadow_by_dependent(
         provider_instance,
         record.dependent_instance,
@@ -35376,6 +35429,7 @@ unsafe fn service_ndis_send_callback(
         )?;
     }
     Ok(result)
+    })
 }
 
 unsafe fn service_ndis_send_packets_callback(
@@ -35432,14 +35486,15 @@ unsafe fn service_ndis_send_packets_callback(
         index += 1;
     }
 
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
         exec_code_va,
         [arg0, dependent_array_component, arg2, 0],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
 
     index = 0;
     while index < count {
@@ -35476,6 +35531,7 @@ unsafe fn service_ndis_send_packets_callback(
         )?;
     }
     Ok(result)
+    })
 }
 
 unsafe fn service_ndis_return_packet_callback(
@@ -35497,14 +35553,15 @@ unsafe fn service_ndis_return_packet_callback(
         dependent_inst,
         shadow,
     )?;
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
         exec_code_va,
         [arg0, shadow.dependent_component_va, 0, 0],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
     sync_ndis_packet_shadow_to_provider(
         provider_instance,
         provider_inst,
@@ -35514,6 +35571,7 @@ unsafe fn service_ndis_return_packet_callback(
         true,
     )?;
     Ok(result)
+    })
 }
 
 unsafe fn service_ndis_transfer_data_callback(
@@ -35559,7 +35617,7 @@ unsafe fn service_ndis_transfer_data_callback(
     let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
     stack_args[0] = provider_stack[0];
     stack_args[1] = provider_stack[1];
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
@@ -35571,7 +35629,8 @@ unsafe fn service_ndis_transfer_data_callback(
             arg3,
         ],
         stack_args,
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
     copy_bytes(provider_bytes_exec, dependent_bytes_exec, 4);
     if result == STATUS_SUCCESS as u64 {
         let Some((_index, refreshed)) = find_hosted_provider_ndis_packet_shadow_by_dependent(
@@ -35592,6 +35651,7 @@ unsafe fn service_ndis_transfer_data_callback(
         )?;
     }
     Ok(result)
+    })
 }
 
 unsafe fn provider_callback_unicode_string_length(
@@ -35743,7 +35803,7 @@ unsafe fn service_ndis_protocol_bind_adapter_callback(
 
     let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
     stack_args[0] = provider_stack[0];
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
@@ -35755,9 +35815,11 @@ unsafe fn service_ndis_protocol_bind_adapter_callback(
             dependent_base_component + registry_desc_off,
         ],
         stack_args,
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
     copy_bytes(provider_status_exec, dependent_base_exec + status_off, 4);
     Ok(result)
+    })
 }
 
 unsafe fn service_ndis_protocol_pnp_event_callback(
@@ -36112,14 +36174,15 @@ unsafe fn service_ndis_protocol_receive_packet_callback(
         dependent_inst,
         shadow,
     )?;
-    let result = dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
         exec_code_va,
         [arg0, shadow.dependent_component_va, 0, 0],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
-    )?;
+    ), move |_dispatch, kept_result| {
+        let result = kept_result?;
     let Some((_index, refreshed)) = find_hosted_provider_ndis_packet_shadow_by_dependent(
         provider_instance,
         record.dependent_instance,
@@ -36137,6 +36200,7 @@ unsafe fn service_ndis_protocol_receive_packet_callback(
         true,
     )?;
     Ok(result)
+    })
 }
 
 unsafe fn service_ndis_miniport_timer_callback(
@@ -36405,30 +36469,40 @@ unsafe fn service_hosted_provider_callback_explicit(
         Ok(caller) => caller,
         Err(status) => return status as u64,
     };
-    let mut dispatch = |record: HostedProviderCallbackRecord,
-                        dependent_inst: DriverInstance,
-                        exec_code_va: u64,
-                        args: [u64; 4],
-                        stack_args: [u64; PROVIDER_CALLBACK_STACK_QWORDS]| {
-        dispatch_hosted_component_target(
-            record.dependent_instance,
-            dependent_inst,
-            exec_code_va,
-            record.target,
-            args,
-            stack_args,
-            caller,
-        )
+    // Hold the continuation row before the dependent can be entered (#420).
+    let slot = match component_scheduler::service_continuation::reserve_slot() {
+        Ok(slot) => slot,
+        Err(status) => return hosted_provider_callback_failure(status),
     };
-    service_hosted_provider_callback_with_dispatch(
+    let mut dispatch = provider_callback_continuation::callback_dispatcher(caller);
+    let service = service_hosted_provider_callback_service(
         provider_channel,
         callback_cookie,
         args,
         HostedProviderMarshalWindowSource::LEGACY_SHARED_BANK,
         &mut dispatch,
-    )
+        true,
+    );
+    let pending = match service {
+        provider_callback_continuation::CallbackService::Replied(value) => return value,
+        provider_callback_continuation::CallbackService::Kept(pending) => pending,
+    };
+    // The dependent is still running while the provider lane stays parked. The step owns
+    // every adapter tail, the dispatch context and the dependency lease, and replies the
+    // true result.
+    let (kept, step) = pending.into_step(caller);
+    match kept.register(slot, ServiceStep::ProviderCallback(step)) {
+        // The reply this returns is intercepted and never sent.
+        Ok(()) => nt_status::NtStatus::PENDING.raw() as u32 as u64,
+        Err((uncertain, step)) => match step {
+            ServiceStep::ProviderCallback(step) => step.complete(uncertain),
+            _ => unreachable!("provider callback step"),
+        },
+    }
 }
 
+/// A provider callback whose dispatch always returns in place (an IRQ arena's), so it never
+/// keeps a target.
 unsafe fn service_hosted_provider_callback_with_dispatch(
     provider_channel: &crate::spawn_hosts::PumpChannel,
     callback_cookie: u64,
@@ -36436,6 +36510,31 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
     marshal_window_source: HostedProviderMarshalWindowSource,
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
 ) -> u64 {
+    match service_hosted_provider_callback_service(
+        provider_channel, callback_cookie, args, marshal_window_source, dispatch, false,
+    ) {
+        provider_callback_continuation::CallbackService::Replied(value) => value,
+        // Keep mode is off, so no dispatch can be kept.
+        provider_callback_continuation::CallbackService::Kept(_) =>
+            unreachable!("returning provider callback was kept"),
+    }
+}
+
+unsafe fn service_hosted_provider_callback_service(
+    provider_channel: &crate::spawn_hosts::PumpChannel,
+    callback_cookie: u64,
+    args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    marshal_window_source: HostedProviderMarshalWindowSource,
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    keeps: bool,
+) -> provider_callback_continuation::CallbackService {
+    use provider_callback_continuation::CallbackService;
+    let hosted_provider_callback_failure =
+        |status| CallbackService::Replied(hosted_provider_callback_failure(status));
+    let mut keep_scope = match provider_callback_continuation::KeepScope::enter(keeps) {
+        Ok(scope) => scope,
+        Err(status) => return hosted_provider_callback_failure(status),
+    };
     HOSTED_PROVIDER_CALLBACK_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let mirror_legacy_irql = marshal_window_source.is_legacy_shared_bank();
     let [arg0, arg1, arg2, arg3, stack0, stack1, stack2, stack3, stack4, stack5, stack6, stack7] =
@@ -36949,21 +37048,11 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
             }
         }
     };
-    if let Some(saved_dependent_irql) = saved_dependent_irql {
-        write_volatile(
-            (dependent_shared + SH_HOSTED_CURRENT_IRQL) as *mut u8,
-            saved_dependent_irql,
-        );
-    }
-    if result.is_ok() {
-        record_provider_protocol_receive_completion(record);
-    }
-    HOSTED_PROVIDER_CALLBACK_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-    trace_hosted_provider_callback(b"done", record, callback_args, &provider_stack, result);
-    match result {
-        Ok(value) => value,
-        Err(status) => hosted_provider_callback_failure(status),
-    }
+    let outer = provider_callback_continuation::OuterTail {
+        record, callback_args, provider_stack, dependent_shared, saved_dependent_irql,
+        _device_dispatch_context, _dependency_lease,
+    };
+    provider_callback_continuation::PendingCallback::from_scope(&mut keep_scope, result, outer)
 }
 
 unsafe fn add_provider_domain_if_callable(
@@ -71035,7 +71124,30 @@ unsafe fn create_hosted_pdo_projection(
     projection_instance: usize,
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<u64, nt_status::NtStatus> {
-    let pdo_object = dispatch_device_projection_control_for_instance(
+    // A DXG AddDevice alias is created inside a provider callback service, which keeps an
+    // unfinished projection pump with the rest of its callback (#420).
+    if provider_callback_continuation::keeps() {
+        use component_scheduler::service_continuation::ServicePump;
+        let (ch, sh) = prepare_device_projection_control_for_instance(
+            projection_instance, 0, FSD_DISPATCH_CREATE_PDO_PROJECTION, 0, 0, false, None,
+        )?;
+        let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
+        let pr = match component_scheduler::service_continuation::settle(pump) {
+            ServicePump::Finished(pr) | ServicePump::Fenced(pr) => pr,
+            ServicePump::Kept(kept) => {
+                return if provider_callback_continuation::keep_pdo_projection(
+                    kept, projection_instance, sh)
+                {
+                    Err(nt_status::NtStatus(CALLBACK_KEPT))
+                } else {
+                    Err(nt_status::NtStatus::UNSUCCESSFUL)
+                };
+            }
+            ServicePump::RootTurn(turn) => turn.fence_unowned(),
+        };
+        return finish_pdo_projection(finish_device_projection_control(projection_instance, sh, pr));
+    }
+    finish_pdo_projection(dispatch_device_projection_control_for_instance(
         projection_instance,
         0,
         FSD_DISPATCH_CREATE_PDO_PROJECTION,
@@ -71044,11 +71156,15 @@ unsafe fn create_hosted_pdo_projection(
         false,
         None,
         caller,
-    )?;
-    if pdo_object == 0 {
-        Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
-    } else {
-        Ok(pdo_object)
+    ))
+}
+
+unsafe fn finish_pdo_projection(
+    pdo_object: Result<u64, nt_status::NtStatus>,
+) -> Result<u64, nt_status::NtStatus> {
+    match pdo_object? {
+        0 => Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+        pdo_object => Ok(pdo_object),
     }
 }
 

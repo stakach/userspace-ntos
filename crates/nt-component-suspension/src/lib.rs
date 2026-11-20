@@ -139,10 +139,12 @@ mod deferred_reply;
 pub use deferred_reply::{DeferralCapacity, DeferredReplies};
 mod root_pump_wait;
 pub use root_pump_wait::{await_root_pump, RootPumpWait};
+mod kept_tail_chain;
+pub use kept_tail_chain::{run_tails, ChainEnd, TailRun};
 mod service_continuation;
 pub use service_continuation::{
-    drive_one, PumpProgress, RegistrationRefusal, RegistrationRefused, ServiceContinuations,
-    SettledParent,
+    drive_one, Completion, PumpProgress, RegistrationRefusal, RegistrationRefused,
+    ServiceContinuations, ServiceReservation, SettledParent,
 };
 pub use resume_pass::ResumePass;
 mod resume_wake;

@@ -168,10 +168,11 @@ pub(super) unsafe fn create(
     pdo_aliases_mut()[alias_index].blocked = true;
     let allocation_index = pdo_aliases_mut()[alias_index].allocations.len() - 1;
     pdo_aliases_mut()[alias_index].allocations[allocation_index].create_callback_active = true;
-    let dispatch_result = dispatch_dependent_provider_callback(dispatch, record,
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(dispatch, record,
         dependent_inst, exec_code_va,
         [provider_context, marshal_window.component_base, 0, 0],
-        [0; PROVIDER_CALLBACK_STACK_QWORDS]);
+        [0; PROVIDER_CALLBACK_STACK_QWORDS]), move |_dispatch, kept_result| {
+        let dispatch_result = kept_result;
     pdo_aliases_mut()[alias_index].allocations[allocation_index].create_callback_active = false;
     let result = match dispatch_result {
         Ok(result) => result,
@@ -251,6 +252,7 @@ pub(super) unsafe fn create(
     pdo_aliases_mut()[alias_index].allocations[allocation_index].release_inputs()?;
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+    })
 }
 
 pub(super) unsafe fn destroy(
@@ -347,10 +349,11 @@ pub(super) unsafe fn destroy(
     allocation.retirement = Some(retirement);
     allocation.destroy_entered = true;
     pdo_aliases_mut()[alias_index].blocked = true;
-    let outcome = dispatch_dependent_provider_callback(dispatch, record,
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(dispatch, record,
         dependent_inst, exec_code_va,
         [provider_context, marshal_window.component_base, 0, 0],
-        [0; PROVIDER_CALLBACK_STACK_QWORDS]);
+        [0; PROVIDER_CALLBACK_STACK_QWORDS]), move |_dispatch, kept_result| {
+        let outcome = kept_result;
     pdo_aliases_mut()[alias_index].allocations[allocation_index].retirement
         .as_mut().unwrap().close_callback_interval();
     let result = match outcome {
@@ -398,6 +401,7 @@ pub(super) unsafe fn destroy(
     pdo_aliases_mut()[alias_index].allocations.remove(allocation_index);
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+    })
 }
 
 pub(super) unsafe fn defer_cookie_free(

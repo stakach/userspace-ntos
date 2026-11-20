@@ -17,7 +17,9 @@
 
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime::nested;
-use nt_component_suspension::{PumpProgress, ServiceContinuations, SettledParent};
+use nt_component_suspension::{
+    Completion, PumpProgress, ServiceContinuations, ServiceReservation, SettledParent,
+};
 
 /// X's true reply. The intercepted envelope supplies its Reply object and, unless the step
 /// names one, its message shape.
@@ -42,6 +44,9 @@ pub(crate) enum ServiceStep {
     ProviderExport(crate::driver_launch::ProviderExportStep),
     /// A routed WDDM bridge call from win32k: the worker finish and the caller write-back.
     WddmBridge(crate::driver_launch::WddmBridgeStep),
+    /// A provider's callback into a dependent: the target's finish, every adapter tail and
+    /// the service's outer tail.
+    ProviderCallback(crate::driver_launch::ProviderCallbackStep),
 }
 
 impl ServiceStep {
@@ -51,6 +56,8 @@ impl ServiceStep {
         match self {
             Self::ZwUnloadDriver(pending) => ServiceReply::status(pending.finish(result)),
             Self::ProviderExport(step) => ServiceReply::status(step.complete(result) as u32 as i32),
+            Self::ProviderCallback(step) =>
+                ServiceReply { info: None, words: [step.complete(result), 0, 0, 0] },
             Self::WddmBridge(step) => {
                 let (status, value) = step.complete(result);
                 ServiceReply { info: None, words: [status as u32 as u64, value, 0, 0] }
@@ -74,13 +81,68 @@ fn services() -> &'static mut Services {
     unsafe { &mut *core::ptr::addr_of_mut!(SERVICES) }
 }
 
+/// One continuation row's capacity, held by a lane's service from before it enters any
+/// dispatch, so keeping its step can never be refused for capacity after an entered effect.
+#[must_use = "hold the slot until the service has replied or registered its step"]
+pub(crate) struct ServiceSlot(Option<ServiceReservation>);
+
+impl ServiceSlot {
+    fn take(&mut self) -> Option<ServiceReservation> { self.0.take() }
+}
+
+impl Drop for ServiceSlot {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.0.take() { services().release(reservation); }
+    }
+}
+
+/// A step's own tail keeping another pump continues the step's existing row; it needs no
+/// capacity of its own.
+pub(crate) fn continuing_slot() -> ServiceSlot { ServiceSlot(None) }
+
+/// Reserve before the service enters anything; a refusal is a pre-entry resource failure.
+pub(crate) unsafe fn reserve_slot() -> Result<ServiceSlot, i32> {
+    let _durable = crate::allocator::enter_durable();
+    services().reserve().map(|reservation| ServiceSlot(Some(reservation)))
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)
+}
+
+/// The service step currently running at a root boundary. A pump its tail enters that stops
+/// unfinished is kept for the same parked parent ([`Completion::Again`]), never waited for.
+static mut CONTINUING: Option<nested::NestedRestoreTicket> = None;
+/// The remaining step and pump such a tail kept, collected when its step returns.
+static mut CONTINUED: Option<(nested::NestedRestoreTicket, ServiceStep, HostedPumpRestore)> = None;
+
+struct ContinuingScope(Option<nested::NestedRestoreTicket>);
+impl ContinuingScope {
+    unsafe fn enter(key: nested::NestedRestoreTicket) -> Self {
+        Self(core::mem::replace(&mut *core::ptr::addr_of_mut!(CONTINUING), Some(key)))
+    }
+}
+impl Drop for ContinuingScope {
+    fn drop(&mut self) { unsafe { *core::ptr::addr_of_mut!(CONTINUING) = self.0; } }
+}
+
+unsafe fn continuing() -> Option<nested::NestedRestoreTicket> {
+    // Only at the root boundary that runs the step; a nested scope has its own owner.
+    if component_scheduler::is_active() { return None; }
+    *core::ptr::addr_of!(CONTINUING)
+}
+
+/// Whose wait an unfinished pump's service is: lane X's parked parent, or the step of a
+/// service already continuing for X.
+enum KeptParent {
+    Parked(nested::ParkedParentHandle),
+    Continuing(nested::NestedRestoreTicket),
+}
+
 /// An unfinished pump and the parked parent of the lane X whose service ran it. Only the
 /// service that owns the whole post-pump state may register its step; every frame between
 /// returns this upward without any effect.
 #[must_use = "register the service's step, or fence the pump"]
 pub(crate) struct KeptPump {
     pump: HostedPumpRestore,
-    parent: nested::ParkedParentHandle,
+    parent: KeptParent,
 }
 
 /// How a service's pump ended for its caller.
@@ -156,10 +218,24 @@ pub(in crate::driver_launch) unsafe fn settle(pump: HostedPumpRestore) -> Servic
             ServicePump::Finished(result)
         }
         mut unfinished => match unfinished.take_outer_parent() {
-            Some(parent) => ServicePump::Kept(KeptPump { pump: unfinished, parent }),
-            None if !component_scheduler::is_active() => await_at_root(unfinished),
-            None => ServicePump::Fenced(fence_pump(unfinished, b"scheduler-scope")),
+            Some(parent) =>
+                ServicePump::Kept(KeptPump { pump: unfinished, parent: KeptParent::Parked(parent) }),
+            None => match continuing() {
+                Some(key) => ServicePump::Kept(KeptPump {
+                    pump: unfinished, parent: KeptParent::Continuing(key),
+                }),
+                None => settle_parentless(unfinished),
+            },
         },
+    }
+}
+
+/// No lane X and no continuing step: root level waits; a nested scope has no owner yet.
+unsafe fn settle_parentless(unfinished: HostedPumpRestore) -> ServicePump {
+    if component_scheduler::is_active() {
+        ServicePump::Fenced(fence_pump(unfinished, b"scheduler-scope"))
+    } else {
+        await_at_root(unfinished)
     }
 }
 
@@ -168,14 +244,30 @@ impl KeptPump {
     /// parent; the step replies once the pump finishes. A refusal fences the pump and hands
     /// back the step with the uncertain result, so the service still runs its own tail.
     pub(crate) unsafe fn register(
-        self, step: ServiceStep,
+        self, mut slot: ServiceSlot, step: ServiceStep,
     ) -> Result<(), (crate::spawn_hosts::PumpResult, ServiceStep)> {
         let Self { pump, parent } = self;
+        let parent = match parent {
+            KeptParent::Parked(parent) => parent,
+            KeptParent::Continuing(key) => {
+                // The running step collects this as its remaining continuation.
+                let continued = &mut *core::ptr::addr_of_mut!(CONTINUED);
+                if continued.is_some() {
+                    return Err((fence_pump(pump, b"continued-twice"), step));
+                }
+                *continued = Some((key, step, pump));
+                trace(b"continued", key);
+                return Ok(());
+            }
+        };
         if nested::await_service(&parent).is_err() {
             return Err((fence_with_parent(pump, parent, b"parent"), step));
         }
         let ticket = parent.ticket();
-        match services().register(ticket, parent, step, pump) {
+        let Some(reservation) = slot.take() else {
+            return Err((fence_with_parent(pump, parent, b"slot"), step));
+        };
+        match services().register_reserved(reservation, ticket, parent, step, pump) {
             Ok(()) => {
                 trace(b"registered", ticket);
                 Ok(())
@@ -185,14 +277,17 @@ impl KeptPump {
                 if let Ok(ticket) = nested::finish_service_await(refused.parent) {
                     crate::spawn_hosts::defer_reply_until_ticket_restored(ticket);
                 }
-                Err((fence_pump(refused.pump, b"capacity"), refused.step))
+                Err((fence_pump(refused.pump, b"duplicate"), refused.step))
             }
         }
     }
 
     /// A service with no step for this pump: fence it and release X with an uncertain result.
     pub(crate) unsafe fn fence(self) -> crate::spawn_hosts::PumpResult {
-        fence_with_parent(self.pump, self.parent, b"no-step")
+        match self.parent {
+            KeptParent::Parked(parent) => fence_with_parent(self.pump, parent, b"no-step"),
+            KeptParent::Continuing(_) => fence_pump(self.pump, b"no-step"),
+        }
     }
 }
 
@@ -364,7 +459,20 @@ pub(crate) unsafe fn drive() -> usize {
             let settled = nt_component_suspension::drive_one(
                 &mut (), |_| services(), key,
                 |pump| retry(pump),
-                |step, result| step.complete(result),
+                |step, result| {
+                    let scope = ContinuingScope::enter(key);
+                    let reply = step.complete(result);
+                    drop(scope);
+                    match (&mut *core::ptr::addr_of_mut!(CONTINUED)).take() {
+                        Some((owner, step, pump)) if owner == key => Completion::Again(step, pump),
+                        Some((_, _, pump)) => {
+                            // Not this row's tail: it can never be continued.
+                            let _ = fence_pump(pump, b"continued-foreign");
+                            Completion::Reply(reply)
+                        }
+                        None => Completion::Reply(reply),
+                    }
+                },
             );
             let Some(SettledParent { key, parent }) = settled else { continue };
             finished += 1;

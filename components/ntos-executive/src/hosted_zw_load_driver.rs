@@ -223,6 +223,11 @@ pub(super) unsafe fn service_unload(
         Ok(call) => call,
         Err(status) => return status,
     };
+    // Hold the continuation row before DriverUnload can be entered (#420).
+    let slot = match crate::driver_launch::reserve_service_slot() {
+        Ok(slot) => slot,
+        Err(status) => return status,
+    };
     let selected = crate::live_config_driver_service_launch_spec_from_registry_path(
         &call.path,
         nt_config_manager::SERVICE_DEMAND_START,
@@ -256,7 +261,7 @@ pub(super) unsafe fn service_unload(
     // DriverUnload is still running: this lane stays parked, and the stop's finish replies
     // with the true status. The reservation stays held until then.
     let step = PendingZwUnload { finish: pending.finish, _reservation: _reservation };
-    match pending.kept.register(crate::driver_launch::ServiceStep::ZwUnloadDriver(step)) {
+    match pending.kept.register(slot, crate::driver_launch::ServiceStep::ZwUnloadDriver(step)) {
         // The reply this returns is intercepted and never sent.
         Ok(()) => nt_status::NtStatus::PENDING.raw(),
         Err((uncertain, step)) => step.complete(uncertain).words[0] as u32 as i32,

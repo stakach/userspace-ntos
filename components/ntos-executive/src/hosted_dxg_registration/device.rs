@@ -106,10 +106,11 @@ pub(super) unsafe fn create(
     });
     pdo_aliases_mut()[alias_index].blocked = true;
     let device_index = pdo_aliases_mut()[alias_index].devices.len() - 1;
-    let outcome = dispatch_dependent_provider_callback(dispatch, record,
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(dispatch, record,
         dependent_inst, exec_code_va,
         [provider_context, marshal_window.component_base, 0, 0],
-        [0; PROVIDER_CALLBACK_STACK_QWORDS]);
+        [0; PROVIDER_CALLBACK_STACK_QWORDS]), move |_dispatch, kept_result| {
+        let outcome = kept_result;
     let result = match outcome {
         Ok(result) => result,
         Err(status) => {
@@ -160,6 +161,7 @@ pub(super) unsafe fn create(
     device.request_guard = None;
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+    })
 }
 
 pub(super) unsafe fn destroy(
@@ -230,9 +232,10 @@ pub(super) unsafe fn destroy(
     device.free_route = Some(route);
     device.retirement = Some(retirement);
     pdo_aliases_mut()[alias_index].blocked = true;
-    let outcome = dispatch_dependent_provider_callback(dispatch, record, dependent_inst,
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(dispatch, record, dependent_inst,
         exec_code_va, [kmd_device, 0, 0, 0],
-        [0; PROVIDER_CALLBACK_STACK_QWORDS]);
+        [0; PROVIDER_CALLBACK_STACK_QWORDS]), move |_dispatch, kept_result| {
+        let outcome = kept_result;
     pdo_aliases_mut()[alias_index].devices[device_index].retirement
         .as_mut().unwrap().close_callback_interval();
     let result = outcome?;
@@ -252,6 +255,7 @@ pub(super) unsafe fn destroy(
     pdo_aliases_mut()[alias_index].devices.remove(device_index);
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+    })
 }
 
 pub(super) unsafe fn defer_cookie_free(

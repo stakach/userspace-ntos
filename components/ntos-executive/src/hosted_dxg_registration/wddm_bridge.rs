@@ -198,6 +198,11 @@ pub(crate) unsafe fn service(
     if spare0 != 0 || spare1 != 0 {
         return reject(b"spare", slot, STATUS_INVALID_PARAMETER);
     }
+    // Hold the continuation row before anything is entered (#420).
+    let service_slot = match crate::driver_launch::reserve_service_slot() {
+        Ok(service_slot) => service_slot,
+        Err(status) => return reject(b"service-slot", slot, status),
+    };
     let Some(win32k) = caller_identity(route) else {
         return reject(b"caller", slot, STATUS_INVALID_HANDLE);
     };
@@ -333,7 +338,7 @@ pub(crate) unsafe fn service(
     // The provider is still running while win32k's lane stays parked. The step owns the
     // captured caller ranges and the marshal state, and replies the true result.
     let KeptExport { kept, finish } = kept;
-    match kept.register(ServiceStep::WddmBridge(WddmBridgeStep { finish, tail })) {
+    match kept.register(service_slot, ServiceStep::WddmBridge(WddmBridgeStep { finish, tail })) {
         // The reply this returns is intercepted and never sent.
         Ok(()) => (nt_status::NtStatus::PENDING.raw(), 0),
         Err((uncertain, step)) => {

@@ -113,9 +113,10 @@ pub(crate) unsafe fn create(
     });
     pdo_aliases_mut()[alias_index].blocked = true;
     let context_index = pdo_aliases_mut()[alias_index].devices[device_index].contexts.len() - 1;
-    let outcome = dispatch_dependent_provider_callback(dispatch, record, dependent_inst,
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(dispatch, record, dependent_inst,
         exec_code_va, [kmd_device, marshal_window.component_base, 0, 0],
-        [0; PROVIDER_CALLBACK_STACK_QWORDS]);
+        [0; PROVIDER_CALLBACK_STACK_QWORDS]), move |_dispatch, kept_result| {
+        let outcome = kept_result;
     let result = match outcome {
         Ok(result) => result,
         Err(status) => {
@@ -197,6 +198,7 @@ pub(crate) unsafe fn create(
     context.request_guard = None;
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+    })
 }
 
 /// The miniport's Destroy and retained Reply have already completed. A later
@@ -399,9 +401,10 @@ pub(crate) unsafe fn destroy(
     context.free_route = Some(route);
     context.retirement = Some(retirement);
     pdo_aliases_mut()[alias_index].blocked = true;
-    let outcome = dispatch_dependent_provider_callback(dispatch, record, dependent_inst,
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(dispatch, record, dependent_inst,
         exec_code_va, [kmd_context, 0, 0, 0],
-        [0; PROVIDER_CALLBACK_STACK_QWORDS]);
+        [0; PROVIDER_CALLBACK_STACK_QWORDS]), move |_dispatch, kept_result| {
+        let outcome = kept_result;
     pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
         .retirement.as_mut().unwrap().close_callback_interval();
     let result = match outcome {
@@ -430,6 +433,7 @@ pub(crate) unsafe fn destroy(
     context.settled_result = Some(result);
     finish_settled_context_cleanup(alias_index, device_index,
         context_index, key, route, route_identity)
+    })
 }
 
 pub(crate) unsafe fn defer_cookie_free(

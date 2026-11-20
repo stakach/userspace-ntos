@@ -117,11 +117,12 @@ pub(super) unsafe fn create(
     });
     pdo_aliases_mut()[alias_index].blocked = true;
     let process_index = pdo_aliases_mut()[alias_index].processes.len() - 1;
-    let result = match dispatch_dependent_provider_callback(
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(
         dispatch, record, dependent_inst, exec_code_va,
         [provider_context, marshal_window.component_base, 0, 0],
         [0; PROVIDER_CALLBACK_STACK_QWORDS],
-    ) {
+    ), move |_dispatch, kept_result| {
+        let result = match kept_result {
         Ok(result) => result,
         Err(status) => {
             let process = &pdo_aliases_mut()[alias_index].processes[process_index];
@@ -193,6 +194,7 @@ pub(super) unsafe fn create(
     }
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+    })
 }
 
 pub(super) unsafe fn destroy(
@@ -247,16 +249,18 @@ pub(super) unsafe fn destroy(
             return Err(STATUS_INVALID_PARAMETER);
         }
         pdo_aliases_mut()[alias_index].blocked = true;
-        let result = dispatch_dependent_provider_callback(dispatch, record, dependent_inst,
-            exec_code_va, [provider_context, 0, 0, 0],
-            [0; PROVIDER_CALLBACK_STACK_QWORDS])?;
-        if (result as u32 as i32) >= 0 {
-            if !pdo_aliases_mut()[alias_index].null_process_credits.as_mut().unwrap()
-                .finish_destroy(true, true)
-            { return Err(STATUS_INVALID_PARAMETER); }
-            pdo_aliases_mut()[alias_index].blocked = false;
-        }
-        return Ok(result);
+        return with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(dispatch,
+            record, dependent_inst, exec_code_va, [provider_context, 0, 0, 0],
+            [0; PROVIDER_CALLBACK_STACK_QWORDS]), move |_dispatch, kept_result| {
+            let result = kept_result?;
+            if (result as u32 as i32) >= 0 {
+                if !pdo_aliases_mut()[alias_index].null_process_credits.as_mut().unwrap()
+                    .finish_destroy(true, true)
+                { return Err(STATUS_INVALID_PARAMETER); }
+                pdo_aliases_mut()[alias_index].blocked = false;
+            }
+            Ok(result)
+        });
     }
     let process_index = alias.processes.iter().position(|process| {
         !process.destroy_entered && process.key.is_some_and(|key| {
@@ -282,9 +286,10 @@ pub(super) unsafe fn destroy(
     pdo_aliases_mut()[alias_index].processes[process_index].free_route = Some(route);
     pdo_aliases_mut()[alias_index].processes[process_index].retirement = retirement;
     pdo_aliases_mut()[alias_index].blocked = true;
-    let outcome = dispatch_dependent_provider_callback(dispatch, record, dependent_inst,
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(dispatch, record, dependent_inst,
         exec_code_va, [provider_context, kmd_process, 0, 0],
-        [0; PROVIDER_CALLBACK_STACK_QWORDS]);
+        [0; PROVIDER_CALLBACK_STACK_QWORDS]), move |_dispatch, kept_result| {
+        let outcome = kept_result;
     pdo_aliases_mut()[alias_index].processes[process_index].retirement
         .as_mut().unwrap().close_callback_interval();
     let result = outcome?;
@@ -310,6 +315,7 @@ pub(super) unsafe fn destroy(
     pdo_aliases_mut()[alias_index].processes.remove(process_index);
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+    })
 }
 
 /// Called only from the authenticated dependent pool-retirement service.

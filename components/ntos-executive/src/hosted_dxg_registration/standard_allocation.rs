@@ -135,10 +135,11 @@ pub(super) unsafe fn query(
         allocation: allocation_guard, resource: resource_guard,
     });
     pdo_aliases_mut()[alias_index].blocked = true;
-    let result = match dispatch_dependent_provider_callback(dispatch, record,
+    with_tail(dispatch, |dispatch| dispatch_dependent_provider_callback(dispatch, record,
         dependent_inst, exec_code_va,
         [provider_context, marshal_window.component_base, 0, 0],
-        [0; PROVIDER_CALLBACK_STACK_QWORDS]) {
+        [0; PROVIDER_CALLBACK_STACK_QWORDS]), move |_dispatch, kept_result| {
+        let result = match kept_result {
         Ok(result) => result,
         Err(status) => {
             pdo_aliases_mut()[alias_index].standard_allocation.as_ref().unwrap()
@@ -230,4 +231,5 @@ pub(super) unsafe fn query(
     pdo_aliases_mut()[alias_index].standard_allocation = None;
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+    })
 }
