@@ -25532,19 +25532,11 @@ impl ExecFileCompletion {
         Ok(())
     }
 
-    fn driver_event(&self, file_id: u64) -> Result<bool, u32> {
+    fn mirror_driver_event(&mut self, file_id: u64, signaled: bool)
+        -> Result<nt_io_completion::DriverEventMirror, u32>
+    {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&*self.table).driver_event(file_id) }
-    }
-
-    fn adopt_driver_event(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).adopt_driver_event(file_id, signaled) }
-    }
-
-    fn set_driver_event(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
-        // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).set_driver_event(file_id, signaled) }
+        unsafe { (&mut *self.table).mirror_driver_event(file_id, signaled) }
     }
 
     fn is_signaled(&self, file_id: u64) -> Result<bool, u32> {

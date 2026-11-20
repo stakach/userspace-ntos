@@ -12571,10 +12571,12 @@ impl ExecNtHandler {
     /// report, then mirror each edit. A newly signaled event wakes the File's waiters exactly as
     /// an I/O-manager completion signal would.
     pub(crate) fn mirror_driver_file_event(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
-        if self.file_completion.driver_event(file_id)? {
-            self.file_completion.set_driver_event(file_id, signaled)?;
-        } else {
-            self.file_completion.adopt_driver_event(file_id, signaled)?;
+        // Boot 44689472419: condrv signalled the event of a File whose last reference was
+        // already released (CLEANUP/CLOSE after cmd closed \Device\ConDrv), and the missing
+        // waitable entry was reported as STATUS_INVALID_HANDLE, a fatal protocol error.
+        let mirror = self.file_completion.mirror_driver_event(file_id, signaled)?;
+        if mirror == nt_io_completion::DriverEventMirror::Unobserved {
+            return Ok(());
         }
         if signaled {
             unsafe {

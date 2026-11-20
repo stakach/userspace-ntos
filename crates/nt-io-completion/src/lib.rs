@@ -150,6 +150,15 @@ struct FileCompletionEntry {
     binding: Option<FileCompletionBinding>,
 }
 
+/// Outcome of mirroring a driver-owned FILE_OBJECT.Event edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriverEventMirror {
+    Adopted,
+    Updated { signaled: bool },
+    /// No reference to the File remains, so no handle can observe the event.
+    Unobserved,
+}
+
 /// Fixed FILE_OBJECT-to-completion-port associations. Handles duplicated from the same file object
 /// share one entry and one immutable completion binding. Pending operations retain the same entry,
 /// so closing the last handle cannot tear down an association before its final completion packet.
@@ -655,21 +664,24 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
 
     /// Adopt the driver's FILE_OBJECT.Event after it set FO_SKIP_SET_EVENT, starting from the
     /// driver's current KEVENT state. Completion and I/O admission stop editing it.
-    pub fn adopt_driver_event(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
-        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+    /// Mirror the owning driver's edit of a FO_SKIP_SET_EVENT FILE_OBJECT.Event. The first edit
+    /// adopts the event as driver-owned. Once the File's last reference has been released, no
+    /// handle can wait on it, so a CLEANUP/CLOSE-time edit has no I/O-manager state to change
+    /// (in NT it is only a KEVENT edit). The caller must already have authenticated the exact
+    /// bound File; this table only owns waitable state.
+    pub fn mirror_driver_event(&mut self, file_id: u64, signaled: bool)
+        -> Result<DriverEventMirror, u32>
+    {
+        if file_id == 0 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let Some(entry) = self.entry_mut(file_id) else {
+            return Ok(DriverEventMirror::Unobserved);
+        };
+        let adopted = !entry.driver_event;
         entry.driver_event = true;
         entry.signaled = signaled;
-        Ok(())
-    }
-
-    /// Mirror the owning driver's KeSetEvent/KeClearEvent/KeResetEvent on FILE_OBJECT.Event.
-    pub fn set_driver_event(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
-        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if !entry.driver_event {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        entry.signaled = signaled;
-        Ok(())
+        Ok(if adopted { DriverEventMirror::Adopted } else { DriverEventMirror::Updated { signaled } })
     }
 
     pub fn driver_event(&self, file_id: u64) -> Result<bool, u32> {
@@ -1931,23 +1943,40 @@ mod tests {
     }
 
     #[test]
+    fn driver_event_edit_after_the_last_file_reference_is_unobserved() {
+        let mut files = FileCompletionTable::<1>::new();
+        files.insert_file(10, 77, false).unwrap();
+        assert_eq!(files.mirror_driver_event(10, false), Ok(DriverEventMirror::Adopted));
+        assert_eq!(files.mirror_driver_event(10, true), Ok(DriverEventMirror::Updated { signaled: true }));
+        assert_eq!(files.is_signaled(10), Ok(true));
+        // The last handle closed: CLEANUP/CLOSE can still edit FILE_OBJECT.Event, but no
+        // handle remains to wait on it, so the edit has no I/O-manager state to change.
+        files.release_handle(10).unwrap();
+        assert_eq!(files.mirror_driver_event(10, false), Ok(DriverEventMirror::Updated { signaled: false }),
+            "CLEANUP still holds the final handle's reference");
+        files.mark_cleanup_lifecycle_started(10).unwrap();
+        files.release_cleanup_reference(10).unwrap();
+        assert_eq!(files.mirror_driver_event(10, true), Ok(DriverEventMirror::Unobserved));
+        assert_eq!(files.mirror_driver_event(0, true), Err(STATUS_INVALID_HANDLE));
+    }
+
+    #[test]
     fn driver_owned_file_event_ignores_manager_edits_and_follows_the_driver() {
         let mut files = FileCompletionTable::<1>::new();
         files.insert_file(10, 77, false).unwrap();
-        assert_eq!(files.set_driver_event(10, true), Err(STATUS_INVALID_PARAMETER));
         assert_eq!(files.driver_event(10), Ok(false));
         // FO_SKIP_SET_EVENT seen after CREATE: start from the driver's non-signaled KEVENT.
-        files.adopt_driver_event(10, false).unwrap();
+        assert_eq!(files.mirror_driver_event(10, false), Ok(DriverEventMirror::Adopted));
         assert_eq!(files.driver_event(10), Ok(true));
         assert_eq!(files.is_signaled(10), Ok(false));
         assert_eq!(files.complete_file(10, STATUS_SUCCESS), Ok(false));
         assert_eq!(files.complete_file(10, 0xC000_0001), Ok(false));
         assert_eq!(files.signal_on_completion_association(10), Ok(false));
         assert_eq!(files.is_signaled(10), Ok(false), "completion never sets a driver event");
-        files.set_driver_event(10, true).unwrap();
+        files.mirror_driver_event(10, true).unwrap();
         files.set_signaled(10, false).unwrap();
         assert_eq!(files.is_signaled(10), Ok(true), "I/O admission never clears it either");
-        files.set_driver_event(10, false).unwrap();
+        files.mirror_driver_event(10, false).unwrap();
         assert_eq!(files.is_signaled(10), Ok(false));
     }
 
