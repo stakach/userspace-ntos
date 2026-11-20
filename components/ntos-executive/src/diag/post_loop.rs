@@ -173,6 +173,9 @@ pub(super) unsafe fn report(
         print_str(b"\n");
         park();
     }
+    // The quiesce gate's line precedes this fence. A runner stops the guest only on this verdict,
+    // after every dirty hive and the volume holding it are durable (#422).
+    print_str(b"[cm-flush] shutdown hive durability proven\n");
     dump_all_hosted_thread_quiesce(
         &nt_handler,
         &*hosted_loaded_images,

@@ -1,6 +1,13 @@
 //! Exact-Key mutation shared by hosted syscalls and kernel provider requests.
 
 use super::*;
+use crate::mutable_hive_edit_route::{hosted_edit_owner, HostedEditOwner, STATUS_DEVICE_NOT_READY};
+
+/// The owner of a hosted mutable-hive edit on the mounted volume's current block route.
+fn hosted_mutable_edit_owner() -> HostedEditOwner {
+    hosted_edit_owner(unsafe { crate::fs_loader::exec_fs_mount_identity() }
+        .and_then(crate::fs_loader::exec_block_route_kind))
+}
 
 impl ExecNtHandler {
     pub(crate) unsafe fn registry_target_set_value(
@@ -182,20 +189,19 @@ impl ExecNtHandler {
             return nt_security::STATUS_ACCESS_DENIED;
         }
         if let Some(mutable) = self.mutable_key_handle(key) {
-            let route = crate::fs_loader::exec_fs_mount_identity()
-                .and_then(crate::fs_loader::exec_block_route_kind);
-            if matches!(route, Some(nt_fs::BlockSourceKind::Draining)) {
-                return 0xC000_00A3;
-            }
-            if matches!(route, Some(nt_fs::BlockSourceKind::Native)) {
-                let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(nt_ulong_arg(args[3]))
-                    else { return STATUS_INVALID_PARAMETER; };
-                return match crate::mutable_hive_mutation_work::submit_hosted_set_value(
-                    self, key, mutable, name, value_type, data,
-                ) {
-                    Ok(()) => 0x103,
-                    Err(status) => status,
-                };
+            match hosted_mutable_edit_owner() {
+                HostedEditOwner::NotReady => return STATUS_DEVICE_NOT_READY,
+                HostedEditOwner::NativeWal => {
+                    let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(nt_ulong_arg(args[3]))
+                        else { return STATUS_INVALID_PARAMETER; };
+                    return match crate::mutable_hive_mutation_work::submit_hosted_set_value(
+                        self, key, mutable, name, value_type, data,
+                    ) {
+                        Ok(()) => 0x103,
+                        Err(status) => status,
+                    };
+                }
+                HostedEditOwner::Synchronous => {}
             }
         }
         self.registry_target_set_value(key, &name, nt_ulong_arg(args[3]), &data)
@@ -246,6 +252,102 @@ impl ExecNtHandler {
                 Err(status) => status,
             };
         }
+        if let Some(mutable) = self.mutable_key_handle(key) {
+            match hosted_mutable_edit_owner() {
+                HostedEditOwner::NotReady => return STATUS_DEVICE_NOT_READY,
+                HostedEditOwner::NativeWal => {
+                    return match crate::mutable_hive_mutation_work::submit_hosted_delete_value(
+                        self, key, mutable, name,
+                    ) {
+                        Ok(()) => 0x103,
+                        Err(status) => status,
+                    };
+                }
+                HostedEditOwner::Synchronous => {}
+            }
+        }
         self.registry_target_delete_value(key, &name)
+    }
+
+    /// `NtDeleteKey`: delete a leaf key (`references/reactos/ntoskrnl/config/ntapi.c`).
+    pub(super) unsafe fn nt_delete_key_admitted(&mut self, args: &[u64]) -> u32 {
+        const DELETE_ACCESS: u32 = 0x0001_0000;
+        const STATUS_CANNOT_DELETE: u32 = 0xC000_0121;
+        let key = match self.resolve_registry_key(args[0], DELETE_ACCESS) {
+            Ok(key) => key,
+            Err(status) => return status,
+        };
+        if key == MACHINE_ROOT_KEY || key == USER_ROOT_KEY {
+            return STATUS_CANNOT_DELETE;
+        }
+        if self.cm_system_key_target(key).is_some() {
+            let retained = match crate::registry_mutation_work::retain_hosted_existing(self, key) {
+                Ok(retained) => retained,
+                Err(status) => return status,
+            };
+            let information = match retained.information() {
+                Ok(information) => information,
+                Err(status) => { retained.abort(self); return status; }
+            };
+            if information.subkey_count != 0 {
+                retained.abort(self);
+                return STATUS_CANNOT_DELETE;
+            }
+            return match crate::registry_mutation_work::submit_hosted_existing(
+                self, retained, information.mount_generation,
+                nt_config_client::SystemHiveMutation::DeleteKey {
+                    path: &information.path,
+                },
+            ) {
+                Ok(()) => 0x103,
+                Err(status) => status,
+            };
+        }
+        let stats = match self.registry_key_stats(key) {
+            Ok(stats) => stats,
+            Err(status) => return status,
+        };
+        if stats.subkeys != 0 {
+            return STATUS_CANNOT_DELETE;
+        }
+        if let Some(index) = overlay_key_idx(key) {
+            let Some(path) = self.overlay.path(index).map(alloc::string::String::from)
+            else {
+                return 0xC000_0034;
+            };
+            if self.overlay.detach_subtree(&path) == 0 {
+                return 0xC000_0034;
+            }
+            self.registry_key_deleted(&path);
+            return 0;
+        }
+        let key_path = self.registry_target_path(key);
+        if let Some(mutable_key) = self.mutable_registry_key(key) {
+            if mutable_key.hive == HIVE_SEL_SYSTEM {
+                return STATUS_INVALID_HANDLE;
+            }
+            match hosted_mutable_edit_owner() {
+                HostedEditOwner::NotReady => return STATUS_DEVICE_NOT_READY,
+                HostedEditOwner::NativeWal => {
+                    return match crate::mutable_hive_mutation_work::submit_hosted_delete_key(
+                        self, key, mutable_key,
+                    ) {
+                        Ok(()) => 0x103,
+                        Err(status) => status,
+                    };
+                }
+                HostedEditOwner::Synchronous => {}
+            }
+            return match self.journal_delete_mutable_key(mutable_key) {
+                Ok(()) => {
+                    if let Some(path) = key_path.as_deref() {
+                        let _ = self.overlay.detach_subtree(path);
+                    }
+                    0
+                }
+                Err(status) => status,
+            };
+        }
+        0xC000_0022 // STATUS_ACCESS_DENIED: borrowed regf keys are read-only.
     }
 }

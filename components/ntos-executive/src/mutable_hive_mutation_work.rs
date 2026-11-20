@@ -5,7 +5,8 @@ use crate::*;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use nt_hive_core::{CellId, CreateChildError, OwnedPreparedCreateChild,
+use nt_hive_core::{CellId, CreateChildError, DeleteKeyEditError, DeleteValueEditError,
+    OwnedPreparedCreateChild, OwnedPreparedDeleteKey, OwnedPreparedDeleteValue,
     OwnedPreparedSetKeySecurity, OwnedPreparedSetValue,
     RegistryValueType, ResolvedHiveKey, SetKeySecurityError, SetValueError};
 use nt_process::native_handle::NativeThreadProcessReference;
@@ -34,12 +35,16 @@ enum Pending {
     Child { parent: CellId, path: String, name: String,
         class: Option<String>, descriptor: Vec<u8>, kind: nt_hive_core::KeyKind },
     Security { key: CellId, path: String, information: u32, modification: Vec<u8> },
+    DeleteValue { key: CellId, path: String, name: String },
+    DeleteKey { key: CellId, path: String },
 }
 
 enum Prepared {
     Value(OwnedPreparedSetValue),
     Child(OwnedPreparedCreateChild),
     Security(OwnedPreparedSetKeySecurity),
+    DeleteValue(OwnedPreparedDeleteValue),
+    DeleteKey(OwnedPreparedDeleteKey),
 }
 
 impl Prepared {
@@ -47,6 +52,7 @@ impl Prepared {
         match self {
             Self::Value(value) => value.record(), Self::Child(child) => child.record(),
             Self::Security(security) => security.record(),
+            Self::DeleteValue(delete) => delete.record(), Self::DeleteKey(delete) => delete.record(),
         }
     }
 
@@ -54,13 +60,15 @@ impl Prepared {
         match self {
             Self::Value(value) => value.mark_entered(), Self::Child(child) => child.mark_entered(),
             Self::Security(security) => security.mark_entered(),
+            Self::DeleteValue(delete) => delete.mark_entered(),
+            Self::DeleteKey(delete) => delete.mark_entered(),
         }
     }
 }
 
 enum Completion {
-    SetValue { key_owner: RegistryKeyHandlePublication },
-    Security { key_owner: RegistryKeyHandlePublication },
+    /// An edit of an existing key keeps the caller's handle to it until the reply.
+    ExistingKey { key_owner: RegistryKeyHandlePublication },
     CreateChild {
         publication: HostedRegistryPublication,
         parent_owner: RegistryKeyHandlePublication,
@@ -91,10 +99,11 @@ struct HostedCaller {
 }
 
 /// What a published edit of an existing key changed, for registry change notification.
-#[derive(Clone, Copy)]
 enum Reported {
     Values(CellId),
     Security(CellId),
+    /// The deleted key's namespace name; the name is gone once the key is.
+    KeyDeleted(String),
 }
 
 struct Work {
@@ -154,6 +163,28 @@ fn create_error(error: CreateChildError) -> u32 {
     }
 }
 
+const STATUS_KEY_DELETED: u32 = 0xC000_017C;
+
+fn delete_value_error(error: DeleteValueEditError) -> u32 {
+    match error {
+        DeleteValueEditError::KeyNotFound => STATUS_KEY_DELETED,
+        DeleteValueEditError::ValueNotFound => 0xC000_0034,
+        DeleteValueEditError::KeyMustBeDurable => 0xC000_0181,
+        DeleteValueEditError::InsufficientResources => 0xC000_009A,
+        DeleteValueEditError::RetainedPublication => 0xC000_00A3,
+    }
+}
+
+fn delete_key_error(error: DeleteKeyEditError) -> u32 {
+    match error {
+        DeleteKeyEditError::NotFound => STATUS_KEY_DELETED,
+        DeleteKeyEditError::CannotDelete => 0xC000_0121,
+        DeleteKeyEditError::KeyMustBeDurable => 0xC000_0181,
+        DeleteKeyEditError::InsufficientResources => 0xC000_009A,
+        DeleteKeyEditError::RetainedPublication => 0xC000_00A3,
+    }
+}
+
 fn security_error(error: SetKeySecurityError) -> u32 {
     match error {
         SetKeySecurityError::KeyNotFound => STATUS_INVALID_HANDLE,
@@ -192,9 +223,25 @@ pub(crate) unsafe fn submit_hosted_set_security(
         ExistingEdit::SetSecurity { information, modification })
 }
 
+/// `NtDeleteValueKey`: the value stays visible until its exact record is anchored (#422).
+pub(crate) unsafe fn submit_hosted_delete_value(
+    handler: &mut ExecNtHandler, key_ref: KeyRef, key: ResolvedHiveKey, name: String,
+) -> Result<(), u32> {
+    submit_hosted_existing_edit(handler, key_ref, key, ExistingEdit::DeleteValue { name })
+}
+
+/// `NtDeleteKey` of a leaf: the key stays visible until its exact record is anchored (#422).
+pub(crate) unsafe fn submit_hosted_delete_key(
+    handler: &mut ExecNtHandler, key_ref: KeyRef, key: ResolvedHiveKey,
+) -> Result<(), u32> {
+    submit_hosted_existing_edit(handler, key_ref, key, ExistingEdit::DeleteKey)
+}
+
 enum ExistingEdit {
     SetValue { name: String, value_type: RegistryValueType, data: Vec<u8> },
     SetSecurity { information: u32, modification: Vec<u8> },
+    DeleteValue { name: String },
+    DeleteKey,
 }
 
 unsafe fn submit_hosted_existing_edit(
@@ -202,11 +249,13 @@ unsafe fn submit_hosted_existing_edit(
 ) -> Result<(), u32> {
     let _durable = allocator::enter_durable();
     let path = handler.mutable_key_relative_path(key).ok_or(STATUS_INVALID_HANDLE)?;
-    let (pending, value_edit) = match edit {
+    let pending = match edit {
         ExistingEdit::SetValue { name, value_type, data } =>
-            (Pending::Value { key: key.key, path, name, value_type, data }, true),
+            Pending::Value { key: key.key, path, name, value_type, data },
         ExistingEdit::SetSecurity { information, modification } =>
-            (Pending::Security { key: key.key, path, information, modification }, false),
+            Pending::Security { key: key.key, path, information, modification },
+        ExistingEdit::DeleteValue { name } => Pending::DeleteValue { key: key.key, path, name },
+        ExistingEdit::DeleteKey => Pending::DeleteKey { key: key.key, path },
     };
     let mut log_path = handler.mutable_hive_checkpoint_path_owned(key.hive)
         .ok_or(STATUS_INVALID_HANDLE)?;
@@ -267,8 +316,7 @@ unsafe fn submit_hosted_existing_edit(
         caller: HostedCaller {
             pi: handler.pi,
             tid: handler.current_tid, badge: handler.current_badge, reply, logical,
-            reference, completion: Some(if value_edit { Completion::SetValue { key_owner } }
-                else { Completion::Security { key_owner } }),
+            reference, completion: Some(Completion::ExistingKey { key_owner }),
             _continuation: if handler.current_native_call_transport {
                 UserApcContinuation::NativeCall
             } else {
@@ -613,6 +661,18 @@ unsafe fn release_pre_entry(handler: &mut ExecNtHandler, work: &mut Work, status
                     return Err(status);
                 }
             }
+            Prepared::DeleteValue(prepared) => {
+                if let Err((_, prepared)) = handler.mutable_hives.release_unentered_owned_delete_value(prepared) {
+                    work.prepared = Some(Prepared::DeleteValue(prepared));
+                    return Err(status);
+                }
+            }
+            Prepared::DeleteKey(prepared) => {
+                if let Err((_, prepared)) = handler.mutable_hives.release_unentered_owned_delete_key(prepared) {
+                    work.prepared = Some(Prepared::DeleteKey(prepared));
+                    return Err(status);
+                }
+            }
         }
     }
     work.status = status;
@@ -631,8 +691,7 @@ unsafe fn caller_cancelled(handler: &ExecNtHandler, caller: &HostedCaller) -> bo
 
 fn release_completion(handler: &mut ExecNtHandler, caller: &mut HostedCaller) {
     match caller.completion.take().expect("retained mutable completion") {
-        Completion::SetValue { key_owner } | Completion::Security { key_owner } =>
-            release_key_owner(handler, key_owner),
+        Completion::ExistingKey { key_owner } => release_key_owner(handler, key_owner),
         Completion::CreateChild { mut publication, parent_owner, published, .. } => {
             if !published {
                 handler.abort_hosted_registry_publication(&mut publication);
@@ -660,8 +719,12 @@ unsafe fn advance(
                 && !handler.mutable_hives.has_retained_publication(work.hive) {
                 let pending = work.pending.take().expect("unprepared mutable edit");
                 work.reported = match &pending {
-                    Pending::Value { key, .. } => Some(Reported::Values(*key)),
+                    Pending::Value { key, .. } | Pending::DeleteValue { key, .. } =>
+                        Some(Reported::Values(*key)),
                     Pending::Security { key, .. } => Some(Reported::Security(*key)),
+                    Pending::DeleteKey { key, .. } => handler.mutable_hives
+                        .key_name(ResolvedHiveKey { hive: work.hive, key: *key })
+                        .map(Reported::KeyDeleted),
                     Pending::Child { .. } => None,
                 };
                 let prepared = match pending {
@@ -694,6 +757,12 @@ unsafe fn advance(
                             work.hive, key, &path, descriptor,
                         ).map(Prepared::Security).map_err(security_error)
                     })(),
+                    Pending::DeleteValue { key, path, name } =>
+                        handler.mutable_hives.prepare_owned_delete_value(work.hive, key, &path, &name)
+                            .map(Prepared::DeleteValue).map_err(delete_value_error),
+                    Pending::DeleteKey { key, path } =>
+                        handler.mutable_hives.prepare_owned_delete_key(work.hive, key, &path)
+                            .map(Prepared::DeleteKey).map_err(delete_key_error),
                 };
                 match prepared {
                     Ok(prepared) => { work.prepared = Some(prepared); work.phase = Phase::Begin; }
@@ -765,6 +834,32 @@ unsafe fn advance(
                         return Err(0xC000_003Eu32);
                     }
                 },
+                Prepared::DeleteValue(prepared) => match nt_fs::publish_anchored_hive_delete_value(
+                    &mut handler.mutable_hives, prepared, receipt.anchored,
+                    receipt.file_id, receipt.expected_log_len, &receipt.log_path,
+                ) {
+                    Ok((continuation, pair)) => (None, continuation, pair),
+                    Err((_, prepared, anchored)) => {
+                        work.prepared = Some(Prepared::DeleteValue(prepared));
+                        work.receipt = Some(writable_fs::hive_wal::NativeHiveJournalReceipt {
+                            anchored, ..receipt
+                        });
+                        return Err(0xC000_003Eu32);
+                    }
+                },
+                Prepared::DeleteKey(prepared) => match nt_fs::publish_anchored_hive_delete_key(
+                    &mut handler.mutable_hives, prepared, receipt.anchored,
+                    receipt.file_id, receipt.expected_log_len, &receipt.log_path,
+                ) {
+                    Ok((continuation, pair)) => (None, continuation, pair),
+                    Err((_, prepared, anchored)) => {
+                        work.prepared = Some(Prepared::DeleteKey(prepared));
+                        work.receipt = Some(writable_fs::hive_wal::NativeHiveJournalReceipt {
+                            anchored, ..receipt
+                        });
+                        return Err(0xC000_003Eu32);
+                    }
+                },
             };
             if let Some(child) = child {
                 let Some(Completion::CreateChild { child: destination, .. }) =
@@ -779,6 +874,10 @@ unsafe fn advance(
                     .mutable_registry_key_values_changed(ResolvedHiveKey { hive: work.hive, key }),
                 (None, Some(Reported::Security(key))) => handler
                     .mutable_registry_key_security_changed(ResolvedHiveKey { hive: work.hive, key }),
+                (None, Some(Reported::KeyDeleted(name))) => {
+                    handler.registry_key_deleted(&name);
+                    let _ = handler.overlay.detach_subtree(&name);
+                }
                 (None, None) => {}
             }
             work.installation = Some((continuation, pair));

@@ -344,3 +344,81 @@ fn wrong_delete_key_hive_retains_both_move_only_owners() {
     core::mem::forget(receipt);
     core::mem::forget(disk);
 }
+
+// #422: Explorer deletes each RunOnce value, and iernonce each RunOnceEx section, before running
+// it. A deletion anchored in the WAL must still be absent after the volume is reloaded and the
+// hive log is replayed over the installed hive.
+const SOFTWARE_LOG: &str = r"\??\C:\Windows\System32\Config\SOFTWARE.LOG";
+const RUN_ONCE: &str = r"Microsoft\Windows\CurrentVersion\RunOnce";
+const RUN_ONCE_EX: &str = r"Microsoft\Windows\CurrentVersion\RunOnceEx";
+const FINALIZE: &str = r"Microsoft\Windows\CurrentVersion\RunOnceEx\Finalize";
+
+fn installed_software() -> Hive {
+    let mut hive = Hive::new(HiveKind::Software);
+    let run_once = hive.create_key(RUN_ONCE);
+    assert!(hive.set_value(run_once, "GuiRunOnce", RegistryValueType::Sz, alloc::vec![b'x', 0]));
+    let finalize = hive.create_key(FINALIZE);
+    assert!(hive.set_value(finalize, "1", RegistryValueType::Sz, alloc::vec![b'y', 0]));
+    hive.finish_clean_import();
+    hive
+}
+
+/// Anchor one prepared record, then fold it into the volume's hive log as boot recovery would.
+fn anchor_into_volume(volume: &mut crate::FileSystem, log_len: &mut u64, record: &[u8])
+    -> (CachedDisk, AnchoredWalPublication, u64, u64)
+{
+    let file_id = volume.existing_file_id(SOFTWARE_LOG).unwrap();
+    let payload = HiveLogWalPayload { file_id, expected_log_len: *log_len, path: SOFTWARE_LOG, record };
+    let (disk, receipt) = anchored_payload(crate::encode_hive_log_wal_payload(payload).unwrap());
+    assert_eq!(volume.replay_hive_log_wal_payload(payload), Ok(crate::HiveLogWalReplay::Appended));
+    let expected = *log_len;
+    *log_len += record.len() as u64;
+    (disk, receipt, file_id, expected)
+}
+
+#[test]
+fn anchored_run_once_deletions_stay_deleted_after_volume_reload() {
+    let mut set = MutableHiveSet::new();
+    set.mount(r"\Registry\Machine\SOFTWARE", 2, installed_software()).unwrap();
+    let mut volume = crate::FileSystem::new(crate::MemFs::new());
+    assert!(volume.provision_file(SOFTWARE_LOG, b""));
+    let mut log_len = 0;
+    let (run_once, finalize) = {
+        let hive = set.hive(2).unwrap();
+        (hive.open_key(RUN_ONCE).unwrap(), hive.open_key(FINALIZE).unwrap())
+    };
+
+    let prepared = set.prepare_owned_delete_value(2, run_once, RUN_ONCE, "GuiRunOnce").unwrap();
+    let (_disk, receipt, file_id, expected) =
+        anchor_into_volume(&mut volume, &mut log_len, prepared.record());
+    let (continuation, pair) =
+        publish_anchored_hive_delete_value(&mut set, prepared, receipt, file_id, expected, SOFTWARE_LOG).ok().unwrap();
+    assert_eq!(continuation.anchor(), pair.anchor());
+    let prepared = set.prepare_owned_delete_value(2, finalize, FINALIZE, "1").unwrap();
+    let (_disk, receipt, file_id, expected) =
+        anchor_into_volume(&mut volume, &mut log_len, prepared.record());
+    let (continuation, pair) =
+        publish_anchored_hive_delete_value(&mut set, prepared, receipt, file_id, expected, SOFTWARE_LOG).ok().unwrap();
+    assert_eq!(continuation.anchor(), pair.anchor());
+    let prepared = set.prepare_owned_delete_key(2, finalize, FINALIZE).unwrap();
+    let (_disk, receipt, file_id, expected) =
+        anchor_into_volume(&mut volume, &mut log_len, prepared.record());
+    let (continuation, pair) =
+        publish_anchored_hive_delete_key(&mut set, prepared, receipt, file_id, expected, SOFTWARE_LOG).ok().unwrap();
+    assert_eq!(continuation.anchor(), pair.anchor());
+    let live = set.hive(2).unwrap();
+    assert_eq!(live.query_value(run_once, "GuiRunOnce"), None);
+    assert_eq!(live.open_key(FINALIZE), None);
+
+    // The next boot: restore the published volume and replay its log over the installed hive.
+    let snapshot = volume.export_volume_snapshot().unwrap();
+    let restored = crate::FileSystem::from_volume_snapshot(&snapshot).unwrap();
+    let log = restored.file_bytes_owned(SOFTWARE_LOG).unwrap();
+    let mut rebooted = installed_software();
+    let base = rebooted.sequence;
+    assert_eq!(nt_hive_core::try_replay_log(&mut rebooted, &log, base), Ok(base + 3));
+    let run_once = rebooted.open_key(RUN_ONCE).expect("RunOnce key stays");
+    assert_eq!(rebooted.query_value(run_once, "GuiRunOnce"), None);
+    assert_eq!(rebooted.open_key(FINALIZE), None);
+    assert!(rebooted.open_key(RUN_ONCE_EX).is_some());
+}

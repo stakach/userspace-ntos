@@ -165,6 +165,54 @@ class SerialTerminalDetectorTests(unittest.TestCase):
             self.assertIsNone(terminal_detector(log).poll())
 
 
+class QuiesceDurabilityFenceTests(unittest.TestCase):
+    """#422: the quiesce gate line precedes the post-loop hive durability fence."""
+
+    @staticmethod
+    def fence(log, gated_at=0):
+        fence = getattr(smoke, "QuiesceDurabilityFence", None)
+        if fence is None:
+            raise AssertionError("the runner stops at the gate line, before the verdict")
+        return fence(log, gated_at, grace_seconds=60)
+
+    def test_the_gate_waits_for_the_proven_verdict_across_split_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(
+                b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n"
+                b"[cm-flush] quiesce v2 boot hive WAL proof dirty-cells=3\n"
+                b"[cm-flush] shutdown hive durability pro"
+            )
+            fence = self.fence(log)
+            self.assertIsNone(fence.poll(5))
+            with log.open("ab") as stream:
+                stream.write(b"ven\n")
+            self.assertEqual(fence.poll(6), "proven")
+
+    def test_a_refused_fence_is_reported_as_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(b"[cm-flush] shutdown hive durability refused status=0x0xc0000001\n")
+            self.assertEqual(self.fence(log).poll(1), "refused")
+
+    def test_a_missing_verdict_ends_the_wait_unproven_at_the_grace_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(b"[quiesce] no boot milestone for ~180s wall-clock -> run gate\n")
+            fence = self.fence(log, gated_at=100)
+            self.assertIsNone(fence.poll(159))
+            self.assertEqual(fence.poll(160), "unproven")
+
+    def test_quoted_verdicts_do_not_end_the_wait(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(
+                b"trace: [cm-flush] shutdown hive durability proven\n"
+                b"[cm-flush] shutdown hive durability proven?\n"
+            )
+            self.assertIsNone(self.fence(log).poll(1))
+
+
 class BootProgressWatchdogTests(unittest.TestCase):
     """Only finite boot milestones and bounded completed disk I/O buy more time."""
 

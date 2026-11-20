@@ -51,6 +51,13 @@ TERMINAL_BOOT_STOP = re.compile(
     rb"\[no fault handler \xe2\x80\x94 suspending thread\]"
     rb")\r?\n"
 )
+# The quiesce gate line precedes the executive's post-loop hive durability fence (#422). The
+# guest may be stopped only once that fence reports, or the wait reaches its bound.
+QUIESCE_DURABILITY_VERDICT = re.compile(
+    rb"(?:^|[\r\n])\[cm-flush\] shutdown hive durability "
+    rb"(proven|refused status=(?:0x){1,2}[0-9a-fA-F]{8})\r?\n"
+)
+QUIESCE_DURABILITY_GRACE_SECONDS = 60
 PS_CREATE_FOLD_EVENT = re.compile(
     rb"\[ps-create-event\] #[0-9]+ stage=fold-(?:enter|service-return|restore-return) "
     rb"route=([0-9]+) reply=0 label=0"
@@ -345,6 +352,33 @@ class SerialTerminalDetector(SerialPanicDetector):
         if "WL: Failed to initialize Gina" in record:
             return "gina-load-failed"
         return "durability-refused"
+
+
+class QuiesceDurabilityFence:
+    """Wait for the hive durability verdict that follows a quiesce gate.
+
+    The gate's evidence is captured when the gate line arrives. The guest keeps running
+    until the executive's post-loop fence has published every dirty hive, so a stop never
+    discards a write that the fence was about to make durable.
+    """
+
+    def __init__(self, path, gated_at, grace_seconds=QUIESCE_DURABILITY_GRACE_SECONDS):
+        self.detector = SerialPanicDetector(path, QUIESCE_DURABILITY_VERDICT)
+        self.deadline = gated_at + grace_seconds
+
+    def poll(self, now):
+        """Return None while waiting, else "proven", "refused" or "unproven"."""
+        verdict = self.detector.poll()
+        if verdict is not None:
+            return "proven" if verdict == "proven" else "refused"
+        return "unproven" if now >= self.deadline else None
+
+
+QUIESCE_VERDICT_REASONS = {
+    "proven": "quiesce",
+    "refused": "durability-refused",
+    "unproven": "quiesce-durability-unproven",
+}
 
 
 def cpu_sample_delay(sample_index):
@@ -903,6 +937,7 @@ def main():
         progress_watchdog = BootProgressWatchdog(started)
         panic_site = None
         terminal_reason = None
+        quiesce_fence = None
         stationary_reason = None
         previous_sample = None
         interaction = seal_detector = None
@@ -950,7 +985,25 @@ def main():
                     print(f"Executive panic at {panic_site}; stopping bounded boot", flush=True)
                     capture_terminal_evidence("panic")
                     break
+                if quiesce_fence is not None:
+                    verdict = quiesce_fence.poll(time.monotonic())
+                    if verdict is None:
+                        if process.poll() is not None:
+                            break
+                        time.sleep(min(1, max(0, deadline - time.monotonic())))
+                        continue
+                    terminal_reason = QUIESCE_VERDICT_REASONS[verdict]
+                    print(f"Quiesce hive durability {verdict}; stopping bounded boot", flush=True)
+                    break
                 terminal_reason = terminal_detector.poll()
+                if terminal_reason == "quiesce":
+                    # Capture the gate's state now; stop only after the durability fence.
+                    print("Guest terminal quiesce; waiting for its hive durability verdict",
+                          flush=True)
+                    capture_terminal_evidence(terminal_reason)
+                    quiesce_fence = QuiesceDurabilityFence(LOG, time.monotonic())
+                    terminal_reason = None
+                    continue
                 if terminal_reason:
                     print(f"Guest terminal {terminal_reason}; stopping bounded boot", flush=True)
                     capture_terminal_evidence(terminal_reason)
@@ -1099,6 +1152,8 @@ def main():
               + ("" if interaction.armed else " (desktop seal never observed)"), flush=True)
     output = LOG.read_text(errors="replace")
     panic_site = panic_site or panic_detector.poll()
+    if quiesce_fence is not None and terminal_reason is None:
+        terminal_reason = QUIESCE_VERDICT_REASONS["unproven"]
     terminal_reason = terminal_reason or terminal_detector.poll()
     if panic_site:
         raise SystemExit(f"executive panic at {panic_site}; inspect native-kvm-smoke.log")

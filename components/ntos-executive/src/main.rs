@@ -56,6 +56,7 @@ mod ring_channel_completion;
 mod cm_key_ownership;
 mod cm_mutation_transport;
 mod registry_mutation_work;
+mod mutable_hive_edit_route;
 mod mutable_hive_mutation_work;
 mod hosted_routed_file_close_work;
 mod registry_key_targets;
