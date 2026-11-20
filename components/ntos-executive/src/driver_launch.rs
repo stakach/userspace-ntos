@@ -56,6 +56,7 @@ mod hosted_dxg_registration;
 pub(crate) mod hosted_provider_export_lane;
 pub(super) use hosted_dxg_registration::bridge_dxg_registration_entry;
 pub(crate) use hosted_dxg_registration::wddm_bridge::service as service_win32k_wddm_bridge_call;
+pub(crate) use hosted_dxg_registration::wddm_bridge::WddmBridgeStep;
 
 #[path = "hosted_wmi.rs"]
 mod hosted_wmi;
@@ -33533,7 +33534,7 @@ unsafe fn service_hosted_provider_export_explicit(
             return hosted_provider_export_failure(status as i32);
         }
     };
-    service_hosted_provider_export_with_dispatch(
+    let service = service_hosted_provider_export_with_dispatch(
         dependent_channel,
         provider_export_rva,
         provider_publication_cookie,
@@ -33550,7 +33551,63 @@ unsafe fn service_hosted_provider_export_explicit(
                     marshalled_args, caller_rsp)
             }
         },
-    )
+    );
+    let pending = match service {
+        ProviderExportService::Replied(result) => return result,
+        ProviderExportService::Kept(pending) => pending,
+    };
+    // The export is still running while the dependent stays parked. The step owns the marshal
+    // window, the dependency lease and the dispatch's finish, and replies the true result.
+    let PendingProviderExport { kept: KeptExport { kept, finish }, tail } = pending;
+    match kept.register(ServiceStep::ProviderExport(ProviderExportStep { finish, tail })) {
+        // The reply this returns is intercepted and never sent.
+        Ok(()) => nt_status::NtStatus::PENDING.raw() as u32 as u64,
+        Err((uncertain, step)) => step.complete(uncertain).words[0],
+    }
+}
+
+/// One provider-export dispatch as the service that owns its post-dispatch state sees it.
+enum ExportDispatch {
+    Returned(Result<u64, i32>),
+    /// The export is still running while the calling lane is parked for it (#420).
+    Kept(KeptExport),
+}
+
+#[must_use = "a kept export is owed its service step"]
+struct KeptExport {
+    kept: component_scheduler::service_continuation::KeptPump,
+    finish: ExportFinish,
+}
+
+/// How a dispatch's receipt becomes the export's result, by the lane it ran on.
+#[derive(Clone, Copy)]
+enum ExportFinish {
+    Worker(hosted_provider_export_lane::WorkerExportFinish),
+    Primary(PrimaryExportFinish),
+}
+
+impl ExportFinish {
+    unsafe fn finish(self, pump: crate::spawn_hosts::PumpResult) -> Result<u64, i32> {
+        match self {
+            Self::Worker(worker) => worker.finish(pump),
+            Self::Primary(primary) => primary.finish(pump),
+        }
+    }
+}
+
+/// Settle one export pump. A pump that stops unfinished stays with its lane's service.
+unsafe fn export_dispatch(
+    finish: ExportFinish, pump: component_scheduler::HostedPumpRestore,
+) -> ExportDispatch {
+    use component_scheduler::service_continuation::ServicePump;
+    match component_scheduler::service_continuation::settle(pump) {
+        ServicePump::Finished(pr) | ServicePump::Fenced(pr) =>
+            ExportDispatch::Returned(finish.finish(pr)),
+        ServicePump::Kept(kept) => ExportDispatch::Kept(KeptExport { kept, finish }),
+        // An export is a service of a running dependent lane, which the ReplyRequest pump
+        // always parks: there is no root-level export caller.
+        ServicePump::RootTurn(_) => unreachable!("provider export without a calling lane"),
+    }
 }
 
 unsafe fn dispatch_hosted_provider_export_legacy(
@@ -33561,7 +33618,7 @@ unsafe fn dispatch_hosted_provider_export_legacy(
     provider_export_rva: u64,
     args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     caller_rsp: u64,
-) -> Result<u64, i32> {
+) -> ExportDispatch {
     let provider_shared = provider_inst.exec_shared_va;
     write_volatile(
         (provider_shared + SH_REQ_MAJOR) as *mut u64,
@@ -33625,40 +33682,59 @@ unsafe fn dispatch_hosted_provider_export_legacy(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
-    let completion = nt_hosted_runtime::classify_hosted_provider_export_completion(
-        pr.completed, pr.status);
-    if completion == nt_hosted_runtime::HostedProviderExportCompletion::Reusable {
-        return Ok(read_volatile((provider_shared + SH_REQ_INFO) as *const u64));
-    }
-    let trace = HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-    if trace < HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP {
-        print_str(b"[provider-export] retained provider=");
-        print_str(singleton.provider.as_bytes());
-        print_str(b" cookie=");
-        print_u64(singleton.provider_publication_cookie);
-        print_str(b" rva=0x");
-        print_hex(provider_export_rva as u32);
-        print_str(b" status=0x");
-        print_hex(pr.status as u32);
-        print_str(b" result=");
-        print_hex64(pr.result);
-        print_str(b" wall-ip=");
-        print_hex64(pr.wall_ip);
-        print_str(b" wall-addr=");
-        print_hex64(pr.wall_addr);
-        print_str(b" wall-label=");
-        print_hex64(pr.wall_label);
-        print_str(b" wall-flags=");
-        print_hex64(pr.wall_flags);
-        print_str(b" tcb=");
-        print_hex64(provider_inst.tcb);
-        print_str(b"\n");
-    }
-    register_instance_ready(singleton.instance, false);
-    match completion {
-        nt_hosted_runtime::HostedProviderExportCompletion::Retain(status) => Err(status),
-        nt_hosted_runtime::HostedProviderExportCompletion::Reusable => unreachable!(),
+    let finish = PrimaryExportFinish {
+        singleton, provider_shared, provider_export_rva, tcb: provider_inst.tcb,
+    };
+    export_dispatch(ExportFinish::Primary(finish),
+        component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller))
+}
+
+/// What an export on the provider's primary lane needs once its pump really returns.
+#[derive(Clone, Copy)]
+struct PrimaryExportFinish {
+    singleton: HostedProviderSingleton,
+    provider_shared: u64,
+    provider_export_rva: u64,
+    tcb: u64,
+}
+
+impl PrimaryExportFinish {
+    unsafe fn finish(self, pr: crate::spawn_hosts::PumpResult) -> Result<u64, i32> {
+        let Self { singleton, provider_shared, provider_export_rva, tcb } = self;
+        let completion = nt_hosted_runtime::classify_hosted_provider_export_completion(
+            pr.completed, pr.status);
+        if completion == nt_hosted_runtime::HostedProviderExportCompletion::Reusable {
+            return Ok(read_volatile((provider_shared + SH_REQ_INFO) as *const u64));
+        }
+        let trace = HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace < HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP {
+            print_str(b"[provider-export] retained provider=");
+            print_str(singleton.provider.as_bytes());
+            print_str(b" cookie=");
+            print_u64(singleton.provider_publication_cookie);
+            print_str(b" rva=0x");
+            print_hex(provider_export_rva as u32);
+            print_str(b" status=0x");
+            print_hex(pr.status as u32);
+            print_str(b" result=");
+            print_hex64(pr.result);
+            print_str(b" wall-ip=");
+            print_hex64(pr.wall_ip);
+            print_str(b" wall-addr=");
+            print_hex64(pr.wall_addr);
+            print_str(b" wall-label=");
+            print_hex64(pr.wall_label);
+            print_str(b" wall-flags=");
+            print_hex64(pr.wall_flags);
+            print_str(b" tcb=");
+            print_hex64(tcb);
+            print_str(b"\n");
+        }
+        register_instance_ready(singleton.instance, false);
+        match completion {
+            nt_hosted_runtime::HostedProviderExportCompletion::Retain(status) => Err(status),
+            nt_hosted_runtime::HostedProviderExportCompletion::Reusable => unreachable!(),
+        }
     }
 }
 
@@ -33670,7 +33746,7 @@ unsafe fn service_hosted_provider_export_with_dispatch<F>(
     mut args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     mut marshal_window_source: HostedProviderMarshalWindowSource,
     dispatch: F,
-) -> u64
+) -> ProviderExportService
 where
     F: FnOnce(
         HostedProviderSingleton,
@@ -33679,13 +33755,13 @@ where
         &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
         u64,
         Option<hosted_provider_export_lane::Selection>,
-    ) -> Result<u64, i32>,
+    ) -> ExportDispatch,
 {
     HOSTED_PROVIDER_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let Some((_singleton_index, singleton)) =
         find_hosted_provider_singleton_by_cookie(provider_publication_cookie)
     else {
-        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_DEVICE_NOT_READY));
     };
     let descriptor = hosted_provider_domain_descriptor(singleton);
     let internal_policy = hosted_provider_internal_rva_marshal_policy(singleton,
@@ -33700,7 +33776,7 @@ where
             .or(internal_policy)
     };
     let Some(policy) = policy else {
-        return hosted_provider_export_failure(STATUS_NOT_SUPPORTED);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_NOT_SUPPORTED));
     };
     let packet_array_export = provider_policy_uses_packet_array(policy);
     if packet_array_export {
@@ -33724,17 +33800,17 @@ where
     match plan_hosted_provider_import_binding(Some(descriptor), provider_export_rva) {
         Ok(HostedProviderImportBinding::ProviderDomainCall(_plan)) => {}
         Ok(HostedProviderImportBinding::PrivateDependencyRequired) => {
-            return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY)
+            return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_DEVICE_NOT_READY))
         }
-        Err(_) => return hosted_provider_export_failure(STATUS_INVALID_PARAMETER),
+        Err(_) => return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_INVALID_PARAMETER)),
     }
     let Some((dependent_index, dependent_inst)) =
         instance_by_shared_va(dependent_channel.shared_va)
     else {
-        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_DEVICE_NOT_READY));
     };
     if dependent_index == singleton.instance {
-        return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_INVALID_PARAMETER));
     }
     if policy.side_effect == HostedProviderExportSideEffect::DxgRegistration
         && !hosted_dxg_registration::validate_call(
@@ -33745,7 +33821,7 @@ where
             &args,
         )
     {
-        return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_INVALID_PARAMETER));
     }
     if matches!(policy.side_effect,
         HostedProviderExportSideEffect::DxgInterfaceCallback
@@ -33763,17 +33839,17 @@ where
         print_str(b" cookie=");
         print_u64(provider_publication_cookie);
         print_str(b"\n");
-        return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_INVALID_PARAMETER));
     }
     let Some(provider_inst) = instance(singleton.instance) else {
-        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_DEVICE_NOT_READY));
     };
     if provider_inst.fault_ep == 0
         || provider_inst.pml4 == 0
         || provider_inst.reply_cap == 0
         || provider_inst.driver_object == 0
     {
-        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_DEVICE_NOT_READY));
     }
     if let Err(status) = ensure_hosted_provider_domain_dependency(
         singleton.instance,
@@ -33787,14 +33863,14 @@ where
             status,
             b"dependency",
         );
-        return hosted_provider_export_failure(status);
+        return ProviderExportService::Replied(hosted_provider_export_failure(status));
     }
     let Some(_dependency_lease) = acquire_hosted_provider_dependency_dispatch_lease(
         singleton.instance,
         dependent_index,
         singleton.provider_publication_cookie,
     ) else {
-        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_DEVICE_NOT_READY));
     };
     let dxg_callback = matches!(policy.side_effect,
         HostedProviderExportSideEffect::DxgInterfaceCallback
@@ -33811,7 +33887,7 @@ where
         let Some(owner) = hosted_provider_object_owner_for_pair(singleton.instance, dependent_index)
         else {
             print_str(b"[provider-export] reject stage=dxg-worker-owner\n");
-            return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+            return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_DEVICE_NOT_READY));
         };
         let dependent = hosted_provider_export_lane::Dependent::Hosted(dependent_index);
         if let Err(status) = hosted_provider_export_lane::prepare(
@@ -33819,13 +33895,13 @@ where
             print_str(b"[provider-export] reject stage=dxg-worker-prepare status=0x");
             print_hex(status.raw() as u32);
             print_str(b"\n");
-            return hosted_provider_export_failure(status.raw() as i32);
+            return ProviderExportService::Replied(hosted_provider_export_failure(status.raw() as i32));
         }
         let Some(selection) = hosted_provider_export_lane::select(
             singleton.instance, dependent, owner, provider_publication_cookie)
         else {
             print_str(b"[provider-export] reject stage=dxg-worker-select\n");
-            return hosted_provider_export_failure(nt_status::NtStatus::DEVICE_BUSY.raw() as i32);
+            return ProviderExportService::Replied(hosted_provider_export_failure(nt_status::NtStatus::DEVICE_BUSY.raw() as i32));
         };
         let Some(window) = HostedProviderMarshalWindow::new(
             selection.component_shared.checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)
@@ -33833,18 +33909,18 @@ where
             selection.executive_shared.checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)
                 .unwrap_or(0),
             SH_PROVIDER_EXPORT_MARSHAL_BYTES,
-        ) else { return hosted_provider_export_failure(STATUS_INVALID_PARAMETER); };
+        ) else { return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_INVALID_PARAMETER)); };
         marshal_window_source.target_exact = Some(window);
         Some(selection)
     } else { None };
     let provider_shared = reentrant.map_or(provider_inst.exec_shared_va, |row| row.executive_shared);
     let Some(marshal_window) = marshal_window_source.resolve(provider_shared) else {
-        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_DEVICE_NOT_READY));
     };
     let Some(exec_code_va) =
         ExecVaWindow::try_for_instance(singleton.instance).map(|win| win.code_va)
     else {
-        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_DEVICE_NOT_READY));
     };
     let original_args = args;
     trace_hosted_provider_export_frame(
@@ -33883,7 +33959,7 @@ where
                 status,
                 b"marshal",
             );
-            return hosted_provider_export_failure(status);
+            return ProviderExportService::Replied(hosted_provider_export_failure(status));
         }
     };
 
@@ -33894,7 +33970,7 @@ where
             &mut marshal_state, &mut args)
         {
             abort_provider_export_marshal_before_dispatch(&marshal_state);
-            return hosted_provider_export_failure(status);
+            return ProviderExportService::Replied(hosted_provider_export_failure(status));
         }
     }
 
@@ -33913,7 +33989,7 @@ where
                 b"resource",
             );
             abort_provider_export_marshal_before_dispatch(&marshal_state);
-            return hosted_provider_export_failure(status);
+            return ProviderExportService::Replied(hosted_provider_export_failure(status));
         }
     } else if marshal_state.resource_projection_required {
         trace_hosted_provider_export_rejection(
@@ -33924,189 +34000,306 @@ where
             b"resource-required",
         );
         abort_provider_export_marshal_before_dispatch(&marshal_state);
-        return hosted_provider_export_failure(STATUS_INVALID_DEVICE_REQUEST);
+        return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_INVALID_DEVICE_REQUEST));
     }
     let image_frames = if provider_inst.image_frames == 0 {
         singleton.image_frames
     } else {
         provider_inst.image_frames
     };
-    let mut result = match dispatch(singleton, provider_inst, exec_code_va, &args, caller_rsp,
-        reentrant) {
-        Ok(result) => result,
-        Err(status) => {
+    let dispatched = dispatch(singleton, provider_inst, exec_code_va, &args, caller_rsp, reentrant);
+    let tail = ProviderExportTail {
+        policy, marshal_state, singleton, provider_inst, dependent_index, dependent_inst,
+        dependent_binding, dependent_shared: dependent_channel.shared_va, provider_shared,
+        original_args, args, packet_array_export,
+        packet_before: [
+            packet_array_protocol_receive_requests_before,
+            packet_array_protocol_receive_completions_before,
+            packet_array_protocol_receive_packet_requests_before,
+            packet_array_protocol_receive_packet_completions_before,
+        ],
+        provider_publication_cookie, provider_export_rva, caller_rsp, image_frames,
+        _dependency_lease,
+    };
+    match dispatched {
+        ExportDispatch::Returned(result) => ProviderExportService::Replied(tail.finish(result)),
+        ExportDispatch::Kept(kept) => ProviderExportService::Kept(PendingProviderExport { kept, tail }),
+    }
+}
+
+/// A provider export whose dispatch always returns in place (it never runs a component
+/// pump that can stop unfinished), such as an IRQ arena's provider import.
+unsafe fn service_hosted_provider_export_returning<F>(
+    dependent_channel: &crate::spawn_hosts::PumpChannel,
+    provider_export_rva: u64,
+    provider_publication_cookie: u64,
+    caller_rsp: u64,
+    args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    marshal_window_source: HostedProviderMarshalWindowSource,
+    dispatch: F,
+) -> u64
+where
+    F: FnOnce(
+        HostedProviderSingleton,
+        DriverInstance,
+        u64,
+        &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+        u64,
+        Option<hosted_provider_export_lane::Selection>,
+    ) -> Result<u64, i32>,
+{
+    match service_hosted_provider_export_with_dispatch(
+        dependent_channel, provider_export_rva, provider_publication_cookie, caller_rsp, args,
+        marshal_window_source,
+        |singleton, provider_inst, exec_code_va, args, caller_rsp, reentrant|
+            ExportDispatch::Returned(dispatch(singleton, provider_inst, exec_code_va, args,
+                caller_rsp, reentrant)),
+    ) {
+        ProviderExportService::Replied(value) => value,
+        // Only a Kept dispatch produces a kept service, and this dispatch never builds one.
+        ProviderExportService::Kept(_) => unreachable!("returning export dispatch was kept"),
+    }
+}
+
+/// How a provider-export service ended for its caller.
+enum ProviderExportService {
+    Replied(u64),
+    /// The export is still running; its service owes the reply once the pump finishes.
+    Kept(PendingProviderExport),
+}
+
+#[must_use = "a kept provider export is owed its service step"]
+struct PendingProviderExport {
+    kept: KeptExport,
+    tail: ProviderExportTail,
+}
+
+/// The service step of a provider export whose dispatch had not finished (#420).
+pub(crate) struct ProviderExportStep {
+    finish: ExportFinish,
+    tail: ProviderExportTail,
+}
+
+impl ProviderExportStep {
+    /// The export's result once its dispatch has really returned (or walled).
+    pub(crate) unsafe fn complete(self, pump: crate::spawn_hosts::PumpResult) -> u64 {
+        self.tail.finish(self.finish.finish(pump))
+    }
+}
+
+/// Everything after the dispatch: marshal write-back or abort, side effects, DMA and resource
+/// completion, and the dependency lease, which stays held until the export has returned.
+struct ProviderExportTail {
+    policy: HostedProviderExportMarshalPolicy,
+    marshal_state: ProviderMarshalState,
+    singleton: HostedProviderSingleton,
+    provider_inst: DriverInstance,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    dependent_binding: Option<HostedDeviceBinding>,
+    dependent_shared: u64,
+    provider_shared: u64,
+    original_args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    packet_array_export: bool,
+    packet_before: [u64; 4],
+    provider_publication_cookie: u64,
+    provider_export_rva: u64,
+    caller_rsp: u64,
+    image_frames: u64,
+    _dependency_lease: HostedProviderDependencyDispatchLease,
+}
+
+impl ProviderExportTail {
+    unsafe fn finish(self, dispatched: Result<u64, i32>) -> u64 {
+        let Self {
+            policy, marshal_state, singleton, provider_inst, dependent_index, dependent_inst,
+            dependent_binding, dependent_shared, provider_shared, original_args, args,
+            packet_array_export, packet_before, provider_publication_cookie,
+            provider_export_rva, caller_rsp, image_frames, _dependency_lease,
+        } = self;
+        let [
+            packet_array_protocol_receive_requests_before,
+            packet_array_protocol_receive_completions_before,
+            packet_array_protocol_receive_packet_requests_before,
+            packet_array_protocol_receive_packet_completions_before,
+        ] = packet_before;
+        let mut result = match dispatched {
+            Ok(result) => result,
+            Err(status) => {
+                if policy.side_effect == HostedProviderExportSideEffect::DxgVidPnMethod {
+                    hosted_dxg_registration::vidpn::retain_uncertain_method(&marshal_state);
+                }
+                trace_hosted_provider_export_rejection(
+                    &singleton.provider,
+                    provider_publication_cookie,
+                    provider_export_rva,
+                    status,
+                    b"dispatch",
+                );
+                abort_provider_export_marshal_after_possible_dispatch(&marshal_state);
+                return hosted_provider_export_failure(status);
+            }
+        };
+        let provider_inst = instance(singleton.instance).unwrap_or(provider_inst);
+        if let Err(status) = complete_provider_export_side_effects(
+            policy,
+            &marshal_state,
+            singleton.instance,
+            dependent_index,
+            provider_publication_cookie,
+            &args,
+            result,
+        ) {
             if policy.side_effect == HostedProviderExportSideEffect::DxgVidPnMethod {
                 hosted_dxg_registration::vidpn::retain_uncertain_method(&marshal_state);
             }
-            trace_hosted_provider_export_rejection(
-                &singleton.provider,
-                provider_publication_cookie,
-                provider_export_rva,
-                status,
-                b"dispatch",
-            );
-            abort_provider_export_marshal_after_possible_dispatch(&marshal_state);
-            return hosted_provider_export_failure(status);
+            print_str(b"[driver-import] provider side effect failed cookie=");
+            print_u64(provider_publication_cookie);
+            print_str(b" status=0x");
+            print_hex(status as u32);
+            print_str(b"\n");
+            if (matches!(policy.side_effect,
+                HostedProviderExportSideEffect::NdisMiniportRegistration
+                    | HostedProviderExportSideEffect::DxgRegistration)
+                    && result == STATUS_SUCCESS as u64)
+                || (matches!(policy.side_effect,
+                    HostedProviderExportSideEffect::DxgVidPnInterfaceQuery
+                        | HostedProviderExportSideEffect::DxgVidPnMethod)
+                    && (result as u32 as i32) >= 0)
+            {
+                result = status as u32 as u64;
+            }
+            if policy.side_effect == HostedProviderExportSideEffect::NdisProtocolDeregistration
+                && marshal_state.ndis_status_provider_exec_va != 0
+            {
+                write_unaligned(
+                    marshal_state.ndis_status_provider_exec_va as *mut i32,
+                    status,
+                );
+            }
         }
-    };
-    let provider_inst = instance(singleton.instance).unwrap_or(provider_inst);
-    if let Err(status) = complete_provider_export_side_effects(
-        policy,
-        &marshal_state,
-        singleton.instance,
-        dependent_index,
-        provider_publication_cookie,
-        &args,
-        result,
-    ) {
-        if policy.side_effect == HostedProviderExportSideEffect::DxgVidPnMethod {
-            hosted_dxg_registration::vidpn::retain_uncertain_method(&marshal_state);
-        }
-        print_str(b"[driver-import] provider side effect failed cookie=");
-        print_u64(provider_publication_cookie);
-        print_str(b" status=0x");
-        print_hex(status as u32);
-        print_str(b"\n");
-        if (matches!(policy.side_effect,
-            HostedProviderExportSideEffect::NdisMiniportRegistration
-                | HostedProviderExportSideEffect::DxgRegistration)
-                && result == STATUS_SUCCESS as u64)
-            || (matches!(policy.side_effect,
-                HostedProviderExportSideEffect::DxgVidPnInterfaceQuery
-                    | HostedProviderExportSideEffect::DxgVidPnMethod)
-                && (result as u32 as i32) >= 0)
-        {
-            result = status as u32 as u64;
-        }
-        if policy.side_effect == HostedProviderExportSideEffect::NdisProtocolDeregistration
-            && marshal_state.ndis_status_provider_exec_va != 0
-        {
-            write_unaligned(
-                marshal_state.ndis_status_provider_exec_va as *mut i32,
-                status,
-            );
-        }
-    }
-    let dma_indeterminate = if let Err(status) = complete_provider_dma_state(
-        &marshal_state,
-        dependent_binding,
-        dependent_channel.shared_va,
-        provider_shared,
-    ) {
-        print_str(b"[driver-import] provider DMA result indeterminate status=0x");
-        print_hex(status.raw() as u32);
-        print_str(b"\n");
-        // Preserve the provider's result. Replacing it with a retryable error after a
-        // possible native effect would let the dependent repeat that effect.
-        // The dependent cannot continue using an indeterminate DMA allocation or free.
-        // register_instance_ready(false) sets its irreversible fault bit.
-        register_instance_ready(dependent_index, false);
-        true
-    } else { false };
-    complete_provider_ndis_object_shadows(
-        &marshal_state,
-        singleton.instance,
-        provider_inst,
-        dependent_index,
-        dependent_inst,
-        dependent_binding,
-    );
-    complete_provider_export_marshal(
-        policy,
-        &marshal_state,
-        singleton.instance,
-        provider_inst,
-        &mut result,
-        dma_indeterminate,
-    );
-    trace_provider_resource_list_export(
-        policy,
-        provider_export_rva,
-        singleton.instance,
-        provider_inst,
-        dependent_index,
-        dependent_inst,
-        &original_args,
-        &args,
-        result,
-    );
-    trace_provider_io_port_range_export(
-        policy,
-        provider_export_rva,
-        singleton.instance,
-        provider_inst,
-        dependent_index,
-        dependent_inst,
-        &original_args,
-        &args,
-        result,
-    );
-    if !dma_indeterminate {
-        complete_provider_resource_mapping(
-            policy,
+        let dma_indeterminate = if let Err(status) = complete_provider_dma_state(
             &marshal_state,
             dependent_binding,
-            dependent_channel.shared_va,
+            dependent_shared,
             provider_shared,
+        ) {
+            print_str(b"[driver-import] provider DMA result indeterminate status=0x");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+            // Preserve the provider's result. Replacing it with a retryable error after a
+            // possible native effect would let the dependent repeat that effect.
+            // The dependent cannot continue using an indeterminate DMA allocation or free.
+            // register_instance_ready(false) sets its irreversible fault bit.
+            register_instance_ready(dependent_index, false);
+            true
+        } else { false };
+        complete_provider_ndis_object_shadows(
+            &marshal_state,
+            singleton.instance,
+            provider_inst,
+            dependent_index,
+            dependent_inst,
+            dependent_binding,
+        );
+        complete_provider_export_marshal(
+            policy,
+            &marshal_state,
+            singleton.instance,
+            provider_inst,
+            &mut result,
+            dma_indeterminate,
+        );
+        trace_provider_resource_list_export(
+            policy,
+            provider_export_rva,
+            singleton.instance,
+            provider_inst,
+            dependent_index,
+            dependent_inst,
+            &original_args,
+            &args,
             result,
         );
+        trace_provider_io_port_range_export(
+            policy,
+            provider_export_rva,
+            singleton.instance,
+            provider_inst,
+            dependent_index,
+            dependent_inst,
+            &original_args,
+            &args,
+            result,
+        );
+        if !dma_indeterminate {
+            complete_provider_resource_mapping(
+                policy,
+                &marshal_state,
+                dependent_binding,
+                dependent_shared,
+                provider_shared,
+                result,
+            );
+        }
+        HOSTED_PROVIDER_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+        if packet_array_export {
+            HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+            HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_REQUESTS.fetch_add(
+                HOSTED_PROVIDER_PROTOCOL_RECEIVE_REQUESTS
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(packet_array_protocol_receive_requests_before),
+                Ordering::Relaxed,
+            );
+            HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_COMPLETIONS.fetch_add(
+                HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETIONS
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(packet_array_protocol_receive_completions_before),
+                Ordering::Relaxed,
+            );
+            HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_REQUESTS.fetch_add(
+                HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_REQUESTS
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(packet_array_protocol_receive_packet_requests_before),
+                Ordering::Relaxed,
+            );
+            HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_COMPLETIONS.fetch_add(
+                HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_COMPLETIONS
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(packet_array_protocol_receive_packet_completions_before),
+                Ordering::Relaxed,
+            );
+        }
+        trace_hosted_provider_export(
+            b"done",
+            &singleton.provider,
+            provider_publication_cookie,
+            provider_export_rva,
+            &args,
+            result,
+        );
+        trace_hosted_provider_export_frame(
+            b"done",
+            provider_export_rva,
+            dependent_index,
+            dependent_inst,
+            caller_rsp,
+        );
+        if DEBUG_TRACE && HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed) <= 8 {
+            print_str(b"[driver-import] provider-domain export dispatched cookie=");
+            print_u64(provider_publication_cookie);
+            print_str(b" rva=0x");
+            print_hex(provider_export_rva as u32);
+            print_str(b" result=0x");
+            print_hex((result >> 32) as u32);
+            print_hex(result as u32);
+            print_str(b" frames=");
+            print_u64(image_frames);
+            print_str(b"\n");
+        }
+        result
     }
-    HOSTED_PROVIDER_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-    if packet_array_export {
-        HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_REQUESTS.fetch_add(
-            HOSTED_PROVIDER_PROTOCOL_RECEIVE_REQUESTS
-                .load(Ordering::Relaxed)
-                .saturating_sub(packet_array_protocol_receive_requests_before),
-            Ordering::Relaxed,
-        );
-        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_COMPLETIONS.fetch_add(
-            HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETIONS
-                .load(Ordering::Relaxed)
-                .saturating_sub(packet_array_protocol_receive_completions_before),
-            Ordering::Relaxed,
-        );
-        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_REQUESTS.fetch_add(
-            HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_REQUESTS
-                .load(Ordering::Relaxed)
-                .saturating_sub(packet_array_protocol_receive_packet_requests_before),
-            Ordering::Relaxed,
-        );
-        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_COMPLETIONS.fetch_add(
-            HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_COMPLETIONS
-                .load(Ordering::Relaxed)
-                .saturating_sub(packet_array_protocol_receive_packet_completions_before),
-            Ordering::Relaxed,
-        );
-    }
-    trace_hosted_provider_export(
-        b"done",
-        &singleton.provider,
-        provider_publication_cookie,
-        provider_export_rva,
-        &args,
-        result,
-    );
-    trace_hosted_provider_export_frame(
-        b"done",
-        provider_export_rva,
-        dependent_index,
-        dependent_inst,
-        caller_rsp,
-    );
-    if DEBUG_TRACE && HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed) <= 8 {
-        print_str(b"[driver-import] provider-domain export dispatched cookie=");
-        print_u64(provider_publication_cookie);
-        print_str(b" rva=0x");
-        print_hex(provider_export_rva as u32);
-        print_str(b" result=0x");
-        print_hex((result >> 32) as u32);
-        print_hex(result as u32);
-        print_str(b" frames=");
-        print_u64(image_frames);
-        print_str(b"\n");
-    }
-    result
 }
 
 #[derive(Clone, Copy)]

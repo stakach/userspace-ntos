@@ -21,6 +21,43 @@ pub const fn classify_hosted_provider_export_completion(
     }
 }
 
+/// How one provider-export dispatch slice ended for the export's owner (#420).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedProviderExportPumpEnd {
+    /// The pump returned this receipt.
+    Returned { completed: bool, status: i32 },
+    /// The pump stopped unfinished and is kept by the calling service's continuation: the
+    /// export has not returned yet, so nothing about its result is known.
+    Kept,
+}
+
+/// The worker lane row after one dispatch slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedProviderExportWorkerPhase {
+    /// Reusable for the next export.
+    Ready,
+    /// Still running this export; no other export may select it.
+    Entered,
+    /// The export may have had native effects that are not accounted for.
+    Uncertain,
+}
+
+/// An unfinished, kept export is still running: its row stays `Entered` until the kept pump
+/// finishes and its own completion classifies it. Only a returned receipt can release it.
+pub const fn hosted_provider_export_worker_phase(
+    end: HostedProviderExportPumpEnd,
+) -> HostedProviderExportWorkerPhase {
+    match end {
+        HostedProviderExportPumpEnd::Kept => HostedProviderExportWorkerPhase::Entered,
+        HostedProviderExportPumpEnd::Returned { completed, status } =>
+            match classify_hosted_provider_export_completion(completed, status) {
+                HostedProviderExportCompletion::Reusable => HostedProviderExportWorkerPhase::Ready,
+                HostedProviderExportCompletion::Retain(_) =>
+                    HostedProviderExportWorkerPhase::Uncertain,
+            },
+    }
+}
+
 /// Whether a provider export runs on a provider worker lane instead of the primary lane.
 ///
 /// DXG interface callbacks always do. Any other export does when the provider's primary lane
@@ -179,5 +216,20 @@ mod reentry_tests {
         assert!(hosted_provider_export_needs_worker(false, false));
         assert!(!hosted_provider_export_needs_worker(false, true));
         assert!(hosted_provider_export_needs_worker(true, true));
+    }
+
+    #[test]
+    fn a_kept_export_keeps_its_worker_entered_until_its_true_result() {
+        use super::{hosted_provider_export_worker_phase as phase,
+            HostedProviderExportPumpEnd as End, HostedProviderExportWorkerPhase as Phase};
+        // The legacy pump reported an unfinished export as an incomplete receipt, which
+        // fenced the worker as uncertain while the export was still running (#420).
+        assert_eq!(phase(End::Returned { completed: false, status: 0xc000_00aeu32 as i32 }),
+            Phase::Uncertain);
+        assert_eq!(phase(End::Kept), Phase::Entered,
+            "a kept export is still running: it is neither reusable nor uncertain");
+        assert_eq!(phase(End::Returned { completed: true, status: 0 }), Phase::Ready);
+        assert_eq!(phase(End::Returned { completed: true, status: 0xc000_0001u32 as i32 }),
+            Phase::Uncertain);
     }
 }

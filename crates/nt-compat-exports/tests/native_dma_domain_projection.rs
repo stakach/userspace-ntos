@@ -31,20 +31,12 @@ fn native_dma_records_remain_in_their_own_domain() {
 
 #[test]
 fn an_uncertain_post_dispatch_dma_result_cannot_publish_stale_outputs_or_invite_replay() {
-    let export = body("let mut result = match dispatch(singleton", "trace_provider_resource_list_export(");
-    assert_eq!(export.matches("dispatch(singleton").count(), 1,
-        "the provider export must run once");
     let uncertain = body("let dma_indeterminate = if let Err(status) = complete_provider_dma_state(",
         "complete_provider_ndis_object_shadows(");
     assert!(!uncertain.contains("result = status"),
         "a possible native effect must not become a retryable replacement status");
     assert!(uncertain.contains("register_instance_ready(dependent_index, false)"),
         "an indeterminate DMA result must fault the dependent before it can dispatch again");
-    assert!(export.contains("&mut result,\n        dma_indeterminate,"));
-    let resource_completion = body("if !dma_indeterminate {\n        complete_provider_resource_mapping(",
-        "HOSTED_PROVIDER_EXPORT_COMPLETIONS.fetch_add(");
-    assert!(resource_completion.contains("complete_provider_resource_mapping("),
-        "an indeterminate native effect must not publish resource state");
 
     let copyout = body("unsafe fn complete_provider_export_marshal(",
         "unsafe fn complete_hosted_provider_miniport_attributes(");

@@ -38,12 +38,23 @@ impl ServiceReply {
 pub(crate) enum ServiceStep {
     /// `ZwUnloadDriver` from a hosted driver: finish the unload and reply its status.
     ZwUnloadDriver(crate::driver_launch::hosted_zw_load_driver::PendingZwUnload),
+    /// A hosted dependent's provider export: the dispatch's finish and the export's tail.
+    ProviderExport(crate::driver_launch::ProviderExportStep),
+    /// A routed WDDM bridge call from win32k: the worker finish and the caller write-back.
+    WddmBridge(crate::driver_launch::WddmBridgeStep),
 }
 
 impl ServiceStep {
-    unsafe fn complete(self, result: crate::spawn_hosts::PumpResult) -> ServiceReply {
+    /// Run the step once on its pump's result. A refused registration runs it at once on the
+    /// uncertain result, so the service's own tail still releases what it holds.
+    pub(crate) unsafe fn complete(self, result: crate::spawn_hosts::PumpResult) -> ServiceReply {
         match self {
             Self::ZwUnloadDriver(pending) => ServiceReply::status(pending.finish(result)),
+            Self::ProviderExport(step) => ServiceReply::status(step.complete(result) as u32 as i32),
+            Self::WddmBridge(step) => {
+                let (status, value) = step.complete(result);
+                ServiceReply { info: None, words: [status as u32 as u64, value, 0, 0] }
+            }
         }
     }
 }
@@ -154,14 +165,14 @@ pub(in crate::driver_launch) unsafe fn settle(pump: HostedPumpRestore) -> Servic
 
 impl KeptPump {
     /// Keep `step` instead of replying. X's pump intercepts its next reply and yields the
-    /// parent; the step replies once the pump finishes. A refusal fences the pump and
-    /// returns its uncertain result for the service to report.
+    /// parent; the step replies once the pump finishes. A refusal fences the pump and hands
+    /// back the step with the uncertain result, so the service still runs its own tail.
     pub(crate) unsafe fn register(
         self, step: ServiceStep,
-    ) -> Result<(), crate::spawn_hosts::PumpResult> {
+    ) -> Result<(), (crate::spawn_hosts::PumpResult, ServiceStep)> {
         let Self { pump, parent } = self;
         if nested::await_service(&parent).is_err() {
-            return Err(fence_with_parent(pump, parent, b"parent"));
+            return Err((fence_with_parent(pump, parent, b"parent"), step));
         }
         let ticket = parent.ticket();
         match services().register(ticket, parent, step, pump) {
@@ -174,7 +185,7 @@ impl KeptPump {
                 if let Ok(ticket) = nested::finish_service_await(refused.parent) {
                     crate::spawn_hosts::defer_reply_until_ticket_restored(ticket);
                 }
-                Err(fence_pump(refused.pump, b"capacity"))
+                Err((fence_pump(refused.pump, b"capacity"), refused.step))
             }
         }
     }

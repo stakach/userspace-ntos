@@ -652,7 +652,7 @@ impl HostedIrqRootSession {
             }
         };
         let mut dispatch_error = None;
-        let value = service_hosted_provider_export_with_dispatch(
+        let value = service_hosted_provider_export_returning(
             &source_lane.channel,
             command.service_id,
             command.authority_cookie,

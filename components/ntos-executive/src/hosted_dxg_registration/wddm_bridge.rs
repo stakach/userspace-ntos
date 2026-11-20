@@ -320,19 +320,72 @@ pub(crate) unsafe fn service(
 
     let argument_count = policy.argument_count as usize;
     trace(b"enter", slot, target.provider_rva, &caller_args[..argument_count], 0);
-    let mut result = match hosted_provider_export_lane::dispatch(
-        selection, target.provider_rva, &args, entry_rsp, caller)
-    {
-        Ok(result) => result,
-        // The provider may have run. Nothing is copied back and the call is never replayed;
-        // the worker stays retained as uncertain.
-        Err(status) => return reject(b"dispatch", slot, status),
+    let dispatched = hosted_provider_export_lane::dispatch(
+        selection, target.provider_rva, &args, entry_rsp, caller);
+    let tail = BridgeTail {
+        targets, route, policy, state, singleton, provider_inst, slot,
+        provider_rva: target.provider_rva, caller_args, argument_count,
     };
-    if targets.iter().flatten().any(|(target, exec)| target.address_if_live(route) != Some(*exec)) {
-        return reject(b"caller-range-retired", slot, STATUS_ACCESS_VIOLATION);
+    let kept = match dispatched {
+        ExportDispatch::Returned(result) => return tail.finish(result),
+        ExportDispatch::Kept(kept) => kept,
+    };
+    // The provider is still running while win32k's lane stays parked. The step owns the
+    // captured caller ranges and the marshal state, and replies the true result.
+    let KeptExport { kept, finish } = kept;
+    match kept.register(ServiceStep::WddmBridge(WddmBridgeStep { finish, tail })) {
+        // The reply this returns is intercepted and never sent.
+        Ok(()) => (nt_status::NtStatus::PENDING.raw(), 0),
+        Err((uncertain, step)) => {
+            let reply = step.complete(uncertain);
+            (reply.words[0] as u32 as i32, reply.words[1])
+        }
     }
-    complete_provider_export_marshal(policy, &state, singleton.instance, provider_inst,
-        &mut result, false);
-    trace(b"done", slot, target.provider_rva, &caller_args[..argument_count], result);
-    (STATUS_SUCCESS, result)
+}
+
+/// The service step of a bridge call whose provider export had not finished (#420).
+pub(crate) struct WddmBridgeStep {
+    finish: ExportFinish,
+    tail: BridgeTail,
+}
+
+impl WddmBridgeStep {
+    pub(crate) unsafe fn complete(self, pump: crate::spawn_hosts::PumpResult) -> (i32, u64) {
+        self.tail.finish(self.finish.finish(pump))
+    }
+}
+
+/// The caller write-back after the provider returned.
+struct BridgeTail {
+    targets: [Option<(super::hosted_kernel_win32k_source_ioctl::Target, u64)>;
+        HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    policy: HostedProviderExportMarshalPolicy,
+    state: ProviderMarshalState,
+    singleton: HostedProviderSingleton,
+    provider_inst: DriverInstance,
+    slot: u64,
+    provider_rva: u64,
+    caller_args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    argument_count: usize,
+}
+
+impl BridgeTail {
+    unsafe fn finish(self, dispatched: Result<u64, i32>) -> (i32, u64) {
+        let Self { targets, route, policy, state, singleton, provider_inst, slot, provider_rva,
+            caller_args, argument_count } = self;
+        let mut result = match dispatched {
+            Ok(result) => result,
+            // The provider may have run. Nothing is copied back and the call is never
+            // replayed; the worker stays retained as uncertain.
+            Err(status) => return reject(b"dispatch", slot, status),
+        };
+        if targets.iter().flatten().any(|(target, exec)| target.address_if_live(route) != Some(*exec)) {
+            return reject(b"caller-range-retired", slot, STATUS_ACCESS_VIOLATION);
+        }
+        complete_provider_export_marshal(policy, &state, singleton.instance, provider_inst,
+            &mut result, false);
+        trace(b"done", slot, provider_rva, &caller_args[..argument_count], result);
+        (STATUS_SUCCESS, result)
+    }
 }

@@ -259,7 +259,7 @@ pub(super) unsafe fn service_unload(
     match pending.kept.register(crate::driver_launch::ServiceStep::ZwUnloadDriver(step)) {
         // The reply this returns is intercepted and never sent.
         Ok(()) => nt_status::NtStatus::PENDING.raw(),
-        Err(_uncertain) => nt_status::NtStatus::UNSUCCESSFUL.raw(),
+        Err((uncertain, step)) => step.complete(uncertain).words[0] as u32 as i32,
     }
 }
 

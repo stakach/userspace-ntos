@@ -100,6 +100,8 @@ pub use dxg_registration::{
 };
 pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderWorkerIdentity,
     HostedWorkerBankLayout, classify_hosted_provider_export_completion,
+    hosted_provider_export_worker_phase, HostedProviderExportPumpEnd,
+    HostedProviderExportWorkerPhase,
     select_hosted_cr8_bank, select_hosted_provider_export_worker, hosted_provider_export_needs_worker,
     hosted_provider_worker_admissible};
 pub use gop_bar_projection::{GopBarProjection, GopLegacyVgaPortAuthority,

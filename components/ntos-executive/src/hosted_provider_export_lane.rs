@@ -640,14 +640,20 @@ pub(super) unsafe fn select(provider: usize, dependent: Dependent,
 
 pub(super) unsafe fn dispatch(selection: Selection, export_rva: u64,
     args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP], caller_rsp: u64,
-    caller: nt_process::native_handle::NativeHandleCaller) -> Result<u64, i32> {
+    caller: nt_process::native_handle::NativeHandleCaller) -> ExportDispatch {
     let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[selection.index];
     if row.phase != Phase::Ready || row.route != Some(selection.route)
         || row.owner != selection.owner || row.publication != selection.publication
-        || row.executive_shared != selection.executive_shared { return Err(STATUS_INVALID_HANDLE); }
-    let worker = worker(selection.provider, row.ordinal).ok_or(STATUS_INVALID_HANDLE)?;
-    let ch = channel(selection.index, worker, crate::spawn_hosts::InitialAction::ReplyRequest)
-        .map_err(|status| status as i32)?;
+        || row.executive_shared != selection.executive_shared {
+        return ExportDispatch::Returned(Err(STATUS_INVALID_HANDLE));
+    }
+    let Some(worker) = worker(selection.provider, row.ordinal) else {
+        return ExportDispatch::Returned(Err(STATUS_INVALID_HANDLE));
+    };
+    let ch = match channel(selection.index, worker, crate::spawn_hosts::InitialAction::ReplyRequest) {
+        Ok(ch) => ch,
+        Err(status) => return ExportDispatch::Returned(Err(status as i32)),
+    };
     let shared = selection.executive_shared;
     write_volatile((shared + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_PROVIDER_EXPORT);
     write_volatile((shared + SH_REQ_MINOR) as *mut u64, export_rva);
@@ -667,19 +673,41 @@ pub(super) unsafe fn dispatch(selection: Selection, export_rva: u64,
     write_volatile((shared + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((shared + SH_REQ_INFO) as *mut u64, 0);
     row.phase = Phase::Entered;
-    let pump = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
-    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[selection.index];
-    let completion = nt_hosted_runtime::classify_hosted_provider_export_completion(
-        pump.completed, pump.status);
-    if row.phase == Phase::Entered && row.route == Some(selection.route) {
-        row.phase = if completion == nt_hosted_runtime::HostedProviderExportCompletion::Reusable {
-            Phase::Ready
-        } else { Phase::Uncertain };
-    }
-    match completion {
-        nt_hosted_runtime::HostedProviderExportCompletion::Reusable =>
-            Ok(read_volatile((shared + SH_REQ_INFO) as *const u64)),
-        nt_hosted_runtime::HostedProviderExportCompletion::Retain(status) => Err(status),
+    let finish = WorkerExportFinish { index: selection.index, route: selection.route, shared };
+    export_dispatch(ExportFinish::Worker(finish),
+        component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller))
+}
+
+/// What a worker export needs once its pump really returns.
+#[derive(Clone, Copy)]
+pub(super) struct WorkerExportFinish {
+    index: usize,
+    route: PeerRoute,
+    shared: u64,
+}
+
+impl WorkerExportFinish {
+    /// Classify the returned receipt and release, or fence, the `Entered` row. A kept export
+    /// never reaches here before its pump finishes, so its row stays `Entered` meanwhile.
+    pub(super) unsafe fn finish(self, pump: crate::spawn_hosts::PumpResult) -> Result<u64, i32> {
+        use nt_hosted_runtime::{HostedProviderExportPumpEnd as End,
+            HostedProviderExportWorkerPhase as WorkerPhase};
+        let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[self.index];
+        let end = End::Returned { completed: pump.completed, status: pump.status };
+        if row.phase == Phase::Entered && row.route == Some(self.route) {
+            row.phase = match nt_hosted_runtime::hosted_provider_export_worker_phase(end) {
+                WorkerPhase::Ready => Phase::Ready,
+                WorkerPhase::Entered => Phase::Entered,
+                WorkerPhase::Uncertain => Phase::Uncertain,
+            };
+        }
+        match nt_hosted_runtime::classify_hosted_provider_export_completion(
+            pump.completed, pump.status)
+        {
+            nt_hosted_runtime::HostedProviderExportCompletion::Reusable =>
+                Ok(read_volatile((self.shared + SH_REQ_INFO) as *const u64)),
+            nt_hosted_runtime::HostedProviderExportCompletion::Retain(status) => Err(status),
+        }
     }
 }
 
