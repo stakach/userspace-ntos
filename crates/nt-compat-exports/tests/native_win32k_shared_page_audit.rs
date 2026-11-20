@@ -34,6 +34,8 @@ fn every_resume_reacquires_and_every_repark_parks() {
     let reacquire = body.find("audit_reacquire(").expect("resume reacquires the page");
     let select = body.find("select_win32k_client_window(client)").unwrap();
     assert!(reacquire < select, "the page is held before the client window is selected");
+    let restore = body.find("restore_shared_resume_snapshot_effect(").expect("resume restores the page");
+    assert!(select < restore, "the exact client window is selected before its page is restored");
     assert!(body.contains("audit_restored("), "the restore's physical evidence is acknowledged");
     // A resumed pump that yields again records the park at the pending record it builds.
     assert!(!RECEIVE.contains("shared_resume: capture_shared_resume_snapshot("),

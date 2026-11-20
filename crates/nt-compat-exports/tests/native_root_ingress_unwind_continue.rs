@@ -40,9 +40,4 @@ fn distinct_receive_half_checks_physical_identity_and_never_resends() {
     assert!(resume.find("root_ingress_unwind_continuation_is_current(").unwrap()
         < resume.find("select_and_restore_shared_resume_snapshot(").unwrap(),
         "physical identity must be checked before shared-client effects");
-    let select_and_restore = PENDING.split("fn select_and_restore_shared_resume_snapshot(").nth(1)
-        .expect("selected shared-page restore boundary");
-    assert!(select_and_restore.find("select_win32k_client_window(").unwrap()
-        < select_and_restore.find("restore_shared_resume_snapshot_effect(").unwrap(),
-        "the shared page may be restored only after selecting its exact client");
 }

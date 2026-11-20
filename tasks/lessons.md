@@ -938,3 +938,8 @@ diagnosis-free failure.
 - When a change alters what a behavioural test exercises (here the admission-error observer's
   first-sighting budget), update that test's expectations. Delete it only if it is a source-text
   check.
+
+## Delete Source-Text Assertions a Change Invalidates
+- When a change breaks an existing source-text check (a pinned call name or ordering in another
+  test), delete that assertion; do not repoint it at the new spelling. Carry the behavioural
+  guarantee in the test that pins the new design, so each guarantee has one owner.
