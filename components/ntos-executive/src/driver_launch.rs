@@ -52198,7 +52198,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
             }
         });
     }
-    let result = hosted_file_owners::dispatch_unretained(
+    let result = hosted_file_owners::dispatch_deferring(
         caller,
         nt_io_manager::detached_file_irp::ExternalFileIrpRequest {
             client: ClientId(IO_MANAGER_COMPONENT_ID),

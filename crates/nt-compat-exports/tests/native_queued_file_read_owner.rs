@@ -70,28 +70,9 @@ fn queued_read_enters_once_and_retains_terminal_for_delivery() {
     let entered = redrive.find("Flight::Dispatch").expect("entered flight");
     let invoke = redrive.find("hosted_file_dispatch::invoke").expect("provider invoke");
     assert!(begin < entered && entered < invoke);
-    assert!(redrive.contains("Payload::Terminal(terminal)"));
     assert!(redrive.contains("ExternalFileIrpResult::Indeterminate"));
     assert!(redrive.contains("ExternalFileIrpResult::NotEntered { status, prepared }"));
     assert!(redrive.contains("block(id, Payload::Prepared(prepared), status)"));
-}
-
-#[test]
-fn queued_terminal_delivery_does_not_issue_an_extra_backend_ack() {
-    let completion = OWNERS
-        .split_once("fn acknowledge_with_buffers(")
-        .expect("terminal delivery")
-        .1;
-    let terminal = completion
-        .split_once("if matches!(row(id).payload.as_ref(), Some(Payload::Terminal(_)))")
-        .expect("synchronous terminal branch")
-        .1
-        .split_once("if monotonic_time_100ns() < row(id).retry_after")
-        .expect("terminal branch boundary")
-        .0;
-    assert!(terminal.contains("retire_external_file_irp_terminal(terminal)"));
-    assert!(!terminal.contains("hosted_file_dispatch::acknowledge"));
-    assert!(completion.contains("retire_external_file_irp_completion_without_backend(completion)"));
 }
 
 #[test]

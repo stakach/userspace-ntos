@@ -1235,7 +1235,7 @@ unsafe fn dispatch_claim(
         }
     } else { None };
     let started_ticks = crate::disk_census_ticks();
-    let dispatch = hosted_file_owners::dispatch_unretained(
+    let dispatch = hosted_file_owners::dispatch_deferring(
         caller, request, input, &output, ExternalFileIrpDispatchPolicy::ScsiAtDevice,
     );
     let dispatch_returned_ticks = crate::disk_census_ticks();

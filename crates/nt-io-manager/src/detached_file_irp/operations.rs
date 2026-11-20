@@ -483,7 +483,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let valid = self
             .validate_detached_completion_operation(&completion)
             .and_then(|_| {
-                if completion.completion.completion_origin != crate::IrpCompletionOrigin::Driver {
+                if !completion.owes_backend_acknowledgement() {
                     return Err(NtStatus::INVALID_PARAMETER);
                 }
                 if !completion.capture_complete()

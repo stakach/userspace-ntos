@@ -15,6 +15,7 @@ mod open_case_tests;
 mod operations_tests;
 mod pump_suspension_tests;
 mod relative_root_tests;
+mod synchronous_terminal_tests;
 
 #[derive(Default)]
 struct Trace {

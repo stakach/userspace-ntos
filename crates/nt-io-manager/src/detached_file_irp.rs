@@ -208,6 +208,8 @@ pub struct ExternalFileIrpCompletionInvocation {
     capture: ExternalFileIrpOutputCapture,
     captured: usize,
     capture_len: usize,
+    /// The driver returned this terminal synchronously; it owes no completion ACK (#420).
+    synchronous_return: bool,
 }
 #[derive(Debug)]
 #[must_use = "finish acknowledgement through the issuing I/O Manager"]
@@ -411,6 +413,12 @@ impl ExternalFileIrpCompletionInvocation {
     }
     pub fn capture_complete(&self) -> bool {
         self.captured == self.capture_len
+    }
+    /// Only a driver that pended and later completed the IRP waits for an ACK. A no-entry
+    /// failure and a queued synchronous return retire without a backend.
+    pub fn owes_backend_acknowledgement(&self) -> bool {
+        self.completion.completion_origin == IrpCompletionOrigin::Driver
+            && !self.synchronous_return
     }
 }
 
@@ -1162,6 +1170,56 @@ impl<P: ObjectManagerPort> IoManager<P> {
         ))
     }
 
+    /// Publish a synchronously returned terminal as the IRP's ordinary queued completion (#420).
+    /// Its caller was already told `STATUS_PENDING`: the dispatch stopped unfinished and only
+    /// returned later. Delivery then reads it as it reads any pending IRP's completion. The
+    /// invocation already holds the captured bytes, and a driver that returned rather than pended
+    /// owes no completion ACK, so the completion retires without a backend.
+    pub fn queue_external_file_irp_terminal(
+        &mut self,
+        terminal: ExternalFileIrpTerminal,
+        capture: ExternalFileIrpOutputCapture,
+    ) -> Result<
+        ExternalFileIrpCompletionInvocation,
+        ExternalFileIrpRejection<ExternalFileIrpTerminal>,
+    > {
+        let valid = self.validate_detached_owner(&terminal.owner).and_then(|_| {
+            if self.completed_irp_snapshot(terminal.completion.id).as_ref()
+                != Some(&terminal.completion)
+                || self.completed_irps.contains(&terminal.completion.id)
+                || terminal.completion.completion_origin != IrpCompletionOrigin::Driver
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let capture_len = capture.required_len(&terminal.owner, &terminal.completion)?;
+            let held = match capture {
+                ExternalFileIrpOutputCapture::MethodNeitherInput => terminal.owner.buffers.input.len(),
+                _ => terminal.owner.buffers.output.len(),
+            };
+            if capture_len > held {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            self.completed_irps
+                .try_reserve(1)
+                .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            Ok(capture_len)
+        });
+        let capture_len = match valid {
+            Ok(capture_len) => capture_len,
+            Err(status) => return Err(ExternalFileIrpRejection { status, owner: terminal }),
+        };
+        let ExternalFileIrpTerminal { owner, completion } = terminal;
+        self.completed_irps.push_back(completion.id);
+        Ok(ExternalFileIrpCompletionInvocation {
+            owner,
+            completion,
+            capture,
+            captured: capture_len,
+            capture_len,
+            synchronous_return: true,
+        })
+    }
+
     pub fn prepare_external_file_irp_completion(
         &mut self,
         retained: RetainedExternalFileIrp,
@@ -1208,6 +1266,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 capture,
                 captured: 0,
                 capture_len,
+                synchronous_return: false,
             }),
             Err(status) => Err(ExternalFileIrpRejection {
                 status,
@@ -1268,7 +1327,8 @@ impl<P: ObjectManagerPort> IoManager<P> {
         ))
     }
 
-    /// Retire a failed preparation without issuing an ACK to a backend that was never entered.
+    /// Retire a completion that owes no backend ACK: a failed preparation whose backend was never
+    /// entered, or a queued synchronous return.
     pub fn retire_external_file_irp_completion_without_backend(
         &mut self,
         completion: ExternalFileIrpCompletionInvocation,
@@ -1280,7 +1340,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             if self.completed_irp_snapshot(completion.completion.id).as_ref()
                 != Some(&completion.completion)
                 || !self.completed_irps.contains(&completion.completion.id)
-                || completion.completion.completion_origin != IrpCompletionOrigin::NoBackendEntry
+                || completion.owes_backend_acknowledgement()
                 || !completion.capture_complete()
             {
                 return Err(NtStatus::INVALID_PARAMETER);
