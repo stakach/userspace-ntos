@@ -25525,9 +25525,25 @@ impl ExecFileCompletion {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe {
             (&mut *self.table).set_signaled(file_id, signaled)?;
+            let signaled = (&*self.table).is_signaled(file_id)?;
             driver_launch::win32k_file_owners::sync_event_signal(file_id, signaled);
         }
         Ok(())
+    }
+
+    fn driver_event(&self, file_id: u64) -> Result<bool, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&*self.table).driver_event(file_id) }
+    }
+
+    fn adopt_driver_event(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).adopt_driver_event(file_id, signaled) }
+    }
+
+    fn set_driver_event(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).set_driver_event(file_id, signaled) }
     }
 
     fn is_signaled(&self, file_id: u64) -> Result<bool, u32> {

@@ -450,6 +450,8 @@ mod hosted_driver_spin_lock;
 mod hosted_driver_ex_spin_lock;
 #[path = "hosted_driver_device_queue.rs"]
 mod hosted_driver_device_queue;
+#[path = "hosted_file_event.rs"]
+mod hosted_file_event;
 #[path = "hosted_driver_hal_target_info.rs"]
 mod hosted_driver_hal_target_info;
 #[path = "hosted_driver_hal_cache.rs"]
@@ -15800,6 +15802,7 @@ extern "win64" fn s_ke_set_event(event: u64, increment: i32, wait: u8) -> i32 {
             0,
         )
     };
+    unsafe { hosted_file_event::mirror(event); }
     previous as u32 as i32
 }
 
@@ -15809,6 +15812,7 @@ extern "win64" fn s_ke_clear_event(event: u64) {
         if hosted_driver_event_reference::clear_if_owned(event).is_some() { return; }
         unsafe {
             kevent::kevent_clear(event as *mut u8);
+            hosted_file_event::mirror(event);
         }
     }
 }
@@ -15821,7 +15825,11 @@ extern "win64" fn s_ke_reset_event(event: u64) -> i32 {
     if let Some(previous) = hosted_driver_event_reference::reset_if_owned(event) {
         return previous as i32;
     }
-    unsafe { kevent::kevent_reset(event as *mut u8) as i32 }
+    unsafe {
+        let previous = kevent::kevent_reset(event as *mut u8) as i32;
+        hosted_file_event::mirror(event);
+        previous
+    }
 }
 
 /// `LONG KePulseEvent(PRKEVENT, KPRIORITY, BOOLEAN)`.
@@ -15842,6 +15850,7 @@ extern "win64" fn s_ke_pulse_event(event: u64, increment: i32, wait: u8) -> i32 
             0,
         )
     };
+    unsafe { hosted_file_event::mirror(event); }
     previous as u32 as i32
 }
 
@@ -40511,6 +40520,15 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         }
         return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
     }
+    if major == IRP_MJ_DEVICE_CONTROL && uses_file_object && request._reserved0 == 0 {
+        if let Some(result) = try_fast_io_device_control(
+            devobj, fo, canonical_irp_id, fsctl as u32, input_data, inlen,
+            if output_is_separate { data } else { 0 }, outlen,
+        ) {
+            pool_free_request_buffers(data, aux_data, 0);
+            return result;
+        }
+    }
     let read_write_buffers = if matches!(major, IRP_MJ_READ | IRP_MJ_WRITE) {
         let device_flags = read_unaligned((devobj + 0x30) as *const u32);
         let transfer_length = if major == IRP_MJ_READ { outlen } else { inlen };
@@ -41446,6 +41464,10 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         trace_port_connect_handler(1, canonical_irp_id, devobj, fsctl, handler, 0);
     }
     let ret = fsd_guarded_call(handler, devobj, irp, jb, boundary);
+    if is_create && fo != 0 {
+        // A driver that took FILE_OBJECT.Event with FO_SKIP_SET_EVENT publishes its state now.
+        hosted_file_event::mirror(fo + nt_io_manager::WDM_X64_FILE_OBJECT_EVENT_OFFSET as u64);
+    }
     if trace_connect_handler {
         trace_port_connect_handler(2, canonical_irp_id, devobj, fsctl, handler, ret as u32 as u64);
     }
@@ -41785,6 +41807,70 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         }
     }
     (st, info)
+}
+
+/// NtDeviceIoControlFile's fast I/O first chance. The driver receives this request's pool
+/// copies in place of the caller's buffers; TRUE completes the request without an IRP and its
+/// visible output is pushed back exactly as an inline IRP completion would be. `None` (no
+/// routine, FALSE, or no memory for a separate output) falls through to the IRP path.
+unsafe fn try_fast_io_device_control(
+    devobj: u64,
+    file_object: u64,
+    canonical_irp_id: u64,
+    control_code: u32,
+    input: u64,
+    input_len: u64,
+    separate_output: u64,
+    output_len: u64,
+) -> Option<(i32, u64)> {
+    use nt_io_manager::fast_io;
+    let driver = read_unaligned((devobj + 0x08) as *const u64);
+    if driver == 0 { return None; }
+    let table = read_unaligned((driver + fast_io::DRIVER_OBJECT_FAST_IO_DISPATCH_OFFSET) as *const u64);
+    if table == 0 { return None; }
+    let routine = fast_io::device_control_routine(
+        read_unaligned(table as *const u32),
+        read_unaligned((table + fast_io::FAST_IO_DEVICE_CONTROL_OFFSET) as *const u64),
+    )?;
+    let output = if output_len == 0 {
+        0
+    } else if separate_output != 0 {
+        separate_output
+    } else {
+        // METHOD_BUFFERED: the IRP path shares one SystemBuffer, but fast I/O sees distinct
+        // caller input and output buffers.
+        match pool_alloc_zeroed(output_len) { 0 => return None, buffer => buffer }
+    };
+    let owned_output = output != 0 && output != separate_output;
+    let synchronous = read_unaligned((file_object + 0x50) as *const u32) & 0x2 != 0;
+    let mut io_status = [0u64; 2];
+    let handled = call_hosted_pe(routine, &[
+        file_object,
+        u64::from(synchronous),
+        if input_len != 0 { input } else { 0 },
+        input_len,
+        output,
+        output_len,
+        u64::from(control_code),
+        io_status.as_mut_ptr() as u64,
+        devobj,
+    ]) as u8 != 0;
+    let result = if handled {
+        let status = io_status[0] as u32;
+        let information = io_status[1];
+        let copy_len = fast_io::output_copy_len(
+            control_code & 3, status, information, output_len,
+        );
+        if copy_len != 0 && !pool_push_request_bytes(canonical_irp_id, output, 0, 0, copy_len) {
+            Some((0xC000_0001u32 as i32, 0)) // STATUS_UNSUCCESSFUL
+        } else {
+            Some((status as i32, information))
+        }
+    } else {
+        None
+    };
+    if owned_output { pool_free(output); }
+    result
 }
 
 #[inline]
@@ -65935,14 +66021,14 @@ pub(crate) fn service_hosted_file(
             (status, object, 0, 0)
         };
     }
-    if !matches!(operation, 1..=3 | 9..=11)
+    if !matches!(operation, 1..=3 | 9..=13)
         || file_id == 0
         || address == 0
         || address & 7 != 0
         || address
             .checked_add(WDM_X64_FILE_OBJECT_SIZE as u64)
             .is_none()
-        || (matches!(operation, 3 | 9) && request_id != 0)
+        || (matches!(operation, 3 | 9 | 12 | 13) && request_id != 0)
         || (matches!(operation, 1 | 2 | 10 | 11) && request_id == 0)
     {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
@@ -66073,6 +66159,7 @@ pub(crate) fn service_hosted_file(
         11 => hosted_device_allocations::acknowledge_file_storage_retirement(
             instance, file_id, address, request_id,
         ).map(|_| 0),
+        12 | 13 => hosted_file_event::service(domain, instance, file, address, operation),
         _ => unreachable!("validated File service operation"),
     };
     match result {

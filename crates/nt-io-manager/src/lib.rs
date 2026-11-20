@@ -54,6 +54,7 @@ mod driver_host;
 mod driver_peer;
 mod ea;
 mod external_dispatch;
+pub mod fast_io;
 mod detached_external_power;
 pub mod detached_file_irp;
 mod fault;

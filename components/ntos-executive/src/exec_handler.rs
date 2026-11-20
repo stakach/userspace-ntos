@@ -12567,6 +12567,25 @@ impl ExecNtHandler {
         nt_fs::STATUS_SUCCESS
     }
 
+    /// Follow a driver-owned FILE_OBJECT.Event (FO_SKIP_SET_EVENT): adopt it on the first
+    /// report, then mirror each edit. A newly signaled event wakes the File's waiters exactly as
+    /// an I/O-manager completion signal would.
+    pub(crate) fn mirror_driver_file_event(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
+        if self.file_completion.driver_event(file_id)? {
+            self.file_completion.set_driver_event(file_id, signaled)?;
+        } else {
+            self.file_completion.adopt_driver_event(file_id, signaled)?;
+        }
+        if signaled {
+            unsafe {
+                wait_wake_dispatcher_set(self);
+                let mut objects = self.dispatcher_objects(None);
+                crate::service_sec_image::provider_wait_select_ready(&mut objects);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn post_file_completion_packet(
         &mut self,
         file_id: u64,

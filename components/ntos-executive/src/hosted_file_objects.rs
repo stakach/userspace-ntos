@@ -180,6 +180,15 @@ pub(super) unsafe fn fo_is_registered(address: u64) -> bool {
         .any(|row| row.projection.is_live() && row.projection.address() == address)
 }
 
+/// The canonical File published at this live FILE_OBJECT address, if any.
+pub(super) unsafe fn fo_file_for_address(address: u64) -> Option<u64> {
+    rows()
+        .iter()
+        .flatten()
+        .find(|row| row.projection.is_live() && row.projection.address() == address)
+        .map(|row| row.projection.file_id())
+}
+
 pub(super) unsafe fn fo_reserve_new_slot() -> bool {
     if rows().iter().any(Option::is_none) || rows().len() < rows().capacity() {
         return true;

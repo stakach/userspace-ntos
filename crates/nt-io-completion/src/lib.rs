@@ -144,6 +144,9 @@ struct FileCompletionEntry {
     cleanup_reference_held: bool,
     cleanup_lifecycle_started: bool,
     notification_modes: u32,
+    /// The driver set FO_SKIP_SET_EVENT: FILE_OBJECT.Event is its own readiness event, so the
+    /// I/O manager neither clears nor sets it and the driver's KEVENT edits are authoritative.
+    driver_event: bool,
     binding: Option<FileCompletionBinding>,
 }
 
@@ -171,6 +174,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
                 cleanup_reference_held: false,
                 cleanup_lifecycle_started: false,
                 notification_modes: 0,
+                driver_event: false,
                 binding: None,
             }; FILES],
         }
@@ -244,6 +248,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             cleanup_reference_held: false,
             cleanup_lifecycle_started: false,
             notification_modes: 0,
+            driver_event: false,
             binding: None,
         };
         Ok(())
@@ -299,6 +304,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             cleanup_reference_held: false,
             cleanup_lifecycle_started: false,
             notification_modes: 0,
+            driver_event: false,
             binding: None,
         };
         Ok(())
@@ -637,10 +643,37 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
+    /// The I/O manager's own edit of FILE_OBJECT.Event. A driver-owned event (FO_SKIP_SET_EVENT)
+    /// is left unchanged.
     pub fn set_signaled(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.driver_event {
+            entry.signaled = signaled;
+        }
+        Ok(())
+    }
+
+    /// Adopt the driver's FILE_OBJECT.Event after it set FO_SKIP_SET_EVENT, starting from the
+    /// driver's current KEVENT state. Completion and I/O admission stop editing it.
+    pub fn adopt_driver_event(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        entry.driver_event = true;
         entry.signaled = signaled;
         Ok(())
+    }
+
+    /// Mirror the owning driver's KeSetEvent/KeClearEvent/KeResetEvent on FILE_OBJECT.Event.
+    pub fn set_driver_event(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.driver_event {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.signaled = signaled;
+        Ok(())
+    }
+
+    pub fn driver_event(&self, file_id: u64) -> Result<bool, u32> {
+        self.entry(file_id).map(|entry| entry.driver_event).ok_or(STATUS_INVALID_HANDLE)
     }
 
     pub fn is_signaled(&self, file_id: u64) -> Result<bool, u32> {
@@ -651,7 +684,8 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
 
     pub fn complete_file(&mut self, file_id: u64, status: u32) -> Result<bool, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if status == STATUS_SUCCESS && entry.notification_modes & FILE_SKIP_SET_EVENT_ON_HANDLE != 0
+        if entry.driver_event
+            || status == STATUS_SUCCESS && entry.notification_modes & FILE_SKIP_SET_EVENT_ON_HANDLE != 0
         {
             return Ok(false);
         }
@@ -661,7 +695,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
 
     pub fn signal_on_completion_association(&mut self, file_id: u64) -> Result<bool, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
-        if entry.notification_modes & FILE_SKIP_SET_EVENT_ON_HANDLE != 0 {
+        if entry.driver_event || entry.notification_modes & FILE_SKIP_SET_EVENT_ON_HANDLE != 0 {
             return Ok(false);
         }
         entry.signaled = true;
@@ -1894,6 +1928,27 @@ mod tests {
         assert_eq!(files.io_lock_owner(10), Ok(None));
         assert_eq!(files.io_waiter_count(10), Ok(0));
         assert_eq!(files.release_io(10, 100), Err(STATUS_INVALID_PARAMETER));
+    }
+
+    #[test]
+    fn driver_owned_file_event_ignores_manager_edits_and_follows_the_driver() {
+        let mut files = FileCompletionTable::<1>::new();
+        files.insert_file(10, 77, false).unwrap();
+        assert_eq!(files.set_driver_event(10, true), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(files.driver_event(10), Ok(false));
+        // FO_SKIP_SET_EVENT seen after CREATE: start from the driver's non-signaled KEVENT.
+        files.adopt_driver_event(10, false).unwrap();
+        assert_eq!(files.driver_event(10), Ok(true));
+        assert_eq!(files.is_signaled(10), Ok(false));
+        assert_eq!(files.complete_file(10, STATUS_SUCCESS), Ok(false));
+        assert_eq!(files.complete_file(10, 0xC000_0001), Ok(false));
+        assert_eq!(files.signal_on_completion_association(10), Ok(false));
+        assert_eq!(files.is_signaled(10), Ok(false), "completion never sets a driver event");
+        files.set_driver_event(10, true).unwrap();
+        files.set_signaled(10, false).unwrap();
+        assert_eq!(files.is_signaled(10), Ok(true), "I/O admission never clears it either");
+        files.set_driver_event(10, false).unwrap();
+        assert_eq!(files.is_signaled(10), Ok(false));
     }
 
     #[test]
