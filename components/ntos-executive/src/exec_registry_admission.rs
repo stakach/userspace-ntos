@@ -610,14 +610,19 @@ impl ExecNtHandler {
         options: nt_config_manager::KeyOpenOptions,
     ) -> u32 {
         let backup = options.backup;
+        let mut phases = crate::registry_open_phase_census::OpenPhaseClock::start(
+            crate::disk_census_ticks());
         let _durable = allocator::enter_durable();
         let (mut state, _) = match self.capture_hosted_registry_publication(args, false) {
             Ok(state) => state,
             Err(status) => {
+                phases.settled(crate::disk_census_ticks());
                 note_registry_capture_error(b"open", status, self.pi, self.current_tid);
+                crate::registry_open_phase_census::record_open(&phases, status);
                 return status;
             }
         };
+        phases.captured(crate::disk_census_ticks());
         state.open_link |= options.open_link;
         trace_computer_name_registry(b"open-ingress", &state.path, 0, self.pi, self.current_tid);
         let result = (|| {
@@ -630,12 +635,27 @@ impl ExecNtHandler {
                 }
             };
             self.bind_hosted_registry_target(&mut state, target)?;
+            phases.target_bound(crate::disk_census_ticks());
             let granted = match self.registry_open_grant(&state, target, backup) {
                 Ok(granted) => granted,
                 Err(status) => return Err(status),
             };
-            self.finish_hosted_registry_publication(&mut state, target, granted, false)
+            phases.granted(crate::disk_census_ticks());
+            let published = self.finish_hosted_registry_publication(&mut state, target, granted, false);
+            phases.published(crate::disk_census_ticks());
+            published
         })();
+        phases.settled(crate::disk_census_ticks());
+        let status = self.complete_registry_open(&mut state, result);
+        crate::registry_open_phase_census::record_open(&phases, status);
+        status
+    }
+
+    unsafe fn complete_registry_open(
+        &mut self,
+        state: &mut HostedRegistryPublication,
+        result: Result<(), u32>,
+    ) -> u32 {
         match result {
             Ok(()) => {
                 trace_computer_name_registry(b"open-return", &state.path, 0, self.pi, self.current_tid);
@@ -658,8 +678,8 @@ impl ExecNtHandler {
                 crate::registry_security_audit::admission_error(
                     b"open", &state.path, status, self.pi, self.current_tid,
                 );
-                self.trace_key_access_denied(&state, status);
-                self.abort_hosted_registry_publication(&mut state);
+                self.trace_key_access_denied(state, status);
+                self.abort_hosted_registry_publication(state);
                 self.observe_install_pipe_enum_open(self.pi, &state.path, status);
                 status
             }
