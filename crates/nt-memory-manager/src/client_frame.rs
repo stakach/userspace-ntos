@@ -109,12 +109,43 @@ pub struct ClientFrameRegistryStats {
     pub identity_exhaustions: u64,
 }
 
+/// Reclaiming rows per process, maintained at the same transitions as the total, so an access
+/// check for a process with none skips the record scan. Processes beyond the fixed slots share
+/// one conservative count.
+#[derive(Clone, Copy)]
+struct ReclaimingByProcess {
+    slots: [usize; Self::SLOTS],
+    other: usize,
+}
+
+impl ReclaimingByProcess {
+    const SLOTS: usize = 64;
+    const fn new() -> Self { Self { slots: [0; Self::SLOTS], other: 0 } }
+    fn slot(&mut self, pi: u64) -> &mut usize {
+        match usize::try_from(pi).ok().filter(|pi| *pi < Self::SLOTS) {
+            Some(pi) => &mut self.slots[pi],
+            None => &mut self.other,
+        }
+    }
+    fn add(&mut self, pi: u64) { *self.slot(pi) += 1; }
+    fn remove(&mut self, pi: u64) { *self.slot(pi) -= 1; }
+    fn any(&self, pi: u64) -> bool {
+        match usize::try_from(pi).ok().filter(|pi| *pi < Self::SLOTS) {
+            Some(pi) => self.slots[pi] != 0,
+            None => self.other != 0,
+        }
+    }
+}
+
 pub struct ClientFrameRegistry {
     records: RecordStorage,
     index: FrameKeyIndex,
     #[cfg(test)]
     lookup_steps: core::cell::Cell<usize>,
+    #[cfg(test)]
+    availability_scans: core::cell::Cell<usize>,
     reclaiming: usize,
+    reclaiming_by_process: ReclaimingByProcess,
     next_age: u64,
     high_water: usize,
     growths: u64,
@@ -135,7 +166,10 @@ impl ClientFrameRegistry {
             index: FrameKeyIndex::new(),
             #[cfg(test)]
             lookup_steps: core::cell::Cell::new(0),
+            #[cfg(test)]
+            availability_scans: core::cell::Cell::new(0),
             reclaiming: 0,
+            reclaiming_by_process: ReclaimingByProcess::new(),
             next_age: 1,
             high_water: 0,
             growths: 0,
@@ -473,6 +507,18 @@ impl ClientFrameRegistry {
         self.reclaiming
     }
 
+    /// One more row of `pi` is reclaiming; called with every increment of the total.
+    fn note_reclaiming(&mut self, pi: u64) {
+        self.reclaiming += 1;
+        self.reclaiming_by_process.add(pi);
+    }
+
+    /// One reclaiming row of `pi` was retired; called with every decrement of the total.
+    fn note_reclaimed(&mut self, pi: u64) {
+        self.reclaiming -= 1;
+        self.reclaiming_by_process.remove(pi);
+    }
+
     /// Deny-only terminal-row exclusion. The ordinary no-reclamation path is constant time.
     pub fn memory_available(&self, pi: u64, base: u64, size: u64) -> bool {
         if size == 0 {
@@ -481,9 +527,11 @@ impl ClientFrameRegistry {
         let Some(end) = base.checked_add(size) else {
             return false;
         };
-        if self.reclaiming == 0 {
+        if self.reclaiming == 0 || !self.reclaiming_by_process.any(pi) {
             return true;
         }
+        #[cfg(test)]
+        self.availability_scans.set(self.availability_scans.get() + 1);
         self.records
             .iter()
             .filter(|row| row.pi == pi && row.is_reclaiming())

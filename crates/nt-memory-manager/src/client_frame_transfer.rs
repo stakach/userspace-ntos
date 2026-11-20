@@ -93,8 +93,8 @@ impl ClientFrameRegistry {
             let row = self.exact_mut(record).expect("prevalidated transfer row");
             row.transfer_id = Some(id);
             records.push(*row);
+            self.note_reclaiming(record.pi);
         }
-        self.reclaiming += expected.len();
         Ok(ClientFrameTransfer { id, records })
     }
 
@@ -116,8 +116,8 @@ impl ClientFrameRegistry {
                 .index_for(record.pi, record.page)
                 .expect("prevalidated transfer row");
             self.swap_remove_index(index);
+            self.note_reclaimed(record.pi);
         }
-        self.reclaiming -= transfer.records.len();
         Ok(())
     }
 }

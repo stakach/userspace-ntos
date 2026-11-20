@@ -1092,3 +1092,41 @@ fn invalid_or_conflicting_backing_provenance_cannot_partially_publish_a_record()
     );
     assert_eq!(registry.get(7, 0x1000), Some(before));
 }
+
+/// Boot copy-ins check memory availability up to four times per page. With any row of any
+/// process reclaiming, each check scanned every registry record (#348).
+#[test]
+fn availability_checks_scan_only_for_a_process_with_reclaiming_rows() {
+    let mut registry = ClientFrameRegistry::new();
+    for page in 0..512u64 {
+        registry.insert(7, MEMORY_PROCESS, 0x1000 + page * 0x1000, 100 + page, 0, 0, 0, true)
+            .unwrap();
+        registry.insert(9, MEMORY_PROCESS, 0x1000 + page * 0x1000, 1000 + page, 0, 0, 0, true)
+            .unwrap();
+    }
+    let (index, row) = registry.get_with_index(9, 0x5000).unwrap();
+    registry.begin_reclaim_at_exact(index, row, RELEASE).unwrap();
+    assert_eq!(registry.reclaiming_count(), 1);
+
+    registry.availability_scans.set(0);
+    for page in 0..64u64 {
+        assert!(registry.memory_available(7, 0x1000 + page * 0x1000, 0x1000));
+    }
+    assert_eq!(registry.availability_scans.get(), 0,
+        "another process's reclamation cannot make this process's pages unavailable");
+
+    // The reclaiming process is still checked exactly.
+    assert!(!registry.memory_available(9, 0x5000, 8));
+    assert!(registry.memory_available(9, 0x6000, 0x1000));
+    assert_eq!(registry.availability_scans.get(), 2);
+
+    // Retiring the row clears the per-process count with the total.
+    let row = registry.get(9, 0x5000).unwrap();
+    let mut io = Io::default();
+    let ready = registry.cleanup_reclaim_at_exact(index, row, RELEASE, &mut io).unwrap();
+    registry.commit_reclaim_at_exact(index, ready, RELEASE, |_| Ok(())).unwrap();
+    assert_eq!(registry.reclaiming_count(), 0);
+    registry.availability_scans.set(0);
+    assert!(registry.memory_available(9, 0x5000, 8));
+    assert_eq!(registry.availability_scans.get(), 0);
+}

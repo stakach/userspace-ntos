@@ -150,7 +150,9 @@ impl ClientFrameRegistry {
                 revoked: false,
                 complete: false,
             });
-            self.reclaiming += 1;
+            let (row, pi) = (*row, row.pi);
+            self.note_reclaiming(pi);
+            return Ok(row);
         }
         Ok(*row)
     }
@@ -229,7 +231,7 @@ impl ClientFrameRegistry {
             return Err(ClientFrameReclaimError::InvalidState);
         }
         terminal(expected).map_err(ClientFrameReclaimError::Backend)?;
-        self.reclaiming -= 1;
+        self.note_reclaimed(expected.pi);
         Ok(self.swap_remove_index(index))
     }
 
