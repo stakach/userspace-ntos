@@ -29280,7 +29280,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(thread_sched_context::GUEST_WORKER_MULTICORE as u64);
     print_str(b" cores=");
     print_u64(SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed));
-    print_str(b" (build NTOS_GUEST_WORKER_MULTICORE=0 to keep workers on core 0)\n");
+    print_str(b" (build NTOS_GUEST_WORKER_MULTICORE=1 to place workers on their affinity cores)\n");
 
     // Fix (B): retype two MCS Reply objects (OBJ_REPLY=6, fixed size, size_bits=0) into the
     // executive's root cspace — one for the main service loop (csrss/smss), one for win32k's
