@@ -552,6 +552,9 @@ pub(super) unsafe fn syscall_nt_route(
         crate::record_native_dispatch_ticks(lp.msg.badge, lp.msg.m0, elapsed_ticks);
         crate::hot_service_cost_census::record_wait_status(
             table_entry.map(|entry| entry.service), res.status);
+        crate::native_device_path_trace::record(
+            &nt_handler, table_entry.map(|entry| entry.service), &argv[..n], pi,
+            dispatch_generation, res.status);
         crate::hot_service_cost_census::record_dispatch(
             table_entry.map(|entry| entry.service), res.status, elapsed_ticks,
             crate::serial_records::root_serial_bytes().wrapping_sub(dispatch_serial),

@@ -19,6 +19,7 @@ extern crate alloc;
 // Re-export the kernel ABI at crate root so `server` can `use crate::*`.
 pub use sel4_rt::*;
 mod serial_records;
+mod native_device_path_trace;
 mod ingress_observation;
 mod hpet_read_observation;
 mod calibrated_tsc_clock;
