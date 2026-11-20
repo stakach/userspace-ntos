@@ -326,6 +326,30 @@ pub(crate) unsafe fn submit_receive_child(
     Ok(true)
 }
 
+static RECEIVE_CHILD_STEP_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// #351 (multicore) diagnosis: each phase change of the Receive child's page-in, and whether its provider
+/// READ is dispatched and pending. Bounded: the first 256 steps, then powers of two. Read-only.
+fn trace_receive_child_step(work: &Work, done: bool, read_pending: bool) {
+    let sample = RECEIVE_CHILD_STEP_TRACES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample > 256 && !sample.is_power_of_two() { return; }
+    let phase = match work.phase {
+        Phase::AwaitSource => 1, Phase::Read => 2, Phase::Publish => 3,
+        Phase::MapPage => 4, Phase::ScanSyscall => 5,
+        Phase::DispatchSyscall => 6, Phase::ReplyReady => 7,
+        Phase::ReadyError => 8, Phase::ReplyEntered => 9,
+        Phase::ReplySent => 10, Phase::Cancel => 11,
+        Phase::Cancelled => 12, Phase::Indeterminate => 13,
+    };
+    print_str(b"[receive-child-pagein-step] sample/tid/page/phase/read-dispatched/read-pending/done/next=");
+    for value in [sample, work.tid, work.page, phase, u64::from(work.read.is_some()),
+        u64::from(read_pending), u64::from(done), NEXT.load(Ordering::Acquire)] {
+        print_str(b"/");
+        print_hex_u64(value);
+    }
+    print_str(b"\n");
+}
+
 /// True while a page-in row owns the selected Receive child's Reply. The turn is consumed
 /// at the acknowledged settlement; retiring the parked Reply after that is ordinary work.
 pub(crate) fn owns_receive_child() -> bool {
@@ -1192,6 +1216,12 @@ unsafe fn redrive_rows(
                 if pending_after != pending_before {
                     work.pending_irp_since_100ns =
                         pending_after.map(|_| monotonic_time_100ns());
+                }
+                if matches!(work.purpose, Purpose::ReceiveChild)
+                    && (core::mem::discriminant(&work.phase) != before
+                        || pending_after.is_some() != pending_before.is_some())
+                {
+                    trace_receive_child_step(&work, done, pending_after.is_some());
                 }
                 if !is_fault { break done; }
                 let step = if done { DriveStep::Done }

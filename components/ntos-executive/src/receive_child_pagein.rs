@@ -46,12 +46,38 @@ pub(crate) unsafe fn prepare_receive() -> bool {
         PUMP_TIMER_TICKS_DRAINED.fetch_add(pending, Ordering::Relaxed);
     }
     let now = monotonic_time_100ns();
-    let Some(deadline) = [
-        native_image_pagein_work::next_deadline(),
-        driver_launch::mounted_native_block_next_deadline(now),
-        driver_launch::hosted_dpc_next_deadline(now),
-    ].into_iter().flatten().min() else {
+    let pagein = native_image_pagein_work::next_deadline();
+    let block = driver_launch::mounted_native_block_next_deadline(now);
+    let dpc = driver_launch::hosted_dpc_next_deadline(now);
+    let Some(deadline) = [pagein, block, dpc].into_iter().flatten().min() else {
+        trace_wake(now, pending, [pagein, block, dpc], b"none");
         return false;
     };
-    delay_timer_program(deadline, DELAY_TIMER_SOURCE_NATIVE_IMAGE_PAGEIN)
+    let programmed = TIMER_SHOTS_PROGRAMMED.load(Ordering::Relaxed);
+    let armed = delay_timer_program(deadline, DELAY_TIMER_SOURCE_NATIVE_IMAGE_PAGEIN);
+    trace_wake(now, pending, [pagein, block, dpc], if !armed { b"refused" }
+        else if TIMER_SHOTS_PROGRAMMED.load(Ordering::Relaxed) != programmed { b"programmed" }
+        else { b"retained" });
+    armed
+}
+
+static WAKE_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// #351 (multicore) diagnosis: what guarantees the owned page-in's next progress when the root blocks.
+/// The retained row's wake must be an armed shot (programmed now, or a live one retained) or a
+/// pending notification. Bounded: the first 256 receives, then powers of two. Read-only.
+unsafe fn trace_wake(now: u64, pending_ticks: u64, deadlines: [Option<u64>; 3], shot: &[u8]) {
+    let sample = WAKE_TRACES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample > 256 && !sample.is_power_of_two() { return; }
+    print_str(b"[receive-child-pagein-wake] sample/now/pending-ticks/pagein/block/dpc/armed/physical-wake=");
+    for value in [sample, now, pending_ticks,
+        deadlines[0].unwrap_or(u64::MAX), deadlines[1].unwrap_or(u64::MAX),
+        deadlines[2].unwrap_or(u64::MAX),
+        u64::from(LAST_REARM_AUTHORITY.is_armed()), LAST_REARM_AUTHORITY.physical_wake_100ns()] {
+        print_str(b"/");
+        print_hex_u64(value);
+    }
+    print_str(b" shot=");
+    print_str(shot);
+    print_str(b"\n");
 }
