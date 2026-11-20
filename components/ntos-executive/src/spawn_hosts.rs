@@ -2178,6 +2178,49 @@ unsafe fn pump_reply_recv4(
     pump_reply_recv4_traced(ch, reply_cap, reply_msginfo, reply_r0, reply_r1, reply_r2, reply_r3, None, false, None)
 }
 
+/// A reply owed to a lane whose parent restore was refused while its service ran (#333). The
+/// service has finished, but the lane is still held: replying and then receiving would block
+/// the root on it. The reply is kept, the pump yields the parent's restore to its owner, and
+/// the nested-restore receive continuation sends this exact reply first.
+#[derive(Clone, Copy)]
+struct DeferredReply {
+    reply_cap: u64,
+    info: u64,
+    words: [u64; 4],
+    dpc_reply: Option<(u64, u64)>,
+}
+
+/// Deferred parents and the replies they intercepted; the policy is crate-tested.
+static mut DEFERRED: nt_component_suspension::DeferredReplies<
+    shared_ingress::owner::runtime::nested::NestedRestoreTicket, DeferredReply,
+> = nt_component_suspension::DeferredReplies::new();
+
+/// A service that parked the running lane could not restore it. The lane's pump owns that
+/// restore: its next reply is deferred until the exact parent is restored.
+pub(crate) unsafe fn defer_reply_until_restored(
+    parent: shared_ingress::owner::runtime::nested::ParkedParentHandle,
+) {
+    if (&mut *core::ptr::addr_of_mut!(DEFERRED)).defer(parent.ticket()).is_err() {
+        // No deferral can own it: the dropped handle makes the root its owner.
+        print_str(b"[deferred-reply] no capacity; parent is root-owned\n");
+        return;
+    }
+    let _ = parent.into_ticket();
+    print_str(b"[deferred-reply] reply waits for its parent restore\n");
+}
+
+/// The same deferral for a restore already refused and claimed as a ticket.
+pub(crate) unsafe fn defer_reply_until_ticket_restored(
+    ticket: shared_ingress::owner::runtime::nested::NestedRestoreTicket,
+) {
+    if (&mut *core::ptr::addr_of_mut!(DEFERRED)).defer(ticket).is_err() {
+        // The row keeps the refused restore; without a deferral its lane's reply is unsafe.
+        print_str(b"[deferred-reply] no capacity for a held parent\n");
+        return;
+    }
+    print_str(b"[deferred-reply] reply waits for its parent restore\n");
+}
+
 unsafe fn pump_reply_recv4_traced(
     ch: &PumpChannel,
     reply_cap: u64,
@@ -2190,6 +2233,18 @@ unsafe fn pump_reply_recv4_traced(
     trace_system_thread_reply: bool,
     dpc_reply: Option<(u64, u64)>,
 ) -> PumpMessage {
+    let deferred = &mut *core::ptr::addr_of_mut!(DEFERRED);
+    if !deferred.is_empty() {
+        if let Ok(Some(route)) = shared_ingress::owner::runtime::channel_route(ch) {
+            let reply = DeferredReply {
+                reply_cap, info: reply_msginfo,
+                words: [reply_r0, reply_r1, reply_r2, reply_r3], dpc_reply,
+            };
+            if let Ok(ticket) = deferred.intercept(|ticket| ticket.identity().route() == route, reply) {
+                return shared_pump::nested_restore_refusal(Some(ticket));
+            }
+        }
+    }
     if let Some((dpc, generation)) = dpc_reply {
         crate::driver_launch::hosted_dpc_transition_trace::record(
             1, None, dpc, generation, reply_r1, reply_r0 as u32 as i32, ch.tcb, reply_cap);
@@ -2977,7 +3032,15 @@ unsafe fn component_pump_continue_receive_half(
             b"resume-before-recv", yielded.parent, yielded.child, yielded.owner,
         );
     }
-    let first = pump_recv_with_scheduler_checkpoint(ch, serviced_scheduler_yield);
+    // A reply deferred behind this restore is sent first; it is the receive's own request.
+    let deferred = previous.nested_restore_yield
+        .and_then(|ticket| (&mut *core::ptr::addr_of_mut!(DEFERRED)).release(ticket));
+    let first = match deferred {
+        Some(reply) => pump_reply_recv4_traced(
+            ch, reply.reply_cap, reply.info, reply.words[0], reply.words[1], reply.words[2],
+            reply.words[3], None, false, reply.dpc_reply),
+        None => pump_recv_with_scheduler_checkpoint(ch, serviced_scheduler_yield),
+    };
     if let Some(yielded) = previous.receive_yield() {
         crate::win32k_glue::trace_receive_phase(
             b"resume-after-recv", yielded.parent, yielded.child, yielded.owner,

@@ -13799,6 +13799,7 @@ fn trace_running_lane_gate(
 pub(crate) unsafe fn drain_root_restores() {
     trace_root_restore_drain(
         crate::spawn_hosts::shared_ingress::owner::runtime::nested::drain_root_restore_queue());
+    let _ = crate::driver_launch::drive_kept_pumps();
 }
 
 /// Bounded evidence for the root restore queue; silent while it is empty.

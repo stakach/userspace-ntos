@@ -868,7 +868,7 @@ fn trace_background_holder_service(
     crate::print_str(b"\n");
 }
 
-unsafe fn nested_restore_refusal(
+pub(super) unsafe fn nested_restore_refusal(
     ticket: Option<runtime::nested::NestedRestoreTicket>,
 ) -> PumpMessage {
     let Some(ticket) = ticket else { return PumpMessage::transport_wall(); };

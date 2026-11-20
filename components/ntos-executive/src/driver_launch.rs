@@ -180,7 +180,7 @@ pub(crate) use hosted_dpc_scheduler::{
 use component_scheduler::hosted_component_pump;
 pub(crate) use component_scheduler::{
     ComponentSchedulerScope, SchedulerServiceRefusal, SchedulerYieldStep, scheduler_yield_step,
-    retry_scheduler_yield_restore,
+    retry_scheduler_yield_restore, drive_kept_pumps,
 };
 pub(crate) use component_scheduler::handoff_exact_component_once;
 
@@ -58918,7 +58918,12 @@ unsafe fn ensure_hosted_irq_lane(
         quarantine_shared_hosted_irq_lane(lane_index);
         return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
     };
-    let mut parent = runtime::nested::park_current().expect("retain parent before IRQ startup");
+    let Ok(mut parent) = runtime::nested::park_current() else {
+        // Nothing was started: the lane is unreferenced and is retired before any Ready.
+        quarantine_shared_hosted_irq_lane(lane_index);
+        retire_hosted_irq_lane_if_unreferenced(projection_instance, domain)?;
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    };
     let started = (|| {
         // Mark possible execution before entering the one-shot native resume owner.
         hosted_irq_lanes_mut()[lane_index].tcb_resumed = true;
@@ -58945,12 +58950,25 @@ unsafe fn ensure_hosted_irq_lane(
             "failed IRQ startup retains semantic owner and parent");
         retire_hosted_irq_lane_if_unreferenced(projection_instance, domain)
             .expect("failed IRQ startup retains uncertain drain and parent");
-        runtime::nested::restore(&mut parent).expect("restore parent after canceled IRQ startup");
+        restore_irq_startup_parent(parent);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Ready;
-    runtime::nested::restore(&mut parent).expect("restore parent after acknowledged IRQ readiness");
+    restore_irq_startup_parent(parent);
     Ok(generation)
+}
+
+/// The startup's result is final either way. A parent that cannot be restored keeps its lane
+/// held, so the service's reply to it is deferred until that exact restore succeeds (#333).
+unsafe fn restore_irq_startup_parent(
+    mut parent: Option<crate::spawn_hosts::shared_ingress::owner::runtime::nested::ParkedParentHandle>,
+) {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    if runtime::nested::restore(&mut parent).is_err() {
+        if let Some(parent) = parent {
+            crate::spawn_hosts::defer_reply_until_restored(parent);
+        }
+    }
 }
 
 unsafe fn quarantine_shared_hosted_irq_lane(index: usize) {
