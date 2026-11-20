@@ -139,7 +139,8 @@ mod deferred_reply;
 pub use deferred_reply::{DeferralCapacity, DeferredReplies};
 mod service_continuation;
 pub use service_continuation::{
-    PumpProgress, RegistrationRefusal, RegistrationRefused, ServiceContinuations, SettledParent,
+    drive_one, PumpProgress, RegistrationRefusal, RegistrationRefused, ServiceContinuations,
+    SettledParent,
 };
 pub use resume_pass::ResumePass;
 mod resume_wake;

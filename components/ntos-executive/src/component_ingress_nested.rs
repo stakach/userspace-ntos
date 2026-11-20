@@ -233,6 +233,9 @@ enum ParentPhase {
     Parked,
     /// The local handle may disappear after a refusal; this row remains discoverable.
     RestorePending,
+    /// Still parked: a service this lane called is kept as a continuation, and its reply does
+    /// not exist yet (#420). A restore is a no-effect refusal until the service settles.
+    ServiceAwait,
     /// A serialized owner is inside the staged restore. A scanner must not enter it twice.
     RestoreAttempt,
     /// Scope admission refused after the physical hold acknowledged. The canonical lane is
@@ -1218,11 +1221,49 @@ pub(crate) unsafe fn pending_ticket(ticket: NestedRestoreTicket) -> bool {
         .get(ticket.index)
         .and_then(Option::as_ref)
         .is_some_and(|parent| {
-            parent.phase == ParentPhase::RestorePending
-                && parent.root_admission.is_none()
+            parent.root_admission.is_none()
                 && ticket_matches(ticket, parent)
-                && restore_refusal_is_retryable(parent)
+                && match parent.phase {
+                    ParentPhase::RestorePending => restore_refusal_is_retryable(parent),
+                    // Its owner retries later; the attempt changes nothing until the service
+                    // settles and hands the row back as RestorePending.
+                    ParentPhase::ServiceAwait => parent.physical.held(),
+                    _ => false,
+                }
         })
+}
+
+/// Keep a parked parent for a service continuation (#420). No physical effect: the row keeps
+/// the Reply, scope and hold, and every restore is refused until [`finish_service_await`].
+pub(crate) unsafe fn await_service(handle: &ParkedParentHandle) -> Result<(), Error> {
+    let parent = (&mut *core::ptr::addr_of_mut!(PARENTS))
+        .get_mut(handle.index).and_then(Option::as_mut).ok_or(Error::Admission)?;
+    if !row_matches(handle, parent) || !ordinary_row(parent) || parent.child.is_some()
+        || parent.phase != ParentPhase::Parked || !parent.physical.held()
+    {
+        return Err(Error::Admission);
+    }
+    parent.phase = ParentPhase::ServiceAwait;
+    Ok(())
+}
+
+/// The service settled and its reply is stored: hand the row to the lane's owner, whose next
+/// retry restores it. A row that no longer matches its held parent is fenced, never restored.
+pub(crate) unsafe fn finish_service_await(
+    handle: ParkedParentHandle,
+) -> Result<NestedRestoreTicket, Error> {
+    let ticket = handle.into_ticket();
+    let parent = (&mut *core::ptr::addr_of_mut!(PARENTS))
+        .get_mut(ticket.index).and_then(Option::as_mut).ok_or(Error::Admission)?;
+    if !ticket_matches(ticket, parent) || parent.phase != ParentPhase::ServiceAwait {
+        return Err(Error::Admission);
+    }
+    if !parent.physical.held() {
+        parent.phase = ParentPhase::Quarantined;
+        return Err(Error::Admission);
+    }
+    parent.phase = ParentPhase::RestorePending;
+    Ok(ticket)
 }
 
 pub(crate) unsafe fn pending_undelivered_root_ticket(ticket: NestedRestoreTicket) -> bool {
@@ -1330,7 +1371,8 @@ pub(crate) unsafe fn retained_ticket_matches_channel(
     let row = (&*core::ptr::addr_of!(PARENTS))
         .get(ticket.index).and_then(Option::as_ref);
     if row.is_none_or(|parent| {
-        !matches!(parent.phase, ParentPhase::RestorePending | ParentPhase::Quarantined)
+        !matches!(parent.phase,
+            ParentPhase::RestorePending | ParentPhase::ServiceAwait | ParentPhase::Quarantined)
             || !ticket_matches(ticket, parent) || parent.reply != reply
     }) {
         return false;

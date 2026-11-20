@@ -2183,11 +2183,18 @@ unsafe fn pump_reply_recv4(
 /// the root on it. The reply is kept, the pump yields the parent's restore to its owner, and
 /// the nested-restore receive continuation sends this exact reply first.
 #[derive(Clone, Copy)]
-struct DeferredReply {
+pub(crate) struct DeferredReply {
     reply_cap: u64,
     info: u64,
     words: [u64; 4],
     dpc_reply: Option<(u64, u64)>,
+}
+
+impl DeferredReply {
+    /// The same Reply and transport shape carrying a service's true result (#420).
+    pub(crate) fn with_words(self, info: Option<u64>, words: [u64; 4]) -> Self {
+        Self { info: info.unwrap_or(self.info), words, ..self }
+    }
 }
 
 /// Deferred parents and the replies they intercepted; the policy is crate-tested.
@@ -2244,6 +2251,14 @@ unsafe fn pump_reply_recv4_traced(
                 return shared_pump::nested_restore_refusal(Some(ticket));
             }
         }
+    }
+    // A service this lane called is kept as a continuation: its result does not exist yet, so
+    // nothing is sent. The lane's owner awaits its parent, whose restore sends the true reply.
+    let envelope = DeferredReply {
+        reply_cap, info: reply_msginfo, words: [reply_r0, reply_r1, reply_r2, reply_r3], dpc_reply,
+    };
+    if let Some(ticket) = crate::driver_launch::intercept_service_reply(ch, envelope) {
+        return shared_pump::nested_restore_refusal(Some(ticket));
     }
     if let Some((dpc, generation)) = dpc_reply {
         crate::driver_launch::hosted_dpc_transition_trace::record(
@@ -3033,8 +3048,9 @@ unsafe fn component_pump_continue_receive_half(
         );
     }
     // A reply deferred behind this restore is sent first; it is the receive's own request.
-    let deferred = previous.nested_restore_yield
-        .and_then(|ticket| (&mut *core::ptr::addr_of_mut!(DEFERRED)).release(ticket));
+    let deferred = previous.nested_restore_yield.and_then(|ticket|
+        (&mut *core::ptr::addr_of_mut!(DEFERRED)).release(ticket)
+            .or_else(|| crate::driver_launch::take_service_reply(ticket)));
     let first = match deferred {
         Some(reply) => pump_reply_recv4_traced(
             ch, reply.reply_cap, reply.info, reply.words[0], reply.words[1], reply.words[2],

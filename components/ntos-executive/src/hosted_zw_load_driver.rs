@@ -244,12 +244,38 @@ pub(super) unsafe fn service_unload(
         Ok(reservation) => reservation,
         Err(status) => return status,
     };
-    let outcome = unload_driver_by_name(&spec.driver_object_path);
+    let outcome = begin_driver_unload(&spec.driver_object_path);
     if !source_reply_unchanged(channel, call.instance_index, call.route, call.dispatch, reply_cap) {
         panic!("ZwUnloadDriver source Reply or dispatch changed during nested unload");
     }
-    match outcome {
-        Ok(()) => 0,
-        Err(status) => status.raw(),
+    let pending = match outcome {
+        DriverUnload::Done(Ok(())) => return 0,
+        DriverUnload::Done(Err(status)) => return status.raw(),
+        DriverUnload::Kept(pending) => pending,
+    };
+    // DriverUnload is still running: this lane stays parked, and the stop's finish replies
+    // with the true status. The reservation stays held until then.
+    let step = PendingZwUnload { finish: pending.finish, _reservation: _reservation };
+    match pending.kept.register(crate::driver_launch::ServiceStep::ZwUnloadDriver(step)) {
+        // The reply this returns is intercepted and never sent.
+        Ok(()) => nt_status::NtStatus::PENDING.raw(),
+        Err(_uncertain) => nt_status::NtStatus::UNSUCCESSFUL.raw(),
+    }
+}
+
+/// The rest of a `ZwUnloadDriver` whose `DriverUnload` had not finished (#420).
+pub(crate) struct PendingZwUnload {
+    finish: DriverUnloadFinish,
+    _reservation: DriverTransitionReservation,
+}
+
+impl PendingZwUnload {
+    /// The stop's true status once `DriverUnload` has returned. The reservation drops here.
+    pub(crate) unsafe fn finish(self, pr: crate::spawn_hosts::PumpResult) -> i32 {
+        let _durable = crate::allocator::enter_durable();
+        match self.finish.after_callback(pr) {
+            Ok(()) => 0,
+            Err(status) => status.raw(),
+        }
     }
 }

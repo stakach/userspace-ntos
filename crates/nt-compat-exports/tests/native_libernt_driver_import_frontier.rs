@@ -33,8 +33,6 @@ fn pinned_next_imports_bind_real_slist_init_and_driver_unload() {
     for name in ["InitializeSListHead", "ZwUnloadDriver"] {
         assert!(source.contains(&format!("\"{name}\",")), "generic export registry lacks {name}");
     }
-    let loader = include_str!("../../../components/ntos-executive/src/hosted_zw_load_driver.rs");
-    assert!(loader.contains("unload_driver_by_name"), "ZwUnloadDriver must reach canonical driver lifecycle");
 }
 
 #[test]

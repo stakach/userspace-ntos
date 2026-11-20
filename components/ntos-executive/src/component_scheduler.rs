@@ -4,9 +4,13 @@ use super::*;
 
 #[path = "hosted_pump_refusal.rs"]
 mod refusal;
-#[path = "hosted_pump_keeper.rs"]
-mod keeper;
-pub(crate) use keeper::drive as drive_kept_pumps;
+#[path = "hosted_service_continuation.rs"]
+pub(super) mod service_continuation;
+pub(crate) use service_continuation::{
+    intercept as intercept_service_reply, take_reply as take_service_reply,
+};
+
+pub(crate) use service_continuation::drive as drive_kept_pumps;
 
 static YIELDS: AtomicU64 = AtomicU64::new(0);
 
@@ -323,19 +327,12 @@ impl HostedPumpRestore {
         }
     }
 
-    /// Settle a pump for a caller that cannot keep a continuation (#333). A finished result is
-    /// returned; a refused outer restore defers the running lane's reply until that parent is
-    /// restored. An unfinished pump goes to the root keeper, which drives it to completion, and
-    /// its caller gets an uncertain, never completed, result.
+    /// Settle a pump for a caller that cannot keep a continuation (#333, #420). A finished
+    /// result is returned; a refused outer restore defers the running lane's reply until that
+    /// parent is restored. An unfinished pump is waited for at root level; under a lane it is
+    /// fenced, driven to the end of its dispatch, and its caller gets an uncertain result.
     unsafe fn legacy(self) -> crate::spawn_hosts::PumpResult {
-        match self {
-            Self::Restored(result) | Self::Unattributed(result) => result,
-            Self::Retained { result, ticket, .. } => {
-                crate::spawn_hosts::defer_reply_until_ticket_restored(ticket);
-                result
-            }
-            unfinished => keeper::keep(unfinished),
-        }
+        service_continuation::settle_without_step(self)
     }
 
     /// The outer parent an unfinished pump still holds parked.

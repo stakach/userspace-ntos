@@ -112,7 +112,7 @@ pub(crate) mod hosted_component_mmio_fault;
 #[path = "hosted_exception_images.rs"]
 mod hosted_exception_images;
 #[path = "hosted_zw_load_driver.rs"]
-mod hosted_zw_load_driver;
+pub(crate) mod hosted_zw_load_driver;
 #[path = "hosted_zw_enumerate_value_key.rs"]
 mod hosted_zw_enumerate_value_key;
 #[path = "hosted_zw_query_key.rs"]
@@ -180,9 +180,10 @@ pub(crate) use hosted_dpc_scheduler::{
 use component_scheduler::hosted_component_pump;
 pub(crate) use component_scheduler::{
     ComponentSchedulerScope, SchedulerServiceRefusal, SchedulerYieldStep, scheduler_yield_step,
-    retry_scheduler_yield_restore, drive_kept_pumps,
+    retry_scheduler_yield_restore, drive_kept_pumps, intercept_service_reply, take_service_reply,
 };
 pub(crate) use component_scheduler::handoff_exact_component_once;
+pub(crate) use component_scheduler::service_continuation::ServiceStep;
 
 #[path = "device_property.rs"]
 pub(crate) mod device_property;
@@ -70589,7 +70590,7 @@ unsafe fn dispatch_driver_unload_for_instance(
     index: usize,
     inst: DriverInstance,
     caller: nt_process::native_handle::NativeHandleCaller,
-) -> Result<(), nt_status::NtStatus> {
+) -> Result<component_scheduler::service_continuation::ServicePump, nt_status::NtStatus> {
     if inst.driver_object == 0 || inst.driver_unload == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -70637,12 +70638,8 @@ unsafe fn dispatch_driver_unload_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
-    if !pr.completed {
-        register_instance_ready(index, false);
-        return Err(nt_status::NtStatus::UNSUCCESSFUL);
-    }
-    nt_status::NtStatus(pr.status).to_result()
+    Ok(component_scheduler::service_continuation::settle(
+        component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller)))
 }
 
 unsafe fn prepare_device_projection_control_for_instance(
@@ -73727,10 +73724,82 @@ unsafe fn dispatch_prepared_hosted_pnp_start(
 }
 
 /// Route SCM/native driver stop through the live hosted driver's real `DriverUnload`, then remove
-/// canonical I/O Manager records and Object Manager namespace entries.
+/// canonical I/O Manager records and Object Manager namespace entries. A root-level caller
+/// waits for an unfinished `DriverUnload` and gets its true result.
 pub(crate) unsafe fn unload_driver_by_name(
     driver_object_path: &str,
 ) -> Result<(), nt_status::NtStatus> {
+    match begin_driver_unload(driver_object_path) {
+        DriverUnload::Done(result) => result,
+        // Only a lane's service can keep the continuation; this caller has none.
+        DriverUnload::Kept(pending) => {
+            let _ = pending.kept.fence();
+            Err(nt_status::NtStatus::UNSUCCESSFUL)
+        }
+    }
+}
+
+/// How a driver stop ended for its caller.
+pub(crate) enum DriverUnload {
+    Done(Result<(), nt_status::NtStatus>),
+    /// `DriverUnload` is still running while the calling lane is parked for it. The I/O
+    /// Manager stays `UnloadRequested`; the caller's service keeps [`PendingDriverUnload`].
+    Kept(PendingDriverUnload),
+}
+
+#[must_use = "an entered DriverUnload is owed its finish"]
+pub(crate) struct PendingDriverUnload {
+    pub(crate) kept: component_scheduler::service_continuation::KeptPump,
+    pub(crate) finish: DriverUnloadFinish,
+}
+
+/// Everything the stop needs after `DriverUnload` returns.
+#[derive(Clone, Copy)]
+pub(crate) struct DriverUnloadFinish {
+    index: usize,
+    driver_id: u64,
+    domain: HostedDomainIdentity,
+}
+
+impl DriverUnloadFinish {
+    /// Finish the stop once `DriverUnload` has really returned (or walled).
+    pub(crate) unsafe fn after_callback(
+        self, pr: crate::spawn_hosts::PumpResult,
+    ) -> Result<(), nt_status::NtStatus> {
+        let returned = if pr.completed {
+            nt_status::NtStatus(pr.status).to_result()
+        } else {
+            Err(nt_status::NtStatus::UNSUCCESSFUL)
+        };
+        if let Err(status) = returned {
+            register_instance_ready(self.index, false);
+            return Err(status);
+        }
+        io_manager_mut().complete_driver_unload_callback(DriverId(self.driver_id))?;
+        self.records()
+    }
+
+    unsafe fn records(self) -> Result<(), nt_status::NtStatus> {
+        io_manager_mut().can_finish_driver_unload(DriverId(self.driver_id))?;
+        if !hosted_driver_device_lifetime_quiesced(self.index, self.driver_id, self.domain)
+            || !hosted_driver_runtime_quiesced(self.index)
+        {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        clear_instance(self.index)
+    }
+}
+
+pub(crate) unsafe fn begin_driver_unload(driver_object_path: &str) -> DriverUnload {
+    match begin_driver_unload_inner(driver_object_path) {
+        Ok(unload) => unload,
+        Err(status) => DriverUnload::Done(Err(status)),
+    }
+}
+
+unsafe fn begin_driver_unload_inner(
+    driver_object_path: &str,
+) -> Result<DriverUnload, nt_status::NtStatus> {
     let driver_id =
         driver_id_by_name(driver_object_path).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     if hosted_pnp_transactions_mut()
@@ -73757,6 +73826,7 @@ pub(crate) unsafe fn unload_driver_by_name(
         .driver(DriverId(driver_id))
         .map(|driver| driver.unload_state)
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let finish = DriverUnloadFinish { index, driver_id, domain };
     match unload_state {
         nt_io_manager::DriverUnloadState::Loaded => {
             if !hosted_driver_device_lifetime_quiesced(index, driver_id, domain) {
@@ -73765,30 +73835,28 @@ pub(crate) unsafe fn unload_driver_by_name(
             io_manager_mut().request_driver_unload_records(DriverId(driver_id))?;
             // DriverUnload executes as executive System work, independently of the stop caller.
             let caller = crate::initial_system_driver_caller();
-            if let Err(status) = dispatch_driver_unload_for_instance(index, inst, caller) {
-                register_instance_ready(index, false);
-                return Err(status);
+            match dispatch_driver_unload_for_instance(index, inst, caller) {
+                Err(status) => {
+                    register_instance_ready(index, false);
+                    Err(status)
+                }
+                Ok(component_scheduler::service_continuation::ServicePump::Finished(pr)
+                    | component_scheduler::service_continuation::ServicePump::Fenced(pr)) =>
+                    Ok(DriverUnload::Done(finish.after_callback(pr))),
+                Ok(component_scheduler::service_continuation::ServicePump::Kept(kept)) =>
+                    Ok(DriverUnload::Kept(PendingDriverUnload { kept, finish })),
             }
-            io_manager_mut().complete_driver_unload_callback(DriverId(driver_id))?;
         }
         nt_io_manager::DriverUnloadState::UnloadRequested => {
             // The callback transport did not return, so re-entry cannot prove whether the void
             // routine ran partially. Keep the exact canonical unload owner as a barrier.
-            return Err(nt_status::NtStatus::DEVICE_BUSY);
+            Err(nt_status::NtStatus::DEVICE_BUSY)
         }
-        nt_io_manager::DriverUnloadState::UnloadCallbackReturned => {}
+        nt_io_manager::DriverUnloadState::UnloadCallbackReturned => Ok(DriverUnload::Done(finish.records())),
         nt_io_manager::DriverUnloadState::Unloaded => {
-            return Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND);
+            Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)
         }
     }
-
-    io_manager_mut().can_finish_driver_unload(DriverId(driver_id))?;
-    if !hosted_driver_device_lifetime_quiesced(index, driver_id, domain)
-        || !hosted_driver_runtime_quiesced(index)
-    {
-        return Err(nt_status::NtStatus::DEVICE_BUSY);
-    }
-    clear_instance(index)
 }
 
 pub(crate) fn device_id_by_name(path: &str) -> Option<u64> {
