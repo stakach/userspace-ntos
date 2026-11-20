@@ -12,6 +12,7 @@ pub enum ProviderWaitPrimitive {
     WaitForMultipleObjects = 2,
     AcquireResource = 3,
     DelayExecutionThread = 4,
+    AcquireFastMutex = 5,
 }
 
 #[repr(u32)]
@@ -67,6 +68,7 @@ impl ProviderLaneStamp {
             2 => "KeWaitForMultipleObjects",
             3 => "ExAcquireResourceLite",
             4 => "KeDelayExecutionThread",
+            5 => "ExAcquireFastMutex",
             _ => "invalid",
         }
     }

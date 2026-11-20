@@ -11838,30 +11838,79 @@ extern "win64" fn s_ex_release_resource_and_leave_critical_region(resource: u64)
     s_ke_leave_critical_region();
 }
 
-/// `VOID ExAcquireFastMutexUnsafe(PFAST_MUTEX FastMutex)`.
-extern "win64" fn s_ex_acquire_fast_mutex_unsafe(mutex: u64) {
-    let thread = unsafe { current_ethread() };
-    match unsafe {
-        nt_kernel_exec::executive_sync::acquire_fast_mutex_unsafe(mutex as *mut u8, thread)
-    } {
-        Ok(nt_kernel_exec::executive_sync::AcquireResult::Acquired) => {}
-        Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) => reject_fast_mutex_sync(
-            b"ExAcquireFastMutexUnsafe",
-            nt_kernel_exec::executive_sync::ExecutiveSyncError::BlockingWaitRequired,
-            mutex,
-            thread,
-        ),
-        Err(error) => reject_fast_mutex_sync(b"ExAcquireFastMutexUnsafe", error, mutex, thread),
-    }
+static mut WIN32K_FAST_MUTEX_WAITS: nt_kernel_exec::executive_sync::FastMutexWaitStore =
+    nt_kernel_exec::executive_sync::FastMutexWaitStore::new();
+
+fn fast_mutex_waits_mut() -> &'static mut nt_kernel_exec::executive_sync::FastMutexWaitStore {
+    // Same discipline as the ERESOURCE store: no borrow crosses a provider call.
+    unsafe { &mut *core::ptr::addr_of_mut!(WIN32K_FAST_MUTEX_WAITS) }
 }
 
-/// `VOID ExReleaseFastMutexUnsafe(PFAST_MUTEX FastMutex)`.
+/// `VOID ExAcquireFastMutexUnsafe(PFAST_MUTEX FastMutex)`. A mutex another thread holds
+/// (it may have yielded into a callback or wait while holding it) is waited for, as
+/// `KeWaitForSingleObject` on the mutex gate would: the release grants it to this thread.
+extern "win64" fn s_ex_acquire_fast_mutex_unsafe(mutex: u64) {
+    use nt_kernel_exec::executive_sync::{ExecutiveSyncError, FastMutexWaitAdmission};
+    let thread = unsafe { current_ethread() };
+    let operation = b"ExAcquireFastMutexUnsafe";
+    match unsafe { nt_kernel_exec::executive_sync::acquire_fast_mutex_unsafe(mutex as *mut u8, thread) } {
+        Ok(nt_kernel_exec::executive_sync::AcquireResult::Acquired) => return,
+        Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) => {}
+        Err(error) => reject_fast_mutex_sync(operation, error, mutex, thread),
+    }
+    // Contended. Publish the Event, then recheck and enqueue in one step.
+    let mut event = [0u64; 3];
+    let event_body = event.as_mut_ptr() as u64;
+    s_ke_initialize_event(event_body, 1, 0);
+    let admission = unsafe { fast_mutex_waits_mut().begin_wait(mutex as *mut u8, thread, event_body) };
+    match admission {
+        Ok(FastMutexWaitAdmission::Acquired) => {}
+        Ok(FastMutexWaitAdmission::Queued(ticket)) => {
+            print_str(b"[win32k-fast-mutex-wait] queued mutex=");
+            print_win32k_hex64(mutex);
+            print_str(b" thread=");
+            print_win32k_hex64(thread);
+            print_str(b"\n");
+            let status = unsafe {
+                provider_wait_rendezvous(
+                    nt_provider_wait::ProviderWaitPrimitive::AcquireFastMutex,
+                    &[event_body], nt_provider_wait::ProviderWaitType::Any, 0, 0, 0,
+                )
+            };
+            if status != 0 {
+                let wake = unsafe { fast_mutex_waits_mut().cancel_wait(mutex as *mut u8, thread, ticket) };
+                let Ok(wake) = wake else { park(); };
+                if let Some(next_event) = wake { s_ke_set_event(next_event, 0, 0); }
+                if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+                reject_fast_mutex_sync(operation, ExecutiveSyncError::BlockingWaitRequired, mutex, thread);
+            }
+            if unsafe { fast_mutex_waits_mut().complete_wait(mutex as *mut u8, thread, ticket) }.is_err() {
+                park();
+            }
+        }
+        Err(error) => {
+            if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+            reject_fast_mutex_sync(operation, error, mutex, thread);
+        }
+    }
+    if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+}
+
+/// `VOID ExReleaseFastMutexUnsafe(PFAST_MUTEX FastMutex)`. The oldest waiter becomes the
+/// owner before its Event is signalled.
 extern "win64" fn s_ex_release_fast_mutex_unsafe(mutex: u64) {
     let thread = unsafe { current_ethread() };
-    if let Err(error) = unsafe {
-        nt_kernel_exec::executive_sync::release_fast_mutex_unsafe(mutex as *mut u8, thread)
-    } {
-        reject_fast_mutex_sync(b"ExReleaseFastMutexUnsafe", error, mutex, thread);
+    let wake = match unsafe { fast_mutex_waits_mut().release(mutex as *mut u8, thread) } {
+        Ok(wake) => wake,
+        Err(error) => reject_fast_mutex_sync(b"ExReleaseFastMutexUnsafe", error, mutex, thread),
+    };
+    if let Some(event) = wake {
+        print_str(b"[win32k-fast-mutex-wait] grant mutex=");
+        print_win32k_hex64(mutex);
+        print_str(b" releaser=");
+        print_win32k_hex64(thread);
+        print_str(b"\n");
+        s_ke_set_event(event, 0, 0);
     }
 }
 

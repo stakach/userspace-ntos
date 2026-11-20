@@ -7,7 +7,9 @@
 
 use alloc::vec::Vec;
 
+mod fast_mutex_wait;
 mod guarded_mutex;
+pub use fast_mutex_wait::{FastMutexWaitAdmission, FastMutexWaitStore, FastMutexWaitTicket};
 pub use guarded_mutex::{guarded_mutex_layout, GuardedMutexStore, GuardedMutexWaitAdmission,
     GuardedMutexWaitTicket};
 
