@@ -70,6 +70,7 @@ mod registry_query_audit;
 mod hot_service_cost_census;
 mod hot_service_latency_census;
 mod registry_open_phase_census;
+mod copy_in_census;
 mod io_lifecycle_trace;
 mod provider_registry_caller;
 mod provider_directory_broker;
@@ -7624,6 +7625,10 @@ pub(crate) fn census_tick_static(now: u64) {
     hot_service_cost_census::print_wait_outcome_census();
     hot_service_latency_census::print_census();
     registry_open_phase_census::print_census();
+    {
+        let frames = client_frame_registry_stats();
+        copy_in_census::print_census(frames.reclaiming_records, frames.records);
+    }
     registry_security_audit::print_admission_census();
     io_lifecycle_trace::print_census();
     driver_launch::print_hosted_file_rpc_phase();

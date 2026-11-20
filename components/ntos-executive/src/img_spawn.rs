@@ -1769,6 +1769,7 @@ pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
         va,
         dst,
         crate::executor::local().scratch_base.load(Ordering::Relaxed),
+        false,
     )
 }
 /// Copy `src.len()` bytes OUT to a SEC_IMAGE process VA (the executive's copyout).
@@ -1782,16 +1783,20 @@ pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
     recorded_frame_copyout(pi, va, src, crate::executor::local().scratch_base.load(Ordering::Relaxed))
 }
 
+/// `page_checked`: the caller already ran `hosted_thread_memory_access(pi, page, 0x1000)` in
+/// this serialized copy with no effect in between that can withdraw availability (an alias
+/// drain only releases scratch mappings), so the identical check is not repeated.
 unsafe fn with_recorded_frame_alias(
     pi: u64,
     process: Option<nt_memory_manager::ProcessIdentity>,
     page: u64,
     scratch_base: u64,
     writable: bool,
+    page_checked: bool,
     access: impl FnOnce(u64),
 ) -> bool {
     if crate::temporary_frame_alias::drain().is_err()
-        || hosted_thread_memory_access(pi, page, 0x1000).is_err() {
+        || (!page_checked && hosted_thread_memory_access(pi, page, 0x1000).is_err()) {
         return false;
     }
     let backing = if let Some(process) = process {
@@ -1846,15 +1851,17 @@ unsafe fn with_recorded_frame_alias(
     ).is_ok()
 }
 
+/// Both callers checked `hosted_thread_memory_access` for a range containing `va..+len`
+/// immediately before; `pages_checked` says each page was also checked whole.
 unsafe fn recorded_frame_copyin(
     pi: u64,
     process: Option<nt_memory_manager::ProcessIdentity>,
     va: u64,
     dst: &mut [u8],
     scratch_base: u64,
+    pages_checked: bool,
 ) -> bool {
-    if crate::temporary_frame_alias::drain().is_err()
-        || hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
+    if crate::temporary_frame_alias::drain().is_err() {
         return false;
     }
     let Some(chunks) = nt_address_space::page_chunks(va, dst.len()) else {
@@ -1862,7 +1869,8 @@ unsafe fn recorded_frame_copyin(
     };
     let mut copied = 0usize;
     for chunk in chunks {
-        let ok = with_recorded_frame_alias(pi, process, chunk.page_base, scratch_base, false, |alias| {
+        let ok = with_recorded_frame_alias(pi, process, chunk.page_base, scratch_base, false,
+            pages_checked, |alias| {
             core::ptr::copy_nonoverlapping(
                 (alias + chunk.page_offset as u64) as *const u8,
                 dst.as_mut_ptr().add(copied),
@@ -1894,7 +1902,8 @@ unsafe fn recorded_frame_copyout_impl(pi: u64, process: Option<nt_memory_manager
         if !admitted && crate::service_sec_image::service_admit_section_alias(pi, chunk.page_base, true, None).is_err() {
             return false;
         }
-        let ok = with_recorded_frame_alias(pi, process, chunk.page_base, scratch_base, true, |alias| {
+        let ok = with_recorded_frame_alias(pi, process, chunk.page_base, scratch_base, true,
+            false, |alias| {
             core::ptr::copy_nonoverlapping(
                 src.as_ptr().add(copied),
                 (alias + chunk.page_offset as u64) as *mut u8,
@@ -1934,7 +1943,7 @@ unsafe fn client_copyin_process_mapped_pi_unchecked(
     dst: &mut [u8],
     scratch_base: u64,
 ) -> bool {
-    client_copyin_process_mapped_impl(
+    client_copyin_process_mapped_timed(
         pi, None, va, dst, scratch_base,
     )
 }
@@ -1947,9 +1956,23 @@ pub(crate) unsafe fn client_copyin_process_mapped_for(
     dst: &mut [u8],
     scratch_base: u64,
 ) -> bool {
-    client_copyin_process_mapped_impl(
+    client_copyin_process_mapped_timed(
         pi, Some(process), va, dst, scratch_base,
     )
+}
+
+/// Times one copy-in for `[census] copy-in`.
+unsafe fn client_copyin_process_mapped_timed(
+    pi: u64,
+    process: Option<nt_memory_manager::ProcessIdentity>,
+    va: u64,
+    dst: &mut [u8],
+    scratch_base: u64,
+) -> bool {
+    let started = crate::disk_census_ticks();
+    let copied = client_copyin_process_mapped_impl(pi, process, va, dst, scratch_base);
+    crate::copy_in_census::record_copy(crate::disk_census_ticks().wrapping_sub(started));
+    copied
 }
 
 unsafe fn client_copyin_process_mapped_impl(
@@ -2009,12 +2032,14 @@ unsafe fn client_copyin_process_mapped_impl(
                 || shared_image_mapping_contains_pi_unchecked(pi, page)
         };
         if recorded {
+            // `client_copyin_frame_lookup_for` checked this page whole for an exact process.
             if !recorded_frame_copyin(
                 pi,
                 process,
                 current,
                 &mut dst[copied..copied + chunk],
                 scratch_base,
+                process.is_some(),
             ) {
                 return false;
             }
@@ -2114,7 +2139,7 @@ pub(crate) unsafe fn client_write_process_mapped_for(
         match backing {
             nt_memory_manager::ClientCopyoutBacking::Resident(_) => {
                 if !with_recorded_frame_alias(
-                    pi, Some(process), chunk.page_base, scratch_base, true, |alias| {
+                    pi, Some(process), chunk.page_base, scratch_base, true, false, |alias| {
                         core::ptr::copy_nonoverlapping(
                             source.as_ptr(),
                             (alias + chunk.page_offset as u64) as *mut u8,

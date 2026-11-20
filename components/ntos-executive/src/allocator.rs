@@ -112,6 +112,12 @@ static ALLOC_WALK: WalkCounter = WalkCounter::new();
 static INSERT_WALK: WalkCounter = WalkCounter::new();
 static GROW_WALK: WalkCounter = WalkCounter::new();
 
+/// Whether this executor allocates from the root heap (root and its workers), where the
+/// shared image's statics are writable; isolated services map them read-only.
+pub(crate) fn is_root_heap() -> bool {
+    transient_heap_size() != 0
+}
+
 /// Approximate cumulative root-only walk counts; concurrent lanes may advance between loads.
 pub fn walk_samples() -> [WalkSample; 3] {
     let root_heap = transient_heap_size() != 0;

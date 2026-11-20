@@ -1030,6 +1030,7 @@ pub(crate) fn hosted_thread_user_stack_for_binding(
 /// No allocation, IPC or callbacks may occur during this short table borrow. Cleanup backends
 /// holding a mutable slot must use retained capabilities directly, never recurse through here.
 pub(crate) fn hosted_thread_memory_access(pi: u64, base: u64, size: u64) -> Result<(), u32> {
+    let _census = crate::copy_in_census::CheckScope::enter();
     hosted_thread_memory_retirement_access(pi, base, size)?;
     if !unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).memory_available(pi, base, size) } {
         return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
