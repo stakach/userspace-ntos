@@ -53,6 +53,7 @@ pub mod processor_topology;
 pub mod ipi_broadcast;
 pub mod push_lock;
 pub mod provider_bugcheck;
+pub mod provider_park;
 pub mod queued_spin_lock;
 pub mod rtl_atom;
 pub mod rtl_bitmap;

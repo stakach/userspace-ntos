@@ -4629,6 +4629,7 @@ pub(crate) unsafe fn retire_bugchecked_vspace(vspace: u64, reporting_tcb: u64) {
     {
         return;
     }
+    crate::provider_park::tear_down_vspace(vspace);
     WIN32K_RETIRED.store(1, Ordering::Release);
     let mut index = 0;
     loop {

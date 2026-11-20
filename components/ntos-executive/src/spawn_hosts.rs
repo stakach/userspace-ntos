@@ -3398,6 +3398,13 @@ unsafe fn component_pump_loop(
                 crate::hosted_win32k_cr8_fault::Cr8FaultOutcome::Unrelated => {}
             }
         }
+        if label == nt_kernel_exec::provider_park::PARK_LABEL {
+            // A provider lane parked at a fail-closed site (#394). Its Call stays unreplied and
+            // owned by the root's parked-lane table; the pump stops here instead of waiting.
+            crate::provider_park::accept(ch, *reply_cap, msg.badge, msg.mi, [msg.m0, msg.m1]);
+            outcome.wall(msg);
+            break;
+        }
         if label == crate::provider_bugcheck::BUGCHECK_LABEL {
             match crate::provider_bugcheck::accept(
                 ch,

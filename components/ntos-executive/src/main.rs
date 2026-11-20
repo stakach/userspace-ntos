@@ -14785,6 +14785,7 @@ mod frame_recycle;
 mod client_frame_cleanup;
 mod retirement_memory_access;
 mod provider_bugcheck;
+mod provider_park;
 mod pagefile_retirement;
 use thread_sched_context::{attach_sched_context, attach_sched_context_on_core};
 

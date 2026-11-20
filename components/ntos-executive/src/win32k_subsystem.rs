@@ -298,21 +298,32 @@ struct HostedHeapArena {
     section_generation: u64,
 }
 
-/// A provider lane that cannot continue safely stops here for good. It keeps yielding rather
-/// than returning, so the root that runs it sees only a lane that never sends again. The site
-/// names itself, bounded, so that state is attributable from the log.
+/// A provider lane that cannot continue safely stops here for good (#394). It parks in an
+/// unreplied labelled Call naming its site, so the root sees a parked lane it owns, walls the
+/// pump, and can tear the lane down. A wake only replies: the site is fail-closed and parks
+/// again. The lane never spins.
 #[track_caller]
 fn park() -> ! {
     static PARKS: AtomicU64 = AtomicU64::new(0);
+    let site = core::panic::Location::caller();
     if PARKS.fetch_add(1, Ordering::Relaxed) < 16 {
-        let site = core::panic::Location::caller();
         print_str(b"[win32k-park] lane stopped at ");
         print_str(site.file().as_bytes());
         print_str(b":");
         print_u64(u64::from(site.line()));
         print_str(b"\n");
     }
-    crate::park()
+    // FNV-1a of the file path: a stable site identity without passing a pointer to root.
+    let file = site.file().bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte|
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3));
+    loop {
+        unsafe {
+            crate::driver_launch::call_on4_raw(
+                nt_kernel_exec::provider_park::PARK_MESSAGE_INFO,
+                u64::from(site.line()), file, 0, 0,
+            );
+        }
+    }
 }
 
 /// One contended acquire of a provider-internal lock. Its holder is a lane inside a short
