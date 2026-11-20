@@ -14225,6 +14225,114 @@ impl ExecNtHandler {
         Ok((worker_slot, publication))
     }
 
+    /// Prepare a thread whose stack the kernel builds in its bounded worker window: the shared
+    /// admission for NtCreateThreadEx and kernel-mode RtlCreateUserThread. Nothing is published
+    /// until the service loop (or the provider spawn) commits the returned request.
+    fn prepare_constructor_stack_thread(
+        &mut self,
+        target_pi: usize,
+        caller_pid: nt_process::ProcessId,
+        desired_access: u32,
+        start: nt_thread_start::Amd64ThreadContext,
+        create_suspended: bool,
+        hide_from_debugger: bool,
+        handle_out: u64,
+    ) -> Result<HostedThreadSpawnRequest, u32> {
+        let (slot, publication) = self.create_hosted_worker_thread_from_start(
+            target_pi,
+            caller_pid,
+            desired_access,
+            start,
+            create_suspended,
+            hide_from_debugger,
+            handle_out,
+            0,
+        )?;
+        let start = nt_thread_start::Amd64ThreadContext { rsp: tp_worker_context_rsp(slot), ..start };
+        let initial_context = match nt_thread_start::amd64_context::InitialAmd64Context::constructor(
+            start, HIGHEST_USER_ADDRESS,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                self.abort_unbuilt_hosted_thread_request(publication);
+                return Err(error.status());
+            }
+        };
+        Ok(HostedThreadSpawnRequest::TpWorker {
+            pi: target_pi,
+            slot,
+            start,
+            initial_context,
+            stack_origin: ThreadStackOrigin::ConstructorStack,
+            publication,
+        })
+    }
+
+    /// Kernel-mode `RtlCreateUserThread` from a hosted driver: create a thread in the process
+    /// named by `process_handle` (resolved under the authenticated kernel caller with
+    /// PROCESS_CREATE_THREAD). The handle is published in the caller's effective process table
+    /// only after the mechanism is built; its value and the new ClientId are returned instead of
+    /// being queued as out-parameter writes, which belong to a syscall turn.
+    pub(crate) unsafe fn create_user_thread_for_provider(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        process_handle: u64,
+        start_address: u64,
+        parameter: u64,
+        create_suspended: bool,
+    ) -> Result<(u64, u64, u64), u32> {
+        const PROCESS_CREATE_THREAD: u32 = 0x0002;
+        const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
+        if start_address == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.pm.validate_native_handle_caller(caller)?;
+        let mut target = self.pm.reference_native_ps_handle(
+            caller,
+            process_handle,
+            Some(nt_process::native_handle::PsHandleType::Process),
+            PROCESS_CREATE_THREAD,
+        )?;
+        let object = target.object();
+        target.release(&mut self.pm)?;
+        let nt_process::HandleObject::Process(target_pid) = object else {
+            return Err(nt_process::native_handle::STATUS_OBJECT_TYPE_MISMATCH);
+        };
+        let target_pi = self.pi_for_pid(target_pid).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        if self.pm.process(target_pid).is_some_and(|process| matches!(
+            process.state,
+            nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
+        )) || self.hosted_process_vspace(target_pi).is_none()
+        {
+            return Err(nt_process::STATUS_PROCESS_IS_TERMINATING);
+        }
+        let start = nt_thread_start::Amd64ThreadContext {
+            rip: start_address, rsp: 0, rcx: parameter, rdx: 0,
+        };
+        let out_writes = self.out_writes_n;
+        let request = self.prepare_constructor_stack_thread(
+            target_pi, caller.effective_process(), THREAD_ALL_ACCESS, start,
+            create_suspended, false, 0,
+        )?;
+        let HostedThreadSpawnRequest::TpWorker { ref publication, .. } = request else {
+            unreachable!("constructor-stack threads are thread-pool windows");
+        };
+        let (handle, tid) = (publication.handle(), publication.tid());
+        crate::service_sec_image::spawn_provider_thread(self, request)?;
+        assert_eq!(self.out_writes_n, out_writes, "provider thread creation queued a turn write");
+        print_str(b"[thread-provider] create target_pi=");
+        print_u64(target_pi as u64);
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" entry=0x");
+        print_hex((start_address >> 32) as u32);
+        print_hex(start_address as u32);
+        print_str(b" suspended=");
+        print_u64(create_suspended as u64);
+        print_str(b"\n");
+        Ok((handle, u64::from(target_pid), tid))
+    }
+
     unsafe fn nt_create_thread_ex_service(&mut self, args: &[u64]) -> u32 {
         const PROCESS_CREATE_THREAD: u32 = 0x0002;
         const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
@@ -14289,7 +14397,7 @@ impl ExecNtHandler {
 
         let create_suspended = create_flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED != 0;
         let hide_from_debugger = create_flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER != 0;
-        let (slot, publication) = match self.create_hosted_worker_thread_from_start(
+        let request = match self.prepare_constructor_stack_thread(
             target_pi,
             caller_pid,
             nt_ulong_arg(args[1]),
@@ -14297,34 +14405,19 @@ impl ExecNtHandler {
             create_suspended,
             hide_from_debugger,
             thread_handle_out,
-            0,
         ) {
-            Ok(created) => created,
+            Ok(request) => request,
             Err(status) => {
                 self.queue_write(thread_handle_out, 0);
                 return status;
             }
         };
-        let start = nt_thread_start::Amd64ThreadContext { rsp: tp_worker_context_rsp(slot), ..start };
-        let initial_context = match nt_thread_start::amd64_context::InitialAmd64Context::constructor(
-            start, HIGHEST_USER_ADDRESS,
-        ) {
-            Ok(context) => context,
-            Err(error) => {
-                self.abort_unbuilt_hosted_thread_request(publication);
-                return error.status();
-            }
+        let HostedThreadSpawnRequest::TpWorker { slot, start, ref publication, .. } = request else {
+            unreachable!("constructor-stack threads are thread-pool windows");
         };
         let trace_tid = publication.tid();
         let trace_handle = publication.handle();
-        self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
-            pi: target_pi,
-            slot,
-            start,
-            initial_context,
-            stack_origin: ThreadStackOrigin::ConstructorStack,
-            publication,
-        });
+        self.thread_spawn_request = Some(request);
 
         print_str(b"[thread-ex] create caller_pi=");
         print_u64(self.pi as u64);
@@ -14652,7 +14745,10 @@ impl ExecNtHandler {
         }
         let tid = publication.activation.thread_id();
         let _ = self.pm.report_existing_thread_create(tid);
-        self.queue_write(publication.handle_out, handle as u64);
+        // A provider-created thread returns its handle through the provider Reply instead.
+        if publication.handle_out != 0 {
+            self.queue_write(publication.handle_out, handle as u64);
+        }
         if publication.client_id_out != 0 {
             self.queue_write(
                 publication.client_id_out,

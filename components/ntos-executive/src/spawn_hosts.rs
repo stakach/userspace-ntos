@@ -4871,6 +4871,22 @@ unsafe fn component_pump_loop(
                 (STATUS_INVALID_PARAMETER_I32, 0)
             };
             pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+        } else if label == crate::driver_launch::FSD_SERVICE_RTL_CREATE_USER_THREAD_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, handle, pid, tid) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_RTL_CREATE_USER_THREAD_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::service_hosted_driver_rtl_create_user_thread(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, handle, pid, tid);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_ZW_TERMINATE_PROCESS_LABEL
             && ch.caps.kind == ReqKind::Irp
         {

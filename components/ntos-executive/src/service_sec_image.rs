@@ -11232,6 +11232,7 @@ pub(crate) unsafe fn service_sec_image(
     // as a reply cap, matching every reply_recv_badge recv in the loop body.
     // The first blocking ingress rechecks retained work like every later one. This barrier
     // only programs wake demand; provider execution stays at the outer loop top.
+    SERVICE_FAULT_EP.store(fault_ep, Ordering::Release);
     let msg = {
         assert!(prepare_service_receive(&mut *delay_queue, &mut nt_handler),
             "initial root receive lost its physical timer owner");
@@ -12285,6 +12286,34 @@ unsafe fn spawn_requested_local_thread(
             }
         }
     }
+}
+
+/// The service loop's hosted-thread fault endpoint, published once before its first receive so
+/// a root service outside a syscall turn can build a thread mechanism on the same endpoint.
+static SERVICE_FAULT_EP: AtomicU64 = AtomicU64::new(0);
+
+/// Build and commit a constructor-stack thread requested by a provider service (kernel-mode
+/// RtlCreateUserThread). This is the same mechanism a syscall turn commits for NtCreateThreadEx.
+pub(crate) unsafe fn spawn_provider_thread(
+    nt_handler: &mut ExecNtHandler,
+    request: HostedThreadSpawnRequest,
+) -> Result<(), u32> {
+    let HostedThreadSpawnRequest::TpWorker {
+        pi, slot, start, initial_context, stack_origin, publication,
+    } = request else {
+        unreachable!("provider threads use the constructor-stack worker window");
+    };
+    let fault_ep = SERVICE_FAULT_EP.load(Ordering::Acquire);
+    let pml4 = nt_handler.hosted_process_vspace(pi);
+    let (Some(pml4), true) = (pml4, fault_ep != 0 && pi < MAX_PI && slot < TP_WORKER_SLOT_COUNT)
+    else {
+        nt_handler.release_unmapped_hosted_tp_worker_slot(pi, slot, publication.tid());
+        nt_handler.abort_hosted_thread_publication(publication);
+        return Err(nt_process::STATUS_PROCESS_IS_TERMINATING);
+    };
+    spawn_requested_tp_worker(
+        nt_handler, pi, slot, pml4, start, &initial_context, stack_origin, publication, fault_ep,
+    )
 }
 
 #[inline(never)]

@@ -518,6 +518,8 @@ mod hosted_driver_luid;
 mod hosted_driver_hal_beep;
 #[path = "hosted_driver_zw_terminate_process.rs"]
 mod hosted_driver_zw_terminate_process;
+#[path = "hosted_driver_rtl_create_user_thread.rs"]
+mod hosted_driver_rtl_create_user_thread;
 #[path = "hosted_driver_kmutex.rs"]
 mod hosted_driver_kmutex;
 #[path = "hosted_driver_guarded_mutex.rs"]
@@ -531,6 +533,7 @@ pub(crate) use hosted_driver_power_setting::service as service_hosted_driver_pow
 pub(crate) use hosted_driver_luid::service as service_hosted_driver_luid;
 pub(crate) use hosted_driver_hal_beep::service as service_hosted_driver_hal_beep;
 pub(crate) use hosted_driver_zw_terminate_process::service as service_hosted_driver_zw_terminate_process;
+pub(crate) use hosted_driver_rtl_create_user_thread::service as service_hosted_driver_rtl_create_user_thread;
 pub(crate) use hosted_driver_kmutex::service as service_hosted_driver_kmutex;
 pub(crate) use hosted_driver_pnp_notification::wake_due as hosted_driver_pnp_notification_wake_due;
 #[path = "hosted_io_create_file_ingress.rs"]
@@ -1473,6 +1476,7 @@ pub const FSD_SERVICE_POWER_SETTING_LABEL: u64 = hosted_driver_power_setting::LA
 pub const FSD_SERVICE_LUID_LABEL: u64 = hosted_driver_luid::LABEL;
 pub const FSD_SERVICE_HAL_BEEP_LABEL: u64 = hosted_driver_hal_beep::LABEL;
 pub const FSD_SERVICE_ZW_TERMINATE_PROCESS_LABEL: u64 = hosted_driver_zw_terminate_process::LABEL;
+pub const FSD_SERVICE_RTL_CREATE_USER_THREAD_LABEL: u64 = hosted_driver_rtl_create_user_thread::LABEL;
 pub const FSD_SERVICE_KMUTEX_LABEL: u64 = hosted_driver_kmutex::LABEL;
 pub const FSD_SERVICE_GUARDED_MUTEX_LABEL: u64 = hosted_driver_guarded_mutex::LABEL;
 pub const FSD_SERVICE_WMI_LABEL: u64 = hosted_driver_wmi::LABEL;
@@ -1527,6 +1531,7 @@ const _: () = {
         FSD_SERVICE_LUID_LABEL,
         FSD_SERVICE_HAL_BEEP_LABEL,
         FSD_SERVICE_ZW_TERMINATE_PROCESS_LABEL,
+        FSD_SERVICE_RTL_CREATE_USER_THREAD_LABEL,
         FSD_SERVICE_KMUTEX_LABEL,
         FSD_SERVICE_GUARDED_MUTEX_LABEL,
         FSD_SERVICE_WMI_LABEL,
@@ -38619,6 +38624,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "PsGetProcessSessionId",
         hosted_driver_process_state::ps_get_process_session_id as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlCreateUserThread",
+        hosted_driver_rtl_create_user_thread::rtl_create_user_thread as *const () as usize as u64,
     );
     reg.bind(
         "ZwTerminateProcess",

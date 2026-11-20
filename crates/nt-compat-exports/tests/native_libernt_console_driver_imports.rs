@@ -23,6 +23,14 @@ fn bound_names() -> BTreeSet<String> {
             }
         }
     }
+    // Data exports resolve through the generic driver data registry instead of reg.bind.
+    let launch = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../components/ntos-executive/src/driver_launch.rs")).expect("driver_launch");
+    let data = launch.split_once("fn fsd_data_export_addr(name: &str) -> Option<u64> {")
+        .expect("driver data registry").1.split_once("\n}").expect("end of data registry").0;
+    for arm in data.split('"').skip(1).step_by(2) {
+        names.insert(arm.to_owned());
+    }
     names
 }
 
@@ -36,22 +44,12 @@ fn pinned_beep_imports_are_all_bound() {
 }
 
 #[test]
-fn pinned_condrv_reader_writer_lock_and_parent_query_are_bound() {
-    let imports = libernt_driver_imports::imports("condrv.sys", &["ntoskrnl.exe"]);
+fn pinned_condrv_imports_are_all_bound() {
+    let imports = libernt_driver_imports::imports("condrv.sys", &["ntoskrnl.exe", "hal.dll"]);
     assert_eq!(imports.len(), 43, "review condrv imports when the release changes");
     let bound = bound_names();
-    for name in [
-        "ExAcquireSpinLockExclusive",
-        "ExAcquireSpinLockShared",
-        "ExReleaseSpinLockExclusive",
-        "ExReleaseSpinLockShared",
-        "PsGetProcessInheritedFromUniqueProcessId",
-        "ObOpenObjectByPointer",
-        "ZwTerminateProcess",
-    ] {
-        assert!(imports.contains(name), "condrv no longer imports {name}");
-        assert!(bound.contains(name), "condrv import {name} has no binding");
-    }
+    let missing: Vec<_> = imports.iter().filter(|name| !bound.contains(*name)).collect();
+    assert!(missing.is_empty(), "condrv.sys imports without a binding: {missing:?}");
     for name in [
         "ExAcquireSpinLockExclusiveAtDpcLevel",
         "ExAcquireSpinLockSharedAtDpcLevel",
