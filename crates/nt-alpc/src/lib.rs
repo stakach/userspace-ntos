@@ -377,6 +377,7 @@ impl AlpcServer {
             opcode::ALPC_OP_LOOKUP_CREATE_PORT => self.op_lookup_create_port(core, in_buf),
             opcode::ALPC_OP_CLOSE_CREATED_PORT => self.op_close_created_port(core, in_buf),
             opcode::ALPC_OP_ACK_SEND_RECEIVE => self.op_ack_send_receive(in_buf),
+            opcode::ALPC_OP_EXPIRE_SEND_RECEIVE => self.op_expire_send_receive(in_buf, out_buf),
             opcode::ALPC_OP_CLOSE_LATER_PORT => self.op_close_later_port(core, in_buf),
             opcode::ALPC_OP_ACK_CONNECT_PORT => self.op_ack_later(in_buf, false),
             opcode::ALPC_OP_ACK_ACCEPT_CONNECT => self.op_ack_later(in_buf, true),
@@ -1139,6 +1140,31 @@ impl AlpcServer {
         }
         out_buf.copy_from_slice(&saved.output);
         Ok(result)
+    }
+
+    /// NtAlpcSendWaitReceivePort's timeout: the pending receive half ends with STATUS_TIMEOUT.
+    /// The send half already happened exactly once and is not undone; a message that arrives
+    /// later stays queued for the next receive. A request that already reached its terminal
+    /// returns that terminal, so the expiry can never race away a delivered message.
+    fn op_expire_send_receive(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<AlpcReply, NtStatus> {
+        let checked: AlpcSendReceiveCheckedRequest = read_req(buf)?;
+        let invocation = checked.invocation;
+        let token = (invocation.invocation_hi, invocation.invocation_lo);
+        let saved = self.send_receive_results.iter_mut().find(|saved| saved.token == token)
+            .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        if saved.owner != (ClientId { process: invocation.owner_process, thread: invocation.owner_thread })
+            || saved.owner_generation != invocation.owner_generation
+        {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
+        if saved.op != opcode::ALPC_OP_SEND_RECEIVE && saved.op != opcode::ALPC_OP_RECEIVE
+            || saved.request != buf || saved.output.len() != out_buf.len()
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let terminal = *saved.terminal.get_or_insert_with(|| reply(NtStatus::TIMEOUT, 0, 0, 0));
+        out_buf.copy_from_slice(&saved.output);
+        Ok(terminal)
     }
 
     fn op_ack_send_receive(&mut self, buf: &[u8]) -> Result<AlpcReply, NtStatus> {

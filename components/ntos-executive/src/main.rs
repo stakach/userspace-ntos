@@ -3185,6 +3185,7 @@ const DELAY_TIMER_SOURCE_SECTION_WRITEBACK: u64 = 50;
 const DELAY_TIMER_SOURCE_SECTION_EXTEND: u64 = 51;
 /// A kernel job's scheduler yield whose lane stayed held retries its parent restore (#333).
 const DELAY_TIMER_SOURCE_KERNEL_YIELD_RETRY: u64 = 52;
+const DELAY_TIMER_SOURCE_ALPC_TIMEOUT: u64 = 53;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;

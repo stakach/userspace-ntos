@@ -221,6 +221,10 @@ pub mod opcode {
     pub const ALPC_OP_ACK_CONNECT_PORT: u16 = 0x2312;
     /// Retire a terminal checked Accept result after native publication/copyout.
     pub const ALPC_OP_ACK_ACCEPT_CONNECT: u16 = 0x2313;
+    /// A checked send/receive whose NtAlpcSendWaitReceivePort timeout expired: the retained
+    /// request (same bytes) becomes terminal with STATUS_TIMEOUT unless it already completed,
+    /// in which case its saved terminal is returned. Retire it with ALPC_OP_ACK_SEND_RECEIVE.
+    pub const ALPC_OP_EXPIRE_SEND_RECEIVE: u16 = 0x2314;
 }
 
 /// `AlpcSendReceiveRequest.flags` bits.

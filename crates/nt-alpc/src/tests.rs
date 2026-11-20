@@ -2589,3 +2589,55 @@ fn bridge_alpc_client_to_lpc_host() {
         assert_eq!(r.detail0, 0, "LPC host reply presents no ALPC attributes");
     }
 }
+
+#[test]
+fn an_expired_receive_times_out_once_and_never_loses_a_later_message() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, owner, (3, 20)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let request = enc_checked_receive(created.detail0, owner, (3, 21));
+    let mut output = [0u8; 128];
+    // No retained record yet: nothing to expire.
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_EXPIRE_SEND_RECEIVE, &request, &mut output).status,
+        nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.0);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &request, &mut output).status,
+        nt_status::NtStatus::PENDING.0);
+    let expired = alpc.dispatch(&mut core, aop::ALPC_OP_EXPIRE_SEND_RECEIVE, &request, &mut output);
+    assert_eq!((expired.status, expired.information), (nt_status::NtStatus::TIMEOUT.0, 0));
+    // The terminal is fixed: a message published now cannot be claimed by the timed-out call.
+    core.connect_with_client_id(&name, PortApi::Alpc, 0, b"hello", client).unwrap();
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &request, &mut output).status,
+        nt_status::NtStatus::TIMEOUT.0);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_SEND_RECEIVE,
+        &enc_ack_receive(owner, (3, 21)), &mut []).status, SUCCESS);
+    // The message is still queued for the next receive.
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(created.detail0, owner, (3, 22)), &mut output).status, SUCCESS);
+}
+
+#[test]
+fn expiry_after_completion_returns_the_delivered_terminal() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, owner, (3, 20)), &mut []);
+    let request = enc_checked_receive(created.detail0, owner, (3, 21));
+    let mut output = [0u8; 128];
+    core.connect_with_client_id(&name, PortApi::Alpc, 0, b"hello", client).unwrap();
+    let delivered = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &request, &mut output);
+    assert_eq!(delivered.status, SUCCESS);
+    let mut again = [0u8; 128];
+    let expired = alpc.dispatch(&mut core, aop::ALPC_OP_EXPIRE_SEND_RECEIVE, &request, &mut again);
+    assert_eq!((expired.status, expired.information), (SUCCESS, delivered.information));
+    assert_eq!(again, output, "the delivered message is the answer, not a timeout");
+}

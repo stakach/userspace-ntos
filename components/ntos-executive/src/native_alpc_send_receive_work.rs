@@ -56,6 +56,18 @@ struct OwnedReceive {
     trace_csrss: bool,
     wait_observation: StartupWaitObservation<(NativeCaller, (u64, u64))>,
     logged_pending: bool,
+    /// NtAlpcSendWaitReceivePort's timeout. Once due, a pending receive is expired in the port
+    /// service, which fixes the exact terminal (STATUS_TIMEOUT or an already-delivered message).
+    deadline: nt_time::Deadline,
+}
+
+/// Earliest monotonic time a parked receive's timeout falls due, for the service loop's timer.
+pub(crate) fn next_deadline() -> Option<u64> {
+    let now = nt_time_snapshot();
+    unsafe { (&*core::ptr::addr_of!(OWNERS)).iter() }
+        .filter(|owner| owner.submitted_once)
+        .filter_map(|owner| owner.deadline.monotonic_target(now))
+        .min()
 }
 
 /// Copied diagnostic data only; this cannot select or complete an ALPC request.
@@ -183,9 +195,9 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
         |address, out| (*handler_ptr).xas_read(address, out),
         |address, len| (*handler_ptr).probe_user_output(address, len),
     )?;
-    if captured.timeout.is_some() || captured.receive.is_none() {
+    if captured.receive.is_none() {
         // A send or reply with no receive half (CSRSS's death-message reply reports this
-        // status) and a bounded wait are not implemented. Record which shape arrived.
+        // status) is not implemented (#416). Record which shape arrived.
         let sequence = UNSUPPORTED_SHAPE_TRACE.fetch_add(1, Ordering::Relaxed);
         if sequence < 8 || sequence.is_power_of_two() {
             print_str(b"[native-alpc-send-unsupported] #"); print_u64(sequence);
@@ -200,6 +212,8 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
         }
         return Err(STATUS_NOT_SUPPORTED);
     }
+    // Relative (negative) or absolute NT time; zero polls once.
+    let deadline = nt_time::Deadline::from_nt_timeout(captured.timeout, nt_time_snapshot());
     let target_capacity = captured.receive.as_ref().ok_or(STATUS_NOT_SUPPORTED)?.capacity;
     if target_capacity > REP_DATA_LEN { return Err(STATUS_NOT_SUPPORTED); }
     let handle_caller = handler.native_handle_caller(nt_syscall::ProcessorMode::UserMode)?;
@@ -267,7 +281,7 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
         wait_observation: StartupWaitObservation::new(
             (caller, token), StartupWaitKind::Alpc, port.service_handle,
             reply_cap, monotonic_time_100ns()),
-        logged_pending: false });
+        logged_pending: false, deadline });
     park.commit();
     Ok(())
 }
@@ -357,13 +371,20 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> Option<(u64, u64)> 
         match owner.flight {
             Flight::Ready => {
                 let request_id = channel.next_id;
+                // After the first submission performed the send half, a due timeout asks the
+                // service to fix this invocation's terminal instead of polling again.
+                let opcode = if owner.submitted_once && owner.deadline.is_due(nt_time_snapshot()) {
+                    nt_alpc_abi::opcode::ALPC_OP_EXPIRE_SEND_RECEIVE
+                } else {
+                    nt_alpc_abi::opcode::ALPC_OP_SEND_RECEIVE
+                };
                 if owner.retained.begin(request_id).is_err() {
                     owner.flight = Flight::InvalidTerminal;
                     RingStep::Idle
                 } else {
                     owner.submitted_once = true;
                     owner.output.fill(0);
-                    match channel.raw_owned(nt_alpc_abi::opcode::ALPC_OP_SEND_RECEIVE,
+                    match channel.raw_owned(opcode,
                         owner.retained.request(), &mut owner.output) {
                         RingCallOutcome::NoEffect(status) => RingStep::NoEffect(request_id, status),
                         RingCallOutcome::Completed(status, _, info, detail0, detail1) =>
