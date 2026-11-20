@@ -96,3 +96,20 @@ fn failure_or_uncertainty_retains_every_owner_and_stops_the_root() {
         }
     }
 }
+
+// Boot 44719389234 (multicore): the child's Reply was sent, and the child ran on another core
+// and delivered its next fault before the root acknowledged the page-in. The root refused that
+// delivery as a duplicate and exited. A delivery after the Reply is the child's next event.
+#[test]
+fn a_childs_next_delivery_after_its_reply_settles_the_page_in_first() {
+    let mut turn = admitted();
+    turn.page_mapped().unwrap();
+    assert_eq!(turn.root_action(ReceiveChildRootEvent::SelectedChild),
+        ReceiveChildRootAction::RefuseIdentity, "before the Reply the child cannot deliver again");
+    turn.enter_reply().unwrap();
+    assert_eq!(turn.root_action(ReceiveChildRootEvent::SelectedChild),
+        ReceiveChildRootAction::SettleFirst);
+    assert_eq!(turn.root_action(ReceiveChildRootEvent::Unrelated),
+        ReceiveChildRootAction::DeferUnrelated);
+    assert!(turn.acknowledge().is_ok());
+}

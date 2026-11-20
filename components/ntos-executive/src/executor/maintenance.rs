@@ -1161,6 +1161,7 @@ pub(super) unsafe fn maintain(
     // This delivery still owns its Reply and captured message. An outer resume can select
     // a different Receive child, so leave that work to a boundary without this ingress.
     } else if let Some(action) = crate::native_image_pagein_work::receive_child_root_action(
+        &mut *nt_handler, nt_dispatcher,
         if badge_has_delay_timer(lp.msg.badge) || hosted_irq_lines_from_badge(lp.msg.badge) != 0 {
             nt_user_host::receive_child_pagein::ReceiveChildRootEvent::Notification
         } else if hosted_ingress_binding(lp.msg.badge).is_some_and(|binding|
@@ -1191,12 +1192,41 @@ pub(super) unsafe fn maintain(
                     local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge,
                 ).expect("unexecuted unrelated Call retains its exact ingress owner");
             }
-            Action::RefuseIdentity | Action::StopRetained => {
+            Action::RefuseIdentity => {
+                // The child delivered again while its page-in still owns its Reply: neither
+                // admissible nor returnable, and receiving would drop this delivery's Reply.
                 lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 lp.exit.stop_ssn = 0;
-                lp.exit.record(b"receive-child-pagein-retained");
+                lp.exit.record(b"receive-child-pagein-identity");
                 return ControlFlow::Break(Turn::Exit);
             }
+            // A retained page-in is an owner waiting on its own completion: return an unrelated
+            // delivery to its ingress row, then wait for the next root event. Never an exit.
+            Action::StopRetained => {
+                if !badge_has_delay_timer(lp.msg.badge) && hosted_irq_lines_from_badge(lp.msg.badge) == 0
+                    && crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+                        local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge,
+                    ).is_err()
+                {
+                    // Only the retained child itself has no row to return to; receiving would
+                    // drop its Reply.
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
+                    lp.exit.record(b"receive-child-pagein-identity");
+                    return ControlFlow::Break(Turn::Exit);
+                }
+                let mut root_event_consumed = false;
+                match wait_retained_settlement(
+                    &mut lp.msg, &mut lp.ingress, nt_handler, &mut lp.exit,
+                    &mut root_event_consumed, false,
+                ) {
+                    QueuedCallbackPark::Retry | QueuedCallbackPark::Turn(Turn::Next) => {
+                        return ControlFlow::Break(Turn::Next);
+                    }
+                    QueuedCallbackPark::Turn(turn) => return ControlFlow::Break(turn),
+                }
+            }
+            Action::SettleFirst => unreachable!("receive_child_root_action settles first"),
         }
         let received = receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),

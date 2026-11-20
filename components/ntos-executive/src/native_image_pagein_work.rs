@@ -333,10 +333,32 @@ pub(crate) fn owns_receive_child() -> bool {
 }
 
 /// The root's admission of one event while the Receive child's page-in owns its Reply.
-pub(crate) fn receive_child_root_action(event: ReceiveChildRootEvent) -> Option<ReceiveChildRootAction> {
+fn owned_receive_child_action(event: ReceiveChildRootEvent) -> Option<ReceiveChildRootAction> {
     unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten()
         .find_map(|row| row.receive.as_ref()) }
         .map(|turn| turn.root_action(event))
+}
+
+/// The root's action for one delivery while a page-in owns the selected Receive child. A child
+/// that delivers again after its Reply was sent (it can run on another core before the root
+/// acknowledges) first has its page-in settled; the delivery is then classified afresh, and
+/// `None` means no page-in owns the child any more. Never returns `SettleFirst`.
+pub(crate) unsafe fn receive_child_root_action(
+    handler: &mut ExecNtHandler,
+    dispatcher: &NativeSyscallDispatcher,
+    event: ReceiveChildRootEvent,
+) -> Option<ReceiveChildRootAction> {
+    match owned_receive_child_action(event)? {
+        ReceiveChildRootAction::SettleFirst => {
+            redrive_receive_child(handler, dispatcher);
+            match owned_receive_child_action(event)? {
+                // Still unacknowledged: the delivery cannot be admitted or returned.
+                ReceiveChildRootAction::SettleFirst => Some(ReceiveChildRootAction::RefuseIdentity),
+                action => Some(action),
+            }
+        }
+        action => Some(action),
+    }
 }
 
 unsafe fn next_syscall_page(

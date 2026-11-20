@@ -155,3 +155,15 @@ fn restricted_notification_runs_only_storage_completion_and_the_exact_row() {
     let prepare = calls(function(&source, "prepare_receive"));
     position(&prepare, "delay_timer_program");
 }
+
+// Boot 44719389234: a retained Receive-child page-in exited the service loop
+// (receive-child-pagein-retained). A retained page-in waits like every retained settlement.
+#[test]
+fn a_retained_page_in_waits_for_the_next_root_event_and_never_exits() {
+    let maintenance = after(MAINTENANCE, "// This delivery still owns its Reply and captured message.");
+    let retained = maintenance.split("Action::StopRetained =>").nth(1).expect("retained arm");
+    let retained = retained.split("Action::SettleFirst").next().unwrap();
+    assert!(retained.contains("wait_retained_settlement("), "the root waits for its next event");
+    assert!(retained.contains("defer_hosted_delivery("), "an unrelated delivery returns to its row");
+    assert!(!MAINTENANCE.contains("receive-child-pagein-retained"), "no retained exit remains");
+}

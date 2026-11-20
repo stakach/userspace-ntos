@@ -25,8 +25,12 @@ pub enum ReceiveChildRootAction {
     RefuseIdentity,
     /// Return the unexecuted Call and Reply to its own ingress row.
     DeferUnrelated,
-    /// The child Reply, Call and held parent stay retained; the root may not continue.
+    /// The child Reply, Call and held parent stay retained: the root waits for its next event
+    /// (the retained-settlement wait), never exits and never continues ordinary work.
     StopRetained,
+    /// The child's Reply was sent and the child delivered again (it ran on another core before
+    /// the root acknowledged). Settle the page-in, then classify the delivery afresh.
+    SettleFirst,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +94,9 @@ impl<C: Copy, K: Copy, P: Copy> ReceiveChildPageIn<C, K, P> {
         }
         match event {
             ReceiveChildRootEvent::Notification => ReceiveChildRootAction::ServicePageIn,
+            ReceiveChildRootEvent::SelectedChild if self.phase == Phase::ReplyEntered => {
+                ReceiveChildRootAction::SettleFirst
+            }
             ReceiveChildRootEvent::SelectedChild => ReceiveChildRootAction::RefuseIdentity,
             ReceiveChildRootEvent::Unrelated => ReceiveChildRootAction::DeferUnrelated,
         }
