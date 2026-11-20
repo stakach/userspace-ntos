@@ -510,6 +510,8 @@ mod hosted_driver_power_setting;
 mod hosted_driver_luid;
 #[path = "hosted_driver_hal_beep.rs"]
 mod hosted_driver_hal_beep;
+#[path = "hosted_driver_zw_terminate_process.rs"]
+mod hosted_driver_zw_terminate_process;
 #[path = "hosted_driver_kmutex.rs"]
 mod hosted_driver_kmutex;
 #[path = "hosted_driver_guarded_mutex.rs"]
@@ -522,6 +524,7 @@ pub(crate) use hosted_driver_pofx::service as service_hosted_driver_pofx;
 pub(crate) use hosted_driver_power_setting::service as service_hosted_driver_power_setting;
 pub(crate) use hosted_driver_luid::service as service_hosted_driver_luid;
 pub(crate) use hosted_driver_hal_beep::service as service_hosted_driver_hal_beep;
+pub(crate) use hosted_driver_zw_terminate_process::service as service_hosted_driver_zw_terminate_process;
 pub(crate) use hosted_driver_kmutex::service as service_hosted_driver_kmutex;
 pub(crate) use hosted_driver_pnp_notification::wake_due as hosted_driver_pnp_notification_wake_due;
 #[path = "hosted_io_create_file_ingress.rs"]
@@ -1463,6 +1466,7 @@ pub const FSD_SERVICE_POFX_LABEL: u64 = hosted_driver_pofx::LABEL;
 pub const FSD_SERVICE_POWER_SETTING_LABEL: u64 = hosted_driver_power_setting::LABEL;
 pub const FSD_SERVICE_LUID_LABEL: u64 = hosted_driver_luid::LABEL;
 pub const FSD_SERVICE_HAL_BEEP_LABEL: u64 = hosted_driver_hal_beep::LABEL;
+pub const FSD_SERVICE_ZW_TERMINATE_PROCESS_LABEL: u64 = hosted_driver_zw_terminate_process::LABEL;
 pub const FSD_SERVICE_KMUTEX_LABEL: u64 = hosted_driver_kmutex::LABEL;
 pub const FSD_SERVICE_GUARDED_MUTEX_LABEL: u64 = hosted_driver_guarded_mutex::LABEL;
 pub const FSD_SERVICE_WMI_LABEL: u64 = hosted_driver_wmi::LABEL;
@@ -1516,6 +1520,7 @@ const _: () = {
         FSD_SERVICE_POWER_SETTING_LABEL,
         FSD_SERVICE_LUID_LABEL,
         FSD_SERVICE_HAL_BEEP_LABEL,
+        FSD_SERVICE_ZW_TERMINATE_PROCESS_LABEL,
         FSD_SERVICE_KMUTEX_LABEL,
         FSD_SERVICE_GUARDED_MUTEX_LABEL,
         FSD_SERVICE_WMI_LABEL,
@@ -38525,6 +38530,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "PsGetProcessSessionId",
         hosted_driver_process_state::ps_get_process_session_id as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwTerminateProcess",
+        hosted_driver_zw_terminate_process::zw_terminate_process as *const () as usize as u64,
     );
     reg.bind(
         "PsGetProcessInheritedFromUniqueProcessId",

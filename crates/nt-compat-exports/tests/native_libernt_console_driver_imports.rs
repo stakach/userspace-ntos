@@ -46,6 +46,8 @@ fn pinned_condrv_reader_writer_lock_and_parent_query_are_bound() {
         "ExReleaseSpinLockExclusive",
         "ExReleaseSpinLockShared",
         "PsGetProcessInheritedFromUniqueProcessId",
+        "ObOpenObjectByPointer",
+        "ZwTerminateProcess",
     ] {
         assert!(imports.contains(name), "condrv no longer imports {name}");
         assert!(bound.contains(name), "condrv import {name} has no binding");

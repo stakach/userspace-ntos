@@ -1565,3 +1565,28 @@ fn kernel_open_by_pointer_publishes_system_handle_and_keeps_pointer_owner_separa
     thread.release(&mut pm).unwrap();
     assert_eq!(counts(&pm, pid, tid).1, 0);
 }
+
+#[test]
+fn kernel_handle_from_pointer_names_the_exact_process_to_terminate() {
+    let (mut pm, user, kernel, pid, tid) = fixture();
+    let mut process = pm.reference_native_ps_body(kernel, 0x3000, Some(PsHandleType::Process)).unwrap();
+    let handle = pm
+        .insert_authorized_native_ps_handle(kernel, &process, crate::PROCESS_ALL_ACCESS, OBJ_KERNEL_HANDLE)
+        .unwrap();
+    process.release(&mut pm).unwrap();
+    // A UserMode caller cannot decode System's kernel handle.
+    assert!(pm.reference_native_ps_handle(user, handle, Some(PsHandleType::Process), crate::PROCESS_TERMINATE).is_err());
+    assert_eq!(
+        pm.reference_native_ps_handle(kernel, handle, Some(PsHandleType::Thread), 0).unwrap_err(),
+        STATUS_OBJECT_TYPE_MISMATCH
+    );
+    let mut target = pm
+        .reference_native_ps_handle(kernel, handle, Some(PsHandleType::Process), crate::PROCESS_TERMINATE)
+        .unwrap();
+    assert_eq!(target.object(), HandleObject::Process(pid));
+    target.release(&mut pm).unwrap();
+    pm.terminate_process_at(pid, 0, 1).unwrap();
+    assert!(pm.is_process_signaled(pid));
+    assert_eq!(pm.kernel_thread_state(0x4000).unwrap().terminating, true);
+    assert_eq!(counts(&pm, pid, tid), (0, 0));
+}

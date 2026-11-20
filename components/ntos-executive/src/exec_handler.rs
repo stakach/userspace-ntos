@@ -9162,6 +9162,55 @@ impl ExecNtHandler {
         unsafe { self.terminate_process_for_exception(self.pi, self.current_tid, code) }
     }
 
+    /// NtTerminateProcess's policy for terminating a whole process from outside its final
+    /// thread: run down its File handles, terminate it in ProcessManager, publish exit
+    /// notifications and the native terminal receipt, and release its handle table. The hosted
+    /// mechanisms (TCBs, VSpace) are torn down afterwards by the caller's turn or by
+    /// `provider_process_termination`'s redrive; critical-process policy is the caller's.
+    pub(crate) fn terminate_process_policy(
+        &mut self,
+        pid: nt_process::ProcessId,
+        status: u32,
+        exit_time: i64,
+    ) -> Result<(), u32> {
+        let process_index = self.pi_for_pid(pid).map(|pi| pi as u8);
+        let reserved_files = self.reserve_rundown_hosted_files(pid)?;
+        let was_terminated = self.pm.is_process_signaled(pid);
+        if let Err(status) = self.pm.terminate_process_at(pid, status, exit_time) {
+            self.cancel_rundown_hosted_files(&reserved_files);
+            return Err(status);
+        }
+        crate::process_terminal_receipt::drain_hosted_process_exit_notifications(self);
+        if !was_terminated {
+            crate::process_terminal_receipt::note_native_process_terminal(self, pid, process_index);
+        }
+        self.release_process_handles(pid, reserved_files);
+        Ok(())
+    }
+
+    /// `ZwTerminateProcess` from a hosted kernel driver on another process. Applies the same
+    /// policy as NtTerminateProcess's remote branch and returns the hosted process identity
+    /// whose mechanisms `provider_process_termination` must tear down. A critical process's
+    /// bugcheck is a service-loop turn action that a driver service cannot take, so it is
+    /// refused before any effect.
+    pub(crate) unsafe fn terminate_process_for_provider(
+        &mut self,
+        pid: nt_process::ProcessId,
+        status: u32,
+    ) -> Result<Option<(u8, nt_user_host::process_identity::ProcessIdentity)>, u32> {
+        if self.pm.critical_process_termination_code(pid).is_some() {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        let mechanism = self.pi_for_pid(pid).and_then(|pi| {
+            Some((u8::try_from(pi).ok()?, self.capture_process_identity(pi)?))
+        });
+        self.sample_hosted_process_scheduler_times(pid);
+        self.terminate_process_policy(pid, status, nt_system_time_100ns() as i64)?;
+        self.refresh_job_time_sampling();
+        wait_wake_dispatcher_set(self);
+        Ok(mechanism)
+    }
+
     /// KiDispatchException's last step for an exception nothing handled: terminate the
     /// process with the exception code, or bugcheck when the process is critical. Sets the
     /// post action the caller's turn executes; returns a status only when termination fails.
@@ -42344,20 +42393,9 @@ impl ExecNtHandler {
                         };
                     }
                 } else {
-                    let reserved_files = match self.reserve_rundown_hosted_files(pid) {
-                        Ok(files) => files,
-                        Err(status) => return status,
-                    };
-                    let was_terminated = self.pm.is_process_signaled(pid);
-                    if let Err(status) = self.pm.terminate_process_at(pid, status, exit_time) {
-                        self.cancel_rundown_hosted_files(&reserved_files);
+                    if let Err(status) = self.terminate_process_policy(pid, status, exit_time) {
                         return status;
                     }
-                    crate::process_terminal_receipt::drain_hosted_process_exit_notifications(self);
-                    if !was_terminated {
-                        crate::process_terminal_receipt::note_native_process_terminal(self, pid, process_index);
-                    }
-                    self.release_process_handles(pid, reserved_files);
                     if let Some(process_index) = process_index {
                         let is_current = pid == caller_pid;
                         self.post_action = ExecPostAction::TerminateProcess {

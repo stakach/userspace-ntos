@@ -174,6 +174,7 @@ mod section_metadata_work;
 mod process_creation_trace;
 mod process_image_snapshot_work;
 mod hosted_spawn_uncertainty;
+mod provider_process_termination;
 mod section_pagein_work;
 mod provider_section_map_work;
 mod native_image_pagein_work;

@@ -36,16 +36,7 @@ pub(super) unsafe fn terminate_process_turn(
     } else {
         false
     };
-    if let Some(pid) = nt_handler.pm_pid_for_pi(process_index as usize) {
-        if nt_handler.pm.is_process_signaled(pid) {
-            if let Some(status) = nt_handler.pm.process(pid)
-                .and_then(|process| process.exit_status) {
-                let _ = nt_handler.observe_install_pipe_child_terminal(
-                    process_index as usize, status,
-                );
-            }
-        }
-    }
+    observe_process_terminal(nt_handler, process_index);
     let reclaimed = terminate_hosted_process_mechanisms(
         process_index,
         preserve_tid,
@@ -142,4 +133,40 @@ pub(super) unsafe fn critical_termination_turn<T>(
     exit.stop = code as u64;
     exit.record(b"fatal-stop");
     ControlFlow::Break(Turn::Exit)
+}
+
+/// A terminated process's exit status is observable before its mechanisms are reclaimed.
+fn observe_process_terminal(nt_handler: &mut ExecNtHandler, process_index: u8) {
+    if let Some(pid) = nt_handler.pm_pid_for_pi(process_index as usize) {
+        if nt_handler.pm.is_process_signaled(pid) {
+            if let Some(status) = nt_handler.pm.process(pid)
+                .and_then(|process| process.exit_status) {
+                let _ = nt_handler.observe_install_pipe_child_terminal(
+                    process_index as usize, status,
+                );
+            }
+        }
+    }
+}
+
+/// The remote-termination half of `terminate_process_turn` (no caller thread to preserve and
+/// no Reply to drop), for a termination decided outside a syscall turn.
+pub(crate) unsafe fn teardown_remote_process(
+    nt_handler: &mut ExecNtHandler,
+    delay_queue: &mut nt_delay_execution::Queue,
+    process_index: u8,
+) {
+    observe_process_terminal(nt_handler, process_index);
+    let reclaimed = terminate_hosted_process_mechanisms(process_index, None, delay_queue, nt_handler);
+    if let Some(pid) = nt_handler.pm_pid_for_pi(process_index as usize) {
+        let _ = nt_handler.try_delete_hosted_process_object(pid);
+    }
+    nt_handler.refresh_process_manager_gates();
+    print_str(b"[process-term] remote pi=");
+    print_u64(process_index as u64);
+    print_str(b" reclaimed=");
+    print_u64(reclaimed as u64);
+    print_str(b" runtimes-pending=");
+    print_u64(nt_handler.thread_runtime.has_process(process_index as usize) as u64);
+    print_str(b"\n");
 }
