@@ -440,6 +440,8 @@ pub(crate) mod hosted_driver_process_attach;
 mod hosted_driver_spin_lock;
 #[path = "hosted_driver_ex_spin_lock.rs"]
 mod hosted_driver_ex_spin_lock;
+#[path = "hosted_driver_device_queue.rs"]
+mod hosted_driver_device_queue;
 #[path = "hosted_driver_hal_target_info.rs"]
 mod hosted_driver_hal_target_info;
 #[path = "hosted_driver_hal_cache.rs"]
@@ -505,6 +507,8 @@ mod hosted_driver_pofx;
 mod hosted_driver_power_setting;
 #[path = "hosted_driver_luid.rs"]
 mod hosted_driver_luid;
+#[path = "hosted_driver_hal_beep.rs"]
+mod hosted_driver_hal_beep;
 #[path = "hosted_driver_kmutex.rs"]
 mod hosted_driver_kmutex;
 #[path = "hosted_driver_guarded_mutex.rs"]
@@ -516,6 +520,7 @@ pub(crate) use hosted_driver_guarded_mutex::service as service_hosted_driver_gua
 pub(crate) use hosted_driver_pofx::service as service_hosted_driver_pofx;
 pub(crate) use hosted_driver_power_setting::service as service_hosted_driver_power_setting;
 pub(crate) use hosted_driver_luid::service as service_hosted_driver_luid;
+pub(crate) use hosted_driver_hal_beep::service as service_hosted_driver_hal_beep;
 pub(crate) use hosted_driver_kmutex::service as service_hosted_driver_kmutex;
 pub(crate) use hosted_driver_pnp_notification::wake_due as hosted_driver_pnp_notification_wake_due;
 #[path = "hosted_io_create_file_ingress.rs"]
@@ -1456,6 +1461,7 @@ pub const FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL: u64 = hosted_driver_ps_handle_r
 pub const FSD_SERVICE_POFX_LABEL: u64 = hosted_driver_pofx::LABEL;
 pub const FSD_SERVICE_POWER_SETTING_LABEL: u64 = hosted_driver_power_setting::LABEL;
 pub const FSD_SERVICE_LUID_LABEL: u64 = hosted_driver_luid::LABEL;
+pub const FSD_SERVICE_HAL_BEEP_LABEL: u64 = hosted_driver_hal_beep::LABEL;
 pub const FSD_SERVICE_KMUTEX_LABEL: u64 = hosted_driver_kmutex::LABEL;
 pub const FSD_SERVICE_GUARDED_MUTEX_LABEL: u64 = hosted_driver_guarded_mutex::LABEL;
 pub const FSD_SERVICE_WMI_LABEL: u64 = hosted_driver_wmi::LABEL;
@@ -1508,6 +1514,7 @@ const _: () = {
         FSD_SERVICE_POFX_LABEL,
         FSD_SERVICE_POWER_SETTING_LABEL,
         FSD_SERVICE_LUID_LABEL,
+        FSD_SERVICE_HAL_BEEP_LABEL,
         FSD_SERVICE_KMUTEX_LABEL,
         FSD_SERVICE_GUARDED_MUTEX_LABEL,
         FSD_SERVICE_WMI_LABEL,
@@ -37318,6 +37325,22 @@ fn register_fsd_trampolines() -> bool {
         s_mm_page_entire_driver as *const () as usize as u64,
     );
     reg.bind(
+        "MmLockPagableDataSection",
+        hosted_image_paging::lock_pagable_data_section as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmLockPagableImageSection",
+        hosted_image_paging::lock_pagable_data_section as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmLockPagableSectionByHandle",
+        hosted_image_paging::lock_pagable_section_by_handle as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmUnlockPagableImageSection",
+        hosted_image_paging::unlock_pagable_image_section as *const () as usize as u64,
+    );
+    reg.bind(
         "MmProbeAndLockPages",
         s_mm_probe_and_lock_pages as *const () as usize as u64,
     );
@@ -37955,6 +37978,7 @@ fn register_fsd_trampolines() -> bool {
         hosted_driver_spin_lock::try_acquire_at_dpc as *const () as usize as u64,
     );
     hosted_driver_ex_spin_lock::bind(reg);
+    hosted_driver_device_queue::bind(reg);
     reg.bind(
         "KeGetCurrentIrql",
         s_ke_get_current_irql as *const () as usize as u64,
@@ -38414,6 +38438,7 @@ fn register_fsd_trampolines() -> bool {
         "HalAcpiQueryInterruptModel",
         s_hal_acpi_query_interrupt_model as *const () as usize as u64,
     );
+    reg.bind("HalMakeBeep", hosted_driver_hal_beep::make_beep as *const () as usize as u64);
     reg.bind(
         "HalGetBusData",
         s_hal_get_bus_data as *const () as usize as u64,

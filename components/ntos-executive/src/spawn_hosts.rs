@@ -4871,6 +4871,19 @@ unsafe fn component_pump_loop(
                 (STATUS_INVALID_PARAMETER_I32, 0)
             };
             pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+        } else if label == crate::driver_launch::FSD_SERVICE_HAL_BEEP_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, beeping) =
+                if msg.mi == ((crate::driver_launch::FSD_SERVICE_HAL_BEEP_LABEL << 12) | 1) {
+                    crate::driver_launch::service_hosted_driver_hal_beep(
+                        ch, msg.m0, msg.badge, *reply_cap,
+                    )
+                } else {
+                    (STATUS_INVALID_PARAMETER_I32, 0)
+                };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, beeping, 0, 0);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_WMI_LABEL
             && ch.caps.kind == ReqKind::Irp
         {

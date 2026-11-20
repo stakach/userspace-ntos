@@ -17,7 +17,7 @@ fn try_acquire(lock: u64) -> bool {
     word(lock).compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
 }
 
-fn acquire(lock: u64) {
+pub(super) fn acquire_word(lock: u64) {
     while !try_acquire(lock) {
         core::hint::spin_loop();
         // A single hosted logical CPU may need to schedule the current owner before the
@@ -26,7 +26,7 @@ fn acquire(lock: u64) {
     }
 }
 
-fn release(lock: u64) {
+pub(super) fn release_word(lock: u64) {
     if word(lock).compare_exchange(1, 0, Ordering::Release, Ordering::Relaxed).is_err() {
         unsafe { crate::provider_bugcheck::report(0xc4, [0x5350_494e, lock, 1, 0]); }
     }
@@ -35,13 +35,13 @@ fn release(lock: u64) {
 /// `KIRQL KeAcquireSpinLockRaiseToDpc(PKSPIN_LOCK)`.
 pub(super) extern "win64" fn acquire_raise_to_dpc(lock: u64) -> u8 {
     let old = unsafe { hosted_raise_irql(DISPATCH_LEVEL) };
-    acquire(lock);
+    acquire_word(lock);
     old
 }
 
 /// `VOID KeReleaseSpinLock(PKSPIN_LOCK, KIRQL)`.
 pub(super) extern "win64" fn release_restore_irql(lock: u64, old_irql: u8) {
-    release(lock);
+    release_word(lock);
     unsafe { hosted_lower_irql(old_irql); }
 }
 
@@ -51,7 +51,7 @@ pub(super) extern "win64" fn acquire_at_dpc(lock: u64) {
     if irql < DISPATCH_LEVEL {
         unsafe { crate::provider_bugcheck::report(0xc4, [0x5350_494e, lock, irql as u64, 2]); }
     }
-    acquire(lock);
+    acquire_word(lock);
 }
 
 /// `VOID KeReleaseSpinLockFromDpcLevel(PKSPIN_LOCK)`.
@@ -60,7 +60,7 @@ pub(super) extern "win64" fn release_from_dpc(lock: u64) {
     if irql < DISPATCH_LEVEL {
         unsafe { crate::provider_bugcheck::report(0xc4, [0x5350_494e, lock, irql as u64, 3]); }
     }
-    release(lock);
+    release_word(lock);
 }
 
 /// `BOOLEAN KeTryToAcquireSpinLockAtDpcLevel(PKSPIN_LOCK)`.

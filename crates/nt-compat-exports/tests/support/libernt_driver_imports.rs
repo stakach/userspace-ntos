@@ -10,7 +10,9 @@ const REVISION: &str = "8e478a22a1e8f8a22bab17131f3184a7b4548c3d";
 fn fixture(driver: &str) -> &'static str {
     match driver {
         "acpi.sys" => include_str!("../fixtures/libernt_acpi_native_imports.txt"),
+        "beep.sys" => include_str!("../fixtures/libernt_beep_native_imports.txt"),
         "basicdisplay.sys" => include_str!("../fixtures/libernt_basicdisplay_native_imports.txt"),
+        "condrv.sys" => include_str!("../fixtures/libernt_condrv_native_imports.txt"),
         "dxgkrnl.sys" => include_str!("../fixtures/libernt_dxgkrnl_native_imports.txt"),
         "ksecdd.sys" => include_str!("../fixtures/libernt_ksecdd_native_imports.txt"),
         "partmgr.sys" => include_str!("../fixtures/libernt_partmgr_native_imports.txt"),

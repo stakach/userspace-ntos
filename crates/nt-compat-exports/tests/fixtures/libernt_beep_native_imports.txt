@@ -1,0 +1,22 @@
+# LiberNT source revision 8e478a22a1e8f8a22bab17131f3184a7b4548c3d
+hal.dll HalMakeBeep
+ntoskrnl.exe ExAcquireFastMutex
+ntoskrnl.exe ExReleaseFastMutex
+ntoskrnl.exe IoAcquireCancelSpinLock
+ntoskrnl.exe IoCreateDevice
+ntoskrnl.exe IoDeleteDevice
+ntoskrnl.exe IofCompleteRequest
+ntoskrnl.exe IoReleaseCancelSpinLock
+ntoskrnl.exe IoStartNextPacket
+ntoskrnl.exe IoStartPacket
+ntoskrnl.exe KeCancelTimer
+ntoskrnl.exe KeInitializeDpc
+ntoskrnl.exe KeInitializeEvent
+ntoskrnl.exe KeInitializeTimer
+ntoskrnl.exe KeRemoveDeviceQueue
+ntoskrnl.exe KeRemoveEntryDeviceQueue
+ntoskrnl.exe KeSetTimer
+ntoskrnl.exe MmLockPagableDataSection
+ntoskrnl.exe MmPageEntireDriver
+ntoskrnl.exe MmUnlockPagableImageSection
+ntoskrnl.exe RtlAssert
