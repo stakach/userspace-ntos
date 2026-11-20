@@ -34,6 +34,15 @@ pub(crate) fn contains(address: u64) -> bool {
     address >= BASE && address - BASE < BYTES
 }
 
+/// Diagnostic read of a committed band page through the root's own mapping. An uncommitted or
+/// out-of-band address reads as None rather than faulting.
+pub(crate) fn root_read_u32(address: u64) -> Option<u32> {
+    if address & 3 != 0 || !contains(address) || unsafe { band() }.committed(address).is_none() {
+        return None;
+    }
+    Some(unsafe { core::ptr::read_volatile(address as *const u32) })
+}
+
 fn trace_denial(stage: &[u8], first: u64, second: u64, status: u32) {
     if DENIAL_TRACES.fetch_add(1, Ordering::Relaxed) >= TRACE_LIMIT {
         return;

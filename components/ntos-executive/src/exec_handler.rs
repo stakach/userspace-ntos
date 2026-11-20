@@ -11984,6 +11984,42 @@ impl ExecNtHandler {
         print_hex_u64(self.current_resume_ip);
         print_str(b" sp=0x");
         print_hex_u64(self.current_sp);
+        // #348: user32's MsgWaitForMultipleObjectsEx fast path polls while
+        // pClientThreadInfo->fsChangeBits & wake mask stays set. Read CLIENTTHREADINFO
+        // {fsChangeBits, fsWakeBits} at +4 through the client alias and through the root's
+        // server view of the same desktop-heap page, to tell a stale alias from bits win32k
+        // never clears.
+        if let Some(teb) = self.pm.thread_teb(self.current_tid as nt_process::ThreadId) {
+            let mut word = [0u8; 8];
+            let client_pcti = teb.checked_add(0x800 + 0x60)
+                .filter(|address| unsafe { self.xas_read(*address, &mut word) })
+                .map(|_| u64::from_le_bytes(word))
+                .unwrap_or(0);
+            let client_delta = teb.checked_add(0x800 + 0x28)
+                .filter(|address| unsafe { self.xas_read(*address, &mut word) })
+                .map(|_| u64::from_le_bytes(word))
+                .unwrap_or(0);
+            let mut bits = [0u8; 4];
+            let client_bits = (client_pcti != 0
+                && unsafe { self.xas_read(client_pcti + 4, &mut bits) })
+                .then(|| u32::from_le_bytes(bits));
+            let server_bits = client_pcti.checked_add(crate::win32k_session_views::CLIENT_DELTA)
+                .and_then(|server| crate::win32k_session_views::root_read_u32(server + 4));
+            print_str(b" pcti=0x");
+            print_hex_u64(client_pcti);
+            print_str(b" ci-delta=0x");
+            print_hex_u64(client_delta);
+            print_str(b" client-change/wake=");
+            match client_bits {
+                Some(value) => { print_str(b"0x"); print_hex(value); }
+                None => print_str(b"?"),
+            }
+            print_str(b" server-change/wake=");
+            match server_bits {
+                Some(value) => { print_str(b"0x"); print_hex(value); }
+                None => print_str(b"?"),
+            }
+        }
         print_str(b" stack:");
         // 64 qwords: kernel32 WaitForMultipleObjectsEx keeps its return address at sp+0x100
         // (0xc0 locals plus seven saved registers above the stub's return), past the first 24.
