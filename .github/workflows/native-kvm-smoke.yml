@@ -33,6 +33,10 @@ on:
         description: After the sealed Explorer desktop, drive scripts/kvm_interaction_steps.json through QMP input and screenshot each step (evidence only)
         type: boolean
         default: false
+      multicore:
+        description: Build with NTOS_GUEST_WORKER_MULTICORE=1 (worker threads on their affinity cores) instead of the core-0 default
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -180,6 +184,8 @@ jobs:
             ${{ steps.native-cache-identity.outputs.prefix }}-
             native-kvm-build-v2-${{ runner.os }}-
       - name: Build native image from verified pinned LiberNT release
+        env:
+          NTOS_GUEST_WORKER_MULTICORE: ${{ inputs.multicore && '1' || '0' }}
         run: |
           set -o pipefail
           bash rust-micro/scripts/test_simpleboot_source.sh
