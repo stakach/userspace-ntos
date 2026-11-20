@@ -250,13 +250,23 @@ jobs:
           python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '300' }}" --trace-interrupts "${interact_args[@]}" || boot_status=$?
           if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
           sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot1.sha256
-          if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi
+          if [ "$boot_status" -ne 0 ]; then
+            # A sealed desktop that went idle is the expected end of a desktop boot; a
+            # two-boot run reboots that disk to prove the desktop persists.
+            if [ "${{ inputs.boot_runs || '1' }}" = '2' ] && [ -s native-kvm-post-setup-idle.txt ]; then
+              echo "Boot 1 stopped idle on a sealed desktop; rebooting the same disk"
+            else
+              exit "$boot_status"
+            fi
+          fi
           if [ "${{ inputs.boot_runs || '1' }}" = '2' ]; then
-            for path in native-kvm-smoke.log native-kvm-smoke.ppm native-kvm-qemu-int-tail.log native-kvm-stall-state.json native-kvm-volume-dispatch-state.json native-kvm-cpu-samples.jsonl native-kvm-blockstats.jsonl native-kvm-stationary.txt; do
+            for path in native-kvm-smoke.log native-kvm-smoke.ppm native-kvm-qemu-int-tail.log native-kvm-stall-state.json native-kvm-volume-dispatch-state.json native-kvm-cpu-samples.jsonl native-kvm-blockstats.jsonl native-kvm-stationary.txt native-kvm-post-setup-idle.txt; do
               if [ -f "$path" ]; then
                 cp "$path" "${path%.*}-boot1.${path##*.}"
               fi
             done
+            # Boot 2 must earn its own desktop evidence.
+            rm -f native-kvm-post-setup-idle.txt native-kvm-stationary.txt
             # The second boot clears interaction evidence, so keep the first boot's apart.
             mkdir -p native-kvm-interact-boot1
             for path in native-kvm-interact.jsonl native-kvm-interact-*.ppm; do
@@ -278,7 +288,7 @@ jobs:
         id: publish-disk
         if: >-
           always() && (steps.boot.outcome == 'success' ||
-          (steps.boot.outcome == 'failure' && (inputs.boot_runs || '1') == '1' &&
+          (steps.boot.outcome == 'failure' &&
           hashFiles('native-kvm-post-setup-idle.txt') != ''))
         run: |
           python3 scripts/ci_kvm_disk_continuation.py publish \
@@ -322,6 +332,7 @@ jobs:
             native-kvm-stationary.txt
             native-kvm-stationary-boot1.txt
             native-kvm-post-setup-idle.txt
+            native-kvm-post-setup-idle-boot1.txt
             native-kvm-interact.jsonl
             native-kvm-interact-*.ppm
             native-kvm-interact-boot1/
