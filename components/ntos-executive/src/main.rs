@@ -7613,6 +7613,7 @@ pub(crate) fn census_tick_static(now: u64) {
     print_badge_ssn_census();
     hot_service_cost_census::print_census();
     hot_service_cost_census::print_wait_status_census();
+    hot_service_cost_census::print_wait_outcome_census();
     hot_service_latency_census::print_census();
     registry_security_audit::print_admission_census();
     io_lifecycle_trace::print_census();

@@ -82,3 +82,31 @@ fn immediate_wait_statuses_are_counted_by_exact_value() {
     assert_eq!(line,
         "[census] wait-multiple-status calls=9 0x00000001=5 0xc0000008=3 0x00000102=1\n");
 }
+
+/// Boot 44647857225: 847,646 of 847,684 NtWaitForMultipleObjects dispatches returned the
+/// park indicator (0x102), so the dispatch status alone cannot say how each wait ended. The
+/// timeout each caller supplied, and the status a parked wait finally completes with, can.
+#[test]
+fn parked_wait_timeouts_are_classified_and_final_statuses_counted() {
+    let mut timeouts = census::WaitTimeoutCensus::new();
+    timeouts.record(None);
+    timeouts.record(Some(0));
+    timeouts.record(Some(-1));          // 100 ns relative
+    timeouts.record(Some(-10_000));     // 1 ms relative
+    timeouts.record(Some(-150_000));    // 15 ms
+    timeouts.record(Some(-5_000_000));  // 500 ms
+    timeouts.record(Some(-50_000_000)); // 5 s
+    timeouts.record(Some(133_000_000_000_000_000)); // absolute
+    let mut line = nt_printf::record::RecordBuffer::<512>::new();
+    timeouts.write_census(&mut line).unwrap();
+    assert_eq!(std::str::from_utf8(line.bytes()).unwrap(),
+        "[census] wait-timeout infinite/zero/le1ms/le16ms/le100ms/le1s/gt1s/absolute=1/1/2/1/0/1/1/1\n");
+
+    let mut finals = census::WaitStatusCensus::new();
+    for _ in 0..4 { finals.record_status(0x102); }
+    finals.record_status(0);
+    let mut line = nt_printf::record::RecordBuffer::<512>::new();
+    finals.write_census_named(&mut line, "object-wait-final").unwrap();
+    assert_eq!(std::str::from_utf8(line.bytes()).unwrap(),
+        "[census] object-wait-final calls=5 0x00000102=4 0x00000000=1\n");
+}

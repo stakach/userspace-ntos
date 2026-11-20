@@ -11865,6 +11865,7 @@ impl ExecNtHandler {
                 Err(status) => return status,
             }
         }
+        crate::hot_service_cost_census::record_wait_timeout(timeout_interval);
         if let Some(timeout) = timeout_interval.map(PendingWaitTimeout::from_interval) {
             if timeout.is_due_now() == Some(true) {
                 return 0x102;

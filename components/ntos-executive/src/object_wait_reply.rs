@@ -171,6 +171,7 @@ unsafe fn finish(handler: &mut ExecNtHandler, id: Identity) -> u64 {
     assert_eq!(view.phase, Phase::Complete);
     let sent = view.payload.reply_sent && !view.teardown_requested;
     let status = view.status;
+    crate::hot_service_cost_census::record_object_wait_final(status as u32);
     let record = table
         .finish_reply(id)
         .expect("wait retirement lost its settled row");

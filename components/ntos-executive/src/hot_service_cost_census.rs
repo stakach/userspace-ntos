@@ -114,9 +114,12 @@ impl WaitStatusCensus {
     }
 
     pub(crate) fn record(&mut self, service: Option<NativeService>, status: u32) {
-        if service != Some(NativeService::NtWaitForMultipleObjects) {
-            return;
+        if service == Some(NativeService::NtWaitForMultipleObjects) {
+            self.record_status(status);
         }
+    }
+
+    pub(crate) fn record_status(&mut self, status: u32) {
         self.calls = self.calls.saturating_add(1);
         if let Some(slot) = self.slots[..self.used].iter_mut().find(|slot| slot.0 == status) {
             slot.1 = slot.1.saturating_add(1);
@@ -132,12 +135,18 @@ impl WaitStatusCensus {
     }
 
     pub(crate) fn write_census(&self, out: &mut impl Write) -> core::fmt::Result {
+        self.write_census_named(out, "wait-multiple-status")
+    }
+
+    pub(crate) fn write_census_named(&self, out: &mut impl Write, name: &str)
+        -> core::fmt::Result
+    {
         let mut order = [0usize; 8];
         for (slot, index) in order.iter_mut().zip(0..) {
             *slot = index;
         }
         order[..self.used].sort_by(|&a, &b| self.slots[b].1.cmp(&self.slots[a].1));
-        write!(out, "[census] wait-multiple-status calls={}", self.calls)?;
+        write!(out, "[census] {name} calls={}", self.calls)?;
         for &index in &order[..self.used] {
             write!(out, " 0x{:08x}={}", self.slots[index].0, self.slots[index].1)?;
         }
@@ -156,5 +165,67 @@ pub(crate) fn print_wait_status_census() {
     let mut record = nt_printf::record::RecordBuffer::<512>::new();
     // SAFETY: see `record_wait_status`.
     let _ = unsafe { (*core::ptr::addr_of!(WAIT_STATUS)).write_census(&mut record) };
+    crate::print_str(record.bytes());
+}
+
+/// The timeout supplied to each parking NtWaitForMultipleObjects, by class. Relative intervals
+/// are negative 100 ns counts; positive values are absolute system times.
+pub(crate) struct WaitTimeoutCensus {
+    counts: [u64; 8],
+}
+
+impl WaitTimeoutCensus {
+    pub(crate) const fn new() -> Self {
+        Self { counts: [0; 8] }
+    }
+
+    pub(crate) fn record(&mut self, timeout: Option<i64>) {
+        let class = match timeout {
+            None => 0,
+            Some(0) => 1,
+            Some(value) if value > 0 => 7,
+            Some(value) => match value.unsigned_abs() {
+                0..=10_000 => 2,
+                10_001..=160_000 => 3,
+                160_001..=1_000_000 => 4,
+                1_000_001..=10_000_000 => 5,
+                _ => 6,
+            },
+        };
+        self.counts[class] = self.counts[class].saturating_add(1);
+    }
+
+    pub(crate) fn write_census(&self, out: &mut impl Write) -> core::fmt::Result {
+        write!(out, "[census] wait-timeout infinite/zero/le1ms/le16ms/le100ms/le1s/gt1s/absolute=")?;
+        for (index, count) in self.counts.iter().enumerate() {
+            if index != 0 {
+                write!(out, "/")?;
+            }
+            write!(out, "{count}")?;
+        }
+        writeln!(out)
+    }
+}
+
+static mut WAIT_TIMEOUTS: WaitTimeoutCensus = WaitTimeoutCensus::new();
+static mut OBJECT_WAIT_FINAL: WaitStatusCensus = WaitStatusCensus::new();
+
+pub(crate) fn record_wait_timeout(timeout: Option<i64>) {
+    // SAFETY: only the single root dispatch executor records or prints this census.
+    unsafe { (*core::ptr::addr_of_mut!(WAIT_TIMEOUTS)).record(timeout) }
+}
+
+pub(crate) fn record_object_wait_final(status: u32) {
+    // SAFETY: see `record_wait_timeout`.
+    unsafe { (*core::ptr::addr_of_mut!(OBJECT_WAIT_FINAL)).record_status(status) }
+}
+
+pub(crate) fn print_wait_outcome_census() {
+    let mut record = nt_printf::record::RecordBuffer::<512>::new();
+    // SAFETY: see `record_wait_timeout`.
+    let _ = unsafe { (*core::ptr::addr_of!(WAIT_TIMEOUTS)).write_census(&mut record) };
+    let _ = unsafe {
+        (*core::ptr::addr_of!(OBJECT_WAIT_FINAL)).write_census_named(&mut record, "object-wait-final")
+    };
     crate::print_str(record.bytes());
 }
