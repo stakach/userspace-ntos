@@ -28,7 +28,19 @@ fn a_call_is_split_into_ingress_handler_tail_and_return() {
     latency.ingress(EXPLORER, 400, 1_120);
     let row = latency.latency(NativeService::NtOpenKeyEx).unwrap();
     assert_eq!(row, census::Latency { calls: 1, ingress: 10, handler: 40, tail: 30,
-        returns: 1, return_idle: 120, return_other: 100 });
+        returns: 1, return_idle: 120, return_other: 100, ..Default::default() });
+
+    // Through the shared reply-receive the tail splits at its entry and reconciliation.
+    latency.dispatch_started(EXPLORER, Some(NativeService::NtOpenKeyEx), 410);
+    latency.dispatch_finished(450);
+    latency.reply_preparing(455);
+    latency.reconciled(470);
+    latency.reconciled(490); // a pending tick re-ran reconciliation; the last pass counts
+    latency.reply_preparing(495); // re-entry keeps the first entry mark
+    latency.replying(EXPLORER, 500, 1_200);
+    let row = latency.latency(NativeService::NtOpenKeyEx).unwrap();
+    assert_eq!((row.calls, row.tail, row.split, row.body, row.reconcile, row.prepare),
+        (2, 80, 1, 5, 35, 10));
 }
 
 #[test]
@@ -80,9 +92,9 @@ fn census_is_one_bounded_record() {
     let mut line = nt_printf::record::RecordBuffer::<1024>::new();
     latency.write_census(&mut line).unwrap();
     let line = std::str::from_utf8(line.bytes()).unwrap();
-    assert!(line.starts_with("[census] hot-service-latency calls/ingress/handler/tail/returns/return-idle/return-other-Mtick:"));
-    assert!(line.contains(" query-value=1/1/2/1/1/5/11 "), "{line}");
-    assert!(line.ends_with(" create-key=0/0/0/0/0/0/0\n"), "{line}");
+    assert!(line.starts_with("[census] hot-service-latency calls/ingress/handler/tail/returns/return-idle/return-other/split/body/reconcile/prepare-Mtick:"));
+    assert!(line.contains(" query-value=1/1/2/1/1/5/11/0/0/0/0 "), "{line}");
+    assert!(line.ends_with(" create-key=0/0/0/0/0/0/0/0/0/0/0\n"), "{line}");
     census::print_census();
     assert!(String::from_utf8(OUTPUT.lock().unwrap().clone()).unwrap()
         .starts_with("[census] hot-service-latency"));

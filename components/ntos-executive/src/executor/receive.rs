@@ -117,6 +117,7 @@ pub(super) unsafe fn reply_receive(
     reply_message: impl FnOnce() -> (u64, u64, u64, u64, u64, u64),
 ) -> ControlFlow<Turn, Received> {
     assert!(crate::executive_ingress::handles(ep));
+    crate::hot_service_latency_census::reply_preparing();
     drive_running_lane(ingress, nt_handler, exit)?;
     if root_add_device_exclusive_pending() {
         if !prepare_parked_add_device_receive(&mut ingress.root_add_device_turn) {

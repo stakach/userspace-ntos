@@ -445,6 +445,7 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) -> ReceivePrep
             return ReceivePreparation::PendingDelivery,
         other => other.expect("runtime timer ownership must permit blocking receive"),
     }
+    crate::hot_service_latency_census::reconciled();
     let preflight_shot = (
         LAST_REARM_AUTHORITY.is_armed(),
         LAST_REARM_AUTHORITY.physical_wake_100ns(),

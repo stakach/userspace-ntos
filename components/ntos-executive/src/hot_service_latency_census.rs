@@ -7,6 +7,9 @@
 //! Root spent blocked idle in its receive and everything else: guest execution of the caller,
 //! scheduling, and Root serving other work while the caller's next Call waited. Observation
 //! only; a phase whose boundary was not observed (a parked or redirected reply) is not counted.
+//! When the reply goes through the shared reply-receive, `tail` is also split into `body`
+//! (dispatch end → reply-receive entry), `reconcile` (→ timer/owner reconciliation done) and
+//! `prepare` (→ Reply sent: receive-boundary observations and the queued-work poll rearm).
 
 use core::fmt::Write;
 use nt_syscall::NativeService;
@@ -30,11 +33,15 @@ pub(crate) struct Latency {
     pub(crate) returns: u64,
     pub(crate) return_idle: u64,
     pub(crate) return_other: u64,
+    pub(crate) split: u64,
+    pub(crate) body: u64,
+    pub(crate) reconcile: u64,
+    pub(crate) prepare: u64,
 }
 
 impl Latency {
     const EMPTY: Self = Self { calls: 0, ingress: 0, handler: 0, tail: 0, returns: 0,
-        return_idle: 0, return_other: 0 };
+        return_idle: 0, return_other: 0, split: 0, body: 0, reconcile: 0, prepare: 0 };
 }
 
 #[derive(Clone, Copy)]
@@ -44,6 +51,8 @@ struct Current {
     ingress_at: u64,
     started: u64,
     finished: Option<u64>,
+    preparing: Option<u64>,
+    reconciled: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -88,12 +97,27 @@ impl LatencyCensus {
             .and_then(|service| {
                 let (ingress_badge, ingress_at) = self.last_ingress?;
                 (ingress_badge == badge).then_some(Current {
-                    badge, service, ingress_at, started: now, finished: None })
+                    badge, service, ingress_at, started: now, finished: None,
+                    preparing: None, reconciled: None })
             });
     }
 
     pub(crate) fn dispatch_finished(&mut self, now: u64) {
         if let Some(current) = self.current.as_mut() { current.finished.get_or_insert(now); }
+    }
+
+    /// The shared reply-receive was entered for the current call.
+    pub(crate) fn reply_preparing(&mut self, now: u64) {
+        if let Some(current) = self.current.as_mut().filter(|current| current.finished.is_some()) {
+            current.preparing.get_or_insert(now);
+        }
+    }
+
+    /// Receive preparation finished reconciling timer owners (the last pass counts).
+    pub(crate) fn reconciled(&mut self, now: u64) {
+        if let Some(current) = self.current.as_mut().filter(|current| current.preparing.is_some()) {
+            current.reconciled = Some(now);
+        }
     }
 
     /// Root is about to send the Reply of the call it last dispatched for `badge`.
@@ -105,6 +129,12 @@ impl LatencyCensus {
         row.ingress = row.ingress.saturating_add(current.started.saturating_sub(current.ingress_at));
         row.handler = row.handler.saturating_add(finished.saturating_sub(current.started));
         row.tail = row.tail.saturating_add(now.saturating_sub(finished));
+        if let (Some(preparing), Some(reconciled)) = (current.preparing, current.reconciled) {
+            row.split = row.split.saturating_add(1);
+            row.body = row.body.saturating_add(preparing.saturating_sub(finished));
+            row.reconcile = row.reconcile.saturating_add(reconciled.saturating_sub(preparing));
+            row.prepare = row.prepare.saturating_add(now.saturating_sub(reconciled));
+        }
         if let Some(slot) = Self::slot(badge) {
             self.returning[slot] = Some(Returning {
                 badge, service: current.service, replied_at: now, idle_at_reply: idle_ticks });
@@ -117,11 +147,13 @@ impl LatencyCensus {
 
     /// `name=calls/ingress/handler/tail/returns/return-idle/return-other` in Mtick.
     pub(crate) fn write_census(&self, out: &mut impl Write) -> core::fmt::Result {
-        write!(out, "[census] hot-service-latency calls/ingress/handler/tail/returns/return-idle/return-other-Mtick:")?;
+        write!(out, "[census] hot-service-latency calls/ingress/handler/tail/returns/return-idle/return-other/split/body/reconcile/prepare-Mtick:")?;
         for ((_, name), row) in SERVICES.iter().zip(&self.rows) {
-            write!(out, " {name}={}/{}/{}/{}/{}/{}/{}", row.calls, row.ingress / 1_000_000,
-                row.handler / 1_000_000, row.tail / 1_000_000, row.returns,
-                row.return_idle / 1_000_000, row.return_other / 1_000_000)?;
+            write!(out, " {name}={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}", row.calls,
+                row.ingress / 1_000_000, row.handler / 1_000_000, row.tail / 1_000_000,
+                row.returns, row.return_idle / 1_000_000, row.return_other / 1_000_000,
+                row.split, row.body / 1_000_000, row.reconcile / 1_000_000,
+                row.prepare / 1_000_000)?;
         }
         writeln!(out)
     }
@@ -155,6 +187,14 @@ pub(crate) fn dispatch_started(badge: u64, service: Option<NativeService>) {
 
 pub(crate) fn dispatch_finished() {
     if let Some(census) = root() { census.dispatch_finished(crate::disk_census_ticks()); }
+}
+
+pub(crate) fn reply_preparing() {
+    if let Some(census) = root() { census.reply_preparing(crate::disk_census_ticks()); }
+}
+
+pub(crate) fn reconciled() {
+    if let Some(census) = root() { census.reconciled(crate::disk_census_ticks()); }
 }
 
 pub(crate) fn replying(badge: u64) {
