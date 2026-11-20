@@ -947,3 +947,15 @@ diagnosis-free failure.
 ## Local ARM Runs Miss x86_64-Only Specs
 - Some crate tests compile only on x86_64 (for example the `extern "win64"` export fixtures in nt-compat-exports). A green local run on an ARM host does not prove CI will compile them; main stayed red on an unnamed generic delay type that only the x86_64 build instantiates.
 - After every push, wait for the CI run that contains your exact commit and read its result. Do not report a slice as verified until that run is green; an earlier red run on main is still a blocker to investigate, not background noise.
+
+## Drive Service Tests With The Production Buffer Shape
+- 8e15b92a rejected every send-only ALPC call with `!out_buf.is_empty()`, and its tests passed
+  `&mut []`. The real `lpc_server` always dispatches with the ring's whole `REP_DATA_LEN` reply
+  frame. The executive then ACKed a terminal the service never recorded and parked the
+  CSRSS request thread in `InvalidTerminal`. CSRSS stopped serving, so every later GUI exit
+  stalled before its final NtTerminateProcess. Before validating a service request against
+  a buffer, read how the transport sizes that buffer, and make tests use the same shape.
+- Absence of an error print is not evidence that a call never ran. Once the refusal was
+  "fixed", the missing `CSRSS: Error while replying` line hid a new rejection. Find the
+  stuck caller (here, SSN 0x703 rows in the ingress census) before blaming the most
+  recent lifetime change.

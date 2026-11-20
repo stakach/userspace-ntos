@@ -2641,3 +2641,143 @@ fn expiry_after_completion_returns_the_delivered_terminal() {
     assert_eq!((expired.status, expired.information), (SUCCESS, delivered.information));
     assert_eq!(again, output, "the delivered message is the answer, not a timeout");
 }
+
+/// The ALPC service always dispatches with the ring's whole reply frame (`lpc_server` passes
+/// `REP_DATA_LEN` bytes), whether or not the native call has a receive half.
+fn rep_frame() -> [u8; 4096] { [0u8; 4096] }
+
+/// CSRSS answers BaseSrvExitProcess (`CsrReplyDeadClient`) with a reply that has no receive
+/// half (ReactOS csrsrv api.c NtReplyPort). The service sends that reply to the waiting client
+/// and completes the call without waiting for, or consuming, another message.
+#[test]
+fn checked_send_only_reply_delivers_and_completes_without_receiving() {
+    use nt_port_core::{ClientId, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let server = ClientId { process: 7, thread: 11 };
+    let identity = MessageIdentity {
+        client: ClientId { process: 8, thread: 12 }, message_id: 93,
+    };
+    let name = utf16("\\CsrApiPortDeath");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, server, (4, 80)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let listen = created.detail0;
+    let kernel = core.retain_connection_port(listen).unwrap();
+    let mut request = port_message(msg_type::REQUEST, b"exit");
+    request[8..16].copy_from_slice(&identity.client.process.to_le_bytes());
+    request[16..24].copy_from_slice(&identity.client.thread.to_le_bytes());
+    request[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    core.send_kernel_request_message(kernel, &request, MessageAttrs::default(), identity).unwrap();
+    let mut received = [0u8; 128];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(listen, server, (4, 81)), &mut received).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_SEND_RECEIVE,
+        &enc_ack_receive(server, (4, 81)), &mut []).status, SUCCESS);
+    // A second queued request must stay queued: the send-only reply receives nothing.
+    let second = MessageIdentity { message_id: 94, ..identity };
+    let mut next = request.clone();
+    next[24..28].copy_from_slice(&second.message_id.to_le_bytes());
+    core.send_kernel_request_message(kernel, &next, MessageAttrs::default(), second).unwrap();
+
+    let mut wire = enc_checked_receive(listen, server, (4, 82));
+    let mut header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&wire);
+    header.send_receive.flags = nt_alpc_abi::send_flag::REPLY_MESSAGE
+        | nt_alpc_abi::send_flag::NO_RECEIVE;
+    header.send_receive.message_offset = wire.len() as u32;
+    header.send_receive.message_len_bytes = request.len() as u32;
+    wire.copy_from_slice(bytemuck::bytes_of(&header));
+    wire.extend_from_slice(&request);
+    let sent = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut rep_frame());
+    assert_eq!((sent.status, sent.information), (SUCCESS, 0));
+    let delivered = core.receive_reply_message(kernel, identity).unwrap().unwrap().bytes;
+    assert_eq!(u16::from_le_bytes(delivered[4..6].try_into().unwrap()), msg_type::REPLY);
+    assert_eq!(&delivered[40..], b"exit");
+    // The terminal is retained for the same token and never resends the reply.
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut rep_frame()), sent);
+    assert_eq!(core.receive_reply_message(kernel, identity).unwrap(), None);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_SEND_RECEIVE,
+        &enc_ack_receive(server, (4, 82)), &mut []).status, SUCCESS);
+    let mut after = [0u8; 128];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(listen, server, (4, 83)), &mut after).status, SUCCESS);
+    assert_eq!(&after[24..28], &second.message_id.to_le_bytes());
+}
+
+#[test]
+fn checked_send_only_requires_a_send_and_excludes_receive_options() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let server = nt_port_core::ClientId { process: 7, thread: 11 };
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&utf16("\\SendOnlyShape"), server, (4, 90)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    for (sequence, flags) in [(91, nt_alpc_abi::send_flag::NO_RECEIVE),
+        (92, nt_alpc_abi::send_flag::NO_RECEIVE | nt_alpc_abi::send_flag::RECV_ATTRIBUTES)]
+    {
+        let mut wire = enc_checked_receive(created.detail0, server, (4, sequence));
+        wire[4..8].copy_from_slice(&flags.to_le_bytes());
+        assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut rep_frame()).status,
+            nt_status::NtStatus::INVALID_PARAMETER.0);
+    }
+}
+
+/// BaseSrvExitProcess: the client's ExitProcess sync request is answered by a send-only reply,
+/// after which CSRSS dereferences the CSR process and closes its server communication port.
+/// The waiting client must still receive that reply.
+#[test]
+fn csrss_exit_process_send_only_reply_reaches_client_across_server_close() {
+    use nt_port_core::{ClientId, ConnectOutcome};
+    for reply_on_listen in [true, false] {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let mut alpc = AlpcServer::new();
+        let server = ClientId { process: 7, thread: 11 };
+        let client = ClientId { process: 8, thread: 12 };
+        let name = utf16("\\CsrExitProcessPort");
+        let listen = core.create_port_with_owner(&name, PortApi::Alpc, server);
+        let ConnectOutcome::Pending { connection_id } = core.connect_with_client_id(
+            &name, PortApi::Alpc, 0, b"", client).unwrap() else { panic!("pending connect"); };
+        core.receive(listen).unwrap();
+        let server_comm = core.accept(connection_id, true, 0x5150).unwrap();
+        let client_comm = core.complete(connection_id).unwrap().0;
+
+        let request = port_message(0, b"exit-process");
+        let mut client_wire = enc_checked_receive(client_comm, client, (5, 91));
+        let mut client_header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+            bytemuck::pod_read_unaligned(&client_wire);
+        client_header.send_receive.flags = nt_alpc_abi::send_flag::SYNC_REQUEST;
+        client_header.send_receive.message_offset = client_wire.len() as u32;
+        client_header.send_receive.message_len_bytes = request.len() as u32;
+        client_wire.copy_from_slice(bytemuck::bytes_of(&client_header));
+        client_wire.extend_from_slice(&request);
+        let mut client_output = [0u8; 128];
+        assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+            &client_wire, &mut client_output).status, nt_status::NtStatus::PENDING.0);
+
+        let mut server_output = [0u8; 128];
+        let received = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+            &enc_checked_receive(listen, server, (5, 92)), &mut server_output);
+        assert_eq!(received.status, SUCCESS);
+        let mut reply = server_output[..received.information as usize].to_vec();
+        let mut wire = enc_checked_receive(if reply_on_listen { listen } else { server_comm },
+            server, (5, 93));
+        let mut header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+            bytemuck::pod_read_unaligned(&wire);
+        header.send_receive.flags = nt_alpc_abi::send_flag::REPLY_MESSAGE
+            | nt_alpc_abi::send_flag::NO_RECEIVE;
+        header.send_receive.message_offset = wire.len() as u32;
+        header.send_receive.message_len_bytes = reply.len() as u32;
+        wire.copy_from_slice(bytemuck::bytes_of(&header));
+        wire.append(&mut reply);
+        let sent = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut rep_frame());
+        assert_eq!(sent.status, SUCCESS, "reply_on_listen={reply_on_listen}");
+        core.close_port(server_comm);
+
+        let completed = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+            &client_wire, &mut client_output);
+        assert_eq!(completed.status, SUCCESS, "reply_on_listen={reply_on_listen}");
+        assert_eq!(&client_output[40..completed.information as usize], b"exit-process");
+    }
+}

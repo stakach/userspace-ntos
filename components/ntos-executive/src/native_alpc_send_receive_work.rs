@@ -26,7 +26,6 @@ const STATUS_PENDING: i32 = 0x0000_0103;
 const MAX_OWNERS: usize = 64;
 
 static NEXT_INVOCATION: AtomicU64 = AtomicU64::new(1);
-static UNSUPPORTED_SHAPE_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut OWNERS: Vec<OwnedReceive> = Vec::new();
 static mut NEXT_OWNER: usize = 0;
 
@@ -43,7 +42,8 @@ enum Flight {
 
 struct OwnedReceive {
     pi: usize,
-    target: ReceiveTarget,
+    /// `None` for a send-only call (reply, datagram or release without ReceiveMessage).
+    target: Option<ReceiveTarget>,
     retained: RetainedLater,
     output: Vec<u8>,
     ack: nt_alpc_abi::AlpcAcknowledgeSendReceiveRequest,
@@ -134,7 +134,12 @@ impl OwnedReceive {
             self.flight = Flight::InvalidTerminal;
             return;
         }
-        let attr_len = if let Some((_, allocated)) = self.target.attributes {
+        let Some(target) = self.target.as_ref() else {
+            // A send-only call has no receive output to copy.
+            if count != 0 { self.flight = Flight::InvalidTerminal; }
+            return;
+        };
+        let attr_len = if let Some((_, allocated)) = target.attributes {
             if count < 8 {
                 self.flight = Flight::InvalidTerminal;
                 return;
@@ -152,17 +157,17 @@ impl OwnedReceive {
         } else { 0 };
         let message_len = count.saturating_sub(attr_len);
         if count < attr_len + core::mem::size_of::<nt_alpc_abi::PortMessage>()
-            || message_len > self.target.capacity
+            || message_len > target.capacity
         {
             self.flight = Flight::InvalidTerminal;
             return;
         }
-        if self.target.attributes.is_some_and(|(pointer, _)|
+        if target.attributes.is_some_and(|(pointer, _)|
             handler.process_memory_write_status(self.pi, pointer,
                 &terminal.output[..attr_len]).is_err())
-            || handler.process_memory_write_status(self.pi, self.target.message,
+            || handler.process_memory_write_status(self.pi, target.message,
                 &terminal.output[attr_len..count]).is_err()
-            || handler.process_memory_write_status(self.pi, self.target.size_pointer,
+            || handler.process_memory_write_status(self.pi, target.size_pointer,
                 &(message_len as u64).to_le_bytes()).is_err()
         {
             self.reply_status = STATUS_ACCESS_VIOLATION as i32;
@@ -195,26 +200,9 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
         |address, out| (*handler_ptr).xas_read(address, out),
         |address, len| (*handler_ptr).probe_user_output(address, len),
     )?;
-    if captured.receive.is_none() {
-        // A send or reply with no receive half (CSRSS's death-message reply reports this
-        // status) is not implemented (#416). Record which shape arrived.
-        let sequence = UNSUPPORTED_SHAPE_TRACE.fetch_add(1, Ordering::Relaxed);
-        if sequence < 8 || sequence.is_power_of_two() {
-            print_str(b"[native-alpc-send-unsupported] #"); print_u64(sequence);
-            print_str(b" pi="); print_u64(pi as u64);
-            print_str(b" tid="); print_u64(thread);
-            print_str(b" flags=0x"); print_hex(captured.flags);
-            print_str(b" send-bytes=");
-            print_u64(captured.send_message.as_ref().map_or(0, |message| message.len() as u64));
-            print_str(b" receive="); print_u64(captured.receive.is_some() as u64);
-            print_str(b" timeout="); print_u64(captured.timeout.is_some() as u64);
-            print_str(b"\n");
-        }
-        return Err(STATUS_NOT_SUPPORTED);
-    }
     // Relative (negative) or absolute NT time; zero polls once.
     let deadline = nt_time::Deadline::from_nt_timeout(captured.timeout, nt_time_snapshot());
-    let target_capacity = captured.receive.as_ref().ok_or(STATUS_NOT_SUPPORTED)?.capacity;
+    let target_capacity = captured.receive.as_ref().map_or(0, |target| target.capacity);
     if target_capacity > REP_DATA_LEN { return Err(STATUS_NOT_SUPPORTED); }
     let handle_caller = handler.native_handle_caller(nt_syscall::ProcessorMode::UserMode)?;
     let port = handler.pm.lookup_native_alpc_port(handle_caller, captured.port, generation)?;
@@ -259,8 +247,11 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
     { return Err(STATUS_DEVICE_BUSY); }
     owners.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     let mut output = Vec::new();
-    let output_capacity = target.capacity.checked_add(if target.attributes.is_some() { 40 } else { 0 })
-        .filter(|capacity| *capacity <= REP_DATA_LEN).ok_or(STATUS_NOT_SUPPORTED)?;
+    let output_capacity = match target.as_ref() {
+        Some(target) => target.capacity
+            .checked_add(if target.attributes.is_some() { 40 } else { 0 }),
+        None => Some(0),
+    }.filter(|capacity| *capacity <= REP_DATA_LEN).ok_or(STATUS_NOT_SUPPORTED)?;
     output.try_reserve_exact(output_capacity).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     output.resize(output_capacity, 0);
     let park = RootReplyPark::prepare().ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
