@@ -550,6 +550,8 @@ pub(super) unsafe fn syscall_nt_route(
         let elapsed_ticks = crate::disk_census_ticks().wrapping_sub(dispatch_started);
         crate::hot_service_latency_census::dispatch_finished();
         crate::record_native_dispatch_ticks(lp.msg.badge, lp.msg.m0, elapsed_ticks);
+        crate::hot_service_cost_census::record_wait_status(
+            table_entry.map(|entry| entry.service), res.status);
         crate::hot_service_cost_census::record_dispatch(
             table_entry.map(|entry| entry.service), res.status, elapsed_ticks,
             crate::serial_records::root_serial_bytes().wrapping_sub(dispatch_serial),

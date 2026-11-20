@@ -64,3 +64,21 @@ fn saturated_counters_still_fit_one_record() {
     assert!(printed.starts_with("[census] hot-service-cost") && printed.ends_with('\n'));
     assert!(printed.ends_with(" close=0/0/0:1/3/5\n"), "{printed}");
 }
+
+/// Boot 44604646550: the tray thread issued ~714k NtWaitForMultipleObjects calls, each
+/// returning within ~30 us. Which status they return decides between a stale signal, an
+/// invalid queue-event handle and a mis-converted timeout.
+#[test]
+fn immediate_wait_statuses_are_counted_by_exact_value() {
+    let mut waits = census::WaitStatusCensus::new();
+    for _ in 0..5 { waits.record(Some(NativeService::NtWaitForMultipleObjects), 0x1); }
+    for _ in 0..3 { waits.record(Some(NativeService::NtWaitForMultipleObjects), 0xc000_0008); }
+    waits.record(Some(NativeService::NtWaitForMultipleObjects), 0x102);
+    waits.record(Some(NativeService::NtReadFile), 0xc000_0008);
+    waits.record(None, 0);
+    let mut line = nt_printf::record::RecordBuffer::<512>::new();
+    waits.write_census(&mut line).unwrap();
+    let line = std::str::from_utf8(line.bytes()).unwrap();
+    assert_eq!(line,
+        "[census] wait-multiple-status calls=9 0x00000001=5 0xc0000008=3 0x00000102=1\n");
+}

@@ -99,3 +99,62 @@ pub(crate) fn print_census() {
     let _ = unsafe { (*core::ptr::addr_of!(ROOT)).write_census(&mut record) };
     crate::print_str(record.bytes());
 }
+
+/// Exact statuses returned by NtWaitForMultipleObjects dispatches (a parked wait's dispatch
+/// status is recorded when it parks). Eight space-saving slots, most frequent first in output.
+pub(crate) struct WaitStatusCensus {
+    calls: u64,
+    slots: [(u32, u64); 8],
+    used: usize,
+}
+
+impl WaitStatusCensus {
+    pub(crate) const fn new() -> Self {
+        Self { calls: 0, slots: [(0, 0); 8], used: 0 }
+    }
+
+    pub(crate) fn record(&mut self, service: Option<NativeService>, status: u32) {
+        if service != Some(NativeService::NtWaitForMultipleObjects) {
+            return;
+        }
+        self.calls = self.calls.saturating_add(1);
+        if let Some(slot) = self.slots[..self.used].iter_mut().find(|slot| slot.0 == status) {
+            slot.1 = slot.1.saturating_add(1);
+            return;
+        }
+        if self.used < self.slots.len() {
+            self.slots[self.used] = (status, 1);
+            self.used += 1;
+            return;
+        }
+        let smallest = (0..self.slots.len()).min_by_key(|&index| self.slots[index].1).unwrap();
+        self.slots[smallest] = (status, self.slots[smallest].1.saturating_add(1));
+    }
+
+    pub(crate) fn write_census(&self, out: &mut impl Write) -> core::fmt::Result {
+        let mut order = [0usize; 8];
+        for (slot, index) in order.iter_mut().zip(0..) {
+            *slot = index;
+        }
+        order[..self.used].sort_by(|&a, &b| self.slots[b].1.cmp(&self.slots[a].1));
+        write!(out, "[census] wait-multiple-status calls={}", self.calls)?;
+        for &index in &order[..self.used] {
+            write!(out, " 0x{:08x}={}", self.slots[index].0, self.slots[index].1)?;
+        }
+        writeln!(out)
+    }
+}
+
+static mut WAIT_STATUS: WaitStatusCensus = WaitStatusCensus::new();
+
+pub(crate) fn record_wait_status(service: Option<NativeService>, status: u32) {
+    // SAFETY: only the single root dispatch executor records or prints this census.
+    unsafe { (*core::ptr::addr_of_mut!(WAIT_STATUS)).record(service, status) }
+}
+
+pub(crate) fn print_wait_status_census() {
+    let mut record = nt_printf::record::RecordBuffer::<512>::new();
+    // SAFETY: see `record_wait_status`.
+    let _ = unsafe { (*core::ptr::addr_of!(WAIT_STATUS)).write_census(&mut record) };
+    crate::print_str(record.bytes());
+}
