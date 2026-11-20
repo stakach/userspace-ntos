@@ -1,4 +1,5 @@
-//! Driver-local queued spin locks with exact in-stack handle ownership.
+//! Driver-local queued spin locks with exact in-stack handle ownership. The handle is the
+//! `hosted_spin_wait` owner token, so these words interoperate with KSPIN_LOCK acquisitions.
 
 use super::*;
 use core::sync::atomic::AtomicU64;
@@ -44,13 +45,11 @@ fn acquire_inner(lock: u64, handle: u64, raise: bool) {
         write_unaligned((handle + LOCK_HANDLE_NEXT_OFF) as *mut u64, 0);
         write_unaligned((handle + LOCK_HANDLE_LOCK_OFF) as *mut u64, lock);
         write_unaligned((handle + LOCK_HANDLE_OLD_IRQL_OFF) as *mut u8, old_irql);
+        // The in-stack handle is the exact owner; contention parks in the root instead of
+        // spinning on a holder lane that may be blocked in a root call.
         let word = &*(lock as *const AtomicU64);
-        loop {
-            match nt_kernel_exec::queued_spin_lock::try_acquire(word, handle) {
-                Ok(true) => break,
-                Ok(false) => core::hint::spin_loop(),
-                Err(_) => invalid(lock, handle, 3),
-            }
+        if hosted_driver_spin_wait::acquire(word, lock, handle).is_err() {
+            invalid(lock, handle, 3);
         }
     }
 }
@@ -86,8 +85,10 @@ fn release_inner(handle: u64, lower: bool) {
             || (!lower && (old_irql < DISPATCH_LEVEL || hosted_current_irql() != old_irql))
         { invalid(lock, handle, 5); }
         let word = &*(lock as *const AtomicU64);
-        if nt_kernel_exec::queued_spin_lock::release(word, handle).is_err() {
-            invalid(lock, handle, 6);
+        match nt_kernel_exec::hosted_spin_wait::release(word, handle) {
+            Ok(true) => hosted_driver_spin_wait::wake(lock),
+            Ok(false) => {}
+            Err(_) => invalid(lock, handle, 6),
         }
         write_unaligned((handle + LOCK_HANDLE_LOCK_OFF) as *mut u64, 0);
         if lower { hosted_lower_irql(old_irql); }

@@ -13,22 +13,30 @@ pub(super) extern "win64" fn initialize(lock: u64) {
     word(lock).store(0, Ordering::Release);
 }
 
+fn fault(lock: u64, detail: u64) -> ! {
+    unsafe { crate::provider_bugcheck::report(0xc4, [0x5350_494e, lock, detail, 5]); }
+}
+
 fn try_acquire(lock: u64) -> bool {
-    word(lock).compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    nt_kernel_exec::hosted_spin_wait::try_acquire(word(lock), hosted_driver_spin_wait::lane_token())
+        .unwrap_or_else(|error| fault(lock, error as u64))
 }
 
+/// Acquire for the calling lane. Contention parks in the root rather than spinning, because the
+/// holder may be another lane blocked in a root call (see `hosted_driver_spin_wait`).
 pub(super) fn acquire_word(lock: u64) {
-    while !try_acquire(lock) {
-        core::hint::spin_loop();
-        // A single hosted logical CPU may need to schedule the current owner before the
-        // lock can become free. Yield without clearing this caller's DISPATCH_LEVEL state.
-        crate::yield_now();
-    }
+    hosted_driver_spin_wait::acquire(word(lock), lock, hosted_driver_spin_wait::lane_token())
+        .unwrap_or_else(|error| fault(lock, error as u64));
 }
 
+/// NT KeReleaseSpinLock does not identify the releasing thread; only a held word is released.
 pub(super) fn release_word(lock: u64) {
-    if word(lock).compare_exchange(1, 0, Ordering::Release, Ordering::Relaxed).is_err() {
+    let previous = word(lock).swap(0, Ordering::Release);
+    if previous & nt_kernel_exec::hosted_spin_wait::HELD == 0 {
         unsafe { crate::provider_bugcheck::report(0xc4, [0x5350_494e, lock, 1, 0]); }
+    }
+    if previous & nt_kernel_exec::hosted_spin_wait::WAITERS != 0 {
+        hosted_driver_spin_wait::wake(lock);
     }
 }
 

@@ -5388,6 +5388,31 @@ unsafe fn component_pump_loop(
                 }
             }
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_SPIN_WAIT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let result = if (1..=3).contains(&msg.m0)
+                && msg.mi == ((crate::driver_launch::FSD_SERVICE_SPIN_WAIT_LABEL << 12) | 3)
+            {
+                crate::driver_launch::service_hosted_driver_spin_wait(
+                    ch, msg.m0, msg.m1, msg.m2, msg.badge, *reply_cap,
+                )
+            } else {
+                crate::driver_launch::HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER_I32)
+            };
+            match result {
+                crate::driver_launch::HostedDriverWaitServiceResult::Reply(status) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+                }
+                crate::driver_launch::HostedDriverWaitServiceResult::SharedParked { .. } => {
+                    if shared_pump::service_wait_yields(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_GUARDED_MUTEX_LABEL
             && ch.caps.kind == ReqKind::Irp
         {

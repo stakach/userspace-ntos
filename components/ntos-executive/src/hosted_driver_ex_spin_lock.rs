@@ -36,22 +36,40 @@ fn lower(lock: u64, old_irql: u8, phase: u64) {
     unsafe { hosted_lower_irql(old_irql); }
 }
 
-// A single hosted logical CPU may need to schedule the current owner before the lock can make
-// progress. Yield without clearing this caller's DISPATCH_LEVEL state, as KSPIN_LOCK does.
-fn wait() {
-    core::hint::spin_loop();
-    crate::yield_now();
+/// A blocked lane never spins on another lane, which may hold the lock while blocked in a root
+/// call: it marks WAITERS on the exact word it observed and parks in the root until it changes.
+fn wait(lock: u64, observed: u32) {
+    match checked(lock, 19, policy::mark_waiting(word(lock), observed)) {
+        Some(observed) => hosted_driver_spin_wait::park(lock, u64::from(observed), false, 0),
+        None => core::hint::spin_loop(),
+    }
+}
+
+fn wake_if(lock: u64, wake: bool) {
+    if wake { hosted_driver_spin_wait::wake(lock); }
 }
 
 fn acquire_shared(lock: u64) {
     let word = word(lock);
-    while !checked(lock, 1, policy::try_acquire_shared(word)) { wait(); }
+    loop {
+        let observed = word.load(Ordering::Relaxed);
+        if checked(lock, 1, policy::try_acquire_shared(word)) { return; }
+        wait(lock, observed);
+    }
 }
 
 fn acquire_exclusive(lock: u64) {
     let word = word(lock);
-    while !checked(lock, 2, policy::try_claim_exclusive(word)) { wait(); }
-    while !checked(lock, 3, policy::exclusive_drained(word)) { wait(); }
+    loop {
+        let observed = word.load(Ordering::Relaxed);
+        if checked(lock, 2, policy::try_claim_exclusive(word)) { break; }
+        wait(lock, observed);
+    }
+    loop {
+        let observed = word.load(Ordering::Relaxed);
+        if checked(lock, 3, policy::exclusive_drained(word)) { return; }
+        wait(lock, observed);
+    }
 }
 
 /// `KIRQL ExAcquireSpinLockExclusive(PEX_SPIN_LOCK)`.
@@ -82,26 +100,28 @@ pub(super) extern "win64" fn acquire_shared_at_dpc(lock: u64) {
 
 /// `VOID ExReleaseSpinLockExclusive(PEX_SPIN_LOCK, KIRQL)`.
 pub(super) extern "win64" fn release_exclusive_lower(lock: u64, old_irql: u8) {
-    checked(lock, 8, policy::release_exclusive(word(lock)));
+    let wake = checked(lock, 8, policy::release_exclusive(word(lock)));
     lower(lock, old_irql, 9);
+    wake_if(lock, wake);
 }
 
 /// `VOID ExReleaseSpinLockExclusiveFromDpcLevel(PEX_SPIN_LOCK)`.
 pub(super) extern "win64" fn release_exclusive_from_dpc(lock: u64) {
     require_dispatch(lock, 10);
-    checked(lock, 8, policy::release_exclusive(word(lock)));
+    wake_if(lock, checked(lock, 8, policy::release_exclusive(word(lock))));
 }
 
 /// `VOID ExReleaseSpinLockShared(PEX_SPIN_LOCK, KIRQL)`.
 pub(super) extern "win64" fn release_shared_lower(lock: u64, old_irql: u8) {
-    checked(lock, 11, policy::release_shared(word(lock)));
+    let wake = checked(lock, 11, policy::release_shared(word(lock)));
     lower(lock, old_irql, 12);
+    wake_if(lock, wake);
 }
 
 /// `VOID ExReleaseSpinLockSharedFromDpcLevel(PEX_SPIN_LOCK)`.
 pub(super) extern "win64" fn release_shared_from_dpc(lock: u64) {
     require_dispatch(lock, 13);
-    checked(lock, 11, policy::release_shared(word(lock)));
+    wake_if(lock, checked(lock, 11, policy::release_shared(word(lock))));
 }
 
 /// `LOGICAL ExTryAcquireSpinLockSharedAtDpcLevel(PEX_SPIN_LOCK)`.

@@ -446,6 +446,8 @@ mod hosted_driver_hal_idt_irql;
 pub(crate) mod hosted_driver_process_attach;
 #[path = "hosted_driver_spin_lock.rs"]
 mod hosted_driver_spin_lock;
+#[path = "hosted_driver_spin_wait.rs"]
+mod hosted_driver_spin_wait;
 #[path = "hosted_driver_ex_spin_lock.rs"]
 mod hosted_driver_ex_spin_lock;
 #[path = "hosted_driver_device_queue.rs"]
@@ -535,6 +537,7 @@ pub(crate) use hosted_driver_pofx::service as service_hosted_driver_pofx;
 pub(crate) use hosted_driver_power_setting::service as service_hosted_driver_power_setting;
 pub(crate) use hosted_driver_luid::service as service_hosted_driver_luid;
 pub(crate) use hosted_driver_hal_beep::service as service_hosted_driver_hal_beep;
+pub(crate) use hosted_driver_spin_wait::service as service_hosted_driver_spin_wait;
 pub(crate) use hosted_driver_zw_terminate_process::service as service_hosted_driver_zw_terminate_process;
 pub(crate) use hosted_driver_rtl_create_user_thread::service as service_hosted_driver_rtl_create_user_thread;
 pub(crate) use hosted_driver_kmutex::service as service_hosted_driver_kmutex;
@@ -1478,6 +1481,7 @@ pub const FSD_SERVICE_POFX_LABEL: u64 = hosted_driver_pofx::LABEL;
 pub const FSD_SERVICE_POWER_SETTING_LABEL: u64 = hosted_driver_power_setting::LABEL;
 pub const FSD_SERVICE_LUID_LABEL: u64 = hosted_driver_luid::LABEL;
 pub const FSD_SERVICE_HAL_BEEP_LABEL: u64 = hosted_driver_hal_beep::LABEL;
+pub const FSD_SERVICE_SPIN_WAIT_LABEL: u64 = hosted_driver_spin_wait::LABEL;
 pub const FSD_SERVICE_ZW_TERMINATE_PROCESS_LABEL: u64 = hosted_driver_zw_terminate_process::LABEL;
 pub const FSD_SERVICE_RTL_CREATE_USER_THREAD_LABEL: u64 = hosted_driver_rtl_create_user_thread::LABEL;
 pub const FSD_SERVICE_KMUTEX_LABEL: u64 = hosted_driver_kmutex::LABEL;
@@ -1533,6 +1537,7 @@ const _: () = {
         FSD_SERVICE_POWER_SETTING_LABEL,
         FSD_SERVICE_LUID_LABEL,
         FSD_SERVICE_HAL_BEEP_LABEL,
+        FSD_SERVICE_SPIN_WAIT_LABEL,
         FSD_SERVICE_ZW_TERMINATE_PROCESS_LABEL,
         FSD_SERVICE_RTL_CREATE_USER_THREAD_LABEL,
         FSD_SERVICE_KMUTEX_LABEL,
@@ -1881,6 +1886,23 @@ static mut POOL_LONG_WALKS: u32 = 0;
 static PEER_COMPLETION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static FSD_CANCEL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static IO_CANCEL_SPIN_LOCK: AtomicU64 = AtomicU64::new(0);
+
+/// The cancel lock is held across root calls (IoStartPacket, cancel routines completing IRPs),
+/// so a contended acquire parks in the root instead of spinning on another blocked lane.
+fn acquire_cancel_spin_lock_word() {
+    let lock = core::ptr::addr_of!(IO_CANCEL_SPIN_LOCK) as u64;
+    hosted_driver_spin_wait::acquire(&IO_CANCEL_SPIN_LOCK, lock, hosted_driver_spin_wait::lane_token())
+        .unwrap_or_else(|error| unsafe {
+            crate::provider_bugcheck::report(0xc4, [0x4341_4e43, lock, error as u64, 0])
+        });
+}
+
+fn release_cancel_spin_lock_word() {
+    let previous = IO_CANCEL_SPIN_LOCK.swap(0, Ordering::Release);
+    if previous & nt_kernel_exec::hosted_spin_wait::WAITERS != 0 {
+        hosted_driver_spin_wait::wake(core::ptr::addr_of!(IO_CANCEL_SPIN_LOCK) as u64);
+    }
+}
 static WDM_FORWARD_CALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static WDM_FORWARD_COMPLETION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const WDM_FORWARD_TRACE_CAP: u64 = 64;
@@ -9540,15 +9562,7 @@ extern "win64" fn s_io_cancel_irp(irp: u64) -> u8 {
     }
     unsafe {
         let old = hosted_raise_irql(DISPATCH_LEVEL);
-        while IO_CANCEL_SPIN_LOCK
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-            // IoStartPacket/IoStartNextPacket hold this lock across their root call. On one
-            // hosted CPU the holder must be scheduled; keep this caller's DISPATCH_LEVEL state.
-            crate::yield_now();
-        }
+        acquire_cancel_spin_lock_word();
         write_unaligned((irp + WDM_X64_IRP_CANCEL_OFFSET) as *mut u8, 1);
         write_unaligned((irp + WDM_X64_IRP_CANCEL_IRQL_OFFSET) as *mut u8, old);
         let routine = (&*((irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const AtomicU64))
@@ -9563,7 +9577,7 @@ extern "win64" fn s_io_cancel_irp(irp: u64) -> u8 {
             call_hosted_pe(routine, &[device, irp]);
             return 1;
         }
-        IO_CANCEL_SPIN_LOCK.store(0, Ordering::Release);
+        release_cancel_spin_lock_word();
         hosted_lower_irql(old);
     }
     0
@@ -9663,15 +9677,7 @@ extern "win64" fn s_io_free_work_item(work_item: u64) {
 extern "win64" fn s_io_acquire_cancel_spin_lock(old_irql_out: u64) {
     unsafe {
         let old = hosted_raise_irql(DISPATCH_LEVEL);
-        while IO_CANCEL_SPIN_LOCK
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-            // IoStartPacket/IoStartNextPacket hold this lock across their root call. On one
-            // hosted CPU the holder must be scheduled; keep this caller's DISPATCH_LEVEL state.
-            crate::yield_now();
-        }
+        acquire_cancel_spin_lock_word();
         if old_irql_out != 0 {
             write_unaligned(old_irql_out as *mut u8, old);
         }
@@ -9681,7 +9687,7 @@ extern "win64" fn s_io_acquire_cancel_spin_lock(old_irql_out: u64) {
 /// `VOID IoReleaseCancelSpinLock(KIRQL)`.
 extern "win64" fn s_io_release_cancel_spin_lock(old_irql: u8) {
     unsafe {
-        IO_CANCEL_SPIN_LOCK.store(0, Ordering::Release);
+        release_cancel_spin_lock_word();
         hosted_lower_irql(old_irql);
     }
 }
@@ -15948,6 +15954,7 @@ unsafe fn hosted_dispatcher_ready_for(
     match key {
         Some(key) => hosted_driver_kmutex::ready(object, key, thread),
         None => hosted_driver_guarded_mutex::ready(object, thread)
+            .or_else(|| hosted_driver_spin_wait::ready(object, thread))
             .unwrap_or_else(|| hosted_dispatcher_ready(object)),
     }
 }
@@ -15989,6 +15996,7 @@ unsafe fn hosted_dispatcher_consume_for(
     match key {
         Some(key) => hosted_driver_kmutex::acquire(object, key, thread, owner) == Ok(true),
         None => hosted_driver_guarded_mutex::consume(object, thread)
+            .or_else(|| hosted_driver_spin_wait::consume(object, thread))
             .unwrap_or_else(|| hosted_dispatcher_consume(object)),
     }
 }
@@ -16057,6 +16065,7 @@ unsafe fn hosted_dispatcher_wait_ready_with_handler(
     let ready = |object: u64, key| match key {
         Some(key) => hosted_driver_kmutex::ready(object, key, thread),
         None => hosted_driver_guarded_mutex::ready(object, thread)
+            .or_else(|| hosted_driver_spin_wait::ready(object, thread))
             .unwrap_or_else(|| hosted_driver_event_reference::projected_ready_with_handler(object, handler)
                 .unwrap_or_else(|| hosted_dispatcher_ready(object))),
     };
@@ -16085,6 +16094,7 @@ unsafe fn hosted_dispatcher_wait_consume_with_handler(
     let mut consume = |object: u64, key| match key {
         Some(key) => hosted_driver_kmutex::acquire(object, key, thread, owner) == Ok(true),
         None => hosted_driver_guarded_mutex::consume(object, thread)
+            .or_else(|| hosted_driver_spin_wait::consume(object, thread))
             .unwrap_or_else(|| hosted_driver_event_reference::projected_consume_with_handler(object, handler)
                 .unwrap_or_else(|| hosted_dispatcher_consume(object))),
     };
@@ -16457,6 +16467,7 @@ unsafe fn reply_hosted_driver_waiter(mut waiter: HostedDriverRawWaiter, status: 
     let reply = waiter.reply_cap;
     if status != STATUS_SUCCESS {
         hosted_driver_guarded_mutex::cancel_pending(instance, thread_handle, reply);
+        hosted_driver_spin_wait::cancel_pending(instance, thread_handle, reply);
     }
     let reply_entered = waiter.delivery.reply_entered();
     if !reply_entered {
@@ -16515,6 +16526,7 @@ unsafe fn reply_hosted_driver_waiter(mut waiter: HostedDriverRawWaiter, status: 
         crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, reply, 13]);
     }
     hosted_driver_guarded_mutex::acknowledged(instance, thread_handle, reply, cancelled);
+    hosted_driver_spin_wait::acknowledged(instance, thread_handle, reply);
     for lease in waiter.event_projection_leases {
         if hosted_driver_event_reference::release_wait(lease).is_err() {
             crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, 0, 11]);
@@ -64902,6 +64914,7 @@ unsafe fn hosted_driver_device_lifetime_quiesced(
         && hosted_driver_pofx::quiesced(domain)
         && hosted_driver_kmutex::quiesced(domain)
         && hosted_driver_guarded_mutex::quiesced(domain)
+        && hosted_driver_spin_wait::quiesced(domain)
 }
 
 fn hosted_driver_thread_error_status(error: HostedDriverThreadError) -> i32 {

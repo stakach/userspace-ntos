@@ -10,8 +10,8 @@ fn shared_owners_count_and_release() {
     assert_eq!(try_acquire_shared(&lock), Ok(true));
     assert_eq!(try_acquire_shared(&lock), Ok(true));
     assert_eq!(lock.load(Ordering::Relaxed), 2);
-    assert_eq!(release_shared(&lock), Ok(()));
-    assert_eq!(release_shared(&lock), Ok(()));
+    assert_eq!(release_shared(&lock), Ok(false));
+    assert_eq!(release_shared(&lock), Ok(false));
     assert_eq!(lock.load(Ordering::Relaxed), 0);
     assert_eq!(release_shared(&lock), Err(ExSpinLockError::NotShared));
 }
@@ -27,9 +27,9 @@ fn exclusive_claim_blocks_new_shared_owners_until_drained() {
     assert_eq!(try_claim_exclusive(&lock), Ok(false));
     // The undrained claimant does not own the lock yet.
     assert_eq!(release_exclusive(&lock), Err(ExSpinLockError::NotExclusive));
-    assert_eq!(release_shared(&lock), Ok(()));
+    assert_eq!(release_shared(&lock), Ok(false));
     assert_eq!(exclusive_drained(&lock), Ok(true));
-    assert_eq!(release_exclusive(&lock), Ok(()));
+    assert_eq!(release_exclusive(&lock), Ok(false));
     assert_eq!(lock.load(Ordering::Relaxed), 0);
     assert_eq!(try_acquire_shared(&lock), Ok(true));
 }
@@ -49,7 +49,7 @@ fn try_exclusive_succeeds_only_on_a_free_lock() {
     assert_eq!(try_acquire_exclusive(&lock), Ok(true));
     assert_eq!(try_acquire_exclusive(&lock), Ok(false));
     assert_eq!(try_acquire_shared(&lock), Ok(false));
-    assert_eq!(release_exclusive(&lock), Ok(()));
+    assert_eq!(release_exclusive(&lock), Ok(false));
     assert_eq!(try_acquire_shared(&lock), Ok(true));
     assert_eq!(try_acquire_exclusive(&lock), Ok(false));
 }
@@ -62,27 +62,21 @@ fn conversion_requires_sole_shared_owner_and_no_claimant() {
     assert_eq!(try_acquire_shared(&lock), Ok(true));
     assert_eq!(try_convert_shared_exclusive(&lock), Ok(false));
     assert_eq!(lock.load(Ordering::Relaxed), 2, "a refused conversion keeps shared ownership");
-    assert_eq!(release_shared(&lock), Ok(()));
+    assert_eq!(release_shared(&lock), Ok(false));
     assert_eq!(try_convert_shared_exclusive(&lock), Ok(true));
     assert_eq!(lock.load(Ordering::Relaxed), EXCLUSIVE);
-    assert_eq!(release_exclusive(&lock), Ok(()));
+    assert_eq!(release_exclusive(&lock), Ok(false));
 
     // A pending exclusive claimant is not displaced by a converting reader.
     assert_eq!(try_acquire_shared(&lock), Ok(true));
     assert_eq!(try_claim_exclusive(&lock), Ok(true));
     assert_eq!(try_convert_shared_exclusive(&lock), Ok(false));
-    assert_eq!(release_shared(&lock), Ok(()));
+    assert_eq!(release_shared(&lock), Ok(false));
     assert_eq!(exclusive_drained(&lock), Ok(true));
 }
 
 #[test]
-fn malformed_words_and_overflow_are_refused() {
-    let lock = AtomicU32::new(0x4000_0000);
-    assert_eq!(try_acquire_shared(&lock), Err(ExSpinLockError::InvalidWord));
-    assert_eq!(try_claim_exclusive(&lock), Err(ExSpinLockError::InvalidWord));
-    assert_eq!(try_acquire_exclusive(&lock), Err(ExSpinLockError::InvalidWord));
-    assert_eq!(release_shared(&lock), Err(ExSpinLockError::InvalidWord));
-    assert_eq!(release_exclusive(&lock), Err(ExSpinLockError::InvalidWord));
+fn shared_count_overflow_is_refused() {
     let full = AtomicU32::new(SHARED_MASK);
     assert_eq!(try_acquire_shared(&full), Err(ExSpinLockError::SharedCountOverflow));
     assert_eq!(full.load(Ordering::Relaxed), SHARED_MASK);
@@ -105,16 +99,46 @@ fn concurrent_readers_and_writers_exclude_each_other() {
                     while !exclusive_drained(&lock).unwrap() { std::thread::yield_now(); }
                     assert_eq!(occupancy.compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst), Ok(0));
                     occupancy.store(0, Ordering::SeqCst);
-                    release_exclusive(&lock).unwrap();
+                    assert!(!release_exclusive(&lock).unwrap());
                 } else {
                     while !try_acquire_shared(&lock).unwrap() { std::thread::yield_now(); }
                     assert!(occupancy.fetch_add(1, Ordering::SeqCst) >= 0);
                     occupancy.fetch_sub(1, Ordering::SeqCst);
-                    release_shared(&lock).unwrap();
+                    assert!(!release_shared(&lock).unwrap());
                 }
             }
         })
     }).collect();
     for thread in threads { thread.join().unwrap(); }
     assert_eq!(lock.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn contended_lanes_park_with_waiters_and_every_release_wakes_them() {
+    let lock = AtomicU32::new(0);
+    assert_eq!(try_acquire_exclusive(&lock), Ok(true));
+    // A reader cannot enter; it records a root-visible wait on the exact observed word.
+    assert_eq!(try_acquire_shared(&lock), Ok(false));
+    let observed = mark_waiting(&lock, lock.load(Ordering::Relaxed)).unwrap().unwrap();
+    assert_eq!(observed, EXCLUSIVE | WAITERS);
+    assert_eq!(mark_waiting(&lock, EXCLUSIVE).unwrap(), None, "a stale observation retries");
+    assert_eq!(exclusive_drained(&lock), Ok(true), "WAITERS is not an owner");
+    assert_eq!(release_exclusive(&lock), Ok(true), "the release must wake the parked reader");
+    assert_eq!(lock.load(Ordering::Relaxed), 0);
+    // Readers hold; an exclusive claimant parks while they drain.
+    assert_eq!(try_acquire_shared(&lock), Ok(true));
+    assert_eq!(try_claim_exclusive(&lock), Ok(true));
+    let observed = mark_waiting(&lock, lock.load(Ordering::Relaxed)).unwrap().unwrap();
+    assert_eq!(observed, EXCLUSIVE | WAITERS | 1);
+    assert_eq!(release_shared(&lock), Ok(true));
+    assert_eq!(lock.load(Ordering::Relaxed), EXCLUSIVE);
+    assert_eq!(exclusive_drained(&lock), Ok(true));
+    assert_eq!(release_exclusive(&lock), Ok(false));
+    // WAITERS left on a free word does not block a later acquisition.
+    lock.store(WAITERS, Ordering::Relaxed);
+    assert_eq!(try_acquire_exclusive(&lock), Ok(true));
+    assert_eq!(release_exclusive(&lock), Ok(true));
+    lock.store(WAITERS, Ordering::Relaxed);
+    assert_eq!(try_acquire_shared(&lock), Ok(true));
+    assert_eq!(release_shared(&lock), Ok(true));
 }

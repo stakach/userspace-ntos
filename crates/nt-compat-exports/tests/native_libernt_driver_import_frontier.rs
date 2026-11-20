@@ -347,9 +347,7 @@ fn pinned_dxgkrnl_in_stack_queued_lock_retains_handle_and_irql() {
         assert!(launch.contains(&format!("\"{name}\",")), "generic registry lacks {name}");
     }
     let adapter = include_str!("../../../components/ntos-executive/src/hosted_driver_queued_spin_lock.rs");
-    assert!(adapter.contains("queued_spin_lock::try_acquire")
-        && adapter.contains("queued_spin_lock::release")
-        && adapter.contains("hosted_raise_irql(DISPATCH_LEVEL)")
+    assert!(adapter.contains("hosted_raise_irql(DISPATCH_LEVEL)")
         && adapter.contains("hosted_lower_irql(old_irql)")
         && adapter.contains("LOCK_HANDLE_OLD_IRQL_OFF"),
         "queue handle must own actual atomic exclusion and restore its saved IRQL");
@@ -478,8 +476,7 @@ fn pinned_dxgkrnl_try_spin_lock_shares_acquire_release_state() {
         assert!(launch.contains(&format!("\"{name}\"")));
     }
     let adapter = include_str!("../../../components/ntos-executive/src/hosted_driver_spin_lock.rs");
-    assert!(adapter.contains("compare_exchange")
-        && adapter.contains("hosted_current_irql")
+    assert!(adapter.contains("hosted_current_irql")
         && adapter.contains("provider_bugcheck")
         && adapter.contains("try_acquire"),
         "try must observe the same lock word and IRQL as all native acquire/release variants");
