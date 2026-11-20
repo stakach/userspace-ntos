@@ -386,6 +386,15 @@ pub struct CmReply {
 pub mod key_flags {
     /// Create the leaf as a volatile key. Ignored when opening an existing key.
     pub const VOLATILE: u16 = 0x0001;
+    /// CM_OP_OPEN_KEY: OBJ_OPENLINK, a final symbolic link key is opened itself.
+    pub const OPEN_LINK: u16 = 0x0002;
+    /// CM_OP_CREATE_SECURED_KEY: REG_OPTION_CREATE_LINK. An existing key is a collision.
+    pub const SYMBOLIC_LINK: u16 = 0x0004;
+}
+
+/// `runtime_key_op::OPEN_RELATIVE` carries these in `CmRuntimeKeyRequest::index`.
+pub mod runtime_open_flags {
+    pub const OPEN_LINK: u32 = 1;
 }
 
 /// `create_key` / `open_key`: a single key path (UTF-16LE) at `[path_offset..]`.
@@ -412,6 +421,8 @@ pub mod runtime_key_op {
     pub const ENUM_KEY: u16 = 7;
     pub const INFO: u16 = 8;
     pub const CLASS: u16 = 9;
+    /// Open `name` beneath `key`. A crossed symbolic link answers CM_STATUS_REPARSE with the
+    /// absolute target (UTF-16LE) as the payload; `index` holds `runtime_open_flags`.
     pub const OPEN_RELATIVE: u16 = 10;
 }
 /// Payload is exactly `name_len` UTF-16 bytes followed by `data_len` bytes.

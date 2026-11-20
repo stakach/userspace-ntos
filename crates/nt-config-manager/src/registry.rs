@@ -192,6 +192,18 @@ struct KeyRecord {
     generation: u32,
     security_descriptor: Option<Vec<u8>>,
     class_name: Option<String>,
+    /// REG_OPTION_CREATE_LINK: the key's target is its `SymbolicLinkValue`.
+    symbolic_link: bool,
+}
+
+/// What a link-aware walk of the runtime registry found (CmpParseKey).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegistryLinkWalk {
+    Found(RegistryKeyId),
+    /// A link key was crossed: open this absolute name instead.
+    Reparse(String),
+    /// A component is absent; `last` when it is the final one (NAME, not PATH, not found).
+    NotFound { last: bool },
 }
 
 /// The registry tree.
@@ -262,6 +274,7 @@ impl Registry {
             generation,
             security_descriptor,
             class_name: None,
+            symbolic_link: false,
         });
         id
     }
@@ -360,6 +373,8 @@ impl Registry {
         if name.is_empty() { return Err(0xC000_0033); }
         let parent = self.open_key(parent_path).ok_or(0xC000_003Au32)?;
         if !volatile && self.is_volatile(parent) { return Err(0xC000_0181); }
+        // CmpDoCreate: a link key has no children.
+        if self.is_symbolic_link(parent) { return Err(0xC000_0022); }
         let mut assigned = Vec::new();
         assigned.try_reserve_exact(descriptor.len()).map_err(|_| 0xC000_009Au32)?;
         assigned.extend_from_slice(descriptor);
@@ -384,6 +399,57 @@ impl Registry {
         let (key, created) = self.create_secured_key(path, descriptor, volatile)?;
         if created { self.record_mut(key).unwrap().class_name = class_name; }
         Ok((key, created))
+    }
+
+    /// REG_OPTION_CREATE_LINK under the exact expected parent. An existing key at `path` is
+    /// STATUS_OBJECT_NAME_COLLISION: a link is created, never opened.
+    pub fn create_secured_link_checked(&mut self, path: &str, descriptor: &[u8], volatile: bool, expected_parent: RegistryKeyId, expected_generation: u32, class: Option<&str>) -> Result<RegistryKeyId, u32> {
+        if self.open_key(path).is_some() { return Err(0xC000_0035); }
+        let (key, created) = self.create_secured_key_checked_with_class(
+            path, descriptor, volatile, expected_parent, expected_generation, class)?;
+        if !created { return Err(0xC000_0035); }
+        self.record_mut(key).unwrap().symbolic_link = true;
+        Ok(key)
+    }
+
+    pub fn is_symbolic_link(&self, key: RegistryKeyId) -> bool {
+        self.record(key).is_some_and(|record| record.symbolic_link)
+    }
+
+    /// CmSetValueKey: a link key holds only its REG_LINK `SymbolicLinkValue`.
+    pub fn link_value_allowed(&self, key: RegistryKeyId, name: &str, value_type: u32) -> bool {
+        !self.is_symbolic_link(key)
+            || (value_type == RegistryValueType::Link as u32
+                && name.eq_ignore_ascii_case(crate::symbolic_link::SYMBOLIC_LINK_VALUE))
+    }
+
+    /// Walk `relative` from `start`, stopping at the first link key to follow; a final link is the
+    /// key itself with `open_link`. `start` itself is never followed.
+    pub fn walk_following_links(
+        &self,
+        start: RegistryKeyId,
+        relative: &str,
+        open_link: bool,
+    ) -> Result<RegistryLinkWalk, crate::symbolic_link::SymbolicLinkError> {
+        let mut key = start;
+        let mut components = relative.split('\\').filter(|part| !part.is_empty()).peekable();
+        while let Some(part) = components.next() {
+            let last = components.peek().is_none();
+            let Some(child) = self.open_subkey(key, part) else {
+                return Ok(RegistryLinkWalk::NotFound { last });
+            };
+            if self.is_symbolic_link(child) && !(last && open_link) {
+                let target = match self.query_value(child, crate::symbolic_link::SYMBOLIC_LINK_VALUE) {
+                    Some(value) => crate::symbolic_link::parse_symbolic_link_value(
+                        value.value_type as u32, &value.data)?,
+                    None => return Err(crate::symbolic_link::SymbolicLinkError::NoTarget),
+                };
+                return crate::symbolic_link::reparse_with_rest(target, components)
+                    .map(RegistryLinkWalk::Reparse);
+            }
+            key = child;
+        }
+        Ok(RegistryLinkWalk::Found(key))
     }
 
     pub fn key_class(&self, key: RegistryKeyId) -> Option<&str> {
@@ -423,6 +489,10 @@ impl Registry {
     pub fn is_volatile(&self, id: RegistryKeyId) -> bool {
         self.record(id).map(|k| k.volatile).unwrap_or(false)
     }
+    pub fn root(&self) -> RegistryKeyId {
+        self.root
+    }
+
     pub fn generation(&self, id: RegistryKeyId) -> Option<u32> {
         self.record(id).map(|k| k.generation)
     }

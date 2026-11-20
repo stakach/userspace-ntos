@@ -342,22 +342,21 @@ impl ExecNtHandler {
             return self.system_key_step(name, Some(target.lease), open_link);
         }
         if let Some(target) = crate::registry_key_targets::runtime(root) {
-            let (reply, _) = crate::config_manager_runtime_key_operation(
-                target.key,
-                nt_config_abi::runtime_key_op::OPEN_RELATIVE,
-                0,
-                name,
-                0,
-                &[],
-            )
-            .map_err(|status| status as u32)?;
+            let key = match crate::config_manager_open_runtime_key_step(Some(target.key), name, open_link)
+                .map_err(|status| status as u32)?
+            {
+                nt_config_client::RuntimeKeyOpen::Key(key) => key,
+                nt_config_client::RuntimeKeyOpen::Reparse(target) => {
+                    return Ok(RegistryTargetStep::Reparse(target));
+                }
+            };
             let mut path = target.path;
             if !name.is_empty() {
                 path.push('\\');
                 path.push_str(name);
             }
             return self
-                .install_cm_runtime_key_target(nt_hive_core::canon_path(&path), reply.detail0)
+                .install_cm_runtime_key_target(nt_hive_core::canon_path(&path), key)
                 .map(RegistryTargetStep::Key);
         }
         // Local hive and overlay resolution has no IPC between validation and lookup. Virtual
@@ -425,8 +424,14 @@ impl ExecNtHandler {
             return Ok(RegistryTargetStep::Key(OVERLAY_KEY_TAG | index as u32));
         }
         if is_cm_runtime_registry_path(path) {
-            let key = crate::config_manager_open_key_id(path).map_err(|status| status as u32)?;
-            return self.install_cm_runtime_key_target(path.into(), key).map(RegistryTargetStep::Key);
+            return match crate::config_manager_open_runtime_key_step(None, path, open_link)
+                .map_err(|status| status as u32)?
+            {
+                nt_config_client::RuntimeKeyOpen::Key(key) => {
+                    self.install_cm_runtime_key_target(path.into(), key).map(RegistryTargetStep::Key)
+                }
+                nt_config_client::RuntimeKeyOpen::Reparse(target) => Ok(RegistryTargetStep::Reparse(target)),
+            };
         }
         if is_system_registry_path(path) {
             return self.system_key_step(path, None, open_link);
@@ -755,10 +760,6 @@ impl ExecNtHandler {
                 return Err(status);
             }
             parent_retention = Some(parent_owner);
-            // CM runtime keys (HARDWARE) are a separate in-memory registry without link keys.
-            if link && is_cm_runtime_registry_path(&state.path) {
-                return Err(STATUS_NOT_SUPPORTED);
-            }
             let runtime_parent = if is_cm_runtime_registry_path(&state.path) {
                 let runtime = self
                     .cm_runtime_key_target(parent)
@@ -835,10 +836,11 @@ impl ExecNtHandler {
             };
             if is_cm_runtime_registry_path(&state.path) {
                 let parent_snapshot = runtime_parent.expect("runtime parent captured")?;
-                let (key, created) = crate::config_manager_create_secured_key_checked_with_class(
+                let (key, created) = crate::config_manager_create_secured_key_of_kind(
                     &state.path,
                     &prepared.descriptor,
                     volatile,
+                    link,
                     parent_snapshot.key,
                     parent_snapshot.generation,
                     class.as_deref(),

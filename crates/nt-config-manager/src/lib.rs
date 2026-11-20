@@ -20,6 +20,7 @@ mod registry;
 mod registry_security;
 mod filter_policy;
 mod key_open_options;
+pub mod symbolic_link;
 #[cfg(test)]
 mod kernel_device_interface_tests;
 
@@ -31,7 +32,7 @@ pub use property::{
     device_property, devprop_type, DevPropKey, DevicePropertySource, PropertyBag, PropertyValue,
 };
 pub use registry::{
-    encode_multi_sz, encode_sz, Registry, RegistryKeyId, RegistryTransaction, RegistryValue,
+    encode_multi_sz, encode_sz, Registry, RegistryKeyId, RegistryLinkWalk, RegistryTransaction, RegistryValue,
     RegistryValueType,
 };
 pub use filter_policy::{DeviceFilterPolicy, DeviceFilterPolicyError};

@@ -271,7 +271,7 @@ impl RegistryOverlay {
                 None => Err(crate::SymbolicLinkError::NoTarget),
             };
             return Some(target.and_then(|target| {
-                crate::symbolic_link::reparse_with_rest(
+                crate::reparse_with_rest(
                     target, components[index + 1..].iter().copied())
             }));
         }

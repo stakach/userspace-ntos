@@ -31,6 +31,7 @@ pub use driver_load_request::{
 mod filter_policy;
 pub use filter_policy::{DeviceFilterPolicySnapshot, UpperFilterLaunchPlanSnapshot};
 mod runtime_key;
+pub use runtime_key::RuntimeKeyOpen;
 mod system_mount;
 pub use system_mount::{SystemHiveMount, SystemHiveMountState};
 mod system_generation;
@@ -1423,7 +1424,14 @@ impl<B: Backend> ConfigClient<B> {
     }
 
     pub fn create_secured_key_checked_with_class(&mut self, path: &str, descriptor: &[u8], volatile: bool, parent_key: u64, parent_generation: u32, class: Option<&str>) -> Result<(u64, bool), i32> {
-        let flags = if volatile { key_flags::VOLATILE } else { 0 };
+        self.create_secured_key_of_kind(path, descriptor, volatile, false, parent_key, parent_generation, class)
+    }
+
+    /// As [`Self::create_secured_key_checked_with_class`]; `symbolic_link` is
+    /// REG_OPTION_CREATE_LINK, where an existing key is STATUS_OBJECT_NAME_COLLISION.
+    pub fn create_secured_key_of_kind(&mut self, path: &str, descriptor: &[u8], volatile: bool, symbolic_link: bool, parent_key: u64, parent_generation: u32, class: Option<&str>) -> Result<(u64, bool), i32> {
+        let flags = if volatile { key_flags::VOLATILE } else { 0 }
+            | if symbolic_link { key_flags::SYMBOLIC_LINK } else { 0 };
         let result = self.key_security_op(opcode::CM_OP_CREATE_SECURED_KEY, path, descriptor, flags, Some((parent_key, parent_generation)), class, &mut [])?;
         if result.status != STATUS_SUCCESS { return Err(result.status); }
         if result.information != 0 || result.detail0 == 0 || result.detail1 > 1 { return Err(STATUS_INVALID_PARAMETER); }

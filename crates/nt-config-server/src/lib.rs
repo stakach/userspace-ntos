@@ -1196,7 +1196,7 @@ impl CmServer {
         match opcode {
             opcode::CM_OP_PING => reply(STATUS_SUCCESS, 0),
             opcode::CM_OP_CREATE_KEY => self.op_create_key(in_buf),
-            opcode::CM_OP_OPEN_KEY => self.op_open_key(in_buf),
+            opcode::CM_OP_OPEN_KEY => self.op_open_key(in_buf, out_buf),
             opcode::CM_OP_RUNTIME_KEY => self.op_runtime_key(in_buf, out_buf),
             opcode::CM_OP_RUNTIME_KEY_SNAPSHOT => self.op_runtime_key_snapshot(in_buf, out_buf),
             opcode::CM_OP_QUERY_KEY_SECURITY | opcode::CM_OP_SET_KEY_SECURITY
@@ -1253,7 +1253,7 @@ impl CmServer {
             || req.reserved != 0 || req.class_reserved != 0 || (!create && req.class_len != 0)
             || (!create && (req.expected_parent != 0 || req.expected_parent_generation != 0))
             || (create && (req.expected_parent == 0 || req.expected_parent_generation > u32::MAX as u64))
-            || req.flags & !(if create { key_flags::VOLATILE } else { 0 }) != 0
+            || req.flags & !(if create { key_flags::VOLATILE | key_flags::SYMBOLIC_LINK } else { 0 }) != 0
             || req.path_offset as usize != header
             || path_end.and_then(|end| end.checked_add(req.class_len as usize)) != Some(req.descriptor_offset as usize)
             || descriptor_end != Some(buf.len())
@@ -1273,7 +1273,17 @@ impl CmServer {
         let descriptor = &buf[req.descriptor_offset as usize..];
         if create {
             let Some(class) = decode(buf, path_end.unwrap() as u32, req.class_len) else { return reply(STATUS_INVALID_PARAMETER, 0); };
-            match self.cm.registry_mut().create_secured_key_checked_with_class(&path, descriptor, req.flags & key_flags::VOLATILE != 0, req.expected_parent, req.expected_parent_generation as u32, (!class.is_empty()).then_some(class.as_str())) {
+            let volatile = req.flags & key_flags::VOLATILE != 0;
+            let class = (!class.is_empty()).then_some(class.as_str());
+            let created = if req.flags & key_flags::SYMBOLIC_LINK != 0 {
+                self.cm.registry_mut().create_secured_link_checked(&path, descriptor, volatile,
+                    req.expected_parent, req.expected_parent_generation as u32, class)
+                    .map(|id| (id, true))
+            } else {
+                self.cm.registry_mut().create_secured_key_checked_with_class(&path, descriptor,
+                    volatile, req.expected_parent, req.expected_parent_generation as u32, class)
+            };
+            match created {
                 Ok((id, created)) => reply_with_info(STATUS_SUCCESS, 0, id, created as u64),
                 Err(status) => reply(status as i32, 0),
             }
@@ -1304,20 +1314,27 @@ impl CmServer {
         reply_with_info(STATUS_SUCCESS, 0, key, created as u64)
     }
 
-    fn op_open_key(&mut self, buf: &[u8]) -> CmReply {
+    fn op_open_key(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
         let Some(req) = CmKeyRequest::from_bytes(buf) else {
             return reply(STATUS_INVALID_PARAMETER, 0);
         };
-        if req.flags != 0 {
+        if req.flags & !key_flags::OPEN_LINK != 0 {
             return reply(STATUS_INVALID_PARAMETER, 0);
         }
         let Some(path) = decode(buf, req.path_offset, req.path_len_bytes) else {
             return reply(STATUS_INVALID_PARAMETER, 0);
         };
-        match self.cm.registry().open_key(&path) {
-            Some(key) => reply(STATUS_SUCCESS, key),
-            None => reply(STATUS_OBJECT_NAME_NOT_FOUND, 0),
-        }
+        let registry = self.cm.registry();
+        // An absolute open reports any missing component as a missing name.
+        let walk = registry
+            .walk_following_links(registry.root(), &path, req.flags & key_flags::OPEN_LINK != 0)
+            .map(|walk| match walk {
+                nt_config_manager::RegistryLinkWalk::NotFound { .. } => {
+                    nt_config_manager::RegistryLinkWalk::NotFound { last: true }
+                }
+                walk => walk,
+            });
+        runtime_key::link_walk_reply(walk, out_buf)
     }
 
     fn op_enumerate_key(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
@@ -1542,6 +1559,9 @@ impl CmServer {
                     }
                     RawValueTarget::Path(path) => self.cm.registry_mut().create_key(&path),
                 };
+                if !self.cm.registry().link_value_allowed(key, &upload.name, upload.value_type as u32) {
+                    return reply(STATUS_ACCESS_DENIED, 0);
+                }
                 if self.cm.registry_mut().set_value(
                     key,
                     &upload.name,

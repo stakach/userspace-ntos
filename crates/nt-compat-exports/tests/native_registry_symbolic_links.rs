@@ -106,3 +106,13 @@ fn links_outside_system_are_created_followed_and_restricted_like_cm_links() {
     assert!(uses(VALUE_MUTATION, "nt_set_value_key_admitted", "registry_key_is_symbolic_link"));
     assert!(uses(VALUE_MUTATION, "nt_set_value_key_admitted", "SYMBOLIC_LINK_VALUE"));
 }
+
+#[test]
+fn hardware_runtime_keys_create_and_follow_links_through_the_cm() {
+    for function in ["acquire_registry_target_step", "acquire_relative_registry_target_step"] {
+        assert!(uses(ADMISSION, function, "config_manager_open_runtime_key_step"), "{function}");
+    }
+    assert!(uses(ADMISSION, "nt_create_key_admitted", "config_manager_create_secured_key_of_kind"));
+    assert!(!ADMISSION.contains("if link && is_cm_runtime_registry_path"),
+        "no hive refuses CREATE_LINK");
+}

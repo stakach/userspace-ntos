@@ -93,7 +93,7 @@ impl CmServer {
             }
             op::OPEN_RELATIVE => {
                 data.is_empty()
-                    && req.index == 0
+                    && req.index & !nt_config_abi::runtime_open_flags::OPEN_LINK == 0
                     && req.value_type == 0
                     && !name.starts_with('\\')
                     && !name.contains('\0')
@@ -108,24 +108,11 @@ impl CmServer {
             return reply(0xC000_017Cu32 as i32, 0);
         }
         match req.operation {
-            op::OPEN_RELATIVE => {
-                let mut key = req.key;
-                let mut names = name.split('\\').filter(|part| !part.is_empty()).peekable();
-                while let Some(part) = names.next() {
-                    let Some(child) = self.cm.registry().open_subkey(key, part) else {
-                        return reply(
-                            if names.peek().is_some() {
-                                0xC000_003Au32 as i32
-                            } else {
-                                STATUS_OBJECT_NAME_NOT_FOUND
-                            },
-                            0,
-                        );
-                    };
-                    key = child;
-                }
-                reply(STATUS_SUCCESS, key)
-            }
+            op::OPEN_RELATIVE => link_walk_reply(
+                self.cm.registry().walk_following_links(
+                    req.key, &name, req.index & nt_config_abi::runtime_open_flags::OPEN_LINK != 0),
+                output,
+            ),
             op::CLASS => {
                 let mut bytes = Vec::new();
                 for unit in self
@@ -151,6 +138,10 @@ impl CmServer {
                 let Some(ty) = RegistryValueType::from_u32(req.value_type) else {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 };
+                // CmSetValueKey: a link key holds only its REG_LINK target.
+                if !self.cm.registry().link_value_allowed(req.key, &name, req.value_type) {
+                    return reply(0xC000_0022u32 as i32, 0);
+                }
                 self.cm
                     .registry_mut()
                     .set_value(req.key, &name, ty, data.to_vec());
@@ -248,6 +239,30 @@ impl CmServer {
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),
         }
+    }
+}
+
+/// CmpParseKey's answer for a runtime walk: the key id in `detail0`, or CM_STATUS_REPARSE with
+/// the absolute target (UTF-16LE) as the payload.
+pub(super) fn link_walk_reply(
+    walk: Result<nt_config_manager::RegistryLinkWalk, nt_config_manager::symbolic_link::SymbolicLinkError>,
+    output: &mut [u8],
+) -> CmReply {
+    use nt_config_manager::RegistryLinkWalk;
+    match walk {
+        Ok(RegistryLinkWalk::Found(key)) => reply(STATUS_SUCCESS, key),
+        Ok(RegistryLinkWalk::NotFound { last: true }) => reply(STATUS_OBJECT_NAME_NOT_FOUND, 0),
+        Ok(RegistryLinkWalk::NotFound { last: false }) => reply(0xC000_003Au32 as i32, 0),
+        Ok(RegistryLinkWalk::Reparse(target)) => {
+            let bytes: Vec<u8> = target.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            if output.len() < bytes.len() {
+                return reply_with_info(STATUS_BUFFER_TOO_SMALL, bytes.len() as u32, 0, 0);
+            }
+            output[..bytes.len()].copy_from_slice(&bytes);
+            reply_with_info(nt_config_abi::CM_STATUS_REPARSE, bytes.len() as u32, 0, 0)
+        }
+        // CmpGetSymbolicLink failure: the open fails as a missing name.
+        Err(_) => reply(STATUS_OBJECT_NAME_NOT_FOUND, 0),
     }
 }
 

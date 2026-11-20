@@ -16053,6 +16053,15 @@ pub(crate) unsafe fn config_manager_open_key_id(path: &str) -> Result<u64, i32> 
     CONFIG_CLIENT_PTR.as_mut().ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?.open_key_id(path)
 }
 
+/// One link-aware runtime OPEN step (absolute `path`, or `name` beneath `root`).
+pub(crate) unsafe fn config_manager_open_runtime_key_step(root: Option<u64>, path: &str, open_link: bool) -> Result<nt_config_client::RuntimeKeyOpen, i32> {
+    let client = CONFIG_CLIENT_PTR.as_mut().ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    match root {
+        Some(root) => client.open_runtime_relative(root, path, open_link),
+        None => client.open_key_id_following(path, open_link),
+    }
+}
+
 pub(crate) unsafe fn config_manager_runtime_key_class(key: u64) -> Result<Option<alloc::string::String>, i32> {
     CONFIG_CLIENT_PTR.as_mut().ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?.runtime_key_class(key)
 }
@@ -16062,7 +16071,11 @@ pub(crate) unsafe fn config_manager_runtime_key_operation(key: u64, operation: u
 }
 
 pub(crate) unsafe fn config_manager_create_secured_key_checked_with_class(path: &str, descriptor: &[u8], volatile: bool, parent_key: u64, parent_generation: u32, class: Option<&str>) -> Result<(u64, bool), i32> {
-    CONFIG_CLIENT_PTR.as_mut().ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?.create_secured_key_checked_with_class(path, descriptor, volatile, parent_key, parent_generation, class)
+    config_manager_create_secured_key_of_kind(path, descriptor, volatile, false, parent_key, parent_generation, class)
+}
+
+pub(crate) unsafe fn config_manager_create_secured_key_of_kind(path: &str, descriptor: &[u8], volatile: bool, symbolic_link: bool, parent_key: u64, parent_generation: u32, class: Option<&str>) -> Result<(u64, bool), i32> {
+    CONFIG_CLIENT_PTR.as_mut().ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?.create_secured_key_of_kind(path, descriptor, volatile, symbolic_link, parent_key, parent_generation, class)
 }
 
 pub(crate) unsafe fn config_manager_set_dword(

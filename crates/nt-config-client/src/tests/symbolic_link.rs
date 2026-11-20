@@ -60,3 +60,31 @@ fn open_link_acquires_the_link_key_itself() {
     assert_eq!(link.value_type, RegistryValueType::Link as u32);
     retained_test_keys::close(&mut client, opened.lease).unwrap();
 }
+
+const HARDWARE_LINK: &str = r"\Registry\Machine\HARDWARE\DEVICEMAP\Link";
+const HARDWARE_TARGET: &str = r"\Registry\Machine\HARDWARE\DESCRIPTION\System";
+
+#[test]
+fn a_runtime_link_is_created_and_followed_through_the_cm_protocol() {
+    let mut client = client();
+    let parent = client.create_key(r"\Registry\Machine\HARDWARE\DEVICEMAP").unwrap();
+    let snapshot = client.query_key_security_snapshot(r"\Registry\Machine\HARDWARE\DEVICEMAP").unwrap();
+    let (link, created) = client.create_secured_key_of_kind(HARDWARE_LINK, &snapshot.descriptor,
+        true, true, parent, snapshot.generation, None).unwrap();
+    assert!(created);
+    assert_eq!(client.create_secured_key_of_kind(HARDWARE_LINK, &snapshot.descriptor, true, true,
+        parent, snapshot.generation, None), Err(0xC000_0035u32 as i32), "a link is never reopened");
+    // Only the REG_LINK target may be set on it.
+    let target: Vec<u8> = HARDWARE_TARGET.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert_eq!(client.runtime_key_operation(link, nt_config_abi::runtime_key_op::SET_VALUE, 0,
+        "Other", RegistryValueType::Sz as u32, &target).err(), Some(0xC000_0022u32 as i32));
+    client.runtime_key_operation(link, nt_config_abi::runtime_key_op::SET_VALUE, 0,
+        "SymbolicLinkValue", RegistryValueType::Link as u32, &target).unwrap();
+    assert_eq!(client.open_key_id_following(&format!(r"{HARDWARE_LINK}\Bus"), false),
+        Ok(RuntimeKeyOpen::Reparse(format!(r"{HARDWARE_TARGET}\Bus"))));
+    assert_eq!(client.open_key_id_following(HARDWARE_LINK, true), Ok(RuntimeKeyOpen::Key(link)));
+    assert_eq!(client.open_runtime_relative(parent, "Link", false),
+        Ok(RuntimeKeyOpen::Reparse(HARDWARE_TARGET.into())));
+    assert_eq!(client.open_runtime_relative(parent, "Link", true), Ok(RuntimeKeyOpen::Key(link)));
+    assert_eq!(client.open_key_id(HARDWARE_LINK), Err(nt_config_abi::CM_STATUS_REPARSE));
+}
