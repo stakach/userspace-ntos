@@ -27,6 +27,9 @@ pub struct NativeHandleCaller {
     system: InitialSystemIdentity,
     original_thread: ThreadLifetime,
     effective_process: ProcessId,
+    /// Creation sequence of an attached effective process (KeStackAttachProcess); `None` when
+    /// the effective process is the original thread's own process.
+    attached_sequence: Option<u64>,
     mode: AccessMode,
 }
 
@@ -647,22 +650,61 @@ impl ProcessManager {
             system,
             original_thread: thread,
             effective_process: thread.process_id(),
+            attached_sequence: None,
             mode,
         };
         self.validate_native_handle_caller(caller)?;
         Ok(caller)
     }
 
+    /// The same kernel-mode caller attached to `process` (KeStackAttachProcess): untagged
+    /// handles resolve in the attached process's table, as NT's current process. An exiting
+    /// process remains attachable until its handle table is run down (ObKillProcess).
+    pub fn attach_native_handle_caller(
+        &self,
+        caller: NativeHandleCaller,
+        process: ProcessId,
+    ) -> Result<NativeHandleCaller, u32> {
+        self.validate_native_handle_caller(caller)?;
+        if caller.mode != AccessMode::KernelMode || caller.attached_sequence.is_some() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let sequence = self
+            .processes
+            .get(&process)
+            .map(|target| target.creation_sequence)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let attached = NativeHandleCaller {
+            effective_process: process,
+            attached_sequence: Some(sequence),
+            ..caller
+        };
+        self.validate_native_handle_caller(attached)?;
+        Ok(attached)
+    }
+
     pub fn validate_native_handle_caller(&self, caller: NativeHandleCaller) -> Result<(), u32> {
         if self.initial_system_identity() != Some(caller.system)
             || !self.initial_system_references_held()
             || !self.validate_thread_lifetime(caller.original_thread)
-            || caller.effective_process != caller.original_thread.process_id()
+            || caller.attached_sequence.is_none()
+                && caller.effective_process != caller.original_thread.process_id()
         {
             return Err(STATUS_INVALID_HANDLE);
         }
+        if let Some(sequence) = caller.attached_sequence {
+            let attached = self
+                .processes
+                .get(&caller.effective_process)
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            if attached.creation_sequence != sequence
+                || attached.handle_table_run_down
+            {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+        }
         let process = self
-            .process(caller.effective_process)
+            .process(caller.original_thread.process_id())
             .ok_or(STATUS_INVALID_HANDLE)?;
         let thread = self
             .thread(caller.original_thread.thread_id())

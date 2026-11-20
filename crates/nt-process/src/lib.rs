@@ -746,6 +746,9 @@ pub struct NtProcess {
     /// Opaque `WINDOWSTATION` pointer (`PsSetProcessWindowStation` /
     /// `PsGetProcessWin32WindowStation`).
     pub win32_window_station: Option<u64>,
+    /// ObKillProcess has run: the handle table is closed to every caller, including callers
+    /// attached to this exiting process. Until then an exiting process keeps its table.
+    handle_table_run_down: bool,
     /// Lazy, stable `ProcessCookie` returned by `NtQueryInformationProcess` class 36.
     process_cookie: u32,
     /// `EPROCESS.DefaultHardErrorProcessing`, queried/set by
@@ -1502,6 +1505,7 @@ impl ProcessManager {
                 win32_process: None,
                 kernel_process_object: None,
                 win32_window_station: None,
+                handle_table_run_down: false,
                 process_cookie: 0,
                 default_hard_error_processing,
                 break_on_termination: false,
@@ -5526,6 +5530,22 @@ impl ProcessManager {
     }
     /// Remove one arbitrary handle from `pid`. Hosts use this during process teardown to release
     /// backing-object references owned outside the process manager.
+    /// ObKillProcess: close the terminated process's handle table to all callers before its
+    /// entries are swept with [`Self::take_any_handle`]. NT runs this after the Win32 process
+    /// callout, so the callout can still use the process's own handles. Idempotent.
+    pub fn run_down_process_handle_table(&mut self, pid: ProcessId) -> Result<(), u32> {
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        if process.state != ProcessState::Terminated {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        process.handle_table_run_down = true;
+        Ok(())
+    }
+
+    pub fn process_handle_table_run_down(&self, pid: ProcessId) -> bool {
+        self.processes.get(&pid).is_some_and(|process| process.handle_table_run_down)
+    }
+
     pub fn take_any_handle(&mut self, pid: ProcessId) -> Option<HandleObject> {
         let proc = self.processes.get_mut(&pid)?;
         proc.handles

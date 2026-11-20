@@ -21145,6 +21145,16 @@ impl ExecNtHandler {
     }
 
     fn reserve_rundown_hosted_files(&mut self, pid: nt_process::ProcessId) -> Result<Vec<u64>, u32> {
+        let caller = self.native_handle_caller(nt_syscall::ProcessorMode::KernelMode);
+        self.reserve_rundown_hosted_files_for(pid, caller)
+    }
+
+    /// `caller` is resolved only when the table holds a hosted File to reserve.
+    fn reserve_rundown_hosted_files_for(
+        &mut self,
+        pid: nt_process::ProcessId,
+        caller: Result<nt_process::native_handle::NativeHandleCaller, u32>,
+    ) -> Result<Vec<u64>, u32> {
         let objects = self.pm.snapshot_process_handle_objects(pid)?;
         let mut files = Vec::new();
         files
@@ -21163,7 +21173,7 @@ impl ExecNtHandler {
         if files.is_empty() {
             return Ok(files);
         }
-        let caller = self.native_handle_caller(nt_syscall::ProcessorMode::KernelMode)?;
+        let caller = caller?;
         let mut reserved = 0;
         for &file_id in &files {
             let requestor = match self.pm.reference_native_requestor(caller) {
@@ -21195,7 +21205,48 @@ impl ExecNtHandler {
         }
     }
 
+    /// ObKillProcess for a terminated process. NT runs it after the last thread's Win32 process
+    /// callout (PspExitThread), which still uses the process's own handles, e.g. the inherited
+    /// window station UserProcessDestroy references. A Win32 process therefore keeps its table
+    /// until [`Self::run_down_win32_exited_process_handles`] observes that callout's return.
     fn release_process_handles(&mut self, pid: nt_process::ProcessId, reserved_files: Vec<u64>) {
+        if self.pm.process_win32(pid).is_some() {
+            self.cancel_rundown_hosted_files(&reserved_files);
+            return;
+        }
+        self.run_down_process_handles(pid, reserved_files);
+    }
+
+    /// The Win32 process-exit callout has returned and no execution remains: run the deferred
+    /// handle table down. File close requestor is System attached to the exiting process.
+    /// Returns false while the rundown cannot yet be reserved; nothing has been closed then.
+    fn run_down_win32_exited_process_handles(&mut self, pid: nt_process::ProcessId) -> bool {
+        if self.pm.process_handle_table_run_down(pid) {
+            return true;
+        }
+        if self.pm.process_win32(pid).is_some() {
+            return false;
+        }
+        let caller = self
+            .pm
+            .initial_system_identity()
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)
+            .and_then(|system| {
+                self.pm.capture_native_handle_caller(system.thread(), nt_types::AccessMode::KernelMode)
+            })
+            .and_then(|system| self.pm.attach_native_handle_caller(system, pid));
+        let Ok(reserved_files) = self.reserve_rundown_hosted_files_for(pid, caller) else {
+            return false;
+        };
+        self.run_down_process_handles(pid, reserved_files);
+        self.pm.process_handle_table_run_down(pid)
+    }
+
+    fn run_down_process_handles(&mut self, pid: nt_process::ProcessId, reserved_files: Vec<u64>) {
+        if self.pm.run_down_process_handle_table(pid).is_err() {
+            self.cancel_rundown_hosted_files(&reserved_files);
+            return;
+        }
         if let Some(pi) = self.pi_for_pid(pid) {
             if let Some(process) = self.capture_process_identity(pi) {
                 // The exact deletion candidate retains failed broker rundown for retry.
@@ -21472,6 +21523,14 @@ impl ExecNtHandler {
         loop {
             match candidate.phase {
                 nt_user_host::ProcessDeletionPhase::AwaitingExecutionQuiescence => {
+                    // ObKillProcess follows the final thread's Win32 process-exit callout and
+                    // precedes the I/O and LPC drains that closing the process's handles settles.
+                    if self.pm.is_process_signaled(pid)
+                        && !self.thread_runtime.has_process(pi)
+                        && !self.run_down_win32_exited_process_handles(pid)
+                    {
+                        return HostedProcessDeletionOutcome::Pending(candidate.phase);
+                    }
                     if !self.io_completion_dependents_quiescent_exact(
                         pi, pid, candidate.generation,
                     ) || !self.lpc_wait_dependents_quiescent_exact(
