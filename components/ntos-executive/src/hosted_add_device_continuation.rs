@@ -489,12 +489,6 @@ enum AddDeviceFinishProgress {
     RetainedCommit(hosted_add_device_rollback::Reservation, u64, usize),
 }
 
-enum AddDevicePreparation {
-    Ready(AddDeviceTransaction),
-    Rejected(nt_status::NtStatus),
-    Retained(AddDeviceTransaction, nt_status::NtStatus),
-}
-
 struct AddDeviceRetainedOwners {
     transaction: Option<AddDeviceTransaction>,
     pump: Option<AddDevicePumpContinuation>,
@@ -1015,4 +1009,3 @@ mod preparation;
 use preparation::{
     call_add_device_for_existing_pdo_progress, continue_typed_after_projection,
 };
-pub(super) use preparation::call_add_device_for_existing_pdo;

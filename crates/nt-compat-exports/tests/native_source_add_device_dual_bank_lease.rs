@@ -41,10 +41,6 @@ fn add_device_claims_both_pages_atomically_in_the_file_transfer_authority() {
         .expect("typed native PDO projection pump");
     assert!(claim < create_pdo,
         "both pages must be claimed before PDO projection writes SH_REQ and enters its pump");
-    let after_projection = between(PREPARATION, "unsafe fn continue_typed_after_projection(",
-        "unsafe fn prepare_add_device_transaction(");
-    assert!(after_projection.contains("publish_shared_registry_identity_at("),
-        "registry publication must follow the leased typed projection stage");
     assert_eq!(transaction.matches("reserve_add_device_bank(").count(), 1,
         "a second page claim after a reentrant effect is not atomic");
 

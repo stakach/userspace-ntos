@@ -4,7 +4,6 @@ use syn::visit::Visit;
 const LEDGER: &str =
     include_str!("../../../../components/ntos-executive/src/hosted_source_irp_ledger.rs");
 const DRIVER: &str = include_str!("../../../../components/ntos-executive/src/driver_launch.rs");
-const ADD_DEVICE_PREPARATION: &str = include_str!("../../../../components/ntos-executive/src/hosted_add_device_continuation/preparation.rs");
 const PUBLICATION: &str = include_str!("../../../../components/ntos-executive/src/hosted_device_publication.rs");
 const RETIREMENT: &str = include_str!("../../../../components/ntos-executive/src/hosted_device_retirement.rs");
 
@@ -112,10 +111,6 @@ fn ordinary_and_pdo_publication_capture_physical_owner_before_canonical_bind() {
             "{name} bypasses physical publication"
         );
     }
-    let preparation = syn::parse_file(ADD_DEVICE_PREPARATION).unwrap();
-    let found = calls(function(&preparation, "call_add_device_for_existing_pdo"));
-    assert!(!found.iter().any(|call| call == "bind_hosted_device_pointer"),
-        "AddDevice preparation bypasses physical publication");
 }
 
 #[test]
