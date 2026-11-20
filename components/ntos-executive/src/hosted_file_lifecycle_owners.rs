@@ -9,6 +9,10 @@ use nt_io_manager::owned_file_lifecycle::{
 };
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
 
+#[path = "lifecycle_ready_scan.rs"]
+mod ready_scan;
+use ready_scan::{first_ready, PassClock};
+
 enum Payload {
     Prepared(PreparedFileLifecycle),
     Returned(FileLifecycleReturn),
@@ -385,9 +389,15 @@ fn queued_route_ready(file_id: FileId) -> bool {
 
 /// No queue claims, backend polling or native effects occur before parent parking.
 pub(super) fn nested_ready(file_id: FileId) -> bool {
-    let Some(index) = index(file_id) else { return false; };
-    let row = &rows()[index];
-    if row.executing || (row.retry_after != 0 && row.retry_after > monotonic_time_100ns()) {
+    let Some(slot) = index(file_id) else { return false; };
+    nested_ready_at(slot, &mut PassClock::new(|| monotonic_time_100ns()))
+}
+
+/// Readiness of the row in `slot`; a scan passes the slot it holds instead of searching for it.
+fn nested_ready_at<F: FnMut() -> u64>(slot: usize, clock: &mut PassClock<F>) -> bool {
+    let row = &rows()[slot];
+    let file_id = row.file_id;
+    if row.executing || clock.deferred(row.retry_after) {
         return false;
     }
     match row.payload.as_ref() {
@@ -449,22 +459,17 @@ pub(super) fn nested_step(file_id: FileId, executor: NativeHandleCaller) -> bool
     progress || completion_progress || before != (rows()[slot].retry_after, rows()[slot].blocked)
 }
 
+fn first_nested_ready() -> Option<FileId> {
+    let mut clock = PassClock::new(|| monotonic_time_100ns());
+    first_ready(rows().len(), &mut clock, nested_ready_at).map(|slot| rows()[slot].file_id)
+}
+
 pub(super) fn nested_work_ready() -> bool {
-    let count = rows().len();
-    for slot in 0..count {
-        let file_id = rows()[slot].file_id;
-        if nested_ready(file_id) { return true; }
-    }
-    false
+    first_nested_ready().is_some()
 }
 
 pub(super) fn nested_work_step(executor: NativeHandleCaller) -> bool {
-    let count = rows().len();
-    for slot in 0..count {
-        let file_id = rows()[slot].file_id;
-        if nested_ready(file_id) { return nested_step(file_id, executor); }
-    }
-    false
+    first_nested_ready().is_some_and(|file_id| nested_step(file_id, executor))
 }
 
 /// Drive bounded work without keeping an I/O-manager borrow across driver entry.
