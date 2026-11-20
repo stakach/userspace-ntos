@@ -42,3 +42,21 @@ fn nested_prelude_and_effective_identity_precede_root_reservation() {
         && client < revalidate && effective_ssn < revalidate && revalidate < reserve,
         "nested credential calls, effective SSN and exact client must settle before page ownership");
 }
+
+// Boot 2 of 44748352997: pi 25's NtUser 0x108d found the page held (not-top), had no matching
+// pre-entry witness, and the root panicked ("no retainable Call"). Every hosted Call is retained
+// in its ingress row before delivery, so a busy root ingress always returns it there.
+#[test]
+fn a_busy_root_ingress_returns_its_call_whether_or_not_the_witness_matched() {
+    let arm = ordinary_win32k_arm();
+    let reserve = arm.find("win32k_shared_page_authority::reserve(").unwrap();
+    let refusal = &arm[reserve..];
+    let refused = refusal.find("Err(error)=>{").expect("one refusal arm");
+    let first_arg = refusal.find("letarg=win32k_subsystem::WIN32K_ARG_VADDR;").unwrap();
+    let body = &refusal[refused..first_arg];
+    assert!(!refusal[..refused].contains("ifpreentry_current"),
+        "retaining the Call does not depend on the witness");
+    assert!(body.contains("defer_hosted_delivery("), "the Call returns to its ingress owner");
+    assert!(body.contains("trace_root_ingress_busy("), "the holder is named");
+    assert!(body.contains("returnControlFlow::Break(Turn::Next);"));
+}

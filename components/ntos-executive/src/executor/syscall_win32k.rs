@@ -290,12 +290,26 @@ pub(super) unsafe fn syscall_win32k_route(
             },
         ) {
             Ok(held) => Some(held),
-            Err(_) if preentry_current => {
-                // Busy: nothing of this Call has run. Return it to its ingress owner unexecuted
-                // and take the next delivery; it is redelivered once the page is free.
-                crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+            Err(error) => {
+                // Busy: nothing of this Call has run, and every hosted Call is retained in its
+                // ingress row (retain records it before delivery). Return it there unexecuted and
+                // take the next delivery; it is redelivered once the page is free. The witness
+                // only records whether the prelude changed the Call; it is not required to retain.
+                let returned = crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
                     local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge,
-                ).expect("an unexecuted witnessed Call retains its exact ingress owner");
+                );
+                crate::win32k_shared_page_authority::trace_root_ingress_busy(
+                    dispatch_id, win32k_glue::shared_page_client_identity(dispatch_client),
+                    lp.msg.m0, error, preentry_current, returned.is_ok(),
+                );
+                if let Err(refusal) = returned {
+                    // Only a selected Receive child has no row to return to. Receiving now would
+                    // drop its Reply, and dispatching would write over the holder: fail fast.
+                    print_str(b"[w32k-page-authority] root ingress refused an unreturnable Call ingress-error=");
+                    print_u64(refusal as u64);
+                    print_str(b"\n");
+                    panic!("win32k root ingress found the shared page held and could not return the Call");
+                }
                 let fault_ep = lp.ingress.fault_ep;
                 let received = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep,
@@ -303,16 +317,6 @@ pub(super) unsafe fn syscall_win32k_route(
                 )?;
                 (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
                 return ControlFlow::Break(Turn::Next);
-            }
-            Err(error) => {
-                // No witnessed Call to return: fail fast rather than write over the holder.
-                print_str(b"[w32k-page-authority] root ingress refused with no retainable Call pi/tid/ssn/error=");
-                for value in [pi as u64, current_tid as u64, lp.msg.m0, error as u64] {
-                    print_str(b"/");
-                    print_hex_u64(value);
-                }
-                print_str(b"\n");
-                panic!("win32k root ingress found the shared page held with no retainable Call");
             }
         }
     };

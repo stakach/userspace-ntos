@@ -183,6 +183,48 @@ fn report(site: &[u8], op: &[u8], error: &[u8], dispatch_id: u64, client: nt_use
     crate::print_str(b"/");
     crate::print_u64(client.tid);
     crate::print_str(b" holder=");
+    print_holder(holder);
+    crate::print_str(b"\n");
+}
+
+static ROOT_INGRESS_BUSY_TRACES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A root ingress found the page held and returned its Call to the ingress owner. Names the
+/// holder (the dispatch that keeps the page), whether the prelude witness still matched, and
+/// whether the return succeeded. Bounded: 16, then powers of two.
+pub(crate) fn trace_root_ingress_busy(
+    dispatch_id: u64,
+    client: nt_user_callback::SharedPageClientIdentity,
+    ssn: u64,
+    error: SharedPageLeaseError,
+    witnessed: bool,
+    returned: bool,
+) {
+    let sample = ROOT_INGRESS_BUSY_TRACES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample > 16 && !sample.is_power_of_two() { return; }
+    let holder = transition(|authority| authority.audit_holder());
+    crate::print_str(b"[w32k-page-authority] root ingress busy sample=");
+    crate::print_u64(sample);
+    crate::print_str(b" dispatch=");
+    crate::print_u64(dispatch_id);
+    crate::print_str(b" pi/tid=");
+    crate::print_u64(u64::from(client.pi));
+    crate::print_str(b"/");
+    crate::print_u64(client.tid);
+    crate::print_str(b" ssn=0x");
+    crate::print_hex_u64(ssn);
+    crate::print_str(b" error=");
+    crate::print_str(error_name(error));
+    crate::print_str(b" witnessed=");
+    crate::print_u64(u64::from(witnessed));
+    crate::print_str(b" returned=");
+    crate::print_u64(u64::from(returned));
+    crate::print_str(b" holder=");
+    print_holder(holder);
+    crate::print_str(b"\n");
+}
+
+fn print_holder(holder: nt_user_callback::SharedPageAuditHolder) {
     let (kind, id): (&[u8], u64) = match holder {
         nt_user_callback::SharedPageAuditHolder::None => (b"none", 0),
         nt_user_callback::SharedPageAuditHolder::Reserved(id) => (b"reserved", id),
@@ -193,7 +235,6 @@ fn report(site: &[u8], op: &[u8], error: &[u8], dispatch_id: u64, client: nt_use
     crate::print_str(kind);
     crate::print_str(b":");
     crate::print_u64(id);
-    crate::print_str(b"\n");
 }
 
 /// One pump return (or a lend of the page) settles its dispatch's hold exactly once.
