@@ -106,31 +106,41 @@ fn concurrent_lanes_exclude_each_other_without_spinning_on_a_held_word() {
     assert_eq!(word.load(Ordering::Relaxed), 0);
 }
 
-// Boots 44717077667 and 44735317922 (#423): mouclass's ClassRead lane held DeviceExtension
-// ->SpinLock and was stopped in its IoCompleteRequest root call. Inside that call the root
-// drained i8042's DPC, whose ClassCallback found the lock held. A DPC lane cannot park (it has no
-// provider wait owner), so it spun and yielded, and the root never answered the holder.
-// The domain is one processor: its DPC may not start while a lane is at DISPATCH_LEVEL.
+// Boots 44717077667, 44735317922 and 44748352997 boot 1 (#423): mouclass's ClassRead lane held
+// DeviceExtension->SpinLock and was stopped in its IoCompleteRequest root call. Inside that call
+// the root drained i8042's DPC, whose ClassCallback found the lock held. A DPC lane cannot park
+// (it has no provider wait owner), so it spun and yielded, and the root never answered the
+// holder. A per-domain IRQL byte did not catch it (74aae474): other lanes rewrite that byte.
+// The domain is one processor: its DPC may not start while any of its spin locks is held.
 #[test]
 fn a_dpc_never_starts_while_a_stopped_lane_of_its_domain_holds_a_spin_lock() {
     const CLASS_READ: u64 = 0x1000_f000_000;
     const DPC_LANE: u64 = 0x1001_1000_000;
+    let held = AtomicU64::new(0);
     let device_lock = AtomicU64::new(0);
-    // ClassRead: KeAcquireSpinLock raises to DISPATCH_LEVEL, takes the lock, then calls the root
-    // (IoCompleteRequest) and stops there.
-    let mut class_read_irql = DISPATCH_LEVEL;
+    // ClassRead takes the lock, then calls the root (IoCompleteRequest) and stops there.
     assert_eq!(acquire(&device_lock, CLASS_READ), Ok(Acquire::Acquired));
-    let passive_lane = 0u8;
+    note_acquired(&held);
     // While it is stopped, the root's DPC pass may not start the domain's DPC.
-    assert!(!dpc_may_start([class_read_irql, passive_lane]));
+    assert!(!dpc_may_start(held.load(Ordering::Acquire)));
     // Had it started, the DPC's ClassCallback could only wait on a holder that cannot run.
     assert!(matches!(acquire(&device_lock, DPC_LANE),
         Ok(Acquire::Park { holder: CLASS_READ, .. })));
-    // The root answers IoCompleteRequest; ClassRead releases and lowers its IRQL.
+    // The root answers IoCompleteRequest; ClassRead releases.
     assert!(release(&device_lock, CLASS_READ).unwrap(), "the would-be waiter was published");
-    class_read_irql = 0;
+    note_released(&held).unwrap();
     // The next DPC pass starts the queued DPC, and ClassCallback takes the lock.
-    assert!(dpc_may_start([class_read_irql, passive_lane]));
+    assert!(dpc_may_start(held.load(Ordering::Acquire)));
     assert_eq!(acquire(&device_lock, DPC_LANE), Ok(Acquire::Acquired));
-    assert!(dpc_may_start(core::iter::empty()), "a domain with no lanes has no holder");
+}
+
+#[test]
+fn an_unbalanced_release_cannot_wrap_the_domain_count() {
+    let held = AtomicU64::new(0);
+    assert_eq!(note_released(&held), Err(SpinError::NotOwner));
+    assert!(dpc_may_start(held.load(Ordering::Acquire)), "the count stays at zero");
+    note_acquired(&held);
+    note_acquired(&held);
+    note_released(&held).unwrap();
+    assert!(!dpc_may_start(held.load(Ordering::Acquire)), "one of two locks is still held");
 }

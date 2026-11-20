@@ -18,8 +18,10 @@ fn fault(lock: u64, detail: u64) -> ! {
 }
 
 fn try_acquire(lock: u64) -> bool {
-    nt_kernel_exec::hosted_spin_wait::try_acquire(word(lock), hosted_driver_spin_wait::lane_token())
-        .unwrap_or_else(|error| fault(lock, error as u64))
+    let acquired = nt_kernel_exec::hosted_spin_wait::try_acquire(word(lock), hosted_driver_spin_wait::lane_token())
+        .unwrap_or_else(|error| fault(lock, error as u64));
+    if acquired { hosted_driver_spin_wait::note_acquired(); }
+    acquired
 }
 
 /// Acquire for the calling lane. Contention parks in the root rather than spinning, because the
@@ -27,6 +29,7 @@ fn try_acquire(lock: u64) -> bool {
 pub(super) fn acquire_word(lock: u64) {
     hosted_driver_spin_wait::acquire(word(lock), lock, hosted_driver_spin_wait::lane_token())
         .unwrap_or_else(|error| fault(lock, error as u64));
+    hosted_driver_spin_wait::note_acquired();
 }
 
 /// NT KeReleaseSpinLock does not identify the releasing thread; only a held word is released.
@@ -35,6 +38,7 @@ pub(super) fn release_word(lock: u64) {
     if previous & nt_kernel_exec::hosted_spin_wait::HELD == 0 {
         unsafe { crate::provider_bugcheck::report(0xc4, [0x5350_494e, lock, 1, 0]); }
     }
+    hosted_driver_spin_wait::note_released(lock);
     if previous & nt_kernel_exec::hosted_spin_wait::WAITERS != 0 {
         hosted_driver_spin_wait::wake(lock);
     }

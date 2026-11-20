@@ -51,6 +51,7 @@ fn acquire_inner(lock: u64, handle: u64, raise: bool) {
         if hosted_driver_spin_wait::acquire(word, lock, handle).is_err() {
             invalid(lock, handle, 3);
         }
+        hosted_driver_spin_wait::note_acquired();
     }
 }
 
@@ -90,6 +91,7 @@ fn release_inner(handle: u64, lower: bool) {
             Ok(false) => {}
             Err(_) => invalid(lock, handle, 6),
         }
+        hosted_driver_spin_wait::note_released(lock);
         write_unaligned((handle + LOCK_HANDLE_LOCK_OFF) as *mut u64, 0);
         if lower { hosted_lower_irql(old_irql); }
     }

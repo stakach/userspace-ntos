@@ -1163,6 +1163,7 @@ pub const SH_VIDEO_MEMORY_CALLER_VA: u64 = 0x760; // in: VA mapped in the EngDev
 pub const SH_VIDEO_MEMORY_MAPPED_VA: u64 = 0x768; // out: last VideoPortMapMemory caller VA
 pub const SH_RESOURCE_IO_PORT_OUT32_FAULTS: u64 = 0x778; // out: serviced WRITE_PORT_ULONG calls
 pub const SH_HOSTED_CURRENT_IRQL: u64 = 0x990; // in/out: hosted KIRQL byte for patched CR8 helpers
+pub const SH_HOSTED_SPIN_LOCKS_HELD: u64 = 0x998; // out: hosted spin locks the domain holds (#423)
 pub const SH_VIDEO_HW_FIND_ADAPTER: u64 = 0x9A8; // out: captured VIDEO_HW_INITIALIZATION_DATA.HwFindAdapter
 pub const SH_VIDEO_HW_INITIALIZE: u64 = 0x9B0; // out: captured VIDEO_HW_INITIALIZATION_DATA.HwInitialize
 pub const SH_VIDEO_HW_START_IO: u64 = 0x9B8; // out: captured VIDEO_HW_INITIALIZATION_DATA.HwStartIO
@@ -1895,10 +1896,12 @@ fn acquire_cancel_spin_lock_word() {
         .unwrap_or_else(|error| unsafe {
             crate::provider_bugcheck::report(0xc4, [0x4341_4e43, lock, error as u64, 0])
         });
+    hosted_driver_spin_wait::note_acquired();
 }
 
 fn release_cancel_spin_lock_word() {
     let previous = IO_CANCEL_SPIN_LOCK.swap(0, Ordering::Release);
+    hosted_driver_spin_wait::note_released(core::ptr::addr_of!(IO_CANCEL_SPIN_LOCK) as u64);
     if previous & nt_kernel_exec::hosted_spin_wait::WAITERS != 0 {
         hosted_driver_spin_wait::wake(core::ptr::addr_of!(IO_CANCEL_SPIN_LOCK) as u64);
     }
@@ -16753,28 +16756,26 @@ fn trace_connect_dpc_probe(stage: u64, first: u64, second: u64, third: u64) {
 }
 
 /// Run a due, paced DPC pass. Self-requeued work retains its wake for a later scheduler boundary.
-static DPC_DISPATCH_LEVEL_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+static DPC_HELD_LOCK_DEFERRALS: AtomicU64 = AtomicU64::new(0);
 
-/// #423: whether a DPC of this hosted domain may start now. None of the domain's lanes may be at
-/// DISPATCH_LEVEL: such a lane is stopped mid critical section (holding a spin lock across a
-/// root call), and the DPC could only spin on it. The ordinary bank of each of the domain's
-/// instances carries its lanes' IRQL. A refusal leaves the DPC queued for the next pass.
+/// #423: whether a DPC of this hosted domain may start now. While the root runs, a spin lock the
+/// domain holds belongs to a lane stopped mid critical section (typically in a root call), and
+/// the DPC could only spin on it. Each instance's ordinary bank of the domain counts its held
+/// hosted spin locks. A refusal leaves the DPC queued for the next pass.
 pub(super) unsafe fn hosted_domain_dpc_may_start(domain_id: u64, domain_cookie: u64) -> bool {
     let Some(instances) = driver_instances() else { return true };
-    let mut raised = None;
-    let may_start = nt_kernel_exec::hosted_spin_wait::dpc_may_start(instances.iter()
+    let held = instances.iter()
         .filter(|inst| inst.hosted_domain_id == domain_id && inst.hosted_domain_cookie == domain_cookie
             && inst.exec_shared_va != 0)
-        .map(|inst| {
-            let irql = read_volatile((inst.exec_shared_va + SH_HOSTED_CURRENT_IRQL) as *const u8);
-            if irql >= nt_kernel_exec::hosted_spin_wait::DISPATCH_LEVEL { raised = Some(irql); }
-            irql
-        }));
+        .map(|inst| read_volatile((inst.exec_shared_va + SH_HOSTED_SPIN_LOCKS_HELD) as *const u64))
+        .max()
+        .unwrap_or(0);
+    let may_start = nt_kernel_exec::hosted_spin_wait::dpc_may_start(held);
     if !may_start {
-        let sample = DPC_DISPATCH_LEVEL_DEFERRALS.fetch_add(1, Ordering::Relaxed) + 1;
+        let sample = DPC_HELD_LOCK_DEFERRALS.fetch_add(1, Ordering::Relaxed) + 1;
         if sample <= 16 || sample.is_power_of_two() {
-            print_str(b"[hosted-dpc] deferred at dispatch level sample/domain/irql=");
-            for value in [sample, domain_id, u64::from(raised.unwrap_or(0))] {
+            print_str(b"[hosted-dpc] deferred while the domain holds a spin lock sample/domain/held=");
+            for value in [sample, domain_id, held] {
                 print_str(b"/");
                 print_hex_u64(value);
             }

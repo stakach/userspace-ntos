@@ -33,6 +33,24 @@ pub(super) fn lane_token() -> u64 {
     }
 }
 
+/// The domain's count of held hosted spin locks, in its ordinary bank. Every lane of the domain
+/// maps that bank; the root reads it through each instance's executive view (#423).
+fn held_count() -> &'static AtomicU64 {
+    unsafe { &*((FSD_SHARED_VADDR + SH_HOSTED_SPIN_LOCKS_HELD) as *const AtomicU64) }
+}
+
+/// A hosted spin lock (any family) was just acquired by this lane.
+pub(super) fn note_acquired() {
+    nt_kernel_exec::hosted_spin_wait::note_acquired(held_count());
+}
+
+/// A hosted spin lock (any family) was just released by this lane.
+pub(super) fn note_released(lock: u64) {
+    if nt_kernel_exec::hosted_spin_wait::note_released(held_count()).is_err() {
+        unsafe { crate::provider_bugcheck::report(0xc4, [LABEL, 0x4845_4c44, lock, 0]); }
+    }
+}
+
 static CONTENTION_TRACES: AtomicU64 = AtomicU64::new(0);
 
 fn trace(lock: u64, observed: u64, holder: u64) {

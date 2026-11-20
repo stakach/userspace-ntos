@@ -84,17 +84,28 @@ pub const fn wait_satisfied(current: u64, observed: u64) -> bool {
     current != observed
 }
 
-/// `DISPATCH_LEVEL`: a lane at or above it holds a spin lock or has raised IRQL.
-pub const DISPATCH_LEVEL: u8 = 2;
+/// A hosted domain is one NT processor to its drivers, and while the root runs none of the
+/// domain's lanes is executing. A spin lock the domain holds therefore belongs to a lane stopped
+/// mid critical section, typically in a root call such as IoCompleteRequest. On that processor no
+/// DPC may start until the lock is released: a DPC started anyway can only spin on the stopped
+/// holder, which the root cannot answer while it drives the DPC. `held` counts the domain's held
+/// hosted spin locks (every family, every lane). A DPC that may not start stays queued and is
+/// delivered by the next DPC pass.
+pub const fn dpc_may_start(held: u64) -> bool {
+    held == 0
+}
 
-/// A hosted domain is one NT processor to its drivers. While the root runs, none of the
-/// domain's lanes is executing, so a lane at DISPATCH_LEVEL or above is stopped mid critical
-/// section, typically in a root call such as IoCompleteRequest made with a spin lock held.
-/// On that processor no DPC may start until the lane lowers its IRQL. A DPC started anyway can
-/// spin on the stopped holder, which the root cannot answer while it drives the DPC. A DPC that
-/// may not start stays queued and is delivered by the next DPC pass.
-pub fn dpc_may_start(domain_lane_irqls: impl IntoIterator<Item = u8>) -> bool {
-    domain_lane_irqls.into_iter().all(|irql| irql < DISPATCH_LEVEL)
+/// One acquisition of a hosted spin lock by any lane of the domain.
+pub fn note_acquired(held: &AtomicU64) {
+    held.fetch_add(1, Ordering::AcqRel);
+}
+
+/// One release. A release with nothing counted is an unbalanced caller; the count stays zero
+/// rather than wrapping, so one bad release cannot fence the domain's DPCs forever.
+pub fn note_released(held: &AtomicU64) -> Result<(), SpinError> {
+    held.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1))
+        .map(|_| ())
+        .map_err(|_| SpinError::NotOwner)
 }
 
 #[cfg(test)]
