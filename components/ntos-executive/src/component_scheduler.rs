@@ -335,6 +335,17 @@ impl HostedPumpRestore {
         service_continuation::settle_without_step(self)
     }
 
+    /// Whether an unfinished pump still holds a parked outer parent.
+    fn has_outer_parent(&self) -> bool {
+        match self {
+            Self::ChildWorkReady { parent, .. } | Self::ChildWorkQuarantined { parent, .. } =>
+                parent.is_some(),
+            Self::ChildWorkPending(pending) => pending.parent.is_some(),
+            Self::SchedulerYieldRetained(pending) => pending.entered.parent.is_some(),
+            Self::Restored(_) | Self::Unattributed(_) | Self::Retained { .. } => false,
+        }
+    }
+
     /// The outer parent an unfinished pump still holds parked.
     fn take_outer_parent(
         &mut self,

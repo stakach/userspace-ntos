@@ -25,6 +25,8 @@ const STATUS_INSUFFICIENT_RESOURCES_LOCAL: i32 = 0xc000_009au32 as i32;
 const STATUS_DEVICE_BUSY_LOCAL: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
 
 struct Work {
+    /// The dispatch's pump kept in its File row (#420); collected before anything else.
+    kept_pump: Option<hosted_file_owners::KeptPumpSelector>,
     source: hosted_read_capture::CapturedSourceRead,
     read_length: u32,
     source_instance: DriverInstance,
@@ -241,6 +243,7 @@ pub(super) unsafe fn submit(
     };
     let read_length = source.read().length();
     let work = Work {
+        kept_pump: None,
         source, read_length, source_instance, provider_instance, caller, actor,
         origin: hosted_forward_origin::HostedForwardOrigin::new(route, dispatch, reply, token),
         source_published: false,
@@ -362,38 +365,49 @@ impl Work {
 
     unsafe fn dispatch_provider(&mut self, handler: *mut ExecNtHandler) {
         assert!(self.retained.is_none() && self.terminal.is_none());
-        if let Err(status) = self.actor.validate(&(*handler).pm) {
-            self.initial_status = Some(status as i32);
-            return;
-        }
-        if self.source.validate_source().is_err() || self.provider_index_if_exact().is_none() {
-            self.initial_status = Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
-            return;
-        }
-        let read = *self.source.read();
-        let mut initial_output = Vec::new();
-        if initial_output.try_reserve_exact(read.length() as usize).is_err() {
-            self.initial_status = Some(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
-            return;
-        }
-        initial_output.resize(read.length() as usize, 0);
-        let request = ExternalFileIrpRequest {
-            client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
-            device_id: self.source.device_id(),
-            file_id: Some(self.source.file_id()),
-            user_data: 0,
-            requestor_tid: u64::from(self.caller.original_thread().thread_id()),
-            major: major::IRP_MJ_READ,
-            parameters: IoParameters::Read(ReadWriteParameters {
-                length: read.length(), key: read.key(), offset: read.byte_offset(),
-            }),
-            stack_flags: read.stack_flags(),
-            request_flags: read.request_flags(),
-            initial_information: 0,
+        // A kept pump is collected first, before any other effect of this turn (#420).
+        let result = match hosted_file_owners::collect_kept(&mut self.kept_pump) {
+            hosted_file_owners::KeptCollect::Pending => return,
+            hosted_file_owners::KeptCollect::Collected(result) => result,
+            hosted_file_owners::KeptCollect::Absent => {
+                if let Err(status) = self.actor.validate(&(*handler).pm) {
+                    self.initial_status = Some(status as i32);
+                    return;
+                }
+                if self.source.validate_source().is_err() || self.provider_index_if_exact().is_none() {
+                    self.initial_status = Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
+                    return;
+                }
+                let read = *self.source.read();
+                let mut initial_output = Vec::new();
+                if initial_output.try_reserve_exact(read.length() as usize).is_err() {
+                    self.initial_status = Some(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
+                    return;
+                }
+                initial_output.resize(read.length() as usize, 0);
+                let request = ExternalFileIrpRequest {
+                    client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
+                    device_id: self.source.device_id(),
+                    file_id: Some(self.source.file_id()),
+                    user_data: 0,
+                    requestor_tid: u64::from(self.caller.original_thread().thread_id()),
+                    major: major::IRP_MJ_READ,
+                    parameters: IoParameters::Read(ReadWriteParameters {
+                        length: read.length(), key: read.key(), offset: read.byte_offset(),
+                    }),
+                    stack_flags: read.stack_flags(),
+                    request_flags: read.request_flags(),
+                    initial_information: 0,
+                };
+                let result = hosted_file_owners::dispatch(
+                    self.caller, request, &[], &initial_output, ExternalFileIrpDispatchPolicy::File,
+                );
+                match hosted_file_owners::keep_or_ready(&mut self.kept_pump, result) {
+                    Some(result) => result,
+                    None => return,
+                }
+            }
         };
-        let result = hosted_file_owners::dispatch(
-            self.caller, request, &[], &initial_output, ExternalFileIrpDispatchPolicy::File,
-        );
         let result = match result {
             Ok(result) => result,
             Err(status) if status == nt_status::NtStatus::DEVICE_BUSY => return,
@@ -620,6 +634,8 @@ impl Work {
             return true;
         }
         if runtime::retained_service_cancelled(self.origin.route, self.origin.dispatch, self.origin.reply, self.origin.token) {
+            // A kept pump is an entered, uninterruptible dispatch: wait for its return (#420).
+            if self.kept_pump.is_some() { return false; }
             if self.retained.is_none() && self.terminal.is_none() && self.canonical_irp.is_none() {
                 if !self.release_unentered_owners() { return false; }
                 runtime::acknowledge_retained_service_cancellation(
@@ -628,6 +644,11 @@ impl Work {
                 return true;
             }
             return self.advance_stopped_source();
+        }
+        if self.kept_pump.is_some() {
+            // The kept pump's own turn: collect it, with no lane preparation repeated (#420).
+            self.dispatch_provider(handler);
+            if self.kept_pump.is_some() { return false; }
         }
         if self.initial_status.is_none() {
             if !self.provider_dispatch_ready() { return false; }

@@ -240,7 +240,7 @@ impl NativeDiskProof {
         };
         let Ok(_authority_guard) = activate_pending_scsi_proof_authority(self.pending_authority)
         else { return ProofProgress::Pending; };
-        match hosted_file_owners::dispatch(
+        match hosted_file_owners::dispatch_unretained(
             caller, native, &input, &output, ExternalFileIrpDispatchPolicy::ScsiAtDevice,
         ) {
             Ok(hosted_file_owners::DispatchResult::Returned { irp_id, status, buffers, .. }) => {

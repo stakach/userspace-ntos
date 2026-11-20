@@ -187,6 +187,11 @@ pub(crate) use component_scheduler::{
 pub(crate) use component_scheduler::handoff_exact_component_once;
 pub(crate) use component_scheduler::service_continuation::{ServiceDelivery, ServiceStep};
 
+/// Root boundary (#420): continue each ordinary File row's kept pump once.
+pub(crate) unsafe fn redrive_plain_file_pumps() -> usize {
+    hosted_file_owners::redrive_plain_suspended_pumps()
+}
+
 /// Hold one service-continuation row before a lane's service enters any dispatch (#420).
 pub(crate) unsafe fn reserve_service_slot()
     -> Result<component_scheduler::service_continuation::ServiceSlot, i32> {
@@ -52175,7 +52180,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
             }
         });
     }
-    let result = hosted_file_owners::dispatch(
+    let result = hosted_file_owners::dispatch_unretained(
         caller,
         nt_io_manager::detached_file_irp::ExternalFileIrpRequest {
             client: ClientId(IO_MANAGER_COMPONENT_ID),
@@ -75632,6 +75637,44 @@ unsafe fn dispatch_irp_for_instance_exact(
     )
 }
 
+/// An owned File caller's dispatch (#420): a pump that stops unfinished where no lane can keep
+/// it is returned as the File owner's continuation instead of an uncertain result.
+pub(super) unsafe fn dispatch_irp_for_instance_exact_retaining(
+    inst: usize,
+    major: u64,
+    minor: u64,
+    device_object: u64,
+    canonical_irp_id: u64,
+    canonical_file_id: u64,
+    fsctl: u64,
+    file_id: u64,
+    requestor_tid: u64,
+    dispatch_request: Option<IrpDispatchRequest>,
+    in_data: &[u8],
+    out: &mut [u8],
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> HostedIrpDispatchProgress {
+    let mut yielded = None;
+    let result = dispatch_irp_for_instance_exact_inner(
+        inst, major, minor, device_object, canonical_irp_id, canonical_file_id, fsctl, file_id,
+        requestor_tid, dispatch_request, in_data, out, Some(caller),
+        Some((&mut yielded, FilePumpMode::Retained)),
+    );
+    match yielded {
+        Some(continuation) => HostedIrpDispatchProgress::ChildWorkYield(continuation),
+        None => HostedIrpDispatchProgress::Returned(result),
+    }
+}
+
+/// How an owned File dispatch keeps a pump that stops before it returns.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FilePumpMode {
+    /// A child-work-capable channel: the owner runs selected children at the root boundary.
+    ChildWork,
+    /// An ordinary channel: only an unfinished pump with no lane to keep it is retained.
+    Retained,
+}
+
 pub(super) unsafe fn dispatch_irp_for_instance_exact_suspend_aware(
     inst: usize,
     major: u64,
@@ -75650,7 +75693,8 @@ pub(super) unsafe fn dispatch_irp_for_instance_exact_suspend_aware(
     let mut yielded = None;
     let result = dispatch_irp_for_instance_exact_inner(
         inst, major, minor, device_object, canonical_irp_id, canonical_file_id, fsctl, file_id,
-        requestor_tid, dispatch_request, in_data, out, caller, Some(&mut yielded),
+        requestor_tid, dispatch_request, in_data, out, caller,
+        Some((&mut yielded, FilePumpMode::ChildWork)),
     );
     match yielded {
         Some(continuation) => HostedIrpDispatchProgress::ChildWorkYield(continuation),
@@ -75672,7 +75716,7 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
     in_data: &[u8],
     out: &mut [u8],
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
-    yielded: Option<&mut Option<FileIrpPumpContinuation>>,
+    yielded: Option<(&mut Option<FileIrpPumpContinuation>, FilePumpMode)>,
 ) -> Option<HostedIrpTransportResult> {
     if yielded.is_some() && caller.is_none() {
         return Some(HostedIrpTransportResult::NotDispatched {
@@ -76168,20 +76212,28 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
             entered_ticks: crate::disk_census_ticks(),
         }));
     scsi_srb_pump_timing.enter_pump();
-    let pump = match (yielded.is_some(), scsi_srb_pump_owner.as_ref(), caller) {
-        (true, Some(owner), Some(caller)) =>
+    let mode = yielded.as_ref().map(|(_, mode)| *mode);
+    let pump = match (mode, scsi_srb_pump_owner.as_ref(), caller) {
+        (Some(FilePumpMode::ChildWork), Some(owner), Some(caller)) =>
             component_scheduler::hosted_component_pump_observed_child_work(&ch, Some(caller), owner),
-        (true, None, Some(caller)) =>
+        (Some(FilePumpMode::ChildWork), None, Some(caller)) =>
             component_scheduler::hosted_component_pump_with_caller_child_work(&ch, caller),
-        (false, Some(owner), caller) =>
+        (Some(FilePumpMode::Retained), owner, Some(caller)) =>
+            component_scheduler::service_continuation::settle_for_file_owner(match owner {
+                Some(owner) => component_scheduler::hosted_component_pump_observed_retained(
+                    &ch, Some(caller), owner),
+                None => component_scheduler::hosted_component_pump_with_caller_retained(
+                    &ch, caller),
+            }),
+        (None, Some(owner), caller) =>
             component_scheduler::HostedPumpRestore::Restored(
                 component_scheduler::hosted_component_pump_observed(&ch, caller, owner)),
-        (false, None, Some(caller)) =>
+        (None, None, Some(caller)) =>
             component_scheduler::HostedPumpRestore::Restored(
                 component_scheduler::hosted_component_pump_with_caller(&ch, caller)),
-        (false, None, None) =>
+        (None, None, None) =>
             component_scheduler::HostedPumpRestore::Restored(hosted_component_pump(&ch)),
-        (true, _, None) => unreachable!("suspend-aware File dispatch requires a caller"),
+        (Some(_), _, None) => unreachable!("suspend-aware File dispatch requires a caller"),
     };
     drop(scsi_srb_pump_owner);
     let ready_for_child =
@@ -76227,7 +76279,7 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
         crate::driver_launch::trace_port_connect_handoff_probe(
             61, &ch, u64::from(continuation.child_work_ready()),
         );
-        *yielded.expect("child-work handoff requires a File owner") = Some(continuation);
+        *yielded.expect("child-work handoff requires a File owner").0 = Some(continuation);
         crate::driver_launch::trace_port_connect_handoff_probe(62, &ch, dispatch_seq);
         return None;
     }

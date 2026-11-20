@@ -22,6 +22,8 @@ const NOT_SUPPORTED: i32 = nt_status::NtStatus::NOT_SUPPORTED.raw();
 const INSUFFICIENT_RESOURCES: i32 = nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw();
 
 struct Work {
+    /// The dispatch's pump kept in its File row (#420); collected before anything else.
+    kept_pump: Option<hosted_file_owners::KeptPumpSelector>,
     source: hosted_internal_control_capture::CapturedSourceInternalControl,
     source_index: usize,
     source_instance: DriverInstance,
@@ -183,6 +185,7 @@ pub(super) unsafe fn submit(
         }
     };
     let work = Work {
+        kept_pump: None,
         progress: InternalControlProgress::new(source.request()),
         source,
         source_index,
@@ -256,38 +259,49 @@ impl Work {
     }
 
     unsafe fn dispatch_provider(&mut self, handler: *mut ExecNtHandler) {
-        if let Err(status) = self.actor.validate(&(*handler).pm) {
-            self.terminal_status = Some(status as i32);
-            return;
-        }
-        if self.source.validate_output().is_err() || !self.provider_exact() {
-            self.terminal_status = Some(INVALID_DEVICE_REQUEST);
-            return;
-        }
-        let control = self.source.request();
-        let request = ExternalFileIrpRequest {
-            client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
-            device_id: self.source.device_id(),
-            file_id: None,
-            user_data: 0,
-            requestor_tid: u64::from(self.caller.original_thread().thread_id()),
-            major: major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
-            parameters: IoParameters::InternalDeviceControl(DeviceControlParameters {
-                ioctl_code: control.code(),
-                input_len: 0,
-                output_len: 8,
-            }),
-            stack_flags: StackFlags::empty(),
-            request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
-            initial_information: 0,
+        // A kept pump is collected first, before any other effect of this turn (#420).
+        let result = match hosted_file_owners::collect_kept(&mut self.kept_pump) {
+            hosted_file_owners::KeptCollect::Pending => return,
+            hosted_file_owners::KeptCollect::Collected(result) => result,
+            hosted_file_owners::KeptCollect::Absent => {
+                if let Err(status) = self.actor.validate(&(*handler).pm) {
+                    self.terminal_status = Some(status as i32);
+                    return;
+                }
+                if self.source.validate_output().is_err() || !self.provider_exact() {
+                    self.terminal_status = Some(INVALID_DEVICE_REQUEST);
+                    return;
+                }
+                let control = self.source.request();
+                let request = ExternalFileIrpRequest {
+                    client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
+                    device_id: self.source.device_id(),
+                    file_id: None,
+                    user_data: 0,
+                    requestor_tid: u64::from(self.caller.original_thread().thread_id()),
+                    major: major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
+                    parameters: IoParameters::InternalDeviceControl(DeviceControlParameters {
+                        ioctl_code: control.code(),
+                        input_len: 0,
+                        output_len: 8,
+                    }),
+                    stack_flags: StackFlags::empty(),
+                    request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
+                    initial_information: 0,
+                };
+                let result = hosted_file_owners::dispatch(
+                    self.caller,
+                    request,
+                    &[],
+                    &[0; 8],
+                    ExternalFileIrpDispatchPolicy::DeviceControlAtDevice,
+                );
+                match hosted_file_owners::keep_or_ready(&mut self.kept_pump, result) {
+                    Some(result) => result,
+                    None => return,
+                }
+            }
         };
-        let result = hosted_file_owners::dispatch(
-            self.caller,
-            request,
-            &[],
-            &[0; 8],
-            ExternalFileIrpDispatchPolicy::DeviceControlAtDevice,
-        );
         let result = match result {
             Ok(result) => result,
             Err(status) if status == nt_status::NtStatus::DEVICE_BUSY => return,
@@ -468,6 +482,8 @@ impl Work {
             return true;
         }
         if runtime::retained_service_cancelled(self.route, self.dispatch, self.reply, self.token) {
+            // A kept pump is an entered, uninterruptible dispatch: wait for its return (#420).
+            if self.kept_pump.is_some() { return false; }
             if !self.cancel_requested {
                 if let Some(irp) = self.canonical_irp { let _ = cancel_irp_if_pending(irp.raw()); }
                 self.cancel_requested = true;
@@ -489,6 +505,8 @@ impl Work {
         if !self.entered_provider && self.terminal_status.is_none() {
             self.dispatch_provider(handler);
         }
+        // A kept pump waits for its own turn (#420).
+        if self.kept_pump.is_some() { return false; }
         if self.canonical_irp.is_some() && self.terminal_status.is_none() {
             self.poll_provider();
         }

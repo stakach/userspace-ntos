@@ -24,6 +24,8 @@ const STATUS_INSUFFICIENT_RESOURCES_LOCAL: i32 = 0xc000_009au32 as i32;
 const STATUS_DEVICE_BUSY_LOCAL: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
 
 struct Work {
+    /// The dispatch's pump kept in its File row (#420); collected before anything else.
+    kept_pump: Option<hosted_file_owners::KeptPumpSelector>,
     source: hosted_query_path_capture::CapturedSourceForward,
     source_device_id: u64,
     source_instance: DriverInstance,
@@ -229,6 +231,7 @@ pub(super) unsafe fn submit(
         }
     };
     let work = Work {
+        kept_pump: None,
         source_device_id: source.device_id().raw(),
         source,
         source_instance,
@@ -329,76 +332,91 @@ impl Work {
 
     unsafe fn dispatch(&mut self, handler: *mut ExecNtHandler) {
         assert!(self.graph.is_none() && self.retained.is_none());
-        if let Err(status) = self.actor.validate(&(*handler).pm) {
-            self.initial_status = Some(status as i32);
-            return;
-        }
-        self.source
-            .validate_source()
-            .expect("query-path source identity");
-        let graph = match hosted_create_security_graph::materialize(
-            self.source_instance,
-            self.security,
-            self.provider_instance,
-        ) {
-            Ok(graph) => graph,
-            Err(status) => {
-                self.initial_status = Some(status);
-                return;
-            }
-        };
-        let provider_address = NonZeroU64::new(graph.io_security_context_address())
-            .expect("query-path provider security address");
-        let input = nt_io_manager::query_path_wire::materialize_provider_input(
-            self.source.request(),
-            provider_address,
-        );
-        self.graph = Some(graph);
-        let input = match input {
-            Ok(input) => input,
-            Err(_) => {
-                self.initial_status = Some(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
-                self.abort_pending = true;
-                return;
-            }
-        };
+        // The terminal response is reserved before the kept pump is collected, so a refusal
+        // here has no effect and the pump stays kept for the next turn.
         let mut terminal_response = Vec::new();
         if terminal_response.try_reserve_exact(4).is_err() {
-            self.initial_status = Some(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
-            self.abort_pending = true;
+            if self.kept_pump.is_none() {
+                self.initial_status = Some(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
+                self.abort_pending = true;
+            }
             return;
         }
         terminal_response.resize(4, 0);
-        if self.source.validate_source().is_err() || !self.provider_still_exact() {
-            self.initial_status = Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
-            self.abort_pending = true;
-            return;
-        }
-        let request = ExternalFileIrpRequest {
-            client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
-            device_id: self.source.device_id(),
-            file_id: Some(self.source.file_id()),
-            user_data: 0,
-            requestor_tid: u64::from(self.caller.original_thread().thread_id()),
-            major: IRP_MJ_DEVICE_CONTROL,
-            parameters: IoParameters::DeviceControl(DeviceControlParameters {
-                ioctl_code: IOCTL_REDIR_QUERY_PATH,
-                input_len: input.len() as u32,
-                output_len: 4,
-            }),
-            stack_flags: StackFlags::empty(),
-            request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
-            initial_information: 0,
+        // A kept pump is collected first, before any other effect of this turn (#420).
+        let result = match hosted_file_owners::collect_kept(&mut self.kept_pump) {
+            hosted_file_owners::KeptCollect::Pending => return,
+            hosted_file_owners::KeptCollect::Collected(result) => result,
+            hosted_file_owners::KeptCollect::Absent => {
+                if let Err(status) = self.actor.validate(&(*handler).pm) {
+                    self.initial_status = Some(status as i32);
+                    return;
+                }
+                self.source
+                    .validate_source()
+                    .expect("query-path source identity");
+                let graph = match hosted_create_security_graph::materialize(
+                    self.source_instance,
+                    self.security,
+                    self.provider_instance,
+                ) {
+                    Ok(graph) => graph,
+                    Err(status) => {
+                        self.initial_status = Some(status);
+                        return;
+                    }
+                };
+                let provider_address = NonZeroU64::new(graph.io_security_context_address())
+                    .expect("query-path provider security address");
+                let input = nt_io_manager::query_path_wire::materialize_provider_input(
+                    self.source.request(),
+                    provider_address,
+                );
+                self.graph = Some(graph);
+                let input = match input {
+                    Ok(input) => input,
+                    Err(_) => {
+                        self.initial_status = Some(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
+                        self.abort_pending = true;
+                        return;
+                    }
+                };
+                if self.source.validate_source().is_err() || !self.provider_still_exact() {
+                    self.initial_status = Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
+                    self.abort_pending = true;
+                    return;
+                }
+                let request = ExternalFileIrpRequest {
+                    client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
+                    device_id: self.source.device_id(),
+                    file_id: Some(self.source.file_id()),
+                    user_data: 0,
+                    requestor_tid: u64::from(self.caller.original_thread().thread_id()),
+                    major: IRP_MJ_DEVICE_CONTROL,
+                    parameters: IoParameters::DeviceControl(DeviceControlParameters {
+                        ioctl_code: IOCTL_REDIR_QUERY_PATH,
+                        input_len: input.len() as u32,
+                        output_len: 4,
+                    }),
+                    stack_flags: StackFlags::empty(),
+                    request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
+                    initial_information: 0,
+                };
+                // `dispatch` returns Err only for a proven not-entered canonical IRP. The source
+                // target is still owned here, so that path can roll back without invoking Mup.
+                let result = hosted_file_owners::dispatch(
+                    self.caller,
+                    request,
+                    &input,
+                    &[0; 4],
+                    ExternalFileIrpDispatchPolicy::FileDeviceControl,
+                );
+                match hosted_file_owners::keep_or_ready(&mut self.kept_pump, result) {
+                    Some(result) => result,
+                    None => return,
+                }
+            }
         };
-        // `dispatch` returns Err only for a proven not-entered canonical IRP. The source
-        // target is still owned here, so that path can roll back without invoking Mup.
-        let result = hosted_file_owners::dispatch(
-            self.caller,
-            request,
-            &input,
-            &[0; 4],
-            ExternalFileIrpDispatchPolicy::FileDeviceControl,
-        );
         let result = match result {
             Ok(result) => result,
             Err(status) => {
@@ -723,6 +741,8 @@ impl Work {
             self.abort_pending = false;
         }
         if self.cancelled() {
+            // A kept pump is an entered, uninterruptible dispatch: wait for its return (#420).
+            if self.kept_pump.is_some() { return false; }
             if self.graph.is_none()
                 && self.retained.is_none()
                 && self.terminal.is_none()
@@ -745,6 +765,8 @@ impl Work {
         if self.initial_status.is_none() {
             self.dispatch(handler);
         }
+        // A kept pump waits for its own turn (#420).
+        if self.kept_pump.is_some() { return false; }
         if self.abort_pending {
             let graph = self.graph.take().expect("pre-entry query-path graph owner");
             if let Err((_status, graph)) = graph.abort_unentered() {

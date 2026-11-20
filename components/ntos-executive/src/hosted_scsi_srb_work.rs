@@ -22,6 +22,8 @@ const DEVICE_BUSY: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
 const INSUFFICIENT_RESOURCES: i32 = nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw();
 
 struct Work {
+    /// The dispatch's pump kept in its File row (#420); collected before anything else.
+    kept_pump: Option<hosted_file_owners::KeptPumpSelector>,
     source: hosted_scsi_srb_capture::CapturedSourceScsi,
     source_instance: DriverInstance,
     provider_instance: DriverInstance,
@@ -350,6 +352,7 @@ pub(super) unsafe fn submit(
         }
     };
     let work = Work {
+        kept_pump: None,
         source,
         source_instance,
         provider_instance,
@@ -425,75 +428,86 @@ impl Work {
     }
 
     unsafe fn dispatch_provider(&mut self, handler: *mut ExecNtHandler) {
-        if let Err(status) = self.actor.validate(&(*handler).pm) {
-            self.terminal_status = Some(status as i32);
-            return;
-        }
-        if !self.provider_exact() {
-            self.terminal_status = Some(INVALID_DEVICE_REQUEST);
-            return;
-        }
-        let children = self.source.children();
-        let Ok(srb) = self.source.wire_srb() else {
-            self.terminal_status = Some(INVALID_PARAMETER);
-            return;
+        // A kept pump is collected first, before any other effect of this turn (#420).
+        let result = match hosted_file_owners::collect_kept(&mut self.kept_pump) {
+            hosted_file_owners::KeptCollect::Pending => return,
+            hosted_file_owners::KeptCollect::Collected(result) => result,
+            hosted_file_owners::KeptCollect::Absent => {
+                if let Err(status) = self.actor.validate(&(*handler).pm) {
+                    self.terminal_status = Some(status as i32);
+                    return;
+                }
+                if !self.provider_exact() {
+                    self.terminal_status = Some(INVALID_DEVICE_REQUEST);
+                    return;
+                }
+                let children = self.source.children();
+                let Ok(srb) = self.source.wire_srb() else {
+                    self.terminal_status = Some(INVALID_PARAMETER);
+                    return;
+                };
+                let Ok(parameters) = ScsiParameters::from_wire(
+                    children.route,
+                    srb,
+                    children.transfer_length,
+                    children.sense_length,
+                ) else {
+                    self.terminal_status = Some(INVALID_PARAMETER);
+                    return;
+                };
+                let Some(output_len) = 64usize
+                    .checked_add(nt_io_manager::scsi_srb_transport::WDM_X64_LEGACY_SRB_SIZE)
+                    .and_then(|length| length.checked_add(self.source.data().len()))
+                    .and_then(|length| length.checked_add(self.source.sense().map_or(0, <[u8]>::len)))
+                else {
+                    self.terminal_status = Some(INVALID_PARAMETER);
+                    return;
+                };
+                let mut input = Vec::new();
+                if input
+                    .try_reserve_exact(
+                        output_len - 64 - nt_io_manager::scsi_srb_transport::WDM_X64_LEGACY_SRB_SIZE,
+                    )
+                    .is_err()
+                {
+                    self.terminal_status = Some(INSUFFICIENT_RESOURCES);
+                    return;
+                }
+                input.extend_from_slice(self.source.data());
+                if let Some(sense) = self.source.sense() {
+                    input.extend_from_slice(sense);
+                }
+                let mut output = Vec::new();
+                if output.try_reserve_exact(output_len).is_err() {
+                    self.terminal_status = Some(INSUFFICIENT_RESOURCES);
+                    return;
+                }
+                output.resize(output_len, 0);
+                let request = ExternalFileIrpRequest {
+                    client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
+                    device_id: self.source.device_id(),
+                    file_id: None,
+                    user_data: 0,
+                    requestor_tid: u64::from(self.caller.original_thread().thread_id()),
+                    major: major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
+                    parameters: IoParameters::Scsi(parameters),
+                    stack_flags: StackFlags::empty(),
+                    request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
+                    initial_information: 0,
+                };
+                let result = hosted_file_owners::dispatch(
+                    self.caller,
+                    request,
+                    &input,
+                    &output,
+                    ExternalFileIrpDispatchPolicy::ScsiAtDevice,
+                );
+                match hosted_file_owners::keep_or_ready(&mut self.kept_pump, result) {
+                    Some(result) => result,
+                    None => return,
+                }
+            }
         };
-        let Ok(parameters) = ScsiParameters::from_wire(
-            children.route,
-            srb,
-            children.transfer_length,
-            children.sense_length,
-        ) else {
-            self.terminal_status = Some(INVALID_PARAMETER);
-            return;
-        };
-        let Some(output_len) = 64usize
-            .checked_add(nt_io_manager::scsi_srb_transport::WDM_X64_LEGACY_SRB_SIZE)
-            .and_then(|length| length.checked_add(self.source.data().len()))
-            .and_then(|length| length.checked_add(self.source.sense().map_or(0, <[u8]>::len)))
-        else {
-            self.terminal_status = Some(INVALID_PARAMETER);
-            return;
-        };
-        let mut input = Vec::new();
-        if input
-            .try_reserve_exact(
-                output_len - 64 - nt_io_manager::scsi_srb_transport::WDM_X64_LEGACY_SRB_SIZE,
-            )
-            .is_err()
-        {
-            self.terminal_status = Some(INSUFFICIENT_RESOURCES);
-            return;
-        }
-        input.extend_from_slice(self.source.data());
-        if let Some(sense) = self.source.sense() {
-            input.extend_from_slice(sense);
-        }
-        let mut output = Vec::new();
-        if output.try_reserve_exact(output_len).is_err() {
-            self.terminal_status = Some(INSUFFICIENT_RESOURCES);
-            return;
-        }
-        output.resize(output_len, 0);
-        let request = ExternalFileIrpRequest {
-            client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
-            device_id: self.source.device_id(),
-            file_id: None,
-            user_data: 0,
-            requestor_tid: u64::from(self.caller.original_thread().thread_id()),
-            major: major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
-            parameters: IoParameters::Scsi(parameters),
-            stack_flags: StackFlags::empty(),
-            request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
-            initial_information: 0,
-        };
-        let result = hosted_file_owners::dispatch(
-            self.caller,
-            request,
-            &input,
-            &output,
-            ExternalFileIrpDispatchPolicy::ScsiAtDevice,
-        );
         match result {
             Ok(hosted_file_owners::DispatchResult::Returned {
                 irp_id,
@@ -795,6 +809,8 @@ impl Work {
             return true;
         }
         if runtime::retained_service_cancelled(self.route, self.dispatch, self.reply, self.token) {
+            // A kept pump is an entered, uninterruptible dispatch: wait for its return (#420).
+            if self.kept_pump.is_some() { return false; }
             if !self.cancel_requested {
                 if let Some(irp) = self.canonical_irp {
                     let _ = cancel_irp_if_pending(irp.raw());
@@ -824,6 +840,8 @@ impl Work {
         if !self.entered_provider && self.terminal_status.is_none() {
             self.dispatch_provider(handler);
         }
+        // A kept pump waits for its own turn (#420).
+        if self.kept_pump.is_some() { return false; }
         if self.canonical_irp.is_some() && self.terminal_status.is_none() {
             self.poll_provider();
         }

@@ -114,6 +114,9 @@ struct Row {
     port_connect_control_storage: Option<usize>,
     hook_pump: Option<HookPumpIdentity>,
     hook_pump_claimed: bool,
+    /// An ordinary caller's pump kept in this row (#420): suspended, then its returned
+    /// terminal, unretired, until that caller collects it. The root boundary redrives it.
+    plain_pump: Option<nt_hosted_runtime::KeptFilePump<ExternalFileIrpPumpKey, ExternalFileIrpTerminal>>,
     /// The one-use child observation is in the native continuation, even across restore retry.
     recorded_generic_child_ran: Option<bool>,
     flight: Flight,
@@ -546,6 +549,7 @@ fn reserve(
         port_connect_control_storage: None,
         hook_pump: None,
         hook_pump_claimed: false,
+        plain_pump: None,
         recorded_generic_child_ran: None,
         flight: Flight::Preparing,
         payload: None,
@@ -1444,6 +1448,27 @@ pub(super) enum DispatchResult {
     },
 }
 
+/// An ordinary caller's dispatch (#420).
+#[must_use = "a suspended pump's selector is the only way to collect its return"]
+pub(super) enum PlainDispatch {
+    Ready(DispatchResult),
+    /// The native pump stopped unfinished with no lane to keep it. The row keeps the
+    /// continuation; the caller keeps this selector and collects the true return later with
+    /// [`collect_pump_returned`]. Nothing has completed yet.
+    PumpSuspended {
+        irp_id: IrpId,
+        key: ExternalFileIrpPumpKey,
+    },
+}
+
+/// What an ordinary caller's later collection found.
+pub(super) enum PumpCollect {
+    /// The pump is still unfinished; collect again on a later turn.
+    Pending,
+    /// The pump returned; this is the dispatch's true result.
+    Collected(Result<DispatchResult, nt_status::NtStatus>),
+}
+
 enum DispatchFailure<Yield> {
     Status(nt_status::NtStatus),
     Yield(Yield),
@@ -1705,6 +1730,102 @@ pub(super) fn dispatch(
     input: &[u8],
     initial_output: &[u8],
     policy: ExternalFileIrpDispatchPolicy,
+) -> Result<PlainDispatch, nt_status::NtStatus> {
+    let result = dispatch_with_port_connect(
+        caller, request, input, initial_output, policy, None,
+        |invocation, caller, capture| {
+            match hosted_file_dispatch::invoke_retaining(invocation, caller, capture) {
+                hosted_file_dispatch::InvokeResult::Returned(returned) => Ok(returned),
+                hosted_file_dispatch::InvokeResult::ChildWorkYield {
+                    invocation, key, continuation,
+                } => Err(PortConnectYield::Keyed { invocation, key, continuation }),
+                hosted_file_dispatch::InvokeResult::UnkeyedChildWorkYield {
+                    invocation, continuation,
+                } => Err(PortConnectYield::Unkeyed { invocation, continuation }),
+            }
+        },
+    );
+    match result {
+        Ok(result) => Ok(PlainDispatch::Ready(result)),
+        Err(DispatchFailure::Status(status)) => Err(status),
+        Err(DispatchFailure::Yield(PortConnectYield::Keyed {
+            invocation, key, continuation,
+        })) => {
+            let irp_id = invocation.irp_id();
+            match suspend_dispatch_for_pump(irp_id, invocation, key, continuation, None) {
+                Ok(()) => {
+                    if let Some(id) = find(irp_id) {
+                        row(id).plain_pump = Some(nt_hosted_runtime::KeptFilePump::Suspended(key));
+                    }
+                    trace_plain_pump(b"suspended", irp_id);
+                    Ok(PlainDispatch::PumpSuspended { irp_id, key })
+                }
+                Err((status, invocation, continuation)) => Ok(PlainDispatch::Ready(
+                    orphan_plain_pump(irp_id, status, invocation, continuation))),
+            }
+        }
+        Err(DispatchFailure::Yield(PortConnectYield::Unkeyed {
+            invocation, continuation,
+        })) => {
+            let irp_id = invocation.irp_id();
+            Ok(PlainDispatch::Ready(orphan_plain_pump(irp_id,
+                nt_status::NtStatus::INVALID_PARAMETER, invocation, continuation)))
+        }
+    }
+}
+
+/// A row caller's selector for its kept pump (#420).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct KeptPumpSelector {
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+}
+
+/// What a row caller's turn found for its kept pump.
+pub(super) enum KeptCollect {
+    /// No pump is kept: the caller dispatches as usual.
+    Absent,
+    /// The kept pump is still unfinished; the caller's turn ends with no other effect.
+    Pending,
+    /// The kept pump returned: the dispatch's true result, exactly once.
+    Collected(Result<DispatchResult, nt_status::NtStatus>),
+}
+
+/// Run first in a row caller's dispatch turn, before any other effect.
+pub(super) fn collect_kept(kept: &mut Option<KeptPumpSelector>) -> KeptCollect {
+    let Some(selector) = *kept else { return KeptCollect::Absent };
+    match collect_pump_returned(selector.irp_id, selector.key) {
+        PumpCollect::Pending => KeptCollect::Pending,
+        PumpCollect::Collected(result) => {
+            *kept = None;
+            KeptCollect::Collected(result)
+        }
+    }
+}
+
+/// Keep a suspended dispatch's selector in the caller's row; a ready result passes through.
+pub(super) fn keep_or_ready(
+    kept: &mut Option<KeptPumpSelector>, dispatched: Result<PlainDispatch, nt_status::NtStatus>,
+) -> Option<Result<DispatchResult, nt_status::NtStatus>> {
+    match dispatched {
+        Ok(PlainDispatch::Ready(result)) => Some(Ok(result)),
+        Ok(PlainDispatch::PumpSuspended { irp_id, key }) => {
+            *kept = Some(KeptPumpSelector { irp_id, key });
+            None
+        }
+        Err(status) => Some(Err(status)),
+    }
+}
+
+/// A caller with no row of its own to keep a pump in. It keeps the synchronous contract: an
+/// unfinished pump with no lane to keep it is waited for at root level and is otherwise
+/// uncertain. #420 still owes each such caller a row.
+pub(super) fn dispatch_unretained(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    request: ExternalFileIrpRequest,
+    input: &[u8],
+    initial_output: &[u8],
+    policy: ExternalFileIrpDispatchPolicy,
 ) -> Result<DispatchResult, nt_status::NtStatus> {
     match dispatch_with_port_connect(
         caller, request, input, initial_output, policy, None,
@@ -1718,6 +1839,115 @@ pub(super) fn dispatch(
         Err(DispatchFailure::Status(status)) => Err(status),
         Err(DispatchFailure::Yield(never)) => match never {},
     }
+}
+
+/// Entered native owners nothing can key or park: an impossible malformed epoch, or a row
+/// that no longer accepts the suspension. Both owners are kept and never resumed; the row is
+/// fenced as an uncertain native effect is, and its caller keeps waiting on it.
+static mut ORPHANED_PLAIN_PUMPS: Vec<(ExternalFileIrpInvocation, FileDispatchContinuation)> =
+    Vec::new();
+
+fn orphan_plain_pump(
+    irp_id: IrpId, status: nt_status::NtStatus,
+    invocation: ExternalFileIrpInvocation, continuation: FileDispatchContinuation,
+) -> DispatchResult {
+    trace_plain_pump(b"orphaned", irp_id);
+    let orphans = unsafe { &mut *core::ptr::addr_of_mut!(ORPHANED_PLAIN_PUMPS) };
+    if orphans.try_reserve(1).is_ok() { orphans.push((invocation, continuation)); }
+    if let Some(id) = find(irp_id) {
+        row(id).flight = Flight::Blocked;
+        row(id).blocked_status = Some(status);
+    }
+    DispatchResult::Outstanding { irp_id }
+}
+
+fn trace_plain_pump(stage: &[u8], irp_id: IrpId) {
+    static TRACED: AtomicU64 = AtomicU64::new(0);
+    let n = TRACED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 32 && !n.is_power_of_two() { return; }
+    print_str(b"[file-plain-pump] n=");
+    print_u64(n);
+    print_str(b" stage=");
+    print_str(stage);
+    print_str(b" irp=0x");
+    print_hex_u64(irp_id.raw());
+    print_str(b"\n");
+}
+
+/// A row's own caller collects its kept pump. A still-unfinished pump is `Pending`; a returned
+/// one is retired here, exactly once, and its true result handed over. A return that left the
+/// IRP provider-pending (or fenced) is `Outstanding`, the ordinary pending contract.
+pub(super) fn collect_pump_returned(irp_id: IrpId, key: ExternalFileIrpPumpKey) -> PumpCollect {
+    let Some(id) = find(irp_id) else {
+        return PumpCollect::Collected(Err(take_plain_refusal(irp_id)
+            .unwrap_or(nt_status::NtStatus::INVALID_HANDLE)));
+    };
+    let suspended = row(id).flight == Flight::PumpSuspended;
+    match nt_hosted_runtime::KeptFilePump::collect(&mut row(id).plain_pump, key) {
+        nt_hosted_runtime::FilePumpCollect::Pending if suspended => PumpCollect::Pending,
+        // The resumed pump returned provider-pending (or was fenced): the ordinary contract.
+        nt_hosted_runtime::FilePumpCollect::Pending => {
+            row(id).plain_pump = None;
+            PumpCollect::Collected(Ok(DispatchResult::Outstanding { irp_id }))
+        }
+        nt_hosted_runtime::FilePumpCollect::Collected(terminal) => {
+            row(id).flight = Flight::Dispatch;
+            PumpCollect::Collected(Ok(retire_returned_terminal(id, irp_id, terminal)))
+        }
+        nt_hosted_runtime::FilePumpCollect::Mismatch =>
+            PumpCollect::Collected(Err(nt_status::NtStatus::INVALID_HANDLE)),
+    }
+}
+
+/// A resumed pump the manager reported as never entered: its row is gone, so its status waits
+/// here for the caller's collection.
+static mut PLAIN_REFUSALS: Vec<(IrpId, nt_status::NtStatus)> = Vec::new();
+
+fn take_plain_refusal(irp_id: IrpId) -> Option<nt_status::NtStatus> {
+    let refusals = unsafe { &mut *core::ptr::addr_of_mut!(PLAIN_REFUSALS) };
+    let index = refusals.iter().position(|(id, _)| *id == irp_id)?;
+    Some(refusals.swap_remove(index).1)
+}
+
+/// Root boundary only: continue each ordinary row's kept pump once (#420). A return stays in
+/// the row for its caller; a no-effect refusal keeps the pump; an uncertain one is fenced.
+pub(super) unsafe fn redrive_plain_suspended_pumps() -> usize {
+    let count = rows().iter().filter(|owner| owner.flight == Flight::PumpSuspended
+        && matches!(owner.plain_pump, Some(nt_hosted_runtime::KeptFilePump::Suspended(_))))
+        .count();
+    let mut selected = Vec::new();
+    if count == 0 || selected.try_reserve(count).is_err() { return 0; }
+    selected.extend(rows().iter().filter_map(|owner| {
+        let Some(nt_hosted_runtime::KeptFilePump::Suspended(key)) = owner.plain_pump.as_ref()
+        else { return None };
+        let key = *key;
+        let retryable = owner.flight == Flight::PumpSuspended
+            && matches!(owner.payload.as_ref(), Some(Payload::PumpSuspended(pump))
+                if pump.invocation.key() == key && pump.continuation.retry_without_new_child());
+        if retryable { Some((owner.irp_id?, key)) } else { None }
+    }));
+    let mut progressed = 0;
+    for (irp_id, key) in selected {
+        match resume_suspended_port_connect_pump(irp_id, key) {
+            PortConnectPumpDrive::Returned(_) => {
+                trace_plain_pump(b"returned", irp_id);
+                progressed += 1;
+            }
+            PortConnectPumpDrive::Retained | PortConnectPumpDrive::Yielded { .. } => {}
+            PortConnectPumpDrive::Blocked => trace_plain_pump(b"fenced", irp_id),
+            PortConnectPumpDrive::Rejected(status) => {
+                let refusals = &mut *core::ptr::addr_of_mut!(PLAIN_REFUSALS);
+                if refusals.try_reserve(1).is_ok() { refusals.push((irp_id, status)); }
+                progressed += 1;
+            }
+            PortConnectPumpDrive::UnownedYield(PortConnectDispatchFailure::UnownedYield {
+                status, invocation, continuation,
+            }) => { let _ = orphan_plain_pump(irp_id, status, invocation, continuation); }
+            PortConnectPumpDrive::UnownedYield(PortConnectDispatchFailure::Status(_))
+            | PortConnectPumpDrive::UnownedReturned(_) => trace_plain_pump(b"unowned", irp_id),
+        }
+    }
+    progressed
 }
 
 pub(super) fn dispatch_port_connect(
@@ -1952,6 +2182,12 @@ fn settle_returned_dispatch(
         }
         ExternalFileIrpResult::Returned(terminal) => {
             trace_file_return_probe(74, irp_id);
+            if let Some(kept) = row(id).plain_pump.take() {
+                // Only this row's own caller may take the return (#420).
+                row(id).plain_pump = Some(kept.returned(terminal));
+                row(id).flight = Flight::PumpReturned;
+                return Ok(DispatchResult::Outstanding { irp_id });
+            }
             if row(id).hook_pump.is_some() {
                 let owner = row(id);
                 owner.payload = Some(Payload::HookReturned(HookReturned {
@@ -1962,41 +2198,7 @@ fn settle_returned_dispatch(
                 trace_file_return_probe(75, irp_id);
                 return Ok(DispatchResult::Outstanding { irp_id });
             }
-            let completion = *terminal.completion();
-            match io_manager_mut().retire_external_file_irp_terminal(terminal) {
-                Ok((receipt, buffers)) => {
-                    trace_file_return_probe(78, irp_id);
-                    assert!(io_manager_mut().accepts_external_file_irp_receipt(&receipt));
-                    row(id).terminal_receipt = Some(receipt);
-                    row(id).settled_buffers = Some(buffers);
-                    let mut retired = match remove(id) {
-                        Ok(retired) => {
-                            trace_file_return_probe(79, irp_id);
-                            retired
-                        }
-                        Err(status) => {
-                            trace_file_return_probe_status(80, irp_id, Some(status));
-                            return Ok(DispatchResult::Outstanding { irp_id });
-                        }
-                    };
-                    Ok(DispatchResult::Returned {
-                        irp_id,
-                        status: completion.status,
-                        information: completion.information,
-                        file_context: completion.file_context,
-                        buffers: retired
-                            .settled_buffers
-                            .take()
-                            .expect("retired File buffers missing"),
-                    })
-                }
-                Err(rejection) => {
-                    let (status, terminal) = rejection.into_parts();
-                    block(id, Payload::Terminal(terminal), status);
-                    trace_file_return_probe_status(81, irp_id, Some(status));
-                    Ok(DispatchResult::Outstanding { irp_id })
-                }
-            }
+            Ok(retire_returned_terminal(id, irp_id, terminal))
         }
         ExternalFileIrpResult::Pending(retained) => {
             keep(id, Payload::Retained(retained));
@@ -2011,6 +2213,47 @@ fn settle_returned_dispatch(
             row(id).blocked_status = Some(transport_status);
             trace_file_return_probe(77, irp_id);
             Ok(DispatchResult::Outstanding { irp_id })
+        }
+    }
+}
+
+/// Retire a returned terminal and hand its result to the caller that owns it.
+fn retire_returned_terminal(
+    id: u64, irp_id: IrpId, terminal: ExternalFileIrpTerminal,
+) -> DispatchResult {
+    let completion = *terminal.completion();
+    match io_manager_mut().retire_external_file_irp_terminal(terminal) {
+        Ok((receipt, buffers)) => {
+            trace_file_return_probe(78, irp_id);
+            assert!(io_manager_mut().accepts_external_file_irp_receipt(&receipt));
+            row(id).terminal_receipt = Some(receipt);
+            row(id).settled_buffers = Some(buffers);
+            let mut retired = match remove(id) {
+                Ok(retired) => {
+                    trace_file_return_probe(79, irp_id);
+                    retired
+                }
+                Err(status) => {
+                    trace_file_return_probe_status(80, irp_id, Some(status));
+                    return DispatchResult::Outstanding { irp_id };
+                }
+            };
+            DispatchResult::Returned {
+                irp_id,
+                status: completion.status,
+                information: completion.information,
+                file_context: completion.file_context,
+                buffers: retired
+                    .settled_buffers
+                    .take()
+                    .expect("retired File buffers missing"),
+            }
+        }
+        Err(rejection) => {
+            let (status, terminal) = rejection.into_parts();
+            block(id, Payload::Terminal(terminal), status);
+            trace_file_return_probe_status(81, irp_id, Some(status));
+            DispatchResult::Outstanding { irp_id }
         }
     }
 }

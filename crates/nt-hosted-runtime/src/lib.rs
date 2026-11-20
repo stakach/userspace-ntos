@@ -3947,3 +3947,6 @@ mod tests {
         state.observe_callback(second_active).unwrap();
     }
 }
+
+mod file_pump_return;
+pub use file_pump_return::{FilePumpCollect, KeptFilePump};

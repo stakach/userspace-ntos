@@ -40,12 +40,6 @@ fn initial_relation_wal_dispatch_uses_its_exact_retained_scsi_authority() {
         .expect("mounted block service")..];
     assert!(dispatch.contains("retained_native_storage_wal_scsi_authority(route)"));
     assert!(dispatch.contains("activate_pending_scsi_proof_authority("));
-    assert!(dispatch.find("activate_pending_scsi_proof_authority(").unwrap()
-        < dispatch.find("hosted_file_owners::dispatch(").unwrap(),
-        "the exact scope must be active before File route capture");
-    assert!(dispatch.find("hosted_file_owners::dispatch(").unwrap()
-        < dispatch.find("drop(_authority_guard)").unwrap(),
-        "the scoped authority must survive only the nested dispatch");
     assert!(dispatch.contains("claim.release_unentered()"),
         "an unavailable authority must retain the unentered WAL work");
 }

@@ -320,6 +320,42 @@ pub(in crate::driver_launch) unsafe fn settle_parked(
     }
 }
 
+/// Settle an owned File dispatch's pump (#420). The File row is a real owner: a pump with no
+/// lane X that cannot be waited for here (a root turn that may not block, a nested child step,
+/// a scheduler service) is returned unfinished for the row to keep and a later root boundary
+/// to resume. A root caller that may block still waits here for the true result.
+pub(in crate::driver_launch) unsafe fn settle_for_file_owner(
+    pump: HostedPumpRestore,
+) -> HostedPumpRestore {
+    let unfinished = !matches!(pump, HostedPumpRestore::Restored(_)
+        | HostedPumpRestore::Unattributed(_) | HostedPumpRestore::Retained { .. });
+    if unfinished && !pump.has_outer_parent() && continuing().is_none()
+        && (component_scheduler::is_active() || !crate::service_sec_image::root_wait_may_block())
+    {
+        trace_file_owner(b"retained");
+        return pump;
+    }
+    match settle(pump) {
+        ServicePump::Finished(result) | ServicePump::Fenced(result) =>
+            HostedPumpRestore::Restored(result),
+        ServicePump::RootTurn(turn) => turn.pump,
+        // No File chain runs under a lane's service (call-context map); one that did has no
+        // step for that lane's reply.
+        ServicePump::Kept(kept) => HostedPumpRestore::Restored(kept.fence()),
+    }
+}
+
+fn trace_file_owner(stage: &[u8]) {
+    static TRACED: AtomicU64 = AtomicU64::new(0);
+    let n = TRACED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() { return; }
+    print_str(b"[service-continuation] file-owner n=");
+    print_u64(n);
+    print_str(b" stage=");
+    print_str(stage);
+    print_str(b"\n");
+}
+
 /// No lane X and no continuing step: root level waits; a nested scope has no owner yet.
 unsafe fn settle_parentless(unfinished: HostedPumpRestore) -> ServicePump {
     if component_scheduler::is_active() {
@@ -550,7 +586,8 @@ pub(crate) unsafe fn take_reply(ticket: nested::NestedRestoreTicket) -> Option<S
 
 /// Root boundary only: drive each intercepted service's kept pump once, then each fenced one.
 pub(crate) unsafe fn drive() -> usize {
-    let mut finished = 0;
+    // Ordinary File rows own their kept pumps; their callers collect each return (#420).
+    let mut finished = crate::driver_launch::redrive_plain_file_pumps();
     if services().has_drivable() {
         // The pump and the step may reenter the registry (a nested service registers, a
         // nested lane replies), so drive from a snapshot and hold no borrow across either.

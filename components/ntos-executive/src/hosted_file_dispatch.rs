@@ -35,6 +35,73 @@ pub(super) enum InvokeResult {
 pub(super) struct FileDispatchContinuation {
     native: FileIrpPumpContinuation,
     instance_index: usize,
+    /// The invocation's output contract, selected once at preparation.
+    capture: ExternalFileIrpOutputCapture,
+    /// Effects owed after the native dispatch returns (#420).
+    tail: ExecuteTail,
+}
+
+/// What `execute_with_capture` does after its native dispatch returns. A kept pump carries it
+/// so the resumed return runs the same tail exactly once.
+#[derive(Clone, Copy)]
+struct ExecuteTail {
+    instance_index: usize,
+    irp_id: u64,
+    major: u8,
+    scsi_data: bool,
+    route_instance: usize,
+    route_inst: DriverInstance,
+}
+
+impl ExecuteTail {
+    /// The tail of an execution that owns no post-dispatch effect.
+    fn none(instance_index: usize, irp_id: u64, major: u8, route_instance: usize,
+        route_inst: DriverInstance) -> Self {
+        Self { instance_index, irp_id, major, scsi_data: false, route_instance, route_inst }
+    }
+
+    fn finish(self, result: Option<HostedIrpTransportResult>) -> HostedIrpTransportResult {
+        if self.scsi_data {
+            match result {
+                Some(HostedIrpTransportResult::NotDispatched { .. }) => {
+                    if unsafe { hosted_scsi_dma_reservation::release_after_ack(self.irp_id) }
+                        .is_err()
+                    {
+                        unsafe { hosted_scsi_dma_reservation::quarantine(self.irp_id) };
+                    }
+                }
+                None | Some(HostedIrpTransportResult::Indeterminate { .. }) =>
+                    unsafe { hosted_scsi_dma_reservation::quarantine(self.irp_id) },
+                Some(HostedIrpTransportResult::Returned { .. }) => {}
+            }
+        }
+        if result.is_none() {
+            print_str(b"[hosted-file] exact dispatch unavailable instance/irp=");
+            print_u64(self.instance_index as u64);
+            print_str(b"/");
+            print_hex_u64(self.irp_id);
+            print_str(b"\n");
+        }
+        let result = result.unwrap_or(HostedIrpTransportResult::NotDispatched {
+            status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+        });
+        if self.major == major::IRP_MJ_CREATE
+            && matches!(result, HostedIrpTransportResult::Returned {
+                status: nt_status::NtStatus::SUCCESS, ..
+            })
+            && unsafe { hosted_instance_video_port_initialized(self.route_inst) }
+        {
+            if let Err(transport_status) =
+                unsafe { commit_video_registry_parameters_for_instance(self.route_inst) }
+            {
+                // Native CREATE already published its File. A later registry failure cannot
+                // undo it.
+                register_instance_ready(self.route_instance, false);
+                return HostedIrpTransportResult::Indeterminate { transport_status };
+            }
+        }
+        result
+    }
 }
 
 impl FileDispatchContinuation {
@@ -63,7 +130,7 @@ impl FileDispatchContinuation {
         self,
         mut invocation: ExternalFileIrpInvocation,
     ) -> Result<InvokeResult, (ExternalFileIrpInvocation, Self)> {
-        let Self { native, instance_index } = self;
+        let Self { native, instance_index, capture, tail } = self;
         let progress = {
             let (_, output) = invocation.buffers_mut().split();
             native.resume_after_child(output)
@@ -71,13 +138,14 @@ impl FileDispatchContinuation {
         match progress {
             Ok(FileIrpResumeProgress::Completed(result)) => {
                 let projection = invocation.projection().clone();
+                let result = tail.finish(Some(result));
                 Ok(InvokeResult::Returned(finish_invoke_result(
-                    invocation, projection, instance_index,
-                    ExternalFileIrpOutputCapture::MethodNeitherInput, result, true,
+                    invocation, projection, instance_index, capture, result,
+                    capture == ExternalFileIrpOutputCapture::MethodNeitherInput,
                 )))
             }
             Ok(FileIrpResumeProgress::ChildWorkYield(native)) => {
-                let continuation = Self { native, instance_index };
+                let continuation = Self { native, instance_index, capture, tail };
                 match ExternalFileIrpPumpKey::new(&invocation, continuation.epoch()) {
                     Some(key) => Ok(InvokeResult::ChildWorkYield {
                         invocation, key, continuation,
@@ -87,7 +155,7 @@ impl FileDispatchContinuation {
                     }),
                 }
             }
-            Err(native) => Err((invocation, Self { native, instance_index })),
+            Err(native) => Err((invocation, Self { native, instance_index, capture, tail })),
         }
     }
 }
@@ -139,6 +207,60 @@ pub(super) fn invoke(
         }
     };
     finish_invoke_result(invocation, projection, instance_index, capture, result, trace_connect)
+}
+
+/// An owned File caller's invocation: a pump that stops unfinished stays with the caller's
+/// File row as a continuation, which a later root boundary resumes (#420).
+pub(super) fn invoke_retaining(
+    mut invocation: ExternalFileIrpInvocation,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    capture: ExternalFileIrpOutputCapture,
+) -> InvokeResult {
+    let projection = invocation.projection().clone();
+    let route = invocation.route();
+    let Some((instance_index, _)) = instance_by_driver_id(route.driver_id().raw()) else {
+        print_str(b"[hosted-file] detached invoke missing driver instance\n");
+        return InvokeResult::Returned(invocation.returned(ExternalFileIrpOutcome::NotEntered {
+            status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+        }));
+    };
+    if route.driver_id() != projection.driver_id || route.device_id() != projection.device_id {
+        return InvokeResult::Returned(invocation.returned(ExternalFileIrpOutcome::NotEntered {
+            status: nt_status::NtStatus::INVALID_PARAMETER,
+        }));
+    }
+    let trace_connect = capture == ExternalFileIrpOutputCapture::MethodNeitherInput;
+    let progress = {
+        let (input, output) = invocation.buffers_mut().split();
+        if let IoParameters::Scsi(parameters) = &projection.parameters {
+            match nt_io_manager::scsi_srb_wire::encode_scsi_dispatch_input(
+                parameters, projection.irp_id, input,
+            ) {
+                Ok(packet) => execute_retaining(
+                    instance_index, caller, &projection, &packet, output, capture),
+                Err(error) => FileExecuteProgress::Returned(
+                    HostedIrpTransportResult::NotDispatched {
+                        status: match error {
+                            nt_io_manager::scsi_srb_wire::ScsiWireError::NoCapacity =>
+                                nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+                            _ => nt_status::NtStatus::INVALID_PARAMETER,
+                        },
+                    }),
+            }
+        } else {
+            execute_retaining(instance_index, caller, &projection, input, output, capture)
+        }
+    };
+    match progress {
+        FileExecuteProgress::Returned(result) => InvokeResult::Returned(finish_invoke_result(
+            invocation, projection, instance_index, capture, result, trace_connect)),
+        FileExecuteProgress::ChildWorkYield(continuation) => {
+            match ExternalFileIrpPumpKey::new(&invocation, continuation.epoch()) {
+                Some(key) => InvokeResult::ChildWorkYield { invocation, key, continuation },
+                None => InvokeResult::UnkeyedChildWorkYield { invocation, continuation },
+            }
+        }
+    }
 }
 
 fn finish_invoke_result(
@@ -661,7 +783,7 @@ fn execute_port_connect_suspend_aware(
     input: &[u8],
     output: &mut [u8],
 ) -> FileExecuteProgress {
-    let (request, route_instance, _, device_object) = match prepare_dispatch_request(
+    let (request, route_instance, route_inst, device_object) = match prepare_dispatch_request(
         instance_index, projection, input.len(), output.len(),
         ExternalFileIrpOutputCapture::MethodNeitherInput,
     ) {
@@ -696,8 +818,73 @@ fn execute_port_connect_suspend_aware(
         HostedIrpDispatchProgress::ChildWorkYield(native) => {
             FileExecuteProgress::ChildWorkYield(FileDispatchContinuation {
                 native, instance_index,
+                capture: ExternalFileIrpOutputCapture::MethodNeitherInput,
+                tail: ExecuteTail::none(instance_index, projection.irp_id.raw(), projection.major,
+                    route_instance, route_inst),
             })
         }
+    }
+}
+
+/// Owned File callers: like [`execute_with_capture`], but a pump that stops unfinished with no
+/// lane to keep it (a root turn that may not block, a nested child step, a scheduler service)
+/// stays in its File owner as a continuation instead of returning an uncertain result (#420).
+fn execute_retaining(
+    instance_index: usize,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    projection: &IrpProjection,
+    input: &[u8],
+    output: &mut [u8],
+    capture: ExternalFileIrpOutputCapture,
+) -> FileExecuteProgress {
+    let (request, route_instance, route_inst, device_object) =
+        match prepare_dispatch_request(
+            instance_index, projection, input.len(), output.len(), capture,
+        ) {
+            Ok(prepared) => prepared,
+            Err(status) => return FileExecuteProgress::Returned(
+                HostedIrpTransportResult::NotDispatched { status }),
+        };
+    let mut tail = ExecuteTail::none(instance_index, projection.irp_id.raw(), projection.major,
+        route_instance, route_inst);
+    if let IoParameters::Scsi(parameters) = &projection.parameters {
+        if parameters.data_length != 0 {
+            if let Err(status) = unsafe {
+                hosted_scsi_dma_reservation::reserve_for_dispatch(
+                    &request, parameters.route.provider_pdo,
+                    u64::from(parameters.data_length),
+                )
+            } {
+                return FileExecuteProgress::Returned(
+                    HostedIrpTransportResult::NotDispatched { status });
+            }
+            tail.scsi_data = true;
+        }
+    }
+    let progress = unsafe {
+        dispatch_irp_for_instance_exact_retaining(
+            route_instance,
+            projection.major as u64,
+            projection.minor as u64,
+            device_object,
+            projection.irp_id.raw(),
+            projection.file_id.map(FileId::raw).unwrap_or(0),
+            projection_fsctl(projection),
+            projection.user_data,
+            projection.requestor_tid,
+            Some(request),
+            input,
+            output,
+            caller,
+        )
+    };
+    match progress {
+        HostedIrpDispatchProgress::Returned(result) =>
+            FileExecuteProgress::Returned(tail.finish(result)),
+        HostedIrpDispatchProgress::ChildWorkYield(native) =>
+            FileExecuteProgress::ChildWorkYield(FileDispatchContinuation {
+                native, instance_index, capture, tail,
+            }),
     }
 }
 
@@ -716,8 +903,10 @@ fn execute_with_capture(
             Ok(prepared) => prepared,
             Err(status) => return HostedIrpTransportResult::NotDispatched { status },
         };
-    let scsi_data = match &projection.parameters {
-        IoParameters::Scsi(parameters) if parameters.data_length != 0 => {
+    let mut tail = ExecuteTail::none(instance_index, projection.irp_id.raw(), projection.major,
+        route_instance, route_inst);
+    if let IoParameters::Scsi(parameters) = &projection.parameters {
+        if parameters.data_length != 0 {
             if let Err(status) = unsafe {
                 hosted_scsi_dma_reservation::reserve_for_dispatch(
                     &request, parameters.route.provider_pdo,
@@ -726,10 +915,9 @@ fn execute_with_capture(
             } {
                 return HostedIrpTransportResult::NotDispatched { status };
             }
-            true
+            tail.scsi_data = true;
         }
-        _ => false,
-    };
+    }
     let result = unsafe {
         dispatch_irp_for_instance_exact(
             route_instance,
@@ -747,49 +935,5 @@ fn execute_with_capture(
             caller,
         )
     };
-    if scsi_data {
-        match result {
-            Some(HostedIrpTransportResult::NotDispatched { .. }) => {
-                if unsafe { hosted_scsi_dma_reservation::release_after_ack(projection.irp_id.raw()) }
-                    .is_err()
-                {
-                    unsafe { hosted_scsi_dma_reservation::quarantine(projection.irp_id.raw()) };
-                }
-            }
-            None | Some(HostedIrpTransportResult::Indeterminate { .. }) =>
-                unsafe { hosted_scsi_dma_reservation::quarantine(projection.irp_id.raw()) },
-            Some(HostedIrpTransportResult::Returned { .. }) => {}
-        }
-    }
-    if result.is_none() {
-        print_str(b"[hosted-file] exact dispatch unavailable instance/device/irp=");
-        print_u64(instance_index as u64);
-        print_str(b"/");
-        print_hex_u64(projection.device_id.raw());
-        print_str(b"/");
-        print_hex_u64(projection.irp_id.raw());
-        print_str(b"\n");
-    }
-    let result = result.unwrap_or(HostedIrpTransportResult::NotDispatched {
-        status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
-    });
-    if projection.major == major::IRP_MJ_CREATE
-        && matches!(
-            result,
-            HostedIrpTransportResult::Returned {
-                status: nt_status::NtStatus::SUCCESS,
-                ..
-            }
-        )
-        && unsafe { hosted_instance_video_port_initialized(route_inst) }
-    {
-        if let Err(transport_status) =
-            unsafe { commit_video_registry_parameters_for_instance(route_inst) }
-        {
-            // Native CREATE already published its File. A later registry failure cannot undo it.
-            register_instance_ready(route_instance, false);
-            return HostedIrpTransportResult::Indeterminate { transport_status };
-        }
-    }
-    result
+    tail.finish(result)
 }

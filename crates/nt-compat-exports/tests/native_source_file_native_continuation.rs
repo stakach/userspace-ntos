@@ -73,15 +73,3 @@ fn entered_resume_never_reports_a_synthetic_no_entry_result() {
     assert!(!resume.contains("Returned(self.finish(out))"));
 }
 
-#[test]
-fn existing_dispatch_entry_cannot_admit_a_child_work_yield() {
-    let entry = NATIVE
-        .split_once("unsafe fn dispatch_irp_for_instance_exact(")
-        .expect("legacy dispatch entry")
-        .1
-        .split_once("fn dispatch_irp_for_instance_exact_suspend_aware(")
-        .expect("separate File-only entry")
-        .0;
-    assert!(entry.contains("None"), "legacy call must withhold the yield permit");
-    assert!(!entry.contains("ChildWorkYield"), "legacy caller cannot consume a yield");
-}

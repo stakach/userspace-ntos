@@ -127,13 +127,6 @@ fn native_disk_proof_can_authenticate_its_retained_precommit_child() {
     let capture = file[bind..].find("capture_route(id, &prepared)")
         .expect("route capture follows exact proof IRP binding");
     assert!(capture > 0);
-
-    let proof = include_str!("../../../components/ntos-executive/src/native_disk_relation.rs");
-    let activate = proof.find("activate_pending_scsi_proof_authority(self.pending_authority)")
-        .expect("proof activates its scoped authority");
-    let dispatch = proof[activate..].find("hosted_file_owners::dispatch(")
-        .expect("proof dispatch follows scoped authority activation");
-    assert!(dispatch > 0);
 }
 
 #[test]

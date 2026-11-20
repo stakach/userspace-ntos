@@ -21,6 +21,8 @@ const NOT_SUPPORTED: i32 = nt_status::NtStatus::NOT_SUPPORTED.raw();
 const INSUFFICIENT_RESOURCES: i32 = nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw();
 
 struct Work {
+    /// The dispatch's pump kept in its File row (#420); collected before anything else.
+    kept_pump: Option<hosted_file_owners::KeptPumpSelector>,
     source: Source,
     source_instance: DriverInstance,
     provider_instance: DriverInstance,
@@ -351,6 +353,7 @@ unsafe fn submit_captured(
         }
     };
     let work = Work {
+        kept_pump: None,
         source,
         source_instance,
         provider_instance,
@@ -431,73 +434,84 @@ impl Work {
     }
 
     unsafe fn dispatch_provider(&mut self, handler: *mut ExecNtHandler) {
-        if let Err(status) = self.actor.validate(&(*handler).pm) {
-            self.terminal_status = Some(status as i32);
-            return;
-        }
-        if !self.source.validate_before_entry() || !self.provider_exact() {
-            self.terminal_status = Some(INVALID_DEVICE_REQUEST);
-            return;
-        }
-        let (major, parameters, stack_flags, request_flags, initial_information, policy, input) =
-            match &self.source {
-                Source::Control(source) => {
-                    let control = source.request();
-                    (
-                        major::IRP_MJ_DEVICE_CONTROL,
-                        IoParameters::DeviceControl(DeviceControlParameters {
-                            ioctl_code: control.code,
-                            input_len: control.input_len,
-                            output_len: control.output_len,
-                        }),
-                        StackFlags::empty(),
-                        // IoBuildDeviceIoControlRequest sets only its transfer method.
-                        nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
-                        control.initial_information,
-                        if control.output_len == 0 {
-                            ExternalFileIrpDispatchPolicy::DeviceControlAtDevice
-                        } else {
-                            ExternalFileIrpDispatchPolicy::BufferedDeviceControlAtDevice
-                        },
-                        source.input(),
-                    )
+        // A kept pump is collected first, before any other effect of this turn (#420).
+        let result = match hosted_file_owners::collect_kept(&mut self.kept_pump) {
+            hosted_file_owners::KeptCollect::Pending => return,
+            hosted_file_owners::KeptCollect::Collected(result) => result,
+            hosted_file_owners::KeptCollect::Absent => {
+                if let Err(status) = self.actor.validate(&(*handler).pm) {
+                    self.terminal_status = Some(status as i32);
+                    return;
                 }
-                Source::Read(source) => {
-                    let read = source.request();
-                    (
-                        major::IRP_MJ_READ,
-                        IoParameters::Read(ReadWriteParameters {
-                            length: read.length,
-                            key: 0,
-                            offset: read.byte_offset,
-                        }),
-                        StackFlags::from_bits_retain(read.stack_flags),
-                        read.request_flags,
-                        0,
-                        ExternalFileIrpDispatchPolicy::ReadAtDevice,
-                        &[][..],
-                    )
+                if !self.source.validate_before_entry() || !self.provider_exact() {
+                    self.terminal_status = Some(INVALID_DEVICE_REQUEST);
+                    return;
                 }
-            };
-        let request = ExternalFileIrpRequest {
-            client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
-            device_id: self.source.device_id(),
-            file_id: None,
-            user_data: 0,
-            requestor_tid: u64::from(self.caller.original_thread().thread_id()),
-            major,
-            parameters,
-            stack_flags,
-            request_flags,
-            initial_information,
+                let (major, parameters, stack_flags, request_flags, initial_information, policy, input) =
+                    match &self.source {
+                        Source::Control(source) => {
+                            let control = source.request();
+                            (
+                                major::IRP_MJ_DEVICE_CONTROL,
+                                IoParameters::DeviceControl(DeviceControlParameters {
+                                    ioctl_code: control.code,
+                                    input_len: control.input_len,
+                                    output_len: control.output_len,
+                                }),
+                                StackFlags::empty(),
+                                // IoBuildDeviceIoControlRequest sets only its transfer method.
+                                nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
+                                control.initial_information,
+                                if control.output_len == 0 {
+                                    ExternalFileIrpDispatchPolicy::DeviceControlAtDevice
+                                } else {
+                                    ExternalFileIrpDispatchPolicy::BufferedDeviceControlAtDevice
+                                },
+                                source.input(),
+                            )
+                        }
+                        Source::Read(source) => {
+                            let read = source.request();
+                            (
+                                major::IRP_MJ_READ,
+                                IoParameters::Read(ReadWriteParameters {
+                                    length: read.length,
+                                    key: 0,
+                                    offset: read.byte_offset,
+                                }),
+                                StackFlags::from_bits_retain(read.stack_flags),
+                                read.request_flags,
+                                0,
+                                ExternalFileIrpDispatchPolicy::ReadAtDevice,
+                                &[][..],
+                            )
+                        }
+                    };
+                let request = ExternalFileIrpRequest {
+                    client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
+                    device_id: self.source.device_id(),
+                    file_id: None,
+                    user_data: 0,
+                    requestor_tid: u64::from(self.caller.original_thread().thread_id()),
+                    major,
+                    parameters,
+                    stack_flags,
+                    request_flags,
+                    initial_information,
+                };
+                let result = hosted_file_owners::dispatch(
+                    self.caller,
+                    request,
+                    input,
+                    &self.terminal_output,
+                    policy,
+                );
+                match hosted_file_owners::keep_or_ready(&mut self.kept_pump, result) {
+                    Some(result) => result,
+                    None => return,
+                }
+            }
         };
-        let result = hosted_file_owners::dispatch(
-            self.caller,
-            request,
-            input,
-            &self.terminal_output,
-            policy,
-        );
         let result = match result {
             Ok(result) => result,
             Err(status) if status == nt_status::NtStatus::DEVICE_BUSY => return,
@@ -639,6 +653,8 @@ impl Work {
             return true;
         }
         if runtime::retained_service_cancelled(self.route, self.dispatch, self.reply, self.token) {
+            // A kept pump is an entered, uninterruptible dispatch: wait for its return (#420).
+            if self.kept_pump.is_some() { return false; }
             if !self.cancel_requested {
                 if let Some(irp) = self.canonical_irp { let _ = cancel_irp_if_pending(irp.raw()); }
                 self.cancel_requested = true;
@@ -660,6 +676,8 @@ impl Work {
         if !self.entered_provider && self.terminal_status.is_none() {
             self.dispatch_provider(handler);
         }
+        // A kept pump waits for its own turn (#420).
+        if self.kept_pump.is_some() { return false; }
         if self.canonical_irp.is_some() && self.terminal_status.is_none() {
             self.poll_provider();
         }
