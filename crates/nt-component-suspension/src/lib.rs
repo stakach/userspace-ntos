@@ -1733,6 +1733,11 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         })
     }
 
+    /// The lane's external token stack, oldest first, for refusal diagnostics.
+    pub fn external_tokens(&self, handle: LaneHandle) -> Result<&[u64], LaneError> {
+        self.lane(handle).map(|lane| lane.external_tokens.as_slice())
+    }
+
     fn lane(&self, handle: LaneHandle) -> Result<&Lane<C, R, T>, LaneError> {
         if !handle.is_valid() {
             return Err(LaneError::InvalidIdentity);

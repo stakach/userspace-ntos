@@ -2345,6 +2345,12 @@ unsafe fn service_wait_admit_with_transfer(
         pending: PendingComponentDispatch::ServiceWait(pending), return_target, destination,
     });
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    // 1: inside an active callback, 2: a callback return's wait, 3: no callback.
+    let (transfer_kind, transfer_callback_token) = match transfer {
+        NestedWaitTransfer::InCallback { token, .. } => (1, token),
+        NestedWaitTransfer::CallbackReturn(completed) => (2, completed.token),
+        NestedWaitTransfer::None => (3, 0),
+    };
     let admitted = match transfer {
         NestedWaitTransfer::InCallback { token, .. } =>
             lanes.admit_in_callback_service_wait_external_owned(
@@ -2361,11 +2367,52 @@ unsafe fn service_wait_admit_with_transfer(
             yielded.token, key, sequence, owner, continuation,
         ),
     };
-    if admitted.is_ok() { RetainedWaitAdmission::Accepted }
-    else {
-        trace_win32k_handoff_refusal(b"service-wait-lane-admission");
-        RetainedWaitAdmission::RefusedNoEffect
+    match admitted {
+        Ok(()) => RetainedWaitAdmission::Accepted,
+        Err((error, _)) => {
+            trace_win32k_handoff_refusal(b"service-wait-lane-admission");
+            trace_service_wait_lane_refusal(
+                lanes, yielded.route.identity().lane, error, transfer_kind,
+                transfer_callback_token, yielded.token, yielded.dispatch,
+            );
+            RetainedWaitAdmission::RefusedNoEffect
+        }
     }
+}
+
+/// Boot 44734360490: an in-callback service wait of explorer's nested 0x11d9 was refused at lane
+/// admission and the root exited (win32k-dispatch-retained). Name the lane error, the transfer
+/// and the lane's external token stack, so the refused invariant is visible. Read-only.
+unsafe fn trace_service_wait_lane_refusal(
+    lanes: &ComponentLanes,
+    lane: nt_component_suspension::LaneHandle,
+    error: nt_component_suspension::LaneError,
+    transfer_kind: u64,
+    callback_token: u64,
+    service_token: u64,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+) {
+    use nt_component_suspension::LaneError as E;
+    let error_code = match error {
+        E::InvalidIdentity => 1, E::DuplicateBinding => 2, E::NoCapacity => 3, E::NotFound => 4,
+        E::StaleGeneration => 5, E::WrongBinding => 6, E::Busy => 7, E::InvalidPhase => 8,
+        E::Suspension(_) => 9,
+    };
+    print_str(b"[service-wait-lane-refusal] lane/gen/error/transfer/callback-token/service-token/dispatch-epoch=");
+    for value in [u64::from(lane.index), u64::from(lane.generation), error_code, transfer_kind,
+        callback_token, service_token, dispatch.epoch()] {
+        print_str(b"/");
+        print_hex_u64(value);
+    }
+    print_str(b" tokens=");
+    match lanes.external_tokens(lane) {
+        Ok(tokens) => for token in tokens.iter().rev().take(6) {
+            print_str(b"/");
+            print_hex_u64(*token);
+        },
+        Err(_) => print_str(b"unavailable"),
+    }
+    print_str(b"\n");
 }
 
 unsafe fn service_wait_admit_current(
