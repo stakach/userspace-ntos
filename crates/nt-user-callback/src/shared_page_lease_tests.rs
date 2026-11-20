@@ -392,3 +392,82 @@ fn audit_repairs_leave_the_authority_consistent_for_the_next_transition() {
     authority.enter(first, ()).unwrap();
     authority.finish_active(first).unwrap();
 }
+
+// #419 boot 44647857225: the provider-finalizer callout for a process whose last thread has
+// retired named pi/tid 7/0 and was refused as an invalid identity.
+#[test]
+fn process_scoped_finalizer_callout_owns_the_page_without_a_thread() {
+    let mut finalizer = identity(13, 1);
+    finalizer.dispatch.ssn = 0;
+    finalizer.client = SharedPageClientIdentity {
+        pi: 7, pid: 76, generation: 1, tid: 0, badge: 30, tcb: 0,
+    };
+    let mut page = SharedPageAuthority::<1>::new();
+    page.enter(finalizer, ()).unwrap_or_else(|_| panic!("a process-scoped callout is a real owner"));
+    assert_eq!(page.settle(finalizer, SharedPagePumpSettlement::Completed), Ok(()));
+    // A thread identity still needs its whole tuple.
+    for partial in [
+        SharedPageClientIdentity { tcb: 0x400, ..finalizer.client },
+        SharedPageClientIdentity { generation: 0, ..finalizer.client },
+        SharedPageClientIdentity { pid: 0, ..finalizer.client },
+    ] {
+        let mut invalid = finalizer;
+        invalid.client = partial;
+        assert_eq!(page.enter(invalid, ()).err().map(|(error, _)| error),
+            Some(SharedPageLeaseError::InvalidIdentity));
+    }
+}
+
+// #419 boot 44647857225: a provider-wait resume that waited again built its pending record
+// without parking, so every later resume of the same dispatch found it still active (not-top)
+// and every root ingress found the page held. Each pump return settles the page once.
+#[test]
+fn a_resumed_dispatch_that_waits_again_parks_before_its_next_resume() {
+    let waiter = identity(92, 1);
+    let root = identity(95, 1);
+    let mut page = SharedPageAuthority::<2>::new();
+    page.enter(waiter, ()).unwrap_or_else(|_| panic!("first entry"));
+    assert_eq!(page.settle(waiter, SharedPagePumpSettlement::Yielded(Some(snapshot(waiter, 1)))), Ok(()));
+    for round in 2..5 {
+        let saved = page.reacquire(waiter).expect("the parked waiter takes the page back");
+        assert_eq!(page.acknowledge_restore(waiter, SharedPageRestoreEffect::Applied(saved)), Ok(()));
+        assert_eq!(page.settle(waiter, SharedPagePumpSettlement::Yielded(Some(snapshot(waiter, round)))),
+            Ok(()), "the resumed pump waited again");
+        // Between resumes the page is free for an unrelated root dispatch.
+        page.enter(root, ()).unwrap_or_else(|_| panic!("the page is free while the waiter is parked"));
+        assert_eq!(page.settle(root, SharedPagePumpSettlement::Completed), Ok(()));
+    }
+    let saved = page.reacquire(waiter).unwrap();
+    assert_eq!(page.acknowledge_restore(waiter, SharedPageRestoreEffect::Applied(saved)), Ok(()));
+    assert_eq!(page.settle(waiter, SharedPagePumpSettlement::Retained), Ok(()));
+    assert_eq!(page.settle(waiter, SharedPagePumpSettlement::Completed), Ok(()));
+    assert!(!page.is_held());
+}
+
+#[test]
+fn a_yield_without_its_exact_page_pins_the_owner() {
+    let owner = identity(40, 1);
+    let mut page = SharedPageAuthority::<1>::new();
+    page.enter(owner, ()).unwrap_or_else(|_| panic!("entry"));
+    assert_eq!(page.settle(owner, SharedPagePumpSettlement::Yielded(None)),
+        Err(SharedPageLeaseError::MissingSnapshot));
+    assert_eq!(page.enter(identity(41, 1), ()).err().map(|(error, _)| error),
+        Some(SharedPageLeaseError::Uncertain), "nobody may write over an uncaptured page");
+    assert_eq!(page.settle(identity(41, 1), SharedPagePumpSettlement::Retained),
+        Err(SharedPageLeaseError::Uncertain));
+}
+
+// #419 boot 44647857225: after a refused reacquire the audit repair made the dispatch active,
+// so its own correct restore was reported as not-displaced. The repair restores instead.
+#[test]
+fn audit_repair_of_a_refused_reacquire_judges_the_restore_on_its_own() {
+    let owner = identity(91, 1);
+    let mut page = SharedPageAuthority::<1>::new();
+    page.enter(owner, ()).unwrap_or_else(|_| panic!("entry"));
+    assert_eq!(page.reacquire(owner), Err(SharedPageLeaseError::NotTop), "never parked");
+    let saved = snapshot(owner, 5);
+    page.audit_force_restoring(owner, saved);
+    assert_eq!(page.audit_holder(), SharedPageAuditHolder::Restoring(91));
+    assert_eq!(page.acknowledge_restore(owner, SharedPageRestoreEffect::Applied(saved)), Ok(()));
+    assert_eq!(page.audit_holder(), SharedPageAuditHolder::Active(91));
+}

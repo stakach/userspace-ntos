@@ -2419,6 +2419,15 @@ impl PumpResult {
         self.ingress_yield.and_then(PumpIngressYield::root_ingress)
     }
 
+    /// The dispatch suspended with its publication still on the shared page: some pending
+    /// owner (callback frame, wait, yield or nested row) will resume it.
+    pub(crate) fn page_yielded(&self) -> bool {
+        self.callback_suspended || self.provider_wait_suspended() || self.lpc_wait_suspended
+            || self.ingress_yield.is_some() || self.service_wait_yield.is_some()
+            || self.maintenance_yield.is_some() || self.nested_restore_yield.is_some()
+            || self.nested_restore_quarantined.is_some()
+    }
+
     /// An adapter's genuine admission failure, never a provider completion or resumable yield.
     pub(crate) fn refused(status: i32, reply_cap: u64) -> Self {
         Self {

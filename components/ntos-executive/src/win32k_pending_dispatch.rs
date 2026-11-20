@@ -281,6 +281,31 @@ impl SharedResumeSnapshot {
         ])
     }
 
+    /// The exact page the authority parked.
+    pub(crate) fn from_lease_snapshot(page: nt_user_callback::SharedPageSnapshot) -> Self {
+        Self {
+            payload: Some(page.callback_payload),
+            ..Self::from_callback_publication(page.header, page.publication)
+        }
+    }
+
+    /// A callback frame retains its request and publication but not the payload it was
+    /// published with. When the parked page is that same publication, restore it whole, so the
+    /// restore is the exact page and the reply is then written over it by its owner.
+    pub(crate) fn with_parked_payload(
+        self, parked: Option<nt_user_callback::SharedPageSnapshot>,
+    ) -> Self {
+        match parked {
+            Some(page) if self.payload.is_none()
+                && page.publication == self.callback_publication()
+                && page.header.matches_dispatch_identity(
+                    self.header.dispatch_id, self.header.client_pi,
+                    self.header.client_tid, self.header.client_badge,
+                ) => Self::from_lease_snapshot(page),
+            _ => self,
+        }
+    }
+
     pub(crate) fn from_callback_publication(
         header: nt_user_callback::CallbackHeader,
         publication: nt_user_callback::SharedCallbackPublication,
@@ -461,34 +486,31 @@ pub(crate) unsafe fn try_capture_exact_shared_resume_snapshot(
     Some(snapshot)
 }
 
-/// #419: a resumed dispatch yields again; its captured page is parked with the authority.
-pub(crate) unsafe fn reparked(
-    snapshot: SharedResumeSnapshot,
+/// #419: every return of a pump entered under the shared page settles that hold once, here,
+/// before any pending owner is built from the result: a suspension parks the exact page, a
+/// return frees it, and a refused or uncertain return keeps the page with its owner.
+pub(crate) unsafe fn settle_pump_page(
     dispatch: nt_user_callback::DispatchContext,
     client: Win32kClientContext,
+    pump: &crate::spawn_hosts::PumpResult,
     site: &[u8],
-) -> SharedResumeSnapshot {
-    crate::win32k_shared_page_authority::audit_park(
+) {
+    use nt_user_callback::SharedPagePumpSettlement as Settlement;
+    let settlement = if pump.provider_wait_capture_refusal.is_some() || pump.refused_before_entry {
+        Settlement::Retained
+    } else if pump.page_yielded() {
+        Settlement::Yielded(try_capture_exact_shared_resume_snapshot(dispatch, client)
+            .and_then(|snapshot| snapshot.lease_snapshot(client)))
+    } else if pump.completed {
+        Settlement::Completed
+    } else {
+        Settlement::Retained
+    };
+    crate::win32k_shared_page_authority::audit_settle(
         nt_user_callback::SharedPageLeaseIdentity { dispatch, client: shared_page_client_identity(client) },
-        snapshot.lease_snapshot(client),
+        settlement,
         site,
     );
-    snapshot
-}
-
-/// As [`reparked`], for an exact capture that may have found the page changed.
-pub(crate) unsafe fn reparked_exact(
-    snapshot: Option<SharedResumeSnapshot>,
-    dispatch: nt_user_callback::DispatchContext,
-    client: Win32kClientContext,
-    site: &[u8],
-) -> Option<SharedResumeSnapshot> {
-    crate::win32k_shared_page_authority::audit_park(
-        nt_user_callback::SharedPageLeaseIdentity { dispatch, client: shared_page_client_identity(client) },
-        snapshot.as_ref().and_then(|snapshot| snapshot.lease_snapshot(client)),
-        site,
-    );
-    snapshot
 }
 
 #[track_caller]
@@ -649,9 +671,14 @@ pub(crate) unsafe fn select_and_restore_shared_resume_snapshot(
         dispatch, client: shared_page_client_identity(client),
     };
     // #419: the parked dispatch takes the page back before restoring its publication.
-    crate::win32k_shared_page_authority::audit_reacquire(identity, b"resume");
-    let selected = super::select_win32k_client_window(client);
-    let restored = selected && match restore_shared_resume_snapshot_effect(snapshot, dispatch, client) {
+    let parked = crate::win32k_shared_page_authority::audit_reacquire(
+        identity, snapshot.lease_snapshot(client), b"resume");
+    let snapshot = snapshot.with_parked_payload(parked);
+    if !super::select_win32k_client_window(client) {
+        crate::win32k_shared_page_authority::audit_restored(identity, None, b"resume-select");
+        return (false, false);
+    }
+    let restored = match restore_shared_resume_snapshot_effect(snapshot, dispatch, client) {
         SharedResumeRestoreEffect::Applied(page) => {
             crate::win32k_shared_page_authority::audit_restored(
                 identity, page.lease_snapshot(client), b"resume");
@@ -662,7 +689,28 @@ pub(crate) unsafe fn select_and_restore_shared_resume_snapshot(
             false
         }
     };
-    (selected, restored)
+    (true, restored)
+}
+
+/// A cancelled or dead-client callback is answered with a failure reply. Before that header
+/// write, its dispatch takes back and restores the exact page it parked at the callback.
+pub(crate) unsafe fn reacquire_parked_callback_page(
+    dispatch: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+    site: &[u8],
+) {
+    let identity = nt_user_callback::SharedPageLeaseIdentity {
+        dispatch, client: shared_page_client_identity(client),
+    };
+    let Some(parked) = crate::win32k_shared_page_authority::audit_reacquire(identity, None, site)
+    else { return };
+    let applied = match restore_shared_resume_snapshot_effect(
+        SharedResumeSnapshot::from_lease_snapshot(parked), dispatch, client,
+    ) {
+        SharedResumeRestoreEffect::Applied(page) => page.lease_snapshot(client),
+        SharedResumeRestoreEffect::NoPageWrite | SharedResumeRestoreEffect::Uncertain => None,
+    };
+    crate::win32k_shared_page_authority::audit_restored(identity, applied, site);
 }
 
 /// The dispatcher's singleton publication for one entered kernel job. `previous` is the
@@ -684,6 +732,13 @@ pub(crate) unsafe fn park_kernel_job_publication(
         return None;
     }
     let page = try_capture_exact_shared_resume_snapshot(job.dispatch, job.client)?;
+    crate::win32k_shared_page_authority::audit_park(
+        nt_user_callback::SharedPageLeaseIdentity {
+            dispatch: job.dispatch, client: shared_page_client_identity(job.client),
+        },
+        page.lease_snapshot(job.client),
+        b"kernel-job-lend",
+    );
     core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), job.previous);
     Some(page)
 }
@@ -693,14 +748,22 @@ pub(crate) unsafe fn restore_kernel_job_publication(
     job: KernelJobPublication,
     page: SharedResumeSnapshot,
 ) -> bool {
-    if core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH)) != job.previous
-        || !matches!(
-            restore_shared_resume_snapshot_effect(page, job.dispatch, job.client),
-            SharedResumeRestoreEffect::Applied(_)
-        )
-    {
+    if core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH)) != job.previous {
         return false;
     }
+    let identity = nt_user_callback::SharedPageLeaseIdentity {
+        dispatch: job.dispatch, client: shared_page_client_identity(job.client),
+    };
+    let _ = crate::win32k_shared_page_authority::audit_reacquire(
+        identity, page.lease_snapshot(job.client), b"kernel-job-lend");
+    let SharedResumeRestoreEffect::Applied(applied) =
+        restore_shared_resume_snapshot_effect(page, job.dispatch, job.client)
+    else {
+        crate::win32k_shared_page_authority::audit_restored(identity, None, b"kernel-job-lend");
+        return false;
+    };
+    crate::win32k_shared_page_authority::audit_restored(
+        identity, applied.lease_snapshot(job.client), b"kernel-job-lend");
     core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), job.dispatch);
     true
 }

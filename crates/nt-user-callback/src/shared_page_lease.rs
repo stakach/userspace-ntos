@@ -23,8 +23,15 @@ impl SharedPageClientIdentity {
             && self.badge == 0 && self.tcb == 0
     }
 
+    /// A Ps process callout issued after the process's last thread retired (the provider's
+    /// process-object finalizer) names the exact process generation and no thread.
+    const fn is_process_scoped(self) -> bool {
+        self.pid != 0 && self.generation != 0 && self.tid == 0 && self.tcb == 0
+    }
+
     const fn is_valid(self) -> bool {
         self.is_executive()
+            || self.is_process_scoped()
             || (self.pid != 0 && self.generation != 0 && self.tid != 0
                 && self.badge != 0 && self.tcb > 1)
     }
@@ -481,6 +488,44 @@ impl<const N: usize> SharedPageAuthority<N> {
     }
 }
 
+/// How one pump run left the dispatch that held the page. Every return of a pump that was
+/// entered under the page settles exactly once, whichever pending owner later retains it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedPagePumpSettlement {
+    /// The dispatch suspended (callback, wait, yield). `None`: its exact page was not stable.
+    Yielded(Option<SharedPageSnapshot>),
+    /// The handler returned: the page has no writer.
+    Completed,
+    /// Neither: a refused or uncertain return keeps the active owner and its page.
+    Retained,
+}
+
+impl<const N: usize> SharedPageAuthority<N> {
+    /// Apply one pump return. A yield without its exact page pins the owner: another dispatch
+    /// may not write over a publication nobody captured.
+    pub fn settle(
+        &mut self, identity: SharedPageLeaseIdentity, settlement: SharedPagePumpSettlement,
+    ) -> Result<(), SharedPageLeaseError> {
+        match settlement {
+            SharedPagePumpSettlement::Yielded(Some(snapshot)) => {
+                self.capture_and_park(identity, snapshot)
+            }
+            SharedPagePumpSettlement::Yielded(None) => {
+                self.quarantine_active(identity)?;
+                Err(SharedPageLeaseError::MissingSnapshot)
+            }
+            SharedPagePumpSettlement::Completed => self.finish_active(identity),
+            SharedPagePumpSettlement::Retained => match self.current {
+                Some(PageAuthorityState::Active(owner)) if owner == identity => Ok(()),
+                Some(PageAuthorityState::Uncertain(..)
+                    | PageAuthorityState::UncertainReservation(..)) => Err(SharedPageLeaseError::Uncertain),
+                Some(_) => Err(SharedPageLeaseError::NotTop),
+                None => Err(SharedPageLeaseError::Empty),
+            },
+        }
+    }
+}
+
 /// What [`SharedPageAuthority`] held before an audit-mode repair: the evidence for a violation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SharedPageAuditHolder {
@@ -517,6 +562,13 @@ impl<const N: usize> SharedPageAuthority<N> {
     pub fn audit_force_active(&mut self, identity: SharedPageLeaseIdentity) {
         self.audit_drop_parked(identity.dispatch.dispatch_id);
         self.current = Some(PageAuthorityState::Active(identity));
+    }
+
+    /// Audit-mode repair after a refused reacquire: `identity` restores `saved` exclusively, so
+    /// the restore that follows is judged on its own evidence rather than on the refusal.
+    pub fn audit_force_restoring(&mut self, identity: SharedPageLeaseIdentity, saved: SharedPageSnapshot) {
+        self.audit_drop_parked(identity.dispatch.dispatch_id);
+        self.current = Some(PageAuthorityState::Restoring(identity, saved));
     }
 
     /// Audit-mode repair: `identity` is parked (replacing any parked entry of its dispatch) and

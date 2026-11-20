@@ -219,25 +219,52 @@ pub(crate) fn audit_enter(identity: SharedPageLeaseIdentity, site: &[u8]) {
     }
 }
 
-/// A dispatch yields: its exact full publication moves into the parked table.
-pub(crate) fn audit_park(identity: SharedPageLeaseIdentity, snapshot: Option<SharedPageSnapshot>, site: &[u8]) {
+/// One pump return (or a lend of the page) settles its dispatch's hold exactly once.
+pub(crate) fn audit_settle(
+    identity: SharedPageLeaseIdentity,
+    settlement: nt_user_callback::SharedPagePumpSettlement,
+    site: &[u8],
+) {
+    use nt_user_callback::SharedPagePumpSettlement as Settlement;
+    let Err(error) = transition(|authority| authority.settle(identity, settlement)) else { return };
     let id = identity.dispatch.dispatch_id;
-    let Some(snapshot) = snapshot else {
-        report(site, b"park", b"no-exact-snapshot", id, identity.client);
-        transition(|authority| authority.audit_force_clear(id));
-        return;
+    let (op, error): (&[u8], &[u8]) = match settlement {
+        Settlement::Yielded(None) => (b"park", b"no-exact-snapshot"),
+        Settlement::Yielded(Some(_)) => (b"park", error_name(error)),
+        Settlement::Completed => (b"finish", error_name(error)),
+        Settlement::Retained => (b"retain", error_name(error)),
     };
-    if let Err(error) = capture_and_park(identity, snapshot) {
-        report(site, b"park", error_name(error), id, identity.client);
-        transition(|authority| authority.audit_force_park(identity, snapshot));
-    }
+    report(site, op, error, id, identity.client);
+    transition(|authority| match settlement {
+        Settlement::Yielded(Some(snapshot)) => authority.audit_force_park(identity, snapshot),
+        Settlement::Yielded(None) | Settlement::Completed => authority.audit_force_clear(id),
+        Settlement::Retained => authority.audit_force_active(identity),
+    });
 }
 
-/// A parked dispatch takes the page back before its publication is restored.
-pub(crate) fn audit_reacquire(identity: SharedPageLeaseIdentity, site: &[u8]) {
-    if let Err(error) = reacquire(identity) {
-        report(site, b"reacquire", error_name(error), identity.dispatch.dispatch_id, identity.client);
-        transition(|authority| authority.audit_force_active(identity));
+/// A dispatch lends the page with its exact full publication (a nested child or source terminal
+/// is about to write it).
+pub(crate) fn audit_park(identity: SharedPageLeaseIdentity, snapshot: Option<SharedPageSnapshot>, site: &[u8]) {
+    audit_settle(identity, nt_user_callback::SharedPagePumpSettlement::Yielded(snapshot), site);
+}
+
+/// A parked dispatch takes the page back before its publication is restored. Returns the
+/// exact page it parked; `expected` is the caller's retained copy, used only by the repair.
+pub(crate) fn audit_reacquire(
+    identity: SharedPageLeaseIdentity,
+    expected: Option<SharedPageSnapshot>,
+    site: &[u8],
+) -> Option<SharedPageSnapshot> {
+    match reacquire(identity) {
+        Ok(parked) => Some(parked),
+        Err(error) => {
+            report(site, b"reacquire", error_name(error), identity.dispatch.dispatch_id, identity.client);
+            transition(|authority| match expected {
+                Some(saved) => authority.audit_force_restoring(identity, saved),
+                None => authority.audit_force_active(identity),
+            });
+            None
+        }
     }
 }
 
@@ -250,13 +277,5 @@ pub(crate) fn audit_restored(identity: SharedPageLeaseIdentity, applied: Option<
     if let Err(error) = acknowledge_restore(identity, effect) {
         report(site, b"restore", error_name(error), identity.dispatch.dispatch_id, identity.client);
         transition(|authority| authority.audit_force_active(identity));
-    }
-}
-
-/// A dispatch completed: the page has no writer.
-pub(crate) fn audit_finish(identity: SharedPageLeaseIdentity, site: &[u8]) {
-    if let Err(error) = finish_active(identity) {
-        report(site, b"finish", error_name(error), identity.dispatch.dispatch_id, identity.client);
-        transition(|authority| authority.audit_force_clear(identity.dispatch.dispatch_id));
     }
 }
