@@ -4402,7 +4402,9 @@ pub(crate) fn service_dll_pe_store_stats() -> DllPeStoreStats {
 /// This boundary also progresses retained wait effects on timer-only activity, when no new user
 /// syscall can arrive to drive a failed context write or capability retirement.
 fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
+    let started = crate::disk_census_ticks();
     let status = finalize_service_loop_work(nt_handler);
+    let finalized = crate::disk_census_ticks();
     // Include readiness created by any late post-action, on success and failure paths alike.
     unsafe { component_resume::reconcile(nt_handler) };
     if unsafe { driver_launch::hosted_scsi_receive_boundary_probe_due() } {
@@ -4410,6 +4412,8 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
         unsafe { driver_launch::trace_hosted_scsi_receive_boundary() };
     }
     unsafe { rearm_requested_mounted_native_timer(nt_handler) };
+    crate::hot_service_latency_census::finalized(
+        finalized.wrapping_sub(started), crate::disk_census_ticks().wrapping_sub(finalized));
     status
 }
 
@@ -4602,7 +4606,10 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     if let Some(status) = redrive_service_loop_global_work(nt_handler) {
         return status;
     }
-    checkpoint_service_loop_volume(nt_handler)
+    let started = crate::disk_census_ticks();
+    let status = checkpoint_service_loop_volume(nt_handler);
+    crate::hot_service_latency_census::checkpointed(crate::disk_census_ticks().wrapping_sub(started));
+    status
 }
 
 /// Advance retained service owners before attempting a mounted-volume checkpoint.

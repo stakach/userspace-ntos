@@ -41,3 +41,17 @@ fn each_phase_owns_the_time_up_to_its_end_and_a_failed_phase_up_to_the_failure()
     census::print_census();
     assert!(OUTPUT.lock().unwrap().starts_with(b"[census] registry-open-phase"));
 }
+
+#[test]
+fn capture_steps_are_split_at_their_marks() {
+    let capture = census::CaptureCensus::new();
+    let mut clock = census::CaptureClock::start(0);
+    for (step, at) in [1, 3, 6, 10, 11, 13].into_iter().enumerate() {
+        clock.mark(step, at * M);
+    }
+    capture.record(&clock);
+    let mut line = nt_printf::record::RecordBuffer::<256>::new();
+    capture.write_census(&mut line).unwrap();
+    assert_eq!(std::str::from_utf8(line.bytes()).unwrap(),
+        "[census] registry-capture-phase calls/attributes/caller/name/subject/reserve/canon-Mtick=1/1/2/3/4/1/2\n");
+}

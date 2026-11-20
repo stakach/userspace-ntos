@@ -112,6 +112,8 @@ impl ExecNtHandler {
         args: &[u64],
         create: bool,
     ) -> Result<(HostedRegistryPublication, u64), u32> {
+        let mut steps = crate::registry_open_phase_census::CaptureClock::start(
+            crate::disk_census_ticks());
         if args[0] == 0
             || !self.probe_user_output(args[0], 8)
             || (create && args[6] != 0 && !self.probe_user_output(args[6], 4))
@@ -129,6 +131,7 @@ impl ExecNtHandler {
         if flags & !(0x2 | 0x40 | 0x80 | OBJ_OPENLINK | 0x200 | 0x400) != 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
+        steps.mark(0, crate::disk_census_ticks());
         let lifetime = self
             .pm
             .thread_lifetime(self.current_tid as u32)
@@ -136,6 +139,7 @@ impl ExecNtHandler {
         let caller = self
             .pm
             .capture_native_handle_caller(lifetime, nt_types::AccessMode::UserMode)?;
+        steps.mark(1, crate::disk_census_ticks());
         let root = u64::from_le_bytes(attributes[8..16].try_into().unwrap());
         let name = self.read_registry_name_checked(u64::from_le_bytes(
             attributes[16..24].try_into().unwrap(),
@@ -159,7 +163,9 @@ impl ExecNtHandler {
             }
             full
         };
+        steps.mark(2, crate::disk_census_ticks());
         let mut subject = RegistrySubject::capture(&self.pm, &mut self.token_store, caller)?;
+        steps.mark(3, crate::disk_census_ticks());
         let mut publication = match self
             .pm
             .reserve_native_registry_key_handle(caller, flags & (0x2 | 0x200))
@@ -172,6 +178,7 @@ impl ExecNtHandler {
                 return Err(status);
             }
         };
+        steps.mark(4, crate::disk_census_ticks());
         let mut retained_root = None;
         let path_result = (|| {
             if root != 0 {
@@ -202,6 +209,8 @@ impl ExecNtHandler {
                 return Err(status);
             }
         };
+        steps.mark(5, crate::disk_census_ticks());
+        crate::registry_open_phase_census::record_capture(&steps);
         Ok((
             HostedRegistryPublication {
                 subject,

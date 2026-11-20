@@ -100,12 +100,62 @@ impl OpenPhaseCensus {
 
 static OPENS: OpenPhaseCensus = OpenPhaseCensus::new();
 
+/// Sub-phases of a successful registry capture (opens and creates).
+pub(crate) const CAPTURE_STEPS: usize = 6;
+const CAPTURE_NAMES: &str = "attributes/caller/name/subject/reserve/canon";
+
+/// TSC marks at the end of each capture step; recorded only when every step completed.
+pub(crate) struct CaptureClock {
+    marks: [u64; CAPTURE_STEPS + 1],
+}
+
+impl CaptureClock {
+    pub(crate) fn start(now: u64) -> Self { Self { marks: [now; CAPTURE_STEPS + 1] } }
+    /// Mark the end of step `step` (0-based, in `CAPTURE_NAMES` order).
+    pub(crate) fn mark(&mut self, step: usize, now: u64) {
+        if step < CAPTURE_STEPS { self.marks[step + 1] = now; }
+    }
+    fn steps(&self) -> [u64; CAPTURE_STEPS] {
+        core::array::from_fn(|step| self.marks[step + 1].saturating_sub(self.marks[step]))
+    }
+}
+
+pub(crate) struct CaptureCensus {
+    calls: AtomicU64,
+    ticks: [AtomicU64; CAPTURE_STEPS],
+}
+
+impl CaptureCensus {
+    pub(crate) const fn new() -> Self {
+        Self { calls: AtomicU64::new(0), ticks: [const { AtomicU64::new(0) }; CAPTURE_STEPS] }
+    }
+    pub(crate) fn record(&self, clock: &CaptureClock) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        for (cell, ticks) in self.ticks.iter().zip(clock.steps()) {
+            cell.fetch_add(ticks, Ordering::Relaxed);
+        }
+    }
+    pub(crate) fn write_census(&self, out: &mut impl Write) -> core::fmt::Result {
+        write!(out, "[census] registry-capture-phase calls/{CAPTURE_NAMES}-Mtick={}",
+            self.calls.load(Ordering::Relaxed))?;
+        for cell in &self.ticks {
+            write!(out, "/{}", cell.load(Ordering::Relaxed) / 1_000_000)?;
+        }
+        writeln!(out)
+    }
+}
+
+static CAPTURES: CaptureCensus = CaptureCensus::new();
+
+pub(crate) fn record_capture(clock: &CaptureClock) { CAPTURES.record(clock); }
+
 pub(crate) fn record_open(clock: &OpenPhaseClock, status: u32) {
     OPENS.record(clock, status, crate::disk_census_ticks());
 }
 
 pub(crate) fn print_census() {
-    let mut record = nt_printf::record::RecordBuffer::<256>::new();
+    let mut record = nt_printf::record::RecordBuffer::<512>::new();
     let _ = OPENS.write_census(&mut record);
+    let _ = CAPTURES.write_census(&mut record);
     crate::print_str(record.bytes());
 }

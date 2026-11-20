@@ -20,6 +20,8 @@ static RECEIVE_CALLS: AtomicU64 = AtomicU64::new(0);
 static RECEIVE_TICKS: AtomicU64 = AtomicU64::new(0);
 static STAGE_COUNTS: [AtomicU64; STAGES] = [const { AtomicU64::new(0) }; STAGES];
 static STAGE_TICKS: [AtomicU64; STAGES] = [const { AtomicU64::new(0) }; STAGES];
+/// Nested-site entries that reported progress; the rest parked the parent for nothing.
+static STAGE_PROGRESS: [AtomicU64; STAGES] = [const { AtomicU64::new(0) }; STAGES];
 
 fn bucket(label: u64) -> usize {
     if label < OTHER_LABEL as u64 { label as usize } else { OTHER_LABEL }
@@ -82,6 +84,12 @@ impl Drop for StageScope {
         STAGE_COUNTS[index].fetch_add(1, Ordering::Relaxed);
         STAGE_TICKS[index].fetch_add(
             crate::disk_census_ticks().wrapping_sub(self.started), Ordering::Relaxed);
+    }
+}
+
+pub(super) unsafe fn note_nested_progress(ch: &PumpChannel, stage: Stage, progressed: bool) {
+    if progressed && crate::driver_launch::file_rpc_pump_for_diagnostic(ch) {
+        STAGE_PROGRESS[stage as usize].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -185,12 +193,14 @@ pub(super) fn print_census() {
         crate::print_u64(STAGE_TICKS[index].load(Ordering::Relaxed) / 1_000_000);
     }
     crate::print_str(b"\n");
-    crate::print_str(b"[census] file-recv-nested count/ticks-M:");
+    crate::print_str(b"[census] file-recv-nested count/progressed/ticks-M:");
     for (stage, name) in NESTED_SITES {
         crate::print_str(b" ");
         crate::print_str(name);
         crate::print_str(b"=");
         crate::print_u64(STAGE_COUNTS[stage as usize].load(Ordering::Relaxed));
+        crate::print_str(b"/");
+        crate::print_u64(STAGE_PROGRESS[stage as usize].load(Ordering::Relaxed));
         crate::print_str(b"/");
         crate::print_u64(STAGE_TICKS[stage as usize].load(Ordering::Relaxed) / 1_000_000);
     }

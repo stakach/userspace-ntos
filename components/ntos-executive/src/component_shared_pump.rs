@@ -1,7 +1,7 @@
 //! Shared receiver routing for a currently entered component invocation.
 
 use super::shared_ingress::owner::runtime;
-use super::file_pump_diagnostic::{Stage, StageScope};
+use super::file_pump_diagnostic::{note_nested_progress, Stage, StageScope};
 use super::*;
 use nt_component_suspension::{
     InlineIrqCheckpoint, InlineIrqCheckpointError, InlineIrqCheckpointMismatch,
@@ -982,6 +982,7 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let progressed = crate::writable_fs::redrive_retained_system_wal_fold_after_native_completion();
+            note_nested_progress(ch, Stage::NestedWalAck, progressed);
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
                 let ticket = runtime::nested::claim_refused(&mut parent);
                 return nested_restore_refusal(ticket);
@@ -1038,6 +1039,7 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let serviced = crate::driver_launch::service_mounted_native_registry_recheck(id);
+            note_nested_progress(ch, Stage::NestedRegistryRecheck, serviced != 0);
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
                 let ticket = runtime::nested::claim_refused(&mut parent);
                 return nested_restore_refusal(ticket);
@@ -1056,6 +1058,7 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let serviced = crate::driver_launch::service_mounted_native_registry_wal(id);
+            note_nested_progress(ch, Stage::NestedRegistryWal, serviced != 0);
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
                 let ticket = runtime::nested::claim_refused(&mut parent);
                 return nested_restore_refusal(ticket);
@@ -1076,6 +1079,7 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let serviced = crate::driver_launch::service_mounted_native_mutable_hive_wal(id);
+            note_nested_progress(ch, Stage::NestedHiveWal, serviced != 0);
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
                 let ticket = runtime::nested::claim_refused(&mut parent);
                 return nested_restore_refusal(ticket);
@@ -1100,6 +1104,7 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let serviced = crate::driver_launch::service_mounted_native_background_holder();
+            note_nested_progress(ch, Stage::NestedBackgroundHolder, serviced != 0);
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
                 let ticket = runtime::nested::claim_refused(&mut parent);
                 return nested_restore_refusal(ticket);
@@ -1152,6 +1157,7 @@ pub(super) unsafe fn receive(
             observed_nested_file = true;
             crate::driver_launch::trace_port_connect_outer_probe(40, ch, u64::from(parent.is_some()));
             let progressed = crate::service_sec_image::redrive_nested_hosted_file_work();
+            note_nested_progress(ch, Stage::NestedFileWork, progressed);
             if source_sample {
                 crate::print_str(b"[inline-source-work] stage/parked/progressed=after-child/");
                 crate::print_u64(u64::from(parent.is_some()));

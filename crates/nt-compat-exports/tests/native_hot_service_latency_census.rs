@@ -33,7 +33,12 @@ fn a_call_is_split_into_ingress_handler_tail_and_return() {
     // Through the shared reply-receive the tail splits at its entry and reconciliation.
     latency.dispatch_started(EXPLORER, Some(NativeService::NtOpenKeyEx), 410);
     latency.dispatch_finished(450);
+    latency.tail_entered(451);
+    latency.finalized(3, 1); // a finalization with no checkpoint
+    latency.checkpointed(1);
+    latency.finalized(2, 0); // a finalization whose work was one checkpoint tick
     latency.reply_preparing(455);
+    latency.finalized(9, 9); // receive preparation is not tail body
     latency.reconciled(470);
     latency.reconciled(490); // a pending tick re-ran reconciliation; the last pass counts
     latency.reply_preparing(495); // re-entry keeps the first entry mark
@@ -41,6 +46,8 @@ fn a_call_is_split_into_ingress_handler_tail_and_return() {
     let row = latency.latency(NativeService::NtOpenKeyEx).unwrap();
     assert_eq!((row.calls, row.tail, row.split, row.body, row.reconcile, row.prepare),
         (2, 80, 1, 5, 35, 10));
+    assert_eq!((row.pre_tail, row.global_work, row.checkpoint, row.finalize_other),
+        (1, 4, 1, 1));
 }
 
 #[test]
@@ -92,9 +99,9 @@ fn census_is_one_bounded_record() {
     let mut line = nt_printf::record::RecordBuffer::<1024>::new();
     latency.write_census(&mut line).unwrap();
     let line = std::str::from_utf8(line.bytes()).unwrap();
-    assert!(line.starts_with("[census] hot-service-latency calls/ingress/handler/tail/returns/return-idle/return-other/split/body/reconcile/prepare-Mtick:"));
-    assert!(line.contains(" query-value=1/1/2/1/1/5/11/0/0/0/0 "), "{line}");
-    assert!(line.ends_with(" create-key=0/0/0/0/0/0/0/0/0/0/0\n"), "{line}");
+    assert!(line.starts_with("[census] hot-service-latency calls/ingress/handler/tail/returns/return-idle/return-other/split/body/reconcile/prepare/pre-tail/global-work/checkpoint/finalize-other-Mtick:"));
+    assert!(line.contains(" query-value=1/1/2/1/1/5/11/0/0/0/0/0/0/0/0 "), "{line}");
+    assert!(line.ends_with(" create-key=0/0/0/0/0/0/0/0/0/0/0/0/0/0/0\n"), "{line}");
     census::print_census();
     assert!(String::from_utf8(OUTPUT.lock().unwrap().clone()).unwrap()
         .starts_with("[census] hot-service-latency"));

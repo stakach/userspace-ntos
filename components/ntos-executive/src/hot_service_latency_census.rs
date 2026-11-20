@@ -10,6 +10,9 @@
 //! When the reply goes through the shared reply-receive, `tail` is also split into `body`
 //! (dispatch end → reply-receive entry), `reconcile` (→ timer/owner reconciliation done) and
 //! `prepare` (→ Reply sent: receive-boundary observations and the queued-work poll rearm).
+//! `body` is further attributed: `pre-tail` (dispatch end → syscall tail entry), and the time
+//! the tail spent in service-loop finalization, split into global redrive work, the mounted
+//! volume checkpoint and the remaining finalization (reconcile, rearm).
 
 use core::fmt::Write;
 use nt_syscall::NativeService;
@@ -37,11 +40,16 @@ pub(crate) struct Latency {
     pub(crate) body: u64,
     pub(crate) reconcile: u64,
     pub(crate) prepare: u64,
+    pub(crate) pre_tail: u64,
+    pub(crate) global_work: u64,
+    pub(crate) checkpoint: u64,
+    pub(crate) finalize_other: u64,
 }
 
 impl Latency {
     const EMPTY: Self = Self { calls: 0, ingress: 0, handler: 0, tail: 0, returns: 0,
-        return_idle: 0, return_other: 0, split: 0, body: 0, reconcile: 0, prepare: 0 };
+        return_idle: 0, return_other: 0, split: 0, body: 0, reconcile: 0, prepare: 0,
+        pre_tail: 0, global_work: 0, checkpoint: 0, finalize_other: 0 };
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +61,8 @@ struct Current {
     finished: Option<u64>,
     preparing: Option<u64>,
     reconciled: Option<u64>,
+    tail_entered: Option<u64>,
+    finalize: [u64; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -98,12 +108,40 @@ impl LatencyCensus {
                 let (ingress_badge, ingress_at) = self.last_ingress?;
                 (ingress_badge == badge).then_some(Current {
                     badge, service, ingress_at, started: now, finished: None,
-                    preparing: None, reconciled: None })
+                    preparing: None, reconciled: None, tail_entered: None, finalize: [0; 3] })
             });
     }
 
     pub(crate) fn dispatch_finished(&mut self, now: u64) {
         if let Some(current) = self.current.as_mut() { current.finished.get_or_insert(now); }
+    }
+
+    /// The syscall tail began for the current call.
+    pub(crate) fn tail_entered(&mut self, now: u64) {
+        if let Some(current) = self.current.as_mut().filter(|current| current.finished.is_some()) {
+            current.tail_entered.get_or_insert(now);
+        }
+    }
+
+    /// One service-loop finalization in the current call's tail: its work (global redrive and
+    /// any volume checkpoint) and the remaining finalization, in ticks.
+    pub(crate) fn finalized(&mut self, work: u64, other: u64) {
+        if let Some(current) = self.tail_current() {
+            current.finalize[0] = current.finalize[0].saturating_add(work);
+            current.finalize[2] = current.finalize[2].saturating_add(other);
+        }
+    }
+
+    /// The volume checkpoint inside the current tail's finalization work, in ticks.
+    pub(crate) fn checkpointed(&mut self, ticks: u64) {
+        if let Some(current) = self.tail_current() {
+            current.finalize[1] = current.finalize[1].saturating_add(ticks);
+        }
+    }
+
+    fn tail_current(&mut self) -> Option<&mut Current> {
+        self.current.as_mut()
+            .filter(|current| current.finished.is_some() && current.preparing.is_none())
     }
 
     /// The shared reply-receive was entered for the current call.
@@ -134,6 +172,13 @@ impl LatencyCensus {
             row.body = row.body.saturating_add(preparing.saturating_sub(finished));
             row.reconcile = row.reconcile.saturating_add(reconciled.saturating_sub(preparing));
             row.prepare = row.prepare.saturating_add(now.saturating_sub(reconciled));
+            if let Some(entered) = current.tail_entered {
+                row.pre_tail = row.pre_tail.saturating_add(entered.saturating_sub(finished));
+            }
+            row.global_work = row.global_work
+                .saturating_add(current.finalize[0].saturating_sub(current.finalize[1]));
+            row.checkpoint = row.checkpoint.saturating_add(current.finalize[1]);
+            row.finalize_other = row.finalize_other.saturating_add(current.finalize[2]);
         }
         if let Some(slot) = Self::slot(badge) {
             self.returning[slot] = Some(Returning {
@@ -147,13 +192,15 @@ impl LatencyCensus {
 
     /// `name=calls/ingress/handler/tail/returns/return-idle/return-other` in Mtick.
     pub(crate) fn write_census(&self, out: &mut impl Write) -> core::fmt::Result {
-        write!(out, "[census] hot-service-latency calls/ingress/handler/tail/returns/return-idle/return-other/split/body/reconcile/prepare-Mtick:")?;
+        write!(out, "[census] hot-service-latency calls/ingress/handler/tail/returns/return-idle/return-other/split/body/reconcile/prepare/pre-tail/global-work/checkpoint/finalize-other-Mtick:")?;
         for ((_, name), row) in SERVICES.iter().zip(&self.rows) {
-            write!(out, " {name}={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}", row.calls,
+            write!(out, " {name}={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}", row.calls,
                 row.ingress / 1_000_000, row.handler / 1_000_000, row.tail / 1_000_000,
                 row.returns, row.return_idle / 1_000_000, row.return_other / 1_000_000,
                 row.split, row.body / 1_000_000, row.reconcile / 1_000_000,
-                row.prepare / 1_000_000)?;
+                row.prepare / 1_000_000, row.pre_tail / 1_000_000,
+                row.global_work / 1_000_000, row.checkpoint / 1_000_000,
+                row.finalize_other / 1_000_000)?;
         }
         writeln!(out)
     }
@@ -187,6 +234,18 @@ pub(crate) fn dispatch_started(badge: u64, service: Option<NativeService>) {
 
 pub(crate) fn dispatch_finished() {
     if let Some(census) = root() { census.dispatch_finished(crate::disk_census_ticks()); }
+}
+
+pub(crate) fn tail_entered() {
+    if let Some(census) = root() { census.tail_entered(crate::disk_census_ticks()); }
+}
+
+pub(crate) fn finalized(work: u64, other: u64) {
+    if let Some(census) = root() { census.finalized(work, other); }
+}
+
+pub(crate) fn checkpointed(ticks: u64) {
+    if let Some(census) = root() { census.checkpointed(ticks); }
 }
 
 pub(crate) fn reply_preparing() {

@@ -19,6 +19,7 @@ pub(super) unsafe fn syscall_tail(
     call: &Syscall,
     sc: &mut SyscallOutcome,
 ) -> ControlFlow<Turn, core::convert::Infallible> {
+    crate::hot_service_latency_census::tail_entered();
     let mut nt_handler = &mut *lp.handler;
     let fault_ep = lp.ingress.fault_ep;
     let delay_queue = lp.ingress.delay_queue;
