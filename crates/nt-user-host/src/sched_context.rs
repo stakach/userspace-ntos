@@ -56,6 +56,23 @@ pub fn select_guest_worker_core(
     Ok(eligible.trailing_zeros() as u8)
 }
 
+/// Where a new hosted worker thread is configured to run. With `multicore` it is a core from its
+/// inherited affinity ([`select_guest_worker_core`]); without it every worker stays on
+/// `control_core`, the pre-#351 placement the executive's off switch restores.
+pub fn guest_worker_placement(
+    multicore: bool,
+    control_core: u8,
+    inherited_mask: u64,
+    active_processor_count: u64,
+    tid: u64,
+) -> Result<u8, u32> {
+    if multicore {
+        select_guest_worker_core(inherited_mask, active_processor_count, tid)
+    } else {
+        Ok(control_core)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     Allocate,

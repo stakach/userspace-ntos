@@ -85,6 +85,8 @@ pub(crate) struct RetainedHostedThreadConstruction {
     pub(crate) construction: ThreadConstructionInventory,
     pub(crate) memory_progress: MemoryConstructionProgress<TP_WORKER_STACK_FRAME_COUNT>,
     pub(crate) teb_alias: u64,
+    /// Known only after the selected SC was configured and bound to this construction's TCB.
+    pub(crate) physical_core: Option<u8>,
 }
 
 /// Unlike the general copy helper, a failed copy returns its still-owned empty slot. The

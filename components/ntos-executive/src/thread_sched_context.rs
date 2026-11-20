@@ -5,8 +5,19 @@ use nt_user_host::sched_context::{Error, SchedContextConstruction, SchedContextI
 // have deleted the failed target TCB. Rows are allocated before any capability is acquired.
 static mut CONSTRUCTIONS: Vec<SchedContextConstruction> = Vec::new();
 
-// Workers stay on core zero until concurrent Win32k dispatches have one exact shared-page owner.
+// SEC_IMAGE main threads use core zero; worker construction selects an allowed core.
 pub(crate) const GUEST_SCHED_CONTROL_CORE: u8 = 0;
+
+/// #351 switch: place hosted worker threads on cores from their NT affinity. Build with
+/// `NTOS_GUEST_WORKER_MULTICORE=0` to keep every guest thread on core 0 if a boot regresses.
+pub(crate) const GUEST_WORKER_MULTICORE: bool = !switched_off(option_env!("NTOS_GUEST_WORKER_MULTICORE"));
+
+const fn switched_off(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => matches!(value.as_bytes(), [b'0']),
+        None => false,
+    }
+}
 
 pub(crate) fn validate_guest_affinity(requested_mask: u64) -> Result<(), u32> {
     nt_user_host::sched_context::validate_hosted_thread_affinity(

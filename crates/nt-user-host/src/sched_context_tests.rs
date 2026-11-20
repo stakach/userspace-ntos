@@ -328,3 +328,18 @@ fn retirement_cannot_cancel_in_progress_construction() {
     owner.construct(&mut io).unwrap();
     assert_eq!(owner.take_bound(), Some(100));
 }
+
+#[test]
+fn the_multicore_switch_selects_affinity_cores_or_keeps_the_control_core() {
+    let cores: Vec<u8> = [4, 8, 12, 16]
+        .into_iter()
+        .map(|tid| guest_worker_placement(true, 0, 0b1111, 4, tid).unwrap())
+        .collect();
+    assert_eq!(cores, [0, 1, 2, 3], "switched on: four workers on four distinct allowed cores");
+    assert_eq!(guest_worker_placement(true, 0, 0b1100, 4, 4), Ok(2), "only allowed cores");
+    assert_eq!(guest_worker_placement(true, 0, 0, 4, 4), Err(STATUS_INVALID_PARAMETER));
+    for tid in [4, 8, 12, 16] {
+        assert_eq!(guest_worker_placement(false, 0, 0b1111, 4, tid), Ok(0),
+            "switched off: the pre-#351 single control core");
+    }
+}
