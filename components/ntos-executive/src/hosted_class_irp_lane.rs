@@ -65,6 +65,8 @@ struct Lane {
     delete_restore: Option<PendingDeleteRestore>,
     delete_unattributed_result: Option<crate::spawn_hosts::PumpResult>,
     delete_yield: Option<component_scheduler::PendingSchedulerYield>,
+    /// The startup pump, retained mid scheduler-yield while the lane is still `Preparing`.
+    startup_yield: Option<component_scheduler::PendingSchedulerYield>,
 }
 
 static mut LANES: Vec<Lane> = Vec::new();
@@ -140,6 +142,13 @@ pub(crate) unsafe fn is_channel(ch: &crate::spawn_hosts::PumpChannel) -> bool {
 
 pub(super) unsafe fn prepare(instance_index: usize) -> Result<(), nt_status::NtStatus> {
     if let Some(index) = index_for(instance_index) {
+        // A startup whose scheduler yield kept the worker held continues here; until it
+        // finishes the lane is still starting, which is the busy result its callers retry.
+        if let Some(pending) = (&mut *core::ptr::addr_of_mut!(LANES))[index].startup_yield.take() {
+            let result = settle_startup(index,
+                component_scheduler::resume_scheduler_yield(pending));
+            return finish_startup(index, result);
+        }
         let row = &(&*core::ptr::addr_of!(LANES))[index];
         return if row.phase == Phase::Ready && row.route.is_some_and(|route|
             matches!(runtime::ready_for_admission(route), Ok(true))) { Ok(()) }
@@ -158,14 +167,60 @@ pub(super) unsafe fn prepare(instance_index: usize) -> Result<(), nt_status::NtS
             route: None, component_shared: 0, executive_shared: 0, phase: Phase::Preparing,
             current_irp: None, startup_dispatch: None,
             delete_ticket: None, delete_restore: None, delete_unattributed_result: None,
-            delete_yield: None });
+            delete_yield: None, startup_yield: None });
         rows.len() - 1
     };
     let result = construct(index, inst);
+    finish_startup(index, result)
+}
+
+/// The startup's state after one slice: started, still owed its scheduler yield, or failed.
+enum Startup { Ready, Pending }
+
+unsafe fn finish_startup(index: usize, result: Result<Startup, u32>) -> Result<(), nt_status::NtStatus> {
     let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
-    row.phase = if result.is_ok() { Phase::Ready } else { Phase::Uncertain };
-    trace_startup_return(row, result.as_ref().err().copied().unwrap_or(0));
-    result.map_err(|status| nt_status::NtStatus(status as i32))
+    match result {
+        Ok(Startup::Pending) => {
+            let retryable = row.startup_yield.as_ref()
+                .is_some_and(component_scheduler::PendingSchedulerYield::retryable);
+            if !retryable { row.phase = Phase::Uncertain; }
+            Err(nt_status::NtStatus::DEVICE_BUSY)
+        }
+        Ok(Startup::Ready) => {
+            row.phase = Phase::Ready;
+            trace_startup_return(row, 0);
+            Ok(())
+        }
+        Err(status) => {
+            row.phase = Phase::Uncertain;
+            trace_startup_return(row, status);
+            Err(nt_status::NtStatus(status as i32))
+        }
+    }
+}
+
+/// Own the startup pump's outcome: a finished pump must carry the exact startup receipt, and a
+/// pump retained mid scheduler-yield stays with the `Preparing` row for the next `prepare`.
+unsafe fn settle_startup(
+    index: usize, pump: component_scheduler::HostedPumpRestore,
+) -> Result<Startup, u32> {
+    let pump = match pump {
+        component_scheduler::HostedPumpRestore::Restored(pump) => pump,
+        component_scheduler::HostedPumpRestore::SchedulerYieldRetained(pending) => {
+            (&mut *core::ptr::addr_of_mut!(LANES))[index].startup_yield = Some(pending);
+            return Ok(Startup::Pending);
+        }
+        // A RecvFirst startup parks no outer parent and runs no child work: anything else is
+        // an uncertain entered startup, fenced with the lane.
+        _ => return Err(STATUS_INVALID_HANDLE as u32),
+    };
+    let row = &(&*core::ptr::addr_of!(LANES))[index];
+    if !pump.completed || pump.status != STATUS_SUCCESS
+        || pump.startup_stack_receipt != Some([row.ordinal, row.domain.domain_id.raw(),
+            row.domain.cookie, row.component_shared, row.handle]) {
+        return Err(STATUS_INVALID_HANDLE as u32);
+    }
+    Ok(Startup::Ready)
 }
 
 fn trace_startup_return(row: &Lane, status: u32) {
@@ -178,7 +233,7 @@ fn trace_startup_return(row: &Lane, status: u32) {
     print_str(b"/"); print_hex(status); print_str(b"\n");
 }
 
-unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
+unsafe fn construct(index: usize, inst: DriverInstance) -> Result<Startup, u32> {
     let (instance_index, domain, ordinal) = {
         let row = &(&*core::ptr::addr_of!(LANES))[index];
         (row.instance, row.domain, row.ordinal)
@@ -240,13 +295,7 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
     (&mut *core::ptr::addr_of_mut!(LANES))[index].startup_dispatch = Some(startup);
     let caller = hosted_thread_resources::registry_caller(worker)?;
     let ch = channel(index, worker, crate::spawn_hosts::InitialAction::RecvFirst)?;
-    let pump = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
-    if !pump.completed || pump.status != STATUS_SUCCESS
-        || pump.startup_stack_receipt != Some([ordinal, domain.domain_id.raw(),
-            domain.cookie, shared, handle]) {
-        return Err(STATUS_INVALID_HANDLE as u32);
-    }
-    Ok(())
+    settle_startup(index, component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller))
 }
 
 unsafe fn channel(index: usize, worker: HostedDriverThreadRuntime,

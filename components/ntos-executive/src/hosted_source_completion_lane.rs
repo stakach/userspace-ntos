@@ -59,6 +59,8 @@ struct SourceCompletionLane {
     startup_dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
     nested_restore: Option<SourcePendingRestore>,
     scheduler_yield: Option<SourceSchedulerYield>,
+    /// The startup pump, retained mid scheduler-yield while the lane is still `Preparing`.
+    startup_yield: Option<component_scheduler::PendingSchedulerYield>,
 }
 
 /// A scheduler service could not hand the unwinder's lane back. Each variant keeps the whole
@@ -246,6 +248,12 @@ pub(super) unsafe fn prepare(
         .iter()
         .position(|row| row.instance == instance_index && row.command == Some(command))
     {
+        // A startup whose scheduler yield kept the worker held continues its own receive.
+        if let Some(pending) = (&mut *core::ptr::addr_of_mut!(LANES))[index].startup_yield.take() {
+            let result = settle_startup(index,
+                component_scheduler::resume_scheduler_yield(pending));
+            return finish_startup(index, result);
+        }
         let phase = match (&*core::ptr::addr_of!(LANES))[index].phase {
             Phase::Preparing => ExistingLanePhase::Preparing,
             Phase::Prepared => ExistingLanePhase::Prepared,
@@ -303,24 +311,37 @@ pub(super) unsafe fn prepare(
             startup_dispatch: None,
             nested_restore: None,
             scheduler_yield: None,
+            startup_yield: None,
         });
         index
     };
     // A retained row precedes construction, publication and Resume. Failure never makes it absent.
     let result = construct(index, inst);
-    (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = if result.is_ok() {
-        Phase::Prepared
-    } else {
-        Phase::Uncertain
-    };
-    if result.is_ok() {
-        Ready
-    } else {
-        RetainedUncertain
+    finish_startup(index, result)
+}
+
+/// The startup's state after one slice: started, or still owed its scheduler yield.
+enum Startup { Started, Pending }
+
+unsafe fn finish_startup(index: usize, result: Result<Startup, u32>) -> SourceCompletionPreparation {
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    match result {
+        Ok(Startup::Started) => {
+            row.phase = Phase::Prepared;
+            SourceCompletionPreparation::Ready
+        }
+        // The lane is still starting; its owner prepares again and the same receive continues.
+        Ok(Startup::Pending) if row.startup_yield.as_ref()
+            .is_some_and(component_scheduler::PendingSchedulerYield::retryable) =>
+            SourceCompletionPreparation::InProgress,
+        Ok(Startup::Pending) | Err(_) => {
+            row.phase = Phase::Uncertain;
+            SourceCompletionPreparation::RetainedUncertain
+        }
     }
 }
 
-unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
+unsafe fn construct(index: usize, inst: DriverInstance) -> Result<Startup, u32> {
     let (instance_index, domain, ordinal) = {
         let row = &(&*core::ptr::addr_of!(LANES))[index];
         (row.instance, row.domain, row.ordinal)
@@ -408,7 +429,28 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
     (&mut *core::ptr::addr_of_mut!(LANES))[index].startup_dispatch = Some(startup_dispatch);
     let caller = hosted_thread_resources::registry_caller(worker)?;
     let channel = channel(index, worker, crate::spawn_hosts::InitialAction::RecvFirst)?;
-    let pump = component_scheduler::hosted_component_pump_with_caller(&channel, caller);
+    settle_startup(index, component_scheduler::hosted_component_pump_with_caller_retained(&channel, caller))
+}
+
+/// Own the startup pump's outcome: a finished pump must carry the exact startup receipt, and a
+/// pump retained mid scheduler-yield stays with the `Preparing` row for the next `prepare`.
+unsafe fn settle_startup(
+    index: usize, pump: component_scheduler::HostedPumpRestore,
+) -> Result<Startup, u32> {
+    let pump = match pump {
+        component_scheduler::HostedPumpRestore::Restored(pump) => pump,
+        component_scheduler::HostedPumpRestore::SchedulerYieldRetained(pending) => {
+            (&mut *core::ptr::addr_of_mut!(LANES))[index].startup_yield = Some(pending);
+            return Ok(Startup::Pending);
+        }
+        // A RecvFirst startup parks no outer parent and runs no child work: anything else is
+        // an uncertain entered startup, fenced with the lane.
+        _ => return Err(STATUS_INVALID_HANDLE as u32),
+    };
+    let (ordinal, domain, shared, handle) = {
+        let row = &(&*core::ptr::addr_of!(LANES))[index];
+        (row.ordinal, row.domain, row.component_shared, row.handle)
+    };
     (&mut *core::ptr::addr_of_mut!(LANES))[index].pump = Some(pump);
     if !pump.completed
         || pump.status != STATUS_SUCCESS
@@ -444,8 +486,7 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
         }
         return Err(STATUS_INVALID_HANDLE as u32);
     }
-    (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Ready;
-    Ok(())
+    Ok(Startup::Started)
 }
 
 unsafe fn channel(
