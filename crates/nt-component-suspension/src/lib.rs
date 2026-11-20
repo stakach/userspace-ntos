@@ -137,6 +137,10 @@ mod scheduler_yield_restore;
 pub use scheduler_yield_restore::{RestoreRetry, SchedulerServiceEnd, SchedulerYieldStep};
 mod deferred_reply;
 pub use deferred_reply::{DeferralCapacity, DeferredReplies};
+mod service_continuation;
+pub use service_continuation::{
+    PumpProgress, RegistrationRefusal, RegistrationRefused, ServiceContinuations, SettledParent,
+};
 pub use resume_pass::ResumePass;
 mod resume_wake;
 pub use resume_wake::{ResumeDemand, ResumeWake, ResumeWakeError, ResumeWakePass};
