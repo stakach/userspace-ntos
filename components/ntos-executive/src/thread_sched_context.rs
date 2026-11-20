@@ -8,13 +8,14 @@ static mut CONSTRUCTIONS: Vec<SchedContextConstruction> = Vec::new();
 // SEC_IMAGE main threads use core zero; worker construction selects an allowed core.
 pub(crate) const GUEST_SCHED_CONTROL_CORE: u8 = 0;
 
-/// #351 switch: place hosted worker threads on cores from their NT affinity. Build with
-/// `NTOS_GUEST_WORKER_MULTICORE=0` to keep every guest thread on core 0 if a boot regresses.
-pub(crate) const GUEST_WORKER_MULTICORE: bool = !switched_off(option_env!("NTOS_GUEST_WORKER_MULTICORE"));
+/// #351 switch: place hosted worker threads on cores from their NT affinity. Off by default until
+/// the win32k shared-page authority enforces (#419); build with `NTOS_GUEST_WORKER_MULTICORE=1`
+/// to turn it on.
+pub(crate) const GUEST_WORKER_MULTICORE: bool = switched_on(option_env!("NTOS_GUEST_WORKER_MULTICORE"));
 
-const fn switched_off(value: Option<&str>) -> bool {
+const fn switched_on(value: Option<&str>) -> bool {
     match value {
-        Some(value) => matches!(value.as_bytes(), [b'0']),
+        Some(value) => matches!(value.as_bytes(), [b'1']),
         None => false,
     }
 }
