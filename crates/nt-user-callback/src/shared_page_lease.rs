@@ -488,6 +488,35 @@ impl<const N: usize> SharedPageAuthority<N> {
     }
 }
 
+impl<const N: usize> SharedPageAuthority<N> {
+    /// The pre-lane reservation currently holding the page, if any.
+    pub fn reservation(&self) -> Option<SharedPageProvisionalIdentity> {
+        match self.current {
+            Some(PageAuthorityState::Reserved(owner)) => Some(owner),
+            _ => None,
+        }
+    }
+
+    /// Forget the parked page of a dispatch whose continuation was discarded (an aborted user
+    /// callback): it can never reacquire, and its slot must not fill the table. The current
+    /// writer is never touched. Returns whether an entry was retired.
+    pub fn retire_parked(&mut self, dispatch_id: u64) -> bool {
+        let mut retired = false;
+        for slot in self.parked.iter_mut() {
+            if slot.as_ref().is_some_and(|(owner, _)| owner.dispatch.dispatch_id == dispatch_id) {
+                *slot = None;
+                retired = true;
+            }
+        }
+        retired
+    }
+
+    /// How many dispatches are parked, for the census.
+    pub fn parked_count(&self) -> usize {
+        self.parked.iter().flatten().count()
+    }
+}
+
 /// How one pump run left the dispatch that held the page. Every return of a pump that was
 /// entered under the page settles exactly once, whichever pending owner later retains it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

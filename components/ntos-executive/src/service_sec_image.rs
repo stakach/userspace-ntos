@@ -784,7 +784,15 @@ pub(crate) unsafe fn component_execution_is_busy() -> bool {
     (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).execution_busy()
 }
 
+/// A fresh win32k dispatch may not start now: a lane's returning pump is unsettled, or a
+/// dispatch holds the singleton shared page (#419).
 pub(crate) unsafe fn component_shared_publication_is_busy() -> bool {
+    component_fresh_dispatch_busy() || crate::win32k_shared_page_authority::is_held()
+}
+
+/// The suspension-model half of the busy fence. The win32k funnel checks only this: it takes
+/// the page itself, and a nested child legitimately starts while its parent holds the page.
+pub(crate) unsafe fn component_fresh_dispatch_busy() -> bool {
     (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).fresh_dispatch_busy()
 }
 

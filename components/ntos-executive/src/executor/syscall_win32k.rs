@@ -7,7 +7,9 @@
 //! `Break(Turn::Exit)`, the end of a turn a `Break(Turn::Next)`, and the flow macros are
 //! direct calls.
 
+use super::loop_receive::receive;
 use super::*;
+use crate::executor::local;
 
 #[inline(never)]
 pub(super) unsafe fn syscall_win32k_route(
@@ -28,6 +30,12 @@ pub(super) unsafe fn syscall_win32k_route(
     // reused by every kernel query this route makes before dispatch (a periodic census, for
     // one), so rereading it here could forward another reply's words as this caller's.
     let [a0, _, a2, a3] = syscall_reply_context.register_args(); // R10, RDX, R8, R9
+    // #419: witness the exact retained Call and bound Reply before any nested prelude can run.
+    // Root reserves the shared page for this Call only after the prelude, and a busy page then
+    // returns this same, still unexecuted Call to its ingress owner.
+    let preentry = crate::spawn_hosts::shared_ingress::owner::runtime::mint_hosted_win32k_preentry_ticket(
+        local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge, lp.msg.m0,
+    ).ok();
     let process_role = nt_handler.hosted_process_role(pi);
     let winlogon_gui_client =
         process_role == Some(nt_exe_image::HostedProcessRole::InteractiveLogon);
@@ -172,38 +180,6 @@ pub(super) unsafe fn syscall_win32k_route(
     // fully pi-keyed (bit `1<<pi`), so a 3rd GUI client needs no new state — same recipe
     // that made winlogon the 2nd client. The reply is caller-agnostic: REPLY_MAIN is
     // bound to THIS caller at its recv, so it resumes exactly services (no reply-spin).
-    W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-    // Count every win32k dispatch for census/gate evidence. This is deliberately not a
-    // liveness policy: real GUI clients can make thousands of win32k calls while still
-    // loading code, faulting pages, running user callbacks, and painting. True stalls are
-    // handled by the wall-clock progress watchdog at the loop top.
-    {
-        bump_w32_total_dispatch(pi);
-        // FORWARD-PROGRESS CENSUS: the win32k SHADOW table lands in the same per-process
-        // histogram as the native table (high half). Without this the census could see
-        // only the native syscalls, and every "the UI work grew" claim about a win32k
-        // frontier was unmeasured by construction.
-        {
-            let bucket = ssn_bucket(lp.msg.m0);
-            match pi {
-                4 => LSASS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
-                3 => SERVICES_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
-                2 => WINLOGON_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
-                1 => CSRSS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
-                6 => EXPLORER_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
-                _ => 0,
-            };
-            if nt_handler.hosted_process_observation_role(pi)
-                == Some(nt_exe_image::HostedProcessRole::Win32Subsystem)
-            {
-                crate::csrss_thread_probe::record_syscall(lp.msg.m0);
-            }
-            // …and the WALL-CLOCK, which is the whole point: this arm runs a nested
-            // pump, so the main loop's badge census cannot see any of the time spent
-            // here. It also ticks the periodic dump, so a non-quiescing boot reports.
-            w32_census_enter(lp.msg.m0);
-        }
-    }
     // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by
     // csrss (winsrv's UserServerDllInitialization) OR by winlogon (its user32 DllMain's
     // NtUserProcessConnect + WinMain's window-station/desktop calls) — the SECOND hosted
@@ -288,10 +264,90 @@ pub(super) unsafe fn syscall_win32k_route(
     trace_cursor_lookup_owner(
         "dispatch-id", dispatch_client, lp.msg.m0, dispatch_id, None, false, false, false,
     );
-    // #419: nothing else may hold the shared page when a fresh call stages into it.
-    crate::win32k_shared_page_authority::audit_root_free(
-        dispatch_id, win32k_glue::shared_page_client_identity(dispatch_client), b"root-ingress",
-    );
+    // The provider SSN this dispatch runs under: handle grants enter win32k's job service.
+    let effective_ssn = if lp.msg.m0 == win32k_subsystem::SSN_NT_USER_USER_HANDLE_GRANT_ACCESS {
+        win32k_subsystem::SSN_WIN32_JOB_USER_HANDLE
+    } else {
+        lp.msg.m0
+    };
+    // The prelude above may have entered win32k (credential posting). The Call must still be
+    // the one witnessed before it, unexecuted, before root takes the page for it.
+    let preentry_current = preentry.as_ref().is_some_and(|ticket|
+        crate::spawn_hosts::shared_ingress::owner::runtime::revalidate_hosted_win32k_preentry_ticket(
+            ticket, local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge, lp.msg.m0,
+        ).is_ok());
+    // #419: own the shared page and ARG bank before the first ARG write. Dropped unpromoted
+    // (a local refusal before dispatch), the reservation is cancelled with no effect.
+    let _root_page_reservation = if sc.wl_milestone_park {
+        None // An intentional park dispatches nothing.
+    } else {
+        match crate::win32k_shared_page_authority::reserve(
+            nt_user_callback::SharedPageProvisionalIdentity {
+                dispatch_id,
+                client: win32k_glue::shared_page_client_identity(dispatch_client),
+                request_ssn: effective_ssn,
+                request_kind: win32k_subsystem::WIN32K_REQUEST_SSDT,
+            },
+        ) {
+            Ok(held) => Some(held),
+            Err(_) if preentry_current => {
+                // Busy: nothing of this Call has run. Return it to its ingress owner unexecuted
+                // and take the next delivery; it is redelivered once the page is free.
+                crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+                    local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge,
+                ).expect("an unexecuted witnessed Call retains its exact ingress owner");
+                let fault_ep = lp.ingress.fault_ep;
+                let received = receive(
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep,
+                    || local().reply_main_slot.load(Ordering::Relaxed),
+                )?;
+                (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
+                return ControlFlow::Break(Turn::Next);
+            }
+            Err(error) => {
+                // No witnessed Call to return: fail fast rather than write over the holder.
+                print_str(b"[w32k-page-authority] root ingress refused with no retainable Call pi/tid/ssn/error=");
+                for value in [pi as u64, current_tid as u64, lp.msg.m0, error as u64] {
+                    print_str(b"/");
+                    print_hex_u64(value);
+                }
+                print_str(b"\n");
+                panic!("win32k root ingress found the shared page held with no retainable Call");
+            }
+        }
+    };
+    W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+    // Count every win32k dispatch for census/gate evidence. This is deliberately not a
+    // liveness policy: real GUI clients can make thousands of win32k calls while still
+    // loading code, faulting pages, running user callbacks, and painting. True stalls are
+    // handled by the wall-clock progress watchdog at the loop top.
+    {
+        bump_w32_total_dispatch(pi);
+        // FORWARD-PROGRESS CENSUS: the win32k SHADOW table lands in the same per-process
+        // histogram as the native table (high half). Without this the census could see
+        // only the native syscalls, and every "the UI work grew" claim about a win32k
+        // frontier was unmeasured by construction.
+        {
+            let bucket = ssn_bucket(lp.msg.m0);
+            match pi {
+                4 => LSASS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                3 => SERVICES_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                2 => WINLOGON_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                1 => CSRSS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                6 => EXPLORER_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                _ => 0,
+            };
+            if nt_handler.hosted_process_observation_role(pi)
+                == Some(nt_exe_image::HostedProcessRole::Win32Subsystem)
+            {
+                crate::csrss_thread_probe::record_syscall(lp.msg.m0);
+            }
+            // …and the WALL-CLOCK, which is the whole point: this arm runs a nested
+            // pump, so the main loop's badge census cannot see any of the time spent
+            // here. It also ticks the periodic dump, so a non-quiescing boot reports.
+            w32_census_enter(lp.msg.m0);
+        }
+    }
     // CROSS-AS ARG MARSHALING. NtUserProcessConnect(handle, USERCONNECT* buf, size): the
     // buffer is a client user pointer (usually its stack) NOT mapped in win32k's VSpace.
     // Passing it raw makes win32k's handler fault/spin on an address win32k_dispatch can't
@@ -3582,22 +3638,20 @@ pub(super) unsafe fn syscall_win32k_route(
         } else {
             (sp, &[])
         };
-        let dispatch_ssn =
-            if lp.msg.m0 == win32k_subsystem::SSN_NT_USER_USER_HANDLE_GRANT_ACCESS {
-                match nt_handler.job_id_for_user_handle_grant(d_a1) {
-                    Ok(job) => {
-                        d_a1 = job as u64;
-                        d_a3 = 0;
-                    }
-                    Err(error) => {
-                        d_a1 = 0;
-                        d_a3 = error as u64;
-                    }
+        if lp.msg.m0 == win32k_subsystem::SSN_NT_USER_USER_HANDLE_GRANT_ACCESS {
+            // The job service takes the grant's job id in place of the caller's handle.
+            match nt_handler.job_id_for_user_handle_grant(d_a1) {
+                Ok(job) => {
+                    d_a1 = job as u64;
+                    d_a3 = 0;
                 }
-                win32k_subsystem::SSN_WIN32_JOB_USER_HANDLE
-            } else {
-                lp.msg.m0
-            };
+                Err(error) => {
+                    d_a1 = 0;
+                    d_a3 = error as u64;
+                }
+            }
+        }
+        let dispatch_ssn = effective_ssn;
         trace_cursor_lookup_owner(
             "pre-dispatch", client, lp.msg.m0, dispatch_id, None, false, false, false,
         );

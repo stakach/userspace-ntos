@@ -471,3 +471,34 @@ fn audit_repair_of_a_refused_reacquire_judges_the_restore_on_its_own() {
     assert_eq!(page.acknowledge_restore(owner, SharedPageRestoreEffect::Applied(saved)), Ok(()));
     assert_eq!(page.audit_holder(), SharedPageAuditHolder::Active(91));
 }
+
+// #419 enforcing: an aborted callback's dispatch never reacquires. Retiring its parked page
+// keeps the fixed table from filling, and never disturbs the current writer.
+#[test]
+fn retiring_an_aborted_dispatch_frees_its_parked_slot_only() {
+    let aborted = identity(50, 1);
+    let live = identity(51, 1);
+    let mut page = SharedPageAuthority::<1>::new();
+    page.enter(aborted, ()).unwrap_or_else(|_| panic!("entry"));
+    assert_eq!(page.settle(aborted, SharedPagePumpSettlement::Yielded(Some(snapshot(aborted, 1)))), Ok(()));
+    page.enter(live, ()).unwrap_or_else(|_| panic!("entry"));
+    assert_eq!(page.settle(live, SharedPagePumpSettlement::Yielded(Some(snapshot(live, 2)))),
+        Err(SharedPageLeaseError::Capacity), "the aborted page fills the one slot");
+    assert!(page.retire_parked(50));
+    assert_eq!(page.parked_count(), 0);
+    assert_eq!(page.audit_holder(), SharedPageAuditHolder::Active(51), "the writer is untouched");
+    assert_eq!(page.settle(live, SharedPagePumpSettlement::Yielded(Some(snapshot(live, 2)))), Ok(()));
+    assert_eq!(page.reacquire(aborted), Err(SharedPageLeaseError::Empty));
+    assert!(!page.retire_parked(50));
+}
+
+#[test]
+fn a_root_reservation_is_visible_until_promoted_or_cancelled() {
+    let owner = identity(60, 1);
+    let mut page = SharedPageAuthority::<1>::new();
+    let reserved = provisional(owner, 0);
+    page.reserve(reserved, ()).unwrap_or_else(|_| panic!("free page"));
+    assert_eq!(page.reservation(), Some(reserved));
+    assert_eq!(page.promote(reserved, owner), Ok(()));
+    assert_eq!(page.reservation(), None);
+}

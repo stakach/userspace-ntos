@@ -3543,6 +3543,16 @@ unsafe fn abort_controlled_user_callbacks() {
         return;
     }
     restore_all_client_callback_windows();
+    // #419: with their continuations discarded, these callbacks' dispatches never take their
+    // pages back. Retire the parked pages so the authority's table cannot fill.
+    {
+        let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+        for index in 0..active.len() {
+            if let Some(frame) = active.frame(index) {
+                crate::win32k_shared_page_authority::retire_parked(frame.dispatch_context().dispatch_id);
+            }
+        }
+    }
     *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS) =
         nt_user_callback::ContinuationStack::new();
     clear_user_callback_client_registry();
@@ -5425,13 +5435,19 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
             };
             let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
             let dispatch_context = *active_frame.dispatch_context();
-            let Some(claim) = reserve_callback_resume(active_frame) else {
-                return (STATUS_UNSUCCESSFUL, false);
-            };
-            reacquire_parked_callback_page(
+            // The failure reply is a header write: take the page back before claiming the resume.
+            if !reacquire_parked_callback_page(
                 dispatch_context, win32k_client_context_from_callback_client(client),
                 b"callback-cancel",
-            );
+            ) {
+                return (STATUS_UNSUCCESSFUL, false);
+            }
+            let Some(claim) = reserve_callback_resume(active_frame) else {
+                // Nothing was written: the callback stays suspended with its page parked.
+                park_callback_suspended_page(
+                    dispatch_context, win32k_client_context_from_callback_client(client));
+                return (STATUS_UNSUCCESSFUL, false);
+            };
             write_callback_failure_reply(request, STATUS_UNSUCCESSFUL);
             let unwind_ok = unwind_controlled_callback(request);
             let cancelled = {
@@ -5656,15 +5672,20 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
         };
         let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
         let dispatch_context = *frame.dispatch_context();
-        let Some(claim) = reserve_callback_resume(frame) else {
-            print_str(b"[user-callback] dead-client resume owner busy; frame retained\n");
-            return unwound;
-        };
-        // (1) Fail the withheld KeUserModeCallback.
-        reacquire_parked_callback_page(
+        // (1) Fail the withheld KeUserModeCallback: a header write, so take the page back first.
+        if !reacquire_parked_callback_page(
             dispatch_context, win32k_client_context_from_callback_client(client),
             b"callback-dead-client",
-        );
+        ) {
+            print_str(b"[user-callback] dead-client page held by another dispatch; frame retained\n");
+            return unwound;
+        }
+        let Some(claim) = reserve_callback_resume(frame) else {
+            print_str(b"[user-callback] dead-client resume owner busy; frame retained\n");
+            park_callback_suspended_page(
+                dispatch_context, win32k_client_context_from_callback_client(client));
+            return unwound;
+        };
         write_callback_failure_reply(request, STATUS_THREAD_IS_TERMINATING);
         // (2) Unwind the callback continuation + pop the active frame (same order as a real return).
         if !unwind_controlled_callback(request) {
@@ -7867,7 +7888,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         }
         print_str(b"\n");
     }
-    let shared_busy = crate::service_sec_image::component_shared_publication_is_busy();
+    let shared_busy = crate::service_sec_image::component_fresh_dispatch_busy();
     let busy_count = shared_busy.then(||
         WIN32K_BUSY_INGRESS_TRACES.fetch_add(1, Ordering::Relaxed) + 1
     );
@@ -7904,6 +7925,26 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         Some(Ok(ticket)) => Some(ticket),
         Some(Err(())) => return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into(),
     };
+    // #419: hold the singleton page before any client selection, grant or request write. Root
+    // ingress may already have reserved it for this dispatch; otherwise reserve it here. A
+    // busy page refuses with no effect; a later local refusal drops the reservation unused.
+    let page_reservation = nt_user_callback::SharedPageProvisionalIdentity {
+        dispatch_id, client: shared_page_client_identity(client), request_ssn: ssn, request_kind,
+    };
+    let (page_reservation, _funnel_page_reservation) =
+        match crate::win32k_shared_page_authority::root_reservation(dispatch_id) {
+            Some(root) => (root, None),
+            None => match crate::win32k_shared_page_authority::reserve(page_reservation) {
+                Ok(held) => (page_reservation, Some(held)),
+                Err(_) if crate::win32k_shared_page_authority::ENFORCING => {
+                    if let Some(ticket) = displaced_parent {
+                        let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+                    }
+                    return (nt_process::STATUS_DEVICE_BUSY as u64, false).into();
+                }
+                Err(_) => (page_reservation, None),
+            },
+        };
     // ── REQUEST FILL (caller-owned, exactly as the FSD `dispatch_irp` fills the IRP before the pump).
     // Attach win32k's client window to the CURRENT dispatch client (KeStackAttachProcess). If this is
     // a different client than last time, the previous client's leaf pages are Unmapped so the new
@@ -8023,12 +8064,23 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         }
     }
     // #419: the page's writer from here until this dispatch parks or completes.
-    crate::win32k_shared_page_authority::audit_enter(
+    if !crate::win32k_shared_page_authority::promote_page(
+        page_reservation,
         nt_user_callback::SharedPageLeaseIdentity {
             dispatch, client: shared_page_client_identity(client),
         },
         b"funnel-publish",
-    );
+    ) {
+        if let Some(ticket) = displaced_parent {
+            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+            if registered_client {
+                unregister_win32k_dispatch_client(dispatch_id, client.pi, client.tid, client.badge);
+            }
+        } else if registered_client {
+            unregister_win32k_dispatch_client(dispatch_id, client.pi, client.tid, client.badge);
+        }
+        return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
+    }
     let previous_dispatch = publish_initial_win32k_request(
         dispatch, request_kind, client, [a0, a1, a2, a3], stack_args,
         nested_user_callback, dispatch_context_out,

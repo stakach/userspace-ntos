@@ -48,6 +48,7 @@ pub(crate) use hosted::{
     can_park_hosted_reply, cancel_hosted, cancel_hosted_caller, defer_hosted_delivery,
     defer_hosted_delivery_for_add_device, defer_hosted_delivery_for_queued_callback,
     deferred_parked_ingress_is_exact,
+    mint_hosted_win32k_preentry_ticket, revalidate_hosted_win32k_preentry_ticket,
     deferred_queued_ingress_selected,
     DeferredParkedIngress,
     is_win32k_native_call,

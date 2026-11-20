@@ -14,12 +14,20 @@ fn compact(source: &str) -> String {
 }
 
 #[test]
-fn the_funnel_enters_before_its_first_publish() {
+fn the_funnel_holds_the_page_before_any_effect_and_promotes_before_its_first_publish() {
     let glue = compact(GLUE);
-    let enter = glue.find("audit_enter(").expect("funnel enters the authority");
-    let publish = glue.find("letprevious_dispatch=publish_initial_win32k_request(")
-        .expect("first request publish");
-    assert!(enter < publish, "the page is held before its request is written");
+    let funnel = glue.find("unsafefnwin32k_dispatch_wide_observed_inner(").unwrap();
+    let body = &glue[funnel..];
+    let displaced = body.find("capture_displaced_shared_resume(").unwrap();
+    let reserve = body.find("win32k_shared_page_authority::reserve(").expect("funnel reserves");
+    let select = body.find("select_win32k_client_window(client)").unwrap();
+    let promote = body.find("win32k_shared_page_authority::promote_page(").expect("funnel promotes");
+    let publish = body.find("letprevious_dispatch=publish_initial_win32k_request(").unwrap();
+    assert!(displaced < reserve, "a displaced parent parks before its child takes the page");
+    assert!(reserve < select, "the page is held before any client selection");
+    assert!(promote < publish, "the page is bound to the lane before its request is written");
+    assert!(body[..reserve].contains("root_reservation(dispatch_id)"),
+        "a root-reserved dispatch adopts the root's reservation");
 }
 
 #[test]
@@ -34,8 +42,8 @@ fn every_resume_reacquires_before_it_selects_and_restores() {
     assert!(select < restore, "the exact client window is selected before its page is restored");
     assert!(body.contains("audit_restored("), "the restore's physical evidence is acknowledged");
     assert!(NESTED.contains("b\"nested-displace\""), "a displaced parent parks before its child");
-    assert!(ROOT.contains("audit_root_free("), "root ingress stages only into a free page");
-    assert!(AUTHORITY.contains("pub(crate) const ENFORCING: bool"));
+    assert!(AUTHORITY.contains("pub(crate) const ENFORCING: bool = true;"),
+        "a refused transition is refused, not repaired");
 }
 
 /// The body of the function that contains `needle`, from its `fn` to the next top-level `fn`.
@@ -80,14 +88,14 @@ fn callback_replies_are_written_only_after_the_page_is_reacquired() {
     for failure in ["write_callback_failure_reply(request, STATUS_UNSUCCESSFUL);",
         "write_callback_failure_reply(request, STATUS_THREAD_IS_TERMINATING);"] {
         let at = GLUE.find(failure).unwrap();
-        let before = &GLUE[at.saturating_sub(400)..at];
-        assert!(before.contains("reacquire_parked_callback_page("), "{failure} follows a reacquire");
+        let claim = GLUE[..at].rfind("reserve_callback_resume(").unwrap();
+        let reacquire = GLUE[..claim].rfind("reacquire_parked_callback_page(").unwrap();
+        assert!(claim - reacquire < 600,
+            "{failure}: the page is taken back before the resume is claimed");
     }
     let reply = GLUE.find("if !publish_callback_reply(").unwrap();
     let restore = GLUE[..reply].rfind("select_and_restore_shared_resume_snapshot(").unwrap();
     assert!(reply - restore < 2000, "the NtCallbackReturn reply follows its page restore");
-    assert!(PENDING.contains("with_parked_payload(parked)"),
-        "a payload-less callback publication restores the exact parked page");
 }
 
 // #419 boot 44660203546: every NtCallbackReturn restore was "restore-not-applied". The page was

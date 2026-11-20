@@ -44,38 +44,11 @@ fn transition<R>(f: impl FnOnce(&mut SharedPageAuthority<MAX_PARKED>) -> R) -> R
     f(unsafe { &mut *core::ptr::addr_of_mut!(AUTHORITY) })
 }
 
-pub(crate) fn reserve<R>(
-    identity: SharedPageProvisionalIdentity,
-    reply: R,
-) -> Result<R, (SharedPageLeaseError, R)> {
-    transition(|authority| authority.reserve(identity, reply))
-}
-
-pub(crate) fn cancel_reservation(
-    identity: SharedPageProvisionalIdentity,
-    effect: SharedPageReservationEffect,
-) -> Result<(), SharedPageLeaseError> {
-    transition(|authority| authority.cancel_reservation(identity, effect))
-}
-
 pub(crate) fn promote(
     identity: SharedPageProvisionalIdentity,
     admitted: SharedPageLeaseIdentity,
 ) -> Result<(), SharedPageLeaseError> {
     transition(|authority| authority.promote(identity, admitted))
-}
-
-pub(crate) fn capture_and_park(
-    identity: SharedPageLeaseIdentity,
-    snapshot: SharedPageSnapshot,
-) -> Result<(), SharedPageLeaseError> {
-    transition(|authority| authority.capture_and_park(identity, snapshot))
-}
-
-pub(crate) fn quarantine_active(
-    identity: SharedPageLeaseIdentity,
-) -> Result<(), SharedPageLeaseError> {
-    transition(|authority| authority.quarantine_active(identity))
 }
 
 pub(crate) fn reacquire(
@@ -91,28 +64,85 @@ pub(crate) fn acknowledge_restore(
     transition(|authority| authority.acknowledge_restore(identity, effect))
 }
 
-pub(crate) fn finish_active(identity: SharedPageLeaseIdentity) -> Result<(), SharedPageLeaseError> {
-    transition(|authority| authority.finish_active(identity))
-}
-
 // ----------------------------------------------------------------------------------------------
-// #419 stage 1: audit mode. Every write-to-dispatch transition goes through the authority, but a
-// refusal is reported and repaired instead of refusing work, so a lifecycle site that is not yet
-// wired shows up as a tagged violation in the boot log rather than wedging win32k.
+// #419: every write-to-dispatch transition goes through the authority. Enforcing, a refused
+// transition is reported and refused: the caller retains its pending owner or answers Busy
+// with no effect. With ENFORCING false (audit mode, kept for diagnosis) the authority is
+// repaired instead, so a missed site shows up in the boot log rather than wedging win32k.
 
-/// False while the lifecycle wiring is audited; enforcing mode refuses instead of repairing.
-pub(crate) const ENFORCING: bool = false;
+/// Whether refused transitions are refused (true) or reported and repaired (audit mode).
+pub(crate) const ENFORCING: bool = true;
 
 static VIOLATIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Total audit violations so far.
+/// Total violations so far.
 pub(crate) fn violations() -> u64 {
     VIOLATIONS.load(Ordering::Relaxed)
+}
+
+/// Parked dispatches, for the census.
+pub(crate) fn parked_count() -> usize {
+    transition(|authority| authority.parked_count())
 }
 
 /// Whether some dispatch holds the page (reserved, active, restoring or pinned).
 pub(crate) fn is_held() -> bool {
     transition(|authority| authority.is_held())
+}
+
+/// Audit mode only: put the authority back in a consistent state after a refused transition.
+fn repair(f: impl FnOnce(&mut SharedPageAuthority<MAX_PARKED>)) {
+    if !ENFORCING {
+        transition(f);
+    }
+}
+
+/// A pre-lane hold of the page by one exact provisional dispatch. Dropped while still only
+/// reserved (a local refusal before the dispatch's first page write), it is cancelled with no
+/// effect. Once promoted, dropping it does nothing: the dispatch's settlement owns the page.
+pub(crate) struct PageReservation(SharedPageProvisionalIdentity);
+
+impl Drop for PageReservation {
+    fn drop(&mut self) {
+        let identity = self.0;
+        transition(|authority| {
+            if authority.reservation() == Some(identity) {
+                // Reserved means no request, header or context cell was written for it.
+                let _ = authority.cancel_reservation(identity, SharedPageReservationEffect::NoEffect);
+            }
+        });
+    }
+}
+
+/// Reserve the page before a dispatch's first shared write. Busy is ordinary contention,
+/// not a violation: the caller retains its Call (root) or answers Busy (funnel).
+pub(crate) fn reserve(
+    identity: SharedPageProvisionalIdentity,
+) -> Result<PageReservation, SharedPageLeaseError> {
+    transition(|authority| authority.reserve(identity, ()))
+        .map(|()| PageReservation(identity))
+        .map_err(|(error, ())| error)
+}
+
+/// The root's reservation for this exact dispatch, if root ingress reserved it.
+pub(crate) fn root_reservation(dispatch_id: u64) -> Option<SharedPageProvisionalIdentity> {
+    transition(|authority| authority.reservation()).filter(|owner| owner.dispatch_id == dispatch_id)
+}
+
+/// Bind the reservation to its admitted lane before the first request write. False refuses.
+pub(crate) fn promote_page(
+    reserved: SharedPageProvisionalIdentity,
+    admitted: SharedPageLeaseIdentity,
+    site: &[u8],
+) -> bool {
+    match promote(reserved, admitted) {
+        Ok(()) => true,
+        Err(error) => {
+            report(site, b"promote", error_name(error), admitted.dispatch.dispatch_id, admitted.client);
+            repair(|authority| authority.audit_force_active(admitted));
+            !ENFORCING
+        }
+    }
 }
 
 fn error_name(error: SharedPageLeaseError) -> &'static [u8] {
@@ -166,59 +196,6 @@ fn report(site: &[u8], op: &[u8], error: &[u8], dispatch_id: u64, client: nt_use
     crate::print_str(b"\n");
 }
 
-/// Root ingress, before the first shared ARG write: no other dispatch may hold the page.
-pub(crate) fn audit_root_free(dispatch_id: u64, client: nt_user_callback::SharedPageClientIdentity, site: &[u8]) {
-    if is_held() {
-        report(site, b"root-ingress", b"page-held", dispatch_id, client);
-        // The holder never released the page: the next transition starts from a free page.
-        transition(|authority| {
-            let holder = match authority.audit_holder() {
-                nt_user_callback::SharedPageAuditHolder::None => return,
-                nt_user_callback::SharedPageAuditHolder::Reserved(id)
-                | nt_user_callback::SharedPageAuditHolder::Active(id)
-                | nt_user_callback::SharedPageAuditHolder::Restoring(id)
-                | nt_user_callback::SharedPageAuditHolder::Uncertain(id) => id,
-            };
-            authority.audit_force_clear(holder);
-        });
-    }
-}
-
-/// Root ingress: reserve the page before the first shared ARG write.
-pub(crate) fn audit_reserve(identity: SharedPageProvisionalIdentity, site: &[u8]) {
-    if let Err((error, ())) = reserve(identity, ()) {
-        report(site, b"reserve", error_name(error), identity.dispatch_id, identity.client);
-        transition(|authority| {
-            authority.audit_force_clear(identity.dispatch_id);
-            let _ = authority.reserve(identity, ());
-        });
-    }
-}
-
-/// A root reservation whose call never reached a lane is released without effect.
-pub(crate) fn audit_cancel(identity: SharedPageProvisionalIdentity, site: &[u8]) {
-    if let Err(error) = cancel_reservation(identity, SharedPageReservationEffect::NoEffect) {
-        report(site, b"cancel", error_name(error), identity.dispatch_id, identity.client);
-        transition(|authority| authority.audit_force_clear(identity.dispatch_id));
-    }
-}
-
-/// First write of a dispatch's request: adopt its root reservation, or enter directly.
-pub(crate) fn audit_enter(identity: SharedPageLeaseIdentity, site: &[u8]) {
-    let id = identity.dispatch.dispatch_id;
-    let result = transition(|authority| {
-        if authority.audit_holder() == nt_user_callback::SharedPageAuditHolder::Reserved(id) {
-            authority.audit_force_active(identity);
-            return Ok(());
-        }
-        authority.enter(identity, ()).map(|()| ()).map_err(|(error, ())| error)
-    });
-    if let Err(error) = result {
-        report(site, b"enter", error_name(error), id, identity.client);
-        transition(|authority| authority.audit_force_active(identity));
-    }
-}
-
 /// One pump return (or a lend of the page) settles its dispatch's hold exactly once.
 pub(crate) fn audit_settle(
     identity: SharedPageLeaseIdentity,
@@ -235,7 +212,7 @@ pub(crate) fn audit_settle(
         Settlement::Retained => (b"retain", error_name(error)),
     };
     report(site, op, error, id, identity.client);
-    transition(|authority| match settlement {
+    repair(|authority| match settlement {
         Settlement::Yielded(Some(snapshot)) => authority.audit_force_park(identity, snapshot),
         Settlement::Yielded(None) | Settlement::Completed => authority.audit_force_clear(id),
         Settlement::Retained => authority.audit_force_active(identity),
@@ -249,23 +226,26 @@ pub(crate) fn audit_park(identity: SharedPageLeaseIdentity, snapshot: Option<Sha
 }
 
 /// A parked dispatch takes the page back before its publication is restored. Returns the
-/// exact page it parked; `expected` is the caller's retained copy, used only by the repair.
+/// exact page it parked. `Err` refuses the resume (in audit mode the caller may go on, and
+/// `expected`, its retained copy, seeds the repair).
 pub(crate) fn audit_reacquire(
     identity: SharedPageLeaseIdentity,
     expected: Option<SharedPageSnapshot>,
     site: &[u8],
-) -> Option<SharedPageSnapshot> {
-    match reacquire(identity) {
-        Ok(parked) => Some(parked),
-        Err(error) => {
-            report(site, b"reacquire", error_name(error), identity.dispatch.dispatch_id, identity.client);
-            transition(|authority| match expected {
-                Some(saved) => authority.audit_force_restoring(identity, saved),
-                None => authority.audit_force_active(identity),
-            });
-            None
-        }
-    }
+) -> Result<SharedPageSnapshot, ()> {
+    reacquire(identity).map_err(|error| {
+        report(site, b"reacquire", error_name(error), identity.dispatch.dispatch_id, identity.client);
+        repair(|authority| match expected {
+            Some(saved) => authority.audit_force_restoring(identity, saved),
+            None => authority.audit_force_active(identity),
+        });
+    })
+}
+
+/// A user callback was abandoned (its continuations discarded): its dispatch never takes the
+/// page back, so its parked page is retired instead of filling the table.
+pub(crate) fn retire_parked(dispatch_id: u64) -> bool {
+    transition(|authority| authority.retire_parked(dispatch_id))
 }
 
 /// The restore's physical evidence: the exact page written, or nothing written.
@@ -276,6 +256,6 @@ pub(crate) fn audit_restored(identity: SharedPageLeaseIdentity, applied: Option<
     };
     if let Err(error) = acknowledge_restore(identity, effect) {
         report(site, b"restore", error_name(error), identity.dispatch.dispatch_id, identity.client);
-        transition(|authority| authority.audit_force_active(identity));
+        repair(|authority| authority.audit_force_active(identity));
     }
 }
