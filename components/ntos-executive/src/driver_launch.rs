@@ -45011,7 +45011,11 @@ pub(crate) fn require_registered_kernel_filesystem_device(device_id: u64) -> Res
     Ok(())
 }
 
+/// Executive I/O-manager pump passes, for the background-holder census (#348).
+static IO_MANAGER_PUMPS: AtomicU64 = AtomicU64::new(0);
+
 fn pump_io_manager() -> usize {
+    IO_MANAGER_PUMPS.fetch_add(1, Ordering::Relaxed);
     let io = io_manager_mut();
     hosted_file_capture::redrive(io);
     let progress = io.pump_with_report().progress;
@@ -45073,6 +45077,7 @@ pub(crate) fn service_mounted_native_mutable_hive_wal(id: u64) -> usize {
 
 pub(crate) fn print_mounted_native_block_census() {
     mounted_native_block::print_census();
+    mounted_native_block::print_background_holder_census();
 }
 
 pub(crate) unsafe fn run_pending_boot_callbacks() -> Result<usize, nt_status::NtStatus> {

@@ -1075,6 +1075,37 @@ pub(super) unsafe fn background_holder_ready() -> bool {
 /// Under a parked nested parent, advance the background snapshot owner that holds the reserve:
 /// settle its one entered physical command through its exact completion/ACK, or enter the
 /// holder's next command. Foreground work waiting on that reserve can then be admitted.
+/// Background-holder settle polls (#348): how many found the pending command's completion
+/// already recorded before their own I/O-manager pump, and how many followed another pump
+/// pass since the previous poll. Decides whether a pump-owned edge can gate the poll.
+static HOLDER_SETTLE_POLLS: AtomicU64 = AtomicU64::new(0);
+static HOLDER_SETTLE_PROGRESS: AtomicU64 = AtomicU64::new(0);
+static HOLDER_VISIBLE_BEFORE_PUMP: AtomicU64 = AtomicU64::new(0);
+static HOLDER_OTHER_PUMP_BETWEEN: AtomicU64 = AtomicU64::new(0);
+static HOLDER_LAST_PUMP: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn observe_holder_settle() {
+    let pumps = IO_MANAGER_PUMPS.load(Ordering::Relaxed);
+    HOLDER_SETTLE_POLLS.fetch_add(1, Ordering::Relaxed);
+    if HOLDER_LAST_PUMP.load(Ordering::Relaxed) != pumps {
+        HOLDER_OTHER_PUMP_BETWEEN.fetch_add(1, Ordering::Relaxed);
+    }
+    let visible = (&*core::ptr::addr_of!(PENDING)).as_ref().is_some_and(|pending| {
+        pending.terminal.is_some() || io_manager_mut().completed_irp(pending.irp).is_some()
+    });
+    if visible { HOLDER_VISIBLE_BEFORE_PUMP.fetch_add(1, Ordering::Relaxed); }
+}
+
+pub(super) fn print_background_holder_census() {
+    print_str(b"[census] background-holder settle-polls/progressed/visible-before-pump/other-pump-between=");
+    for (index, counter) in [&HOLDER_SETTLE_POLLS, &HOLDER_SETTLE_PROGRESS,
+        &HOLDER_VISIBLE_BEFORE_PUMP, &HOLDER_OTHER_PUMP_BETWEEN].into_iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(counter.load(Ordering::Relaxed));
+    }
+    print_str(b"\n");
+}
+
 pub(super) unsafe fn service_background_holder() -> usize {
     use crate::outer_native_io::{background_holder_step, BackgroundHolderStep};
     let Some(_guard) = NativeServiceGuard::enter() else { return 0; };
@@ -1085,7 +1116,13 @@ pub(super) unsafe fn service_background_holder() -> usize {
         crate::writable_fs::native_snapshot_io::background_outer_io_queued(),
     ) {
         BackgroundHolderStep::None => 0,
-        BackgroundHolderStep::Settle => poll_pending(),
+        BackgroundHolderStep::Settle => {
+            observe_holder_settle();
+            let progress = poll_pending();
+            HOLDER_LAST_PUMP.store(IO_MANAGER_PUMPS.load(Ordering::Relaxed), Ordering::Relaxed);
+            if progress != 0 { HOLDER_SETTLE_PROGRESS.fetch_add(1, Ordering::Relaxed); }
+            progress
+        }
         BackgroundHolderStep::Enter => {
             let Some(route) = native_disk_relation::native_storage_route() else { return 0; };
             let Some(claim) = crate::writable_fs::native_snapshot_io::claim_background_snapshot_io()
