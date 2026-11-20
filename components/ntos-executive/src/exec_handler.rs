@@ -11962,7 +11962,7 @@ impl ExecNtHandler {
 
     /// Boot 44689472419: ~1.03M NtWaitForMultipleObjects calls polled with a zero timeout. Name the
     /// user-mode caller: at doubling call counts (1, 2, 4, ...; at most 24 records), print the
-    /// caller's return IP and the top of its user stack for offline symbolization.
+    /// caller's return IP and the top 64 qwords of its user stack for offline symbolization.
     fn sample_zero_timeout_wait(&mut self, count: usize) {
         static ZERO_WAITS: AtomicU64 = AtomicU64::new(0);
         static RECORDS: AtomicU64 = AtomicU64::new(0);
@@ -11985,7 +11985,9 @@ impl ExecNtHandler {
         print_str(b" sp=0x");
         print_hex_u64(self.current_sp);
         print_str(b" stack:");
-        for index in 0..24u64 {
+        // 64 qwords: kernel32 WaitForMultipleObjectsEx keeps its return address at sp+0x100
+        // (0xc0 locals plus seven saved registers above the stub's return), past the first 24.
+        for index in 0..64u64 {
             let mut bytes = [0u8; 8];
             let Some(address) = self.current_sp.checked_add(index * 8) else { break };
             if !unsafe { self.xas_read(address, &mut bytes) } {

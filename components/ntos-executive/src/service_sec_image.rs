@@ -16964,6 +16964,20 @@ unsafe fn pending_file_io_redrive_pass(
                 nt_handler.release_file_reference(finished.route.hosted_file_id().expect("provider completion lost its File route"));
             }
             nt_io_manager::PendingFileIoOperation::Create(create) => {
+                // #421: name the final status of a pended device CREATE (condrv pends the
+                // console reference open), bounded, beside the `[device-path]` dispatch record.
+                static PENDED_CREATES: AtomicU64 = AtomicU64::new(0);
+                if PENDED_CREATES.fetch_add(1, Ordering::Relaxed) < 64 {
+                    print_str(b"[device-path] pi=");
+                    print_u64(finished.pi as u64);
+                    print_str(b" pended-create file=0x");
+                    print_hex_u64(finished.route.hosted_file_id().unwrap_or(0));
+                    print_str(b" final-status=0x");
+                    print_hex(terminal_status as u32);
+                    print_str(b" handle=0x");
+                    print_hex_u64(create.handle_value);
+                    print_str(b"\n");
+                }
                 if create.handle_value == 0 {
                     nt_handler.release_unpublished_hosted_create(finished);
                 }
