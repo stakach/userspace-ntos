@@ -215,3 +215,24 @@ fn first_fit_removes_exact_block_and_discards_unusable_suffix() {
     assert!(heap.blocks().is_empty());
     assert_eq!(heap.bump(), 512);
 }
+
+#[test]
+fn first_fit_can_leave_a_small_split_suffix_unlinked_for_its_cache() {
+    let mut heap = Heap::new(4096);
+    heap.insert(0, 512);
+    // 512 - 448 leaves a 64-byte suffix: below the spill bound it is returned, not linked.
+    let taken = unsafe { heap.list.take_fit_spilling(WORD, 448, 257) }.unwrap();
+    assert_eq!(taken.address, Some(heap.data));
+    assert_eq!(taken.spilled_suffix, Some((heap.data + 448, 64)));
+    assert!(heap.blocks().is_empty());
+    // A suffix at or above the bound stays linked in place.
+    heap.insert(1024, 1024);
+    let taken = unsafe { heap.list.take_fit_spilling(WORD, 512, 257) }.unwrap();
+    assert_eq!(taken.spilled_suffix, None);
+    assert_eq!(heap.blocks(), [(1536, 512)]);
+    // The plain first fit never spills.
+    heap.insert(0, 512);
+    let taken = unsafe { heap.list.take_fit(WORD, 448) }.unwrap();
+    assert_eq!(taken.spilled_suffix, None);
+    assert_eq!(heap.blocks(), [(448, 64), (1536, 512)]);
+}

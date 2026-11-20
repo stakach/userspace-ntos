@@ -33,6 +33,9 @@ pub(super) struct TakeFit {
     pub inspected: usize,
     pub prefix_reinsert_visits: Option<usize>,
     pub suffix_reinsert_visits: Option<usize>,
+    /// A split suffix smaller than the caller's spill bound, left unlinked for the caller to
+    /// cache or insert. `None` when the suffix was linked in place or there was none.
+    pub spilled_suffix: Option<(usize, usize)>,
 }
 
 #[derive(Debug)]
@@ -94,6 +97,17 @@ impl FreeList {
         align: usize,
         needed: usize,
     ) -> Result<TakeFit, TakeFitError> {
+        unsafe { self.take_fit_spilling(align, needed, 0) }
+    }
+
+    /// First fit that leaves a split suffix smaller than `spill_below` unlinked and returns it
+    /// in [`TakeFit::spilled_suffix`]. A top-ending suffix is still trimmed from the bump.
+    pub(super) unsafe fn take_fit_spilling(
+        &self,
+        align: usize,
+        needed: usize,
+        spill_below: usize,
+    ) -> Result<TakeFit, TakeFitError> {
         let align = align.max(GRANULE);
         let top = self.data.checked_add(unsafe { Self::read(self.counter) })
             .ok_or_else(|| TakeFitError {
@@ -121,6 +135,7 @@ impl FreeList {
                 None => return Ok(TakeFit {
                     address: None, inspected,
                     prefix_reinsert_visits: None, suffix_reinsert_visits: None,
+                    spilled_suffix: None,
                 }),
             };
             let mut prefix = start - cur;
@@ -130,6 +145,7 @@ impl FreeList {
                     None => return Ok(TakeFit {
                         address: None, inspected,
                         prefix_reinsert_visits: None, suffix_reinsert_visits: None,
+                        spilled_suffix: None,
                     }),
                 };
                 prefix = start - cur;
@@ -146,7 +162,8 @@ impl FreeList {
                 let keep_prefix = prefix >= NODE_SIZE;
                 // Insertion immediately trims a top-ending suffix. Publish the same bump
                 // position without first writing and walking an unreachable free node.
-                let keep_suffix = suffix >= NODE_SIZE && cur_end != top;
+                let spill = suffix >= NODE_SIZE && cur_end != top && suffix < spill_below;
+                let keep_suffix = suffix >= NODE_SIZE && cur_end != top && !spill;
                 let first = if keep_prefix { cur }
                     else if keep_suffix { suffix_start }
                     else { next };
@@ -167,7 +184,8 @@ impl FreeList {
                 return Ok(TakeFit {
                     address: Some(start), inspected,
                     prefix_reinsert_visits: keep_prefix.then_some(0),
-                    suffix_reinsert_visits: (suffix >= NODE_SIZE).then_some(0),
+                    suffix_reinsert_visits: (suffix >= NODE_SIZE && !spill).then_some(0),
+                    spilled_suffix: spill.then_some((suffix_start, suffix)),
                 });
             }
             prev_link = cur + WORD;
@@ -177,6 +195,7 @@ impl FreeList {
         Ok(TakeFit {
             address: None, inspected,
             prefix_reinsert_visits: None, suffix_reinsert_visits: None,
+            spilled_suffix: None,
         })
     }
 

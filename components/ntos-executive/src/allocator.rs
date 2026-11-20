@@ -32,6 +32,9 @@ mod free_list;
 #[path = "allocator_quick_lists.rs"]
 mod quick_lists;
 use quick_lists::{QuickLists, QUICK_WORDS};
+#[path = "allocator_durable_policy.rs"]
+mod durable_policy;
+use durable_policy::{DurablePolicy, PolicyFault};
 use free_list::align_up;
 #[path = "allocator_sites.rs"]
 mod sites;
@@ -801,62 +804,59 @@ unsafe fn insert_free_block(start: usize, size: usize) {
 
 const QUICK: QuickLists = QuickLists { meta: QUICK_META, data: DATA };
 
-/// Release a durable block: a small block not at the bump top goes to its exact-size cache;
-/// everything else is inserted (and coalesced, or trimmed from the top) in address order.
-unsafe fn release_durable_block(start: usize, size: usize) {
-    let at_top = start.checked_add(size) == Some(DATA + unsafe { read_word(CTR) });
-    if at_top || !unsafe { QUICK.push(start, size) } {
-        unsafe { insert_free_block(start, size) };
-    }
-}
+const POLICY: DurablePolicy = DurablePolicy {
+    list: free_list::FreeList { data: DATA, counter: CTR, head: FREE_HEAD },
+    quick: QUICK,
+};
 
-/// Pop an exact-size cached block, or `None` when the address-ordered list must serve it.
-unsafe fn alloc_from_quick_list(layout: Layout, needed: usize) -> Option<*mut u8> {
-    let top = DATA + unsafe { read_word(CTR) };
-    match unsafe { QUICK.pop(needed, layout.align(), top) } {
-        Ok(found) => found.map(|address| address as *mut u8),
-        Err(corruption) => allocator_corruption(
-            b"quick-pop", corruption.node, needed, corruption.node, corruption.size,
+fn policy_corruption(fault: PolicyFault) -> ! {
+    match fault {
+        PolicyFault::Quick(corruption) => allocator_corruption(
+            b"quick-pop", corruption.node, corruption.size, corruption.node, corruption.size,
+            corruption.next,
+        ),
+        PolicyFault::TakeFit(error) => allocator_corruption(
+            error.corruption.operation, error.owner_start, error.owner_size,
+            error.corruption.node, error.corruption.size, error.corruption.next,
+        ),
+        PolicyFault::Insert { start, size, corruption } => allocator_corruption(
+            corruption.operation, start, size, corruption.node, corruption.size,
             corruption.next,
         ),
     }
 }
 
+/// Release a durable block through the reuse policy, recording any insertion walk.
+unsafe fn release_durable_block(start: usize, size: usize) {
+    let started = crate::disk_census_ticks();
+    match unsafe { POLICY.release(start, size, DATA + read_word(CTR)) } {
+        Ok(Some(visits)) => INSERT_WALK.record(transient_heap_size() != 0, visits,
+            crate::disk_census_ticks().wrapping_sub(started)),
+        Ok(None) => {}
+        Err(fault) => policy_corruption(fault),
+    }
+}
+
+/// Reuse a cached or free-list block, or null when the bump must grow.
+unsafe fn alloc_from_reuse(layout: Layout, needed: usize) -> *mut u8 {
+    let started = crate::disk_census_ticks();
+    let reuse = match unsafe { POLICY.reuse(layout.align(), needed, DATA + read_word(CTR)) } {
+        Ok(reuse) => reuse,
+        Err(fault) => policy_corruption(fault),
+    };
+    let root_heap = transient_heap_size() != 0;
+    if let Some(visits) = reuse.fit_visits {
+        ALLOC_WALK.record(root_heap, visits, crate::disk_census_ticks().wrapping_sub(started));
+    }
+    if let Some(visits) = reuse.insert_visits {
+        INSERT_WALK.record(root_heap, visits, 0);
+    }
+    reuse.address.map_or(null_mut(), |address| address as *mut u8)
+}
+
 /// Before refusing an allocation, return every cached block to the coalescing list.
 unsafe fn drain_quick_lists() -> bool {
     unsafe { QUICK.drain(|start, size| insert_free_block(start, size)) != 0 }
-}
-
-unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
-    let list = free_list::FreeList {
-        data: DATA,
-        counter: CTR,
-        head: FREE_HEAD,
-    };
-    let started = crate::disk_census_ticks();
-    match unsafe { list.take_fit(layout.align(), needed) } {
-        Ok(taken) => {
-            // The split reinsertions run inside take_fit; their time is the alloc walk's.
-            let ticks = crate::disk_census_ticks().wrapping_sub(started);
-            let root_heap = transient_heap_size() != 0;
-            if let Some(visits) = taken.prefix_reinsert_visits {
-                INSERT_WALK.record(root_heap, visits, 0);
-            }
-            if let Some(visits) = taken.suffix_reinsert_visits {
-                INSERT_WALK.record(root_heap, visits, 0);
-            }
-            ALLOC_WALK.record(root_heap, taken.inspected, ticks);
-            taken.address.map_or(null_mut(), |address| address as *mut u8)
-        }
-        Err(error) => allocator_corruption(
-            error.corruption.operation,
-            error.owner_start,
-            error.owner_size,
-            error.corruption.node,
-            error.corruption.size,
-            error.corruption.next,
-        ),
-    }
 }
 
 unsafe fn grow_in_place_from_adjacent_free(start: usize, old_size: usize, new_size: usize) -> bool {
@@ -898,12 +898,9 @@ impl Bump {
             );
             return null_mut();
         };
-        if let Some(cached) = unsafe { alloc_from_quick_list(layout, size) } {
-            return cached;
-        }
-        let from_free = unsafe { alloc_from_free_list(layout, size) };
-        if !from_free.is_null() {
-            return from_free;
+        let reused = unsafe { alloc_from_reuse(layout, size) };
+        if !reused.is_null() {
+            return reused;
         }
 
         let cur = unsafe { read_word(CTR) }; // 0 on a freshly-zeroed heap frame

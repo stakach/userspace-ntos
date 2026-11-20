@@ -7,7 +7,7 @@ mod free_list;
 mod quick_lists;
 
 use free_list::FreeList;
-use quick_lists::{QuickCorruption, QuickLists, QUICK_CLASS_CAP, QUICK_MAX_BLOCK, QUICK_WORDS};
+use quick_lists::{class_cap, QuickCorruption, QuickLists, QUICK_MAX_BLOCK, QUICK_WORDS};
 
 const WORD: usize = core::mem::size_of::<usize>();
 
@@ -82,6 +82,9 @@ fn hot_small_cycle_stops_walking_the_address_ordered_list() {
 
 #[test]
 fn caches_are_exact_size_lifo_bounded_and_counted() {
+    #[allow(non_snake_case)]
+    let QUICK_CLASS_CAP = class_cap(32);
+    assert_eq!(class_cap(QUICK_MAX_BLOCK), 512, "each cache holds a bounded byte budget");
     let heap = Heap::new(QUICK_CLASS_CAP * 64 + 4096);
     let block = |index: usize| heap.data + index * 64;
     // Outside the cached sizes: undersized, unaligned and large blocks are refused.

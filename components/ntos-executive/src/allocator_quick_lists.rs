@@ -5,7 +5,7 @@
 //! average of ~170 nodes per allocation. A released block of 16..=[`QUICK_MAX_BLOCK`] bytes is
 //! therefore not threaded back into that list as one more fragment: it is pushed onto
 //! the cache of its exact size and the next allocation of that size pops it, both without a
-//! walk. Each cache is bounded by [`QUICK_CLASS_CAP`]; a full cache, a misaligned head or an
+//! walk. Each cache holds at most [`QUICK_CLASS_BYTES`]; a full cache, a misaligned head or an
 //! exhausted heap falls back to (or drains into) the address-ordered list, which coalesces.
 //! Metadata lives in caller-supplied words so isolated heaps keep it out of the shared image.
 
@@ -16,7 +16,11 @@ const GRANULE: usize = core::mem::align_of::<usize>();
 const MIN_BLOCK: usize = WORD * 2;
 pub(super) const QUICK_MAX_BLOCK: usize = 256;
 pub(super) const QUICK_CLASSES: usize = (QUICK_MAX_BLOCK - MIN_BLOCK) / GRANULE + 1;
-pub(super) const QUICK_CLASS_CAP: usize = 256;
+/// Bytes each exact-size cache may hold; smaller sizes cache proportionally more blocks.
+pub(super) const QUICK_CLASS_BYTES: usize = 128 * 1024;
+
+/// Blocks the cache of `size` may hold.
+pub(super) const fn class_cap(size: usize) -> usize { QUICK_CLASS_BYTES / size }
 /// A head and a count per class.
 pub(super) const QUICK_WORDS: usize = QUICK_CLASSES * 2;
 
@@ -56,7 +60,7 @@ impl QuickLists {
     pub(super) unsafe fn push(&self, start: usize, size: usize) -> bool {
         let Some(class) = Self::class(size) else { return false; };
         let count = unsafe { Self::read(self.count_addr(class)) };
-        if count >= QUICK_CLASS_CAP { return false; }
+        if count >= class_cap(size) { return false; }
         unsafe {
             Self::write(start, size);
             Self::write(start + WORD, Self::read(self.head_addr(class)));
