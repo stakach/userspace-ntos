@@ -71,8 +71,8 @@ impl LatencyCensus {
     pub(crate) fn ingress(&mut self, badge: u64, now: u64, idle_ticks: u64) {
         self.last_ingress = Some((badge, now));
         let Some(slot) = Self::slot(badge) else { return; };
-        let Some(returning) = self.returning[slot].take().filter(|row| row.badge == badge)
-            else { return; };
+        if self.returning[slot].is_none_or(|row| row.badge != badge) { return; }
+        let Some(returning) = self.returning[slot].take() else { return; };
         let row = &mut self.rows[returning.service];
         let total = now.saturating_sub(returning.replied_at);
         let idle = idle_ticks.saturating_sub(returning.idle_at_reply).min(total);
@@ -126,8 +126,10 @@ impl LatencyCensus {
         writeln!(out)
     }
 
+    /// Badges are sparse (Explorer's GUI thread was 1242); the stored badge disambiguates a
+    /// shared slot, and a colliding reply replaces the older pending return sample.
     fn slot(badge: u64) -> Option<usize> {
-        usize::try_from(badge).ok().filter(|slot| *slot < BADGE_SLOTS)
+        Some((badge % BADGE_SLOTS as u64) as usize)
     }
 }
 

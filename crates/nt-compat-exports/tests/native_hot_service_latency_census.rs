@@ -54,15 +54,18 @@ fn unobserved_boundaries_are_not_counted() {
     latency.dispatch_started(OTHER, Some(NativeService::NtWriteFile), 16);
     latency.dispatch_finished(17);
     latency.replying(OTHER, 18, 0);
-    // An out-of-table badge is measured for its call but has no return slot.
-    latency.ingress(u64::MAX, 20, 0);
-    latency.dispatch_started(u64::MAX, Some(NativeService::NtWriteFile), 21);
+    // Sparse badges are measured through a shared slot; a colliding badge's next message does
+    // not close another badge's return.
+    let sparse = census::BADGE_SLOTS as u64 + 218;
+    latency.ingress(sparse, 20, 0);
+    latency.dispatch_started(sparse, Some(NativeService::NtWriteFile), 21);
     latency.dispatch_finished(22);
-    latency.replying(u64::MAX, 23, 0);
-    latency.ingress(u64::MAX, 30, 0);
+    latency.replying(sparse, 23, 0);
+    latency.ingress(218, 25, 0);
+    latency.ingress(sparse, 30, 0);
     assert_eq!(latency.latency(NativeService::NtReadFile).unwrap(), census::Latency::default());
     let write = latency.latency(NativeService::NtWriteFile).unwrap();
-    assert_eq!((write.calls, write.returns), (2, 0));
+    assert_eq!((write.calls, write.returns, write.return_other), (2, 1, 7));
     assert!(latency.latency(NativeService::NtCreateProcess).is_none());
 }
 
