@@ -79,9 +79,57 @@ pub(crate) enum ServicePump {
     Finished(crate::spawn_hosts::PumpResult),
     /// Unfinished while lane X is parked for it.
     Kept(KeptPump),
-    /// Unfinished and nothing can own its continuation. It is fenced with every resource it
-    /// holds; the caller sees an uncertain, never completed, result.
+    /// Unfinished at root level inside a turn that may not block. The caller's own owner
+    /// keeps it and the next root turn continues it ([`RootTurnPump`]).
+    RootTurn(RootTurnPump),
+    /// The pump entered an uncertain effect. It is fenced with every resource it holds; the
+    /// caller sees an uncertain, never completed, result.
     Fenced(crate::spawn_hosts::PumpResult),
+}
+
+/// A root-level pump whose caller runs inside a turn that may not block (#420). Its owner
+/// keeps it in a typed retained row and calls [`RootTurnPump::resume`] from a later root turn,
+/// where the caller's result is finished with the true outcome.
+#[must_use = "a root-turn pump is owed a retained owner"]
+pub(crate) struct RootTurnPump {
+    pump: HostedPumpRestore,
+}
+
+/// One root turn's attempt at a retained root pump.
+pub(crate) enum RootTurnProgress {
+    Finished(crate::spawn_hosts::PumpResult),
+    Pending(RootTurnPump),
+    /// The pump entered an uncertain effect.
+    Fenced(crate::spawn_hosts::PumpResult),
+}
+
+impl RootTurnPump {
+    /// Continue the pump once from a root turn; a frame that may block waits for it here.
+    pub(crate) unsafe fn resume(self) -> RootTurnProgress {
+        if crate::service_sec_image::root_wait_may_block() {
+            return match await_at_root(self.pump) {
+                ServicePump::Finished(result) => RootTurnProgress::Finished(result),
+                ServicePump::RootTurn(pump) => RootTurnProgress::Pending(pump),
+                ServicePump::Fenced(result) => RootTurnProgress::Fenced(result),
+                ServicePump::Kept(kept) => RootTurnProgress::Fenced(kept.fence()),
+            };
+        }
+        match retry(self.pump) {
+            PumpProgress::Finished(result) => RootTurnProgress::Finished(result),
+            PumpProgress::Unfinished(pump) => RootTurnProgress::Pending(Self { pump }),
+            PumpProgress::Fenced(pump) => RootTurnProgress::Fenced(fence_pump(pump, b"root-turn")),
+        }
+    }
+
+    /// Whether a root turn can continue it.
+    pub(crate) fn retryable(&self) -> bool { self.pump.retryable_continuation() }
+
+    /// A caller with no retained owner for a root turn: the pump is fenced and driven to the
+    /// end of its dispatch, and the caller sees an uncertain result. Each such caller is still
+    /// owed a typed retained row (#420); the marker names them.
+    pub(crate) unsafe fn fence_unowned(self) -> crate::spawn_hosts::PumpResult {
+        fence_pump(self.pump, b"root-turn-unowned")
+    }
 }
 
 /// Settle a pump whose channel parked the running lane itself (`ReplyRequest`). At root
@@ -168,15 +216,29 @@ unsafe fn fence_pump(pump: HostedPumpRestore, reason: &[u8]) -> crate::spawn_hos
     result
 }
 
-/// Root progress passes a runtime root waiter makes before it reports the pump uncertain.
-const ROOT_WAIT_PASSES: usize = 64;
+/// Root-level waiters currently driving a kept pump. Their held lane is their own execution,
+/// not a busy component that would keep the bootstrap owner from receiving.
+static ROOT_WAITS: AtomicU64 = AtomicU64::new(0);
 
-/// Root level only (no lane X, no scheduler scope): wait for the kept pump and return its true
-/// result. Each pass services timer, IRQ and DPC work, retries the root-owned restores the pump
-/// is usually waiting on, and continues the pump once. During boot the bootstrap receive owner
-/// also receives between passes; at runtime the wait is bounded, and a pump that is still
-/// unfinished keeps the fenced, uncertain outcome.
+/// Whether a root-level waiter owns the execution the bootstrap receive owner sees as busy.
+pub(crate) fn root_wait_owns_execution() -> bool { ROOT_WAITS.load(Ordering::Acquire) != 0 }
+
+struct RootWaitScope;
+impl RootWaitScope {
+    fn enter() -> Self { ROOT_WAITS.fetch_add(1, Ordering::AcqRel); Self }
+}
+impl Drop for RootWaitScope {
+    fn drop(&mut self) { ROOT_WAITS.fetch_sub(1, Ordering::AcqRel); }
+}
+
+/// Root level only (no lane X, no scheduler scope): the caller owns the kept pump and waits
+/// for its true result, driving it between passes of the root's own work. There is no pass
+/// budget; only a pump that entered an uncertain effect ends the wait without a result.
+/// During boot the bootstrap receive owner runs the passes; at runtime the root progress loop
+/// does, wherever this frame may block. A frame that may not block (a timer delivery or a
+/// component-resume pass is running above it) gets the pump back as a root-turn continuation.
 unsafe fn await_at_root(pump: HostedPumpRestore) -> ServicePump {
+    let _waiting = RootWaitScope::enter();
     if crate::dispatcher_bootstrap::is_owned() {
         let mut pump = Some(pump);
         let mut finished = None;
@@ -192,27 +254,33 @@ unsafe fn await_at_root(pump: HostedPumpRestore) -> ServicePump {
         });
         return match (waited, finished) {
             (Ok(_), Some(result)) => { trace_root(b"boot-finished"); ServicePump::Finished(result) }
+            // The bootstrap owner refused a receive transition, or the pump entered an
+            // uncertain effect: both keep their entered state, and nothing is replayed.
             _ => ServicePump::Fenced(fence_pump(pump.take().expect("unfinished root pump"),
-                b"boot-wait")),
+                b"boot-uncertain")),
         };
     }
-    let mut pump = pump;
-    for _ in 0..ROOT_WAIT_PASSES {
-        {
-            let scope = component_scheduler::ComponentSchedulerScope::enter();
-            drop(scope.service_irq_yield(0));
-        }
-        crate::service_sec_image::drain_root_restores();
-        match retry(pump) {
-            PumpProgress::Finished(result) => {
-                trace_root(b"finished");
-                return ServicePump::Finished(result);
-            }
-            PumpProgress::Unfinished(next) => pump = next,
-            PumpProgress::Fenced(next) => return ServicePump::Fenced(fence_pump(next, b"root-fenced")),
-        }
+    if !crate::service_sec_image::root_wait_may_block() {
+        trace_root(b"root-turn");
+        return ServicePump::RootTurn(RootTurnPump { pump });
     }
-    ServicePump::Fenced(fence_pump(pump, b"root-wait"))
+    let transport = core::cell::Cell::new(false);
+    let waited = nt_component_suspension::await_root_pump(
+        pump,
+        || if !transport.get() && crate::service_sec_image::root_progress_pass().is_err() {
+            transport.set(true);
+        },
+        |pump| if transport.get() { PumpProgress::Fenced(pump) } else { retry(pump) },
+    );
+    let transport = transport.get();
+    match waited {
+        nt_component_suspension::RootPumpWait::Finished(result) => {
+            trace_root(b"finished");
+            ServicePump::Finished(result)
+        }
+        nt_component_suspension::RootPumpWait::Fenced(pump) => ServicePump::Fenced(fence_pump(
+            pump, if transport { b"root-transport" } else { b"root-uncertain" })),
+    }
 }
 
 fn trace_root(stage: &[u8]) {
@@ -233,6 +301,8 @@ pub(super) unsafe fn settle_without_step(pump: HostedPumpRestore) -> crate::spaw
     match settle(pump) {
         ServicePump::Finished(result) | ServicePump::Fenced(result) => result,
         ServicePump::Kept(kept) => kept.fence(),
+        // This caller has no retained owner for a root turn yet.
+        ServicePump::RootTurn(turn) => turn.fence_unowned(),
     }
 }
 

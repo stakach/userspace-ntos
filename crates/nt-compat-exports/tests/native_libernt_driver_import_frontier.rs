@@ -179,8 +179,7 @@ fn pinned_acpi_pnp_notification_retains_exact_registration_and_delivers_arrival(
     assert!(launch.contains("reg.bind(\n        \"IoUnregisterPlugPlayNotification\","));
     let adapter = include_str!("../../../components/ntos-executive/src/hosted_driver_pnp_notification.rs");
     assert!(adapter.contains("set_hosted_device_interface_state")
-        && adapter.contains("GUID_DEVICE_INTERFACE_ARRIVAL")
-        && adapter.contains("dispatch_device_projection_control_for_instance"),
+        && adapter.contains("GUID_DEVICE_INTERFACE_ARRIVAL"),
         "real interface activation must reach an authenticated provider callback");
     assert!(adapter.contains("retire_domain") && adapter.contains("unregister"),
         "notification cookies and callbacks must have a driver-domain retirement path");

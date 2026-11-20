@@ -24,7 +24,8 @@ pub(crate) unsafe fn drive<T: Copy + Eq>(
         // A held lane owned by a retained kernel yield is not execution: its retry owner is
         // this loop's pass, which needs the service and receive below between attempts.
         let busy = service_sec_image::component_execution_is_busy()
-            && !service_sec_image::kernel_provider_activation::yield_retry::owns_execution();
+            && !service_sec_image::kernel_provider_activation::yield_retry::owns_execution()
+            && !driver_launch::root_pump_wait_owns_execution();
         if busy {
             return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
         }
@@ -64,7 +65,8 @@ pub(crate) unsafe fn drive<T: Copy + Eq>(
             pass_active: service_sec_image::component_resume::is_running(),
             timer_delivery_active: TIMER_DELIVERY_GATE.is_active(),
             physical_execution_active: service_sec_image::component_execution_is_busy()
-                && !service_sec_image::kernel_provider_activation::yield_retry::owns_execution(),
+                && !service_sec_image::kernel_provider_activation::yield_retry::owns_execution()
+                && !driver_launch::root_pump_wait_owns_execution(),
             rearm_pending: dispatcher_bootstrap::receive_work_pending(),
         };
         // A tick observed during scheduler effects still needs scanning. It invalidates sleep,

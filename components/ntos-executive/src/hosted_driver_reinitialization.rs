@@ -195,6 +195,56 @@ pub(super) unsafe fn run_pending_for_instance(
     }
 }
 
+/// One reinitialization callback dispatched from a root drain turn (#420).
+pub(super) enum ReinitStep {
+    Acknowledged,
+    /// Its dispatch was still running when this turn returned; the drain keeps it Executing
+    /// and the next drain turn continues the same pump.
+    Pending(PendingReinit),
+}
+
+#[must_use = "an executing reinitialization callback is owed its acknowledgement"]
+pub(super) struct PendingReinit {
+    ticket: nt_io_manager::driver_reinitialization::DriverReinitializationTicket,
+    dispatch: PendingProjectionControl,
+}
+
+pub(super) unsafe fn dispatch_ticket(
+    index: usize,
+    ticket: nt_io_manager::driver_reinitialization::DriverReinitializationTicket,
+    selector: u64,
+) -> Result<ReinitStep, nt_status::NtStatus> {
+    let dispatched = dispatch_device_projection_control_retained(
+        index, ticket.identity.driver_object, selector, ticket.identity.routine,
+        ticket.identity.context, crate::initial_system_driver_caller(),
+    );
+    settle_ticket(ticket, dispatched)
+}
+
+impl PendingReinit {
+    pub(super) unsafe fn resume(self) -> Result<ReinitStep, nt_status::NtStatus> {
+        settle_ticket(self.ticket, self.dispatch.resume())
+    }
+}
+
+unsafe fn settle_ticket(
+    ticket: nt_io_manager::driver_reinitialization::DriverReinitializationTicket,
+    dispatched: ProjectionControl,
+) -> Result<ReinitStep, nt_status::NtStatus> {
+    let count = match dispatched {
+        ProjectionControl::Done(result) => result?,
+        ProjectionControl::Pending(dispatch) =>
+            return Ok(ReinitStep::Pending(PendingReinit { ticket, dispatch })),
+    };
+    if count != u64::from(ticket.count) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    queue().acknowledge(ticket).map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    Ok(ReinitStep::Acknowledged)
+}
+
+static mut PENDING_ORDINARY: Option<PendingReinit> = None;
+
 /// A boot callback can register an ordinary callback after DriverEntry's one-time drain. Claim
 /// those rows only after the boot callback has acknowledged its exact terminal and Count.
 pub(super) unsafe fn run_pending_ordinary_callbacks() -> Result<usize, nt_status::NtStatus> {
@@ -203,6 +253,15 @@ pub(super) unsafe fn run_pending_ordinary_callbacks() -> Result<usize, nt_status
     { return Ok(0); }
     let _guard = OrdinaryDrainGuard;
     let mut completed = 0usize;
+    if let Some(pending) = (&mut *core::ptr::addr_of_mut!(PENDING_ORDINARY)).take() {
+        match pending.resume()? {
+            ReinitStep::Acknowledged => completed += 1,
+            ReinitStep::Pending(pending) => {
+                *core::ptr::addr_of_mut!(PENDING_ORDINARY) = Some(pending);
+                return Ok(0);
+            }
+        }
+    }
     while let Some(ticket) = queue().begin_next_ready(|identity| {
         instance_by_driver_id(identity.driver_id).is_some_and(|(_, inst)| {
             inst.driver_object == identity.driver_object
@@ -219,21 +278,13 @@ pub(super) unsafe fn run_pending_ordinary_callbacks() -> Result<usize, nt_status
             || domain.cookie != ticket.identity.domain_cookie
             || inst.driver_object != ticket.identity.driver_object
         { return Err(nt_status::NtStatus::ACCESS_DENIED); }
-        let count = dispatch_device_projection_control_for_instance(
-            index,
-            ticket.identity.driver_object,
-            FSD_DISPATCH_DRIVER_REINIT,
-            ticket.identity.routine,
-            ticket.identity.context,
-            false,
-            None,
-            crate::initial_system_driver_caller(),
-        )?;
-        if count != u64::from(ticket.count) {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        match dispatch_ticket(index, ticket, FSD_DISPATCH_DRIVER_REINIT)? {
+            ReinitStep::Acknowledged => completed += 1,
+            ReinitStep::Pending(pending) => {
+                *core::ptr::addr_of_mut!(PENDING_ORDINARY) = Some(pending);
+                return Ok(completed);
+            }
         }
-        queue().acknowledge(ticket).map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        completed += 1;
     }
     Ok(completed)
 }

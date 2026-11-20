@@ -137,6 +137,8 @@ mod scheduler_yield_restore;
 pub use scheduler_yield_restore::{RestoreRetry, SchedulerServiceEnd, SchedulerYieldStep};
 mod deferred_reply;
 pub use deferred_reply::{DeferralCapacity, DeferredReplies};
+mod root_pump_wait;
+pub use root_pump_wait::{await_root_pump, RootPumpWait};
 mod service_continuation;
 pub use service_continuation::{
     drive_one, PumpProgress, RegistrationRefusal, RegistrationRefused, ServiceContinuations,

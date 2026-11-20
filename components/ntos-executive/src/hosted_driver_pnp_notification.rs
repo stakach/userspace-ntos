@@ -573,6 +573,7 @@ pub(super) unsafe fn component_dispatch() -> (i32, u64) {
 /// Timer-driven root dispatch runs only after the originating SetInterfaceState Call replied.
 /// An uncertain callback remains Executing and cannot be retried or discarded during unload.
 pub(crate) unsafe fn wake_due() -> u64 {
+    if resume_pending() { return 1; }
     if wake_target_due() != 0 { return 1; }
     let Some(event) = (&*core::ptr::addr_of!(EVENTS)).iter()
         .copied().find(|event| event.state == EventState::Pending) else { return 0; };
@@ -599,20 +600,63 @@ pub(crate) unsafe fn wake_due() -> u64 {
     for (offset, byte) in event.link.as_bytes().iter().enumerate() {
         write_volatile((arg + ARG_LINK_BUF + offset as u64 * 2) as *mut u16, *byte as u16);
     }
-    let dispatched = dispatch_device_projection_control_for_instance(
+    let dispatched = dispatch_device_projection_control_retained(
         registration.instance,
         registration.driver_object,
         FSD_DISPATCH_PNP_NOTIFICATION,
         registration.callback,
         registration.context,
-        false,
-        None,
         crate::initial_system_driver_caller(),
     );
-    if dispatched.is_ok() {
-        (&mut *core::ptr::addr_of_mut!(EVENTS)).retain(|row| row.ticket != event.ticket);
-    }
+    settle(Delivery::Event { ticket: event.ticket }, dispatched);
     1
+}
+
+/// Which callback a pending dispatch delivers, and what its true result finishes.
+#[derive(Clone, Copy)]
+enum Delivery {
+    Event { ticket: u64 },
+    Target { ticket: u64, inst: DriverInstance, allocation: u64 },
+    TargetComplete { ticket: u64 },
+}
+
+/// A callback whose dispatch was still running when this timer turn returned (#420). Its row
+/// stays Executing; the next wake continues the same pump and finishes it with its result.
+static mut PENDING: Option<(Delivery, PendingProjectionControl)> = None;
+
+unsafe fn resume_pending() -> bool {
+    let Some((delivery, pending)) = (&mut *core::ptr::addr_of_mut!(PENDING)).take() else {
+        return false;
+    };
+    settle(delivery, pending.resume());
+    true
+}
+
+unsafe fn settle(delivery: Delivery, dispatched: ProjectionControl) {
+    let result = match dispatched {
+        ProjectionControl::Done(result) => result,
+        ProjectionControl::Pending(pending) => {
+            *core::ptr::addr_of_mut!(PENDING) = Some((delivery, pending));
+            return;
+        }
+    };
+    match delivery {
+        Delivery::Event { ticket } => if result.is_ok() {
+            (&mut *core::ptr::addr_of_mut!(EVENTS)).retain(|row| row.ticket != ticket);
+        },
+        Delivery::Target { ticket, inst, allocation } => if result.is_ok() {
+            let Some(_guard) = hosted_instance_pool_lock(inst.exec_pool_va) else { return; };
+            if !hosted_instance_pool_free_unlocked(inst, allocation) { return; }
+            let Some(report) = (&mut *core::ptr::addr_of_mut!(TARGET_REPORTS))
+                .iter_mut().find(|row| row.ticket == ticket) else { return; };
+            report.delivery_allocation = None;
+            report.next += 1;
+            report.state = EventState::Pending;
+        },
+        Delivery::TargetComplete { ticket } => if result.is_ok() {
+            let _ = finish_target_report(ticket);
+        },
+    }
 }
 
 unsafe fn target_registration_dispatch(cookie: u64, pdo: nt_io_manager::DeviceId,
@@ -696,19 +740,11 @@ unsafe fn wake_target_due() -> u64 {
             report.delivery_allocation = Some((instance_index, allocation));
             report.state = EventState::Executing;
         }
-        let result = dispatch_device_projection_control_for_instance(
+        let result = dispatch_device_projection_control_retained(
             instance_index, driver_object, FSD_DISPATCH_PNP_NOTIFICATION,
-            callback, context, false, None, crate::initial_system_driver_caller(),
+            callback, context, crate::initial_system_driver_caller(),
         );
-        if result.is_ok() {
-            let Some(_guard) = hosted_instance_pool_lock(inst.exec_pool_va) else { return 1; };
-            if !hosted_instance_pool_free_unlocked(inst, allocation) { return 1; }
-            let Some(report) = (&mut *core::ptr::addr_of_mut!(TARGET_REPORTS))
-                .iter_mut().find(|row| row.ticket == ticket) else { return 1; };
-            report.delivery_allocation = None;
-            report.next += 1;
-            report.state = EventState::Pending;
-        }
+        settle(Delivery::Target { ticket, inst, allocation }, result);
         return 1;
     }
     if completion == 0 {
@@ -723,12 +759,11 @@ unsafe fn wake_target_due() -> u64 {
     write_volatile((inst.exec_arg_va + ARG_EVENT_KIND) as *mut u32, DISPATCH_TARGET_COMPLETE);
     (&mut *core::ptr::addr_of_mut!(TARGET_REPORTS)).iter_mut()
         .find(|row| row.ticket == ticket).expect("pending target report").state = EventState::Executing;
-    let result = dispatch_device_projection_control_for_instance(
+    let result = dispatch_device_projection_control_retained(
         reporter_index, inst.driver_object, FSD_DISPATCH_PNP_NOTIFICATION,
-        completion, completion_context, false, None,
-        crate::initial_system_driver_caller(),
+        completion, completion_context, crate::initial_system_driver_caller(),
     );
-    if result.is_ok() { let _ = finish_target_report(ticket); }
+    settle(Delivery::TargetComplete { ticket }, result);
     1
 }
 

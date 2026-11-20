@@ -13802,6 +13802,65 @@ pub(crate) unsafe fn drain_root_restores() {
     let _ = crate::driver_launch::drive_kept_pumps();
 }
 
+/// Whether a root-level owner may block in the root progress loop here (#420): the live
+/// runtime timer owner is registered, and this frame is neither inside a timer delivery nor a
+/// component-resume pass, whose own turn must return before the root receives again.
+pub(crate) unsafe fn root_wait_may_block() -> bool {
+    SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) != 0
+        && SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) != 0
+        && crate::DELAY_TIMER_HANDLER.load(Ordering::Relaxed) != 0
+        && crate::DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) == crate::DELAY_TIMER_IRQ_ACTIVE
+        && !crate::TIMER_DELIVERY_GATE.is_active()
+        && !component_resume::is_running()
+}
+
+/// Why a root progress pass could not run to its receive.
+pub(crate) enum RootPassError {
+    /// A retained-service, autonomous or receive transition returned an error; its owner
+    /// keeps the entered state, and this waiter may not receive past it.
+    Transport,
+}
+
+/// One pass of the root's own work for a root-level owner waiting on retained execution
+/// (#420), the runtime counterpart of `bootstrap_receive::drive` and the loop in
+/// `run_kernel_job`. Only call it where [`root_wait_may_block`] holds.
+pub(crate) unsafe fn root_progress_pass() -> Result<(), RootPassError> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime as ingress;
+    if redrive_nested_hosted_file_work() { return Ok(()); }
+    {
+        let scope = crate::driver_launch::ComponentSchedulerScope::enter();
+        drop(scope.service_irq_yield(0));
+    }
+    drain_root_restores();
+    crate::registry_mutation_work::redrive_provider();
+    if ingress::resume_acknowledged_retained_services().map_err(|_| RootPassError::Transport)? {
+        return Ok(());
+    }
+    if !crate::writable_fs::registry_journal::owns_volume()
+        && ingress::service_autonomous().map_err(|_| RootPassError::Transport)?
+    {
+        return Ok(());
+    }
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    component_resume::run_outer(handler);
+    let _ = kernel_provider_activation::redrive_ready_completions();
+    match component_resume::prepare_receive(&mut *handler) {
+        component_resume::ReceivePreparation::Ready => {}
+        // No delivery is running above this frame, so this owner can drain the tick itself;
+        // the next pass receives.
+        component_resume::ReceivePreparation::PendingDelivery => {
+            let _ = drain_nested_pump_timer_delivery();
+            return Ok(());
+        }
+    }
+    let arrival = ingress::receive(nt_component_suspension::IngressExecutionOwner::Idle, 1, true)
+        .map_err(|_| RootPassError::Transport)?;
+    if let ingress::Arrival::Notification(message) = arrival {
+        crate::spawn_hosts::pump_handle_executive_event_badge(message.badge());
+    }
+    Ok(())
+}
+
 /// Bounded evidence for the root restore queue; silent while it is empty.
 fn trace_root_restore_drain(drain: nt_component_suspension::RootRestoreDrain) {
     static TRACED: AtomicU64 = AtomicU64::new(0);

@@ -184,6 +184,7 @@ pub(crate) use component_scheduler::{
 };
 pub(crate) use component_scheduler::handoff_exact_component_once;
 pub(crate) use component_scheduler::service_continuation::ServiceStep;
+pub(crate) use component_scheduler::service_continuation::root_wait_owns_execution as root_pump_wait_owns_execution;
 
 #[path = "device_property.rs"]
 pub(crate) mod device_property;
@@ -70729,12 +70730,74 @@ unsafe fn dispatch_device_projection_control_for_instance(
         delete_pdo, class_projection,
     )?;
     let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
+    finish_device_projection_control(index, sh, pr)
+}
+
+unsafe fn finish_device_projection_control(
+    index: usize, sh: u64, pr: crate::spawn_hosts::PumpResult,
+) -> Result<u64, nt_status::NtStatus> {
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     nt_status::NtStatus(pr.status).to_result()?;
     Ok(read_volatile((sh + SH_REQ_INFO) as *const u64))
+}
+
+/// A projection-control dispatch issued from a root turn that may not block (#420).
+pub(crate) enum ProjectionControl {
+    Done(Result<u64, nt_status::NtStatus>),
+    /// Still running; its owner keeps this and resumes it from a later root turn.
+    Pending(PendingProjectionControl),
+}
+
+#[must_use = "an entered projection control is owed its finish"]
+pub(crate) struct PendingProjectionControl {
+    turn: component_scheduler::service_continuation::RootTurnPump,
+    index: usize,
+    sh: u64,
+}
+
+impl PendingProjectionControl {
+    /// Continue once from a root turn: the true result once the dispatch has returned.
+    pub(crate) unsafe fn resume(self) -> ProjectionControl {
+        use component_scheduler::service_continuation::RootTurnProgress as Progress;
+        let Self { turn, index, sh } = self;
+        match turn.resume() {
+            Progress::Finished(pr) | Progress::Fenced(pr) =>
+                ProjectionControl::Done(finish_device_projection_control(index, sh, pr)),
+            Progress::Pending(turn) =>
+                ProjectionControl::Pending(PendingProjectionControl { turn, index, sh }),
+        }
+    }
+}
+
+/// The same dispatch for a root-level owner with a retained row: a pump still running in a
+/// turn that may not block comes back as [`ProjectionControl::Pending`].
+pub(crate) unsafe fn dispatch_device_projection_control_retained(
+    index: usize,
+    driver_object: u64,
+    selector: u64,
+    pdo_object: u64,
+    previous_device_head: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> ProjectionControl {
+    use component_scheduler::service_continuation::ServicePump;
+    let (ch, sh) = match prepare_device_projection_control_for_instance(
+        index, driver_object, selector, pdo_object, previous_device_head, false, None,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => return ProjectionControl::Done(Err(status)),
+    };
+    let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
+    match component_scheduler::service_continuation::settle(pump) {
+        ServicePump::Finished(pr) | ServicePump::Fenced(pr) =>
+            ProjectionControl::Done(finish_device_projection_control(index, sh, pr)),
+        ServicePump::Kept(kept) =>
+            ProjectionControl::Done(finish_device_projection_control(index, sh, kept.fence())),
+        ServicePump::RootTurn(turn) =>
+            ProjectionControl::Pending(PendingProjectionControl { turn, index, sh }),
+    }
 }
 
 unsafe fn create_hosted_pdo_projection(
@@ -73845,6 +73908,9 @@ unsafe fn begin_driver_unload_inner(
                     Ok(DriverUnload::Done(finish.after_callback(pr))),
                 Ok(component_scheduler::service_continuation::ServicePump::Kept(kept)) =>
                     Ok(DriverUnload::Kept(PendingDriverUnload { kept, finish })),
+                // NtUnloadDriver has no retained guest-reply owner for a root turn yet.
+                Ok(component_scheduler::service_continuation::ServicePump::RootTurn(turn)) =>
+                    Ok(DriverUnload::Done(finish.after_callback(turn.fence_unowned()))),
             }
         }
         nt_io_manager::DriverUnloadState::UnloadRequested => {

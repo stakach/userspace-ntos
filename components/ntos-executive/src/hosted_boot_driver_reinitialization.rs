@@ -5,6 +5,8 @@ use nt_io_manager::driver_reinitialization::DriverReinitializationError;
 
 const BOOTREINIT_REGISTERED: u32 = 0x20;
 static DRAIN_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The boot callback whose dispatch a drain turn left running (#420).
+static mut PENDING: Option<hosted_driver_reinitialization::PendingReinit> = None;
 
 pub(super) fn boot_drain_active() -> bool {
     DRAIN_ACTIVE.load(Ordering::Acquire)
@@ -53,6 +55,15 @@ pub(crate) unsafe fn run_pending_boot_callbacks() -> Result<usize, nt_status::Nt
     hosted_driver_reinitialization::queue().open_boot_phase()
         .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let mut completed = 0usize;
+    if let Some(pending) = (&mut *core::ptr::addr_of_mut!(PENDING)).take() {
+        match pending.resume()? {
+            hosted_driver_reinitialization::ReinitStep::Acknowledged => completed += 1,
+            hosted_driver_reinitialization::ReinitStep::Pending(pending) => {
+                *core::ptr::addr_of_mut!(PENDING) = Some(pending);
+                return Ok(0);
+            }
+        }
+    }
     while let Some(ticket) = hosted_driver_reinitialization::queue().begin_next_boot() {
         let (index, inst) = instance_by_driver_id(ticket.identity.driver_id)
             .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
@@ -61,22 +72,16 @@ pub(crate) unsafe fn run_pending_boot_callbacks() -> Result<usize, nt_status::Nt
             || domain.cookie != ticket.identity.domain_cookie
             || inst.driver_object != ticket.identity.driver_object
         { return Err(nt_status::NtStatus::ACCESS_DENIED); }
-        let count = dispatch_device_projection_control_for_instance(
-            index,
-            ticket.identity.driver_object,
-            FSD_DISPATCH_BOOT_DRIVER_REINIT,
-            ticket.identity.routine,
-            ticket.identity.context,
-            false,
-            None,
-            crate::initial_system_driver_caller(),
-        )?;
-        if count != u64::from(ticket.count) {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        match hosted_driver_reinitialization::dispatch_ticket(
+            index, ticket, FSD_DISPATCH_BOOT_DRIVER_REINIT)?
+        {
+            hosted_driver_reinitialization::ReinitStep::Acknowledged => completed += 1,
+            hosted_driver_reinitialization::ReinitStep::Pending(pending) => {
+                // The callback stays Executing; the next drain turn continues its pump.
+                *core::ptr::addr_of_mut!(PENDING) = Some(pending);
+                return Ok(completed);
+            }
         }
-        hosted_driver_reinitialization::queue().acknowledge(ticket)
-            .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        completed += 1;
     }
     Ok(completed)
 }
