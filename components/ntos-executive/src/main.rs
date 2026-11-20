@@ -17579,15 +17579,14 @@ unsafe fn delay_timer_program(deadline: u64, source: u64) -> bool {
         return false;
     }
     let now = monotonic_time_100ns();
-    if LAST_REARM_AUTHORITY.covers(now, deadline) {
+    let Some(shot) = LAST_REARM_AUTHORITY.select(now, deadline, DELAY_TIMER_MIN_ARM_100NS) else {
         TIMER_SHOTS_RETAINED.fetch_add(1, Ordering::Relaxed);
         return true;
-    }
+    };
     if deadline <= now {
         TIMER_PAST_DEADLINE_REARMS.fetch_add(1, Ordering::Relaxed);
         TIMER_PAST_DEADLINE_SOURCE.store(source, Ordering::Relaxed);
     }
-    let shot = nt_kernel_exec::pit_oneshot_for_deadline(now, deadline, DELAY_TIMER_MIN_ARM_100NS);
     let ioport = DELAY_TIMER_IOPORT.load(Ordering::Relaxed);
     if ioport == 0
         || shot.program(|port, value| {

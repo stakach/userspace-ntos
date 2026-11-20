@@ -238,6 +238,18 @@ impl PitOneShotAuthority {
         )
     }
 
+    /// The shot to program for `deadline_100ns`, or `None` when the live shot is retained.
+    ///
+    /// A fresh shot rounds its wake up past the deadline (PIT ticks and the minimum arm), so
+    /// comparing the live wake with the deadline alone reprogrammed an unchanged deadline on
+    /// every rearm. The live shot is kept whenever it wakes no later than a fresh one would.
+    pub fn select(&self, now_100ns: u64, deadline_100ns: u64, minimum_delay_100ns: u64)
+        -> Option<PitOneShot> {
+        let fresh = pit_oneshot_for_deadline(now_100ns, deadline_100ns, minimum_delay_100ns);
+        let feasible = deadline_100ns.max(fresh.wake_deadline_100ns);
+        (!self.covers(now_100ns, feasible)).then_some(fresh)
+    }
+
     pub fn is_armed(&self) -> bool {
         self.armed.load(Ordering::Acquire)
     }

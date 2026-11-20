@@ -435,3 +435,42 @@ fn cancelled_notification_and_chunk_wakes_do_not_advance_time() {
     assert_eq!(timers.run_due(&clock), vec![22]);
     assert!(!timers.read_state(1));
 }
+
+/// Count physical programmings when the root rearms for the same deadline on every receive,
+/// as `delay_timer_program` does (minimum arm 1 ms, PIT rounding upward).
+fn programmings(deadline_offset: u64, rearms: u64, step: u64) -> u64 {
+    let authority = PitOneShotAuthority::new();
+    let start = 1_000_000;
+    let deadline = start + deadline_offset;
+    let mut programmed = 0;
+    for rearm in 0..rearms {
+        let now = start + rearm * step;
+        if let Some(shot) = authority.select(now, deadline, 10_000) {
+            programmed += 1;
+            authority.publish(shot.wake_deadline_100ns);
+        }
+    }
+    programmed
+}
+
+#[test]
+fn rearming_an_unchanged_deadline_keeps_the_live_shot() {
+    // 1,000 receive preparations 0.5 µs apart, all selecting the same 5 ms or 0.2 ms deadline.
+    // The live shot already wakes no later than a fresh one could; reprogramming it costs
+    // three port writes each time.
+    assert_eq!(programmings(50_000, 1_000, 5), 1);
+    assert_eq!(programmings(2_000, 1_000, 5), 1);
+}
+
+#[test]
+fn a_fresh_shot_that_can_wake_earlier_is_still_programmed() {
+    let authority = PitOneShotAuthority::new();
+    let first = authority.select(1_000_000, 1_000_000 + 100_000, 10_000).unwrap();
+    authority.publish(first.wake_deadline_100ns);
+    // An earlier deadline needs an earlier physical wake.
+    let earlier = authority.select(1_000_010, 1_000_000 + 40_000, 10_000).unwrap();
+    assert!(earlier.wake_deadline_100ns < first.wake_deadline_100ns);
+    // A delivered shot never covers new demand.
+    authority.invalidate();
+    assert!(authority.select(1_000_020, 1_000_000 + 200_000, 10_000).is_some());
+}
