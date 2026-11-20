@@ -125,6 +125,28 @@ pub(crate) unsafe fn run_kernel_job(
     result: &KernelJobResult,
     publication: win32k_glue::KernelJobPublication,
 ) -> Result<KernelJobRun, u32> {
+    let run = drive_kernel_job(caller, result, publication);
+    // #419: the job's hold on the win32k shared page ends with this run when it returned, or
+    // when it parked for the service loop, which continues it without a publication. An
+    // incomplete or failed run keeps the page with its uncertain owner.
+    if matches!(run, Ok(KernelJobRun::Returned(_) | KernelJobRun::Parked)) {
+        crate::win32k_shared_page_authority::audit_settle(
+            nt_user_callback::SharedPageLeaseIdentity {
+                dispatch: publication.dispatch,
+                client: win32k_glue::shared_page_client_identity(publication.client),
+            },
+            nt_user_callback::SharedPagePumpSettlement::Completed,
+            if matches!(run, Ok(KernelJobRun::Parked)) { b"kernel-job-parked" } else { b"kernel-job-return" },
+        );
+    }
+    run
+}
+
+unsafe fn drive_kernel_job(
+    caller: KernelProviderCaller,
+    result: &KernelJobResult,
+    publication: win32k_glue::KernelJobPublication,
+) -> Result<KernelJobRun, u32> {
     use nt_user_host::provider_kernel_pump::KernelSourceTerminal;
     use nt_user_host::provider_kernel_wait::{
         KernelJobOrigin, KernelJobRunnerStep, KernelProviderStoppedOutcome as Stop,

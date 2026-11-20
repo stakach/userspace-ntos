@@ -20,7 +20,6 @@ fn the_funnel_enters_before_its_first_publish() {
     let publish = glue.find("letprevious_dispatch=publish_initial_win32k_request(")
         .expect("first request publish");
     assert!(enter < publish, "the page is held before its request is written");
-    assert!(glue.contains("b\"kernel-job-complete\""));
 }
 
 #[test]
@@ -123,4 +122,19 @@ fn a_returned_kernel_job_leaves_its_runner_before_another_dispatch_resumes() {
     let returned = body.find("ifletSome(status)=result.returned(){returnOk(KernelJobRun::Returned(status));}").unwrap();
     let resume = body.find("component_resume::run_outer(handler);").unwrap();
     assert!(returned < resume);
+}
+
+// #419 boot 44689472419: both remaining violations were a kernel job parked for the service
+// loop (wait captured) that kept the page active, so the next resume found it not-top and the
+// next root ingress found it held. A parked job runs on without a publication.
+#[test]
+fn a_kernel_job_releases_the_page_where_its_run_returns_or_parks() {
+    const ACTIVATION: &str =
+        include_str!("../../../components/ntos-executive/src/kernel_provider_activation.rs");
+    let source = compact(ACTIVATION);
+    let runner = source.find("pub(crate)unsafefnrun_kernel_job(").unwrap();
+    let body = &source[runner..source[runner..].find("unsafefndrive_kernel_job(").unwrap() + runner];
+    assert!(body.contains("Ok(KernelJobRun::Returned(_)|KernelJobRun::Parked)"));
+    assert!(body.contains("SharedPagePumpSettlement::Completed"));
+    assert!(!compact(GLUE).contains("b\"kernel-job-complete\""), "one settlement owner");
 }

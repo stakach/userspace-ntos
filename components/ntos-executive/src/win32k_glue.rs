@@ -8065,16 +8065,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch,
         );
+        // The job settled its own hold on the shared page where its run ended (`run_kernel_job`).
         let job_settled = result.as_ref().is_ok_and(|(_, completed)| *completed);
-        if job_settled {
-            crate::win32k_shared_page_authority::audit_settle(
-                nt_user_callback::SharedPageLeaseIdentity {
-                    dispatch, client: shared_page_client_identity(client),
-                },
-                nt_user_callback::SharedPagePumpSettlement::Completed,
-                b"kernel-job-complete",
-            );
-        }
         if let Some(ticket) = displaced_parent {
             let terminal = job_settled;
             if !crate::nested_restore_owner::finish_displacing_child(
