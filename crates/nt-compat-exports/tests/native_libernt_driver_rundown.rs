@@ -21,6 +21,17 @@ fn yield_now() {
     std::thread::yield_now();
 }
 
+/// The host stands in for a domain's `KeDelayExecutionThread` with a real short sleep.
+#[cfg(target_arch = "x86_64")]
+struct HostRundownDelay;
+
+#[cfg(target_arch = "x86_64")]
+impl ex_rundown_exports::RundownWaitDelay for HostRundownDelay {
+    fn delay() {
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+}
+
 const RUNDOWN_IMPORTS: [&str; 5] = [
     "ExAcquireRundownProtection",
     "ExInitializeRundownProtection",
@@ -96,7 +107,7 @@ fn shared_win64_exports_preserve_real_descriptor_lifecycle() {
     let release: extern "win64" fn(*const ExRundownRef) =
         ex_rundown_exports::ex_release_rundown_protection;
     let wait: extern "win64" fn(*const ExRundownRef) =
-        ex_rundown_exports::ex_wait_for_rundown_protection_release;
+        ex_rundown_exports::ex_wait_for_rundown_protection_release::<HostRundownDelay>;
     let reinitialize: extern "win64" fn(*const ExRundownRef) =
         ex_rundown_exports::ex_reinitialize_rundown_protection;
 
@@ -131,7 +142,7 @@ fn cache_aware_win64_exports_preserve_caller_owned_descriptor_lifecycle() {
     let release: extern "win64" fn(*const ExCacheAwareRundownRef) =
         ex_rundown_exports::ex_release_rundown_protection_cache_aware;
     let wait: extern "win64" fn(*const ExCacheAwareRundownRef) =
-        ex_rundown_exports::ex_wait_for_rundown_protection_release_cache_aware;
+        ex_rundown_exports::ex_wait_for_rundown_protection_release_cache_aware::<HostRundownDelay>;
     let reinitialize: extern "win64" fn(*const ExCacheAwareRundownRef) =
         ex_rundown_exports::ex_reinitialize_rundown_protection_cache_aware;
 
