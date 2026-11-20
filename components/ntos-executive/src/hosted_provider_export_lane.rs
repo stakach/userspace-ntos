@@ -30,9 +30,13 @@ const _: () = assert!(JUMP_OFFSET + 3 * 8 <= 0x1000);
 enum Phase { Preparing, StartupRestore, StartupRestoreAttempt, Ready, Entered, Uncertain,
     Retiring, Retired }
 
+/// A startup slice's state: started, or still owed its scheduler yield in `startup_yield`.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Startup { Ready, Pending }
+
 enum StartupRestorePayload {
-    Chain { key: NestedRestoreResultKey, chain: NestedRestoreChain<Result<(), u32>> },
-    Quarantined(Result<(), u32>),
+    Chain { key: NestedRestoreResultKey, chain: NestedRestoreChain<Result<Startup, u32>> },
+    Quarantined(Result<Startup, u32>),
 }
 
 struct PendingStartupRestore {
@@ -78,6 +82,8 @@ struct Lane {
     phase: Phase,
     startup_dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
     startup_restore: Option<PendingStartupRestore>,
+    /// The startup pump, retained mid scheduler-yield while the lane is still `Preparing`.
+    startup_yield: Option<component_scheduler::PendingSchedulerYield>,
 }
 
 static mut LANES: Vec<Lane> = Vec::new();
@@ -155,6 +161,16 @@ pub(super) unsafe fn prepare(
         return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
     }
     if let Some(index) = index_for(provider, dependent, owner, publication) {
+        // A startup whose scheduler yield kept the worker held continues here. Until it
+        // finishes the lane is still starting: the busy answer its callers already retry.
+        let rows = &mut *core::ptr::addr_of_mut!(LANES);
+        if rows[index].phase == Phase::Preparing {
+            if let Some(pending) = rows[index].startup_yield.take() {
+                let result = run_startup(index, || settle_startup(index,
+                    component_scheduler::resume_scheduler_yield(pending)));
+                return finish_startup(index, result);
+            }
+        }
         let row = &(&*core::ptr::addr_of!(LANES))[index];
         return if row.phase == Phase::Ready && row.route.is_some_and(|route|
             matches!(runtime::ready_for_admission(route), Ok(true))) { Ok(()) }
@@ -185,18 +201,94 @@ pub(super) unsafe fn prepare(
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         rows.push(Lane { provider, domain, pml4: inst.pml4, dependent, owner, publication, ordinal,
             handle: 0, route: None, component_shared: 0, executive_shared: 0,
-            phase: Phase::Preparing, startup_dispatch: None, startup_restore: None });
+            phase: Phase::Preparing, startup_dispatch: None, startup_restore: None,
+            startup_yield: None });
         rows.len() - 1
     };
     let result = construct(index, inst);
-    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
-    if row.phase == Phase::Preparing {
-        row.phase = if result.is_ok() { Phase::Ready } else { Phase::Uncertain };
-    }
-    result.map_err(|status| nt_status::NtStatus(status as i32))
+    finish_startup(index, result)
 }
 
-unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
+unsafe fn finish_startup(
+    index: usize, result: Result<Startup, u32>,
+) -> Result<(), nt_status::NtStatus> {
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    if row.phase != Phase::Preparing {
+        // Another owner holds the row (a refused parent restore keeps the result in its
+        // StartupRestore row); this slice reports only what it observed.
+        return match result {
+            Ok(Startup::Ready) => Ok(()),
+            Ok(Startup::Pending) => Err(nt_status::NtStatus::DEVICE_BUSY),
+            Err(status) => Err(nt_status::NtStatus(status as i32)),
+        };
+    }
+    match result {
+        Ok(Startup::Ready) => { row.phase = Phase::Ready; Ok(()) }
+        Ok(Startup::Pending) => {
+            if !row.startup_yield.as_ref()
+                .is_some_and(component_scheduler::PendingSchedulerYield::retryable)
+            {
+                row.phase = Phase::Uncertain;
+            }
+            Err(nt_status::NtStatus::DEVICE_BUSY)
+        }
+        Err(status) => { row.phase = Phase::Uncertain; Err(nt_status::NtStatus(status as i32)) }
+    }
+}
+
+/// Own the startup pump's outcome: a finished pump must carry the exact startup receipt, and a
+/// pump retained mid scheduler-yield stays with the `Preparing` row for the next `prepare`.
+unsafe fn settle_startup(
+    index: usize, pump: component_scheduler::HostedPumpRestore,
+) -> Result<Startup, u32> {
+    let pump = match pump {
+        component_scheduler::HostedPumpRestore::Restored(pump) => pump,
+        component_scheduler::HostedPumpRestore::SchedulerYieldRetained(pending) => {
+            print_str(b"[dxg-worker] startup-yield retained\n");
+            (&mut *core::ptr::addr_of_mut!(LANES))[index].startup_yield = Some(pending);
+            return Ok(Startup::Pending);
+        }
+        // A RecvFirst startup parks no outer parent and runs no child work: anything else is
+        // an uncertain entered startup, fenced with the lane.
+        _ => return Err(STATUS_INVALID_HANDLE as u32),
+    };
+    let row = &(&*core::ptr::addr_of!(LANES))[index];
+    if !pump.completed || pump.status != STATUS_SUCCESS
+        || pump.startup_stack_receipt != Some([row.ordinal, row.domain.domain_id.raw(),
+            row.domain.cookie, row.component_shared, row.handle]) {
+        print_str(b"[dxg-worker] startup-reject completed=");
+        print_u64(u64::from(pump.completed));
+        print_str(b" status=0x");
+        print_hex(pump.status as u32);
+        print_str(b" receipt=");
+        print_u64(u64::from(pump.startup_stack_receipt.is_some()));
+        print_str(b"\n");
+        return Err(STATUS_INVALID_HANDLE as u32);
+    }
+    Ok(Startup::Ready)
+}
+
+/// Bootstrap, like ordinary nested dispatch, needs exclusive control of the scheduler's
+/// running lane. Retain the dependent's live Call and physical hold around one startup slice,
+/// then restore that exact parent even if startup has an uncertain result.
+unsafe fn run_startup(
+    index: usize, slice: impl FnOnce() -> Result<Startup, u32>,
+) -> Result<Startup, u32> {
+    let mut parent = runtime::nested::park_current().map_err(|_| STATUS_INVALID_HANDLE as u32)?;
+    let startup_result = slice();
+    let Some(handle) = parent.as_ref() else { return startup_result; };
+    let ticket = handle.ticket();
+    let key = runtime::nested::result_key(handle);
+    if runtime::nested::restore_or_retain(&mut parent).is_ok() {
+        return startup_result;
+    }
+    // The startup row keeps the exact ticket; take ownership from the handle.
+    let _owned = runtime::nested::claim_refused(&mut parent);
+    retain_startup_restore(index, ticket, key, startup_result);
+    Err(STATUS_INVALID_HANDLE as u32)
+}
+
+unsafe fn construct(index: usize, inst: DriverInstance) -> Result<Startup, u32> {
     print_str(b"[dxg-worker] construct\n");
     let (provider, domain, ordinal) = {
         let row = &(&*core::ptr::addr_of!(LANES))[index];
@@ -265,11 +357,7 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
     let initial_irql = read_volatile((inst.exec_shared_va + SH_HOSTED_CURRENT_IRQL) as *const u8);
     if initial_irql > 15 { return Err(STATUS_INVALID_HANDLE as u32); }
     write_volatile((bank.executive + SH_HOSTED_CURRENT_IRQL) as *mut u8, initial_irql);
-    // Bootstrap, like ordinary nested dispatch, needs exclusive control of the scheduler's
-    // running lane. Retain the dependent's live Call and physical hold before resuming this
-    // worker, then restore that exact parent even if startup has an uncertain result.
-    let mut parent = runtime::nested::park_current().map_err(|_| STATUS_INVALID_HANDLE as u32)?;
-    let startup_result = (|| -> Result<(), u32> {
+    run_startup(index, || {
         let startup = runtime::start_bootstrap(route, spawn.cnode, spawn.sched_context)
             .map_err(|_| STATUS_INVALID_HANDLE as u32)?;
         print_str(b"[dxg-worker] bootstrap\n");
@@ -280,32 +368,10 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
         print_str(b"[dxg-worker] channel\n");
         crate::spawn_hosts::trace_root_stack_rsp(
             crate::spawn_hosts::RootStackProbe::DxgWorkerChannel);
-        let pump = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
+        let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
         print_str(b"[dxg-worker] startup-pump\n");
-        if !pump.completed || pump.status != STATUS_SUCCESS
-            || pump.startup_stack_receipt != Some([ordinal, domain.domain_id.raw(),
-                domain.cookie, shared, handle]) {
-            print_str(b"[dxg-worker] startup-reject completed=");
-            print_u64(u64::from(pump.completed));
-            print_str(b" status=0x");
-            print_hex(pump.status as u32);
-            print_str(b" receipt=");
-            print_u64(u64::from(pump.startup_stack_receipt.is_some()));
-            print_str(b"\n");
-            return Err(STATUS_INVALID_HANDLE as u32);
-        }
-        Ok(())
-    })();
-    let Some(handle) = parent.as_ref() else { return startup_result; };
-    let ticket = handle.ticket();
-    let key = runtime::nested::result_key(handle);
-    if runtime::nested::restore_or_retain(&mut parent).is_ok() {
-        return startup_result;
-    }
-    // The startup row keeps the exact ticket; take ownership from the handle.
-    let _owned = runtime::nested::claim_refused(&mut parent);
-    retain_startup_restore(index, ticket, key, startup_result);
-    Err(STATUS_INVALID_HANDLE as u32)
+        settle_startup(index, pump)
+    })
 }
 
 /// The exact parent and startup result survive a refused physical restore. A failed startup
@@ -314,7 +380,7 @@ unsafe fn retain_startup_restore(
     index: usize,
     ticket: runtime::nested::NestedRestoreTicket,
     key: Option<NestedRestoreResultKey>,
-    result: Result<(), u32>,
+    result: Result<Startup, u32>,
 ) {
     let retryable = runtime::nested::pending_ticket(ticket);
     let payload = match key.and_then(|key| {
@@ -404,8 +470,14 @@ unsafe fn retry_startup_restore(index: usize) -> bool {
         return false;
     };
     row.startup_restore = None;
-    row.phase = if result.is_ok() { Phase::Ready } else { Phase::Uncertain };
-    result.is_ok()
+    row.phase = match result {
+        Ok(Startup::Ready) => Phase::Ready,
+        // The startup is still owed its scheduler yield; the next prepare continues it.
+        Ok(Startup::Pending) if row.startup_yield.as_ref()
+            .is_some_and(component_scheduler::PendingSchedulerYield::retryable) => Phase::Preparing,
+        Ok(Startup::Pending) | Err(_) => Phase::Uncertain,
+    };
+    result == Ok(Startup::Ready)
 }
 
 unsafe fn has_pending_startup_restore() -> bool {
