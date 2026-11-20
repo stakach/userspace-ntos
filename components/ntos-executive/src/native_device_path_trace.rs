@@ -96,6 +96,12 @@ pub(crate) fn record(
             }
             print_str(b"\" status=0x");
             print_hex(status);
+            // A pended CREATE must park its caller until the IRP completes (IopParseDevice
+            // waits); name whether this dispatch staged a parked, waiting transfer.
+            print_str(b" staged=");
+            print_u64(handler.pending_file_io_transfer.is_some() as u64);
+            print_str(b" wait=");
+            print_u64(handler.pending_file_io_wait as u64);
             print_str(b"\n");
         }
         NativeService::NtDeviceIoControlFile => {
