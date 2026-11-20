@@ -68,6 +68,10 @@ pub mod gui_exit;
 pub mod gui_client_info_snapshot;
 pub mod win32k_teb;
 pub mod win32k_process_heap;
+pub mod win32k_threadinfo;
+#[cfg(test)]
+#[path = "win32k_threadinfo_tests.rs"]
+mod win32k_threadinfo_tests;
 #[cfg(test)]
 mod win32k_teb_tests;
 pub mod provider_kernel_activation;

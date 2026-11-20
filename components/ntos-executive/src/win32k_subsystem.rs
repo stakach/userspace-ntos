@@ -111,6 +111,7 @@ mod provider_input;
 #[path = "win32k_subsystem/native_assertion.rs"]
 mod native_assertion;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
+use nt_user_host::win32k_threadinfo;
 use nt_compat_exports::{
     ssdt::{
         x64_argument_count_from_sspt_byte,
@@ -1478,24 +1479,10 @@ const THREADINFO_PDESKINFO_OFF: u64 = 0x80;
 /// client-side `pci->pDeskInfo` (desktop.c:3434) from this.
 const THREADINFO_PCLIENTINFO_OFF: u64 = 0x88;
 const THREADINFO_PCTI_OFF: u64 = 0x70;
-/// THREADINFO.cti, the embedded CLIENTTHREADINFO used while a thread has no desktop. ReactOS
-/// initializes `pcti = &cti` and only replaces it with desktop-heap storage in IntSetThreadDesktop.
-const THREADINFO_EMBEDDED_CTI_OFF: u64 = 0x2A8;
 const CLIENTTHREADINFO_SIZE: u64 = 0x20;
 const CLIENTINFO_PDESKINFO_OFF: u64 = 0x20;
 const CLIENTINFO_ULCLIENTDELTA_OFF: u64 = 0x28;
 const CLIENTINFO_PCLIENTTHREADINFO_OFF: u64 = 0x60;
-/// THREADINFO->hEventQueueClient / ->pEventQueueServer offsets. ReactOS' `CreateThreadInfo` creates
-/// a synchronization event, stores the client handle at +0x138, then references it to a server KEVENT
-/// pointer at +0x140. `IntMsqSetWakeMask` returns the handle to user32 and `MsqWakeQueue` signals the
-/// server pointer.
-const THREADINFO_HEVENT_QUEUE_CLIENT_OFF: u64 = 0x138;
-/// THREADINFO->PtiLink offset, membership in DESKTOP.PtiList.
-const THREADINFO_PTI_LINK_OFF: u64 = 0x148;
-/// Pinned LiberNT `MsqCleanupThreadMsgs` addresses `PostedMessagesListHead` at THREADINFO+0x190.
-/// This is distinct from the preceding +0x188 field; seeding a head there makes an empty
-/// +0x190 list appear to contain the +0x188 field and trips `RemoveEntryList` fail-fast.
-const THREADINFO_POSTED_MESSAGES_OFF: u64 = 0x190;
 /// KL layout and CLIENTINFO.{hKL,CodePage}. ReactOS' `tagKL` starts with `HEAD` (16 bytes on x64),
 /// then the pklNext/pklPrev ring, flags, hkl, spkf, font sigs/base charset, and CodePage.
 const KL_PKL_PREV_OFF: u64 = 0x18;
@@ -18881,30 +18868,14 @@ unsafe fn select_initial_system_context() -> bool {
 /// Initialize the thread-list heads + `pClientInfo` a win32k THREADINFO needs before it can host
 /// window/callback linking. Both the dispatch thread and the desktop thread (`gptiDesktopThread`) run
 /// through window-manager code that operates on these fields; our zeroed placeholders leave them NULL.
-/// Offsets (checked build, confirmed by disasm):
-///   +0x2d8 WindowListHead     — `InsertTailList(&pti->WindowListHead,…)` IntCreateWindow window.c:2142
-///   +0x2e8 W32CallbackListHead — `InsertTailList(&pti->W32CallbackListHead,…)` IntCbAllocateMemory
-///   +0x148 PtiLink             — membership in the current DESKTOP.PtiList
-///   +0x88  pClientInfo         — `pti->pClientInfo->dwTIFlags = …` IntCreateDesktop
+/// The list-head offsets are the pinned layout in `nt_user_host::win32k_threadinfo`; +0x88
+/// pClientInfo is read by IntCreateDesktop (`pti->pClientInfo->dwTIFlags = …`).
 /// Real win32k `InitializeListHead`s the lists in CreateThreadInfo (main.c) and points pClientInfo at
-/// the thread's CLIENTINFO. `pool_alloc` returns zeroed memory, so an already-initialized field is
-/// left as-is.
+/// the thread's CLIENTINFO. This also runs on every client THREADINFO, so it writes only fields that
+/// are still NULL (#348: heads seeded inside `nCntsQBits[]` left the queue bits set forever).
 unsafe fn init_threadinfo_placeholder(w32thread: u64) {
     sync_threadinfo_process(w32thread);
-    // THREADINFO LIST_ENTRY heads the window-manager / paint path touches (offsets from win32.h,
-    // W32THREAD prefix = 0x50; anchored to the confirmed +0x88 pClientInfo / +0x90 TIF_flags):
-    //   +0xB0  SentMessagesListHead   (message.c / co_MsqSendMessage)
-    //   +0x2d8 WindowListHead         (IntCreateWindow window.c:2142)
-    //   +0x2e8 W32CallbackListHead    (IntCbAllocateMemory callback.c)
-    //   +0x148 PtiLink                (IntSetThreadDesktop desktop.c:3463/3471)
-    //   +0x190 PostedMessagesListHead — `InsertTailList(&pti->PostedMessagesListHead,…)` MsqPostMessage
-    //          (msgqueue.c:1369). NtUserPostMessage(SAS window, WLX_WM_SAS) posts here; a NULL (zeroed)
-    //          list head → InsertTailList derefs head->Blink (offset +8) → null-deref at cr2=0x8.
-    //          Offset confirmed by pinned LiberNT `MsqCleanupThreadMsgs` list-head LEA.
-    for off in [0xB0u64, THREADINFO_PTI_LINK_OFF, THREADINFO_POSTED_MESSAGES_OFF, 0x2d8, 0x2e8] {
-        let head = w32thread + off;
-        ensure_list_head_initialized(head);
-    }
+    win32k_threadinfo::seed_list_heads(&mut LiveThreadInfoMemory, w32thread);
     if read_volatile((w32thread + 0x88) as *const u64) == 0 {
         let ci = pool_alloc(0x100);
         if ci != 0 {
@@ -18957,7 +18928,7 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
     if read_volatile((w32thread + 0x70) as *const u64) == 0 {
         write_volatile(
             (w32thread + THREADINFO_PCTI_OFF) as *mut u64,
-            w32thread + THREADINFO_EMBEDDED_CTI_OFF,
+            w32thread + win32k_threadinfo::EMBEDDED_CLIENT_THREAD_INFO,
         );
     }
     // hEventQueueClient / pEventQueueServer: user32's MsgWaitForMultipleObjectsEx asks win32k for
@@ -18966,17 +18937,22 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
     // it cannot participate in the real wait/wake path explorer uses while bringing up the desktop.
 }
 
-unsafe fn initialize_list_head(head: u64) {
-    write_volatile(head as *mut u64, head);
-    write_volatile((head + 8) as *mut u64, head);
+/// Server memory as the hosted win32k sees it: THREADINFO and queue fields are plain session
+/// pool addresses in the executive's VSpace.
+struct LiveThreadInfoMemory;
+
+impl win32k_threadinfo::ThreadInfoMemory for LiveThreadInfoMemory {
+    fn read_u64(&self, address: u64) -> u64 {
+        unsafe { read_volatile(address as *const u64) }
+    }
+
+    fn write_u64(&mut self, address: u64, value: u64) {
+        unsafe { write_volatile(address as *mut u64, value) }
+    }
 }
 
 unsafe fn ensure_list_head_initialized(head: u64) {
-    let flink = read_volatile(head as *const u64);
-    let blink = read_volatile((head + 8) as *const u64);
-    if flink == 0 || blink == 0 {
-        initialize_list_head(head);
-    }
+    win32k_threadinfo::ensure_list_head(&mut LiveThreadInfoMemory, head);
 }
 
 unsafe fn sync_threadinfo_process(w32thread: u64) {
