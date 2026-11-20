@@ -300,104 +300,263 @@ unsafe fn submit(
         abort_capture(source);
         return Some((nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw(), false));
     }
-    let prepared = match hosted_reverse_class_projection::prepare(
+    // The continuation row is held before any port effect, so keeping an unfinished stage can
+    // never be refused for capacity once the port driver has been entered (#420).
+    let slot = match component_scheduler::service_continuation::reserve_slot() {
+        Ok(slot) => slot,
+        Err(status) => {
+            abort_capture(source);
+            return Some((status, false));
+        }
+    };
+    let owner_id = match hosted_reverse_class_projection::begin(
         class_index, port_index, class_port, source.payload().class_device, lower_origin,
     ) {
-        Ok(prepared) => prepared,
+        Ok(owner_id) => owner_id,
         Err(status) => {
             abort_capture(source);
             return Some((status.raw(), false));
         }
     };
-    let configured = match hosted_reverse_class_projection::dispatch_configure(
-        prepared, crate::initial_system_driver_caller(),
-    ) {
-        Ok(configured) => configured,
-        Err(status) => {
-            // A component effect may have happened. The reverse owner quarantines aliases;
-            // the source IRP has not entered the provider and can retire independently.
-            abort_capture(source);
-            return Some((status.raw(), false));
-        }
+    let submit = ConnectSubmit {
+        source, class_index, class_domain, class_port_address: class_port.address(),
+        port_index, lower_origin, route, dispatch, reply, token, caller, source_irp,
+        owner_id, configured: None,
     };
-    let thunk = match hosted_class_callback_thunk::publish(
-        configured.owner_id, port_index, class_index, source.payload().class_device,
-        source.payload().class_service, source.payload().forward.control,
-    ) {
-        Ok(thunk) => thunk,
-        Err(status) => {
-            // Publication may have reserved executable bytes before a failed component ACK.
-            // Keep both alias generations until that effect can be reconciled.
-            hosted_reverse_class_projection::block_uncertain(configured.owner_id);
-            abort_capture(source);
-            return Some((status.raw(), false));
-        }
-    };
-    let permit = match hosted_class_callback_thunk::issue_permit(thunk) {
-        Ok(permit) => permit,
-        Err(status) => {
-            abort_published_unentered(source, configured.owner_id, thunk.cookie);
-            return Some((status.raw(), false));
-        }
-    };
-    let port = match hosted_input_connect_dispatch::PortLocalConnect::prepare(
-        source.payload(), configured.owner_id, lower_origin, thunk,
-    ) {
-        Ok(port) => port,
-        Err(status) => {
-            abort_published_unentered(source, configured.owner_id, thunk.cookie);
-            return Some((status.raw(), false));
-        }
-    };
-    let port_storage_instance = hosted_completion_storage_instance(port_index);
-    let Some(port_storage_domain) =
-        instance(port_storage_instance).and_then(instance_domain_identity)
-    else {
-        abort_published_unentered(source, configured.owner_id, thunk.cookie);
-        return Some((nt_status::NtStatus::DEVICE_NOT_CONNECTED.raw(), false));
-    };
-    let sequence = I8042ConnectHookSequence::new(source.payload().forward);
-    let origin = hosted_forward_origin::HostedForwardOrigin::new(route, dispatch, reply, token);
-    let work = Box::new(Work {
-        class_instance: class_index,
-        class_domain,
-        class_port_address: class_port.address(),
-        port_instance: port_index,
-        port_domain: lower_origin.domain(),
-        port_storage_instance,
-        port_storage_domain,
-        reverse_owner_id: configured.owner_id,
-        source: hosted_connect_work::RetainedConnectWork::new(source, origin),
-        port,
-        permit,
-        sequence,
-        caller,
-        provider_entered: false,
-        blocked: false,
-        source_acknowledged: false,
-        port_acknowledged: false,
-    });
-    if runtime::park_retained_service(route, token).is_err() {
-        // No provider effect has occurred; retire the published thunk before its aliases.
-        let mut work = work;
-        if hosted_class_callback_thunk::retire_after_quiescence(thunk.cookie).is_err() {
-            hosted_class_callback_thunk::block(thunk.cookie);
-            hosted_reverse_class_projection::block_uncertain(configured.owner_id);
-        } else if hosted_reverse_class_projection::abort_before_provider_entry(configured.owner_id)
-            .is_err() {
-            hosted_reverse_class_projection::block_uncertain(configured.owner_id);
-        }
-        if !work.source.abort_unentered() {
-            core::mem::forget(work);
-            crate::provider_bugcheck::report(
-                0xc4, [FSD_SERVICE_CONNECT_FORWARD_LABEL, 10, source_irp, token],
-            );
-        }
-        return Some((nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw(), false));
+    match submit.advance(nt_hosted_runtime::ConnectSubmitNext::Enter(
+        nt_hosted_runtime::ConnectSubmitStage::FIRST))
+    {
+        SubmitRun::Reply(reply) => Some(reply),
+        SubmitRun::Park(parked) => parked.park(),
+        SubmitRun::Kept(kept, pending) => match kept.register(
+            slot, crate::driver_launch::ServiceStep::ConnectSubmit(pending),
+        ) {
+            // The class driver stays parked; this reply is intercepted and never sent.
+            Ok(()) => Some((nt_status::NtStatus::PENDING.raw(), false)),
+            // The class driver is still running here, so a park is made at once.
+            Err((uncertain, step)) => match step.answer(uncertain) {
+                component_scheduler::service_continuation::ServiceAnswer::Reply(reply) =>
+                    Some((reply.words[0] as u32 as i32, reply.words[1] != 0)),
+                component_scheduler::service_continuation::ServiceAnswer::ParkConnect(parked) =>
+                    parked.park(),
+            },
+        },
     }
-    rows().push(Some(work));
-    trace_connect_live(3, source_irp, token, port_index as u64);
-    None
+}
+
+/// A CONNECT submit between its pumped stages (#420). It owns the captured source, the
+/// reverse-class owner row (staged, then `Entered`) and every identity the tail publishes.
+pub(crate) struct ConnectSubmit {
+    source: hosted_connect_capture::CapturedConnect,
+    class_index: usize,
+    class_domain: HostedDomainIdentity,
+    class_port_address: u64,
+    port_index: usize,
+    lower_origin: HostedDevicePointerRegistration,
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    source_irp: u64,
+    owner_id: u64,
+    configured: Option<hosted_reverse_class_projection::PreparedReverseClassProjection>,
+}
+
+/// A kept submit: the stage whose pump is still running in the port driver.
+pub(crate) struct PendingConnectSubmit {
+    submit: ConnectSubmit,
+    stage: Pending,
+}
+
+enum Pending {
+    Alias(nt_hosted_runtime::ConnectSubmitStage, PdoProjectionFinish),
+    Configure(hosted_reverse_class_projection::ConfigureFinish),
+}
+
+pub(crate) enum SubmitRun {
+    Reply((i32, bool)),
+    /// Every stage returned: park the class driver's Call on its retained service.
+    Park(ParkedConnect),
+    Kept(component_scheduler::service_continuation::KeptPump, PendingConnectSubmit),
+}
+
+impl ConnectSubmit {
+    unsafe fn advance(mut self, mut next: nt_hosted_runtime::ConnectSubmitNext) -> SubmitRun {
+        use nt_hosted_runtime::{ConnectStageEnd, ConnectSubmitNext as Next, ConnectSubmitStage as Stage};
+        loop {
+            match next {
+                Next::Enter(stage) => {
+                    let end = match stage {
+                        Stage::PortAlias | Stage::ClassAlias => {
+                            match hosted_reverse_class_projection::enter_alias(self.owner_id) {
+                                Err(status) => Err(status),
+                                Ok(PdoProjection::Done(alias)) =>
+                                    hosted_reverse_class_projection::finish_alias(
+                                        self.owner_id, stage == Stage::PortAlias, alias),
+                                Ok(PdoProjection::Kept(kept, finish)) => return SubmitRun::Kept(
+                                    kept, PendingConnectSubmit {
+                                        submit: self, stage: Pending::Alias(stage, finish),
+                                    }),
+                            }
+                        }
+                        Stage::Configure => match hosted_reverse_class_projection::finish_prepare(
+                            self.owner_id,
+                        ).and_then(|prepared| hosted_reverse_class_projection::dispatch_configure(
+                            prepared, crate::initial_system_driver_caller()))
+                        {
+                            Err(status) => Err(status),
+                            Ok(hosted_reverse_class_projection::ConfigurePump::Done(configured)) =>
+                                configured.map(|configured| self.configured = Some(configured)),
+                            Ok(hosted_reverse_class_projection::ConfigurePump::Kept(kept, finish)) =>
+                                return SubmitRun::Kept(kept, PendingConnectSubmit {
+                                    submit: self, stage: Pending::Configure(finish),
+                                }),
+                        },
+                    };
+                    next = stage.after(ConnectStageEnd::Returned(end.map_err(|status| status.raw())));
+                }
+                // `after` keeps a stage only for a kept end, which returns above instead.
+                Next::Keep(_) => unreachable!("a returned CONNECT stage is never kept"),
+                Next::Rollback(status) => {
+                    // A component effect may have happened. The reverse owner quarantines its
+                    // aliases; the source IRP has not entered the provider and can retire.
+                    abort_capture(self.source);
+                    return SubmitRun::Reply((status, false));
+                }
+                Next::Tail => return self.tail(),
+            }
+        }
+    }
+
+    unsafe fn tail(self) -> SubmitRun {
+        let Self {
+            source, class_index, class_domain, class_port_address, port_index, lower_origin,
+            route, dispatch, reply, token, caller, source_irp, owner_id: _, configured,
+        } = self;
+        let Some(configured) = configured else {
+            abort_capture(source);
+            return SubmitRun::Reply((INVALID, false));
+        };
+        let thunk = match hosted_class_callback_thunk::publish(
+            configured.owner_id, port_index, class_index, source.payload().class_device,
+            source.payload().class_service, source.payload().forward.control,
+        ) {
+            Ok(thunk) => thunk,
+            Err(status) => {
+                // Publication may have reserved executable bytes before a failed component ACK.
+                // Keep both alias generations until that effect can be reconciled.
+                hosted_reverse_class_projection::block_uncertain(configured.owner_id);
+                abort_capture(source);
+                return SubmitRun::Reply((status.raw(), false));
+            }
+        };
+        let permit = match hosted_class_callback_thunk::issue_permit(thunk) {
+            Ok(permit) => permit,
+            Err(status) => {
+                abort_published_unentered(source, configured.owner_id, thunk.cookie);
+                return SubmitRun::Reply((status.raw(), false));
+            }
+        };
+        let port = match hosted_input_connect_dispatch::PortLocalConnect::prepare(
+            source.payload(), configured.owner_id, lower_origin, thunk,
+        ) {
+            Ok(port) => port,
+            Err(status) => {
+                abort_published_unentered(source, configured.owner_id, thunk.cookie);
+                return SubmitRun::Reply((status.raw(), false));
+            }
+        };
+        let port_storage_instance = hosted_completion_storage_instance(port_index);
+        let Some(port_storage_domain) =
+            instance(port_storage_instance).and_then(instance_domain_identity)
+        else {
+            abort_published_unentered(source, configured.owner_id, thunk.cookie);
+            return SubmitRun::Reply((nt_status::NtStatus::DEVICE_NOT_CONNECTED.raw(), false));
+        };
+        let sequence = I8042ConnectHookSequence::new(source.payload().forward);
+        let origin = hosted_forward_origin::HostedForwardOrigin::new(route, dispatch, reply, token);
+        let work = Box::new(Work {
+            class_instance: class_index,
+            class_domain,
+            class_port_address,
+            port_instance: port_index,
+            port_domain: lower_origin.domain(),
+            port_storage_instance,
+            port_storage_domain,
+            reverse_owner_id: configured.owner_id,
+            source: hosted_connect_work::RetainedConnectWork::new(source, origin),
+            port,
+            permit,
+            sequence,
+            caller,
+            provider_entered: false,
+            blocked: false,
+            source_acknowledged: false,
+            port_acknowledged: false,
+        });
+        SubmitRun::Park(ParkedConnect {
+            work, route, token, thunk_cookie: thunk.cookie, owner_id: configured.owner_id,
+            source_irp, port_index,
+        })
+    }
+}
+
+impl PendingConnectSubmit {
+    /// The kept stage's pump returned: finish that stage on its true result and continue.
+    pub(crate) unsafe fn complete(self, result: crate::spawn_hosts::PumpResult) -> SubmitRun {
+        use nt_hosted_runtime::ConnectStageEnd;
+        let Self { mut submit, stage } = self;
+        let (stage, end) = match stage {
+            Pending::Alias(stage, finish) => (stage, hosted_reverse_class_projection::finish_alias(
+                submit.owner_id, stage == nt_hosted_runtime::ConnectSubmitStage::PortAlias,
+                finish.after(result))),
+            Pending::Configure(finish) => (nt_hosted_runtime::ConnectSubmitStage::Configure,
+                finish.after(result).map(|configured| submit.configured = Some(configured))),
+        };
+        submit.advance(stage.after(ConnectStageEnd::Returned(end.map_err(|status| status.raw()))))
+    }
+}
+
+/// A submit whose stages all returned: the class driver's Call is parked on its retained
+/// service only while that lane runs, so a kept submit parks it as its restored receive's
+/// first act.
+pub(crate) struct ParkedConnect {
+    work: Box<Work>,
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    token: u64,
+    thunk_cookie: u64,
+    owner_id: u64,
+    source_irp: u64,
+    port_index: usize,
+}
+
+impl ParkedConnect {
+    /// Park the class driver's Call: `None` when parked (no reply now), else the reply.
+    pub(crate) unsafe fn park(self) -> Option<(i32, bool)> {
+        let Self { work, route, token, thunk_cookie, owner_id, source_irp, port_index } = self;
+        if rows().try_reserve(1).is_err() || runtime::park_retained_service(route, token).is_err() {
+            // No provider effect has occurred; retire the published thunk before its aliases.
+            let mut work = work;
+            if hosted_class_callback_thunk::retire_after_quiescence(thunk_cookie).is_err() {
+                hosted_class_callback_thunk::block(thunk_cookie);
+                hosted_reverse_class_projection::block_uncertain(owner_id);
+            } else if hosted_reverse_class_projection::abort_before_provider_entry(owner_id)
+                .is_err() {
+                hosted_reverse_class_projection::block_uncertain(owner_id);
+            }
+            if !work.source.abort_unentered() {
+                core::mem::forget(work);
+                crate::provider_bugcheck::report(
+                    0xc4, [FSD_SERVICE_CONNECT_FORWARD_LABEL, 10, source_irp, token],
+                );
+            }
+            return Some((nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw(), false));
+        }
+        rows().push(Some(work));
+        trace_connect_live(3, source_irp, token, port_index as u64);
+        None
+    }
 }
 
 unsafe fn arm(

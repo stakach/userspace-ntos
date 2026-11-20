@@ -34,6 +34,8 @@ mod driver_load_receipt;
 mod dxg_registration;
 mod contiguous_ram;
 mod provider_export_worker;
+mod connect_submit;
+pub use connect_submit::{ConnectStageEnd, ConnectSubmitNext, ConnectSubmitStage};
 mod caller_marshal;
 mod gop_bar_projection;
 mod hosted_driver_thread_object;

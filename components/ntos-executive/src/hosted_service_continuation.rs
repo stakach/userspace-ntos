@@ -47,13 +47,63 @@ pub(crate) enum ServiceStep {
     /// A provider's callback into a dependent: the target's finish, every adapter tail and
     /// the service's outer tail.
     ProviderCallback(crate::driver_launch::ProviderCallbackStep),
+    /// A class driver's CONNECT forward: the kept alias or configure stage, the remaining
+    /// stages and the tail that parks the class driver's Call.
+    ConnectSubmit(crate::driver_launch::PendingConnectSubmit),
+}
+
+/// What a step owes X once its pump has returned: a reply, or (for a CONNECT submit whose
+/// stages all returned) parking X's Call on its retained service, which only X's restored
+/// receive may do.
+pub(crate) enum ServiceAnswer {
+    Reply(ServiceReply),
+    ParkConnect(crate::driver_launch::ParkedConnect),
+}
+
+/// What X's restored receive does first.
+pub(crate) enum ServiceDelivery {
+    Reply(crate::spawn_hosts::DeferredReply),
+    /// Park the Call, then reply the returned status if parking was refused.
+    ParkConnect(crate::spawn_hosts::DeferredReply, crate::driver_launch::ParkedConnect),
 }
 
 impl ServiceStep {
+    /// Run the step once at a root boundary, where X is parked: a CONNECT park is handed to
+    /// X's restored receive instead of being made here.
+    pub(crate) unsafe fn answer(self, result: crate::spawn_hosts::PumpResult) -> ServiceAnswer {
+        let Self::ConnectSubmit(pending) = self else {
+            return ServiceAnswer::Reply(self.complete(result));
+        };
+        use crate::driver_launch::SubmitRun;
+        match pending.complete(result) {
+            SubmitRun::Reply((status, accepted)) => ServiceAnswer::Reply(ServiceReply {
+                info: None, words: [status as u32 as u64, u64::from(accepted), 0, 0],
+            }),
+            SubmitRun::Park(parked) => ServiceAnswer::ParkConnect(parked),
+            // A later stage stopped unfinished: it continues this same row.
+            SubmitRun::Kept(kept, pending) => match kept.register(
+                continuing_slot(), Self::ConnectSubmit(pending),
+            ) {
+                Ok(()) => ServiceAnswer::Reply(ServiceReply::status(nt_status::NtStatus::PENDING.raw())),
+                Err((uncertain, step)) => step.answer(uncertain),
+            },
+        }
+    }
+
     /// Run the step once on its pump's result. A refused registration runs it at once on the
     /// uncertain result, so the service's own tail still releases what it holds.
     pub(crate) unsafe fn complete(self, result: crate::spawn_hosts::PumpResult) -> ServiceReply {
         match self {
+            // Runs where the service runs, with X executing: a park is made at once.
+            Self::ConnectSubmit(_) => match self.answer(result) {
+                ServiceAnswer::Reply(reply) => reply,
+                ServiceAnswer::ParkConnect(parked) => match parked.park() {
+                    Some((status, accepted)) => ServiceReply {
+                        info: None, words: [status as u32 as u64, u64::from(accepted), 0, 0],
+                    },
+                    None => ServiceReply::status(nt_status::NtStatus::PENDING.raw()),
+                },
+            },
             Self::ZwUnloadDriver(pending) => ServiceReply::status(pending.finish(result)),
             Self::ProviderExport(step) => ServiceReply::status(step.complete(result) as u32 as i32),
             Self::ProviderCallback(step) =>
@@ -68,7 +118,7 @@ impl ServiceStep {
 
 type Services = ServiceContinuations<
     nested::NestedRestoreTicket, nested::ParkedParentHandle, ServiceStep, HostedPumpRestore,
-    crate::spawn_hosts::DeferredReply, ServiceReply,
+    crate::spawn_hosts::DeferredReply, ServiceAnswer,
 >;
 
 static mut SERVICES: Services = ServiceContinuations::new();
@@ -438,12 +488,14 @@ pub(crate) unsafe fn intercept(
 }
 
 /// After X's parent is restored: its service's reply, exactly once.
-pub(crate) unsafe fn take_reply(
-    ticket: nested::NestedRestoreTicket,
-) -> Option<crate::spawn_hosts::DeferredReply> {
-    let (envelope, reply) = services().take_reply(ticket)?;
+pub(crate) unsafe fn take_reply(ticket: nested::NestedRestoreTicket) -> Option<ServiceDelivery> {
+    let (envelope, answer) = services().take_reply(ticket)?;
     trace(b"replied", ticket);
-    Some(envelope.with_words(reply.info, reply.words))
+    Some(match answer {
+        ServiceAnswer::Reply(reply) =>
+            ServiceDelivery::Reply(envelope.with_words(reply.info, reply.words)),
+        ServiceAnswer::ParkConnect(parked) => ServiceDelivery::ParkConnect(envelope, parked),
+    })
 }
 
 /// Root boundary only: drive each intercepted service's kept pump once, then each fenced one.
@@ -461,7 +513,7 @@ pub(crate) unsafe fn drive() -> usize {
                 |pump| retry(pump),
                 |step, result| {
                     let scope = ContinuingScope::enter(key);
-                    let reply = step.complete(result);
+                    let reply = step.answer(result);
                     drop(scope);
                     match (&mut *core::ptr::addr_of_mut!(CONTINUED)).take() {
                         Some((owner, step, pump)) if owner == key => Completion::Again(step, pump),

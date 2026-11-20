@@ -81,6 +81,7 @@ mod hosted_connect_capture;
 mod hosted_connect_work;
 #[path = "hosted_connect_live.rs"]
 mod hosted_connect_live;
+pub(crate) use hosted_connect_live::{ParkedConnect, PendingConnectSubmit, SubmitRun};
 #[path = "hosted_class_callback_lane.rs"]
 mod hosted_class_callback_lane;
 #[path = "hosted_class_callback_thunk.rs"]
@@ -184,7 +185,7 @@ pub(crate) use component_scheduler::{
     retry_scheduler_yield_restore, drive_kept_pumps, intercept_service_reply, take_service_reply,
 };
 pub(crate) use component_scheduler::handoff_exact_component_once;
-pub(crate) use component_scheduler::service_continuation::ServiceStep;
+pub(crate) use component_scheduler::service_continuation::{ServiceDelivery, ServiceStep};
 
 /// Hold one service-continuation row before a lane's service enters any dispatch (#420).
 pub(crate) unsafe fn reserve_service_slot()
@@ -71166,6 +71167,50 @@ unsafe fn create_hosted_pdo_projection(
         None,
         caller,
     ))
+}
+
+/// One PDO projection pump for a lane's service that keeps its own continuation (#420).
+pub(crate) enum PdoProjection {
+    Done(Result<u64, nt_status::NtStatus>),
+    /// Still running in the projecting driver while the calling lane is parked for it.
+    Kept(component_scheduler::service_continuation::KeptPump, PdoProjectionFinish),
+}
+
+/// What a PDO projection needs once its kept pump has returned.
+#[derive(Clone, Copy)]
+pub(crate) struct PdoProjectionFinish {
+    index: usize,
+    sh: u64,
+}
+
+impl PdoProjectionFinish {
+    pub(crate) unsafe fn after(
+        self, pr: crate::spawn_hosts::PumpResult,
+    ) -> Result<u64, nt_status::NtStatus> {
+        finish_pdo_projection(finish_device_projection_control(self.index, self.sh, pr))
+    }
+}
+
+/// Create one PDO projection; an unfinished pump comes back kept for the caller's service.
+pub(crate) unsafe fn begin_pdo_projection(
+    projection_instance: usize,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> PdoProjection {
+    use component_scheduler::service_continuation::ServicePump;
+    let (ch, sh) = match prepare_device_projection_control_for_instance(
+        projection_instance, 0, FSD_DISPATCH_CREATE_PDO_PROJECTION, 0, 0, false, None,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => return PdoProjection::Done(Err(status)),
+    };
+    let finish = PdoProjectionFinish { index: projection_instance, sh };
+    let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
+    match component_scheduler::service_continuation::settle(pump) {
+        ServicePump::Finished(pr) | ServicePump::Fenced(pr) => PdoProjection::Done(finish.after(pr)),
+        ServicePump::Kept(kept) => PdoProjection::Kept(kept, finish),
+        // A lane's service always has its parked parent or its continuing step.
+        ServicePump::RootTurn(turn) => PdoProjection::Done(finish.after(turn.fence_unowned())),
+    }
 }
 
 unsafe fn finish_pdo_projection(

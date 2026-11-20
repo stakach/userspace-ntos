@@ -3057,21 +3057,41 @@ unsafe fn component_pump_continue_receive_half(
         );
     }
     // A reply deferred behind this restore is sent first; it is the receive's own request.
+    use crate::driver_launch::ServiceDelivery;
     let deferred = previous.nested_restore_yield.and_then(|ticket|
-        (&mut *core::ptr::addr_of_mut!(DEFERRED)).release(ticket)
+        (&mut *core::ptr::addr_of_mut!(DEFERRED)).release(ticket).map(ServiceDelivery::Reply)
             .or_else(|| crate::driver_launch::take_service_reply(ticket)));
     let first = match deferred {
-        Some(reply) => pump_reply_recv4_traced(
+        Some(ServiceDelivery::Reply(reply)) => Some(pump_reply_recv4_traced(
             ch, reply.reply_cap, reply.info, reply.words[0], reply.words[1], reply.words[2],
-            reply.words[3], None, false, reply.dpc_reply),
-        None => pump_recv_with_scheduler_checkpoint(ch, serviced_scheduler_yield),
+            reply.words[3], None, false, reply.dpc_reply)),
+        // A kept CONNECT submit whose stages all returned parks the lane's Call now that the
+        // lane runs again, exactly as its service would have before replying (#420).
+        Some(ServiceDelivery::ParkConnect(envelope, parked)) => match parked.park() {
+            Some((status, accepted)) => Some(pump_reply_recv4_traced(
+                ch, envelope.reply_cap, envelope.info, status as u32 as u64, u64::from(accepted),
+                0, 0, None, false, envelope.dpc_reply)),
+            None if shared_pump::service_wait_yields(ch) => None,
+            None => Some(pump_recv(ch, reply_cap)),
+        },
+        None => Some(pump_recv_with_scheduler_checkpoint(ch, serviced_scheduler_yield)),
     };
     if let Some(yielded) = previous.receive_yield() {
         crate::win32k_glue::trace_receive_phase(
             b"resume-after-recv", yielded.parent, yielded.child, yielded.owner,
         );
     }
-    let mut outcome = component_pump_loop(ch, first, &mut reply_cap, previous.accounting, &mut seh.pump);
+    let mut outcome = match first {
+        Some(first) =>
+            component_pump_loop(ch, first, &mut reply_cap, previous.accounting, &mut seh.pump),
+        // The parked Call is now a provider wait, as in the service arm's own yield.
+        None => {
+            let mut outcome = PumpLoopOutcome::new();
+            outcome.accounting = previous.accounting;
+            outcome.provider_wait_suspended = true;
+            outcome
+        }
+    };
     let suspended = outcome.callback_suspended || outcome.provider_wait_suspended
         || outcome.provider_wait_capture_refusal.is_some() || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {

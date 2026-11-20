@@ -127,13 +127,15 @@ unsafe fn source_member(
 /// Reserve both source generations before either foreign allocation. `class_port` must be the
 /// PortDO created by the active class AddDevice; `class_main` comes from captured CONNECT_DATA.
 /// `lower_origin` is the native port-side registration underlying the class-local lower alias.
-pub(super) unsafe fn prepare(
+/// Creates the owner row; the two alias projections then run as their own stages
+/// ([`enter_alias`], [`finish_alias`]) and [`finish_prepare`] stages the projection.
+pub(super) unsafe fn begin(
     class_instance: usize,
     port_instance: usize,
     class_port: HostedDevicePointerRegistration,
     class_main: HostedDevicePointerRegistration,
     lower_origin: HostedDevicePointerRegistration,
-) -> Result<PreparedReverseClassProjection, nt_status::NtStatus> {
+) -> Result<u64, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let class_inst = instance(class_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     let port_inst = instance(port_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
@@ -211,43 +213,70 @@ pub(super) unsafe fn prepare(
     unsafe {
         NEXT_ID = next;
     }
-    let caller = crate::initial_system_driver_caller();
-    for is_port_do in [true, false] {
-        let alias = match create_hosted_pdo_projection(port_instance, caller) {
-            Ok(address) => address,
-            Err(status) => {
-                block_uncertain(id);
-                return Err(status);
-            }
-        };
-        let member = if is_port_do {
-            &mut owner(id).unwrap().port_do
-        } else {
-            &mut owner(id).unwrap().class_do
-        };
-        member.alias = Some(alias);
-        let allocation = match hosted_device_allocations::capture_allocation(port_inst, alias) {
-            Ok(allocation) => allocation,
-            Err(status) => {
-                block_uncertain(id);
-                return Err(status);
-            }
-        };
-        let member = if is_port_do {
-            &mut owner(id).unwrap().port_do
-        } else {
-            &mut owner(id).unwrap().class_do
-        };
-        member.alias_allocation = Some(allocation);
-        if let Err(status) =
-            hosted_device_allocations::protect_allocation_exact(port_inst, alias, Some(allocation))
-        {
+    Ok(id)
+}
+
+/// Enter one alias projection in the port domain. An unfinished pump is kept by the caller's
+/// service; the owner row stays as it is until [`finish_alias`] runs on the true result.
+pub(super) unsafe fn enter_alias(id: u64) -> Result<PdoProjection, nt_status::NtStatus> {
+    let port_instance = owner(id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?.port_instance;
+    let _durable = crate::allocator::enter_durable();
+    Ok(begin_pdo_projection(port_instance, crate::initial_system_driver_caller()))
+}
+
+/// Record one returned alias projection: the PortDO alias first, then the class DO alias.
+pub(super) unsafe fn finish_alias(
+    id: u64, is_port_do: bool, alias: Result<u64, nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    let row = owner(id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let (port_instance, port_domain) = (row.port_instance, row.port_domain);
+    let source = if is_port_do { row.port_do.source } else { row.class_do.source };
+    let port_inst = instance(port_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let _durable = crate::allocator::enter_durable();
+    let alias = match alias {
+        Ok(address) => address,
+        Err(status) => {
             block_uncertain(id);
             return Err(status);
         }
-        let source = if is_port_do { class_port } else { class_main };
-        match register_unlinked_hosted_device_projection(port_inst, port_domain, alias, source.device_id()) {
-            Ok(registration) => {
+    };
+    let member = if is_port_do {
+        &mut owner(id).unwrap().port_do
+    } else {
+        &mut owner(id).unwrap().class_do
+    };
+    member.alias = Some(alias);
+    let allocation = match hosted_device_allocations::capture_allocation(port_inst, alias) {
+        Ok(allocation) => allocation,
+        Err(status) => {
+            block_uncertain(id);
+            return Err(status);
+        }
+    };
+    let member = if is_port_do {
+        &mut owner(id).unwrap().port_do
+    } else {
+        &mut owner(id).unwrap().class_do
+    };
+    member.alias_allocation = Some(allocation);
+    if let Err(status) =
+        hosted_device_allocations::protect_allocation_exact(port_inst, alias, Some(allocation))
+    {
+        block_uncertain(id);
+        return Err(status);
+    }
+    match register_unlinked_hosted_device_projection(port_inst, port_domain, alias, source.device_id()) {
+        Ok(registration) => {
+            let member = if is_port_do {
+                &mut owner(id).unwrap().port_do
+            } else {
+                &mut owner(id).unwrap().class_do
+            };
+            member.alias_registration = Some(registration);
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(registration) = error.accepted_registration() {
                 let member = if is_port_do {
                     &mut owner(id).unwrap().port_do
                 } else {
@@ -255,21 +284,18 @@ pub(super) unsafe fn prepare(
                 };
                 member.alias_registration = Some(registration);
             }
-            Err(error) => {
-                if let Some(registration) = error.accepted_registration() {
-                    let member = if is_port_do {
-                        &mut owner(id).unwrap().port_do
-                    } else {
-                        &mut owner(id).unwrap().class_do
-                    };
-                    member.alias_registration = Some(registration);
-                }
-                block_uncertain(id);
-                return Err(error.status);
-            }
+            block_uncertain(id);
+            Err(error.status)
         }
     }
-    let identity = owner(id).unwrap().identity()?;
+}
+
+/// Stage the projection once both aliases are recorded.
+pub(super) unsafe fn finish_prepare(
+    id: u64,
+) -> Result<PreparedReverseClassProjection, nt_status::NtStatus> {
+    let _durable = crate::allocator::enter_durable();
+    let identity = owner(id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?.identity()?;
     if let Err(status) = owner(id)
         .unwrap()
         .projection
@@ -427,10 +453,47 @@ pub(super) unsafe fn begin_configure(
 /// Configure both retained aliases in their exact port instance. The publication transition is
 /// recorded before the component can modify either header, and only the matching address ACK
 /// permits completion. Every ambiguous outcome leaves the owner blocked with both aliases held.
+/// The configure pump: returned, or kept by the caller's service while the owner stays
+/// `Entered` with both aliases held.
+pub(super) enum ConfigurePump {
+    Done(Result<PreparedReverseClassProjection, nt_status::NtStatus>),
+    Kept(component_scheduler::service_continuation::KeptPump, ConfigureFinish),
+}
+
+/// What configure needs once its pump has returned.
+pub(super) struct ConfigureFinish {
+    id: u64,
+    index: usize,
+    sh: u64,
+    port_do: u64,
+}
+
+impl ConfigureFinish {
+    pub(super) unsafe fn after(
+        self, result: crate::spawn_hosts::PumpResult,
+    ) -> Result<PreparedReverseClassProjection, nt_status::NtStatus> {
+        let Self { id, index, sh, port_do } = self;
+        if !result.completed {
+            register_instance_ready(index, false);
+            block_uncertain(id);
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+        if result.status != 0 || read_volatile((sh + SH_REQ_INFO) as *const u64) != port_do {
+            block_uncertain(id);
+            return Err(if result.status == 0 {
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST
+            } else {
+                nt_status::NtStatus(result.status)
+            });
+        }
+        complete_configure(id, port_do)
+    }
+}
+
 pub(super) unsafe fn dispatch_configure(
     prepared: PreparedReverseClassProjection,
     caller: nt_process::native_handle::NativeHandleCaller,
-) -> Result<PreparedReverseClassProjection, nt_status::NtStatus> {
+) -> Result<ConfigurePump, nt_status::NtStatus> {
     let id = prepared.owner_id;
     let row = owner(id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
     let index = row.port_instance;
@@ -531,23 +594,16 @@ pub(super) unsafe fn dispatch_configure(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    let result = component_scheduler::hosted_component_pump_with_caller(&channel, caller);
-    if !result.completed {
-        register_instance_ready(index, false);
-        block_uncertain(id);
-        return Err(nt_status::NtStatus::UNSUCCESSFUL);
-    }
-    if result.status != 0
-        || read_volatile((sh + SH_REQ_INFO) as *const u64) != current.port_domain_port_do
-    {
-        block_uncertain(id);
-        return Err(if result.status == 0 {
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST
-        } else {
-            nt_status::NtStatus(result.status)
-        });
-    }
-    complete_configure(id, current.port_domain_port_do)
+    use component_scheduler::service_continuation::ServicePump;
+    let finish = ConfigureFinish { id, index, sh, port_do: current.port_domain_port_do };
+    let pump = component_scheduler::hosted_component_pump_with_caller_retained(&channel, caller);
+    Ok(match component_scheduler::service_continuation::settle(pump) {
+        ServicePump::Finished(result) | ServicePump::Fenced(result) =>
+            ConfigurePump::Done(finish.after(result)),
+        ServicePump::Kept(kept) => ConfigurePump::Kept(kept, finish),
+        // A lane's service always has its parked parent or its continuing step.
+        ServicePump::RootTurn(turn) => ConfigurePump::Done(finish.after(turn.fence_unowned())),
+    })
 }
 
 pub(super) unsafe fn complete_configure(
