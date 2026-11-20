@@ -29,6 +29,9 @@ mod headroom;
 mod oom_budget;
 #[path = "allocator_free_list.rs"]
 mod free_list;
+#[path = "allocator_quick_lists.rs"]
+mod quick_lists;
+use quick_lists::{QuickLists, QUICK_WORDS};
 use free_list::align_up;
 #[path = "allocator_sites.rs"]
 mod sites;
@@ -88,7 +91,8 @@ const DRIVER_OBJECT_EXTENSIONS_STATE: usize = HEAP_BASE + 144; // component-loca
 const ALLOC_UNLOCKED: usize = 0;
 const ALLOC_HELD: usize = 1;
 const ALLOC_POISONED: usize = 2;
-const DATA: usize = HEAP_BASE + 152; // allocations start past allocator/local metadata
+const QUICK_META: usize = HEAP_BASE + 152; // exact-size small-block cache heads and counts
+const DATA: usize = QUICK_META + QUICK_WORDS * size_of::<usize>(); // allocations start here
 const _: () = assert!(COMPONENT_HEAP_LIMIT_BYTES + size_of::<usize>() <= OOM_REPORTED);
 const _: () = assert!(OOM_SCOPE_LEN + size_of::<usize>() <= LARGE_REPORTED);
 const _: () = assert!(LARGE_REPORTED + size_of::<usize>() <= SITE_LEDGER);
@@ -795,6 +799,34 @@ unsafe fn insert_free_block(start: usize, size: usize) {
     }
 }
 
+const QUICK: QuickLists = QuickLists { meta: QUICK_META, data: DATA };
+
+/// Release a durable block: a small block not at the bump top goes to its exact-size cache;
+/// everything else is inserted (and coalesced, or trimmed from the top) in address order.
+unsafe fn release_durable_block(start: usize, size: usize) {
+    let at_top = start.checked_add(size) == Some(DATA + unsafe { read_word(CTR) });
+    if at_top || !unsafe { QUICK.push(start, size) } {
+        unsafe { insert_free_block(start, size) };
+    }
+}
+
+/// Pop an exact-size cached block, or `None` when the address-ordered list must serve it.
+unsafe fn alloc_from_quick_list(layout: Layout, needed: usize) -> Option<*mut u8> {
+    let top = DATA + unsafe { read_word(CTR) };
+    match unsafe { QUICK.pop(needed, layout.align(), top) } {
+        Ok(found) => found.map(|address| address as *mut u8),
+        Err(corruption) => allocator_corruption(
+            b"quick-pop", corruption.node, needed, corruption.node, corruption.size,
+            corruption.next,
+        ),
+    }
+}
+
+/// Before refusing an allocation, return every cached block to the coalescing list.
+unsafe fn drain_quick_lists() -> bool {
+    unsafe { QUICK.drain(|start, size| insert_free_block(start, size)) != 0 }
+}
+
 unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
     let list = free_list::FreeList {
         data: DATA,
@@ -852,9 +884,7 @@ impl Bump {
         let Some(size) = block_size(layout.size()) else {
             return;
         };
-        unsafe {
-            insert_free_block(start, size);
-        };
+        unsafe { release_durable_block(start, size) };
     }
 
     unsafe fn alloc_durable(&self, layout: Layout) -> *mut u8 {
@@ -868,6 +898,9 @@ impl Bump {
             );
             return null_mut();
         };
+        if let Some(cached) = unsafe { alloc_from_quick_list(layout, size) } {
+            return cached;
+        }
         let from_free = unsafe { alloc_from_free_list(layout, size) };
         if !from_free.is_null() {
             return from_free;
@@ -884,6 +917,10 @@ impl Bump {
         let requested_end = start.saturating_add(layout.size());
         let end = match start.checked_add(size) {
             Some(e) if ensure_durable_end(e) => e,
+            _ if unsafe { drain_quick_lists() } => {
+                // Coalescing the cached small blocks may now satisfy the request.
+                return unsafe { self.alloc_durable(layout) };
+            }
             _ => {
                 report_oom(
                     layout.size(),
@@ -1134,6 +1171,9 @@ pub fn usage() -> HeapUsage {
         node = unsafe { free_node_next(node) };
         guard += 1;
     }
+    let (cached, largest_cached) = unsafe { QUICK.cached() };
+    free_bytes = free_bytes.saturating_add(cached);
+    largest_free = largest_free.max(largest_cached);
     let lane = transient_lane();
     HeapUsage {
         bump,

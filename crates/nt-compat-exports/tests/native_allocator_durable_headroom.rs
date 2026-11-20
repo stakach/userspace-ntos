@@ -6,7 +6,8 @@ mod allocator_headroom;
 use allocator_headroom::DurableExtent;
 
 const PAGE: usize = 0x1000;
-/// Allocator metadata ahead of the first allocation (`allocator::DATA - HEAP_BASE`).
+/// Allocator metadata ahead of the first allocation (`allocator::DATA - HEAP_BASE`) in the
+/// logged runs, before the small-block cache words were added.
 const METADATA: usize = 152;
 /// `EXECUTIVE_DURABLE_HEAP_FRAMES` in the logged runs: the 88 MiB root reservation of the time
 /// less its transient lane.
