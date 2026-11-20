@@ -90,3 +90,37 @@ fn callback_replies_are_written_only_after_the_page_is_reacquired() {
     assert!(PENDING.contains("with_parked_payload(parked)"),
         "a payload-less callback publication restores the exact parked page");
 }
+
+// #419 boot 44660203546: every NtCallbackReturn restore was "restore-not-applied". The page was
+// parked when the pump returned, after the callback rendezvous had already lifted the client
+// context out of it, so the parked page never matched the frame's recorded publication.
+#[test]
+fn a_callback_suspension_parks_its_page_before_the_root_lifts_the_client_context() {
+    let glue = compact(GLUE);
+    let suspend = glue.find("ifsuspend_component{").expect("callback rendezvous suspends");
+    let body = &glue[suspend..];
+    let park = body.find("park_callback_suspended_page(").expect("the rendezvous parks the page");
+    let lift = body.find("capture_suspended_published_win32k_context(client);").unwrap();
+    assert!(park < lift, "the exact page is parked before its context cells are cleared");
+    let pending = compact(PENDING);
+    let settle = pending.find("pub(crate)unsafefnsettle_pump_page(").unwrap();
+    let body = &pending[settle..];
+    let skip = body.find("}elseifpump.callback_suspended{").expect("callback suspension already parked");
+    assert!(skip < body.find("}elseifpump.page_yielded(){").unwrap());
+}
+
+// #419 boot 44660203546: a kernel job's source-work resume returned, then its runner resumed
+// dispatch 93 over the page the job still held (reacquire not-top, then finish empty).
+#[test]
+fn a_returned_kernel_job_leaves_its_runner_before_another_dispatch_resumes() {
+    const ACTIVATION: &str =
+        include_str!("../../../components/ntos-executive/src/kernel_provider_activation.rs");
+    let source = compact(ACTIVATION);
+    let runner = source.find("pub(crate)unsafefnrun_kernel_job(").unwrap();
+    let body = &source[runner..];
+    let looped = body.find("loop{").unwrap();
+    let body = &body[looped..];
+    let returned = body.find("ifletSome(status)=result.returned(){returnOk(KernelJobRun::Returned(status));}").unwrap();
+    let resume = body.find("component_resume::run_outer(handler);").unwrap();
+    assert!(returned < resume);
+}

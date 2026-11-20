@@ -498,6 +498,10 @@ pub(crate) unsafe fn settle_pump_page(
     use nt_user_callback::SharedPagePumpSettlement as Settlement;
     let settlement = if pump.provider_wait_capture_refusal.is_some() || pump.refused_before_entry {
         Settlement::Retained
+    } else if pump.callback_suspended {
+        // Parked at the callback rendezvous (`park_callback_suspended_page`), before the root
+        // lifted the client context out of the page.
+        return;
     } else if pump.page_yielded() {
         Settlement::Yielded(try_capture_exact_shared_resume_snapshot(dispatch, client)
             .and_then(|snapshot| snapshot.lease_snapshot(client)))
@@ -690,6 +694,20 @@ pub(crate) unsafe fn select_and_restore_shared_resume_snapshot(
         }
     };
     (true, restored)
+}
+
+/// A user callback suspends its dispatch: park the exact page at the rendezvous, while it still
+/// carries the client context the callback frame recorded.
+pub(crate) unsafe fn park_callback_suspended_page(
+    dispatch: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+) {
+    crate::win32k_shared_page_authority::audit_park(
+        nt_user_callback::SharedPageLeaseIdentity { dispatch, client: shared_page_client_identity(client) },
+        try_capture_exact_shared_resume_snapshot(dispatch, client)
+            .and_then(|snapshot| snapshot.lease_snapshot(client)),
+        b"callback-suspend",
+    );
 }
 
 /// A cancelled or dead-client callback is answered with a failure reply. Before that header

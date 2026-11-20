@@ -59,7 +59,8 @@ pub(crate) use pending_dispatch::{
 };
 use pending_dispatch::{
     capture_initial_arg_snapshot, capture_lpc_wait_repark, capture_provider_wait_repark,
-    capture_shared_resume_snapshot, reacquire_parked_callback_page, settle_pump_page,
+    capture_shared_resume_snapshot, park_callback_suspended_page, reacquire_parked_callback_page,
+    settle_pump_page,
     SuspendedPumpSnapshot,
     LPC_WAIT_LAST_PUMP_SUSPENDED, LPC_WAIT_PENDING_DISPATCH, PROVIDER_WAIT_LAST_PUMP_SUSPENDED,
     PROVIDER_WAIT_PENDING_DISPATCH,
@@ -4122,6 +4123,12 @@ pub(crate) unsafe fn service_user_callback(
     }
 
     if suspend_component {
+        // #419: the dispatch yields its page here, at the callback rendezvous. The exact page
+        // is parked before the root lifts the client context out of it below.
+        park_callback_suspended_page(
+            core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH)),
+            win32k_client_context_from_callback_client(client),
+        );
         capture_suspended_published_win32k_context(client);
         if callback_trace {
             print_str(

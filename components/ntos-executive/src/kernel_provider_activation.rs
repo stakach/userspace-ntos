@@ -168,6 +168,9 @@ pub(crate) unsafe fn run_kernel_job(
     let mut parked_passes = 0u64;
     let mut heartbeat = ps_callout::RunnerHeartbeat::new();
     loop {
+        // A returned job leaves the runner before any other dispatch resumes: it still holds the
+        // win32k shared page until the funnel finishes it (#419).
+        if let Some(status) = result.returned() { return Ok(KernelJobRun::Returned(status)); }
         // Every call below ends its handler/activation borrow before entering a native provider.
         component_resume::run_outer(handler);
         redrive_ready_completions();
