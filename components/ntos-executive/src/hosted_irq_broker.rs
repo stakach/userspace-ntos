@@ -2317,6 +2317,11 @@ unsafe fn dispatch_next_dpc(
     {
         return Ok(HostedDpcRootDispatchOutcome::DeferredBusy);
     }
+    // The domain is one processor: no DPC starts while one of its lanes is stopped at
+    // DISPATCH_LEVEL holding a spin lock across a root call (#423).
+    if !super::hosted_domain_dpc_may_start(owner.domain_id, owner.domain_cookie) {
+        return Ok(HostedDpcRootDispatchOutcome::DeferredBusy);
+    }
     let arena = lane.arena();
     let transaction = match arena.control.root_begin_transaction(
         lane.identity,

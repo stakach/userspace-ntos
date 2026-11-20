@@ -84,6 +84,19 @@ pub const fn wait_satisfied(current: u64, observed: u64) -> bool {
     current != observed
 }
 
+/// `DISPATCH_LEVEL`: a lane at or above it holds a spin lock or has raised IRQL.
+pub const DISPATCH_LEVEL: u8 = 2;
+
+/// A hosted domain is one NT processor to its drivers. While the root runs, none of the
+/// domain's lanes is executing, so a lane at DISPATCH_LEVEL or above is stopped mid critical
+/// section, typically in a root call such as IoCompleteRequest made with a spin lock held.
+/// On that processor no DPC may start until the lane lowers its IRQL. A DPC started anyway can
+/// spin on the stopped holder, which the root cannot answer while it drives the DPC. A DPC that
+/// may not start stays queued and is delivered by the next DPC pass.
+pub fn dpc_may_start(domain_lane_irqls: impl IntoIterator<Item = u8>) -> bool {
+    domain_lane_irqls.into_iter().all(|irql| irql < DISPATCH_LEVEL)
+}
+
 #[cfg(test)]
 #[path = "hosted_spin_wait_tests.rs"]
 mod tests;

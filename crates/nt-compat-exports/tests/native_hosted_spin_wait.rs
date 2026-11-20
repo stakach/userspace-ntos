@@ -26,3 +26,19 @@ fn every_hosted_spin_lock_family_parks_instead_of_spinning() {
     assert!(wait.contains("park_hosted_driver_wait("), "contention must use the provider wait owner");
     assert!(wait.contains("holder-lane="), "contention traces name the holder lane");
 }
+
+// #423 (boots 44717077667, 44735317922): a DPC lane has no provider wait owner, so a DPC started
+// while a lane of its domain holds a spin lock across a root call spins on a holder the root
+// cannot answer. The root refuses to start the DPC first; it stays queued for the next pass.
+#[test]
+fn a_dpc_is_not_started_while_its_domain_is_at_dispatch_level() {
+    const BROKER: &str =
+        include_str!("../../../components/ntos-executive/src/hosted_irq_broker.rs");
+    let dispatch = BROKER.split("unsafe fn dispatch_next_dpc(").nth(1).expect("DPC dispatch");
+    let gate = dispatch.find("hosted_domain_dpc_may_start(owner.domain_id, owner.domain_cookie)")
+        .expect("the DPC pass checks the domain's IRQL");
+    let begin = dispatch.find("root_begin_transaction(").expect("transaction begin");
+    assert!(gate < begin, "the refusal happens before the DPC lane is entered");
+    assert!(dispatch[gate..begin].contains("HostedDpcRootDispatchOutcome::DeferredBusy"),
+        "a refused DPC stays queued");
+}

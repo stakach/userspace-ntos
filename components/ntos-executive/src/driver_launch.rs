@@ -16753,6 +16753,37 @@ fn trace_connect_dpc_probe(stage: u64, first: u64, second: u64, third: u64) {
 }
 
 /// Run a due, paced DPC pass. Self-requeued work retains its wake for a later scheduler boundary.
+static DPC_DISPATCH_LEVEL_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+
+/// #423: whether a DPC of this hosted domain may start now. None of the domain's lanes may be at
+/// DISPATCH_LEVEL: such a lane is stopped mid critical section (holding a spin lock across a
+/// root call), and the DPC could only spin on it. The ordinary bank of each of the domain's
+/// instances carries its lanes' IRQL. A refusal leaves the DPC queued for the next pass.
+pub(super) unsafe fn hosted_domain_dpc_may_start(domain_id: u64, domain_cookie: u64) -> bool {
+    let Some(instances) = driver_instances() else { return true };
+    let mut raised = None;
+    let may_start = nt_kernel_exec::hosted_spin_wait::dpc_may_start(instances.iter()
+        .filter(|inst| inst.hosted_domain_id == domain_id && inst.hosted_domain_cookie == domain_cookie
+            && inst.exec_shared_va != 0)
+        .map(|inst| {
+            let irql = read_volatile((inst.exec_shared_va + SH_HOSTED_CURRENT_IRQL) as *const u8);
+            if irql >= nt_kernel_exec::hosted_spin_wait::DISPATCH_LEVEL { raised = Some(irql); }
+            irql
+        }));
+    if !may_start {
+        let sample = DPC_DISPATCH_LEVEL_DEFERRALS.fetch_add(1, Ordering::Relaxed) + 1;
+        if sample <= 16 || sample.is_power_of_two() {
+            print_str(b"[hosted-dpc] deferred at dispatch level sample/domain/irql=");
+            for value in [sample, domain_id, u64::from(raised.unwrap_or(0))] {
+                print_str(b"/");
+                print_hex_u64(value);
+            }
+            print_str(b"\n");
+        }
+    }
+    may_start
+}
+
 pub(crate) unsafe fn drain_hosted_driver_dpcs() -> u64 {
     hosted_dpc_scheduler::run()
 }
