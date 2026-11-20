@@ -50073,6 +50073,24 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         .saturating_add(unsafe { hosted_sync_relations::drain() })
 }
 
+static QUEUED_CALLBACK_DRAIN_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// #425 input stall: the root's passive work-queue drain (which runs, among others, the win32k
+/// raw-input thread's next read) is skipped while an AddDevice turn, a queued-callback turn or an
+/// exclusive queued callback owns the root. Traces each skip with its reasons. Bounded: the first
+/// 32 skips, then powers of two.
+pub(crate) fn trace_queued_callback_drain_gate(add_device: bool, queued_turn: bool, exclusive: bool) {
+    if !(add_device || queued_turn || exclusive) { return; }
+    let sample = QUEUED_CALLBACK_DRAIN_SKIPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample > 32 && !sample.is_power_of_two() { return; }
+    print_str(b"[queued-callback-drain] skipped sample/add-device/queued-turn/exclusive=");
+    for value in [sample, u64::from(add_device), u64::from(queued_turn), u64::from(exclusive)] {
+        print_str(b"/");
+        print_hex_u64(value);
+    }
+    print_str(b"\n");
+}
+
 /// Admit passive queue work only where the root can immediately settle a suspended callback's
 /// exact queue selector, provider dispatch and physical Reply before any other provider runs.
 ///

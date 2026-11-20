@@ -202,6 +202,11 @@ pub(super) unsafe fn maintain(
         // Reply. Settle it before running another AddDevice child or resuming the batch.
         // Passive work may enter a provider and retain a physical callback Reply. Only
         // this root boundary can hand that owner to the callback settlement below.
+        crate::driver_launch::trace_queued_callback_drain_gate(
+            lp.ingress.root_add_device_turn.is_some(),
+            !lp.ingress.root_queued_callback_turn.is_empty(),
+            root_queued_callback_exclusive_pending(),
+        );
         if lp.ingress.root_add_device_turn.is_none()
             && lp.ingress.root_queued_callback_turn.is_empty()
             && !root_queued_callback_exclusive_pending()
@@ -1242,3 +1247,4 @@ pub(super) unsafe fn maintain(
     }
     ControlFlow::Continue((ingress, native_ingress_request))
 }
+

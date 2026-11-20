@@ -147,12 +147,17 @@ pub(crate) unsafe fn run_hosted(
     }
     let pump_completion = match continuation.pending {
         PendingComponentDispatch::Provider(pending) => {
-            match win32k_glue::resume_suspended_provider_wait_component(
+            let resumed = win32k_glue::resume_suspended_provider_wait_component(
                 nt_handler,
                 pending,
                 resume.key.id,
                 resume.completion.status,
-            ) {
+            );
+            trace_provider_wait_resume_outcome(
+                pending.dispatch.dispatch_id, pending.client.pi, pending.client.tid,
+                resume.key.id, resume.completion.status, &resumed,
+            );
+            match resumed {
                 win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => {
                     crate::spawn_hosts::shared_ingress::owner::runtime::nested::trace_deferred_resume_owner(
                         lane, resume.key, frame.owner,
@@ -902,4 +907,38 @@ unsafe fn finish_hosted_resume(
         }
     }
     Some(ComponentSuspensionRuntimeOutcome::Rearmed)
+}
+
+static PROVIDER_WAIT_RESUME_OUTCOMES: AtomicU64 = AtomicU64::new(0);
+
+/// #425 input stall: how each resumed provider wait left its resume. The win32k raw-input thread
+/// parks in provider waits on the mouse and keyboard File events; a resume that does not lead to
+/// its next read names the step here. Bounded: the first 64, then powers of two. Outcome codes:
+/// 1 completed, 2 waits again, 3 LPC wait, 4 Receive, 5 service wait, 6 user callback,
+/// 7 nested source deferred, 8 capture refused, 9 retained failure, 10 failed.
+unsafe fn trace_provider_wait_resume_outcome(
+    dispatch_id: u64, pi: u32, tid: u64, wait_id: u64, status: i32,
+    completion: &win32k_glue::ProviderWaitPumpCompletion,
+) {
+    use win32k_glue::ProviderWaitPumpCompletion as C;
+    let sample = PROVIDER_WAIT_RESUME_OUTCOMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample > 64 && !sample.is_power_of_two() { return; }
+    let (outcome, detail) = match completion {
+        C::Completed(_) => (1, 0),
+        C::Reparked(next) => (2, next.request.header.wait_id),
+        C::LpcReparked(_) => (3, 0),
+        C::ReceiveReparked(_) => (4, 0),
+        C::ServiceReparked(_) => (5, 0),
+        C::UserCallbackSuspended => (6, 0),
+        C::NestedSourceDeferred => (7, 0),
+        C::CaptureRefused(..) => (8, 0),
+        C::RetainedFailure(_, status) => (9, *status as u32 as u64),
+        C::Failed(status) => (10, *status as u32 as u64),
+    };
+    print_str(b"[provider-wait-resume] sample/dispatch/pi/tid/wait/status/outcome/detail=");
+    for value in [sample, dispatch_id, u64::from(pi), tid, wait_id, status as u32 as u64, outcome, detail] {
+        print_str(b"/");
+        print_hex_u64(value);
+    }
+    print_str(b"\n");
 }

@@ -281,8 +281,20 @@ pub(crate) unsafe fn submit(
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
     (&mut *core::ptr::addr_of_mut!(ACTIVE)).push((route, handle, token));
+    let trace = SUBMIT_TRACE.fetch_add(1, Ordering::Relaxed) + 1;
+    if trace <= 64 || trace.is_power_of_two() {
+        // #425: the raw-input thread issued its next read (a new token on the same handle).
+        print_str(b"[win32k-async-read] submit sample/handle/token/length=");
+        for value in [trace, handle, token, u64::from(request.parameters.length)] {
+            print_str(b"/");
+            print_hex_u64(value);
+        }
+        print_str(b"\n");
+    }
     None
 }
+
+static SUBMIT_TRACE: AtomicU64 = AtomicU64::new(0);
 
 impl Work {
     unsafe fn ready_for_nested_step(&self) -> bool {
@@ -635,7 +647,7 @@ impl Work {
             .set_signaled(self.file.file_id(), true)
             .expect("terminal win32k read File event");
         let trace = NESTED_READ_TRACE.fetch_add(1, Ordering::Relaxed);
-        if trace < 8 {
+        if trace < 64 {
             print_str(b"[win32k-async-read] file-event token=");
             print_u64(self.token);
             print_str(b" irp=");
@@ -647,7 +659,15 @@ impl Work {
             print_str(b"\n");
         }
         let mut objects = (*handler).dispatcher_objects(None);
-        crate::service_sec_image::provider_wait_select_ready(&mut objects);
+        let selected = crate::service_sec_image::provider_wait_select_ready(&mut objects);
+        if trace < 64 {
+            // #425: whether the File event's completion released a parked reader.
+            print_str(b"[win32k-async-read] file-event-selected token=");
+            print_u64(self.token);
+            print_str(b" waits=");
+            print_u64(selected);
+            print_str(b"\n");
+        }
         self.delivery
             .confirm_file_event(&self.token)
             .expect("win32k read File event publication");
