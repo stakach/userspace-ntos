@@ -102,14 +102,13 @@ pub const SERVICE_DEMAND_START: u32 = 3;
 pub const SERVICE_DISABLED: u32 = 4;
 
 /// Registry groups whose no-devnode device services have a hosted boot path.
-/// Base services run at boot; the network wrapper and transports also run at system start.
+/// Base services (ConDrv, Null, Beep, ...) and the network wrapper and transports run at boot
+/// or system start, as IopInitializeSystemDrivers loads every system-start service.
 pub fn hosted_boot_legacy_device_group(start_type: u32, group: Option<&str>) -> bool {
     let Some(group) = group else { return false };
-    if start_type == SERVICE_BOOT_START && group.eq_ignore_ascii_case(BASE_LOAD_ORDER_GROUP) {
-        return true;
-    }
     (start_type == SERVICE_BOOT_START || start_type == SERVICE_SYSTEM_START)
-        && (group.eq_ignore_ascii_case(NETWORK_WRAPPER_LOAD_ORDER_GROUP)
+        && (group.eq_ignore_ascii_case(BASE_LOAD_ORDER_GROUP)
+            || group.eq_ignore_ascii_case(NETWORK_WRAPPER_LOAD_ORDER_GROUP)
             || group.eq_ignore_ascii_case(NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP)
             || group.eq_ignore_ascii_case(NETWORK_TRANSPORT_LOAD_ORDER_GROUP))
 }
@@ -1150,7 +1149,7 @@ impl ConfigManager {
     /// Whether a boot/system driver service has a hosted no-devnode boot path.
     ///
     /// The hosted boot-driver path can start PnP-bound device drivers from imported `Enum`
-    /// devnodes. Boot-start Base services and the registry-declared NT5 network
+    /// devnodes. Boot/system-start Base services and the registry-declared NT5 network
     /// wrapper/transport groups are admitted. Boot-bus extenders, WDF framework loaders,
     /// debug/SAC services, and storage class drivers need their own kernel mechanisms.
     pub fn is_boot_system_legacy_driver(&self, service: &ServiceMetadata) -> bool {
@@ -2435,6 +2434,20 @@ mod tests {
 
     use super::*;
 
+    /// Boot 44604646550: cmd.exe's console allocation failed because ConDrv (System start,
+    /// group "Base", no devnode) was never loaded. IopInitializeSystemDrivers loads every
+    /// system-start service, so a no-devnode Base driver has a hosted path at system start too.
+    #[test]
+    fn system_start_base_services_have_a_hosted_boot_path() {
+        for start in [SERVICE_BOOT_START, SERVICE_SYSTEM_START] {
+            assert!(hosted_boot_legacy_device_group(start, Some("Base")));
+            assert!(hosted_boot_legacy_device_group(start, Some("base")));
+        }
+        assert!(!hosted_boot_legacy_device_group(SERVICE_DEMAND_START, Some("Base")));
+        assert!(!hosted_boot_legacy_device_group(SERVICE_SYSTEM_START, None));
+        assert!(!hosted_boot_legacy_device_group(SERVICE_SYSTEM_START, Some("Boot Bus Extender")));
+    }
+
     #[test]
     fn root_keys_exist() {
         let cm = ConfigManager::new();
@@ -3577,7 +3590,12 @@ mod tests {
         let service = cm.service_metadata("EntropyProvider").unwrap();
         assert!(cm.is_boot_system_legacy_driver(&service));
 
+        // IopInitializeSystemDrivers loads system-start Base services too (ConDrv, Null, Beep).
         cm.registry_mut().set_dword(key, "Start", SERVICE_SYSTEM_START);
+        let service = cm.service_metadata("EntropyProvider").unwrap();
+        assert!(cm.is_boot_system_legacy_driver(&service));
+
+        cm.registry_mut().set_dword(key, "Start", SERVICE_DEMAND_START);
         let service = cm.service_metadata("EntropyProvider").unwrap();
         assert!(!cm.is_boot_system_legacy_driver(&service));
     }
