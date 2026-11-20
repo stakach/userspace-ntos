@@ -18471,20 +18471,17 @@ extern "win64" fn s_ob_reference_object_by_handle(
 /// `NTSTATUS ObOpenObjectByPointer(PVOID, ULONG, PACCESS_STATE, ACCESS_MASK, POBJECT_TYPE, MODE, PHANDLE)`.
 extern "win64" fn s_ob_open_object_by_pointer(
     object: u64,
-    _handle_attributes: u32,
-    _passed_access_state: u64,
-    _desired_access: u32,
-    _object_type: u64,
-    _access_mode: u8,
+    handle_attributes: u32,
+    passed_access_state: u64,
+    desired_access: u32,
+    object_type: u64,
+    access_mode: u8,
     handle_out: u64,
 ) -> i32 {
-    if object == 0 || handle_out == 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
-    unsafe {
-        write_unaligned(handle_out as *mut u64, object);
-    }
-    STATUS_SUCCESS
+    hosted_driver_ps_handle_reference::ob_open_object_by_pointer(
+        object, handle_attributes, passed_access_state, desired_access, object_type,
+        access_mode, handle_out,
+    )
 }
 
 /// `NTSTATUS ObSetSecurityObjectByPointer(PVOID, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR)`.

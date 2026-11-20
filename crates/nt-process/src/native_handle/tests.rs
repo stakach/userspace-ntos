@@ -1529,3 +1529,39 @@ fn typed_close_mismatches_remain_non_mutating_after_generic_refactor() {
         );
     }
 }
+
+#[test]
+fn kernel_open_by_pointer_publishes_system_handle_and_keeps_pointer_owner_separate() {
+    let (mut pm, user, kernel, pid, tid) = fixture();
+    let system = pm.initial_system_identity().unwrap().process_id();
+    assert_eq!(
+        pm.reference_native_ps_body(user, 0x3000, None).unwrap_err(),
+        STATUS_ACCESS_DENIED
+    );
+    assert_eq!(
+        pm.reference_native_ps_body(kernel, 0x3000, Some(PsHandleType::Thread)).unwrap_err(),
+        STATUS_OBJECT_TYPE_MISMATCH
+    );
+    assert_eq!(
+        pm.reference_native_ps_body(kernel, 0x5000, None).unwrap_err(),
+        STATUS_OBJECT_TYPE_MISMATCH
+    );
+    assert_eq!(counts(&pm, pid, tid), (0, 0), "refusals take no reference");
+
+    let mut process = pm.reference_native_ps_body(kernel, 0x3000, Some(PsHandleType::Process)).unwrap();
+    assert_eq!(process.object(), HandleObject::Process(pid));
+    let handle = pm
+        .insert_authorized_native_ps_handle(kernel, &process, crate::PROCESS_ALL_ACCESS, OBJ_KERNEL_HANDLE)
+        .unwrap();
+    assert_ne!(handle & KERNEL_HANDLE_TAG, 0);
+    let raw = (handle & !KERNEL_HANDLE_TAG) as Handle;
+    assert_eq!(pm.lookup_handle(system, raw), Some(HandleObject::Process(pid)));
+    process.release(&mut pm).unwrap();
+    assert_eq!(counts(&pm, pid, tid).0, 0, "publication does not consume the pointer owner");
+    assert_eq!(pm.lookup_handle(system, raw), Some(HandleObject::Process(pid)));
+
+    let mut thread = pm.reference_native_ps_body(kernel, 0x4000, None).unwrap();
+    assert_eq!(thread.object(), HandleObject::Thread(tid));
+    thread.release(&mut pm).unwrap();
+    assert_eq!(counts(&pm, pid, tid).1, 0);
+}

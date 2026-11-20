@@ -943,3 +943,7 @@ diagnosis-free failure.
 - When a change breaks an existing source-text check (a pinned call name or ordering in another
   test), delete that assertion; do not repoint it at the new spelling. Carry the behavioural
   guarantee in the test that pins the new design, so each guarantee has one owner.
+
+## Local ARM Runs Miss x86_64-Only Specs
+- Some crate tests compile only on x86_64 (for example the `extern "win64"` export fixtures in nt-compat-exports). A green local run on an ARM host does not prove CI will compile them; main stayed red on an unnamed generic delay type that only the x86_64 build instantiates.
+- After every push, wait for the CI run that contains your exact commit and read its result. Do not report a slice as verified until that run is green; an earlier red run on main is still a blocker to investigate, not background noise.

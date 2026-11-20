@@ -904,6 +904,42 @@ impl ProcessManager {
         })
     }
 
+    /// `ObOpenObjectByPointer`'s Ps object admission for a KernelMode requestor. The adapter must
+    /// first prove that the caller already owns a pointer reference to `body`; this acquires one
+    /// additional counted reference for the duration of handle publication. No access check is
+    /// performed, as NT skips it for KernelMode, so a UserMode requestor is refused here.
+    pub fn reference_native_ps_body(
+        &mut self,
+        caller: NativeHandleCaller,
+        body: u64,
+        expected: Option<PsHandleType>,
+    ) -> Result<NativeObjectReference, u32> {
+        self.validate_native_handle_caller(caller)?;
+        if caller.mode != AccessMode::KernelMode {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        let (kind, object, thread) = if let Some(pid) = self.pid_for_kernel_process_object(body) {
+            (PsHandleType::Process, HandleObject::Process(pid), None)
+        } else if let Some(tid) = self.tid_for_kernel_thread_object(body) {
+            let lifetime = self.thread_lifetime(tid).ok_or(STATUS_INVALID_HANDLE)?;
+            (PsHandleType::Thread, HandleObject::Thread(tid), Some(lifetime))
+        } else {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        };
+        if expected.is_some_and(|expected| expected != kind) {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        self.retain_kernel_object_pointer(body)?;
+        Ok(NativeObjectReference {
+            system: caller.system,
+            object,
+            thread,
+            body,
+            information: NativeHandleInformation { attributes: 0, granted_access: None },
+            held: true,
+        })
+    }
+
     /// Low-level publication of an ALREADY AUTHORIZED grant; this is not ObOpenObjectByPointer's
     /// security policy. A retained target supplies stable identity, and its pointer reference is
     /// independent of the new handle's table-owned reference. Only KernelMode can select System's

@@ -10,6 +10,7 @@ use nt_process::native_handle::{NativeObjectReference, PsHandleType};
 pub(super) const LABEL: u64 = 0x7C9;
 const REFERENCE: u64 = 1;
 const RELEASE: u64 = 2;
+const OPEN_BY_POINTER: u64 = 3;
 const STATUS_UNOWNED_OBJECT: i32 = STATUS_NOT_SUPPORTED;
 
 struct TypedLease {
@@ -73,6 +74,119 @@ pub(super) extern "win64" fn ob_reference_object_by_handle(
     }
 }
 
+/// `NTSTATUS ObOpenObjectByPointer` for Process and Thread bodies. The handle is a real
+/// ProcessManager table entry; the body pointer itself is never returned as a handle. Only a
+/// KernelMode requestor without a passed access state is supported, matching NT's no-check path;
+/// other objects and requestor modes are refused rather than given a synthetic handle.
+pub(super) extern "win64" fn ob_open_object_by_pointer(
+    object: u64,
+    handle_attributes: u32,
+    passed_access_state: u64,
+    desired_access: u32,
+    object_type: u64,
+    access_mode: u8,
+    handle_out: u64,
+) -> i32 {
+    if handle_out == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    unsafe { write_unaligned(handle_out as *mut u64, 0); }
+    if object == 0 || access_mode > 1 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if passed_access_state != 0 || access_mode != 0 {
+        return STATUS_NOT_SUPPORTED;
+    }
+    let expected = match object_type {
+        0 => 0u64,
+        value if value == nt_object_manager::object_type::process_object_type_addr() => 1,
+        value if value == nt_object_manager::object_type::thread_object_type_addr() => 2,
+        _ => return STATUS_NOT_SUPPORTED,
+    };
+    let access = u64::from(desired_access) | (u64::from(handle_attributes) << 32);
+    unsafe {
+        let (words, raw, handle, unused0, unused1) =
+            call_on4_raw((LABEL << 12) | 4, OPEN_BY_POINTER, object, expected, access);
+        let canonical_status = raw == raw as u32 as u64 || raw == raw as u32 as i32 as i64 as u64;
+        let status = raw as u32 as i32;
+        if words != 4 || !canonical_status || unused0 != 0 || unused1 != 0
+            || (status == STATUS_SUCCESS) != (handle != 0)
+        {
+            crate::provider_bugcheck::report(0xc4, [LABEL, OPEN_BY_POINTER, words, raw]);
+        }
+        if status == STATUS_SUCCESS {
+            write_unaligned(handle_out as *mut u64, handle);
+        }
+        status
+    }
+}
+
+/// A body is open-able only through a pointer this exact driver domain already owns: its typed
+/// handle reference, its Ps lookup lease, or the requestor's own effective process or thread.
+fn owns_body(
+    pm: &nt_process::ProcessManager,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    body: u64,
+) -> bool {
+    let typed = unsafe { (&*core::ptr::addr_of!(LEASES)).iter().any(|lease| {
+        lease.domain == domain && lease.pml4 == inst.pml4 && lease.reference.body() == body
+    }) };
+    typed
+        || hosted_driver_process_identity::authorized_process(pm, caller, inst, body).is_ok()
+        || pm.thread_kernel_object(caller.original_thread().thread_id()) == Some(body)
+}
+
+fn open_by_pointer(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    body: u64,
+    expected: u64,
+    access: u64,
+) -> (i32, u64, u64, u64) {
+    let expected = match expected {
+        0 => None,
+        1 => Some(PsHandleType::Process),
+        2 => Some(PsHandleType::Thread),
+        _ => return (STATUS_INVALID_PARAMETER, 0, 0, 0),
+    };
+    let desired = access as u32;
+    let attributes = (access >> 32) as u32;
+    let result = unsafe {
+        crate::service_sec_image::with_provider_process_manager(|pm| {
+            pm.validate_native_handle_caller(caller)?;
+            let kind = if pm.pid_for_kernel_process_object(body).is_some() {
+                PsHandleType::Process
+            } else if pm.tid_for_kernel_thread_object(body).is_some() {
+                PsHandleType::Thread
+            } else {
+                return Err(nt_process::native_handle::STATUS_NOT_SUPPORTED);
+            };
+            if expected.is_some_and(|expected| expected != kind) {
+                return Err(nt_process::native_handle::STATUS_OBJECT_TYPE_MISMATCH);
+            }
+            if !owns_body(pm, caller, inst, domain, body) {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+            let granted = match kind {
+                PsHandleType::Process => nt_process::map_process_access(desired),
+                PsHandleType::Thread => nt_process::map_thread_access(desired),
+            };
+            let mut reference = pm.reference_native_ps_body(caller, body, Some(kind))?;
+            let handle = pm.insert_authorized_native_ps_handle(caller, &reference, granted, attributes);
+            reference.release(pm)
+                .expect("open-by-pointer retains its exact transient Ps reference");
+            handle
+        })
+    };
+    match result {
+        Ok(handle) => (STATUS_SUCCESS, handle, 0, 0),
+        Err(status) => (status as i32, 0, 0, 0),
+    }
+}
+
 /// Called by generic ObfDereferenceObject before the older process-lookup
 /// ledger. A canonical Process body without this broker's lease may belong to
 /// that ledger. A canonical Thread body without a lease is a contract violation.
@@ -116,6 +230,9 @@ pub(crate) fn service(
         Ok(caller) => caller,
         Err(status) => return (status as i32, 0, 0, 0),
     };
+    if op == OPEN_BY_POINTER {
+        return open_by_pointer(caller, inst, domain, value, packed, desired_access);
+    }
     unsafe {
         match op {
             REFERENCE => {
