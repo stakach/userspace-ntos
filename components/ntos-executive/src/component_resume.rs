@@ -805,6 +805,10 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
         trace_selected_resume_gate(b"root-parent-after-return", 0);
         return;
     }
+    // A selected wait whose scheduler service kept the lane held continues its receive (#333).
+    if kernel_provider_activation::yield_retry::redrive_waits() {
+        kernel_provider_activation::publish_runtime_waits(&mut *handler);
+    }
     if let Some(ticket) = nested_restore_owner::next_retry() {
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = allocator::enter_durable();
@@ -905,7 +909,8 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
                         progressed = true;
                     }
                     Ok(DriverEntryWaitOutcome::Returned(_terminal)) => progressed = true,
-                    Ok(DriverEntryWaitOutcome::Stopped(_stop)) => {}
+                    Ok(DriverEntryWaitOutcome::Stopped(_)
+                        | DriverEntryWaitOutcome::YieldRetained) => {}
                     Err(status) => report_retained(status),
                 }
                 // A fresh wait owns its observed timeout origin and replaces the old frame

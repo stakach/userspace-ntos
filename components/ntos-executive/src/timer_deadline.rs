@@ -102,6 +102,10 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             DELAY_TIMER_SOURCE_WIN32K_STARTUP_RESTORE,
         ),
         (
+            service_sec_image::kernel_provider_activation::yield_retry::next_deadline(),
+            DELAY_TIMER_SOURCE_KERNEL_YIELD_RETRY,
+        ),
+        (
             driver_launch::hosted_acpi_pci_route_recovery_next_deadline(now.monotonic_100ns),
             DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY,
         ),

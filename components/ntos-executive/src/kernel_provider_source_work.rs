@@ -147,11 +147,12 @@ pub(super) unsafe fn park(
 
 /// Continue the receive half once. The entry is claimed from the retained activation before
 /// any restoration, so every later failure retains an uncertain pump and is never replayed.
+/// `None` when a later scheduler service kept the lane held: the runner continues it.
 pub(super) unsafe fn resume(
     caller: KernelProviderCaller,
     parked: ParkedSourceWork,
     publication: win32k_glue::KernelJobPublication,
-) -> Result<KernelJobOutcome, u32> {
+) -> Result<Option<KernelJobOutcome>, u32> {
     let scope = driver_launch::ComponentSchedulerScope::enter();
     let terminal = parked.terminal();
     // A recorded return retires the recipient; keep its target for the final trace line.
@@ -197,7 +198,10 @@ pub(super) unsafe fn resume(
             caller, attempt, channel, Some(result), None, status,
         ));
     }
-    let outcome = finish_entered_kernel_job(&scope, caller, result)?;
+    let Some(outcome) = finish_entered_kernel_job(&scope, caller, result)? else {
+        trace_source_work_for(b"yield-retained", caller, tid, parked.wait, 0);
+        return Ok(None);
+    };
     use nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome as Stop;
     let (stage, detail): (&[u8], u64) = match outcome.stop {
         Stop::Returned(status) => (b"returned", u64::from(status)),
@@ -206,7 +210,7 @@ pub(super) unsafe fn resume(
         _ => (b"stopped", 0),
     };
     trace_source_work_for(stage, caller, tid, parked.wait, detail);
-    Ok(outcome)
+    Ok(Some(outcome))
 }
 
 static STOP_TRACES: AtomicU64 = AtomicU64::new(0);

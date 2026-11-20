@@ -44,6 +44,20 @@ enum KernelCaptureRefusalSlot {
         status: u32,
         resume: Option<KernelResumeAuthority>,
     },
+    /// A scheduler service could not hand this job's lane back (#333). The receive attempt,
+    /// the yielded pump and the owed step stay here until the owner continues the same receive.
+    SchedulerYield(RetainedKernelYield),
+}
+
+/// Everything one scheduler-yield receive needs after its service, kept across unwinding.
+pub(super) struct RetainedKernelYield {
+    pub caller: KernelProviderCaller,
+    pub attempt: KernelProviderPumpAttempt,
+    pub channel: spawn_hosts::PumpChannel,
+    pub previous: spawn_hosts::PumpResult,
+    pub step: crate::driver_launch::SchedulerYieldStep,
+    pub entry_reply: u64,
+    pub capture: Option<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture>,
 }
 
 /// The selected wait's authority survives a pre-Call adapter refusal and a later uncertain
@@ -249,6 +263,50 @@ impl KernelJobRecipient {
             status, resume,
         };
         if identity_ok { status } else { nt_process::STATUS_INVALID_HANDLE }
+    }
+
+    /// Move a reserved receive whose scheduler service kept the lane held into this row.
+    pub(super) fn retain_scheduler_yield(
+        &mut self,
+        caller: KernelProviderCaller,
+        attempt: KernelProviderPumpAttempt,
+        channel: spawn_hosts::PumpChannel,
+        previous: spawn_hosts::PumpResult,
+        step: crate::driver_launch::SchedulerYieldStep,
+        capture: Option<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture>,
+    ) {
+        let KernelCaptureRefusalSlot::Reserved { caller: reserved, entry_reply } = self.refusal
+        else { panic!("kernel provider stop lost its pre-entry owner") };
+        assert!(reserved == caller, "kernel scheduler yield retained for another caller");
+        self.refusal = KernelCaptureRefusalSlot::SchedulerYield(RetainedKernelYield {
+            caller, attempt, channel, previous, step, entry_reply, capture,
+        });
+    }
+
+    /// The retained yield an owner may drive again, and whether it resumes a selected wait.
+    pub(super) fn retained_yield(&self) -> Option<(bool, bool)> {
+        match &self.refusal {
+            KernelCaptureRefusalSlot::SchedulerYield(retained) =>
+                Some((retained.step.retryable(), retained.capture.is_some())),
+            _ => None,
+        }
+    }
+
+    /// Take the retained yield for one retry, restoring its pre-entry reservation. The caller
+    /// either continues the receive or returns the row with [`Self::return_scheduler_yield`].
+    pub(super) fn take_scheduler_yield(&mut self, caller: KernelProviderCaller) -> Option<RetainedKernelYield> {
+        let KernelCaptureRefusalSlot::SchedulerYield(retained) = &self.refusal else { return None };
+        if retained.caller != caller || !retained.step.retryable() { return None; }
+        let entry_reply = retained.entry_reply;
+        let KernelCaptureRefusalSlot::SchedulerYield(retained) = core::mem::replace(
+            &mut self.refusal, KernelCaptureRefusalSlot::Reserved { caller, entry_reply },
+        ) else { unreachable!("checked retained scheduler yield") };
+        Some(retained)
+    }
+
+    pub(super) fn return_scheduler_yield(&mut self, retained: RetainedKernelYield) {
+        debug_assert!(matches!(self.refusal, KernelCaptureRefusalSlot::Reserved { .. }));
+        self.refusal = KernelCaptureRefusalSlot::SchedulerYield(retained);
     }
 
     /// Release only after the result and any provider request are safely observed.

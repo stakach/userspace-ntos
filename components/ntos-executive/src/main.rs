@@ -3183,6 +3183,8 @@ const DELAY_TIMER_SOURCE_SOURCE_IRP_PROBE: u64 = 49;
 /// Routed Section pages owe retained paging writes, or a flushing caller waits on them.
 const DELAY_TIMER_SOURCE_SECTION_WRITEBACK: u64 = 50;
 const DELAY_TIMER_SOURCE_SECTION_EXTEND: u64 = 51;
+/// A kernel job's scheduler yield whose lane stayed held retries its parent restore (#333).
+const DELAY_TIMER_SOURCE_KERNEL_YIELD_RETRY: u64 = 52;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -17865,6 +17867,8 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(27, driver_launch::hosted_provider_export_lane::wake_due(now_100ns))
         + subdrain!(28, spawn_hosts::shared_ingress::owner::runtime::nested::wake_abort_due(now_100ns))
         + subdrain!(29, unsafe { win32k_glue::win32k_startup_restore_wake_due(now_100ns) })
+        + subdrain!(29, unsafe {
+            service_sec_image::kernel_provider_activation::yield_retry::wake_due(now_100ns) })
         + subdrain!(14, cm_key_ownership::wake_due(now_100ns))
         + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
         + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))

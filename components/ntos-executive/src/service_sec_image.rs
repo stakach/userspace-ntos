@@ -4583,6 +4583,9 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
     if unsafe { win32k_glue::win32k_startup_restore_next_deadline() }.is_some() {
         unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
     }
+    if unsafe { kernel_provider_activation::yield_retry::next_deadline() }.is_some() {
+        unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
+    }
     // A completed physical fold can be waiting only for its exact CM ACK. It still owns the
     // reserve, so redrive that receipt before any ordinary snapshot tries to acquire it.
     if crate::writable_fs::system_wal_fold_ack_pending() {

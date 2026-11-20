@@ -178,7 +178,10 @@ pub(crate) use hosted_dpc_scheduler::{
     next_deadline as hosted_dpc_next_deadline, wake_due as hosted_dpc_wake_due,
 };
 use component_scheduler::hosted_component_pump;
-pub(crate) use component_scheduler::{ComponentSchedulerScope, SchedulerServiceRefusal};
+pub(crate) use component_scheduler::{
+    ComponentSchedulerScope, SchedulerServiceRefusal, SchedulerYieldStep, scheduler_yield_step,
+    retry_scheduler_yield_restore,
+};
 pub(crate) use component_scheduler::handoff_exact_component_once;
 
 #[path = "device_property.rs"]

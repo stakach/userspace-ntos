@@ -24,6 +24,8 @@ pub(crate) use source_work::source_work_yield;
 mod terminal;
 #[path = "kernel_provider_wait_work.rs"]
 mod wait_work;
+#[path = "kernel_provider_yield_retry.rs"]
+pub(crate) mod yield_retry;
 pub(super) use wait_work::{publish_bootstrap_waits, publish_runtime_waits};
 use bootstrap::{KernelJobCompletion, KernelJobInitialization, KernelJobRecipient, KernelResumeAuthority};
 
@@ -132,43 +134,37 @@ pub(crate) unsafe fn run_kernel_job(
     } else {
         KernelJobOrigin::Executive
     };
-    let outcome = run_issued_kernel_job(caller).map_err(|status| {
+    let entered = run_issued_kernel_job(caller).map_err(|status| {
         source_work::trace_stop(caller, b"entry", status);
         status
     })?;
-    if let Some(receipt) = outcome.receipt {
-        deliver_driver_entry_completion(receipt)?;
-    }
-    if let Some(status) = result.returned() { return Ok(KernelJobRun::Returned(status)); }
-    if !matches!(outcome.stop, Stop::WaitCaptured(_) | Stop::SourceWorkYielded) {
-        source_work::trace_stop(caller, b"initial-stop", nt_process::STATUS_UNSUCCESSFUL);
-        return Ok(KernelJobRun::Incomplete(nt_process::STATUS_UNSUCCESSFUL));
-    }
-    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
-    if handler.is_null() {
-        source_work::trace_stop(caller, b"no-handler", nt_status::NtStatus::DEVICE_NOT_READY.raw() as u32);
-        return Err(nt_status::NtStatus::DEVICE_NOT_READY.raw() as u32);
-    }
-    let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    use spawn_hosts::shared_ingress::owner::runtime as ingress;
-    if outcome.stop.runner_step(origin) == KernelJobRunnerStep::ParkForServiceLoop {
-        // Publish the captured wait now, as the runner's first pass used to: the lane leaves
-        // Running, so the wait's owner and every other provider dispatch can execute.
-        publish_runtime_waits(&mut *handler);
-        return Ok(KernelJobRun::Parked);
-    }
-    // Present only while this job has lent its publication to its own source terminal. The
-    // page is copied before any other owner below can publish over it.
-    let mut parked = match outcome.stop {
-        Stop::SourceWorkYielded => match source_work::park(caller, publication) {
-            Ok(owner) => Some(owner),
-            Err(status) => {
-                source_work::trace_stop(caller, b"park-refused", status);
+    // A scheduler yield whose lane stayed held is this runner's to continue (#333).
+    let mut retained_yield = entered.is_none();
+    let mut parked = None;
+    let handler;
+    let _message;
+    match entered {
+        Some(outcome) => {
+            if let Some(receipt) = outcome.receipt {
+                deliver_driver_entry_completion(receipt)?;
+            }
+            if let Some(status) = result.returned() { return Ok(KernelJobRun::Returned(status)); }
+            if !matches!(outcome.stop, Stop::WaitCaptured(_) | Stop::SourceWorkYielded) {
+                source_work::trace_stop(caller, b"initial-stop", nt_process::STATUS_UNSUCCESSFUL);
                 return Ok(KernelJobRun::Incomplete(nt_process::STATUS_UNSUCCESSFUL));
             }
-        },
-        _ => None,
-    };
+            handler = runner_handler(caller)?;
+            _message = crate::ipc_message::SavedMessageBuffer::capture();
+            if let Some(run) = admit_runner_stop(caller, origin, handler, publication, outcome.stop,
+                &mut parked)
+            { return Ok(run); }
+        }
+        None => {
+            handler = runner_handler(caller)?;
+            _message = crate::ipc_message::SavedMessageBuffer::capture();
+        }
+    }
+    use spawn_hosts::shared_ingress::owner::runtime as ingress;
     let mut parked_passes = 0u64;
     let mut heartbeat = ps_callout::RunnerHeartbeat::new();
     loop {
@@ -176,6 +172,31 @@ pub(crate) unsafe fn run_kernel_job(
         component_resume::run_outer(handler);
         redrive_ready_completions();
         if let Some(status) = result.returned() { return Ok(KernelJobRun::Returned(status)); }
+        if retained_yield {
+            match yield_retry::resume(caller)? {
+                Some(yield_retry::Resumed::Initial(outcome)) => {
+                    retained_yield = false;
+                    if let Some(receipt) = outcome.receipt {
+                        deliver_driver_entry_completion(receipt)?;
+                    }
+                    if let Some(status) = result.returned() {
+                        return Ok(KernelJobRun::Returned(status));
+                    }
+                    if !matches!(outcome.stop, Stop::WaitCaptured(_) | Stop::SourceWorkYielded) {
+                        source_work::trace_stop(caller, b"resumed-stop", nt_process::STATUS_UNSUCCESSFUL);
+                        return Ok(KernelJobRun::Incomplete(nt_process::STATUS_UNSUCCESSFUL));
+                    }
+                    if let Some(run) = admit_runner_stop(caller, origin, handler, publication,
+                        outcome.stop, &mut parked)
+                    { return Ok(run); }
+                    continue;
+                }
+                Some(yield_retry::Resumed::Wait(_)) => return Err(nt_process::STATUS_INVALID_PARAMETER),
+                None => {}
+            }
+        }
+        // A retained yield has no observed stop yet; its retry above is the only progress.
+        if !retained_yield {
         let stop = (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?.stopped_outcome()
             .map_err(|status| {
                 source_work::trace_stop(caller, b"unobserved-stop", status);
@@ -206,11 +227,15 @@ pub(crate) unsafe fn run_kernel_job(
             match owner.terminal() {
                 KernelSourceTerminal::Acknowledged => {
                     parked_passes = 0;
-                    let resumed = source_work::resume(caller, owner, publication)
+                    let Some(resumed) = source_work::resume(caller, owner, publication)
                         .map_err(|status| {
                             source_work::trace_stop(caller, b"resume", status);
                             status
-                        })?;
+                        })?
+                    else {
+                        retained_yield = true;
+                        continue;
+                    };
                     if resumed.stop.runner_step(origin) == KernelJobRunnerStep::ParkForServiceLoop {
                         // Leave before any other owner can resume this wait under the
                         // runner: only the service loop runs the job without a publication.
@@ -241,6 +266,7 @@ pub(crate) unsafe fn run_kernel_job(
                     parked = Some(owner);
                 }
             }
+        }
         }
         if redrive_nested_hosted_file_work() { continue; }
         {
@@ -285,6 +311,45 @@ pub(crate) unsafe fn run_kernel_job(
             spawn_hosts::pump_handle_executive_event_badge(message.badge());
         }
     }
+}
+
+unsafe fn runner_handler(caller: KernelProviderCaller) -> Result<*mut ExecNtHandler, u32> {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler.is_null() {
+        source_work::trace_stop(caller, b"no-handler", nt_status::NtStatus::DEVICE_NOT_READY.raw() as u32);
+        return Err(nt_status::NtStatus::DEVICE_NOT_READY.raw() as u32);
+    }
+    Ok(handler)
+}
+
+/// Admit a job's first observed stop into the runner: a captured wait goes to the service
+/// loop, and a source-work stop lends this job's publication to its own terminal. The page
+/// is copied before any other owner can publish over it.
+unsafe fn admit_runner_stop(
+    caller: KernelProviderCaller,
+    origin: nt_user_host::provider_kernel_wait::KernelJobOrigin,
+    handler: *mut ExecNtHandler,
+    publication: win32k_glue::KernelJobPublication,
+    stop: nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome,
+    parked: &mut Option<source_work::ParkedSourceWork>,
+) -> Option<KernelJobRun> {
+    use nt_user_host::provider_kernel_wait::{KernelJobRunnerStep, KernelProviderStoppedOutcome as Stop};
+    if stop.runner_step(origin) == KernelJobRunnerStep::ParkForServiceLoop {
+        // Publish the captured wait now, as the runner's first pass used to: the lane leaves
+        // Running, so the wait's owner and every other provider dispatch can execute.
+        publish_runtime_waits(&mut *handler);
+        return Some(KernelJobRun::Parked);
+    }
+    if matches!(stop, Stop::SourceWorkYielded) {
+        match source_work::park(caller, publication) {
+            Ok(owner) => *parked = Some(owner),
+            Err(status) => {
+                source_work::trace_stop(caller, b"park-refused", status);
+                return Some(KernelJobRun::Incomplete(nt_process::STATUS_UNSUCCESSFUL));
+            }
+        }
+    }
+    None
 }
 
 pub(super) unsafe fn wait_resume_is_eligible(
@@ -570,18 +635,22 @@ pub(crate) struct KernelJobOutcome {
 
 /// Claim the first pump once, then only genuine IRQ-yield receive continuations. The provider
 /// retains its Running lane throughout; walls and typed waits do not enter this scheduler path.
+/// A yield whose lane stayed held is continued here, behind the bootstrap receive owner.
 pub(crate) unsafe fn run_initial_driver_entry(
     caller: KernelProviderCaller,
 ) -> Result<KernelJobOutcome, u32> {
     if !(&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?.is_driver_entry() {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
-    run_issued_kernel_job(caller)
+    match run_issued_kernel_job(caller)? {
+        Some(outcome) => Ok(outcome),
+        None => yield_retry::await_initial(caller),
+    }
 }
 
 unsafe fn run_issued_kernel_job(
     caller: KernelProviderCaller,
-) -> Result<KernelJobOutcome, u32> {
+) -> Result<Option<KernelJobOutcome>, u32> {
     let scope = driver_launch::ComponentSchedulerScope::enter();
     let (channel, mut attempt) = with_provider_process_manager(|pm| {
         let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
@@ -609,12 +678,23 @@ unsafe fn run_issued_kernel_job(
 
 /// Shared tail of every initial-origin entry: service scheduler yields, then classify the
 /// observed stop and, for a real return, record its completion from retained evidence.
+/// `None` when a scheduler service kept the lane held: the job's retry owner continues it.
 unsafe fn finish_entered_kernel_job(
     scope: &driver_launch::ComponentSchedulerScope,
     caller: KernelProviderCaller,
     result: spawn_hosts::PumpResult,
+) -> Result<Option<KernelJobOutcome>, u32> {
+    match receive_driver_entry_yields(scope, caller, None, result, None)? {
+        yield_retry::YieldsEnd::Received(result) => classify_entered_kernel_job(caller, result).map(Some),
+        yield_retry::YieldsEnd::Retained => Ok(None),
+    }
+}
+
+/// Classify an initial-origin job's observed stop and, for a real return, record its completion.
+unsafe fn classify_entered_kernel_job(
+    caller: KernelProviderCaller,
+    result: spawn_hosts::PumpResult,
 ) -> Result<KernelJobOutcome, u32> {
-    let result = receive_driver_entry_yields(scope, caller, None, result)?;
     use nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome;
     let stop = (&*core::ptr::addr_of!(ACTIVATIONS))
         .recipient(caller)?
@@ -663,25 +743,34 @@ unsafe fn receive_driver_entry_yields(
     caller: KernelProviderCaller,
     capture: Option<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture>,
     mut result: spawn_hosts::PumpResult,
-) -> Result<spawn_hosts::PumpResult, u32> {
+    mut retained: Option<yield_retry::RetainedYield>,
+) -> Result<yield_retry::YieldsEnd, u32> {
     let mut watch =
         nt_user_host::provider_kernel_yield::KernelJobYieldWatch::new(monotonic_time_100ns());
-    while result.scheduler_yielded {
-        if let Some(report) = watch.observe(monotonic_time_100ns(), result.provider_messages) {
-            ps_callout::trace_silent_yields(caller, capture, report);
-        }
-        let (receiving, mut receive_attempt, previous) = with_provider_process_manager(|pm| {
-            let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
-            activations.validate(
-                caller,
-                pm,
-                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
-                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
-            )?;
-            activations
-                .recipient_mut(caller)?
-                .begin_receive_after_yield(caller)
-        })?;
+    loop {
+        let (receiving, mut receive_attempt, previous, step) = match retained.take() {
+            // A retried yield already owns its receive attempt and reservation.
+            Some(retained) => (retained.channel, retained.attempt, retained.previous, retained.step),
+            None => {
+                if !result.scheduler_yielded { break; }
+                if let Some(report) = watch.observe(monotonic_time_100ns(), result.provider_messages) {
+                    ps_callout::trace_silent_yields(caller, capture, report);
+                }
+                let (receiving, receive_attempt, previous) = with_provider_process_manager(|pm| {
+                    let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
+                    activations.validate(
+                        caller,
+                        pm,
+                        &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                        &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+                    )?;
+                    activations
+                        .recipient_mut(caller)?
+                        .begin_receive_after_yield(caller)
+                })?;
+                (receiving, receive_attempt, previous, driver_launch::SchedulerYieldStep::Service)
+            }
+        };
         if let Err(status) = validate_driver_entry_execution(caller, capture, &receive_attempt) {
             return Err(retain_driver_entry_uncertain(
                 caller, receive_attempt, receiving, None,
@@ -689,10 +778,14 @@ unsafe fn receive_driver_entry_yields(
                 status,
             ));
         }
-        if scope.service_irq_yield(receiving.shared_va).is_err() {
-            // DriverEntry has no owner for a retained scheduler yield yet (#333): receiving
-            // on its held lane would block the root, so stop here rather than hang.
-            panic!("DriverEntry scheduler service could not hand back its lane");
+        if !step.may_receive() {
+            let step = driver_launch::scheduler_yield_step(scope.service_irq_yield(receiving.shared_va));
+            if !step.may_receive() {
+                // The lane is held, or was never serviced: receiving on it would block the
+                // root. Keep the attempt, pump and owed step for this job's retry owner (#333).
+                return yield_retry::retain(
+                    caller, receive_attempt, receiving, previous, step, capture);
+            }
         }
         // Dedicated IRQ workers can perform nested IPC. Recheck authority after those effects,
         // without minting another attempt or permitting a failed entered continuation to replay.
@@ -754,7 +847,7 @@ unsafe fn receive_driver_entry_yields(
             ));
         }
     }
-    Ok(result)
+    Ok(yield_retry::YieldsEnd::Received(result))
 }
 
 /// The recipient's inline row was reserved before this exact native pump. Store the refused

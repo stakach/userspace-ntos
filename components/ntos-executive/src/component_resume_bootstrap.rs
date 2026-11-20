@@ -88,6 +88,8 @@ pub(crate) unsafe fn run_bootstrap_outer(
         let _durable = allocator::enter_durable();
         spawn_hosts::shared_ingress::owner::runtime::nested::drain_abort();
         win32k_glue::drain_win32k_startup_restores();
+        // A selected wait whose scheduler service kept the lane held continues here (#333).
+        let _ = kernel_provider_activation::yield_retry::redrive_waits();
     if let Some(initialized) = kernel_provider_activation::take_retained_bootstrap_result(target) {
         return Ok(BootstrapPassOutcome::TargetAcknowledged { initialized });
     }
@@ -102,6 +104,7 @@ pub(crate) unsafe fn run_bootstrap_outer(
         if let Some(deadline) = [
             spawn_hosts::shared_ingress::owner::runtime::nested::next_abort_deadline(),
             win32k_glue::win32k_startup_restore_next_deadline(),
+            kernel_provider_activation::yield_retry::next_deadline(),
         ].into_iter().flatten().min() {
             return Ok(BootstrapPassOutcome::Deferred { deadline });
         }
@@ -133,7 +136,7 @@ pub(crate) unsafe fn run_bootstrap_outer(
                     progressed = true;
                 }
                 Ok(DriverEntryWaitOutcome::Returned(_)) => progressed = true,
-                Ok(DriverEntryWaitOutcome::Stopped(_)) => {}
+                Ok(DriverEntryWaitOutcome::Stopped(_) | DriverEntryWaitOutcome::YieldRetained) => {}
                 Err(status) => report_retained(status),
             }
             progressed |= kernel_provider_activation::publish_bootstrap_waits()

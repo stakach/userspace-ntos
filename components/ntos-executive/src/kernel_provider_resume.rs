@@ -58,6 +58,8 @@ pub(crate) enum DriverEntryWaitOutcome {
     WaitCaptured(KernelProviderWaitCapture),
     Returned(nt_component_suspension::TerminalIdentity),
     Stopped(spawn_hosts::PumpResult),
+    /// A scheduler service kept the lane held; `yield_retry` continues this same receive.
+    YieldRetained,
 }
 
 /// Readiness selects the real typed frame before this entry. The outer bootstrap receive owner
@@ -131,11 +133,13 @@ pub(crate) unsafe fn run_driver_entry_wait_resume(
             Some(KernelResumeAuthority { capture, selection: Some(selection) }), status,
         ));
     }
-    let result = receive_driver_entry_yields(&scope, caller, Some(capture), result)?;
-    finish_stopped_wait(caller, capture, result)
+    match receive_driver_entry_yields(&scope, caller, Some(capture), result, None)? {
+        super::yield_retry::YieldsEnd::Received(result) => finish_stopped_wait(caller, capture, result),
+        super::yield_retry::YieldsEnd::Retained => Ok(DriverEntryWaitOutcome::YieldRetained),
+    }
 }
 
-unsafe fn finish_stopped_wait(
+pub(super) unsafe fn finish_stopped_wait(
     caller: KernelProviderCaller,
     previous: KernelProviderWaitCapture,
     result: spawn_hosts::PumpResult,
