@@ -63508,6 +63508,52 @@ fn io_port_in_range(port: u16, base: u64, len: u64) -> bool {
     len != 0 && port >= base && port < base.saturating_add(len)
 }
 
+/// #425 census: the 8042 status register (port 0x64), read through the live port grant of the
+/// driver that owns the controller. Reading the status register has no device effect. `None`
+/// while no current resource record grants the port.
+pub(crate) unsafe fn i8042_status_sample() -> Option<u8> {
+    const I8042_STATUS_PORT: u16 = 0x64;
+    let resource = hosted_device_resource_states()?.iter().find_map(|state| {
+        hosted_state_address_resources(state).iter().copied().find(|resource| {
+            resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT
+                && resource.broker_va_or_root_cap != 0
+                && io_port_in_range(I8042_STATUS_PORT, resource.translated_start, resource.len)
+        })
+    })?;
+    let (status, error) = crate::io_in8_r(resource.broker_va_or_root_cap, I8042_STATUS_PORT);
+    (error == 0).then_some(status)
+}
+
+static I8042_CENSUS_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static I8042_LAST_OUTPUT_FULL: AtomicBool = AtomicBool::new(false);
+
+/// #425 periodic input census. A full output buffer (OBF) seen at two consecutive samples, a
+/// whole census period apart, is a byte no ISR consumed: its IRQ1/IRQ12 edge never arrived.
+/// That sample, and the first one as a baseline, also asks the kernel for its IRQ route
+/// snapshot (IOAPIC mask, remote IRR and delivery state for pins 1 and 12). Read-only.
+pub(crate) unsafe fn print_i8042_input_census() {
+    let Some(status) = i8042_status_sample() else { return };
+    let sample = I8042_CENSUS_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+    let output_full = status & 0x01 != 0;
+    let aux = status & 0x20 != 0;
+    let previously_full = I8042_LAST_OUTPUT_FULL.swap(output_full, Ordering::Relaxed);
+    let stuck = output_full && previously_full;
+    print_str(b"[census] i8042 sample=");
+    print_u64(sample);
+    print_str(b" status=0x");
+    print_hex(u32::from(status));
+    print_str(b" obf=");
+    print_u64(u64::from(output_full));
+    print_str(b" auxb=");
+    print_u64(u64::from(aux));
+    print_str(b" stuck=");
+    print_u64(u64::from(stuck));
+    print_str(b"\n");
+    if sample == 1 || stuck {
+        sel4_rt::debug_snapshot();
+    }
+}
+
 pub(crate) unsafe fn hosted_io_port_fault_grant(
     shared_va: u64,
     port: u16,

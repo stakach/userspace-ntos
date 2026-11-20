@@ -7372,6 +7372,7 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
         }
     }
 
+    unsafe { driver_launch::print_i8042_input_census() };
     print_str(b"[census] periodic #");
     print_u64(n);
     print_str(b" t_ms=");
