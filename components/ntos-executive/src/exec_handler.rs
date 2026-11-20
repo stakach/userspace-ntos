@@ -11915,6 +11915,9 @@ impl ExecNtHandler {
             }
         }
         crate::hot_service_cost_census::record_wait_timeout(timeout_interval);
+        if timeout_interval == Some(0) {
+            self.sample_zero_timeout_wait(count);
+        }
         if let Some(timeout) = timeout_interval.map(PendingWaitTimeout::from_interval) {
             if timeout.is_due_now() == Some(true) {
                 return 0x102;
@@ -11931,6 +11934,43 @@ impl ExecNtHandler {
         self.wait_park_all = wait_all;
         self.wait_alertable = alertable;
         0x102
+    }
+
+    /// Boot 44689472419: ~1.03M NtWaitForMultipleObjects calls polled with a zero timeout. Name the
+    /// user-mode caller: at doubling call counts (1, 2, 4, ...; at most 24 records), print the
+    /// caller's return IP and the top of its user stack for offline symbolization.
+    fn sample_zero_timeout_wait(&mut self, count: usize) {
+        static ZERO_WAITS: AtomicU64 = AtomicU64::new(0);
+        static RECORDS: AtomicU64 = AtomicU64::new(0);
+        let n = ZERO_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if !n.is_power_of_two() || RECORDS.fetch_add(1, Ordering::Relaxed) >= 24 {
+            return;
+        }
+        print_str(b"[zero-timeout-wait] n=");
+        print_u64(n);
+        print_str(b" pi=");
+        print_u64(self.pi as u64);
+        print_str(b" tid=");
+        print_u64(self.current_tid);
+        print_str(b" badge=");
+        print_u64(self.current_badge);
+        print_str(b" objects=");
+        print_u64(count as u64);
+        print_str(b" ip=0x");
+        print_hex_u64(self.current_resume_ip);
+        print_str(b" sp=0x");
+        print_hex_u64(self.current_sp);
+        print_str(b" stack:");
+        for index in 0..24u64 {
+            let mut bytes = [0u8; 8];
+            let Some(address) = self.current_sp.checked_add(index * 8) else { break };
+            if !unsafe { self.xas_read(address, &mut bytes) } {
+                break;
+            }
+            print_str(b" ");
+            print_hex_u64(u64::from_le_bytes(bytes));
+        }
+        print_str(b"\n");
     }
 
     fn process_thread_or_file_wait_object(
