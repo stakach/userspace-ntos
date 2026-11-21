@@ -7,7 +7,8 @@
 use super::*;
 
 const BATCH_SECTORS: u32 = 32;
-const MAX_BATCH_SECTORS: u32 = 256;
+/// The largest batch an async snapshot commit accepts; its write buffer is sized from it.
+pub const MAX_BATCH_SECTORS: u32 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AsyncSnapshotIoKind {

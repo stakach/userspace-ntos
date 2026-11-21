@@ -128,6 +128,7 @@ pub use volume_open_route::{
 };
 pub use snapshot_store::{
     AnchoredWalPublication, AsyncSnapshotCommit, AsyncSnapshotCommitError, AsyncSnapshotHeaderRecheck,
+    ASYNC_SNAPSHOT_MAX_BATCH_SECTORS,
     AsyncSnapshotIoKind, AsyncSnapshotRequest, AsyncWalSnapshotAnchorUpdate, AsyncWalEpochRollover,
     RecheckedPairedWalSnapshot, BootSnapshotRecovery,
     PayloadSectorReader, PayloadSectorWriter, SnapshotBlockDevice, SnapshotBlockStore,

@@ -14,7 +14,8 @@ pub use payload_writer::PayloadSectorWriter;
 
 #[path = "snapshot_async_commit.rs"]
 mod async_commit;
-pub use async_commit::{AsyncSnapshotCommit, AsyncSnapshotCommitError, AsyncSnapshotIoKind, AsyncSnapshotRequest};
+pub use async_commit::{AsyncSnapshotCommit, AsyncSnapshotCommitError, AsyncSnapshotIoKind, AsyncSnapshotRequest,
+    MAX_BATCH_SECTORS as ASYNC_SNAPSHOT_MAX_BATCH_SECTORS};
 
 #[path = "snapshot_async_header_recheck.rs"]
 mod async_header_recheck;

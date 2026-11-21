@@ -92,6 +92,7 @@ pub mod irp_request_flags;
 pub mod internal_block_io;
 pub mod scsi_srb_transport;
 pub mod scsi_block_command;
+pub mod storage_adapter_limit;
 pub mod scsi_srb_wire;
 pub mod scsi_source_retention;
 pub mod kernel_irp_builder;
