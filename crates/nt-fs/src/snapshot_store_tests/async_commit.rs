@@ -485,3 +485,53 @@ fn async_commit_power_cuts_preserve_a_complete_wal_snapshot() {
         }
     }
 }
+
+/// The native lazy checkpoint's two ways to start a commit. With headers that match the
+/// boot-verified pair it starts from the rechecked pair and reads no payload sector. Once a
+/// header has changed under the reserve the recheck refuses, leaving only the full CRC scan.
+#[test]
+fn checkpoint_reads_no_payload_when_headers_match_and_scans_after_a_change() {
+    let store = SnapshotBlockStore::new(0, 256);
+    let mut disk = CachedDisk::with_sectors(256);
+    let old = alloc::vec![0x31; 40 * 512];
+    store.commit_next_with_wal_manifest(&mut disk, &old, baseline()).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, &old, baseline()).unwrap();
+    let replacement = alloc::vec![0xa5; 40 * 512];
+
+    // Matching headers: the commit issues only barriers and writes.
+    let proof = rechecked_pair(store, &mut disk);
+    let reads = disk.read_attempts;
+    let mut commit = AsyncSnapshotCommit::new_from_rechecked_pair(
+        replacement.clone(), baseline(), proof,
+    ).ok().unwrap();
+    while let Some(request) = commit.enter_next().unwrap() {
+        assert_ne!(request.kind, AsyncSnapshotIoKind::Read);
+        perform(&mut disk, &mut commit, request);
+    }
+    assert_eq!(disk.read_attempts, reads, "a matching header pair skips every payload read");
+    let (_, pair) = unsafe { commit.finish_with_paired_proof() }.ok().unwrap();
+
+    // Another writer changes a slot: the recheck of the retained pair refuses it.
+    store.commit_next_with_wal_manifest(&mut disk, b"changed", baseline()).unwrap();
+    let mut recheck = AsyncSnapshotHeaderRecheck::new(
+        store, pair, disk.sector_size(), disk.sector_count()).ok().unwrap();
+    let mut refused = false;
+    while let Some(request) = recheck.enter_next().unwrap_or(None) {
+        let mut bytes = alloc::vec![0; request.bytes];
+        disk.read_sectors(request.lba, &mut bytes).unwrap();
+        if recheck.complete_read(request, &bytes).is_err() { refused = true; break; }
+    }
+    assert!(refused, "a changed header is never trusted");
+
+    // Without a proof the commit CRC-scans each valid slot payload before writing.
+    let reads = disk.read_attempts;
+    let mut commit = AsyncSnapshotCommit::new(
+        store, replacement, baseline(), disk.sector_size(), disk.sector_count(),
+    ).ok().unwrap();
+    let mut payload_reads = 0;
+    while let Some(request) = commit.enter_next().unwrap() {
+        if request.kind == AsyncSnapshotIoKind::Read && request.bytes > 512 { payload_reads += 1; }
+        perform(&mut disk, &mut commit, request);
+    }
+    assert!(payload_reads > 0 && disk.read_attempts > reads, "a mismatch falls back to the full scan");
+}

@@ -12,7 +12,6 @@ enum Work {
         id: u64,
         lease: snapshot_storage::Lease,
         token: nt_fs::RegistryWalContinuation,
-        old_proof: nt_fs::RecheckedPairedWalSnapshot,
         commit: Commit,
         bytes: usize,
         entered: bool,
@@ -91,10 +90,13 @@ unsafe fn advance_recheck() -> Result<(), u32> {
         }
     };
     let bytes = image.as_slice().len();
-    let commit = match AsyncSnapshotCommit::new(lease.store(), image,
-        proof.manifest(), lease.sector_size(), lease.sector_count()) {
+    // The two headers were just rechecked unchanged under this exclusive reserve against a
+    // pair whose payloads were CRC-verified this boot, so no payload sector is reread. The
+    // commit retains the proof through every native effect.
+    let manifest = proof.manifest();
+    let commit = match AsyncSnapshotCommit::new_from_rechecked_pair(image, manifest, proof) {
         Ok(commit) => commit,
-        Err(error) => {
+        Err((error, _image, proof)) => {
             WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
             let status = super::restore_unwritten_checkpoint_authority(lease,
                 Some((token, proof.into_pair())), snapshot_store_error_status(error));
@@ -102,7 +104,7 @@ unsafe fn advance_recheck() -> Result<(), u32> {
             return Err(status);
         }
     };
-    *slot = Some(Work::Committing { id, lease, token, old_proof: proof,
+    *slot = Some(Work::Committing { id, lease, token,
         commit, bytes, entered: false, failed: false, settled: 0 });
     Ok(())
 }
@@ -260,7 +262,7 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
     *entered = false;
     *settled += 1;
     if !commit.is_done() { return Ok(SnapshotCompletion::Settled); }
-    let Some(Work::Committing { lease, token, old_proof, commit, bytes, .. }) = slot.take()
+    let Some(Work::Committing { lease, token, commit, bytes, .. }) = slot.take()
         else { unreachable!() };
     // Every cursor completion above came from exact native provider terminal + ACK.
     let (generation, pair) = match unsafe { commit.finish_with_paired_proof() } {
@@ -269,18 +271,15 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
             core::mem::forget(commit);
             core::mem::forget(lease);
             core::mem::forget(token);
-            core::mem::forget(old_proof);
             return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DATA_ERROR)));
         }
     };
     if pair.anchor() != token.anchor() {
         core::mem::forget(lease);
         core::mem::forget(token);
-        core::mem::forget(old_proof);
         core::mem::forget(pair);
         return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DATA_ERROR)));
     }
-    drop(old_proof);
     if let Err((status, token, pair)) = snapshot_storage::install_wal_continuation(&lease, token, pair) {
         core::mem::forget(lease);
         core::mem::forget(token);
