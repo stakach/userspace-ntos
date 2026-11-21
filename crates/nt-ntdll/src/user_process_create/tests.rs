@@ -65,6 +65,7 @@ fn the_attribute_list_kernel32_builds_for_a_user_token_decodes() {
             token: Some(0x1a4),
             client_id_out: 0x2000,
             image_info_out: 0x3000,
+            handle_list: None,
         })
     );
 }
@@ -88,7 +89,6 @@ fn an_attribute_list_needs_a_whole_image_name() {
 #[test]
 fn attributes_that_would_change_the_process_are_refused_not_dropped() {
     for number in [
-        PS_ATTRIBUTE_HANDLE_LIST,
         PS_ATTRIBUTE_MITIGATION_OPTIONS,
         PS_ATTRIBUTE_CHILD_PROCESS_POLICY,
         PS_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
@@ -143,11 +143,15 @@ impl UserProcessOps for Recorder {
         flags: u32,
         section: u64,
         debug_port: u64,
+        handle_list: Option<(u64, u64)>,
     ) -> Result<u64, u32> {
+        let list = handle_list.map_or(alloc::string::String::new(), |(address, size)| {
+            alloc::format!(",list={address:#x}/{size}")
+        });
         self.step(
             "process",
             alloc::format!(
-                "({access:#x},{object_attributes:#x},{parent:?},{flags:#x},{section:#x},{debug_port:#x})"
+                "({access:#x},{object_attributes:#x},{parent:?},{flags:#x},{section:#x},{debug_port:#x}{list})"
             ),
         )?;
         Ok(0x30)
@@ -443,4 +447,23 @@ fn the_child_block_is_denormalized_and_points_at_the_child_environment() {
     let mut expected = denormalized;
     process_params::set_environment_pointer(&mut expected, 0x2_0000);
     assert_eq!(child, expected, "the strings are block-relative again and the flag is clear");
+}
+
+/// Boot 44899095932: kernelbase's AllocConsole starts conhost with PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+/// naming the ConDrv Server handle; kernel32 passes it as PS_ATTRIBUTE_HANDLE_LIST
+/// (`PS_ATTRIBUTE_INPUT`), and the refusal (step=arguments 0xc00000bb) failed AllocConsole.
+#[test]
+fn a_handle_list_reaches_process_creation_with_inheritance() {
+    const HANDLE_LIST: u64 = PS_ATTRIBUTE_HANDLE_LIST | 0x2_0000;
+    let attributes =
+        decode_attribute_list(&attribute_list(&[(IMAGE_NAME, 70, 0x1000), (HANDLE_LIST, 8, 0x4000)]))
+            .unwrap();
+    assert_eq!(attributes.handle_list, Some((0x4000, 8)));
+
+    let mut ops = Recorder::default();
+    let mut request = request(None);
+    request.process_flags = 0x4; // PROCESS_CREATE_FLAGS_INHERIT_HANDLES
+    request.attributes.handle_list = attributes.handle_list;
+    create_user_process(&mut ops, &request).unwrap();
+    assert_eq!(ops.calls[2], "process(0x1fffff,0x500,None,0x4,0x20,0x0,list=0x4000/8)");
 }

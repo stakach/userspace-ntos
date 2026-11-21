@@ -213,22 +213,26 @@ impl UserProcessOps for NativeUserProcessOps {
         flags: u32,
         section: u64,
         debug_port: u64,
+        handle_list: Option<(u64, u64)>,
     ) -> Result<u64, u32> {
         let mut process = 0u64;
-        // SAFETY: the out handle is a live local; the caller's OBJECT_ATTRIBUTES is forwarded
-        // untouched for the service to capture.
+        let out = (&mut process as *mut u64) as u64;
+        let parent = parent.unwrap_or(NT_CURRENT_PROCESS);
+        // SAFETY: the out handle is a live local; the caller's OBJECT_ATTRIBUTES and handle array
+        // are forwarded untouched for the service to capture.
         checked(unsafe {
-            trap_stubs::nt_create_process_ex(
-                (&mut process as *mut u64) as u64,
-                u64::from(access),
-                object_attributes,
-                parent.unwrap_or(NT_CURRENT_PROCESS),
-                u64::from(flags),
-                section,
-                debug_port,
-                0,
-                0,
-            )
+            match handle_list {
+                // NtCreateProcessEx cannot restrict inheritance to a list; the executive's private
+                // service takes the same nine arguments plus the HANDLE array.
+                Some((list, size)) => trap_stubs::nt_create_process_ex_with_handle_list(
+                    out, u64::from(access), object_attributes, parent, u64::from(flags), section,
+                    debug_port, 0, 0, list, size,
+                ),
+                None => trap_stubs::nt_create_process_ex(
+                    out, u64::from(access), object_attributes, parent, u64::from(flags), section,
+                    debug_port, 0, 0,
+                ),
+            }
         })?;
         if process == 0 { Err(STATUS_INVALID_HANDLE) } else { Ok(process) }
     }

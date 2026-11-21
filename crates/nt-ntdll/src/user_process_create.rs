@@ -107,13 +107,16 @@ pub struct Attributes {
     pub client_id_out: u64,
     /// Address that receives `SECTION_IMAGE_INFORMATION` (`PsAttributeImageInfo`).
     pub image_info_out: u64,
+    /// `PsAttributeHandleList`: address and byte size of the `HANDLE` array that restricts the
+    /// handles the new process inherits.
+    pub handle_list: Option<(u64, u64)>,
 }
 
 /// Decode a `PS_ATTRIBUTE_LIST` (`bytes` is exactly `TotalLength` bytes).
 ///
-/// The image name is required. Attributes the pinned kernel acts on but this service cannot honour
-/// (an explicit inherited-handle list, mitigation and policy options, object-directory isolation)
-/// are refused rather than dropped; attribute numbers the pinned kernel itself ignores stay
+/// The image name is required. An explicit inherited-handle list is carried to process creation.
+/// Attributes the pinned kernel acts on but this service cannot honour (mitigation and policy
+/// options, object-directory isolation) are refused rather than dropped; attribute numbers the pinned kernel itself ignores stay
 /// ignored.
 pub fn decode_attribute_list(bytes: &[u8]) -> Result<Attributes, u32> {
     if bytes.len() < PS_ATTRIBUTE_LIST_HEADER + PS_ATTRIBUTE_SIZE {
@@ -136,8 +139,9 @@ pub fn decode_attribute_list(bytes: &[u8]) -> Result<Attributes, u32> {
             PS_ATTRIBUTE_TOKEN => attributes.token = Some(value),
             PS_ATTRIBUTE_CLIENT_ID => attributes.client_id_out = value,
             PS_ATTRIBUTE_IMAGE_INFO => attributes.image_info_out = value,
-            PS_ATTRIBUTE_HANDLE_LIST
-            | PS_ATTRIBUTE_MITIGATION_OPTIONS
+            // The executive validates the array (whole handles, inheritable, present).
+            PS_ATTRIBUTE_HANDLE_LIST => attributes.handle_list = Some((value, size)),
+            PS_ATTRIBUTE_MITIGATION_OPTIONS
             | PS_ATTRIBUTE_CHILD_PROCESS_POLICY
             | PS_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY
             | PS_ATTRIBUTE_BNO_ISOLATION
@@ -278,6 +282,7 @@ pub trait UserProcessOps {
         flags: u32,
         section: u64,
         debug_port: u64,
+        handle_list: Option<(u64, u64)>,
     ) -> Result<u64, u32>;
     /// `NtQuerySection(SectionImageInformation)`.
     fn query_image(&mut self, section: u64) -> Result<ImageInformation, u32>;
@@ -364,6 +369,7 @@ pub fn create_user_process<O: UserProcessOps>(
                 request.process_flags,
                 section,
                 request.attributes.debug_port,
+                request.attributes.handle_list,
             )
             .map_err(|status| fail(status, Step::CreateProcess))?;
         let image = ops.query_image(section).map_err(|status| fail(status, Step::QueryImage))?;
