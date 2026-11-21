@@ -176,6 +176,26 @@ impl<P> IoManager<P> {
             .map(|binding| binding.identity))
     }
 
+    /// The FILE_OBJECT address at which `domain` already binds `file`, when it does.
+    /// `ObReferenceObjectByHandle` from the driver that owns the File returns that object: a
+    /// second projection of the same File in one domain is a binding collision.
+    pub fn owned_hosted_file_address(
+        &self,
+        domain: HostedDomainIdentity,
+        file: FileId,
+    ) -> Result<Option<u64>, NtStatus> {
+        let record = self
+            .hosted_domains
+            .get(domain.domain_id)
+            .filter(|record| domain.cookie != 0 && record.cookie() == domain.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        Ok(record
+            .files
+            .iter()
+            .find(|binding| binding.identity.file == file)
+            .map(|binding| binding.identity.address))
+    }
+
     /// Observe any binding at a physical FILE_OBJECT address, including one whose canonical
     /// File record has already retired. Exact tuple absence alone cannot prove address vacancy.
     pub fn hosted_file_identity_at_address(

@@ -266,6 +266,9 @@ dependencies = [
 [[package]]
 name = "nt-component-suspension"
 version = "0.1.0"
+dependencies = [
+ "nt-hosted-runtime",
+]
 
 [[package]]
 name = "nt-config-abi"

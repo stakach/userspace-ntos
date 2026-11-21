@@ -458,6 +458,18 @@ pub(super) unsafe fn reference_handle(
         {
             return Err(STATUS_ACCESS_DENIED);
         }
+        // The domain that owns the File (condrv referencing a handle to one of its own console
+        // Files) gets its own FILE_OBJECT back, as NT returns the one object behind every
+        // handle. Its lifetime follows its handles and IRP_MJ_CLOSE, as for ObfReferenceObject
+        // on that object, so no projection or pointer count is created.
+        if let Some(address) = io_manager_mut()
+            .owned_hosted_file_address(domain, file_id)
+            .map_err(|status| status.raw())?
+        {
+            if row_for_pointer(domain, address).is_none() {
+                return Ok((address, grant, attributes));
+            }
+        }
         if let Some(id) = row_for_handle(domain, owner, handle, file_id) {
             if row(id).device_id != device_id || row(id).phase != Phase::Live {
                 return Err(STATUS_BUSY);
