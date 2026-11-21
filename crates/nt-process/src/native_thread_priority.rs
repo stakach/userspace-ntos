@@ -22,6 +22,10 @@ impl KernelThreadPriorityPlan {
     pub const fn kernel_object(&self) -> u64 { self.ethread }
     pub const fn previous(&self) -> i32 { self.previous }
     pub const fn next(&self) -> i32 { self.next }
+    /// Whether a native TCB must change before commit.
+    pub const fn needs_scheduler_effect(&self) -> bool {
+        !matches!(self.state, ThreadState::Terminated)
+    }
 }
 
 impl ProcessManager {
@@ -33,7 +37,9 @@ impl ProcessManager {
         }
         let tid = self.tid_for_kernel_thread_object(ethread).ok_or(STATUS_INVALID_HANDLE)?;
         let thread = self.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if matches!(thread.state, ThreadState::Initialized | ThreadState::Terminated) {
+        // An unstarted thread has no TCB yet. A terminated one keeps its KTHREAD while it is
+        // referenced, and KeSetPriorityThread updates it without a scheduler effect.
+        if thread.state == ThreadState::Initialized {
             return Err(STATUS_INVALID_HANDLE);
         }
         let lifetime = self.thread_lifetime(tid).ok_or(STATUS_INVALID_HANDLE)?;

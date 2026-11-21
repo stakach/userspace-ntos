@@ -180,10 +180,13 @@ pub(super) fn dispatch(
         win32k_subsystem::W32_PS_OP_SET_THREAD_PRIORITY => {
             let plan = handler.pm.prepare_kernel_thread_priority(object, value as u32 as i32);
             plan.and_then(|plan| {
+                let mut effects = alloc::vec::Vec::new();
+                if !plan.needs_scheduler_effect() {
+                    return run(handler, PendingPlan::Thread(plan), effects);
+                }
                 let runtime = exact_runtime(handler, plan.lifetime())?;
                 let previous = nt_user_host::hosted_priority::hosted_tcb_priority(plan.previous())?;
                 let next = nt_user_host::hosted_priority::hosted_tcb_priority(plan.next())?;
-                let mut effects = alloc::vec::Vec::new();
                 if previous != next {
                     effects.try_reserve_exact(1).map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
                     effects.push(PriorityEffect::new(runtime.binding(), plan.lifetime(), previous, next));

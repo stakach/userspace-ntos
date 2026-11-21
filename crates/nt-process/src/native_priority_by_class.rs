@@ -195,13 +195,10 @@ impl ProcessManager {
             return Err(STATUS_INVALID_PARAMETER);
         }
         policy.validate()?;
+        // PsSetProcessPriorityByClass has no state check: a referenced EPROCESS of an exiting or
+        // terminated process is updated like any other, and its terminated threads carry no
+        // scheduler effect.
         let process = self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
-        if matches!(
-            process.state,
-            ProcessState::Exiting | ProcessState::Terminated
-        ) {
-            return Err(STATUS_INVALID_HANDLE);
-        }
         let base_priority = *CLASS_BASE_PRIORITIES
             .get(usize::from(process.priority_class))
             .ok_or(STATUS_INVALID_PARAMETER)?;
@@ -359,10 +356,6 @@ impl ProcessManager {
         let process = self.process(plan.pid).ok_or(STATUS_INVALID_HANDLE)?;
         if process.creation_sequence != plan.creation_sequence
             || process.state != plan.process_state
-            || matches!(
-                process.state,
-                ProcessState::Exiting | ProcessState::Terminated
-            )
             || process.priority_class != plan.expected.priority_class
             || process.base_priority != plan.expected.base_priority
             || process.quantum_reset != plan.expected.quantum_reset

@@ -110,3 +110,24 @@ fn prepared_by_class_plan_refuses_stale_process_or_thread_without_partial_commit
     assert_eq!(pm.process_scheduling_state_for_kernel_object(0x5000).unwrap(), process_before);
     assert_eq!(pm.thread_scheduling_state(tid).unwrap(), thread_before);
 }
+
+/// Boot 44918270753: win32k's foreground change called PsSetProcessPriorityByClass for a console
+/// process that had already ended but whose EPROCESS win32k still referenced, and the refusal
+/// (STATUS_INVALID_HANDLE) reached `reject_ps_broker`, which panicked. NT has no state check:
+/// KeSetPriorityAndQuantumProcess updates the terminated process and its thread fields, and a
+/// terminated thread has no scheduler effect.
+#[test]
+fn by_class_updates_a_terminated_but_referenced_process() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("conhost.exe", None, None);
+    pm.set_process_base_priority(pid, 8).unwrap();
+    let tid = pm.create_thread(pid, 0, 0, false).unwrap();
+    assert!(pm.publish_process_kernel_object(pid, 0x7000));
+    assert!(pm.publish_thread_kernel_object(tid, 0x8000));
+    pm.set_priority_class_for_kernel_process_object(0x7000, PROCESS_PRIORITY_CLASS_HIGH).unwrap();
+    pm.terminate_process(pid, 0).unwrap();
+
+    assert_eq!(pm.set_process_priority_by_class_for_kernel_object(0x7000, 1, policy()), Ok(()));
+    let state = pm.process_scheduling_state_for_kernel_object(0x7000).unwrap();
+    assert_eq!((state.base_priority, state.memory_priority), (13, 0));
+}

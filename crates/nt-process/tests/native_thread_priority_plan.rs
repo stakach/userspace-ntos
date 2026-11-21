@@ -41,3 +41,21 @@ fn hosted_system_worker_priority_plan_cannot_target_its_requestor() {
     assert_eq!(pm.thread_scheduling_state(worker).unwrap().priority, 16);
     assert_eq!(pm.thread_scheduling_state(requestor).unwrap().priority, requestor_before);
 }
+
+/// KeSetPriorityThread has no state check: win32k may adjust a referenced thread of a process that
+/// has already ended (boot 44918270753's foreground change). The PM record updates and the plan
+/// asks for no scheduler effect, because a terminated thread has no TCB to reprioritise.
+#[test]
+fn a_terminated_but_referenced_thread_takes_the_priority_without_a_scheduler_effect() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("conhost.exe", None, None);
+    let tid = pm.create_thread(pid, 0, 0, false).unwrap();
+    assert!(pm.publish_thread_kernel_object(tid, 0x2000));
+    let original = pm.thread_scheduling_state(tid).unwrap().priority;
+    pm.terminate_process(pid, 0).unwrap();
+
+    let plan = pm.prepare_kernel_thread_priority(0x2000, 12).unwrap();
+    assert!(!plan.needs_scheduler_effect());
+    assert_eq!(pm.commit_kernel_thread_priority(plan), Ok(original));
+    assert_eq!(pm.thread_scheduling_state(tid).unwrap().priority, 12);
+}
