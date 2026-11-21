@@ -631,16 +631,48 @@ impl SourceIrpLedger {
             .any(|row| row.ticket == ticket && row.free_requested)
     }
 
-    /// Resolve one IRP that the exact hosted instance is allowed to forward.
-    ///
-    /// Driver-allocated and caller-owned projections share the forwarding contract but retain
-    /// distinct teardown authority. More than one matching owner is an invalid ambiguity.
+    /// Resolve and pin one IRP that the exact hosted instance is allowed to forward.
     pub fn pin_hosted_forward(
         &mut self,
         instance: usize,
         domain: HostedDomainIdentity,
         component_address: u64,
     ) -> Result<(SourceIrpTicket, SourceIrpAllocation), SourceIrpLedgerError> {
+        let index = self.hosted_forward_row(instance, domain, component_address)?;
+        let row = &mut self.rows[index];
+        if row.retirement_started {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
+        row.pins = row
+            .pins
+            .checked_add(1)
+            .ok_or(SourceIrpLedgerError::Exhausted)?;
+        Ok((row.ticket, row.allocation))
+    }
+
+    /// The IRP the exact hosted instance may forward, observed without pinning it: the same
+    /// owner rule as `pin_hosted_forward`, and a packet whose retirement began is refused.
+    pub fn hosted_forward_allocation(
+        &self,
+        instance: usize,
+        domain: HostedDomainIdentity,
+        component_address: u64,
+    ) -> Result<(SourceIrpTicket, SourceIrpAllocation), SourceIrpLedgerError> {
+        let row = &self.rows[self.hosted_forward_row(instance, domain, component_address)?];
+        if row.retirement_started {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
+        Ok((row.ticket, row.allocation))
+    }
+
+    /// Driver-allocated and caller-owned projections share the forwarding contract but retain
+    /// distinct teardown authority. More than one matching owner is an invalid ambiguity.
+    fn hosted_forward_row(
+        &self,
+        instance: usize,
+        domain: HostedDomainIdentity,
+        component_address: u64,
+    ) -> Result<usize, SourceIrpLedgerError> {
         let mut found = None;
         for (index, row) in self.rows.iter().enumerate() {
             let owned_by_instance = matches!(
@@ -657,15 +689,7 @@ impl SourceIrpLedger {
                 }
             }
         }
-        let row = &mut self.rows[found.ok_or(SourceIrpLedgerError::NotFound)?];
-        if row.retirement_started {
-            return Err(SourceIrpLedgerError::RetirementStarted);
-        }
-        row.pins = row
-            .pins
-            .checked_add(1)
-            .ok_or(SourceIrpLedgerError::Exhausted)?;
-        Ok((row.ticket, row.allocation))
+        found.ok_or(SourceIrpLedgerError::NotFound)
     }
 
     /// `IoFreeIrp` authority is limited to storage allocated by the exact hosted driver.

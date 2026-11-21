@@ -1860,6 +1860,35 @@ pub(super) fn register_for(
     }
 }
 
+/// Admit a DPC's `IofCallDriver(device, irp)` from the lane's authenticated source: the packet
+/// must be a live IRP the instance may forward, and its next stack location must name `device`,
+/// a DEVICE_OBJECT whose canonical registration another domain's provider dispatches.
+pub(super) unsafe fn admit_call_driver(
+    source: hosted_forward_projection::ForwardSource,
+    irp: u64,
+    device: u64,
+) -> Result<nt_io_manager::forward_projection::CallDriverAdmission,
+            nt_io_manager::forward_projection::CallDriverRefusal> {
+    use nt_io_manager::forward_projection::{CallDriverRefusal, SourcePacketMemory};
+    struct Pool(hosted_source_pool_memory::SourcePoolMemory);
+    impl SourcePacketMemory for Pool {
+        fn irp(&self, address: u64) -> Option<nt_kernel_abi::Irp> { self.0.read_value(address) }
+        fn stack_location(&self, address: u64) -> Option<nt_kernel_abi::IoStackLocation> {
+            self.0.read_value(address)
+        }
+    }
+    let memory = Pool(
+        hosted_source_pool_memory::SourcePoolMemory::new(source.instance())
+            .ok_or(CallDriverRefusal::ForeignIrp)?,
+    );
+    let _guard = lock();
+    nt_io_manager::forward_projection::admit_call_driver(
+        io_manager_mut(), ledger(), source.index(), source.domain(), irp, device, &memory,
+        |device_id| hosted_forward_projection::target_provider(device_id)
+            .and_then(|(_, provider)| instance_domain_identity(provider)),
+    )
+}
+
 pub(super) fn service(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,

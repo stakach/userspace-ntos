@@ -10217,6 +10217,26 @@ impl ForwardProjectionCaller {
     }
 }
 
+/// `IofCallDriver` from a DPC or ISR to a DEVICE_OBJECT with no handler in this domain. The
+/// primary forward protocols wall the IRQ lane, so the lane publishes a typed CallDriver; `None`
+/// off the lane. The root refuses before any dispatch, leaving the IRP untouched for its owner.
+unsafe fn lane_call_driver(device: u64, irp: u64) -> Option<i32> {
+    use nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply;
+    let result = hosted_irq_lane_request(
+        nt_hosted_runtime::HostedIrqServiceKind::CallDriver,
+        FSD_SERVICE_SOURCE_IRP_LABEL,
+        &[device, irp],
+    )?;
+    if result.value_count != 2 || result.values[1] != 0 {
+        hosted_irq_lane_protocol_fault(irp);
+    }
+    match HostedForwardDispatchReply::decode(result.status, result.values[0]) {
+        Some(HostedForwardDispatchReply::Rejected(status)) => Some(status),
+        // The root issues no dispatch token yet.
+        _ => hosted_irq_lane_protocol_fault(irp),
+    }
+}
+
 extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
     unsafe {
         let Some((_, previous_location, _)) = validate_hosted_irp_packet(irp) else {
@@ -10247,6 +10267,10 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     as *const u64,
             );
             if handler == 0 {
+                // No handler in this domain: the target is cross-domain.
+                if let Some(status) = lane_call_driver(device, irp) {
+                    return status;
+                }
                 if major == major::IRP_MJ_READ as u64
                     && read_unaligned(next as *const nt_kernel_abi::IoStackLocation)
                         .file_object.0 == 0
@@ -10303,6 +10327,10 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                 STATUS_PENDING as i32,
             );
             return call_hosted_pe(handler, &[device, irp]) as u32 as i32;
+        }
+        // No DRIVER_OBJECT in this domain: the target is cross-domain.
+        if let Some(status) = lane_call_driver(device, irp) {
+            return status;
         }
 
         if major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL as u64 {

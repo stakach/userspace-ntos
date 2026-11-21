@@ -1731,6 +1731,34 @@ impl HostedIrqRootSession {
         service_result(status, Some(transferred))
     }
 
+    /// IofCallDriver from the lane's DPC to a cross-domain DEVICE_OBJECT. The reply is the
+    /// primary forward's op 1 `(status, disposition, token)`. Admission is exact; the target
+    /// dispatch on its own lane is not yet served, so an admitted call is refused, untouched,
+    /// with STATUS_INVALID_DEVICE_REQUEST, as for a target with no handler for its major.
+    unsafe fn call_driver_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        use nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply;
+        let (index, inst) = match self.lane_driver(lane_index, command, FSD_SERVICE_SOURCE_IRP_LABEL) {
+            Ok(driver) => driver,
+            Err(refused) => return refused,
+        };
+        let Some(source) = hosted_forward_projection::ForwardSource::new(index, inst) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let [device, irp, ..] = command.arguments;
+        let status = match hosted_source_irp_ledger::admit_call_driver(source, irp, device) {
+            Ok(_) => STATUS_INVALID_DEVICE_REQUEST,
+            Err(refusal) => refusal.status().raw(),
+        };
+        let (status, disposition) = HostedForwardDispatchReply::Rejected(status)
+            .words()
+            .expect("a refusal is never STATUS_PENDING");
+        values_result(status, &[disposition, 0])
+    }
+
     /// IoAllocateIrp from the lane's DPC: register its pool packet in the source IRP ledger.
     unsafe fn allocate_irp_service(
         &mut self,
@@ -2012,10 +2040,12 @@ impl HostedIrqRootSession {
             nt_hosted_runtime::HostedIrqServiceKind::ClassServiceRequest => {
                 self.class_callback_service(lane_index, service, command)
             }
-            // No lane dispatch issues a CallDriver token yet, so neither kind has an exact
-            // owner to serve: each is a protocol violation of the lane.
-            nt_hosted_runtime::HostedIrqServiceKind::CallDriver
-            | nt_hosted_runtime::HostedIrqServiceKind::CallDriverAcknowledge => {
+            nt_hosted_runtime::HostedIrqServiceKind::CallDriver => {
+                self.call_driver_service(lane_index, command)
+            }
+            // No CallDriver issues a dispatch token yet, so an acknowledgement has no exact
+            // owner: it is a protocol violation of the lane.
+            nt_hosted_runtime::HostedIrqServiceKind::CallDriverAcknowledge => {
                 fatal_service_result(STATUS_INVALID_DEVICE_REQUEST)
             }
         }
