@@ -881,7 +881,10 @@ pub(super) unsafe fn maintain(
             return ControlFlow::Break(Turn::Next);
         }
     }
-    if pending_driver_start_redrive_needed(&nt_handler)
+    // Taken first, so the wake is never left set behind a short-circuit (#420).
+    let backend_pump_returned = driver_launch::take_backend_pump_return_wake();
+    if backend_pump_returned
+        || pending_driver_start_redrive_needed(&nt_handler)
         || driver_launch::hosted_driver_dpc_activation_pending()
         || driver_launch::hosted_acpi_pci_route_recovery_ready()
     {

@@ -198,6 +198,12 @@ pub(crate) unsafe fn redrive_plain_file_pumps() -> usize {
         .saturating_add(hosted_backend_pumps::redrive())
 }
 
+/// Whether a kept backend pump returned since the last call (#420). The root opens its hosted
+/// I/O pass on this, so a kept return is collected without an unrelated trigger.
+pub(crate) fn take_backend_pump_return_wake() -> bool {
+    hosted_backend_pumps::take_return_wake()
+}
+
 /// Hold one service-continuation row before a lane's service enters any dispatch (#420).
 pub(crate) unsafe fn reserve_service_slot()
     -> Result<component_scheduler::service_continuation::ServiceSlot, i32> {

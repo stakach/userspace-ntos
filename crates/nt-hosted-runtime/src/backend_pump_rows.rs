@@ -37,6 +37,9 @@ struct Row<P, T> {
 pub struct KeptBackendPumps<P, T> {
     rows: Vec<Row<P, T>>,
     next: u64,
+    /// A kept pump returned since the root last looked: its collector must run without
+    /// waiting for an unrelated event.
+    return_wake: bool,
 }
 
 impl<P, T> Default for KeptBackendPumps<P, T> {
@@ -44,7 +47,7 @@ impl<P, T> Default for KeptBackendPumps<P, T> {
 }
 
 impl<P, T> KeptBackendPumps<P, T> {
-    pub const fn new() -> Self { Self { rows: Vec::new(), next: 1 } }
+    pub const fn new() -> Self { Self { rows: Vec::new(), next: 1, return_wake: false } }
 
     /// Hold room for one more kept dispatch before the dispatch enters, so keeping it later
     /// never allocates.
@@ -105,7 +108,11 @@ impl<P, T> KeptBackendPumps<P, T> {
         else { return Err(value) };
         let state = core::mem::replace(&mut row.state, KeptFilePump::DeferredCompletion);
         match state.returned(value) {
-            FilePumpReturned::Kept(state) => { row.state = state; Ok(()) }
+            FilePumpReturned::Kept(state) => {
+                row.state = state;
+                self.return_wake = true;
+                Ok(())
+            }
             FilePumpReturned::Publish(value) => { row.state = KeptFilePump::DeferredCompletion; Err(value) }
         }
     }
@@ -115,6 +122,12 @@ impl<P, T> KeptBackendPumps<P, T> {
     pub fn collectable(&self, ticket: &BackendTicket) -> bool {
         self.rows.iter().any(|row| row.id == ticket.0
             && matches!(row.state, KeptFilePump::Returned(..)))
+    }
+
+    /// Whether a kept pump returned since the last call; taking it clears it. The root opens
+    /// its collection pass on this alone.
+    pub fn take_return_wake(&mut self) -> bool {
+        core::mem::take(&mut self.return_wake)
     }
 
     pub fn is_empty(&self) -> bool { self.rows.is_empty() }
@@ -185,6 +198,36 @@ mod tests {
         assert!(table.collectable(&ticket), "a held return is ready for its holder");
         assert!(table.collectable(&ticket), "asking changes nothing");
         assert_eq!(table.collect(ticket), Some(BackendCollect::Collected(5)));
+    }
+
+    /// The root's collection pass: it opens on an unrelated event or on a return's wake.
+    fn root_turn(
+        table: &mut KeptBackendPumps<&'static str, u32>,
+        unrelated_event: bool,
+        ticket: BackendTicket,
+    ) -> BackendCollect<u32> {
+        let wake = table.take_return_wake();
+        if !(unrelated_event || wake) {
+            return BackendCollect::Pending(ticket);
+        }
+        table.collect(ticket).unwrap()
+    }
+
+    #[test]
+    fn a_return_is_collected_with_no_unrelated_trigger() {
+        let (mut table, ticket) = kept_one();
+        let id = ticket.id();
+        let BackendCollect::Pending(ticket) = root_turn(&mut table, false, ticket) else {
+            panic!("nothing has returned");
+        };
+        let pump = table.take_pump(id).unwrap();
+        table.unfinished(id, pump).unwrap();
+        assert!(!table.take_return_wake(), "a pump that stopped again wakes nothing");
+        table.take_pump(id).unwrap();
+        table.returned(id, 6).unwrap();
+        assert_eq!(root_turn(&mut table, false, ticket), BackendCollect::Collected(6),
+            "the return alone opens the root's collection pass");
+        assert!(!table.take_return_wake(), "the wake is taken once");
     }
 
     #[test]

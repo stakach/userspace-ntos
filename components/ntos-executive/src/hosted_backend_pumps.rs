@@ -96,6 +96,12 @@ pub(super) fn collect(ticket: BackendTicket) -> BackendCollected {
     }
 }
 
+/// Whether a kept pump returned since the last call; taking it clears it (#420). The root's
+/// collection pass opens on this alone, so a return never waits for an unrelated event.
+pub(super) fn take_return_wake() -> bool {
+    kept().take_return_wake()
+}
+
 /// Whether the ticket's next collection would find its true result. Changes nothing.
 pub(super) fn collectable(ticket: &BackendTicket) -> bool {
     kept().collectable(ticket)
@@ -137,6 +143,10 @@ pub(super) unsafe fn redrive() -> usize {
                 }
             }
         }
+    }
+    if progressed != 0 {
+        // File rows (lifecycle, lower File work) collect on the File delivery retry.
+        crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
     }
     progressed
 }
