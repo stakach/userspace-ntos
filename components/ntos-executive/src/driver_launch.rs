@@ -347,6 +347,9 @@ mod hosted_scsi_dma_reservation;
 mod hosted_scsi_srb_work;
 #[path = "native_disk_relation.rs"]
 mod native_disk_relation;
+#[path = "native_storage_transfer_limit.rs"]
+mod native_storage_transfer_limit;
+pub(crate) use native_storage_transfer_limit::published_transfer_sectors as native_storage_transfer_sectors;
 
 pub(crate) fn published_native_storage_mount() -> Option<nt_memory_manager::SectionMountId> {
     native_disk_relation::native_storage_route().map(|route| route.mount)

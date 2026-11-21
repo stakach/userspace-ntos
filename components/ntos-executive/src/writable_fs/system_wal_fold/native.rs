@@ -181,7 +181,7 @@ unsafe fn advance_recheck() -> Result<(), u32> {
         }
     };
     let bytes = image.as_slice().len();
-    let commit = match AsyncSnapshotCommit::new_from_rechecked_pair(
+    let mut commit = match AsyncSnapshotCommit::new_from_rechecked_pair(
         image, fold_manifest(manifest), proof) {
         Ok(commit) => commit,
         Err((error, image, proof)) => {
@@ -189,6 +189,8 @@ unsafe fn advance_recheck() -> Result<(), u32> {
                 snapshot_store_error_status(error)));
         }
     };
+    commit.set_max_batch_sectors(crate::driver_launch::native_storage_transfer_sectors())
+        .expect("a fresh snapshot commit has no request in flight");
     *slot = Some(Work::Active(Active { id, prepared, lease, token, old_pair: None,
         manifest, bytes, cursor: Some(Cursor::First(commit)), entered: false, failed: false }));
     Ok(())
@@ -366,13 +368,15 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
             WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(active.bytes as u64, Ordering::Relaxed);
             // First-pass terminal and strict ACK minted this pair under the same exclusive lease.
-            let second = match unsafe { AsyncSnapshotCommit::new_from_verified_pair(
+            let mut second = match unsafe { AsyncSnapshotCommit::new_from_verified_pair(
                 active.lease.store(), image, fold_manifest(active.manifest),
                 active.lease.sector_size(), active.lease.sector_count(), pair) } {
                 Ok(second) => second,
                 Err((error, image, pair)) => return Ok(SnapshotCompletion::Failed(stall_second_admission(
                     slot, active, image, pair, snapshot_store_error_status(error)))),
             };
+            second.set_max_batch_sectors(crate::driver_launch::native_storage_transfer_sectors())
+                .expect("a fresh snapshot commit has no request in flight");
             active.cursor = Some(Cursor::Second(second));
             *slot = Some(Work::Active(active));
         }

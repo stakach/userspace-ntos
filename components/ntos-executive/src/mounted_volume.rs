@@ -124,7 +124,8 @@ pub(crate) fn release_unentered_mounted_directory_sector(
 
 pub(crate) fn claim_mounted_read_sectors() -> Option<crate::mounted_volume_backend::mounted_installed_read::ReadSectorClaim> {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_READ_QUEUE)).as_ref()?.clone() };
-    let claim = queue.borrow_mut().claim_next();
+    let claim = queue.borrow_mut()
+        .claim_next_bounded(crate::driver_launch::native_storage_transfer_sectors());
     claim
 }
 

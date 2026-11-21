@@ -991,6 +991,11 @@ pub(super) unsafe fn service() -> usize {
         }
         settled
     } else { 0 };
+    // The adapter's transfer limit is asked once per published route, between commands.
+    let settled = match native_disk_relation::native_storage_route() {
+        Some(route) => settled.saturating_add(super::native_storage_transfer_limit::service(route)),
+        None => settled,
+    };
     if native_disk_relation::native_storage_route().is_some() {
         let mut first_claim = true;
         let mut cached_in_turn = 0usize;
@@ -1183,6 +1188,17 @@ unsafe fn dispatch_claim(
         claim.refuse_unentered(nt_status::NtStatus(nt_fs::STATUS_DATA_ERROR as i32));
         return CacheClaimStep::Stop(1);
     };
+    // Never send the adapter more than it reported it can move in one command.
+    if let nt_fs::BlockOperation::Read { sectors, .. } | nt_fs::BlockOperation::Write { sectors, .. }
+        = operation
+    {
+        if super::native_storage_transfer_limit::reported_transfer_sectors(route)
+            .is_some_and(|limit| sectors > limit)
+        {
+            claim.refuse_unentered(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            return CacheClaimStep::Stop(1);
+        }
+    }
     // A hit is an exact copied sector from an earlier authenticated terminal/ACK under this
     // physical mount and provider generation. The Executive-owned poison linearizes before any
     // possible same-disk write enters its provider. Complete only the retained logical claim;

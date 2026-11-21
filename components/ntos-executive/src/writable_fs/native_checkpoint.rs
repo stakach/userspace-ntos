@@ -94,7 +94,7 @@ unsafe fn advance_recheck() -> Result<(), u32> {
     // pair whose payloads were CRC-verified this boot, so no payload sector is reread. The
     // commit retains the proof through every native effect.
     let manifest = proof.manifest();
-    let commit = match AsyncSnapshotCommit::new_from_rechecked_pair(image, manifest, proof) {
+    let mut commit = match AsyncSnapshotCommit::new_from_rechecked_pair(image, manifest, proof) {
         Ok(commit) => commit,
         Err((error, _image, proof)) => {
             WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
@@ -104,6 +104,8 @@ unsafe fn advance_recheck() -> Result<(), u32> {
             return Err(status);
         }
     };
+    commit.set_max_batch_sectors(crate::driver_launch::native_storage_transfer_sectors())
+        .expect("a fresh snapshot commit has no request in flight");
     *slot = Some(Work::Committing { id, lease, token,
         commit, bytes, entered: false, failed: false, settled: 0 });
     Ok(())

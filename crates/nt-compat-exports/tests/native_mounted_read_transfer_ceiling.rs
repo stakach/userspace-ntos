@@ -1,12 +1,10 @@
-//! Keep the live installed READ claim on the crate's verified 32-sector path.
-//! The retained owner tests exercise the range and completion contract; this test checks that
-//! the native mount actually uses it and forwards its exact sector count to the SCSI route.
+//! The native mount forwards an installed READ claim's exact sector count to the SCSI route.
+//! The claim's size comes from the adapter's reported transfer limit
+//! (`nt_io_manager::storage_adapter_limit`); the retained owner tests exercise its range.
 
 use syn::{visit::Visit, Expr, ImplItem, Item};
 
-const VOLUME: &str = include_str!("../../../components/ntos-executive/src/mounted_volume.rs");
 const NATIVE: &str = include_str!("../../../components/ntos-executive/src/mounted_native_block.rs");
-const READS: &str = include_str!("../../nt-fs/src/mounted_installed_read.rs");
 
 fn function(source: &str, name: &str) -> syn::ItemFn {
     syn::parse_file(source).unwrap().items.into_iter().find_map(|item| match item {
@@ -46,25 +44,7 @@ impl<'ast> Visit<'ast> for Calls {
 }
 
 #[test]
-fn native_mounted_read_uses_verified_32_sector_claim_and_exact_scsi_count() {
-    let mut owner = Calls::default();
-    owner.visit_impl_item_fn(&method(READS, "claim_next"));
-    assert_eq!(owner.methods, ["claim_next_bounded"]);
-    let default = method(READS, "claim_next");
-    assert!(matches!(default.block.stmts.as_slice(),
-        [syn::Stmt::Expr(Expr::MethodCall(call), None)]
-            if call.method == "claim_next_bounded"
-                && matches!(call.args.first(), Some(Expr::Lit(lit))
-                    if matches!(&lit.lit, syn::Lit::Int(value)
-                        if value.base10_parse::<u32>().ok() == Some(32)))));
-
-    let mut live = Calls::default();
-    live.visit_item_fn(&function(VOLUME, "claim_mounted_read_sectors"));
-    assert_eq!(live.methods.iter().filter(|name| *name == "claim_next").count(), 1,
-        "the native mount must claim through the verified full-range owner");
-    assert!(!live.methods.iter().any(|name| name == "claim_next_bounded"),
-        "a separate native cap would silently narrow the proven range");
-
+fn native_mounted_read_forwards_the_exact_scsi_count() {
     let mut route = Calls::default();
     route.visit_impl_item_fn(&method(NATIVE, "operation"));
     assert!(route.methods.iter().any(|name| name == "block_read_operation"),
