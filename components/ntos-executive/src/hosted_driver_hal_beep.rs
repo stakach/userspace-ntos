@@ -13,20 +13,10 @@ const STATUS_IO_DEVICE_ERROR: i32 = 0xC000_0185u32 as i32;
 /// whose root exchange admits only typed arena services, so it requests the same root program
 /// through the lane instead of a primary-channel Call.
 pub(super) extern "win64" fn make_beep(frequency: u32) -> u8 {
-    if let Some((_, identity, _, _, grant)) = unsafe { hosted_irq_lane_context() } {
-        let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
-        arguments[0] = u64::from(frequency);
-        let result = unsafe { hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
-            kind: nt_hosted_runtime::HostedIrqServiceKind::HalMakeBeep,
-            service_id: LABEL,
-            target_domain_id: identity.domain_id,
-            target_domain_cookie: identity.domain_cookie,
-            authority_cookie: 0,
-            grant,
-            argument_count: 1,
-            arguments,
-        }) };
-        if result.faulted || result.value_count != 1 {
+    if let Some(result) = unsafe { hosted_irq_lane_request(
+        nt_hosted_runtime::HostedIrqServiceKind::HalMakeBeep, LABEL, &[u64::from(frequency)],
+    ) } {
+        if result.value_count != 1 {
             hosted_irq_lane_protocol_fault(u64::from(frequency));
         }
         return u8::from(result.status == STATUS_SUCCESS && result.values[0] == 1);

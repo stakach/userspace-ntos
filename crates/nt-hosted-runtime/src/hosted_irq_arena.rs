@@ -156,6 +156,10 @@ pub enum HostedIrqServiceKind {
     DmaPutSg = 16,
     /// `HalMakeBeep(Frequency)` from DPC or cancel context; 0 silences the speaker.
     HalMakeBeep = 17,
+    /// `IoStartNextPacket(Device, Cancelable)`: the root dequeues; StartIo runs on the lane.
+    StartNextPacket = 18,
+    /// The lane's StartIo returned for the exact StartNextPacket transaction.
+    StartNextPacketReturned = 19,
 }
 
 impl HostedIrqServiceKind {
@@ -178,6 +182,8 @@ impl HostedIrqServiceKind {
             15 => Some(Self::DmaQuerySg),
             16 => Some(Self::DmaPutSg),
             17 => Some(Self::HalMakeBeep),
+            18 => Some(Self::StartNextPacket),
+            19 => Some(Self::StartNextPacketReturned),
             _ => None,
         }
     }
@@ -540,6 +546,19 @@ impl HostedIrqServiceCommand {
                         && self.argument_count == 1
                         && self.arguments[0] <= u32::MAX as u64
                         && self.arguments[1..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::StartNextPacket => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 2
+                        && self.arguments[0] != 0
+                        && self.arguments[1] <= 1
+                        && self.arguments[2..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::StartNextPacketReturned => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 3
+                        && self.arguments[..3].iter().all(|argument| *argument != 0)
+                        && self.arguments[3..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::PoolRetirement => {
                     self.authority_cookie == 0
@@ -2568,7 +2587,7 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
         assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
-        assert_eq!(HostedIrqServiceKind::from_raw(18), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(20), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2732,6 +2751,51 @@ mod tests {
         beep.authority_cookie = 0;
         beep.argument_count = 0;
         assert!(!beep.valid(), "missing frequency");
+    }
+
+    #[test]
+    fn irq_start_next_packet_carries_device_and_cancelable_flag() {
+        // IoStartNextPacket is the classic DPC-for-ISR call (DISPATCH_LEVEL).
+        assert_eq!(HostedIrqServiceKind::from_raw(18), Some(HostedIrqServiceKind::StartNextPacket));
+        let mut next = service();
+        next.kind = HostedIrqServiceKind::StartNextPacket;
+        next.authority_cookie = 0;
+        next.argument_count = 2;
+        next.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        next.arguments[0] = 0x4000;
+        for cancelable in [0, 1] {
+            next.arguments[1] = cancelable;
+            assert!(next.valid());
+        }
+        next.arguments[1] = 2;
+        assert!(!next.valid(), "Cancelable is a BOOLEAN");
+        next.arguments[1] = 0;
+        next.arguments[0] = 0;
+        assert!(!next.valid(), "a device object is required");
+        next.arguments[0] = 0x4000;
+        next.arguments[2] = 1;
+        assert!(!next.valid(), "trailing argument");
+    }
+
+    #[test]
+    fn irq_start_next_packet_return_names_its_exact_transaction() {
+        assert_eq!(HostedIrqServiceKind::from_raw(19),
+            Some(HostedIrqServiceKind::StartNextPacketReturned));
+        let mut done = service();
+        done.kind = HostedIrqServiceKind::StartNextPacketReturned;
+        done.authority_cookie = 0;
+        done.argument_count = 3;
+        done.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        done.arguments[..3].copy_from_slice(&[7, 0x5000, 0x4000]);
+        assert!(done.valid());
+        for index in 0..3 {
+            let saved = done.arguments[index];
+            done.arguments[index] = 0;
+            assert!(!done.valid(), "serial, IRP and device are all required ({index})");
+            done.arguments[index] = saved;
+        }
+        done.arguments[3] = 1;
+        assert!(!done.valid());
     }
 
     #[test]

@@ -87,6 +87,14 @@ fn service_result(status: i32, value: Option<u64>) -> nt_hosted_runtime::HostedI
     result
 }
 
+/// A completed service returning exactly `values`; its status is the driver-visible result.
+fn values_result(status: i32, values: &[u64]) -> nt_hosted_runtime::HostedIrqArenaResult {
+    let mut result = service_result(status, None);
+    result.value_count = values.len() as u8;
+    result.values[..values.len()].copy_from_slice(values);
+    result
+}
+
 fn fatal_service_result(status: i32) -> nt_hosted_runtime::HostedIrqArenaResult {
     nt_hosted_runtime::HostedIrqArenaResult {
         status,
@@ -1615,31 +1623,80 @@ impl HostedIrqRootSession {
         }
     }
 
-    /// `HalMakeBeep` from the lane's DPC: the lane's own domain and grant are the authority.
+    /// The driver instance whose own IRQ lane requested a root service: the lane's domain and
+    /// grant are the authority, never a component-supplied identity.
+    unsafe fn lane_driver(
+        &self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+        service_id: u64,
+    ) -> Result<(usize, DriverInstance), nt_hosted_runtime::HostedIrqArenaResult> {
+        let refused = fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        let lane = self.lane(lane_index).map_err(|_| refused)?;
+        if command.service_id != service_id
+            || command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.authority_cookie != 0
+            || (!self.has_dpc_dispatch_grant(lane, command.grant)
+                && !lane_has_service_grant(lane, command.grant))
+        {
+            return Err(refused);
+        }
+        let inst = instance(lane.projection_instance).ok_or(refused)?;
+        let domain = instance_domain_identity(inst).ok_or(refused)?;
+        if domain.domain_id.raw() != lane.identity.domain_id
+            || domain.cookie != lane.identity.domain_cookie
+        {
+            return Err(refused);
+        }
+        Ok((lane.projection_instance, inst))
+    }
+
+    /// `HalMakeBeep` from the lane's DPC.
     unsafe fn hal_beep_service(
         &mut self,
         lane_index: usize,
         command: nt_hosted_runtime::HostedIrqServiceCommand,
     ) -> nt_hosted_runtime::HostedIrqArenaResult {
-        let Ok(lane) = self.lane(lane_index) else {
-            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
-        };
+        if let Err(refused) = self.lane_driver(lane_index, command, FSD_SERVICE_HAL_BEEP_LABEL) {
+            return refused;
+        }
         let Ok(frequency) = u32::try_from(command.arguments[0]) else {
             return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
         };
-        if command.service_id != FSD_SERVICE_HAL_BEEP_LABEL
-            || command.target_domain_id != lane.identity.domain_id
-            || command.target_domain_cookie != lane.identity.domain_cookie
-            || command.authority_cookie != 0
-            || command.argument_count != 1
-            || command.arguments[1..].iter().any(|argument| *argument != 0)
-            || (!self.has_dpc_dispatch_grant(lane, command.grant)
-                && !lane_has_service_grant(lane, command.grant))
-        {
-            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
-        }
         let (status, beeping) = hosted_driver_hal_beep::program(frequency);
         service_result(status, Some(beeping))
+    }
+
+    /// `IoStartNextPacket` from the lane's DPC: the root dequeues, StartIo runs on the lane.
+    unsafe fn start_next_packet_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let (index, inst) = match self.lane_driver(lane_index, command, FSD_SERVICE_DEVICE_LABEL) {
+            Ok(driver) => driver,
+            Err(refused) => return refused,
+        };
+        let [device, cancelable, ..] = command.arguments;
+        let (status, start_io, serial, irp) =
+            hosted_start_io::start_next_packet_for(index, inst, device, cancelable != 0);
+        values_result(status, &[start_io, serial, irp])
+    }
+
+    unsafe fn start_next_packet_returned_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let (index, inst) = match self.lane_driver(lane_index, command, FSD_SERVICE_DEVICE_LABEL) {
+            Ok(driver) => driver,
+            Err(refused) => return refused,
+        };
+        let [serial, irp, device, ..] = command.arguments;
+        let (status, ..) =
+            hosted_start_io::start_next_packet_returned_for(index, inst, serial, irp, device);
+        values_result(status, &[])
     }
 
     unsafe fn begin_local_irp_completion_service(
@@ -1802,6 +1859,12 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::HalMakeBeep => {
                 self.hal_beep_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::StartNextPacket => {
+                self.start_next_packet_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::StartNextPacketReturned => {
+                self.start_next_packet_returned_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::BeginLocalIrpCompletion => {
                 self.begin_local_irp_completion_service(lane_index, command)

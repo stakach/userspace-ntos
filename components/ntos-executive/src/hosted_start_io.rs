@@ -677,13 +677,24 @@ pub(super) extern "win64" fn s_io_start_next_packet(device: u64, cancelable: u8)
         } else {
             None
         };
-        let (words, status, callback, serial, selected_irp) = call_on4_raw(
-            (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
-            HOSTED_DEVICE_OP_START_NEXT_PACKET,
-            device,
-            u64::from(cancelable != 0),
-            0,
+        // A DPC (the DPC-for-ISR pattern) calls this at DISPATCH_LEVEL on the IRQ lane.
+        let lane = hosted_irq_lane_request(
+            nt_hosted_runtime::HostedIrqServiceKind::StartNextPacket,
+            FSD_SERVICE_DEVICE_LABEL,
+            &[device, u64::from(cancelable != 0)],
         );
+        let (words, status, callback, serial, selected_irp) = match lane {
+            Some(result) if result.value_count == 3 => (4, result.status as u32 as u64,
+                result.values[0], result.values[1], result.values[2]),
+            Some(result) => (u64::from(result.value_count), result.status as u32 as u64, 0, 0, 0),
+            None => call_on4_raw(
+                (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
+                HOSTED_DEVICE_OP_START_NEXT_PACKET,
+                device,
+                u64::from(cancelable != 0),
+                0,
+            ),
+        };
         if words != 4 || status != STATUS_SUCCESS as u32 as u64 {
             crate::provider_bugcheck::report(0xc4, [HOSTED_DEVICE_OP_START_NEXT_PACKET, device, status, words]);
         }
@@ -696,11 +707,19 @@ pub(super) extern "win64" fn s_io_start_next_packet(device: u64, cancelable: u8)
         }
         let start_io: extern "win64" fn(u64, u64) = core::mem::transmute(callback);
         start_io(device, selected_irp);
-        let (words, status, rest0, rest1, rest2) = call_on4_raw(
-            (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
-            HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED,
-            serial, selected_irp, device,
+        let lane = hosted_irq_lane_request(
+            nt_hosted_runtime::HostedIrqServiceKind::StartNextPacketReturned,
+            FSD_SERVICE_DEVICE_LABEL,
+            &[serial, selected_irp, device],
         );
+        let (words, status, rest0, rest1, rest2) = match lane {
+            Some(result) => (4 + u64::from(result.value_count), result.status as u32 as u64, 0, 0, 0),
+            None => call_on4_raw(
+                (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
+                HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED,
+                serial, selected_irp, device,
+            ),
+        };
         if words != 4 || status != STATUS_SUCCESS as u32 as u64
             || rest0 != 0 || rest1 != 0 || rest2 != 0
         {
@@ -720,9 +739,22 @@ pub(super) fn service_start_next_packet(
     if cancelable > 1 || reserved != 0 {
         return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
     }
-    let cancelable = cancelable != 0;
-    let (index, inst, device_id) = match authenticated_hosted_device(ch, device, active_reply_cap) {
-        Ok(identity) => identity,
+    let Some((index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+    };
+    start_next_packet_for(index, inst, device, cancelable != 0)
+}
+
+/// IoStartNextPacket for an authenticated driver instance: its primary channel, or the IRQ lane
+/// whose DPC calls it at DISPATCH_LEVEL. Returns `(status, StartIo, serial, selected IRP)`.
+pub(super) fn start_next_packet_for(
+    index: usize,
+    inst: DriverInstance,
+    device: u64,
+    cancelable: bool,
+) -> (i32, u64, u64, u64) {
+    let device_id = match instance_hosted_device(inst, device) {
+        Ok(device_id) => device_id,
         Err(status) => return (status.raw(), 0, 0, 0),
     };
     let Some(domain) = instance_domain_identity(inst) else {
@@ -903,6 +935,17 @@ pub(super) fn service_start_next_packet_callback_returned(
     let Some((index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return (STATUS_INVALID_HANDLE, 0, 0, 0);
     };
+    start_next_packet_returned_for(index, inst, serial, irp, device)
+}
+
+/// The exact StartNextPacket transaction's StartIo returned on its authenticated instance.
+pub(super) fn start_next_packet_returned_for(
+    index: usize,
+    inst: DriverInstance,
+    serial: u64,
+    irp: u64,
+    device: u64,
+) -> (i32, u64, u64, u64) {
     let Some(domain) = instance_domain_identity(inst) else {
         return (STATUS_INVALID_HANDLE, 0, 0, 0);
     };

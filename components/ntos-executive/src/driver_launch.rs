@@ -15494,7 +15494,32 @@ unsafe fn hosted_irq_lane_execute_dispatch(
     }
 }
 
-#[allow(dead_code)]
+/// A DISPATCH_LEVEL root service requested from this domain's IRQ lane, or `None` off the lane.
+/// The lane's root exchange admits only typed arena services, never a primary-channel label.
+unsafe fn hosted_irq_lane_request(
+    kind: nt_hosted_runtime::HostedIrqServiceKind,
+    service_id: u64,
+    arguments: &[u64],
+) -> Option<nt_hosted_runtime::HostedIrqArenaResult> {
+    let (_, identity, _, _, grant) = hosted_irq_lane_context()?;
+    let mut words = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+    words[..arguments.len()].copy_from_slice(arguments);
+    let result = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+        kind,
+        service_id,
+        target_domain_id: identity.domain_id,
+        target_domain_cookie: identity.domain_cookie,
+        authority_cookie: 0,
+        grant,
+        argument_count: arguments.len() as u8,
+        arguments: words,
+    });
+    if result.faulted {
+        hosted_irq_lane_protocol_fault(service_id);
+    }
+    Some(result)
+}
+
 unsafe fn hosted_irq_lane_service(
     command: nt_hosted_runtime::HostedIrqServiceCommand,
 ) -> nt_hosted_runtime::HostedIrqArenaResult {
@@ -61219,6 +61244,14 @@ fn authenticated_hosted_device(
 ) -> Result<(usize, DriverInstance, nt_io_manager::DeviceId), nt_status::NtStatus> {
     let (instance, inst) = instance_for_pump_channel(ch, active_reply_cap)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    Ok((instance, inst, instance_hosted_device(inst, device_object)?))
+}
+
+/// The DEVICE_OBJECT an already-authenticated driver instance names in its own domain.
+fn instance_hosted_device(
+    inst: DriverInstance,
+    device_object: u64,
+) -> Result<nt_io_manager::DeviceId, nt_status::NtStatus> {
     if inst.hosted_domain_id == 0 || inst.hosted_domain_cookie == 0 || device_object == 0 {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
@@ -61226,10 +61259,9 @@ fn authenticated_hosted_device(
         domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
         cookie: inst.hosted_domain_cookie,
     };
-    let device_id = io_manager_mut()
+    io_manager_mut()
         .hosted_device_by_identity(identity, device_object)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    Ok((instance, inst, device_id))
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
 }
 
 fn authenticated_hosted_pdo(
