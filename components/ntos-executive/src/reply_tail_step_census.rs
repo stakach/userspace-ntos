@@ -55,8 +55,13 @@ steps! {
     ProcessImages => "process-images",
     SectionRetirement => "section-retirement",
     FileCleanup => "file-cleanup",
-    // The syscall tail's own pass.
+    // The syscall tail's own pass, and its parts.
     HostedReady => "hosted-ready",
+    HostedReadySelect => "hosted-ready-select",
+    HostedReadyTerminals => "hosted-ready-terminals",
+    HostedReadyMaintenance => "hosted-ready-maintenance",
+    HostedReadySearch => "hosted-ready-search",
+    HostedReadyRun => "hosted-ready-run",
 }
 
 pub(crate) const STEPS: usize = NAMES.len();
@@ -139,7 +144,7 @@ pub(crate) fn end<T: StepProgress>(step: Step, started: u64, result: T) -> T {
 
 pub(crate) fn print_census() {
     let Some(census) = root() else { return; };
-    let mut record = nt_printf::record::RecordBuffer::<1536>::new();
+    let mut record = nt_printf::record::RecordBuffer::<2048>::new();
     let _ = census.write_census(&mut record);
     crate::print_str(record.bytes());
 }

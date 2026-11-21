@@ -296,9 +296,12 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
     let Some(ctx) = (*handler).loop_ctx else {
         return 0;
     };
+    use crate::reply_tail_step_census::{begin, end, Step};
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
     let _durable = allocator::enter_durable();
+    let t = begin();
     select_ready_service_waits();
+    end(Step::HostedReadySelect, t, ());
     let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
     let mut drained = 0;
     loop {
@@ -307,7 +310,9 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
         {
             break;
         }
-        drained += component_terminal::drain(&mut *handler, &mut *ctx.procs, &mut *ctx.pfilled);
+        let t = begin();
+        drained += end(Step::HostedReadyTerminals, t,
+            component_terminal::drain(&mut *handler, &mut *ctx.procs, &mut *ctx.pfilled));
         if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
             || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
         {
@@ -315,7 +320,10 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
         }
         if let Some(ticket) = root_maintenance_owner::next_returned_ticket()
             .or_else(|| root_maintenance_owner::next_ready_ticket()) {
-            match run_root_maintenance(handler, ticket) {
+            let t = begin();
+            let outcome = run_root_maintenance(handler, ticket);
+            end(Step::HostedReadyMaintenance, t, ());
+            match outcome {
                 RootMaintenanceResumeOutcome::Parked | RootMaintenanceResumeOutcome::Terminal => {
                     continue;
                 }
@@ -323,7 +331,10 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
                 | RootMaintenanceResumeOutcome::RetainedFailure => break,
             }
         }
-        let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) else {
+        let t = begin();
+        let candidate = next_in_pass(&(*handler).pm, &mut pass);
+        end(Step::HostedReadySearch, t, candidate.is_some());
+        let Some(candidate) = candidate else {
             trace_selected_resume_gate(b"hosted-no-candidate", 0);
             break;
         };
@@ -331,7 +342,10 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
             ComponentNativeContinuation::Kernel(_) | ComponentNativeContinuation::RootIngress(_)) {
             break;
         }
-        if run_hosted(handler, candidate).is_none() {
+        let t = begin();
+        let ran = run_hosted(handler, candidate);
+        end(Step::HostedReadyRun, t, ran.is_some());
+        if ran.is_none() {
             break;
         }
     }
