@@ -92,8 +92,9 @@ pub(crate) unsafe fn trace_user_fault_context(
             }
             let _ = write!(
                 record,
-                "+0x{:x} base=0x{:x} size=0x{:x}",
-                context.registers[0] - module.base, module.base, module.size
+                "+0x{:x} base=0x{:x} size=0x{:x} ldr-flags=0x{:x} same-name-loaded={}",
+                context.registers[0] - module.base, module.base, module.size, module.flags,
+                module.same_name
             );
         }
         None => {

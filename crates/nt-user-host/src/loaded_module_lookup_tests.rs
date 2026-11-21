@@ -27,18 +27,23 @@ const PEB: u64 = 0x2000;
 const LDR: u64 = 0x3000;
 
 fn process(modules: &[(u64, u32, &str)]) -> Memory {
+    process_with_flags(&modules.iter().map(|&(base, size, name)| (base, size, name, 0)).collect::<Vec<_>>())
+}
+
+fn process_with_flags(modules: &[(u64, u32, &str, u32)]) -> Memory {
     let mut memory = Memory(BTreeMap::new());
     memory.put(TEB + 0x60, &PEB.to_le_bytes());
     memory.put(PEB + 0x18, &LDR.to_le_bytes());
     let head = LDR + 0x10;
     let entries: Vec<u64> = (0..modules.len() as u64).map(|index| 0x4000 + index * 0x100).collect();
     memory.put(head, &entries.first().copied().unwrap_or(head).to_le_bytes());
-    for (index, &(base, size, name)) in modules.iter().enumerate() {
+    for (index, &(base, size, name, flags)) in modules.iter().enumerate() {
         let entry = entries[index];
         let next = entries.get(index + 1).copied().unwrap_or(head);
         memory.put(entry, &next.to_le_bytes());
         memory.put(entry + 0x30, &base.to_le_bytes());
         memory.put(entry + 0x40, &u64::from(size).to_le_bytes());
+        memory.put(entry + 0x68, &u64::from(flags).to_le_bytes());
         let units: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let buffer = entry + 0x80;
         memory.put(buffer, &units);
@@ -71,4 +76,16 @@ fn an_address_outside_every_image_or_an_unreadable_list_names_nothing() {
     let memory = process(&[(0x1_4000_0000, 0x1000, "cmd.exe")]);
     assert_eq!(module_containing(TEB, 0x1_4000_1000, |va, out| memory.read(va, out)), None);
     assert_eq!(module_containing(0x9000, 0x1_4000_0000, |va, out| memory.read(va, out)), None);
+}
+
+#[test]
+fn reports_attach_flags_and_a_duplicate_image_of_the_same_name() {
+    let memory = process_with_flags(&[
+        (0x1_8000_0000, 0x7_1000, "KERNELBASE.dll", 0x8_4004),
+        (0x100_3044_0000, 0x7_1000, "kernelbase.dll", 0x4),
+    ]);
+    let module = module_containing(TEB, 0x100_3045_2339, |va, out| memory.read(va, out)).unwrap();
+    assert_eq!(module.base, 0x100_3044_0000);
+    assert_eq!(module.flags, 0x4);
+    assert_eq!(module.same_name, 2);
 }
