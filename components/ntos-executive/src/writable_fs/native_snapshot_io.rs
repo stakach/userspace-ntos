@@ -32,16 +32,23 @@ pub(crate) struct SnapshotClaim {
     owner: SnapshotOwnerToken,
 }
 
+/// Labels of the snapshot owner kinds, indexed by [`SnapshotClaim::owner_index`].
+pub(crate) const OWNER_KINDS: [&[u8]; 6] =
+    [b"mutation", b"relation-wal", b"hive", b"storage", b"checkpoint", b"fold"];
+
 impl SnapshotClaim {
-    pub(crate) fn owner_kind(&self) -> &'static [u8] {
+    pub(crate) fn owner_index(&self) -> usize {
         match &self.owner {
-            SnapshotOwnerToken::Mutation { .. } => b"mutation",
-            SnapshotOwnerToken::RelationWal { .. } => b"relation-wal",
-            SnapshotOwnerToken::Hive(_) => b"hive",
-            SnapshotOwnerToken::Storage(_) => b"storage",
-            SnapshotOwnerToken::Checkpoint(_) => b"checkpoint",
-            SnapshotOwnerToken::Fold(_) => b"fold",
+            SnapshotOwnerToken::Mutation { .. } => 0,
+            SnapshotOwnerToken::RelationWal { .. } => 1,
+            SnapshotOwnerToken::Hive(_) => 2,
+            SnapshotOwnerToken::Storage(_) => 3,
+            SnapshotOwnerToken::Checkpoint(_) => 4,
+            SnapshotOwnerToken::Fold(_) => 5,
         }
+    }
+    pub(crate) fn owner_kind(&self) -> &'static [u8] {
+        OWNER_KINDS[self.owner_index()]
     }
     /// The command belongs to a background snapshot owner (lazy checkpoint or SYSTEM fold),
     /// including the header recheck read that owner is waiting on.

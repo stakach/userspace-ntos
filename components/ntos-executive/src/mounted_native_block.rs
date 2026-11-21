@@ -24,6 +24,11 @@ static WAKE_UNSAMPLED: AtomicU64 = AtomicU64::new(0);
 // counted only after the exact IRP terminal (and, for pending IRPs, acknowledgement).
 static NATIVE_FAT_CENSUS: nt_ahci::CommandCensus = nt_ahci::CommandCensus::new();
 static NATIVE_SNAPSHOT_CENSUS: nt_ahci::CommandCensus = nt_ahci::CommandCensus::new();
+/// The snapshot source split by the owner kind that claimed each command.
+static NATIVE_SNAPSHOT_OWNER_CENSUS: [nt_ahci::CommandCensus;
+    crate::writable_fs::native_snapshot_io::OWNER_KINDS.len()] =
+    [const { nt_ahci::CommandCensus::new() };
+        crate::writable_fs::native_snapshot_io::OWNER_KINDS.len()];
 // Count only installed-file READ claims accepted by the physical route. Metadata and snapshot
 // commands are excluded, so this shows whether the mounted READ sector ceiling binds in vivo.
 struct InstalledReadShapeCensus {
@@ -241,12 +246,21 @@ pub(super) fn print_census() {
     print_str(b" recheck-id=");
     print_u64(unsafe { crate::driver_launch::native_storage_relation_recheck_id() }.unwrap_or(0));
     print_str(b"\n");
-    for (source, census) in [
-        (b"fat".as_slice(), &NATIVE_FAT_CENSUS),
-        (b"snapshot".as_slice(), &NATIVE_SNAPSHOT_CENSUS),
-    ] {
+    let owners = crate::writable_fs::native_snapshot_io::OWNER_KINDS.iter()
+        .zip(&NATIVE_SNAPSHOT_OWNER_CENSUS)
+        .map(|(owner, census)| (b"snapshot owner=".as_slice(), *owner, census));
+    for (source, owner, census) in [
+        (b"fat".as_slice(), b"".as_slice(), &NATIVE_FAT_CENSUS),
+        (b"snapshot".as_slice(), b"".as_slice(), &NATIVE_SNAPSHOT_CENSUS),
+    ].into_iter().chain(owners) {
+        if !owner.is_empty() && [nt_ahci::IoOperation::Read, nt_ahci::IoOperation::Write,
+            nt_ahci::IoOperation::Barrier].iter().all(|op| census.snapshot(*op).commands == 0)
+        {
+            continue;
+        }
         print_str(b"[census] native-block source=");
         print_str(source);
+        print_str(owner);
         for (label, operation) in [
             (b" read=".as_slice(), nt_ahci::IoOperation::Read),
             (b" write=".as_slice(), nt_ahci::IoOperation::Write),
@@ -845,8 +859,13 @@ fn settle(pending: Pending, terminal: Terminal) {
         nt_fs::BlockSource::Fat => &NATIVE_FAT_CENSUS,
         nt_fs::BlockSource::Snapshot => &NATIVE_SNAPSHOT_CENSUS,
     };
-    census.record(operation, pending.started_ticks, crate::disk_census_ticks(),
-        (pending.command.data_len() / 512) as u64, result.is_err());
+    let settled_ticks = crate::disk_census_ticks();
+    let sectors = (pending.command.data_len() / 512) as u64;
+    census.record(operation, pending.started_ticks, settled_ticks, sectors, result.is_err());
+    if let WorkClaim::Snapshot(claim) = &pending.claim {
+        NATIVE_SNAPSHOT_OWNER_CENSUS[claim.owner_index()].record(
+            operation, pending.started_ticks, settled_ticks, sectors, result.is_err());
+    }
     if result.is_ok() {
         crate::fs_loader::complete_exec_native_block(pending.ticket, pending.command.data_len() as u64)
             .expect("exact native block ticket lost");
