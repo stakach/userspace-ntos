@@ -113,7 +113,15 @@ unsafe fn release_node(address: u64) {
 struct LockLease {
     address: u64,
     map_owner: u64,
-    pin: Option<file_ioctl_target::PinnedIoctlOutput>,
+    pin: Option<LockPin>,
+}
+
+/// What keeps a contended lock's storage live for the slow path.
+enum LockPin {
+    /// A provider stack, provider pool, or writable image data (a global lock).
+    Output(file_ioctl_target::PinnedIoctlOutput),
+    /// An object in a provider heap arena, such as a GDI object from a paged lookaside list.
+    Heap(nt_provider_wait::ProviderAllocationPin),
 }
 
 impl LockLease {
@@ -137,8 +145,18 @@ impl LockLease {
                 fatal(address, 11);
             }
         }
-        let pin = file_ioctl_target::pin_output(activation, address, 8)
-            .unwrap_or_else(|_| fatal(address, 12));
+        let pin = if provider_heap_arena_contains(address, 8) {
+            let pin = with_provider_allocations(|catalog| catalog.pin_containing(address, 8))
+                .and_then(Result::ok)
+                .unwrap_or_else(|| fatal(address, 12))
+                .1;
+            LockPin::Heap(pin)
+        } else {
+            LockPin::Output(
+                file_ioctl_target::pin_output(activation, address, 8)
+                    .unwrap_or_else(|_| fatal(address, 12)),
+            )
+        };
         Self {
             address,
             map_owner: WIN32K_ROOT_IMAGE_MAP_OWNER.load(Ordering::Acquire),
@@ -147,7 +165,17 @@ impl LockLease {
     }
 
     unsafe fn atomic(&self) -> &AtomicU64 {
-        if !source_irp::target_live(self.pin.as_ref().unwrap(), self.map_owner, self.address, 8) {
+        let live = match self.pin.as_ref().unwrap() {
+            LockPin::Output(pin) => source_irp::target_live(pin, self.map_owner, self.address, 8),
+            LockPin::Heap(pin) => with_provider_allocations(|catalog| {
+                catalog.snapshot_active(pin.identity()).is_ok_and(|snapshot| {
+                    snapshot.offset_of(self.address).is_some_and(|offset| {
+                        offset.checked_add(8).is_some_and(|end| end <= snapshot.capacity)
+                    })
+                })
+            }) == Some(true),
+        };
+        if !live {
             fatal(self.address, 13);
         }
         &*(self.address as *const AtomicU64)
@@ -157,7 +185,10 @@ impl LockLease {
 impl Drop for LockLease {
     fn drop(&mut self) {
         unsafe {
-            file_ioctl_target::release_output(self.pin.take().unwrap());
+            match self.pin.take().unwrap() {
+                LockPin::Output(pin) => file_ioctl_target::release_output(pin),
+                LockPin::Heap(pin) => release_provider_allocation_pin_or_park(pin),
+            }
         }
     }
 }

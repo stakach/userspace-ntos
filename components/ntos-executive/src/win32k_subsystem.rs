@@ -1172,6 +1172,23 @@ unsafe fn retire_provider_allocation_timers(
     retire_provider_local_timers_for_backing(provider_allocation_event_backing(allocation))
 }
 
+/// Whether `address..address + length` lies in a provider heap arena: the root heap (paged
+/// lookaside fallbacks such as GDI objects, section descriptors) or a section-backed USER or
+/// desktop heap. Its blocks are registered in the provider allocation catalog like pool.
+unsafe fn provider_heap_arena_contains(address: u64, length: u64) -> bool {
+    let Some(end) = address.checked_add(length) else {
+        return false;
+    };
+    let within = |base: u64, bytes: u64| address >= base && end <= base.saturating_add(bytes);
+    if within(WIN32K_HEAP_VADDR, WIN32K_HEAP_FRAMES * 0x1000) {
+        return true;
+    }
+    let _metadata = ProviderMetadataGuard::acquire();
+    (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS))
+        .as_ref()
+        .is_some_and(|arenas| arenas.iter().any(|arena| within(arena.base, arena.bytes)))
+}
+
 unsafe fn provider_heap_arena_identity(
     arena_base: u64,
 ) -> Option<nt_provider_wait::ProviderArenaIdentity> {
