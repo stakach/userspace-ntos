@@ -206,9 +206,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
         &mut self,
         mut requestor_tid: impl FnMut(FileId) -> Option<u64>,
     ) -> Result<Option<PreparedFileLifecycle>, NtStatus> {
-        if !self.owned_peer_file_lifecycle {
+        // Only a File with `close_retry_queued` can be ready, and the queued count is kept at
+        // every set and clear of that latch, so a zero count proves there is nothing to find.
+        if !self.owned_peer_file_lifecycle || self.deferred_file_close_queued == 0 {
             return Ok(None);
         }
+        self.peer_file_lifecycle_scans = self.peer_file_lifecycle_scans.saturating_add(1);
         let mut ready = None;
         for (file_id, _) in self.files.iter() {
             if self.queued_peer_file_lifecycle_ready(file_id)? {
@@ -223,6 +226,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
             return Ok(None);
         };
         self.prepare_queued_peer_file_lifecycle(file_id, tid)
+    }
+
+    /// File-table scans made by [`Self::prepare_next_queued_peer_file_lifecycle`].
+    pub fn peer_file_lifecycle_scans(&self) -> u64 {
+        self.peer_file_lifecycle_scans
     }
 
     /// Give a preparation back to the close pump when native dispatch could

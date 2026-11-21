@@ -389,6 +389,8 @@ pub struct IoManager<P> {
     rejected_completion_acks: Vec<(usize, IrpId)>,
     deferred_file_close_cursor: u64,
     deferred_file_close_queued: usize,
+    /// Census: File-table scans made looking for a queued peer CLEANUP/CLOSE.
+    peer_file_lifecycle_scans: u64,
     owned_peer_file_lifecycle: bool,
     disconnected_client_retries: Vec<ClientId>,
     port: P,
@@ -416,6 +418,7 @@ impl<P> IoManager<P> {
             rejected_completion_acks: Vec::new(),
             deferred_file_close_cursor: 0,
             deferred_file_close_queued: 0,
+            peer_file_lifecycle_scans: 0,
             owned_peer_file_lifecycle: false,
             disconnected_client_retries: Vec::new(),
             port,

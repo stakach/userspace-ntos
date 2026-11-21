@@ -311,3 +311,32 @@ fn repeated_final_handle_release_restores_retry_after_prepared_cleanup_is_discar
     assert_eq!(retry.projection().major, major::IRP_MJ_CLEANUP);
     io.discard_prepared_file_lifecycle(retry).unwrap();
 }
+
+#[test]
+fn queued_peer_lifecycle_scan_runs_only_while_a_release_is_queued() {
+    let (mut io, client, file, _, _, _) = external_file(false, true);
+    // A live File with nothing queued: the close pump has no work and must not scan.
+    assert!(io.prepare_next_queued_peer_file_lifecycle(|_| Some(0x42)).unwrap().is_none());
+    assert_eq!(io.peer_file_lifecycle_scans(), 0);
+
+    // The final release queues CLEANUP: the next pass scans and prepares it.
+    io.queue_external_file_release(client, file).unwrap();
+    let prepared = io
+        .prepare_next_queued_peer_file_lifecycle(|id| (id == file).then_some(0x42))
+        .unwrap()
+        .expect("queued CLEANUP is driven");
+    assert_eq!(prepared.projection().major, major::IRP_MJ_CLEANUP);
+    assert_eq!(io.peer_file_lifecycle_scans(), 1);
+
+    // Preparing took the queued work; a pass while it is in flight is skipped.
+    assert!(io.prepare_next_queued_peer_file_lifecycle(|_| Some(0x42)).unwrap().is_none());
+    assert_eq!(io.peer_file_lifecycle_scans(), 1);
+
+    // Requeueing restores the readiness and the work is driven again.
+    io.requeue_prepared_file_lifecycle(prepared).unwrap();
+    assert!(io
+        .prepare_next_queued_peer_file_lifecycle(|id| (id == file).then_some(0x42))
+        .unwrap()
+        .is_some());
+    assert_eq!(io.peer_file_lifecycle_scans(), 2);
+}
