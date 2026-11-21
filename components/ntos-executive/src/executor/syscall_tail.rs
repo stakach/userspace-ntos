@@ -1222,7 +1222,9 @@ pub(super) unsafe fn syscall_tail(
     // Event/timer processing may have selected an older provider continuation while this
     // syscall was in flight. The nested provider dispatch has returned to its retained
     // rendezvous by this point. Resume only admissions from this pass, not fresh reparks.
+    let step = crate::reply_tail_step_census::begin();
     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
+    crate::reply_tail_step_census::end(crate::reply_tail_step_census::Step::HostedReady, step, ());
     // ★ PHASE 3 — ONE reply shape for every serviced client syscall: resume the caller
     // through the reply object the KERNEL bound to it at its recv (`decode_reply` →
     // `replies[idx].bound_tcb`), then recv the next event re-registering that same object.

@@ -69,6 +69,7 @@ mod registry_checkpoint_audit;
 mod registry_query_audit;
 mod hot_service_cost_census;
 mod hot_service_latency_census;
+mod reply_tail_step_census;
 mod registry_open_phase_census;
 mod copy_in_census;
 mod io_lifecycle_trace;
@@ -7624,6 +7625,7 @@ pub(crate) fn census_tick_static(now: u64) {
     hot_service_cost_census::print_wait_status_census();
     hot_service_cost_census::print_wait_outcome_census();
     hot_service_latency_census::print_census();
+    reply_tail_step_census::print_census();
     registry_open_phase_census::print_census();
     {
         let frames = client_frame_registry_stats();

@@ -1134,7 +1134,9 @@ pub(super) unsafe fn syscall_nt_route(
         }
     }
     sc.park_thread_alert_deadline = nt_handler.thread_alert_wait.take();
+    let step = crate::reply_tail_step_census::begin();
     thread_alert::redrive(&mut nt_handler);
+    crate::reply_tail_step_census::end(crate::reply_tail_step_census::Step::ThreadAlert, step, ());
     if nt_handler.io_completion_park_port >= 0 {
         sc.park_io_completion_port = nt_handler.io_completion_park_port;
         sc.park_io_completion_key_out = nt_handler.io_completion_key_out;
@@ -1142,7 +1144,10 @@ pub(super) unsafe fn syscall_nt_route(
         sc.park_io_completion_iosb_out = nt_handler.io_completion_iosb_out;
         sc.park_io_completion_deadline = nt_handler.io_completion_timeout.deadline();
     }
-    let _ = unsafe { io_completion_deliver(&mut nt_handler) };
+    let step = crate::reply_tail_step_census::begin();
+    let _ = crate::reply_tail_step_census::end(
+        crate::reply_tail_step_census::Step::IoCompletionDeliver, step,
+        unsafe { io_completion_deliver(&mut nt_handler) });
     if nt_handler.io_signal_event >= 0 {
         let _ = wait_wake_dispatcher_set(&mut nt_handler);
     }

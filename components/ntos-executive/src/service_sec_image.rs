@@ -4615,8 +4615,10 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
 /// Advance retained service owners before attempting a mounted-volume checkpoint.
 /// A pending fold ACK, journal volume owner, or section-retirement error can defer it.
 fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u32> {
+    use crate::reply_tail_step_census::{begin, end, Step};
     // A native directory caller owns its original Reply until the exact Object Manager
     // request and local handle publication settle. Redrive before WAL early returns.
+    let t = begin();
     {
         let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
         unsafe { crate::native_directory_open_work::redrive(nt_handler) };
@@ -4624,8 +4626,12 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
         unsafe { crate::native_directory_effect_work::redrive_effects(nt_handler) };
         unsafe { crate::native_directory_effect_work::redrive_detached(nt_handler) };
     }
+    end(Step::DirectoryWork, t, ());
+    let t = begin();
     nt_handler.sweep_directory_security_bodies();
     nt_handler.sweep_data_section_security();
+    end(Step::SecuritySweeps, t, ());
+    let t = begin();
     // A hosted import can consume its last object reference while its primary Call still owns
     // the Reply. The dynamic delete drain waits for that primary's exact ready receipt, then
     // invokes DeleteProcedure on a separate PASSIVE worker.
@@ -4648,6 +4654,7 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
     if unsafe { kernel_provider_activation::yield_retry::next_deadline() }.is_some() {
         unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
     }
+    end(Step::DeferredDrains, t, ());
     // A completed physical fold can be waiting only for its exact CM ACK. It still owns the
     // reserve, so redrive that receipt before any ordinary snapshot tries to acquire it.
     if crate::writable_fs::system_wal_fold_ack_pending() {
@@ -4669,13 +4676,18 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
     if crate::writable_fs::registry_journal::owns_volume() {
         return Some(nt_fs::STATUS_SUCCESS);
     }
+    let t = begin();
     unsafe { kernel_provider_activation::publish_runtime_waits(nt_handler) };
+    end(Step::RuntimeWaits, t, ());
+    let t = begin();
     unsafe { inline_file_retirement::redrive(nt_handler) };
     unsafe { crate::object_wait_apc::redrive(nt_handler) };
     unsafe { crate::object_wait_reply::redrive(nt_handler) };
     unsafe { crate::pending_file_apc::redrive(nt_handler) };
     unsafe { crate::current_apc::redrive(nt_handler) };
+    end(Step::WaitApcRedrive, t, ());
     if FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel) {
+        let t = begin();
         // This boundary can follow receive, before the new caller's arguments are captured.
         // Retained cancellation must also converge when a timer delivers its only completion.
         let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
@@ -4685,11 +4697,15 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
             let _ = driver_launch::pump_hosted_file_lifecycle();
             let _ = file_irp_drain_redrive_all(nt_handler);
         }
+        end(Step::RetryFileRedrive, t, ());
     }
     // Object Manager references can reach zero in handle, wait, debug, LPC, or teardown paths. The
     // serialized ownership barrier is the single convergence point for exact-generation final
     // process deletion; individual release sites may still make an eager attempt for low latency.
+    let t = begin();
     let _ = nt_handler.drain_hosted_process_deletion_candidates();
+    end(Step::ProcessDeletion, t, ());
+    let t = begin();
     {
         let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
         unsafe {
@@ -4697,17 +4713,25 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
             let _ = lpc_connect_completion_drain(nt_handler);
         }
     }
+    end(Step::SectionRollbacks, t, ());
+    let t = begin();
     nt_handler.drain_native_process_images();
+    end(Step::ProcessImages, t, ());
     if let Some(ctx) = nt_handler.loop_ctx {
-        if let Err(status) = unsafe {
+        let t = begin();
+        let retirement = unsafe {
             service_drain_section_retirement_for_handler(&mut *ctx.generic_sections, nt_handler)
-        } {
+        };
+        end(Step::SectionRetirement, t, ());
+        if let Err(status) = retirement {
             return Some(report_service_finalize_failure(b"section-retirement", status));
         }
     }
+    let t = begin();
     unsafe { crate::writable_fs::redrive_file_cleanup_work() };
     // A failed launch whose rollback was refused finishes once its owners release it (#361).
     let _ = unsafe { driver_launch::retire_quarantined_launches() };
+    end(Step::FileCleanup, t, ());
     None
 }
 
@@ -15270,29 +15294,39 @@ fn service_mounted_native_blocks_and_redrive_backends() -> u64 {
 /// Advance hosted I/O, driver, File, and LPC owners after the current syscall.
 /// Keep the original ordering and retry-flag claim.
 unsafe fn redrive_global_post_syscall_work(nt_handler: &mut ExecNtHandler) {
-    let _ = driver_launch::pump_hosted_file_lifecycle();
+    use crate::reply_tail_step_census::{begin, end, Step};
+    let t = begin();
+    let _ = end(Step::LifecyclePump, t, driver_launch::pump_hosted_file_lifecycle());
+    let t = begin();
+    let activated = end(Step::Dpcs, t, driver_launch::drain_hosted_driver_dpcs());
     let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(
-        driver_launch::drain_hosted_driver_dpcs(),
+        activated,
         nt_handler,
     );
     if hosted_io_progress != 0
         || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
     {
+        let t = begin();
         let _ = pending_file_io_redrive_all(nt_handler);
         let _ = file_cleanup_redrive_all(nt_handler);
         let _ = driver_launch::pump_hosted_file_lifecycle();
+        end(Step::ProgressFileRedrive, t, ());
     }
     if nt_handler.pipe_endpoint_progress || hosted_io_progress != 0 {
-        let _ = pending_file_io_redrive_all(nt_handler);
+        let t = begin();
+        let _ = end(Step::PipeFileRedrive, t, pending_file_io_redrive_all(nt_handler));
     }
     // Cancellation drains are ordered after the original IRP owners. A waiter becomes
     // runnable only once generic/LISTEN publication has ACKed and removed every exact
     // manager IRP for its File and requestor thread.
-    let _ = file_irp_drain_redrive_all(nt_handler);
+    let t = begin();
+    let _ = end(Step::IrpDrain, t, file_irp_drain_redrive_all(nt_handler));
     if nt_handler.lpc_endpoint_progress {
-        let _ = lpc_endpoint_redrive_all(nt_handler);
+        let t = begin();
+        let _ = end(Step::LpcEndpoint, t, lpc_endpoint_redrive_all(nt_handler));
     }
-    let _ = lpc_connect_completion_drain(nt_handler);
+    let t = begin();
+    let _ = end(Step::LpcConnect, t, lpc_connect_completion_drain(nt_handler));
 }
 
 // Callers execute DPCs before borrowing the handler and pass only the completed work count.
@@ -15300,26 +15334,43 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
     activated: u64,
     nt_handler: &mut ExecNtHandler,
 ) -> u64 {
-    let retired = driver_launch::drain_hosted_file_retirements();
-    let video_retired = crate::video_device::drain_video_file_retirements();
-    let serviced = driver_launch::service_pending_file_backends() as u64;
+    use crate::reply_tail_step_census::{begin, end, Step};
+    let t = begin();
+    let retired = end(Step::FileRetirements, t, driver_launch::drain_hosted_file_retirements());
+    let t = begin();
+    let video_retired =
+        end(Step::VideoRetirements, t, crate::video_device::drain_video_file_retirements());
+    let t = begin();
+    let serviced = end(Step::Backends, t, driver_launch::service_pending_file_backends() as u64);
+    let t = begin();
     let native_blocks = service_mounted_native_blocks_and_redrive_backends();
-    let pumped = driver_launch::pump_hosted_io_completions() as u64;
+    end(Step::NativeBlocks, t, native_blocks);
+    let t = begin();
+    let pumped = end(Step::IoCompletions, t, driver_launch::pump_hosted_io_completions() as u64);
     if crate::config_manager_take_device_action_wake() {
         nt_handler.pnp_signal_pending_action();
     }
+    let t = begin();
+    let driver_starts = end(Step::DriverStarts, t, pending_driver_start_redrive_all(nt_handler));
+    let t = begin();
+    let critical_children =
+        end(Step::CriticalChildren, t, start_committed_critical_children(nt_handler));
+    let t = begin();
+    let pnp_operations = end(Step::PnpOperations, t, pending_pnp_operation_redrive_all(nt_handler));
     let mut progress = activated
         .saturating_add(retired)
         .saturating_add(video_retired)
         .saturating_add(serviced)
         .saturating_add(native_blocks)
         .saturating_add(pumped)
-        .saturating_add(pending_driver_start_redrive_all(nt_handler))
-        .saturating_add(start_committed_critical_children(nt_handler))
-        .saturating_add(pending_pnp_operation_redrive_all(nt_handler));
+        .saturating_add(driver_starts)
+        .saturating_add(critical_children)
+        .saturating_add(pnp_operations);
     // Deferred bus relations can load another boot-start driver after the initial plan loop.
     // Dispatch boot callbacks only at a turn with no relation or START admission in flight;
     // keep the boot phase open so a later exact registration is still owned and dispatched.
+    let t = begin();
+    let before_callbacks = progress;
     if !hosted_pnp_start::hosted_start_batch_drive_active()
         && !driver_launch::hosted_bus_relation_pending()
         && !driver_launch::hosted_critical_child_start_pending()
@@ -15335,6 +15386,7 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
                 .expect("driver reinitialization lost its exact callback terminal") as u64,
         );
     }
+    end(Step::ReinitCallbacks, t, progress != before_callbacks);
     if progress != 0 {
         FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
     }

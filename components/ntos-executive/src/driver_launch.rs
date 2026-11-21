@@ -50059,13 +50059,17 @@ impl Drop for HostedIoPumpObservation {
 /// Advance completion and cleanup owners without admitting a new passive queued callback.
 /// Each completion path still enforces its own provider and Reply ownership prerequisites.
 pub(crate) fn pump_hosted_io_completions() -> usize {
+    use crate::reply_tail_step_census::{begin, end, Step};
     let _observation = HostedIoPumpObservation::enter();
-    let pumped = pump_io_manager();
-    pumped
-        .saturating_add(hosted_start_io::drain_cleanup())
+    let t = begin();
+    let pumped = end(Step::IoManager, t, pump_io_manager());
+    let t = begin();
+    let owners = hosted_start_io::drain_cleanup()
         .saturating_add(hosted_file_owners::drain())
-        .saturating_add(hosted_file_lifecycle_owners::retire())
-        .saturating_add(unsafe { drain_hosted_acpi_pci_route_indeterminate_irps() })
+        .saturating_add(hosted_file_lifecycle_owners::retire());
+    let owners = end(Step::IoOwnerDrains, t, owners);
+    let t = begin();
+    let pnp = (unsafe { drain_hosted_acpi_pci_route_indeterminate_irps() })
         .saturating_add(unsafe { drain_hosted_device_retirements() })
         .saturating_add(unsafe { hosted_add_device_rollback::drain() })
         .saturating_add(unsafe { drain_hosted_pnp_completions() })
@@ -50075,7 +50079,9 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_query() })
         .saturating_add(unsafe { start_hosted_device_relation_query() })
         .saturating_add(unsafe { start_hosted_acpi_pci_route_query() })
-        .saturating_add(unsafe { hosted_sync_relations::drain() })
+        .saturating_add(unsafe { hosted_sync_relations::drain() });
+    let pnp = end(Step::IoPnpDrains, t, pnp);
+    pumped.saturating_add(owners).saturating_add(pnp)
 }
 
 static QUEUED_CALLBACK_DRAIN_SKIPS: AtomicU64 = AtomicU64::new(0);
