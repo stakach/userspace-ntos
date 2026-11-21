@@ -45225,6 +45225,14 @@ unsafe fn completed_irp_snapshot_exact(irp_id: u64) -> Option<nt_io_manager::Com
         return None;
     }
     pump_io_manager();
+    published_irp_snapshot_exact(irp_id)
+}
+
+/// The terminal already published to its owner, without polling providers first.
+fn published_irp_snapshot_exact(irp_id: u64) -> Option<nt_io_manager::CompletedIrp> {
+    if irp_id == 0 {
+        return None;
+    }
     if hosted_file_owners::contains(IrpId(irp_id)) {
         hosted_file_owners::completion(IrpId(irp_id)).ok()
     } else {
@@ -45232,10 +45240,24 @@ unsafe fn completed_irp_snapshot_exact(irp_id: u64) -> Option<nt_io_manager::Com
     }
 }
 
+/// Publish every ready provider completion to the I/O Manager. A caller that looks up many
+/// IRPs pumps once with this and then uses the `published_*` lookups.
+pub(crate) fn publish_backend_completions() -> usize {
+    pump_io_manager()
+}
+
 /// Resolve immutable terminal metadata for one exact canonical IRP. Generic executive delivery
 /// validates all of these identities before publishing its first user-visible surface.
 pub(crate) unsafe fn completed_irp_exact(irp_id: u64) -> Option<HostedCompletedIrp> {
-    let completion = completed_irp_snapshot_exact(irp_id)?;
+    completed_irp_snapshot_exact(irp_id).and_then(hosted_completed_irp)
+}
+
+/// [`completed_irp_exact`] over completions already published, without polling providers.
+pub(crate) fn published_completed_irp_exact(irp_id: u64) -> Option<HostedCompletedIrp> {
+    published_irp_snapshot_exact(irp_id).and_then(hosted_completed_irp)
+}
+
+fn hosted_completed_irp(completion: nt_io_manager::CompletedIrp) -> Option<HostedCompletedIrp> {
     Some(HostedCompletedIrp {
         client_id: completion.client_id.0,
         driver_id: completion.driver_id.raw(),
@@ -45311,7 +45333,12 @@ pub(crate) unsafe fn completed_irp_copy_requires_retry(irp_id: u64) -> bool {
         return false;
     }
     pump_io_manager();
-    io_manager_mut().irp(IrpId(irp_id))
+    published_completed_irp_copy_requires_retry(irp_id)
+}
+
+/// [`completed_irp_copy_requires_retry`] over completions already published.
+pub(crate) fn published_completed_irp_copy_requires_retry(irp_id: u64) -> bool {
+    irp_id != 0 && io_manager_mut().irp(IrpId(irp_id))
         .is_some_and(|irp| irp.state == nt_io_manager::IrpState::Completed)
 }
 

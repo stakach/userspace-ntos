@@ -70,6 +70,7 @@ mod registry_query_audit;
 mod hot_service_cost_census;
 mod hot_service_latency_census;
 mod reply_tail_step_census;
+mod pending_file_completion_scan;
 mod registry_open_phase_census;
 mod copy_in_census;
 mod io_lifecycle_trace;

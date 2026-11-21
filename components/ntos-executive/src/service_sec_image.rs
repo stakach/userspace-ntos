@@ -15891,6 +15891,8 @@ unsafe fn pending_file_io_redrive_pass(
         }};
     }
 
+    let mut completions = crate::pending_file_completion_scan::CompletionScan::begin(
+        driver_launch::publish_backend_completions);
     let mut snapshot: alloc::vec::Vec<_> = (&*core::ptr::addr_of!(PENDING_FILE_IO))
         .drain_exact()
         .filter(|(_, pending)| !finish_settled_busy_only
@@ -15995,7 +15997,7 @@ unsafe fn pending_file_io_redrive_pass(
         {
             None
         } else {
-            driver_launch::completed_irp_exact(pending.irp_id)
+            completions.lookup(|| driver_launch::published_completed_irp_exact(pending.irp_id))
         };
         // Provider completion lookup may dispatch nested work and retire/reuse this slot.
         if !(&*core::ptr::addr_of!(PENDING_FILE_IO))
@@ -16005,7 +16007,9 @@ unsafe fn pending_file_io_redrive_pass(
         }
         if completed.is_none() && transaction_terminal.is_none()
             && attribute_inline_terminal.is_none() && local_terminal.is_none() {
-            if !pending.is_local() && driver_launch::completed_irp_copy_requires_retry(pending.irp_id) {
+            if !pending.is_local() && completions.copy_requires_retry(
+                || driver_launch::published_completed_irp_copy_requires_retry(pending.irp_id))
+            {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
             }
             continue;
@@ -17098,6 +17102,11 @@ unsafe fn pending_file_io_redrive_pass(
     }
     restore_file_io_mirrors!();
     nt_handler.loop_ctx = saved_ctx;
+    if completions.finish() {
+        // A row may have been visited before its completion was published. Redrive at this
+        // boundary's finalization rather than waiting for an unrelated wake.
+        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+    }
     let settled = if finish_settled_busy_only {
         0
     } else {
