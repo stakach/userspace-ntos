@@ -70,6 +70,7 @@ mod registry_query_audit;
 mod hot_service_cost_census;
 mod hot_service_latency_census;
 mod reply_tail_step_census;
+mod hosted_resume_census;
 mod process_deletion_demand;
 mod pending_file_completion_scan;
 mod registry_open_phase_census;
@@ -7235,6 +7236,12 @@ pub(crate) fn root_idle_receive_ticks() -> u64 {
         .sample(nt_hosted_runtime::SharedReceiveOwner::Idle, true).total_ticks
 }
 
+/// Root time blocked in a dispatch receive: waiting while a provider runs.
+pub(crate) fn root_dispatch_receive_ticks() -> u64 {
+    spawn_hosts::shared_ingress::receive_census_snapshot()
+        .sample(nt_hosted_runtime::SharedReceiveOwner::Dispatch, true).total_ticks
+}
+
 fn print_shared_receive_census() {
     use nt_hosted_runtime::{SharedReceiveOwner, SharedReceiveReturn};
     let census = spawn_hosts::shared_ingress::receive_census_snapshot();
@@ -7630,6 +7637,7 @@ pub(crate) fn census_tick_static(now: u64) {
     hot_service_cost_census::print_wait_outcome_census();
     hot_service_latency_census::print_census();
     reply_tail_step_census::print_census();
+    hosted_resume_census::print_census();
     registry_open_phase_census::print_census();
     {
         let frames = client_frame_registry_stats();

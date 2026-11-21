@@ -4691,16 +4691,17 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
     end(Step::WaitApcRedrive, t, ());
     if FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel) {
         let t = begin();
+        let mut progressed = 0u64;
         // This boundary can follow receive, before the new caller's arguments are captured.
         // Retained cancellation must also converge when a timer delivers its only completion.
         let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
         unsafe {
-            let _ = pending_file_io_redrive_all(nt_handler);
-            let _ = file_cleanup_redrive_all(nt_handler);
-            let _ = driver_launch::pump_hosted_file_lifecycle();
-            let _ = file_irp_drain_redrive_all(nt_handler);
+            progressed += pending_file_io_redrive_all(nt_handler);
+            progressed += file_cleanup_redrive_all(nt_handler);
+            progressed += driver_launch::pump_hosted_file_lifecycle() as u64;
+            progressed += file_irp_drain_redrive_all(nt_handler);
         }
-        end(Step::RetryFileRedrive, t, ());
+        end(Step::RetryFileRedrive, t, progressed);
     }
     // Object Manager references can reach zero in handle, wait, debug, LPC, or teardown paths. The
     // serialized ownership barrier is the single convergence point for exact-generation final
@@ -15310,10 +15311,10 @@ unsafe fn redrive_global_post_syscall_work(nt_handler: &mut ExecNtHandler) {
         || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
     {
         let t = begin();
-        let _ = pending_file_io_redrive_all(nt_handler);
-        let _ = file_cleanup_redrive_all(nt_handler);
-        let _ = driver_launch::pump_hosted_file_lifecycle();
-        end(Step::ProgressFileRedrive, t, ());
+        let delivered = pending_file_io_redrive_all(nt_handler);
+        let cleaned = file_cleanup_redrive_all(nt_handler);
+        let pumped = driver_launch::pump_hosted_file_lifecycle() as u64;
+        end(Step::ProgressFileRedrive, t, delivered + cleaned + pumped);
     }
     if nt_handler.pipe_endpoint_progress || hosted_io_progress != 0 {
         let t = begin();

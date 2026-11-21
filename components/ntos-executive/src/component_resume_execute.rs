@@ -64,6 +64,7 @@ pub(crate) unsafe fn run_hosted(
     nt_handler: *mut ExecNtHandler,
     candidate: Candidate,
 ) -> Option<ComponentSuspensionRuntimeOutcome> {
+    let mut clock = crate::hosted_resume_census::ResumeClock::start();
     let trace_lane = candidate.resume.lane;
     let trace_key = candidate.resume.suspension.key;
     let trace_owner = candidate.owner;
@@ -145,6 +146,12 @@ pub(crate) unsafe fn run_hosted(
             PROVIDER_WAIT_SUCCESSFUL_RESUMES.fetch_add(1, Ordering::Relaxed);
         }
     }
+    clock.pump_started(match continuation.pending {
+        PendingComponentDispatch::Provider(_) => crate::hosted_resume_census::Kind::Provider,
+        PendingComponentDispatch::Lpc(_) => crate::hosted_resume_census::Kind::Lpc,
+        PendingComponentDispatch::ServiceWait(_) => crate::hosted_resume_census::Kind::ServiceWait,
+        _ => crate::hosted_resume_census::Kind::Other,
+    });
     let pump_completion = match continuation.pending {
         PendingComponentDispatch::Provider(pending) => {
             let resumed = win32k_glue::resume_suspended_provider_wait_component(
@@ -296,6 +303,7 @@ pub(crate) unsafe fn run_hosted(
             }
         }
     };
+    clock.pump_finished();
     let trace_nested_provider = matches!(continuation.pending,
         PendingComponentDispatch::Provider(pending) if pending.nested_user_callback)
         && NESTED_PROVIDER_OUTER_TRACES.fetch_add(1, Ordering::Relaxed) < 4096;
