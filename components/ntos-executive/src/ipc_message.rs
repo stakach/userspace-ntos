@@ -29,6 +29,18 @@ impl Drop for SavedMessageBuffer {
     }
 }
 
+/// Run `work` with the root TCB's received message restored afterwards; see
+/// [`nt_component_suspension::preserving_message_buffer`].
+pub(crate) unsafe fn preserving_received<R>(work: impl FnOnce() -> R) -> R {
+    let base = executor::local().ipc_buffer.load(Ordering::Relaxed) as *mut u64;
+    assert!(!base.is_null(), "maintenance has no root message buffer");
+    nt_component_suspension::preserving_message_buffer(
+        |index| unsafe { core::ptr::read_volatile(base.add(index)) },
+        |index, word| unsafe { core::ptr::write_volatile(base.add(index), word) },
+        work,
+    )
+}
+
 pub(crate) unsafe fn capture_received(
     badge: u64,
     info: u64,

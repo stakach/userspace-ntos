@@ -11,3 +11,4 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 nt-hosted-runtime = { path = "../nt-hosted-runtime" }
+nt-syscall-abi = { path = "../nt-syscall-abi" }

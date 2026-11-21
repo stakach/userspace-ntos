@@ -108,7 +108,7 @@ pub use lane_peer::PeerLaneError;
 pub use receive_probe::{
     classify_received_call, require_free_reply, ReceiveProbeError, ReplyBindingObservation,
 };
-pub use message::{IpcBufferSnapshot, ReceivedMessage, IPC_BUFFER_WORDS};
+pub use message::{preserving_message_buffer, IpcBufferSnapshot, ReceivedMessage, IPC_BUFFER_WORDS};
 pub use ingress::{
     IngressExecutionOwner,
     ComponentIngress, IngressError, IngressObservation, IngressReceiveAttempt, IngressReplyAttempt,

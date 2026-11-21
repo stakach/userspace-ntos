@@ -26,6 +26,20 @@ impl IpcBufferSnapshot {
     }
 }
 
+/// Run `work`, which may invoke capabilities on the receiving TCB, without disturbing the message
+/// that TCB already received: its IPC buffer is snapshotted first and restored afterwards, so a
+/// later capture still reads the original Call's tail words. Nested scopes restore in stack order.
+pub fn preserving_message_buffer<R>(
+    read: impl FnMut(usize) -> u64,
+    write: impl FnMut(usize, u64),
+    work: impl FnOnce() -> R,
+) -> R {
+    let snapshot = IpcBufferSnapshot::capture(read);
+    let result = work();
+    snapshot.restore(write);
+    result
+}
+
 /// A receive observation, not evidence that a Call bound a Reply object. Badge/tag values alone
 /// cannot distinguish a Call, Send, notification, or empty nonblocking receive. Captured cap words
 /// are metadata, not ownership of transferred capabilities. This object has no Drop-side effects.

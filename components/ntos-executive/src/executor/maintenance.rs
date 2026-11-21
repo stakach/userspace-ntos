@@ -39,25 +39,31 @@ pub(super) unsafe fn maintain(
     let hosted_loaded_images_ptr = lp.images.hosted_loaded_images_ptr;
     let reg = &mut *lp.images.reg;
     let ntdll = lp.images.ntdll;
-    // Restores no continuation kept are root-owned (#333); retry them before admitting work.
-    drain_root_restores();
-    let queued_callback_fences_providers = root_queued_callback_exclusive_pending()
-        || crate::driver_launch::unsettled_queued_callback();
-    #[cfg(not(feature = "mup-provider-kernel-only"))]
-    if !queued_callback_fences_providers {
-        service_primary_alias_retry(&mut nt_handler, &mut lp.ingress.primary_alias_activation);
-    }
-    if !queued_callback_fences_providers {
-        hosted_spawn_uncertainty::redrive(&mut *delay_queue, &mut nt_handler);
-        // Driver ZwTerminateProcess already applied Ps policy; reclaim its mechanisms here.
-        for (pi, identity) in crate::provider_process_termination::take() {
-            if nt_handler.capture_process_identity(pi as usize) == Some(identity) {
-                super::loop_process_termination::teardown_remote_process(
-                    &mut *nt_handler, &mut *delay_queue, pi,
-                );
+    // The previous turn's receive is still in the root IPC buffer, and its native tail is
+    // captured only below. Restores, alias retries, spawn redrives and teardowns can all invoke
+    // capabilities on this TCB (a kept dispatch's resume really receives), so they run with that
+    // message preserved (#420, #427).
+    crate::ipc_message::preserving_received(|| {
+        // Restores no continuation kept are root-owned (#333); retry them before admitting work.
+        drain_root_restores();
+        let queued_callback_fences_providers = root_queued_callback_exclusive_pending()
+            || crate::driver_launch::unsettled_queued_callback();
+        #[cfg(not(feature = "mup-provider-kernel-only"))]
+        if !queued_callback_fences_providers {
+            service_primary_alias_retry(&mut nt_handler, &mut lp.ingress.primary_alias_activation);
+        }
+        if !queued_callback_fences_providers {
+            hosted_spawn_uncertainty::redrive(&mut *delay_queue, &mut nt_handler);
+            // Driver ZwTerminateProcess already applied Ps policy; reclaim its mechanisms here.
+            for (pi, identity) in crate::provider_process_termination::take() {
+                if nt_handler.capture_process_identity(pi as usize) == Some(identity) {
+                    super::loop_process_termination::teardown_remote_process(
+                        &mut *nt_handler, &mut *delay_queue, pi,
+                    );
+                }
             }
         }
-    }
+    });
     // The previous iteration's event locals and borrows have ended. Restore before any
     // new maintenance or admission; refusal retains the boundary and cannot be replayed.
     if let Some(boundary) = lp.ingress.receive_boundary.take() {
