@@ -503,3 +503,41 @@ fn last_epoch_is_issued_once_and_failed_preflight_never_consumes_it() {
     assert_eq!(lanes.active_dispatch_identity(lane), Ok(None));
     assert_eq!(lanes.running(), None);
 }
+
+// Boot 44836920548: explorer's in-callback service wait was refused (InvalidIdentity) and the
+// root exited. The lane held callback token 0x2f9 from the user-callback counter, and the
+// service wait parked token 0x2f9 from the service-wait issuer: two counters, one stack.
+#[test]
+fn a_callback_and_its_service_wait_from_one_issuer_never_alias() {
+    // Reproduction: independent counters that reach the same value alias on the lane.
+    let mut lanes = Lanes::new(1, 4);
+    let lane = lanes.allocate(binding(1)).unwrap();
+    let reply = binding(1).reply_object;
+    lanes.begin_dispatch(lane, reply).unwrap();
+    let dispatch = identity(&lanes, lane);
+    let (callback_counter, service_counter) = (0x2f9, 0x2f9);
+    lanes.suspend_running(lane, reply, callback_counter).unwrap();
+    lanes.resume_external(lane, reply, callback_counter).unwrap();
+    lanes.suspend_running(lane, reply, service_counter).unwrap();
+    let key = SuspensionKey::service_wait(1);
+    assert_eq!(lanes.admit_in_callback_service_wait_external_owned(
+        lane, reply, dispatch, callback_counter, service_counter, key, 1, owner(1), 99,
+    ), Err((LaneError::InvalidIdentity, 99)));
+
+    // One issuer: whatever kind takes a token next, it differs from every earlier one.
+    let mut lanes = Lanes::new(1, 4);
+    let lane = lanes.allocate(binding(1)).unwrap();
+    lanes.begin_dispatch(lane, reply).unwrap();
+    let dispatch = identity(&lanes, lane);
+    let issuer = crate::ServiceWaitTokenIssuer::new();
+    let callback = issuer.issue().unwrap();
+    let service = issuer.issue().unwrap();
+    assert_ne!(callback, service);
+    lanes.suspend_running(lane, reply, callback).unwrap();
+    lanes.resume_external(lane, reply, callback).unwrap();
+    lanes.suspend_running(lane, reply, service).unwrap();
+    lanes.admit_in_callback_service_wait_external_owned(
+        lane, reply, dispatch, callback, service, key, 1, owner(1), 99,
+    ).unwrap();
+    assert_eq!(lanes.external_top(lane), Ok(Some(service)));
+}

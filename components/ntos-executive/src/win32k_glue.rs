@@ -92,7 +92,6 @@ pub(crate) fn next_win32k_dispatch_id() -> Option<u64> {
         .ok()?
         .checked_add(1)
 }
-static USER_CALLBACK_TRANSFER_IDS: AtomicU64 = AtomicU64::new(1);
 static USER_CALLBACK_RENDEZVOUS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_WINLOGON_API0: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_API0_REDIRECTS: AtomicU64 = AtomicU64::new(0);
@@ -2935,11 +2934,11 @@ unsafe fn begin_controlled_continuation(
     if callback_client.tcb <= 1 {
         return false;
     }
-    let Ok(external_token) = USER_CALLBACK_TRANSFER_IDS.try_update(
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-        |next| next.checked_add(1),
-    ) else {
+    // The lane's external token stack holds this token beside service-wait tokens, and its
+    // admission compares them: every lane external token comes from the one issuer.
+    let Ok(external_token) =
+        crate::spawn_hosts::shared_ingress::owner::runtime::next_service_wait_token()
+    else {
         return false;
     };
     let mut token_user_sid = [0u8; nt_user_callback::CLIENT_TOKEN_USER_SID_MAX];

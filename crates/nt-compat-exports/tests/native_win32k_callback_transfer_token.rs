@@ -7,8 +7,6 @@ fn nested_callbacks_do_not_reuse_their_dispatch_local_header_ids_as_lane_tokens(
         "capture must return the retained frame's unique external transfer token");
 
     let glue = include_str!("../../../components/ntos-executive/src/win32k_glue.rs");
-    assert!(glue.contains("USER_CALLBACK_TRANSFER_IDS"),
-        "the root must mint a distinct token for every active callback");
     for name in ["active_callback_lane_and_token", "pending_callback_token_on_lane"] {
         let body = glue.split(&format!("unsafe fn {name}(")).nth(1).unwrap()
             .split("\n}").next().unwrap();

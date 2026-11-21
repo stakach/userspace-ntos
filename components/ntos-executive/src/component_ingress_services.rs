@@ -34,6 +34,8 @@ impl WaitPhase {
 static SERVICE_WAIT_TOKENS: nt_component_suspension::ServiceWaitTokenIssuer =
     nt_component_suspension::ServiceWaitTokenIssuer::new();
 
+/// The one issuer of component lane external tokens: service waits, retained services and
+/// user-callback frames all push onto the same lane token stack, whose admission compares them.
 pub(crate) fn next_service_wait_token() -> Result<u64, ()> {
     SERVICE_WAIT_TOKENS.issue().ok_or(())
 }
