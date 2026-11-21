@@ -6,6 +6,7 @@ use nt_memory_manager::ProcessIdentity;
 pub(crate) unsafe fn trace_user_fault_context(
     handler: &ExecNtHandler,
     expected: crate::hosted_thread_runtime::HostedThreadRuntime,
+    fault_address: u64,
     scratch_base: u64,
 ) {
     use core::fmt::Write;
@@ -71,6 +72,32 @@ pub(crate) unsafe fn trace_user_fault_context(
             None => {
                 let _ = write!(record, " stack[{index}]=unreadable");
             }
+        }
+    }
+    // Boot 44887442144: cmd.exe faulted at rip 0x10030452339, inside an image mapped in the
+    // section-view range, and nothing named it. Name the loaded module from the process's own
+    // loader list.
+    let _ = write!(record, " fault-addr=0x{fault_address:016x}");
+    let module = handler.pm.thread_teb(expected.tid as nt_process::ThreadId).and_then(|teb| {
+        nt_user_host::loaded_module_lookup::module_containing(teb, context.registers[0], |va, out| {
+            client_copyin_process_mapped_for(expected.pi as u64, process, va, out, scratch_base)
+        })
+    });
+    match module {
+        Some(module) => {
+            let _ = write!(record, " module=");
+            for unit in &module.name[..module.name_units] {
+                let byte = u8::try_from(*unit).ok().filter(|byte| byte.is_ascii_graphic()).unwrap_or(b'?');
+                let _ = record.write_char(char::from(byte));
+            }
+            let _ = write!(
+                record,
+                "+0x{:x} base=0x{:x} size=0x{:x}",
+                context.registers[0] - module.base, module.base, module.size
+            );
+        }
+        None => {
+            let _ = write!(record, " module=?");
         }
     }
     let _ = writeln!(record);

@@ -231,7 +231,7 @@ pub(super) unsafe fn vm_fault(
     // with a diagnostic instead — exactly like the win32k `[vmf-out]` stop path.
     if addr < 0x10000 {
         fault_stack_diagnostics::trace_user_fault_context(
-            &nt_handler, event_runtime, scratch_base,
+            &nt_handler, event_runtime, addr, scratch_base,
         );
         if is_tp_worker {
             assert!(drop_current_hosted_reply(), "terminal worker fault must retire its Call");

@@ -69,6 +69,10 @@ pub mod gui_client_info_snapshot;
 pub mod win32k_teb;
 pub mod win32k_process_heap;
 pub mod win32k_threadinfo;
+pub mod loaded_module_lookup;
+#[cfg(test)]
+#[path = "loaded_module_lookup_tests.rs"]
+mod loaded_module_lookup_tests;
 #[cfg(test)]
 #[path = "win32k_threadinfo_tests.rs"]
 mod win32k_threadinfo_tests;
