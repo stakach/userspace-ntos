@@ -75,6 +75,7 @@ mod hosted_device_pointer;
 pub mod hosted_provider_child_route;
 mod completion_ack;
 mod completion_retirement;
+mod returned_completion;
 mod projection_allocation;
 mod hosted_attached_device_reference;
 mod hosted_safe_attach;
@@ -183,6 +184,7 @@ pub use cleanup_wait::{
     PendingFileCleanupWait, PendingFileCleanupWaitReservation, PendingFileCleanupWaitTable,
 };
 pub use complete::{CompletedIrp, IoPumpReport};
+pub use returned_completion::{ReturnedIrp, ReturnedIrpRejection};
 pub use completion_unwind::{
     CompletionClaimRelease, CompletionOwnerClaim, CompletionOwnerPhase,
     CompletionRoutineDisposition, CompletionUnwindCursor, CompletionUnwindError,
@@ -1587,6 +1589,7 @@ mod tests {
     mod detached_external_pnp;
     mod detached_external_pnp_completion;
     mod detached_external_power_tests;
+    mod returned_completion;
 
     use super::*;
     use nt_io_abi::{ioctl, major};

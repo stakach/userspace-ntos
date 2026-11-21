@@ -126,6 +126,8 @@ pub struct ExternalPnpCompletionInvocation {
     completion: CompletedIrp,
     reservation: CompletionAckReservation,
     backend_index: usize,
+    /// False for a returned completion the I/O Manager holds (#420).
+    backend_owed: bool,
 }
 
 impl ExternalPnpCompletionInvocation {
@@ -139,11 +141,22 @@ impl ExternalPnpCompletionInvocation {
     pub fn backend_index(&self) -> usize {
         self.backend_index
     }
+    /// Whether a backend retains this completion and is owed its ACK. A returned completion
+    /// (#420) is held by the I/O Manager alone.
+    pub fn owes_backend_acknowledgement(&self) -> bool {
+        self.backend_owed
+    }
+    /// Issue the backend ACK once. A returned completion has no backend owner, so `invoke` is
+    /// never called: the I/O Manager's own release is its whole acknowledgement.
     pub fn invoke<F>(self, invoke: F) -> ExternalPnpCompletionReturn
     where
         F: FnOnce(&CompletedIrp) -> CompletionAcknowledgement,
     {
-        let acknowledgement = invoke(&self.completion);
+        let acknowledgement = if self.backend_owed {
+            invoke(&self.completion)
+        } else {
+            CompletionAcknowledgement::Acknowledged
+        };
         ExternalPnpCompletionReturn {
             invocation: self,
             acknowledgement,
@@ -295,18 +308,19 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 .map(|driver| driver.backend.0 as usize)
                 .filter(|index| *index < self.backends.len())
                 .ok_or(NtStatus::INVALID_PARAMETER)?;
-            if self.backends[backend_index].is_faulted() {
+            let backend_owed = self.completion_owes_backend(id);
+            if backend_owed && self.backends[backend_index].is_faulted() {
                 return Err(NtStatus::DEVICE_NOT_CONNECTED);
             }
             let reservation = CompletionAckReservation::new(self.ownership_identity(), id)?;
-            Ok((completion, reservation, backend_index))
+            Ok((completion, reservation, backend_index, backend_owed))
         })();
         match valid {
             Err(status) => Err(ExternalPnpCompletionRejection {
                 status,
                 owner: retained,
             }),
-            Ok((completion, reservation, backend_index)) => {
+            Ok((completion, reservation, backend_index, backend_owed)) => {
                 self.irps
                     .get_mut(completion.id)
                     .unwrap()
@@ -316,6 +330,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                     completion,
                     reservation,
                     backend_index,
+                    backend_owed,
                 })
             }
         }

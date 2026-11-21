@@ -603,6 +603,9 @@ pub struct IrpRecord {
     /// Driver-owned context captured by the terminal CREATE result.
     pub completion_file_context: Option<u64>,
     pub completion_origin: Option<IrpCompletionOrigin>,
+    /// The output of a later synchronous return the I/O Manager published as this IRP's
+    /// completion (#420). The manager, not a backend, holds it until acknowledgement.
+    pub(crate) returned_output: Option<Vec<u8>>,
     /// One-shot authority consumed when an external PnP owner claims the terminal stack receipt.
     pub(crate) external_pnp_terminal_receipt_claimed: bool,
     /// A detached dispatch owns retirement; ordinary free/ACK cannot consume it across IPC.
@@ -649,6 +652,7 @@ impl IrpRecord {
             information: 0,
             completion_file_context: None,
             completion_origin: None,
+            returned_output: None,
             external_pnp_terminal_receipt_claimed: false,
             detached_file_owner: false,
             subsidiary_file_lifecycle: None,

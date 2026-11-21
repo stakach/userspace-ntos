@@ -3,7 +3,7 @@ use super::*;
 use crate::detached_file_irp::ExternalFileIrpAcknowledgement;
 use crate::source_irp_auxiliary::SourcePoolAllocationIdentity;
 
-fn pending(
+pub(super) fn pending(
     io: &mut IoManager<MockObjectPort>,
 ) -> (RetainedExternalPnp, std::rc::Rc<std::cell::Cell<bool>>) {
     pending_for(

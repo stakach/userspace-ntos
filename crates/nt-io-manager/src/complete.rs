@@ -395,7 +395,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.publish_verified_completion(completion, IrpCompletionOrigin::TransportFault)
     }
 
-    fn publish_verified_completion(
+    pub(crate) fn publish_verified_completion(
         &mut self,
         completion: DriverCompletion,
         origin: IrpCompletionOrigin,
@@ -554,6 +554,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         if offset > transfer_len {
             return Err(NtStatus::INVALID_PARAMETER);
         }
+        if let Some(copied) = self.copy_returned_output(irp_id, transfer_len, offset, output) {
+            return copied;
+        }
         let copy_capacity = output.len().min(transfer_len - offset);
         if copy_capacity == 0 {
             return Ok(0);
@@ -654,6 +657,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
             )
         };
         let offset = usize::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if let Some(copied) = self.copy_returned_output(irp_id, payload_len, offset, output) {
+            return copied;
+        }
         if offset > payload_len {
             return Err(NtStatus::INVALID_PARAMETER);
         }
@@ -719,7 +725,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .map(|driver| driver.backend.0 as usize)
             .filter(|index| *index < self.backends.len())
             .ok_or(NtStatus::INVALID_PARAMETER)?;
-        if self.backends[backend_index].is_faulted() {
+        if !self.completion_owes_backend(irp_id) {
+            // A returned completion's state is the I/O Manager's own; no backend holds it.
+        } else if self.backends[backend_index].is_faulted() {
             if !reclaim_faulted_backend {
                 return Err(NtStatus::DEVICE_NOT_CONNECTED);
             }
