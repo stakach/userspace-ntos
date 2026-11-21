@@ -5466,7 +5466,18 @@ unsafe fn dbg_emit_stack_bytes(bytes: &[u8]) {
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        crate::dbg_print_bytes(bytes.as_ptr(), bytes.len());
+        let (pid, tid): (u64, u64);
+        // SAFETY: the current NT TEB holds ClientId {UniqueProcess, UniqueThread} at GS:[0x40].
+        core::arch::asm!(
+            "mov {}, gs:[0x40]",
+            "mov {}, gs:[0x48]",
+            out(reg) pid,
+            out(reg) tid,
+            options(nostack, preserves_flags, readonly)
+        );
+        let mut tagged = [0u8; DBG_PRINT_BUFFER_SIZE + 48];
+        let len = nt_ntdll::dbg::tag_with_client_id(pid, tid, bytes, &mut tagged);
+        crate::dbg_print_bytes(tagged.as_ptr(), len);
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

@@ -72,6 +72,37 @@ pub fn finalize_print_buffer(buffer: &mut [u8], rendered_len: usize, overflowed:
     }
 }
 
+/// Write `pid=<pid> tid=<tid> ` and then `message` into `out`, truncating at its end, and return
+/// the length. The serial debug service prints every process's DbgPrint output into one log;
+/// boot 44873582254 could not tell cmd.exe's `Can't allocate console` from kbswitch.exe's.
+pub fn tag_with_client_id(pid: u64, tid: u64, message: &[u8], out: &mut [u8]) -> usize {
+    let mut len = 0usize;
+    let mut push = |byte: u8| {
+        if len < out.len() {
+            out[len] = byte;
+            len += 1;
+        }
+    };
+    for (label, value) in [(&b"pid="[..], pid), (&b" tid="[..], tid)] {
+        label.iter().copied().for_each(&mut push);
+        let mut digits = [0u8; 20];
+        let mut count = 0usize;
+        let mut rest = value;
+        loop {
+            digits[count] = b'0' + (rest % 10) as u8;
+            count += 1;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        digits[..count].iter().rev().copied().for_each(&mut push);
+    }
+    push(b' ');
+    message.iter().copied().for_each(&mut push);
+    len
+}
+
 fn push_hex(out: &mut Vec<u8>, value: u64, minimum_digits: usize) {
     let significant_digits = if value == 0 {
         1
@@ -358,6 +389,16 @@ pub unsafe fn emit(msg: *const u8, len: usize) {
 mod tests {
     extern crate std;
     use super::*;
+
+    #[test]
+    fn tagged_message_names_its_process_and_thread_and_truncates() {
+        let mut out = [0u8; 64];
+        let len = tag_with_client_id(664, 668, b"err: Can't allocate console\n", &mut out);
+        assert_eq!(&out[..len], b"pid=664 tid=668 err: Can't allocate console\n");
+        let mut short = [0u8; 10];
+        let len = tag_with_client_id(0, 18_446_744_073_709_551_615, b"x", &mut short);
+        assert_eq!(&short[..len], b"pid=0 tid=");
+    }
 
     /// The five debug-object services `DbgUi*` is a thin shim over — name, `sysfuncs.lst`-derived
     /// SSN (its 0-based line index) and parameter count. Kept here so the DbgUi surface's ABI is
