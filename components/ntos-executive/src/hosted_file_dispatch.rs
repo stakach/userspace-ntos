@@ -1,7 +1,7 @@
 //! Stateless File IRP execution and owned dispatch/ACK adapters.
 //!
-//! Owned callers release manager borrows before invocation. The remaining borrowed backend
-//! callers fail-stop on uncertainty until their lifecycle and delivery owners are detached.
+//! Owned callers release manager borrows before invocation. A backend caller whose pump stops
+//! unfinished keeps it (`hosted_backend_pumps`) and collects its true result later (#420).
 
 use super::*;
 use nt_io_manager::detached_file_irp::{
@@ -58,7 +58,7 @@ struct FileTerminal {
     file_context: Option<u64>,
 }
 
-/// What `execute_with_capture` does after its native dispatch returns. A kept pump carries it
+/// What a File execution does after its native dispatch returns. A kept pump carries it
 /// so the resumed return runs the same tail exactly once.
 #[derive(Clone, Copy)]
 pub(super) struct ExecuteTail {
@@ -660,46 +660,6 @@ pub(super) fn acknowledgement_result(
     }
 }
 
-pub(super) fn borrowed_acknowledgement_result(
-    result: HostedIrpTransportResult,
-    irp_id: IrpId,
-) -> Result<(), nt_status::NtStatus> {
-    match acknowledgement_result(result) {
-        ExternalFileIrpAcknowledgement::Acknowledged => Ok(()),
-        ExternalFileIrpAcknowledgement::NotEntered { status }
-        | ExternalFileIrpAcknowledgement::Rejected { status } => Err(status),
-        ExternalFileIrpAcknowledgement::Indeterminate { .. } => {
-            panic!(
-                "indeterminate borrowed File IRP ACK {:?}: {:?}",
-                irp_id, result
-            )
-        }
-    }
-}
-
-pub(super) fn borrowed_control_result(
-    result: HostedIrpTransportResult,
-    irp_id: IrpId,
-) -> Result<u64, nt_status::NtStatus> {
-    match result {
-        HostedIrpTransportResult::NotDispatched { status } => Err(status),
-        HostedIrpTransportResult::Returned {
-            status: nt_status::NtStatus::SUCCESS,
-            information,
-            ..
-        } => Ok(information),
-        HostedIrpTransportResult::Returned { status, .. } if status.is_error() => Err(status),
-        HostedIrpTransportResult::Returned { .. }
-        | HostedIrpTransportResult::Indeterminate { .. } => {
-            // A possibly accepted ACK or cancel cannot be blindly retried by the old pump.
-            panic!(
-                "indeterminate borrowed File IRP control {:?}: {:?}",
-                irp_id, result
-            )
-        }
-    }
-}
-
 /// Only the completion-storage selectors are controls; the storage instance is resolved once.
 fn control_storage(
     instance_index: usize,
@@ -869,19 +829,9 @@ pub(super) fn control_exact_storage(
     })
 }
 
-pub(super) fn execute(
-    instance_index: usize,
-    caller: Option<nt_process::native_handle::NativeHandleCaller>,
-    projection: &IrpProjection,
-    input: &[u8],
-    output: &mut [u8],
-) -> HostedIrpTransportResult {
-    execute_with_capture(instance_index, caller, projection, input, output,
-        ExternalFileIrpOutputCapture::Information)
-}
-
-/// [`execute`] for a caller whose row keeps a ticket (#420): an unfinished pump with no lane to
-/// keep it stays kept with its execute tail, and the row's next turn collects the true result.
+/// Execute a File IRP for a caller whose row keeps a ticket (#420): an unfinished pump with no
+/// lane to keep it stays kept with its execute tail, and the row's next turn collects the true
+/// result.
 pub(super) fn execute_kept(
     instance_index: usize,
     caller: nt_process::native_handle::NativeHandleCaller,
@@ -1002,9 +952,9 @@ fn execute_port_connect_suspend_aware(
     }
 }
 
-/// Owned File callers: like [`execute_with_capture`], but a pump that stops unfinished with no
-/// lane to keep it (a root turn that may not block, a nested child step, a scheduler service)
-/// stays in its File owner as a continuation instead of returning an uncertain result (#420).
+/// Owned File callers: execute the IRP. A pump that stops unfinished with no lane to keep it
+/// (a root turn that may not block, a nested child step, a scheduler service) stays in its
+/// File owner as a continuation instead of returning an uncertain result (#420).
 fn execute_retaining(
     instance_index: usize,
     caller: nt_process::native_handle::NativeHandleCaller,
@@ -1052,44 +1002,4 @@ fn execute_retaining(
                 stage: FileStage::Dispatch(tail),
             }),
     }
-}
-
-fn execute_with_capture(
-    instance_index: usize,
-    caller: Option<nt_process::native_handle::NativeHandleCaller>,
-    projection: &IrpProjection,
-    input: &[u8],
-    output: &mut [u8],
-    capture: ExternalFileIrpOutputCapture,
-) -> HostedIrpTransportResult {
-    let (request, route_instance, route_inst, device_object) =
-        match prepare_dispatch_request(
-            instance_index, projection, input.len(), output.len(), capture,
-        ) {
-            Ok(prepared) => prepared,
-            Err(status) => return HostedIrpTransportResult::NotDispatched { status },
-        };
-    let mut tail = ExecuteTail::none(instance_index, projection.irp_id.raw(), projection.major,
-        route_instance, route_inst);
-    if let Err(status) = tail.reserve_scsi_data(&request, projection) {
-        return HostedIrpTransportResult::NotDispatched { status };
-    }
-    let result = unsafe {
-        dispatch_irp_for_instance_exact(
-            route_instance,
-            projection.major as u64,
-            projection.minor as u64,
-            device_object,
-            projection.irp_id.raw(),
-            projection.file_id.map(FileId::raw).unwrap_or(0),
-            projection_fsctl(projection),
-            projection.user_data,
-            projection.requestor_tid,
-            Some(request),
-            input,
-            output,
-            caller,
-        )
-    };
-    tail.finish(result)
 }

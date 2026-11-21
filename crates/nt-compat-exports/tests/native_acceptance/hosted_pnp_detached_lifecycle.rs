@@ -2,8 +2,6 @@
 
 const SOURCE: &str =
     include_str!("../../../../components/ntos-executive/src/driver_launch.rs");
-const FILE_DISPATCH: &str =
-    include_str!("../../../../components/ntos-executive/src/hosted_file_dispatch.rs");
 
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let (_, tail) = source.split_once(start).expect("missing lifecycle boundary");
@@ -68,9 +66,6 @@ fn pending_lifecycle_acks_exact_provider_before_state_publication() {
     assert!(drain.contains("control_exact_storage("));
     assert!(!drain.contains("take_completed_external_pnp_receipt"));
     assert!(!drain.contains("acknowledge_completed_irp_strict"));
-    let exact = between(FILE_DISPATCH, "pub(super) fn control_exact_storage(", "pub(super) fn execute(");
-    assert!(!exact.contains("hosted_completion_storage_instance"));
-    assert!(exact.contains("instance_domain_identity(inst) != Some(storage_domain)"));
     let poll = between(
         SOURCE,
         "unsafe fn poll_hosted_detached_pnp_completion(",

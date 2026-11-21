@@ -174,6 +174,8 @@ use hosted_pool_lock::{component_pool_lock, hosted_instance_pool_lock,
 mod component_scheduler;
 #[path = "hosted_backend_pumps.rs"]
 mod hosted_backend_pumps;
+#[path = "hosted_backend_irp_operations.rs"]
+mod hosted_backend_irp_operations;
 #[path = "hosted_dpc_scheduler.rs"]
 mod hosted_dpc_scheduler;
 #[path = "hosted_dpc_transition_trace.rs"]
@@ -50308,7 +50310,9 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
     use crate::reply_tail_step_census::{begin, end, Step};
     let _observation = HostedIoPumpObservation::enter();
     let t = begin();
-    let pumped = end(Step::IoManager, t, pump_io_manager());
+    // A kept dispatch's return is its pending IRP's ordinary completion (#420).
+    let returned = hosted_backend_irp_operations::publish_returned();
+    let pumped = end(Step::IoManager, t, returned.saturating_add(pump_io_manager()));
     let t = begin();
     let owners = hosted_start_io::drain_cleanup()
         .saturating_add(hosted_file_owners::drain())
@@ -51809,7 +51813,7 @@ fn hosted_irp_explicit_transfer_dispatch(
     instance: usize,
     mut ctx: DispatchContext<'_>,
     irp: &IrpProjection,
-) -> Result<HostedIrpTransportResult, nt_status::NtStatus> {
+) -> Result<hosted_backend_irp_operations::TraitDispatch, nt_status::NtStatus> {
     let buffer = irp.buffer.ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let input_len = buffer.input_len as usize;
     let output_len = buffer.output_len as usize;
@@ -51823,13 +51827,14 @@ fn hosted_irp_explicit_transfer_dispatch(
         let packet = nt_io_manager::scsi_srb_wire::encode_scsi_dispatch_input(
             parameters, irp.irp_id, &ctx.system_buffer[..transfer],
         ).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
-        return Ok(hosted_file_dispatch::execute(
-            instance,
-            Some(unsafe { crate::initial_system_driver_caller() }),
-            irp,
-            &packet,
-            &mut ctx.system_buffer[..output_len],
-        ));
+        return Ok(hosted_backend_irp_operations::dispatch(instance, irp, || Some(
+            hosted_file_dispatch::execute_kept(
+                instance,
+                unsafe { crate::initial_system_driver_caller() },
+                irp,
+                &packet,
+                &mut ctx.system_buffer[..output_len],
+            ))));
     }
     let control = matches!(
         irp.major,
@@ -51867,14 +51872,15 @@ fn hosted_irp_explicit_transfer_dispatch(
         .get_mut(..output_len)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     // execute copies both banks into owned native transfer storage before peer entry;
-    // pending native IRPs never retain these borrowed DispatchContext slices.
-    Ok(hosted_file_dispatch::execute(
-        instance,
-        Some(unsafe { crate::initial_system_driver_caller() }),
-        irp,
-        &input,
-        output,
-    ))
+    // pending native IRPs and kept pumps never retain these borrowed DispatchContext slices.
+    Ok(hosted_backend_irp_operations::dispatch(instance, irp, || Some(
+        hosted_file_dispatch::execute_kept(
+            instance,
+            unsafe { crate::initial_system_driver_caller() },
+            irp,
+            &input,
+            output,
+        ))))
 }
 
 impl DriverDispatchBackend for HostedDriverBackend {
@@ -51886,6 +51892,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
         if irp.requestor_tid != 0 {
             return Err(nt_status::NtStatus::INVALID_HANDLE);
         }
+        use hosted_backend_irp_operations::TraitDispatch;
         let result = if matches!(irp.parameters, IoParameters::Scsi(_))
             || ctx.has_nonbuffered_transfer() {
             hosted_irp_explicit_transfer_dispatch(self.instance, ctx, irp)?
@@ -51900,34 +51907,31 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 _ => return Err(nt_status::NtStatus::INVALID_PARAMETER),
             };
             let input = Vec::from(&ctx.system_buffer[..input_len]);
-            hosted_file_dispatch::execute(
-                self.instance,
-                Some(unsafe { crate::initial_system_driver_caller() }),
-                irp,
-                &input,
-                &mut ctx.system_buffer[output_offset..output_end],
-            )
+            let instance = self.instance;
+            hosted_backend_irp_operations::dispatch(instance, irp, || Some(
+                hosted_file_dispatch::execute_kept(
+                    instance,
+                    unsafe { crate::initial_system_driver_caller() },
+                    irp,
+                    &input,
+                    &mut ctx.system_buffer[output_offset..output_end],
+                )))
         };
         match result {
-            HostedIrpTransportResult::NotDispatched { status } => Err(status),
-            HostedIrpTransportResult::Returned {
-                status: nt_status::NtStatus::PENDING,
-                ..
-            } => Ok(DispatchOutcome::Pending),
-            HostedIrpTransportResult::Returned {
-                status,
-                information,
-                file_context,
-            } => Ok(DispatchOutcome::Completed {
-                status,
-                information,
-                file_context: major::is_create_major(irp.major).then_some(file_context),
-            }),
-            // The remaining borrowed lifecycle callers cannot retain uncertain native buffers.
-            // Do not return a fabricated terminal failure and release a possibly live raw IRP.
-            HostedIrpTransportResult::Indeterminate { transport_status } => {
-                panic!("indeterminate borrowed File IRP {:?}: {:?}", irp.irp_id, transport_status)
-            }
+            TraitDispatch::NotDispatched(status) => Err(status),
+            // An unfinished pump (#420), or the driver's own pending return.
+            TraitDispatch::Pending
+            | TraitDispatch::Returned { status: nt_status::NtStatus::PENDING, .. } =>
+                Ok(DispatchOutcome::Pending),
+            TraitDispatch::Returned { status, information, file_context } =>
+                Ok(DispatchOutcome::Completed {
+                    status,
+                    information,
+                    file_context: major::is_create_major(irp.major).then_some(file_context),
+                }),
+            // Entered with no trustworthy return: the IRP stays pending, never a fabricated
+            // terminal, and its native storage is quarantined.
+            TraitDispatch::Quarantined { .. } => Ok(DispatchOutcome::Pending),
         }
     }
 
@@ -52020,8 +52024,8 @@ impl DriverDispatchBackend for HostedDriverBackend {
         } else {
             &mut ctx.system_buffer[..output_len]
         };
-        let result = unsafe {
-            dispatch_irp_for_instance_exact(
+        let result = hosted_backend_irp_operations::dispatch(route_instance, irp, || unsafe {
+            hosted_backend_pumps::dispatch_exact(
                 route_instance,
                 irp.major as u64,
                 irp.minor as u64,
@@ -52036,32 +52040,11 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 Some(request),
                 &input,
                 output,
-                Some(caller),
+                caller,
+                hosted_file_dispatch::BackendTail::None,
             )
-        };
-        match result {
-            None => PnpBackendDispatch::NotDispatched {
-                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
-            },
-            Some(HostedIrpTransportResult::NotDispatched { status }) => {
-                PnpBackendDispatch::NotDispatched { status }
-            }
-            Some(HostedIrpTransportResult::Returned {
-                status: nt_status::NtStatus::PENDING,
-                ..
-            }) => PnpBackendDispatch::Pending,
-            Some(HostedIrpTransportResult::Returned {
-                status,
-                information,
-                ..
-            }) => PnpBackendDispatch::Returned {
-                status,
-                information,
-            },
-            Some(HostedIrpTransportResult::Indeterminate { transport_status }) => {
-                PnpBackendDispatch::Indeterminate { transport_status }
-            }
-        }
+        });
+        pnp_backend_dispatch(result)
     }
 
     fn dispatch_power_irp(
@@ -52092,8 +52075,8 @@ impl DriverDispatchBackend for HostedDriverBackend {
             };
         };
         let caller = unsafe { crate::initial_system_driver_caller() };
-        let result = unsafe {
-            dispatch_irp_for_instance_exact(
+        let result = hosted_backend_irp_operations::dispatch(route_instance, irp, || unsafe {
+            hosted_backend_pumps::dispatch_exact(
                 route_instance,
                 irp.major as u64,
                 irp.minor as u64,
@@ -52106,30 +52089,19 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 Some(request),
                 &[],
                 &mut [],
-                Some(caller),
+                caller,
+                hosted_file_dispatch::BackendTail::None,
             )
-        };
-        match result {
-            None => PnpBackendDispatch::NotDispatched {
-                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
-            },
-            Some(HostedIrpTransportResult::NotDispatched { status }) =>
-                PnpBackendDispatch::NotDispatched { status },
-            Some(HostedIrpTransportResult::Returned {
-                status: nt_status::NtStatus::PENDING, ..
-            }) => PnpBackendDispatch::Pending,
-            Some(HostedIrpTransportResult::Returned { status, information, .. }) =>
-                PnpBackendDispatch::Returned { status, information },
-            Some(HostedIrpTransportResult::Indeterminate { transport_status }) =>
-                PnpBackendDispatch::Indeterminate { transport_status },
-        }
+        });
+        pnp_backend_dispatch(result)
     }
 
+    /// `Err(PENDING)`: the cancel is still running, or another operation owns the IRP; the
+    /// I/O Manager retries it, and the identical retry collects it (#420).
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
-        let result = hosted_file_dispatch::control(
-            self.instance, irp_id, FSD_DISPATCH_CANCEL_IRP, 0, &mut [],
-        );
-        hosted_file_dispatch::borrowed_control_result(result, irp_id).map(|_| ())
+        hosted_backend_irp_operations::control(
+            self.instance, irp_id, FSD_DISPATCH_CANCEL_IRP, 0, &mut [], certain_control_result,
+        ).and_then(control_information).map(|_| ())
     }
 
     fn poll_completion(&mut self) -> Option<nt_io_manager::DriverCompletion> {
@@ -52145,25 +52117,74 @@ impl DriverDispatchBackend for HostedDriverBackend {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, nt_status::NtStatus> {
-        let result = hosted_file_dispatch::control(
+        // `Err(PENDING)` as for `cancel_irp`; the identical copy collects (#420).
+        let information = hosted_backend_irp_operations::control(
             self.instance, irp_id, FSD_DISPATCH_COPY_COMPLETION, offset, output,
-        );
-        let information = hosted_file_dispatch::borrowed_control_result(result, irp_id)?;
+            certain_control_result,
+        ).and_then(control_information)?;
         usize::try_from(information)
             .ok()
             .filter(|copied| *copied <= output.len())
             .ok_or(nt_status::NtStatus::INVALID_PARAMETER)
     }
 
+    /// `Err(PENDING)` as for `cancel_irp`; the identical ACK collects (#420).
     fn acknowledge_completion(&mut self, irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
-        let result = hosted_file_dispatch::control(
-            self.instance, irp_id, FSD_DISPATCH_ACK_COMPLETION, 0, &mut [],
-        );
-        hosted_file_dispatch::borrowed_acknowledgement_result(result, irp_id)
+        let certain = |result: &HostedIrpTransportResult| !matches!(
+            hosted_file_dispatch::acknowledgement_result(*result),
+            nt_io_manager::detached_file_irp::ExternalFileIrpAcknowledgement::Indeterminate { .. });
+        let result = hosted_backend_irp_operations::control(
+            self.instance, irp_id, FSD_DISPATCH_ACK_COMPLETION, 0, &mut [], certain,
+        )?;
+        match hosted_file_dispatch::acknowledgement_result(result) {
+            nt_io_manager::detached_file_irp::ExternalFileIrpAcknowledgement::Acknowledged => Ok(()),
+            nt_io_manager::detached_file_irp::ExternalFileIrpAcknowledgement::NotEntered { status }
+            | nt_io_manager::detached_file_irp::ExternalFileIrpAcknowledgement::Rejected { status } =>
+                Err(status),
+            nt_io_manager::detached_file_irp::ExternalFileIrpAcknowledgement::Indeterminate { .. } =>
+                unreachable!("an uncertain ACK is quarantined, never returned"),
+        }
     }
 
     fn is_faulted(&self) -> bool {
         hosted_driver_backend_faulted(instance(hosted_completion_storage_instance(self.instance)))
+    }
+}
+
+/// The PnP/POWER trait answer for a hosted dispatch (#420).
+fn pnp_backend_dispatch(result: hosted_backend_irp_operations::TraitDispatch) -> PnpBackendDispatch {
+    use hosted_backend_irp_operations::TraitDispatch;
+    match result {
+        TraitDispatch::NotDispatched(status) => PnpBackendDispatch::NotDispatched { status },
+        TraitDispatch::Pending
+        | TraitDispatch::Returned { status: nt_status::NtStatus::PENDING, .. } =>
+            PnpBackendDispatch::Pending,
+        TraitDispatch::Returned { status, information, .. } =>
+            PnpBackendDispatch::Returned { status, information },
+        TraitDispatch::Quarantined { transport_status } =>
+            PnpBackendDispatch::Indeterminate { transport_status },
+    }
+}
+
+/// A cancel or copy return is trustworthy when it is a certain no-entry, a success, or an error.
+/// A possibly accepted control is never retried: it is quarantined instead.
+fn certain_control_result(result: &HostedIrpTransportResult) -> bool {
+    match result {
+        HostedIrpTransportResult::NotDispatched { .. } => true,
+        HostedIrpTransportResult::Returned { status, .. } =>
+            *status == nt_status::NtStatus::SUCCESS || status.is_error(),
+        HostedIrpTransportResult::Indeterminate { .. } => false,
+    }
+}
+
+fn control_information(result: HostedIrpTransportResult) -> Result<u64, nt_status::NtStatus> {
+    match result {
+        HostedIrpTransportResult::Returned { status: nt_status::NtStatus::SUCCESS, information, .. } =>
+            Ok(information),
+        HostedIrpTransportResult::NotDispatched { status }
+        | HostedIrpTransportResult::Returned { status, .. } => Err(status),
+        HostedIrpTransportResult::Indeterminate { .. } =>
+            unreachable!("an uncertain control is quarantined, never returned"),
     }
 }
 

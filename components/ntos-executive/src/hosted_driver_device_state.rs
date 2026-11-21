@@ -232,6 +232,11 @@ unsafe fn complete(index: usize) -> bool {
             return false;
         }
     };
+    if !invocation.owes_backend_acknowledgement() {
+        // A returned completion (#420): the I/O Manager holds it, and no backend is owed an ACK.
+        finish_ack(index, invocation, None);
+        return true;
+    }
     let result = match hosted_file_dispatch::control_kept(
         provider, irp, FSD_DISPATCH_ACK_COMPLETION, 0, &mut [],
     ) {
@@ -241,7 +246,7 @@ unsafe fn complete(index: usize) -> bool {
             return true;
         }
     };
-    finish_ack(index, invocation, result);
+    finish_ack(index, invocation, Some(result));
     true
 }
 
@@ -255,7 +260,7 @@ unsafe fn collect_ack(index: usize) -> bool {
             false
         }
         hosted_backend_pumps::BackendCollected::Collected(result, _) => {
-            finish_ack(index, invocation, result);
+            finish_ack(index, invocation, Some(result));
             true
         }
     }
@@ -264,9 +269,11 @@ unsafe fn collect_ack(index: usize) -> bool {
 unsafe fn finish_ack(
     index: usize,
     invocation: nt_io_manager::ExternalPnpCompletionInvocation,
-    result: HostedIrpTransportResult,
+    result: Option<HostedIrpTransportResult>,
 ) {
-    let returned = invocation.invoke(|_| hosted_file_dispatch::acknowledgement_result(result));
+    // `invoke` calls its closure only for a completion a backend is owed an ACK for.
+    let returned = invocation.invoke(|_| hosted_file_dispatch::acknowledgement_result(
+        result.expect("an owed ACK carries its backend result")));
     match io_manager_mut().finish_external_pnp_completion(returned) {
         Ok((receipt, payload)) if payload.is_empty() => {
             if commit(index, &receipt) { queries().remove(index); }
