@@ -26640,6 +26640,12 @@ fn build_nt_table() -> NativeServiceTable {
             // NtCreateProcessEx uses the same implementation as NtCreateProcess, but keeps its own
             // service identity so the dispatcher marshals the canonical ninth JobMemberLevel arg.
             (NativeService::NtCreateProcessEx, 50),
+            // Our ntdll's NtCreateUserProcess composition: NtCreateProcessEx plus the
+            // PS_ATTRIBUTE_HANDLE_LIST that restricts inheritance to the listed handles.
+            (
+                NativeService::NtCreateProcessExWithHandleList,
+                nt_syscall_abi::NT_CREATE_PROCESS_EX_WITH_HANDLE_LIST_SSN,
+            ),
             // ITEM 2a — live terminate-dispatch. NtTerminateProcess is table-dispatched because real
             // ReactOS shutdown depends on both NT forms: NULL current-process termination returns after
             // stopping peer threads, while NtCurrentProcess/real Process handles are final and do not

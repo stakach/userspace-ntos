@@ -406,6 +406,7 @@ generate_trap_stubs! {
     (nt_create_port, "NtCreatePort", 48, 5),
     (nt_create_process, "NtCreateProcess", 49, 8),
     (nt_create_process_ex, "NtCreateProcessEx", 50, 9),
+    (nt_create_process_ex_with_handle_list, "NtCreateProcessExWithHandleList", 0x30c, 11),
     (nt_create_section, "NtCreateSection", 52, 7),
     (nt_create_semaphore, "NtCreateSemaphore", 53, 5),
     (nt_create_symbolic_link_object, "NtCreateSymbolicLinkObject", 54, 4),

@@ -62,6 +62,7 @@ pub mod user_object_handle;
 mod routed_file_handle;
 mod handle_attributes;
 mod inherit_handle_list;
+pub use inherit_handle_list::{decode_process_create_with_handle_list, InheritHandleList, INHERIT_HANDLE_LIST_CAPACITY};
 #[cfg(test)]
 #[path = "inherit_handle_list_tests.rs"]
 mod inherit_handle_list_tests;
@@ -96,6 +97,7 @@ pub const STATUS_DEVICE_BUSY: u32 = 0x8000_0011;
 pub const THREAD_NAME_MAX_UNITS: usize = 256;
 pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_CID: u32 = 0xC000_000B;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
@@ -165,6 +167,8 @@ pub struct ProcessCreateInput {
     pub debug_port: u64,
     pub exception_port: u64,
     pub job_member_level: u32,
+    /// `PS_ATTRIBUTE_HANDLE_LIST`, carried by our ntdll's `NtCreateUserProcess` composition.
+    pub inherit_list: Option<InheritHandleList>,
 }
 
 /// Decode the two native process-creation ABIs without reading beyond the registered service
@@ -192,6 +196,7 @@ pub fn decode_process_create_input(
             // caller is only required to define the low byte of a stack argument this narrow, so
             // the remaining seven bytes must never participate in process or job policy.
             job_member_level: args[8] as u8 as u32,
+            inherit_list: None,
         });
     }
 
@@ -211,6 +216,7 @@ pub fn decode_process_create_input(
         debug_port: args[6] & !3,
         exception_port: args[7],
         job_member_level: 0,
+        inherit_list: None,
     })
 }
 

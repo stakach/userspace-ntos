@@ -46,3 +46,44 @@ fn a_repeated_listed_handle_is_inherited_once() {
         pm.inheritable_handles_from_list(parent, &[u64::from(listed), u64::from(listed)]).unwrap();
     assert_eq!(inherited.len(), 1);
 }
+
+fn create_args(list: u64, size: u64) -> [u64; 11] {
+    [0, 0, 0, 0x40, u64::from(PROCESS_CREATE_FLAGS_INHERIT_HANDLES), 0x100, 0, 0, 0, list, size]
+}
+
+#[test]
+fn the_private_service_captures_the_listed_handles() {
+    let list: [u64; 2] = [0x1c, 0x24];
+    let bytes: alloc::vec::Vec<u8> = list.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let create = decode_process_create_with_handle_list(&create_args(0x5000, 16), |va, out| {
+        let at = usize::try_from(va - 0x5000).unwrap();
+        out.copy_from_slice(&bytes[at..at + out.len()]);
+        true
+    })
+    .unwrap();
+    assert_eq!(create.flags, PROCESS_CREATE_FLAGS_INHERIT_HANDLES);
+    assert_eq!(create.section_handle, 0x100);
+    assert_eq!(create.inherit_list.unwrap().values(), &list);
+}
+
+#[test]
+fn the_handle_list_size_must_be_whole_handles_within_capacity_and_needs_inheritance() {
+    let ok = |_: u64, out: &mut [u8]| {
+        out.fill(0);
+        true
+    };
+    assert_eq!(decode_process_create_with_handle_list(&create_args(0x5000, 0), ok), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(decode_process_create_with_handle_list(&create_args(0x5000, 12), ok), Err(STATUS_INVALID_PARAMETER));
+    let too_long = (INHERIT_HANDLE_LIST_CAPACITY as u64 + 1) * 8;
+    assert_eq!(
+        decode_process_create_with_handle_list(&create_args(0x5000, too_long), ok),
+        Err(STATUS_INSUFFICIENT_RESOURCES)
+    );
+    let mut no_inherit = create_args(0x5000, 8);
+    no_inherit[4] = 0;
+    assert_eq!(decode_process_create_with_handle_list(&no_inherit, ok), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(
+        decode_process_create_with_handle_list(&create_args(0x5000, 8), |_, _| false),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+}

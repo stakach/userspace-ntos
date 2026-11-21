@@ -10049,9 +10049,9 @@ impl ExecNtHandler {
         &mut self,
         parent: nt_process::ProcessId,
         image: nt_exe_image::HostedProcessImageRef<'_>,
-        flags: u32,
-        job_member_level: u32,
+        create: nt_process::ProcessCreateInput,
     ) -> Result<usize, u32> {
+        let (flags, job_member_level) = (create.flags, create.job_member_level);
         let child_pi = image.pi;
         let name = image.process_name;
         let ctx = self.loop_ctx.ok_or(nt_process::STATUS_INVALID_IMAGE_FORMAT)?;
@@ -10060,10 +10060,11 @@ impl ExecNtHandler {
         let selected_job = self
             .pm
             .select_child_job(Some(parent), flags, job_member_level)?;
-        let inherited_handles = if flags & nt_process::PROCESS_CREATE_FLAGS_INHERIT_HANDLES != 0 {
-            self.pm.inheritable_handles(parent)?
-        } else {
-            Vec::new()
+        // PS_ATTRIBUTE_HANDLE_LIST restricts inheritance to the listed handles (ObInitProcess).
+        let inherited_handles = match create.inherit_list {
+            _ if flags & nt_process::PROCESS_CREATE_FLAGS_INHERIT_HANDLES == 0 => Vec::new(),
+            Some(list) => self.pm.inheritable_handles_from_list(parent, list.values())?,
+            None => self.pm.inheritable_handles(parent)?,
         };
         if let Some(existing_pid) = self.pm_pid_for_pi(child_pi) {
             let matches_existing = self.pm.process(existing_pid).is_some_and(|process| {
@@ -33033,7 +33034,16 @@ impl ExecNtHandler {
     #[inline(never)]
     unsafe fn nt_create_process_service(&mut self, args: &[u64], previous_mode: nt_syscall::ProcessorMode) -> u32 {
         let legacy = self.current_service_number == SSN_NT_CREATE_PROCESS as u32;
-        let create = match nt_process::decode_process_create_input(args, !legacy) {
+        let with_handle_list =
+            self.current_service_number == nt_syscall_abi::NT_CREATE_PROCESS_EX_WITH_HANDLE_LIST_SSN;
+        let decoded = if with_handle_list {
+            nt_process::decode_process_create_with_handle_list(args, |va, out| {
+                unsafe { self.xas_read(va, out) }
+            })
+        } else {
+            nt_process::decode_process_create_input(args, !legacy)
+        };
+        let create = match decoded {
             Ok(create) => create,
             Err(status) => return status,
         };
@@ -33159,7 +33169,7 @@ impl ExecNtHandler {
         };
         let new_process = self.pm_pid_for_pi(image.pi).is_none();
         if let Err(status) =
-            self.allocate_hosted_process_slot(parent, image, create.flags, create.job_member_level)
+            self.allocate_hosted_process_slot(parent, image, create)
         {
             return status;
         }
@@ -42580,7 +42590,9 @@ impl ExecNtHandler {
             // Control-flow case: validate the SectionHandle through the executable image table, reserve
             // the process publication, then let the loop build the seL4 mechanism from the same
             // SpawnRequest used by Win32 children.
-            NativeService::NtCreateProcess | NativeService::NtCreateProcessEx => unsafe {
+            NativeService::NtCreateProcess
+            | NativeService::NtCreateProcessEx
+            | NativeService::NtCreateProcessExWithHandleList => unsafe {
                 let service =
                     core::ptr::read_volatile(core::ptr::addr_of!(NT_CREATE_PROCESS_SERVICE_ENTRY));
                 service(self as *mut ExecNtHandler, args.as_ptr(), args.len(),

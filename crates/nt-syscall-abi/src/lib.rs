@@ -126,6 +126,10 @@ impl NativeIngressRoute {
 /// the win32k shadow table for GUI clients, including native calls after receive normalization.
 pub const LIBERNT_BASE_SSN: u32 = 0x300;
 
+/// `NtCreateProcessExWithHandleList`, private to our ntdll/executive pair: the process-creation
+/// step of ntdll's NtCreateUserProcess composition when the caller passes PS_ATTRIBUTE_HANDLE_LIST.
+pub const NT_CREATE_PROCESS_EX_WITH_HANDLE_LIST_SSN: u32 = LIBERNT_BASE_SSN + 12;
+
 /// Reserved native SSNs for the remaining pinned LiberNT ntdll syscall export names.
 /// These stay below the executive's 0x1000 win32k shadow-table routing boundary.
 pub const LIBERNT_FULL_EXPORT_SSN_BASE: u32 = 0x400;
@@ -611,6 +615,10 @@ pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtRemoveIoCompletionEx", LIBERNT_BASE_SSN + 9),
     n("NtSetInformationVirtualMemory", LIBERNT_BASE_SSN + 10),
     n("NtTraceControl", LIBERNT_BASE_SSN + 11),
+    // Not an NT export: the process-creation step of our ntdll's NtCreateUserProcess
+    // composition when the caller passes PS_ATTRIBUTE_HANDLE_LIST. The nine NtCreateProcessEx
+    // arguments, then the handle array and its byte size.
+    n("NtCreateProcessExWithHandleList", NT_CREATE_PROCESS_EX_WITH_HANDLE_LIST_SSN),
     n("NtAcquireCMFViewOwnership", LIBERNT_FULL_EXPORT_SSN_BASE + 0),
     n("NtAddBootEntry", LIBERNT_FULL_EXPORT_SSN_BASE + 1),
     n("NtAddDriverEntry", LIBERNT_FULL_EXPORT_SSN_BASE + 2),
@@ -1156,6 +1164,7 @@ pub const ZW_ALIASES: &[ZwAlias] = &[
     z("ZwRemoveIoCompletionEx", "NtRemoveIoCompletionEx", LIBERNT_BASE_SSN + 9),
     z("ZwSetInformationVirtualMemory", "NtSetInformationVirtualMemory", LIBERNT_BASE_SSN + 10),
     z("ZwTraceControl", "NtTraceControl", LIBERNT_BASE_SSN + 11),
+    z("ZwCreateProcessExWithHandleList", "NtCreateProcessExWithHandleList", NT_CREATE_PROCESS_EX_WITH_HANDLE_LIST_SSN),
     z("ZwAcquireCMFViewOwnership", "NtAcquireCMFViewOwnership", LIBERNT_FULL_EXPORT_SSN_BASE + 0),
     z("ZwAddBootEntry", "NtAddBootEntry", LIBERNT_FULL_EXPORT_SSN_BASE + 1),
     z("ZwAddDriverEntry", "NtAddDriverEntry", LIBERNT_FULL_EXPORT_SSN_BASE + 2),
@@ -1399,6 +1408,7 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtCreatePort", 5),
     ("NtCreateProcess", 8),
     ("NtCreateProcessEx", 9),
+    ("NtCreateProcessExWithHandleList", 11),
     ("NtCreatePrivateNamespace", 4),
     ("NtCreateSection", 7),
     ("NtCreateSemaphore", 5),

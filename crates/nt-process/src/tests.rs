@@ -4509,6 +4509,7 @@ fn process_create_abis_decode_to_one_internal_contract() {
             debug_port: 0x204,
             exception_port: 0x300,
             job_member_level: 0,
+            inherit_list: None,
         }
     );
 
@@ -4535,6 +4536,7 @@ fn process_create_abis_decode_to_one_internal_contract() {
             debug_port: 0x200,
             exception_port: 0x300,
             job_member_level: 7,
+            inherit_list: None,
         }
     );
 }

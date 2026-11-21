@@ -179,7 +179,7 @@ impl ExecNtHandler {
                 return Err(STATUS_INSUFFICIENT_RESOURCES);
             }
         };
-        if let Err(status) = self.allocate_hosted_process_slot(parent, image, create.flags, create.job_member_level) {
+        if let Err(status) = self.allocate_hosted_process_slot(parent, image, create) {
             (&mut *ctx.exe_images).discard_native_section_spawn(request).expect("exact unentered native spawn");
             self.abort_native_image_process(target);
             return Err(status);

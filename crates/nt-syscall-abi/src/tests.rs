@@ -31,10 +31,11 @@ fn native_request_keeps_exact_arguments_when_nested_ipc_reuses_receive_buffer() 
 }
 
 /// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
-/// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
+/// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`,
+/// `NtCreateProcessExWithHandleList`), and registry hive
 /// load/unload variants that route to real executive CM functionality.
-const REQUIRED_NT_COUNT: usize = 428;
-const REQUIRED_ZW_COUNT: usize = 428;
+const REQUIRED_NT_COUNT: usize = 429;
+const REQUIRED_ZW_COUNT: usize = 429;
 
 #[test]
 fn released_libernt_audit_exports_preserve_every_stack_argument() {
@@ -139,11 +140,11 @@ fn libernt_private_native_numbers_cannot_enter_win32k_shadow_dispatch() {
     // native-call messages after it normalizes them into UnknownSyscall frames.
     // ReactOS sysfuncs.lst occupies SSNs 0..=295.
     assert!(LIBERNT_BASE_SSN > 295);
-    assert!(LIBERNT_BASE_SSN + 11 < 0x1000);
+    assert!(LIBERNT_BASE_SSN + 12 < 0x1000);
     let private = NT_SYSCALLS.iter().filter(|service| {
-        (LIBERNT_BASE_SSN..LIBERNT_BASE_SSN + 12).contains(&service.ssn)
+        (LIBERNT_BASE_SSN..LIBERNT_BASE_SSN + 13).contains(&service.ssn)
     });
-    assert_eq!(private.clone().count(), 12);
+    assert_eq!(private.clone().count(), 13);
     for service in private {
         assert!(service.ssn < 0x1000, "{} collides with win32k", service.name);
     }
@@ -520,4 +521,14 @@ fn legacy_native_call_has_no_application_resume_metadata() {
     assert_eq!(parked.resume_ip(), 0);
     assert_eq!(parked.resume_sp(), 0);
     assert_eq!(parked.resume_flags(), 0);
+}
+
+#[test]
+fn ntdll_create_user_process_composition_has_a_private_handle_list_service() {
+    // Not an NT export: NtCreateProcessEx's nine arguments plus PS_ATTRIBUTE_HANDLE_LIST's array
+    // and byte size, issued only by our ntdll's NtCreateUserProcess.
+    assert_eq!(ssn_of("NtCreateProcessExWithHandleList"), Some(NT_CREATE_PROCESS_EX_WITH_HANDLE_LIST_SSN));
+    assert_eq!(NT_CREATE_PROCESS_EX_WITH_HANDLE_LIST_SSN, 0x30c);
+    assert_eq!(exact_argc_of("NtCreateProcessExWithHandleList"), Some(11));
+    assert_eq!(ssn_of("ZwCreateProcessExWithHandleList"), Some(0x30c));
 }

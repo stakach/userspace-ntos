@@ -293,6 +293,7 @@ pub enum NativeService {
     /// distinct service-table identity even when it shares the same executive implementation as
     /// `NtCreateProcess`.
     NtCreateProcessEx,
+    NtCreateProcessExWithHandleList,
     // Dbgk — the user-mode debugging plane (`ntoskrnl/dbgk`). Backed by the real DEBUG_OBJECT in
     // `nt_process::dbgk`: create/attach/wait/continue/detach.
     NtCreateDebugObject,
@@ -526,6 +527,7 @@ impl NativeService {
             NtSetDefaultUILanguage => "NtSetDefaultUILanguage",
             NtCreateProcess => "NtCreateProcess",
             NtCreateProcessEx => "NtCreateProcessEx",
+            NtCreateProcessExWithHandleList => "NtCreateProcessExWithHandleList",
             NtCreateDebugObject => "NtCreateDebugObject",
             NtDebugActiveProcess => "NtDebugActiveProcess",
             NtDebugContinue => "NtDebugContinue",
@@ -756,6 +758,7 @@ impl NativeService {
         NativeService::NtRequestWakeupLatency,
         NativeService::NtSetDefaultHardErrorPort,
         NativeService::NtCreateProcessEx,
+        NativeService::NtCreateProcessExWithHandleList,
         NativeService::NtQueryMutant,
         NativeService::NtQueryTimer,
         NativeService::NtAlertThreadByThreadId,

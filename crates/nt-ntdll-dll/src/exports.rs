@@ -25025,6 +25025,11 @@ zw_alias!(
     "ZwCreateProcessEx",
     nt_create_process_ex
 );
+zw_alias!(
+    zw_create_process_ex_with_handle_list,
+    "ZwCreateProcessExWithHandleList",
+    nt_create_process_ex_with_handle_list
+);
 zw_alias!(zw_create_section, "ZwCreateSection", nt_create_section);
 zw_alias!(
     zw_create_semaphore,
@@ -30475,6 +30480,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_create_port as *const () as usize,
         zw_create_process as *const () as usize,
         zw_create_process_ex as *const () as usize,
+        zw_create_process_ex_with_handle_list as *const () as usize,
         zw_create_section as *const () as usize,
         zw_create_semaphore as *const () as usize,
         zw_create_symbolic_link_object as *const () as usize,
