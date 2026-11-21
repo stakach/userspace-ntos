@@ -2,34 +2,61 @@
 //!
 //! Wine's kernelbase AllocConsole opens \Device\ConDrv\Server, opens a reference relative to that
 //! handle, issues ConDrv device controls and creates conhost.exe. Boots 44689472419 and
-//! 44694366016 log only `Can't allocate console`, so this records, per process generation and
-//! globally bounded, each NtCreateFile/NtOpenFile of a \Device\ name or a root-relative name,
-//! each NtDeviceIoControlFile code and each process creation, with the returned status.
-//! Diagnostic only: it reads caller memory after dispatch and changes nothing.
+//! 44694366016 log only `Can't allocate console`, so this records, per process generation, each
+//! NtCreateFile/NtOpenFile of a \Device\ name or a root-relative name, each
+//! NtDeviceIoControlFile code, each process creation and each pended CREATE's completion, with
+//! the returned status. Diagnostic only: it reads caller memory after dispatch and changes nothing.
+//!
+//! There is no global cap. Boot 44841573736 spent a global 512 on the processes before cmd.exe,
+//! so the one process the trace exists for logged nothing. Every process generation has its own
+//! budgets, which bounds the trace by the processes the boot creates.
 
 use super::*;
 use nt_syscall::NativeService;
 
-const PER_PROCESS: u8 = 48;
-const GLOBAL: u64 = 512;
-static TRACED: AtomicU64 = AtomicU64::new(0);
-static mut BUDGET: [(u64, u8); MAX_PI] = [(0, 0); MAX_PI];
+/// Dispatch records (creates, opens, device controls, process creations) per generation.
+const DISPATCHES_PER_PROCESS: u8 = 48;
+/// Pended-CREATE completion records per generation: a console client needs two per open.
+const PENDED_CREATES_PER_PROCESS: u8 = 8;
 
-fn claim(pi: usize, generation: Option<u64>) -> bool {
+#[derive(Clone, Copy)]
+enum Budget {
+    Dispatch,
+    PendedCreate,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessBudget {
+    generation: u64,
+    dispatches: u8,
+    pended_creates: u8,
+}
+
+static mut BUDGET: [ProcessBudget; MAX_PI] =
+    [ProcessBudget { generation: 0, dispatches: 0, pended_creates: 0 }; MAX_PI];
+
+fn claim_from(budget: Budget, pi: usize, generation: Option<u64>) -> bool {
     let Some(generation) = generation.filter(|value| *value != 0 && pi < MAX_PI) else {
         return false;
     };
     // SAFETY: only the single root dispatch executor records this trace.
     let slot = unsafe { &mut (&mut *core::ptr::addr_of_mut!(BUDGET))[pi] };
-    if slot.0 != generation {
-        *slot = (generation, 0);
+    if slot.generation != generation {
+        *slot = ProcessBudget { generation, dispatches: 0, pended_creates: 0 };
     }
-    if slot.1 >= PER_PROCESS || TRACED.load(Ordering::Relaxed) >= GLOBAL {
+    let (used, limit) = match budget {
+        Budget::Dispatch => (&mut slot.dispatches, DISPATCHES_PER_PROCESS),
+        Budget::PendedCreate => (&mut slot.pended_creates, PENDED_CREATES_PER_PROCESS),
+    };
+    if *used >= limit {
         return false;
     }
-    slot.1 += 1;
-    TRACED.fetch_add(1, Ordering::Relaxed);
+    *used += 1;
     true
+}
+
+fn claim(pi: usize, generation: Option<u64>) -> bool {
+    claim_from(Budget::Dispatch, pi, generation)
 }
 
 /// The object name and root of an OBJECT_ATTRIBUTES in the caller, up to 96 UTF-16 units.
@@ -137,10 +164,10 @@ pub(crate) fn record(
 }
 
 /// A pended CREATE's completion as the root publishes it (#421). Boot 44834608861 parked cmd.exe's
-/// `Reference` open (STATUS_PENDING, staged, waiting), but the old globally bounded record had
-/// spent its 64 lines before cmd ran. `phase` is `completed` (the IRP's terminal IoStatus and the
-/// driver's FsContext with the handle publication's result) or `final` (the status and handle
-/// the parked caller is answered with).
+/// `Reference` open (STATUS_PENDING, staged, waiting). `phase` is `completed` (the IRP's terminal
+/// IoStatus and the driver's FsContext, with the handle publication's result) or `final` (the
+/// status and handle the parked caller is answered with). It has its own per-generation budget,
+/// so a process's device completions cannot spend its dispatch records.
 pub(crate) fn pended_create(
     phase: &[u8],
     pi: usize,
@@ -150,7 +177,7 @@ pub(crate) fn pended_create(
     status: u32,
     handle: u64,
 ) {
-    if !claim(pi, generation) {
+    if !claim_from(Budget::PendedCreate, pi, generation) {
         return;
     }
     print_str(b"[device-path] pi=");
