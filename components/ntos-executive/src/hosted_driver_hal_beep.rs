@@ -9,8 +9,28 @@ use nt_kernel_exec::pc_speaker::{
 pub(super) const LABEL: u64 = 0x7DA;
 const STATUS_IO_DEVICE_ERROR: i32 = 0xC000_0185u32 as i32;
 
-/// `BOOLEAN HalMakeBeep(ULONG Frequency)`.
+/// `BOOLEAN HalMakeBeep(ULONG Frequency)`. A DPC or IRQ callback runs on the domain's IRQ lane,
+/// whose root exchange admits only typed arena services, so it requests the same root program
+/// through the lane instead of a primary-channel Call.
 pub(super) extern "win64" fn make_beep(frequency: u32) -> u8 {
+    if let Some((_, identity, _, _, grant)) = unsafe { hosted_irq_lane_context() } {
+        let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        arguments[0] = u64::from(frequency);
+        let result = unsafe { hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+            kind: nt_hosted_runtime::HostedIrqServiceKind::HalMakeBeep,
+            service_id: LABEL,
+            target_domain_id: identity.domain_id,
+            target_domain_cookie: identity.domain_cookie,
+            authority_cookie: 0,
+            grant,
+            argument_count: 1,
+            arguments,
+        }) };
+        if result.faulted || result.value_count != 1 {
+            hosted_irq_lane_protocol_fault(u64::from(frequency));
+        }
+        return u8::from(result.status == STATUS_SUCCESS && result.values[0] == 1);
+    }
     let (label, status, beeping, _, _) =
         unsafe { call_on4((LABEL << 12) | 1, u64::from(frequency), 0, 0, 0) };
     if label != 0 { return 0; }
@@ -86,6 +106,11 @@ pub(crate) fn service(
         return (STATUS_ACCESS_DENIED, 0);
     }
     let Ok(frequency) = u32::try_from(frequency) else { return (STATUS_INVALID_PARAMETER, 0) };
+    program(frequency)
+}
+
+/// Program the root-owned speaker for a caller its transport already authenticated.
+pub(super) fn program(frequency: u32) -> (i32, u64) {
     let _guard = lock_speaker();
     let ports = unsafe {
         port_cap(&PIT_CHANNEL2_PORTS, TIMER_CHANNEL2_DATA_PORT, TIMER_CONTROL_PORT)

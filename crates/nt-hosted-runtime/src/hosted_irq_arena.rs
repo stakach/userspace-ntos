@@ -154,6 +154,8 @@ pub enum HostedIrqServiceKind {
     BeginLocalIrpCompletion = 14,
     DmaQuerySg = 15,
     DmaPutSg = 16,
+    /// `HalMakeBeep(Frequency)` from DPC or cancel context; 0 silences the speaker.
+    HalMakeBeep = 17,
 }
 
 impl HostedIrqServiceKind {
@@ -175,6 +177,7 @@ impl HostedIrqServiceKind {
             14 => Some(Self::BeginLocalIrpCompletion),
             15 => Some(Self::DmaQuerySg),
             16 => Some(Self::DmaPutSg),
+            17 => Some(Self::HalMakeBeep),
             _ => None,
         }
     }
@@ -530,6 +533,12 @@ impl HostedIrqServiceCommand {
                     self.authority_cookie == 0
                         && self.argument_count == 1
                         && self.arguments[0] != 0
+                        && self.arguments[1..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::HalMakeBeep => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 1
+                        && self.arguments[0] <= u32::MAX as u64
                         && self.arguments[1..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::PoolRetirement => {
@@ -2559,7 +2568,7 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
         assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
-        assert_eq!(HostedIrqServiceKind::from_raw(17), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(18), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2698,6 +2707,31 @@ mod tests {
         signal.arguments[0] = 0x18000;
         signal.arguments[1] = 1;
         assert!(!signal.valid());
+    }
+
+    #[test]
+    fn irq_hal_beep_carries_one_frequency_including_silence() {
+        // beep.sys calls HalMakeBeep(0) from its timer DPC: the IRQ lane needs a typed service.
+        assert_eq!(HostedIrqServiceKind::from_raw(17), Some(HostedIrqServiceKind::HalMakeBeep));
+        let mut beep = service();
+        beep.kind = HostedIrqServiceKind::HalMakeBeep;
+        beep.authority_cookie = 0;
+        beep.argument_count = 1;
+        beep.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        assert!(beep.valid(), "silence is a valid frequency");
+        beep.arguments[0] = 750;
+        assert!(beep.valid());
+        beep.arguments[0] = u64::from(u32::MAX) + 1;
+        assert!(!beep.valid(), "HalMakeBeep takes a ULONG");
+        beep.arguments[0] = 750;
+        beep.arguments[1] = 1;
+        assert!(!beep.valid(), "trailing argument");
+        beep.arguments[1] = 0;
+        beep.authority_cookie = 1;
+        assert!(!beep.valid(), "unexpected authority cookie");
+        beep.authority_cookie = 0;
+        beep.argument_count = 0;
+        assert!(!beep.valid(), "missing frequency");
     }
 
     #[test]

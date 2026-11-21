@@ -1615,6 +1615,33 @@ impl HostedIrqRootSession {
         }
     }
 
+    /// `HalMakeBeep` from the lane's DPC: the lane's own domain and grant are the authority.
+    unsafe fn hal_beep_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let Ok(frequency) = u32::try_from(command.arguments[0]) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if command.service_id != FSD_SERVICE_HAL_BEEP_LABEL
+            || command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.authority_cookie != 0
+            || command.argument_count != 1
+            || command.arguments[1..].iter().any(|argument| *argument != 0)
+            || (!self.has_dpc_dispatch_grant(lane, command.grant)
+                && !lane_has_service_grant(lane, command.grant))
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let (status, beeping) = hosted_driver_hal_beep::program(frequency);
+        service_result(status, Some(beeping))
+    }
+
     unsafe fn begin_local_irp_completion_service(
         &mut self,
         lane_index: usize,
@@ -1772,6 +1799,9 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::SetEvent => {
                 self.set_event_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::HalMakeBeep => {
+                self.hal_beep_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::BeginLocalIrpCompletion => {
                 self.begin_local_irp_completion_service(lane_index, command)
