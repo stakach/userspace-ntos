@@ -1164,6 +1164,21 @@ pub(crate) unsafe fn redrive_receive_child(
     if owns_receive_child() { redrive_rows(handler, dispatcher, true); }
 }
 
+/// While a Receive child's page-in owns the root: its own rows, and the exact producer of a
+/// source page one of them awaits (another row already reading it), which nothing else drives.
+unsafe fn runs_with_receive_child(row: &Work) -> bool {
+    let awaited = (&*core::ptr::addr_of!(WORK)).iter().flatten()
+        .filter(|child| matches!(child.purpose, Purpose::ReceiveChild)
+            && matches!(child.phase, Phase::AwaitSource))
+        .map(|child| (child.view.view.area(), child.rva));
+    nt_memory_manager::image_source_page::runs_during_receive_child(
+        matches!(row.purpose, Purpose::ReceiveChild),
+        (row.view.view.area(), row.rva),
+        matches!(row.phase, Phase::Read | Phase::Publish),
+        awaited,
+    )
+}
+
 unsafe fn redrive_rows(
     handler: &mut ExecNtHandler, dispatcher: &NativeSyscallDispatcher, receive_child_only: bool,
 ) {
@@ -1174,7 +1189,7 @@ unsafe fn redrive_rows(
     let count = (&*core::ptr::addr_of!(WORK)).len();
     for index in 0..count {
         if receive_child_only && !(&*core::ptr::addr_of!(WORK))[index].as_ref()
-            .is_some_and(|row| matches!(row.purpose, Purpose::ReceiveChild))
+            .is_some_and(|row| runs_with_receive_child(row))
         { continue; }
         let Some(mut work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].take() else { continue; };
         EXECUTING_INDEX.store(index as u64, Ordering::Release);

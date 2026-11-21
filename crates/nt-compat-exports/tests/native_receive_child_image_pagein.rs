@@ -167,3 +167,17 @@ fn a_retained_page_in_waits_for_the_next_root_event_and_never_exits() {
     assert!(retained.contains("defer_hosted_delivery("), "an unrelated delivery returns to its row");
     assert!(!MAINTENANCE.contains("receive-child-pagein-retained"), "no retained exit remains");
 }
+
+// Multicore boot 44871343315: a Receive-child page-in awaited another row's READ of the same
+// source page, and the receive-child-only redrive never drove that producer.
+#[test]
+fn the_receive_child_redrive_also_drives_the_awaited_producer() {
+    let work = include_str!("../../../components/ntos-executive/src/native_image_pagein_work.rs");
+    let rows = work.split("unsafe fn redrive_rows(").nth(1).unwrap();
+    assert!(rows[..rows.find("\n}\n").unwrap()].contains("runs_with_receive_child(row)"));
+    let rule = work.split("unsafe fn runs_with_receive_child(").nth(1).unwrap();
+    let rule = &rule[..rule.find("\n}\n").unwrap()];
+    assert!(rule.contains("runs_during_receive_child("));
+    assert!(rule.contains("Phase::AwaitSource") && rule.contains("Phase::Read | Phase::Publish"),
+        "only a producing row whose page a waiting child needs");
+}

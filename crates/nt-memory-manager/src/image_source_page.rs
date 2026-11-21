@@ -51,6 +51,19 @@ pub const fn routed_source_read_decision(
     else { RoutedSourceReadDecision::EnterRead }
 }
 
+/// While a Receive child's page-in owns the root, only that child's rows may run, and also the
+/// exact producer of a source page the child's row awaits (`AwaitProducer`). Without the
+/// producer the child waits on a READ nobody advances, and the root has nothing else to run.
+/// `row` is a candidate's (source, producing) and `awaited` the sources Receive-child rows wait on.
+pub fn runs_during_receive_child<S: PartialEq + Copy>(
+    row_is_receive_child: bool,
+    row_source: S,
+    row_producing: bool,
+    mut awaited: impl Iterator<Item = S>,
+) -> bool {
+    row_is_receive_child || (row_producing && awaited.any(|source| source == row_source))
+}
+
 /// Classify one attempt to fill a canonical source frame through a scratch alias.
 ///
 /// `alias` is `Err` when the alias itself failed and `Ok(read)` once it has retired, where
@@ -192,6 +205,29 @@ impl<D: Copy + Eq> ImageSourcePage<D> {
                 Phase::Quarantined(status) => return ImageSourcePageOutcome::Quarantined(status),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod receive_child_producer_tests {
+    use super::*;
+
+    // Multicore boot 44871343315: pi 12's Receive-child page-in (0x7ffaa067000) found another
+    // row already reading the same source page, so it waited (AwaitProducer). While a Receive
+    // child owns the root only Receive-child rows were driven, so the producer row never
+    // advanced; the root woke every 100 ms (258 programmed shots) and nothing settled.
+    #[test]
+    fn the_awaited_producer_runs_with_the_receive_child() {
+        const SOURCE: (u64, u32) = (7, 0x67000);
+        const OTHER: (u64, u32) = (7, 0x68000);
+        let decision = routed_source_read_decision(false, false, true, false);
+        assert_eq!(decision, RoutedSourceReadDecision::AwaitProducer, "the child waits");
+        // The producing Fault row for the same page runs; any other non-child row does not.
+        assert!(runs_during_receive_child(false, SOURCE, true, [SOURCE].into_iter()));
+        assert!(!runs_during_receive_child(false, OTHER, true, [SOURCE].into_iter()));
+        assert!(!runs_during_receive_child(false, SOURCE, false, [SOURCE].into_iter()),
+            "a row that is not producing has nothing the child waits for");
+        assert!(runs_during_receive_child(true, OTHER, false, core::iter::empty()));
     }
 }
 
