@@ -76810,7 +76810,7 @@ impl FileIrpPumpContinuation {
         hosted_class_irp_lane::finish(dispatch_index, selection, pr.completed && !guarded_abort);
         if (class_hook_control || connect_ack_control) && major == FSD_DISPATCH_ACK_COMPLETION
             && pr.completed && !guarded_abort && pr.status == STATUS_SUCCESS {
-            hosted_class_irp_lane::acknowledged(dispatch_index, canonical_irp_id);
+            hosted_class_irp_lane::release_irp(dispatch_index, canonical_irp_id);
         }
     }
     let (source_registered, source_subject) = active_hosted_irp_transfer_mut(sh, canonical_irp_id)

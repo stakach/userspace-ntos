@@ -59,7 +59,7 @@ struct Lane {
     component_shared: u64,
     executive_shared: u64,
     phase: Phase,
-    current_irp: Option<u64>,
+    current_irp: nt_hosted_runtime::WorkerIrpClaim,
     startup_dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
     delete_ticket: Option<DynamicDeleteTicket>,
     delete_restore: Option<PendingDeleteRestore>,
@@ -165,7 +165,7 @@ pub(super) unsafe fn prepare(instance_index: usize) -> Result<(), nt_status::NtS
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         rows.push(Lane { instance: instance_index, domain, pml4: inst.pml4, ordinal, handle: 0,
             route: None, component_shared: 0, executive_shared: 0, phase: Phase::Preparing,
-            current_irp: None, startup_dispatch: None,
+            current_irp: nt_hosted_runtime::WorkerIrpClaim::idle(), startup_dispatch: None,
             delete_ticket: None, delete_restore: None, delete_unattributed_result: None,
             delete_yield: None, startup_yield: None });
         rows.len() - 1
@@ -364,9 +364,9 @@ unsafe fn select(instance_index: usize, purpose: SelectionPurpose) -> Option<Sel
             && matches!(purpose, SelectionPurpose::Callback))
     { return None; }
     match purpose {
-        SelectionPurpose::New if row.current_irp.is_some() => return None,
-        SelectionPurpose::Control(irp) if row.current_irp != Some(irp) => return None,
-        SelectionPurpose::Callback if row.current_irp.is_some()
+        SelectionPurpose::New if !row.current_irp.admits_new() => return None,
+        SelectionPurpose::Control(irp) if !row.current_irp.owns(irp) => return None,
+        SelectionPurpose::Callback if !row.current_irp.admits_new()
             || (row.phase == Phase::Ready && row.delete_ticket.is_some())
             || (row.phase == Phase::DeletePrepared && row.delete_ticket.is_none())
             => return None,
@@ -396,7 +396,7 @@ pub(super) unsafe fn claim_delete(
     let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
     if row.phase != Phase::Ready || !matches!(selection.purpose, SelectionPurpose::Callback)
         || row.route != Some(selection.route) || row.executive_shared != selection.shared
-        || row.current_irp.is_some() || row.delete_ticket.is_some()
+        || !row.current_irp.admits_new() || row.delete_ticket.is_some()
     { return false; }
     let Some(registry) = hosted_driver_dynamic_type::registry_mut() else { return false; };
     if registry.take_delete_into(lease, &mut row.delete_ticket).is_err() { return false; }
@@ -713,7 +713,7 @@ pub(super) unsafe fn select_completion_control(instance_index: usize, irp: u64) 
 pub(super) unsafe fn owns_irp(instance_index: usize, irp: u64) -> bool {
     index_for(instance_index).is_some_and(|index| {
         let row = &(&*core::ptr::addr_of!(LANES))[index];
-        row.current_irp == Some(irp) && row.phase != Phase::Retired
+        row.current_irp.owns(irp) && row.phase != Phase::Retired
     })
 }
 
@@ -726,16 +726,16 @@ pub(super) unsafe fn mark_entered(instance_index: usize, selection: &Selection,
         || row.executive_shared != selection.shared { return false; }
     match selection.purpose {
         SelectionPurpose::New if row.phase != Phase::Ready
-            || irp.is_none() || row.current_irp.is_some() => return false,
+            || irp.is_none() || !row.current_irp.admits_new() => return false,
         SelectionPurpose::Control(expected) if row.phase != Phase::Ready || irp.is_some()
-            || row.current_irp != Some(expected) => return false,
+            || !row.current_irp.owns(expected) => return false,
         SelectionPurpose::Callback if row.phase != Phase::DeletePrepared
-            || irp.is_some() || row.current_irp.is_some()
+            || irp.is_some() || !row.current_irp.admits_new()
             || row.delete_ticket.is_none() => return false,
         _ => {}
     }
     row.phase = Phase::Entered;
-    if let Some(irp) = irp { row.current_irp = Some(irp); }
+    if let Some(irp) = irp { row.current_irp.enter(irp); }
     true
 }
 
@@ -748,11 +748,13 @@ pub(super) unsafe fn finish(instance_index: usize, selection: &Selection, comple
     }
 }
 
-pub(super) unsafe fn acknowledged(instance_index: usize, irp: u64) {
+/// `irp` needs this lane no more: its ACK ran here, or its File owner retired after a
+/// synchronous terminal that owes no lane control (#427).
+pub(super) unsafe fn release_irp(instance_index: usize, irp: u64) {
     if let Some(index) = index_for(instance_index) {
         let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
-        if row.phase == Phase::Ready && row.current_irp == Some(irp) {
-            row.current_irp = None;
+        if row.phase == Phase::Ready {
+            row.current_irp.release(irp);
         }
     }
 }
@@ -761,7 +763,7 @@ pub(super) unsafe fn begin_worker_retirement(instance_index: usize, handle: u64)
     let Some(row) = (&mut *core::ptr::addr_of_mut!(LANES)).iter_mut()
         .find(|row| row.instance == instance_index && row.handle == handle)
     else { return true; };
-    if !matches!(row.phase, Phase::Ready | Phase::Retiring) || row.current_irp.is_some()
+    if !matches!(row.phase, Phase::Ready | Phase::Retiring) || !row.current_irp.admits_new()
         || row.delete_ticket.is_some() {
         return false;
     }

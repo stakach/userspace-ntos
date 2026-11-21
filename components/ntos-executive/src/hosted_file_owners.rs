@@ -518,7 +518,15 @@ fn remove(id: u64) -> Result<Row, nt_status::NtStatus> {
         quarantine_release(id, status);
         return Err(status);
     }
-    Ok(rows().swap_remove(index))
+    let retired = rows().swap_remove(index);
+    // No later control targets a retired owner's IRP, so the worker lane that entered it is
+    // free for the next one, even when its terminal returned with no ACK.
+    if let (Some(irp), Some(driver)) = (retired.irp_id, retired.primary_driver) {
+        if let Some((instance, _)) = instance_by_driver_id(driver.raw()) {
+            unsafe { hosted_class_irp_lane::release_irp(instance, irp.raw()) };
+        }
+    }
+    Ok(retired)
 }
 
 fn reserve(

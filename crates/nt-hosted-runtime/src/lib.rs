@@ -35,7 +35,7 @@ mod dxg_registration;
 mod contiguous_ram;
 mod provider_export_worker;
 mod ordinary_irp_lane;
-pub use ordinary_irp_lane::{select_ordinary_irp_lane, OrdinaryIrpLane};
+pub use ordinary_irp_lane::{select_ordinary_irp_lane, OrdinaryIrpLane, WorkerIrpClaim};
 mod driver_load_slice;
 pub use driver_load_slice::{driver_load_step, DriverLoadSliceEnd, DriverLoadStep};
 mod connect_submit;

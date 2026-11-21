@@ -35,6 +35,44 @@ pub const fn select_ordinary_irp_lane(
     }
 }
 
+/// The ordinary IRP a dispatch-worker lane has entered. Its later controls (copy, ACK) must reach
+/// this lane, whose bank holds it, so the lane admits no other IRP until the claim is released:
+/// by the IRP's ACK on this lane or by the retirement of its File owner, whichever comes first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkerIrpClaim(Option<u64>);
+
+impl WorkerIrpClaim {
+    pub const fn idle() -> Self {
+        Self(None)
+    }
+
+    pub const fn admits_new(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn owns(&self, irp: u64) -> bool {
+        self.0 == Some(irp)
+    }
+
+    /// Claim the lane for `irp`; refused while another IRP holds it.
+    pub fn enter(&mut self, irp: u64) -> bool {
+        if self.0.is_some() {
+            return false;
+        }
+        self.0 = Some(irp);
+        true
+    }
+
+    /// End `irp`'s claim. Only that IRP's claim is released, and only once.
+    pub fn release(&mut self, irp: u64) -> bool {
+        if self.0 != Some(irp) {
+            return false;
+        }
+        self.0 = None;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{select_ordinary_irp_lane as select, OrdinaryIrpLane as Lane};
