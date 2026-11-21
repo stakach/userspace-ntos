@@ -164,6 +164,10 @@ pub enum HostedIrqServiceKind {
     PulseEvent = 20,
     /// `KeReleaseSemaphore(Semaphore, Increment, Adjustment, FALSE)`.
     ReleaseSemaphore = 21,
+    /// `HalGetBusDataByOffset` / `HalSetBusDataByOffset` on PCI configuration space.
+    PciConfig = 22,
+    /// `IoWMIWriteEvent(WnodeEventItem)`.
+    WmiWriteEvent = 23,
 }
 
 impl HostedIrqServiceKind {
@@ -190,6 +194,8 @@ impl HostedIrqServiceKind {
             19 => Some(Self::StartNextPacketReturned),
             20 => Some(Self::PulseEvent),
             21 => Some(Self::ReleaseSemaphore),
+            22 => Some(Self::PciConfig),
+            23 => Some(Self::WmiWriteEvent),
             _ => None,
         }
     }
@@ -542,6 +548,7 @@ impl HostedIrqServiceCommand {
                 }
                 HostedIrqServiceKind::SetEvent
                 | HostedIrqServiceKind::PulseEvent
+                | HostedIrqServiceKind::WmiWriteEvent
                 | HostedIrqServiceKind::BeginLocalIrpCompletion => {
                     self.authority_cookie == 0
                         && self.argument_count == 1
@@ -573,6 +580,14 @@ impl HostedIrqServiceCommand {
                         && self.arguments[0] != 0
                         && self.arguments[1] <= u32::MAX as u64
                         && self.arguments[2..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::PciConfig => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 4
+                        && self.arguments[1] != 0
+                        && self.arguments[2] >> 32 != 0
+                        && self.arguments[3] <= 1
+                        && self.arguments[4..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::PoolRetirement => {
                     self.authority_cookie == 0
@@ -2601,7 +2616,7 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
         assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
-        assert_eq!(HostedIrqServiceKind::from_raw(22), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(24), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2847,6 +2862,46 @@ mod tests {
         release.arguments[0] = 0x18000;
         release.arguments[2] = 1;
         assert!(!release.valid());
+    }
+
+    #[test]
+    fn irq_pci_config_carries_slot_buffer_range_and_direction() {
+        // HalGetBusDataByOffset / HalSetBusDataByOffset: IRQL <= DISPATCH_LEVEL.
+        assert_eq!(HostedIrqServiceKind::from_raw(22), Some(HostedIrqServiceKind::PciConfig));
+        let mut config = service();
+        config.kind = HostedIrqServiceKind::PciConfig;
+        config.authority_cookie = 0;
+        config.argument_count = 4;
+        config.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        for op in [0, 1] {
+            config.arguments[..4].copy_from_slice(&[0, 0x6000, 4 << 32, op]);
+            assert!(config.valid(), "bus 0 slot 0 is a valid location");
+        }
+        config.arguments[3] = 2;
+        assert!(!config.valid(), "read or write only");
+        config.arguments[3] = 0;
+        config.arguments[1] = 0;
+        assert!(!config.valid(), "a buffer is required");
+        config.arguments[1] = 0x6000;
+        config.arguments[2] = 0;
+        assert!(!config.valid(), "a zero-length access is not a request");
+        config.arguments[2] = 4 << 32;
+        config.arguments[4] = 1;
+        assert!(!config.valid());
+    }
+
+    #[test]
+    fn irq_wmi_write_event_carries_one_wnode() {
+        assert_eq!(HostedIrqServiceKind::from_raw(23), Some(HostedIrqServiceKind::WmiWriteEvent));
+        let mut event = service();
+        event.kind = HostedIrqServiceKind::WmiWriteEvent;
+        event.authority_cookie = 0;
+        event.argument_count = 1;
+        event.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        event.arguments[0] = 0x7000;
+        assert!(event.valid());
+        event.arguments[0] = 0;
+        assert!(!event.valid());
     }
 
     #[test]

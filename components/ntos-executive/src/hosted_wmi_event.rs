@@ -18,6 +18,12 @@ pub(super) fn service(
     if hosted_driver_caller(index, inst, badge).is_none() {
         return STATUS_ACCESS_DENIED;
     }
+    write_event_for(inst, pointer)
+}
+
+/// IoWMIWriteEvent for an authenticated driver instance: its primary channel or IRQ lane.
+pub(super) fn write_event_for(inst: DriverInstance, pointer: u64) -> i32 {
+    if pointer == 0 { return STATUS_INVALID_PARAMETER; }
     let Some(domain) = instance_domain_identity(inst) else {
         return STATUS_ACCESS_DENIED;
     };

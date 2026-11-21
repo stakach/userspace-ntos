@@ -19580,14 +19580,21 @@ fn hosted_pci_config_call(
     }
     let bus_slot = bus_number as u64 | ((slot_number as u64) << 32);
     let range = offset as u64 | ((length as u64) << 32);
-    let (_label, status, transferred, _, _) = unsafe {
-        call_on4(
-            (FSD_SERVICE_PCI_CONFIG_LABEL << 12) | 4,
-            bus_slot,
-            buffer,
-            range,
-            op,
-        )
+    // HalGet/SetBusDataByOffset are callable at DISPATCH_LEVEL, so a DPC reaches them too.
+    let lane = unsafe { hosted_irq_lane_request(
+        nt_hosted_runtime::HostedIrqServiceKind::PciConfig,
+        FSD_SERVICE_PCI_CONFIG_LABEL,
+        &[bus_slot, buffer, range, op],
+    ) };
+    let (status, transferred) = match lane {
+        Some(result) if result.value_count == 1 => (result.status as u32 as u64, result.values[0]),
+        Some(_) => hosted_irq_lane_protocol_fault(buffer),
+        None => {
+            let (_label, status, transferred, _, _) = unsafe {
+                call_on4((FSD_SERVICE_PCI_CONFIG_LABEL << 12) | 4, bus_slot, buffer, range, op)
+            };
+            (status, transferred)
+        }
     };
     if status as u32 as i32 == STATUS_SUCCESS {
         transferred.min(length as u64) as u32
@@ -66656,6 +66663,23 @@ pub(crate) fn service_hosted_driver_pci_config(
     let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return (STATUS_ACCESS_DENIED, 0);
     };
+    let Some(caller) = hosted_driver_caller(instance, inst, caller_badge) else {
+        return (STATUS_ACCESS_DENIED, 0);
+    };
+    pci_config_for(instance, inst, caller.runtime, bus_slot, component_buffer, range, op)
+}
+
+/// PCI configuration access for an authenticated driver instance. A worker's own stack buffer
+/// resolves through its runtime; the IRQ lane passes `None` and names instance-owned storage.
+pub(crate) fn pci_config_for(
+    instance: usize,
+    inst: DriverInstance,
+    runtime: Option<HostedDriverThreadRuntime>,
+    bus_slot: u64,
+    component_buffer: u64,
+    range: u64,
+    op: u64,
+) -> (i32, u64) {
     if !matches!(op, HOSTED_PCI_CONFIG_OP_READ | HOSTED_PCI_CONFIG_OP_WRITE) {
         return (STATUS_INVALID_PARAMETER, 0);
     }
@@ -66667,10 +66691,6 @@ pub(crate) fn service_hosted_driver_pci_config(
         Ok(access) if access.length != 0 => access,
         _ => return (STATUS_INVALID_PARAMETER, 0),
     };
-    let Some(caller) = hosted_driver_caller(instance, inst, caller_badge) else {
-        return (STATUS_ACCESS_DENIED, 0);
-    };
-    let runtime = caller.runtime;
     let Some(exec_buffer) =
         component_to_exec_va_for_instance(instance, inst, component_buffer, access.length as u64)
             .or_else(|| {

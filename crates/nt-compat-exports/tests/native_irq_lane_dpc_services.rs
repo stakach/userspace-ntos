@@ -9,6 +9,7 @@ use syn::{visit::Visit, Item};
 const SOURCES: &[(&str, &str)] = &[
     ("driver_launch.rs", include_str!("../../../components/ntos-executive/src/driver_launch.rs")),
     ("hosted_start_io.rs", include_str!("../../../components/ntos-executive/src/hosted_start_io.rs")),
+    ("hosted_driver_wmi.rs", include_str!("../../../components/ntos-executive/src/hosted_driver_wmi.rs")),
     ("hosted_driver_hal_beep.rs",
         include_str!("../../../components/ntos-executive/src/hosted_driver_hal_beep.rs")),
 ];
@@ -19,10 +20,18 @@ const DPC_LEGAL: &[(&str, &str)] = &[
     ("IoStartNextPacket", "s_io_start_next_packet"),
     ("KePulseEvent", "s_ke_pulse_event"),
     ("KeReleaseSemaphore", "s_ke_release_semaphore"),
+    ("MmBuildMdlForNonPagedPool", "s_mm_build_mdl_for_nonpaged_pool"),
+    ("HalGetBusDataByOffset/HalSetBusDataByOffset", "hosted_pci_config_call"),
+    ("IoWMIWriteEvent", "write_event"),
 ];
 
 /// The driver-side entry points that publish a typed service on the current IRQ lane.
-const LANE_REQUESTS: &[&str] = &["hosted_irq_lane_request", "hosted_irq_lane_dispatcher_signal"];
+const LANE_REQUESTS: &[&str] = &[
+    "hosted_irq_lane_request",
+    "hosted_irq_lane_dispatcher_signal",
+    // The MDL service publishes HostedIrqServiceKind::Mdl on the lane (hosted_mdl_service).
+    "require_hosted_mdl_service",
+];
 
 fn function(name: &str) -> syn::ItemFn {
     SOURCES.iter().find_map(|(_, source)| {

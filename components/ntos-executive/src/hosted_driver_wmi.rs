@@ -39,6 +39,12 @@ pub(super) fn bind(reg: &mut DriverExportRegistry) {
 /// `NTSTATUS IoWMIWriteEvent(PVOID WnodeEventItem)`.
 pub(super) extern "win64" fn write_event(wnode: u64) -> i32 {
     if wnode == 0 { return STATUS_INVALID_PARAMETER; }
+    // IoWMIWriteEvent is callable at DISPATCH_LEVEL, so a DPC reaches it on the IRQ lane.
+    if let Some(result) = unsafe { hosted_irq_lane_request(
+        nt_hosted_runtime::HostedIrqServiceKind::WmiWriteEvent, LABEL, &[wnode],
+    ) } {
+        return result.status;
+    }
     ticket_operation(OP_WRITE_EVENT, wnode, 0, 0)
         .map_or_else(|status| status, |_| STATUS_SUCCESS)
 }

@@ -1684,6 +1684,34 @@ impl HostedIrqRootSession {
         values_result(status, &[start_io, serial, irp])
     }
 
+    /// HalGet/SetBusDataByOffset from the lane's DPC, on instance-owned storage.
+    unsafe fn pci_config_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let (index, inst) = match self.lane_driver(lane_index, command, FSD_SERVICE_PCI_CONFIG_LABEL) {
+            Ok(driver) => driver,
+            Err(refused) => return refused,
+        };
+        let [bus_slot, buffer, range, op, ..] = command.arguments;
+        let (status, transferred) = pci_config_for(index, inst, None, bus_slot, buffer, range, op);
+        service_result(status, Some(transferred))
+    }
+
+    /// IoWMIWriteEvent from the lane's DPC.
+    unsafe fn wmi_write_event_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let (_, inst) = match self.lane_driver(lane_index, command, hosted_driver_wmi::LABEL) {
+            Ok(driver) => driver,
+            Err(refused) => return refused,
+        };
+        service_result(hosted_wmi_event::write_event_for(inst, command.arguments[0]), None)
+    }
+
     /// KePulseEvent or KeReleaseSemaphore (Wait == FALSE) from the lane's DPC.
     unsafe fn dispatcher_signal_service(
         &mut self,
@@ -1883,6 +1911,12 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::StartNextPacketReturned => {
                 self.start_next_packet_returned_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::PciConfig => {
+                self.pci_config_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::WmiWriteEvent => {
+                self.wmi_write_event_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::PulseEvent => {
                 self.dispatcher_signal_service(lane_index, command, FSD_SERVICE_KE_PULSE_EVENT_LABEL)
