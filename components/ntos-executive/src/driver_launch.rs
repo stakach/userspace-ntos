@@ -3251,7 +3251,6 @@ unsafe fn poll_hosted_completion_at_storage(
             let next = read_volatile(node_exec as *const u64);
             let ready_state = pending_irp_owner_state(node_exec).load(Ordering::Acquire);
             if hosted_irp_state_kind(ready_state) != HOSTED_IRP_READY {
-                let entry = read_volatile(pending_irp_entry_address(node_exec) as *const PendingIrp);
                 node = next;
                 steps += 1;
                 continue;
