@@ -1684,6 +1684,24 @@ impl HostedIrqRootSession {
         values_result(status, &[start_io, serial, irp])
     }
 
+    /// KePulseEvent or KeReleaseSemaphore (Wait == FALSE) from the lane's DPC.
+    unsafe fn dispatcher_signal_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+        service_id: u64,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let (index, inst) = match self.lane_driver(lane_index, command, service_id) {
+            Ok(driver) => driver,
+            Err(refused) => return refused,
+        };
+        let arguments = [command.arguments[0], command.arguments[1]];
+        match service_hosted_irq_lane_dispatcher_signal(index, inst, command.kind, arguments) {
+            Ok(previous) => service_result(STATUS_SUCCESS, Some(previous as u32 as u64)),
+            Err(status) => service_result(status, Some(0)),
+        }
+    }
+
     unsafe fn start_next_packet_returned_service(
         &mut self,
         lane_index: usize,
@@ -1866,6 +1884,12 @@ impl HostedIrqRootSession {
             nt_hosted_runtime::HostedIrqServiceKind::StartNextPacketReturned => {
                 self.start_next_packet_returned_service(lane_index, command)
             }
+            nt_hosted_runtime::HostedIrqServiceKind::PulseEvent => {
+                self.dispatcher_signal_service(lane_index, command, FSD_SERVICE_KE_PULSE_EVENT_LABEL)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::ReleaseSemaphore => self.dispatcher_signal_service(
+                lane_index, command, FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL,
+            ),
             nt_hosted_runtime::HostedIrqServiceKind::BeginLocalIrpCompletion => {
                 self.begin_local_irp_completion_service(lane_index, command)
             }

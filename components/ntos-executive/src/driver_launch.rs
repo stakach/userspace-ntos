@@ -15892,6 +15892,13 @@ extern "win64" fn s_ke_pulse_event(event: u64, increment: i32, wait: u8) -> i32 
     if let Some(previous) = hosted_driver_event_reference::pulse_if_owned(event) {
         return previous as i32;
     }
+    if let Some(previous) = unsafe { hosted_irq_lane_dispatcher_signal(
+        nt_hosted_runtime::HostedIrqServiceKind::PulseEvent,
+        FSD_SERVICE_KE_PULSE_EVENT_LABEL, &[event], wait,
+    ) } {
+        unsafe { hosted_file_event::mirror(event); }
+        return previous;
+    }
     let packed = (increment as u32 as u64) | ((wait as u64) << 32);
     let (_label, previous, _, _, _) = unsafe {
         call_on4(
@@ -15904,6 +15911,25 @@ extern "win64" fn s_ke_pulse_event(event: u64, increment: i32, wait: u8) -> i32 
     };
     unsafe { hosted_file_event::mirror(event); }
     previous as u32 as i32
+}
+
+/// Signal a dispatcher object from a DPC: the previous state, or `None` off the IRQ lane. The
+/// priority increment has no effect here; `Wait == TRUE` is illegal at DISPATCH_LEVEL.
+unsafe fn hosted_irq_lane_dispatcher_signal(
+    kind: nt_hosted_runtime::HostedIrqServiceKind,
+    service_id: u64,
+    arguments: &[u64],
+    wait: u8,
+) -> Option<i32> {
+    hosted_irq_lane_context()?;
+    if wait != 0 {
+        hosted_irq_lane_protocol_fault(arguments[0]);
+    }
+    let result = hosted_irq_lane_request(kind, service_id, arguments)?;
+    if result.value_count != 1 {
+        hosted_irq_lane_protocol_fault(arguments[0]);
+    }
+    Some(if result.status == STATUS_SUCCESS { result.values[0] as u32 as i32 } else { result.status })
 }
 
 /// `LONG KeReadStateEvent(PRKEVENT)`.
@@ -15942,6 +15968,12 @@ extern "win64" fn s_ke_release_semaphore(
 ) -> i32 {
     if semaphore == 0 {
         return 0;
+    }
+    if let Some(previous) = unsafe { hosted_irq_lane_dispatcher_signal(
+        nt_hosted_runtime::HostedIrqServiceKind::ReleaseSemaphore,
+        FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL, &[semaphore, adjustment as u32 as u64], wait,
+    ) } {
+        return previous;
     }
     let packed = (increment as u32 as u64) | ((wait as u64) << 32);
     let (_label, previous, _, _, _) = unsafe {
@@ -70942,6 +70974,60 @@ pub(crate) fn service_hosted_driver_ke_cancel_timer(
     unsafe { apply_hosted_driver_ke_cancel_timer(instance, timer) }
 }
 
+/// KePulseEvent on a resolved event: set, satisfy the waiters, reset. `(previous, woken)`.
+fn pulse_hosted_driver_event(instance: usize, exec_event: u64) -> (i32, u64) {
+    let previous = unsafe { kevent::kevent_read_state(exec_event as *const u8) as i32 };
+    unsafe {
+        kevent::kevent_set(exec_event as *mut u8);
+    }
+    let woken = wake_hosted_driver_waiters_for_instance(instance);
+    unsafe {
+        kevent::kevent_clear(exec_event as *mut u8);
+    }
+    (previous, woken)
+}
+
+/// KeReleaseSemaphore on a resolved semaphore. `(previous count, woken)`.
+fn release_hosted_driver_semaphore(
+    instance: usize,
+    exec_semaphore: u64,
+    adjustment: i32,
+) -> Result<(i32, u64), i32> {
+    let previous = unsafe { ksemaphore_release(exec_semaphore as *mut u8, adjustment) }
+        .map_err(|_| STATUS_SEMAPHORE_LIMIT_EXCEEDED)?;
+    Ok((previous, wake_hosted_driver_waiters_for_instance(instance)))
+}
+
+/// KePulseEvent or KeReleaseSemaphore from an authenticated IRQ lane, through its instance's
+/// mapped storage; the lane's component pointer is never dereferenced as root memory.
+pub(crate) unsafe fn service_hosted_irq_lane_dispatcher_signal(
+    instance_index: usize,
+    inst: DriverInstance,
+    kind: nt_hosted_runtime::HostedIrqServiceKind,
+    arguments: [u64; 2],
+) -> Result<i32, i32> {
+    let exec_object = hosted_driver_wait_object_exec_va(instance_index, inst, None, arguments[0])
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    match kind {
+        nt_hosted_runtime::HostedIrqServiceKind::PulseEvent => {
+            if !matches!(read_unaligned(exec_object as *const u8),
+                kevent::EVENT_NOTIFICATION_OBJECT | kevent::EVENT_SYNCHRONIZATION_OBJECT)
+            {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            Ok(pulse_hosted_driver_event(instance_index, exec_object).0)
+        }
+        nt_hosted_runtime::HostedIrqServiceKind::ReleaseSemaphore => {
+            if read_unaligned(exec_object as *const u8) != SEMAPHORE_OBJECT {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            release_hosted_driver_semaphore(instance_index, exec_object, arguments[1] as u32 as i32)
+                .map(|(previous, _)| previous)
+        }
+        _ => Err(STATUS_INVALID_PARAMETER),
+    }
+}
+
 pub(crate) fn service_hosted_driver_ke_pulse_event(
     ch: &crate::spawn_hosts::PumpChannel,
     event: u64,
@@ -70974,14 +71060,7 @@ pub(crate) fn service_hosted_driver_ke_pulse_event(
         }
         return 0;
     };
-    let previous = unsafe { kevent::kevent_read_state(exec_event as *const u8) as i32 };
-    unsafe {
-        kevent::kevent_set(exec_event as *mut u8);
-    }
-    let woken = wake_hosted_driver_waiters_for_instance(instance);
-    unsafe {
-        kevent::kevent_clear(exec_event as *mut u8);
-    }
+    let (previous, woken) = pulse_hosted_driver_event(instance, exec_event);
     if woken != 0 && request <= 8 {
         print_str(b"[driver-wait] KePulseEvent woke=");
         print_u64(woken);
@@ -71027,11 +71106,10 @@ pub(crate) fn service_hosted_driver_ke_release_semaphore(
         }
         return STATUS_INVALID_PARAMETER;
     };
-    let previous = match unsafe { ksemaphore_release(exec_semaphore as *mut u8, adjustment) } {
-        Ok(previous) => previous,
-        Err(_) => return STATUS_SEMAPHORE_LIMIT_EXCEEDED,
+    let (previous, woken) = match release_hosted_driver_semaphore(instance, exec_semaphore, adjustment) {
+        Ok(released) => released,
+        Err(status) => return status,
     };
-    let woken = wake_hosted_driver_waiters_for_instance(instance);
     if woken != 0 && request <= 8 {
         print_str(b"[driver-wait] KeReleaseSemaphore woke=");
         print_u64(woken);

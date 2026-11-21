@@ -160,6 +160,10 @@ pub enum HostedIrqServiceKind {
     StartNextPacket = 18,
     /// The lane's StartIo returned for the exact StartNextPacket transaction.
     StartNextPacketReturned = 19,
+    /// `KePulseEvent(Event, Increment, FALSE)`.
+    PulseEvent = 20,
+    /// `KeReleaseSemaphore(Semaphore, Increment, Adjustment, FALSE)`.
+    ReleaseSemaphore = 21,
 }
 
 impl HostedIrqServiceKind {
@@ -184,6 +188,8 @@ impl HostedIrqServiceKind {
             17 => Some(Self::HalMakeBeep),
             18 => Some(Self::StartNextPacket),
             19 => Some(Self::StartNextPacketReturned),
+            20 => Some(Self::PulseEvent),
+            21 => Some(Self::ReleaseSemaphore),
             _ => None,
         }
     }
@@ -535,6 +541,7 @@ impl HostedIrqServiceCommand {
                         && self.arguments[4..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::SetEvent
+                | HostedIrqServiceKind::PulseEvent
                 | HostedIrqServiceKind::BeginLocalIrpCompletion => {
                     self.authority_cookie == 0
                         && self.argument_count == 1
@@ -559,6 +566,13 @@ impl HostedIrqServiceCommand {
                         && self.argument_count == 3
                         && self.arguments[..3].iter().all(|argument| *argument != 0)
                         && self.arguments[3..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::ReleaseSemaphore => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 2
+                        && self.arguments[0] != 0
+                        && self.arguments[1] <= u32::MAX as u64
+                        && self.arguments[2..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::PoolRetirement => {
                     self.authority_cookie == 0
@@ -2587,7 +2601,7 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
         assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
-        assert_eq!(HostedIrqServiceKind::from_raw(20), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(22), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2796,6 +2810,43 @@ mod tests {
         }
         done.arguments[3] = 1;
         assert!(!done.valid());
+    }
+
+    #[test]
+    fn irq_pulse_event_carries_one_owned_event() {
+        assert_eq!(HostedIrqServiceKind::from_raw(20), Some(HostedIrqServiceKind::PulseEvent));
+        let mut pulse = service();
+        pulse.kind = HostedIrqServiceKind::PulseEvent;
+        pulse.authority_cookie = 0;
+        pulse.argument_count = 1;
+        pulse.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        pulse.arguments[0] = 0x18000;
+        assert!(pulse.valid());
+        pulse.arguments[0] = 0;
+        assert!(!pulse.valid());
+        pulse.arguments[0] = 0x18000;
+        pulse.arguments[1] = 1;
+        assert!(!pulse.valid());
+    }
+
+    #[test]
+    fn irq_release_semaphore_carries_object_and_long_adjustment() {
+        assert_eq!(HostedIrqServiceKind::from_raw(21), Some(HostedIrqServiceKind::ReleaseSemaphore));
+        let mut release = service();
+        release.kind = HostedIrqServiceKind::ReleaseSemaphore;
+        release.authority_cookie = 0;
+        release.argument_count = 2;
+        release.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        release.arguments[..2].copy_from_slice(&[0x18000, 1]);
+        assert!(release.valid());
+        release.arguments[1] = u64::from(u32::MAX) + 1;
+        assert!(!release.valid(), "Adjustment is a LONG");
+        release.arguments[1] = 1;
+        release.arguments[0] = 0;
+        assert!(!release.valid());
+        release.arguments[0] = 0x18000;
+        release.arguments[2] = 1;
+        assert!(!release.valid());
     }
 
     #[test]

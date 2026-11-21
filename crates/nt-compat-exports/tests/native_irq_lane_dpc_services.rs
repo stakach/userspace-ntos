@@ -17,7 +17,12 @@ const SOURCES: &[(&str, &str)] = &[
 const DPC_LEGAL: &[(&str, &str)] = &[
     ("HalMakeBeep", "make_beep"),
     ("IoStartNextPacket", "s_io_start_next_packet"),
+    ("KePulseEvent", "s_ke_pulse_event"),
+    ("KeReleaseSemaphore", "s_ke_release_semaphore"),
 ];
+
+/// The driver-side entry points that publish a typed service on the current IRQ lane.
+const LANE_REQUESTS: &[&str] = &["hosted_irq_lane_request", "hosted_irq_lane_dispatcher_signal"];
 
 fn function(name: &str) -> syn::ItemFn {
     SOURCES.iter().find_map(|(_, source)| {
@@ -47,7 +52,7 @@ fn dpc_legal_exports_request_typed_lane_services() {
     for (export, implementation) in DPC_LEGAL {
         let mut calls = Calls::default();
         calls.visit_item_fn(&function(implementation));
-        let lane = calls.0.iter().position(|name| name == "hosted_irq_lane_request");
+        let lane = calls.0.iter().position(|name| LANE_REQUESTS.contains(&name.as_str()));
         let raw = calls.0.iter().position(|name| name.starts_with("call_on4"));
         assert!(lane.is_some(), "{export} must request its root service on the IRQ lane");
         assert!(raw.is_none_or(|raw| lane.is_some_and(|lane| lane < raw)),
