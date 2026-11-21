@@ -555,6 +555,12 @@ pub(super) unsafe fn syscall_nt_route(
         crate::native_device_path_trace::record(
             &nt_handler, table_entry.map(|entry| entry.service), &argv[..n], pi,
             dispatch_generation, res.status);
+        if matches!(table_entry.map(|entry| entry.service),
+            Some(nt_syscall::NativeService::NtCreateFile | nt_syscall::NativeService::NtOpenFile))
+            && nt_handler.pending_file_io_transfer.is_some()
+        {
+            sc.pended_create_generation = dispatch_generation;
+        }
         crate::hot_service_cost_census::record_dispatch(
             table_entry.map(|entry| entry.service), res.status, elapsed_ticks,
             crate::serial_records::root_serial_bytes().wrapping_sub(dispatch_serial),
@@ -877,6 +883,13 @@ pub(super) unsafe fn syscall_nt_route(
     sc.published_file_io = file_dispatch_handoff::finish_after_inline_retirement(
         &mut nt_handler, handoff,
     );
+    if sc.pended_create_generation.is_some() {
+        crate::native_device_path_trace::pended_create_step(
+            b"published", pi, sc.pended_create_generation,
+            sc.published_file_io.is_some() as u64,
+            sc.published_file_io.as_ref().is_some_and(|published| published.wait_for_completion) as u64,
+        );
+    }
     let post_action_process = match post_action {
         ExecPostAction::TerminateProcess { process_index, .. } => Some(process_index),
         _ => None,

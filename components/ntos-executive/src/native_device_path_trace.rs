@@ -16,8 +16,9 @@ use nt_syscall::NativeService;
 
 /// Dispatch records (creates, opens, device controls, process creations) per generation.
 const DISPATCHES_PER_PROCESS: u8 = 48;
-/// Pended-CREATE completion records per generation: a console client needs two per open.
-const PENDED_CREATES_PER_PROCESS: u8 = 8;
+/// Pended-CREATE records per generation: up to four per open (published, handoff, completed,
+/// final), and a console client pends Reference and Connection.
+const PENDED_CREATES_PER_PROCESS: u8 = 16;
 
 #[derive(Clone, Copy)]
 enum Budget {
@@ -198,5 +199,25 @@ pub(crate) fn pended_create(
     print_hex(status);
     print_str(b" handle=0x");
     print_hex_u64(handle);
+    print_str(b"\n");
+}
+
+/// One step of a staged pended CREATE's caller handoff (#421), on the pended-CREATE budget.
+/// Boot 44866000603 staged cmd.exe's `Reference` open (STATUS_PENDING, staged=1 wait=1) and no
+/// completion was ever delivered for it, yet cmd resumed. `published` gives (published, wait),
+/// `handoff` (wait, still parked), and `direct-reply` (the status replied, the Reply) when the
+/// syscall tail answered the caller itself.
+pub(crate) fn pended_create_step(phase: &[u8], pi: usize, generation: Option<u64>, first: u64, second: u64) {
+    if !claim_from(Budget::PendedCreate, pi, generation) {
+        return;
+    }
+    print_str(b"[device-path] pi=");
+    print_u64(pi as u64);
+    print_str(b" pended-create ");
+    print_str(phase);
+    print_str(b" 0x");
+    print_hex_u64(first);
+    print_str(b" 0x");
+    print_hex_u64(second);
     print_str(b"\n");
 }
