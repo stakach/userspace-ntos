@@ -82,6 +82,21 @@ fn visit(
     order.push(i); // emit AFTER dependencies → dependencies-before-dependents
 }
 
+/// The module a Win32 GUI or console process loads before its EXE's imports, as its base name.
+///
+/// ReactOS `LdrpInitializeProcess` (ldrinit.c) calls `LdrLoadDll(kernel32.dll)` for an
+/// `IMAGE_SUBSYSTEM_WINDOWS_GUI` or `_CUI` image before `LdrpWalkImportDescriptor` walks the EXE.
+/// kernel32 and its dependency closure therefore finish loading, and enter
+/// `InInitializationOrderModuleList`, first. Seeding the attach traversal from it gives the same
+/// order inside the LiberNT kernel32 <-> kernelbase cycle: kernelbase initializes before kernel32,
+/// whose DllMain calls `kernelbase!ConDllInitialize`.
+pub fn win32_preloaded_module(subsystem: Option<u16>) -> Option<&'static str> {
+    const IMAGE_SUBSYSTEM_WINDOWS_GUI: u16 = 2;
+    const IMAGE_SUBSYSTEM_WINDOWS_CUI: u16 = 3;
+    matches!(subsystem, Some(IMAGE_SUBSYSTEM_WINDOWS_GUI | IMAGE_SUBSYSTEM_WINDOWS_CUI))
+        .then_some("kernel32")
+}
+
 /// Convenience: the init order as module **names** (for tests / diagnostics / `PEB->Ldr` build).
 pub fn initialization_order_names(
     state: &LoaderState,

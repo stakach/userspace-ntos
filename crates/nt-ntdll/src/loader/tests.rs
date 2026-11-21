@@ -702,3 +702,39 @@ fn process_cookie_is_deterministic_and_nonzero() {
         init::compute_process_cookie(0x1234_5678_9ABC_DEF0)
     );
 }
+
+/// LiberNT kernel32 and kernelbase import each other, and kernel32's DllMain calls
+/// `kernelbase!ConDllInitialize`. cmd.exe reaches kernelbase first through advapi32 -> sechost.
+/// Boot 44896134068: with the traversal seeded from the EXE, kernel32's DllMain ran first and
+/// allocated the console with kernelbase's locale tables still NULL (GetStringTypeW fault).
+#[test]
+fn win32_process_initializes_kernelbase_before_kernel32_inside_their_cycle() {
+    const IMAGE_SUBSYSTEM_WINDOWS_CUI: u16 = 3;
+    let mut st = LoaderState::new();
+    st.add(LoadedModule::mock(
+        "cmd.exe",
+        0x1_4000_0000,
+        vec![],
+        vec![imports("advapi32.dll", &[]), imports("kernel32.dll", &[])],
+    ));
+    st.add(LoadedModule::mock("advapi32.dll", 0x2_0000, vec![], vec![imports("sechost.dll", &[])]));
+    st.add(LoadedModule::mock("sechost.dll", 0x3_0000, vec![], vec![imports("kernelbase.dll", &[])]));
+    st.add(LoadedModule::mock("kernelbase.dll", 0x4_0000, vec![], vec![imports("kernel32.dll", &[])]));
+    st.add(LoadedModule::mock("kernel32.dll", 0x5_0000, vec![], vec![imports("kernelbase.dll", &[])]));
+
+    let mut roots: Vec<&str> = order::win32_preloaded_module(Some(IMAGE_SUBSYSTEM_WINDOWS_CUI))
+        .into_iter()
+        .collect();
+    roots.push("cmd.exe");
+    let names = order::initialization_order_names(&st, &roots);
+    let pos = |n: &str| names.iter().position(|x| x == n).unwrap();
+    assert!(pos("kernelbase.dll") < pos("kernel32.dll"), "init order {names:?}");
+    assert_eq!(names.last().unwrap(), "cmd.exe");
+}
+
+#[test]
+fn native_process_has_no_preloaded_module() {
+    const IMAGE_SUBSYSTEM_NATIVE: u16 = 1;
+    assert_eq!(order::win32_preloaded_module(Some(IMAGE_SUBSYSTEM_NATIVE)), None);
+    assert_eq!(order::win32_preloaded_module(None), None);
+}

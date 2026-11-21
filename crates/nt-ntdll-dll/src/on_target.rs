@@ -667,9 +667,11 @@ unsafe fn run_process_attach(table: *mut ModuleTable, startup_reserved: u64) -> 
         let mut vn = 0usize;
         let mut newly_attached = [0u64; MODULE_TABLE_CAP];
         let mut attached_count = 0usize;
-        let mut i = 0usize;
-        while i < count {
-            let b = (*table).mods[i].base;
+        // A Win32 process initializes kernel32's dependency closure first, as NT loads it first.
+        let preloaded = nt_ntdll::loader::order::win32_preloaded_module(current_image_subsystem())
+            .map_or(0, |name| (*table).find(name.as_bytes()));
+        let table_bases = (0..count).map(|index| unsafe { (*table).mods[index].base });
+        for b in core::iter::once(preloaded).chain(table_bases) {
             if b >= 0x1_0000 {
                 let status = attach_dfs(
                     table,
@@ -686,7 +688,6 @@ unsafe fn run_process_attach(table: *mut ModuleTable, startup_reserved: u64) -> 
                     return status;
                 }
             }
-            i += 1;
         }
         0
     }
