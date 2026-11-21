@@ -2012,6 +2012,12 @@ impl HostedIrqRootSession {
             nt_hosted_runtime::HostedIrqServiceKind::ClassServiceRequest => {
                 self.class_callback_service(lane_index, service, command)
             }
+            // No lane dispatch issues a CallDriver token yet, so neither kind has an exact
+            // owner to serve: each is a protocol violation of the lane.
+            nt_hosted_runtime::HostedIrqServiceKind::CallDriver
+            | nt_hosted_runtime::HostedIrqServiceKind::CallDriverAcknowledge => {
+                fatal_service_result(STATUS_INVALID_DEVICE_REQUEST)
+            }
         }
     }
 

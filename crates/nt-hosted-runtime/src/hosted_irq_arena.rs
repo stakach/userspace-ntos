@@ -178,6 +178,14 @@ pub enum HostedIrqServiceKind {
     /// (1 TID, 2 PID, 3 ETHREAD, 4 EPROCESS, 5 TEB, 6 Wow64). A DPC runs in the processor's
     /// idle thread, which has no hosted correlation handle (selector 0).
     CurrentIdentity = 26,
+    /// `IofCallDriver(Device, Irp)` to a DEVICE_OBJECT with no handler in the lane's domain:
+    /// the primary forward's op 1 words `(device, irp)`. The root admits the IRP and reads its
+    /// major from the next stack location; the reply is `(status, disposition, token)`.
+    CallDriver = 27,
+    /// The source's reply to a CallDriver disposition, `(irp, token, operation)`, after its
+    /// local completion unwind. `operation` is the primary forward's: 2 acknowledges a
+    /// terminal, 3 arms a Pending dispatch, 4 holds an inline STATUS_MORE_PROCESSING_REQUIRED.
+    CallDriverAcknowledge = 28,
 }
 
 impl HostedIrqServiceKind {
@@ -209,12 +217,17 @@ impl HostedIrqServiceKind {
             24 => Some(Self::AllocateIrp),
             25 => Some(Self::DeferredDereference),
             26 => Some(Self::CurrentIdentity),
+            27 => Some(Self::CallDriver),
+            28 => Some(Self::CallDriverAcknowledge),
             _ => None,
         }
     }
 
     pub const fn may_request_nested_dispatch(self) -> bool {
-        matches!(self, Self::ProviderCallbackRequest | Self::ClassServiceRequest)
+        matches!(
+            self,
+            Self::ProviderCallbackRequest | Self::ClassServiceRequest | Self::CallDriver
+        )
     }
 }
 
@@ -622,6 +635,19 @@ impl HostedIrqServiceCommand {
                         && self.argument_count == 1
                         && (1..=6).contains(&self.arguments[0])
                         && self.arguments[1..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::CallDriver => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 2
+                        && self.arguments[..2].iter().all(|argument| *argument != 0)
+                        && self.arguments[2..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::CallDriverAcknowledge => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 3
+                        && self.arguments[..2].iter().all(|argument| *argument != 0)
+                        && (2..=4).contains(&self.arguments[2])
+                        && self.arguments[3..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::PoolRetirement => {
                     self.authority_cookie == 0
@@ -2650,7 +2676,7 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
         assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
-        assert_eq!(HostedIrqServiceKind::from_raw(27), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(29), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2988,6 +3014,74 @@ mod tests {
         identity.argument_count = 1;
         identity.authority_cookie = 1;
         assert!(!identity.valid());
+    }
+
+    #[test]
+    fn irq_call_driver_carries_the_primary_forward_submission_words() {
+        // IofCallDriver (IRQL <= DISPATCH_LEVEL) to a cross-domain DEVICE_OBJECT. The words are
+        // the primary forward's op 1 `(device, irp)`; the major is read from the admitted IRP.
+        assert_eq!(HostedIrqServiceKind::from_raw(27), Some(HostedIrqServiceKind::CallDriver));
+        assert!(HostedIrqServiceKind::CallDriver.may_request_nested_dispatch());
+        let mut call = service();
+        call.kind = HostedIrqServiceKind::CallDriver;
+        call.authority_cookie = 0;
+        call.argument_count = 2;
+        call.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        call.arguments[..2].copy_from_slice(&[0x5000, 0x9000]);
+        assert!(call.valid());
+        call.arguments[0] = 0;
+        assert!(!call.valid(), "the target DEVICE_OBJECT is required");
+        call.arguments[0] = 0x5000;
+        call.arguments[1] = 0;
+        assert!(!call.valid(), "the IRP is required");
+        call.arguments[1] = 0x9000;
+        call.arguments[2] = 1;
+        assert!(!call.valid(), "the major is not a caller-supplied word");
+        call.arguments[2] = 0;
+        call.argument_count = 3;
+        assert!(!call.valid());
+        call.argument_count = 2;
+        call.authority_cookie = 1;
+        assert!(!call.valid());
+    }
+
+    #[test]
+    fn irq_call_driver_acknowledgement_names_the_exact_dispatch_token() {
+        // The source's reply to a CallDriver disposition after its local unwind. The operation
+        // word is the primary forward's: 2 terminal ACK, 3 arm Pending, 4 hold an inline MPR.
+        assert_eq!(
+            HostedIrqServiceKind::from_raw(28),
+            Some(HostedIrqServiceKind::CallDriverAcknowledge),
+        );
+        assert!(!HostedIrqServiceKind::CallDriverAcknowledge.may_request_nested_dispatch());
+        let mut ack = service();
+        ack.kind = HostedIrqServiceKind::CallDriverAcknowledge;
+        ack.authority_cookie = 0;
+        ack.argument_count = 3;
+        ack.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        for operation in 2..=4 {
+            ack.arguments[..3].copy_from_slice(&[0x9000, 0x44, operation]);
+            assert!(ack.valid(), "operation {operation}");
+        }
+        for operation in [0, 1, 5, u64::MAX] {
+            ack.arguments[2] = operation;
+            assert!(!ack.valid(), "op 1 is CallDriver itself (operation {operation})");
+        }
+        ack.arguments[2] = 2;
+        ack.arguments[1] = 0;
+        assert!(!ack.valid(), "an acknowledgement without its dispatch token is not exact");
+        ack.arguments[1] = 0x44;
+        ack.arguments[0] = 0;
+        assert!(!ack.valid(), "the IRP is required");
+        ack.arguments[0] = 0x9000;
+        ack.arguments[3] = 1;
+        assert!(!ack.valid());
+        ack.arguments[3] = 0;
+        ack.argument_count = 2;
+        assert!(!ack.valid());
+        ack.argument_count = 3;
+        ack.authority_cookie = 1;
+        assert!(!ack.valid());
     }
 
     #[test]
