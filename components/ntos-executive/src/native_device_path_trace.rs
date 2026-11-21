@@ -135,3 +135,41 @@ pub(crate) fn record(
         _ => {}
     }
 }
+
+/// A pended CREATE's completion as the root publishes it (#421). Boot 44834608861 parked cmd.exe's
+/// `Reference` open (STATUS_PENDING, staged, waiting), but the old globally bounded record had
+/// spent its 64 lines before cmd ran. `phase` is `completed` (the IRP's terminal IoStatus and the
+/// driver's FsContext with the handle publication's result) or `final` (the status and handle
+/// the parked caller is answered with).
+pub(crate) fn pended_create(
+    phase: &[u8],
+    pi: usize,
+    generation: Option<u64>,
+    file: u64,
+    irp_status: Option<(u32, u64, u64)>,
+    status: u32,
+    handle: u64,
+) {
+    if !claim(pi, generation) {
+        return;
+    }
+    print_str(b"[device-path] pi=");
+    print_u64(pi as u64);
+    print_str(b" pended-create ");
+    print_str(phase);
+    print_str(b" file=0x");
+    print_hex_u64(file);
+    if let Some((irp_status, information, file_context)) = irp_status {
+        print_str(b" irp-status=0x");
+        print_hex(irp_status);
+        print_str(b" info=0x");
+        print_hex_u64(information);
+        print_str(b" fs-context=0x");
+        print_hex_u64(file_context);
+    }
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" handle=0x");
+    print_hex_u64(handle);
+    print_str(b"\n");
+}
