@@ -36,6 +36,27 @@ pub enum FilePumpReturned<P, T> {
     Publish(T),
 }
 
+/// Whether a root redrive may resume a kept pump now.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ScopedResume<S> {
+    /// Resume with no scoped authority active.
+    Resume,
+    /// Restore exactly this scope, resume, and end the scope again.
+    RestoreThenResume(S),
+    /// Not now: nothing happens, and the pump stays kept for a later boundary.
+    Wait,
+}
+
+/// A pump entered under a scoped authority `kept` may resume only under that same scope, and
+/// no kept pump resumes while another dispatch's scope (`active`) is still running above it.
+pub fn scoped_resume<S: Copy>(active: Option<S>, kept: Option<S>) -> ScopedResume<S> {
+    match (active, kept) {
+        (Some(_), _) => ScopedResume::Wait,
+        (None, Some(scope)) => ScopedResume::RestoreThenResume(scope),
+        (None, None) => ScopedResume::Resume,
+    }
+}
+
 impl<K: Copy + Eq, T> KeptFilePump<K, T> {
     /// The resumed pump returned.
     pub fn returned(self, value: T) -> FilePumpReturned<Self, T> {
@@ -115,6 +136,17 @@ mod tests {
         slot = slot.and_then(|pump| kept(pump.returned("true result")));
         assert_eq!(KeptFilePump::collect(&mut slot, 4), FilePumpCollect::Collected("true result"),
             "the caller's selector still collects the return exactly once");
+    }
+
+    #[test]
+    fn a_scoped_pump_resumes_only_under_its_own_scope() {
+        assert_eq!(scoped_resume::<u8>(None, Some(3)), ScopedResume::RestoreThenResume(3),
+            "a pump entered under a scope must not run outside it");
+        assert_eq!(scoped_resume::<u8>(Some(9), Some(3)), ScopedResume::Wait,
+            "another dispatch's scope is still running above this boundary");
+        assert_eq!(scoped_resume::<u8>(Some(9), None), ScopedResume::Wait,
+            "an unscoped pump must not run inside another dispatch's scope");
+        assert_eq!(scoped_resume::<u8>(None, None), ScopedResume::Resume);
     }
 
     #[test]

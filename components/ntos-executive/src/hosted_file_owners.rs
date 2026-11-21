@@ -117,6 +117,9 @@ struct Row {
     /// An ordinary caller's pump kept in this row (#420): suspended, then its returned
     /// terminal, unretired, until that caller collects it. The root boundary redrives it.
     plain_pump: Option<nt_hosted_runtime::KeptFilePump<ExternalFileIrpPumpKey, ExternalFileIrpTerminal>>,
+    /// The scoped SCSI proof authority a kept pump was entered under (#420). Its pump resumes
+    /// only with exactly this scope active again, and never outside it.
+    proof_scope: Option<ActivePendingScsiProofAuthority>,
     /// The one-use child observation is in the native continuation, even across restore retry.
     recorded_generic_child_ran: Option<bool>,
     flight: Flight,
@@ -550,6 +553,7 @@ fn reserve(
         hook_pump: None,
         hook_pump_claimed: false,
         plain_pump: None,
+        proof_scope: None,
         recorded_generic_child_ran: None,
         flight: Flight::Preparing,
         payload: None,
@@ -1825,8 +1829,8 @@ pub(super) fn keep_or_ready(
 /// unfinished stays in the File row with deferred completion, and the caller gets
 /// `Outstanding`: the dispatch is still running. The root boundary resumes the pump, and its
 /// return is published as the IRP's ordinary completion, the one the caller's pending owner
-/// reads. A dispatch under a scoped SCSI proof authority keeps the synchronous contract,
-/// because its pump cannot be resumed outside that authority.
+/// reads. A dispatch under a scoped SCSI proof authority keeps that exact scope with its pump,
+/// which resumes only under it.
 pub(super) fn dispatch_deferring(
     caller: nt_process::native_handle::NativeHandleCaller,
     request: ExternalFileIrpRequest,
@@ -1834,9 +1838,6 @@ pub(super) fn dispatch_deferring(
     initial_output: &[u8],
     policy: ExternalFileIrpDispatchPolicy,
 ) -> Result<DispatchResult, nt_status::NtStatus> {
-    if unsafe { pending_scsi_proof_slot() }.is_some() {
-        return dispatch_unretained(caller, request, input, initial_output, policy);
-    }
     match dispatch_with_port_connect(
         caller, request, input, initial_output, policy, None, invoke_retaining,
     ) {
@@ -1844,7 +1845,14 @@ pub(super) fn dispatch_deferring(
         Err(DispatchFailure::Status(status)) => Err(status),
         Err(DispatchFailure::Yield(PortConnectYield::Keyed { invocation, key, continuation })) => {
             let irp_id = invocation.irp_id();
-            let _ = defer_pump(irp_id, invocation, key, continuation);
+            // The caller's scope is still active here; its guard ends with the caller's frame.
+            let scope = unsafe { pending_scsi_proof_slot() };
+            if scope.is_some_and(|scope| scope.irp_id != Some(irp_id)) {
+                // A scope bound to another IRP cannot authorize this pump's resume.
+                return Ok(orphan_plain_pump(irp_id, nt_status::NtStatus::INVALID_PARAMETER,
+                    invocation, continuation));
+            }
+            let _ = defer_pump(irp_id, invocation, key, continuation, scope);
             Ok(DispatchResult::Outstanding { irp_id })
         }
         Err(DispatchFailure::Yield(PortConnectYield::Unkeyed { invocation, continuation })) => {
@@ -1862,11 +1870,13 @@ fn defer_pump(
     invocation: ExternalFileIrpInvocation,
     key: ExternalFileIrpPumpKey,
     continuation: FileDispatchContinuation,
+    scope: Option<ActivePendingScsiProofAuthority>,
 ) -> Result<(), nt_status::NtStatus> {
     match suspend_dispatch_for_pump(irp_id, invocation, key, continuation, None) {
         Ok(()) => {
             if let Some(id) = find(irp_id) {
                 row(id).plain_pump = Some(nt_hosted_runtime::KeptFilePump::DeferredCompletion);
+                row(id).proof_scope = scope;
             }
             trace_plain_pump(b"deferred", irp_id);
             Ok(())
@@ -1875,30 +1885,6 @@ fn defer_pump(
             let _ = orphan_plain_pump(irp_id, status, invocation, continuation);
             Err(status)
         }
-    }
-}
-
-/// A caller that must not see `STATUS_PENDING` from an unfinished pump: one whose pump runs
-/// under a scoped SCSI proof authority. An unfinished pump with no lane to keep it is waited
-/// for at root level and is otherwise uncertain.
-pub(super) fn dispatch_unretained(
-    caller: nt_process::native_handle::NativeHandleCaller,
-    request: ExternalFileIrpRequest,
-    input: &[u8],
-    initial_output: &[u8],
-    policy: ExternalFileIrpDispatchPolicy,
-) -> Result<DispatchResult, nt_status::NtStatus> {
-    match dispatch_with_port_connect(
-        caller, request, input, initial_output, policy, None,
-        |invocation, caller, capture| {
-            Ok::<_, core::convert::Infallible>(
-                hosted_file_dispatch::invoke(invocation, caller, capture),
-            )
-        },
-    ) {
-        Ok(result) => Ok(result),
-        Err(DispatchFailure::Status(status)) => Err(status),
-        Err(DispatchFailure::Yield(never)) => match never {},
     }
 }
 
@@ -1985,11 +1971,29 @@ pub(super) unsafe fn redrive_plain_suspended_pumps() -> usize {
         let key = owner.plain_pump.as_ref()?.resume_key(pump.invocation.key())?;
         let retryable = owner.flight == Flight::PumpSuspended
             && pump.continuation.retry_without_new_child();
-        if retryable { Some((owner.irp_id?, key)) } else { None }
+        if retryable { Some((owner.irp_id?, key, owner.proof_scope)) } else { None }
     }));
     let mut progressed = 0;
-    for (irp_id, key) in selected {
-        match resume_suspended_port_connect_pump(irp_id, key) {
+    for (irp_id, key, scope) in selected {
+        // A pump resumes only under the exact scope it was entered with (crate policy).
+        let scope_guard = match nt_hosted_runtime::scoped_resume(pending_scsi_proof_slot(), scope) {
+            nt_hosted_runtime::ScopedResume::Resume => None,
+            nt_hosted_runtime::ScopedResume::RestoreThenResume(scope) =>
+                match restore_pending_scsi_proof_scope(scope) {
+                    Ok(guard) => Some(guard),
+                    Err(_) => continue,
+                },
+            nt_hosted_runtime::ScopedResume::Wait => continue,
+        };
+        let drive = resume_suspended_port_connect_pump(irp_id, key);
+        if scope_guard.is_some() {
+            // A pump that stopped again keeps the scope as it now stands (its one-shot claim).
+            if let Some(id) = find(irp_id).filter(|id| row(*id).flight == Flight::PumpSuspended) {
+                row(id).proof_scope = pending_scsi_proof_slot();
+            }
+        }
+        drop(scope_guard);
+        match drive {
             PortConnectPumpDrive::Returned(_) => {
                 trace_plain_pump(b"returned", irp_id);
                 progressed += 1;
@@ -2560,7 +2564,8 @@ pub(super) fn redrive_queued_read(irp_id: IrpId) -> QueuedReadRedriveOutcome {
             // The READ's caller is already parked on its pending owner (#420).
             hosted_file_dispatch::InvokeResult::ChildWorkYield {
                 invocation, key, continuation,
-            } => return match defer_pump(irp_id, invocation, key, continuation) {
+            // A READ is never bound to a scoped SCSI proof.
+            } => return match defer_pump(irp_id, invocation, key, continuation, None) {
                 Ok(()) => QueuedReadRedriveOutcome::Progressed,
                 Err(status) => QueuedReadRedriveOutcome::Retained(status),
             },

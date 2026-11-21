@@ -62852,6 +62852,19 @@ unsafe fn activate_pending_scsi_proof_authority(
     Ok(PendingScsiProofGuard)
 }
 
+/// Restore the exact scope a kept proof pump was entered under, for that pump's resume only
+/// (#420): the same authority, bound IRP and one-shot claim. Every use still revalidates the
+/// live relation, devnode and registration, so a stale scope fails closed.
+unsafe fn restore_pending_scsi_proof_scope(
+    scope: ActivePendingScsiProofAuthority,
+) -> Result<PendingScsiProofGuard, nt_status::NtStatus> {
+    let _lock = PendingScsiProofSlotLock::acquire();
+    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_PENDING_SCSI_PROOF);
+    if slot.is_some() { return Err(nt_status::NtStatus::DEVICE_BUSY); }
+    *slot = Some(scope);
+    Ok(PendingScsiProofGuard)
+}
+
 /// Bind only the SCSI IRP prepared for the retained child. This happens before route capture or
 /// provider dispatch, while the prepared owner can still be discarded on refusal.
 unsafe fn bind_pending_scsi_proof_irp(

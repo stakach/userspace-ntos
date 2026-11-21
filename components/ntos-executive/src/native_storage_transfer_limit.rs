@@ -117,7 +117,7 @@ unsafe fn dispatch(owner: &mut Owner) -> usize {
         initial_information: 0,
     };
     let output = [0u8; STORAGE_ADAPTER_DESCRIPTOR_QUERY_LEN];
-    match hosted_file_owners::dispatch_unretained(
+    match hosted_file_owners::dispatch_deferring(
         caller, request, &adapter_property_query(), &output,
         ExternalFileIrpDispatchPolicy::BufferedDeviceControlAtDevice,
     ) {

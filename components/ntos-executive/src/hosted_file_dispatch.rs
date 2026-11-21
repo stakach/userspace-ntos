@@ -165,50 +165,6 @@ enum FileExecuteProgress {
     ChildWorkYield(FileDispatchContinuation),
 }
 
-pub(super) fn invoke(
-    mut invocation: ExternalFileIrpInvocation,
-    caller: nt_process::native_handle::NativeHandleCaller,
-    capture: ExternalFileIrpOutputCapture,
-) -> ExternalFileIrpReturn {
-    let projection = invocation.projection().clone();
-    let route = invocation.route();
-    let Some((instance_index, _)) = instance_by_driver_id(route.driver_id().raw()) else {
-        print_str(b"[hosted-file] detached invoke missing driver instance\n");
-        return invocation.returned(ExternalFileIrpOutcome::NotEntered {
-            status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
-        });
-    };
-    if route.driver_id() != projection.driver_id || route.device_id() != projection.device_id {
-        return invocation.returned(ExternalFileIrpOutcome::NotEntered {
-            status: nt_status::NtStatus::INVALID_PARAMETER,
-        });
-    }
-    let trace_connect = capture == ExternalFileIrpOutputCapture::MethodNeitherInput;
-    if trace_connect {
-        trace_port_connect_execute(0, projection.irp_id, projection.device_id);
-    }
-    let result = {
-        let (input, output) = invocation.buffers_mut().split();
-        if let IoParameters::Scsi(parameters) = &projection.parameters {
-            match nt_io_manager::scsi_srb_wire::encode_scsi_dispatch_input(
-                parameters, projection.irp_id, input,
-            ) {
-                Ok(packet) => execute_with_capture(instance_index, Some(caller), &projection, &packet, output, capture),
-                Err(error) => HostedIrpTransportResult::NotDispatched {
-                    status: match error {
-                        nt_io_manager::scsi_srb_wire::ScsiWireError::NoCapacity =>
-                            nt_status::NtStatus::INSUFFICIENT_RESOURCES,
-                        _ => nt_status::NtStatus::INVALID_PARAMETER,
-                    },
-                },
-            }
-        } else {
-            execute_with_capture(instance_index, Some(caller), &projection, input, output, capture)
-        }
-    };
-    finish_invoke_result(invocation, projection, instance_index, capture, result, trace_connect)
-}
-
 /// An owned File caller's invocation: a pump that stops unfinished stays with the caller's
 /// File row as a continuation, which a later root boundary resumes (#420).
 pub(super) fn invoke_retaining(

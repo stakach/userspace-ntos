@@ -3952,4 +3952,4 @@ mod tests {
 }
 
 mod file_pump_return;
-pub use file_pump_return::{FilePumpCollect, FilePumpReturned, KeptFilePump};
+pub use file_pump_return::{scoped_resume, FilePumpCollect, FilePumpReturned, KeptFilePump, ScopedResume};
