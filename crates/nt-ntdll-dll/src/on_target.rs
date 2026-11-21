@@ -2154,6 +2154,32 @@ const DIRECTORY_ENTRY_EXCEPTION: u64 = 3;
 /// # Safety
 /// Reads mapped PE headers of each loaded module.
 #[cfg(target_arch = "x86_64")]
+/// The loader's base name for the image at `base` (`exe` for the process image), for diagnostics.
+///
+/// # Safety
+/// Single-threaded loader context, as [`seh_containing_image`].
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn seh_image_name(base: u64, out: &mut [u8]) -> usize {
+    // SAFETY: module records stay valid for the process lifetime.
+    unsafe {
+        if base != 0 && base == EXE_BASE {
+            let name = b"exe";
+            let len = name.len().min(out.len());
+            out[..len].copy_from_slice(&name[..len]);
+            return len;
+        }
+        let table = &*core::ptr::addr_of!(MODULE_TABLE);
+        for m in &table.mods[..table.count.min(MODULE_TABLE_CAP)] {
+            if m.base == base {
+                let len = usize::from(m.nlen).min(out.len());
+                out[..len].copy_from_slice(&m.name[..len]);
+                return len;
+            }
+        }
+    }
+    0
+}
+
 pub unsafe fn seh_containing_image(pc: u64) -> u64 {
     // SAFETY: single-threaded loader context; module images stay mapped for the process lifetime.
     unsafe {

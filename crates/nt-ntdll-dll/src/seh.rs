@@ -326,6 +326,29 @@ pub unsafe extern "system" fn rtl_get_callers_address(
 ///
 /// # Safety
 /// `image_base_out` null or writable; `control_pc` a code address.
+/// Report, once per process, the first walk frame inside a loaded image that has no function entry.
+fn report_unwind_gap(walk: nt_ntdll::seh_frame_audit::Walk, frame: u32, pc: u64, image_base: u64) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    let Some(gap) = nt_ntdll::seh_frame_audit::classify_missing_entry(walk, frame, pc, image_base)
+    else {
+        return;
+    };
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut name = [0u8; 32];
+    // SAFETY: the module table outlives every exception walk.
+    let len = unsafe { crate::on_target::seh_image_name(gap.image_base, &mut name) };
+    let record = nt_ntdll::seh_frame_audit::gap_record(&gap, &name[..len]);
+    let bytes = record.bytes();
+    let mut stack = [0u8; 160];
+    let len = bytes.len().min(stack.len());
+    stack[..len].copy_from_slice(&bytes[..len]);
+    // SAFETY: the record is copied to this mapped stack buffer, as the debug service requires.
+    unsafe { crate::dbg_print_bytes(stack.as_ptr(), len) };
+}
+
 pub unsafe fn rtl_lookup_function_entry(
     control_pc: u64,
     image_base_out: *mut u64,
@@ -543,6 +566,7 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
         if guard > 4096 {
             return unsafe { finish_vectored_dispatch(record, context, false) };
         }
+        let frame = guard - 1;
         // SAFETY: work_ptr is our CONTEXT copy.
         let control_pc = unsafe { core::ptr::read_unaligned(work_ptr.add(CTX_RIP) as *const u64) };
         if control_pc == 0 {
@@ -554,6 +578,7 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
             rtl_lookup_function_entry(control_pc, &mut image_base, core::ptr::null_mut())
         };
         if func.is_null() {
+            report_unwind_gap(nt_ntdll::seh_frame_audit::Walk::Dispatch, frame, control_pc, image_base);
             // A leaf frame (no .pdata): pop the return address directly and continue.
             // SAFETY: reads/writes our CONTEXT copy + the live stack.
             unsafe {
@@ -828,6 +853,7 @@ unsafe fn rtl_unwind_ex_from_context(
         if guard > 4096 {
             break;
         }
+        let frame = guard - 1;
         // SAFETY: our CONTEXT copy.
         let control_pc = unsafe { core::ptr::read_unaligned(work_ptr.add(CTX_RIP) as *const u64) };
         let rsp = unsafe { core::ptr::read_unaligned(work_ptr.add(CTX_RSP) as *const u64) };
@@ -840,6 +866,7 @@ unsafe fn rtl_unwind_ex_from_context(
             rtl_lookup_function_entry(control_pc, &mut image_base, core::ptr::null_mut())
         };
         if func.is_null() {
+            report_unwind_gap(nt_ntdll::seh_frame_audit::Walk::Unwind, frame, control_pc, image_base);
             // Leaf: pop return addr and continue.
             // SAFETY: stack read + CONTEXT write.
             unsafe {

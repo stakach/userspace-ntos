@@ -61,6 +61,7 @@ pub mod crt;
 pub mod crypto;
 pub mod csr;
 pub mod dbg;
+pub mod seh_frame_audit;
 pub mod etw;
 pub mod etw_classic;
 pub mod handle_table;
