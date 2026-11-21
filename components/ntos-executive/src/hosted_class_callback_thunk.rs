@@ -361,6 +361,14 @@ pub(super) fn instance_quiesced(index: usize) -> bool {
         .all(|row| row.port_instance != index && row.class_instance != index)
 }
 
+/// The class domains a port domain's DPC can enter through a published class service callback
+/// (mouclass and kbdclass for i8042prt). Their held spin locks fence the port's DPCs (#423).
+pub(super) fn class_domains_entered_by(port_domain: HostedDomainIdentity) -> impl Iterator<Item = HostedDomainIdentity> {
+    records().iter()
+        .filter(move |row| row.port_domain == port_domain && row.phase == Phase::Published)
+        .map(|row| row.class_domain)
+}
+
 pub(super) fn references_irq_lane(instance_index: usize, domain: HostedDomainIdentity) -> bool {
     records().iter().any(|row| {
         row.class_instance == instance_index

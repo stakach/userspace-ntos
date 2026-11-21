@@ -144,3 +144,25 @@ fn an_unbalanced_release_cannot_wrap_the_domain_count() {
     note_released(&held).unwrap();
     assert!(!dpc_may_start(held.load(Ordering::Acquire)), "one of two locks is still held");
 }
+
+// Boot 1 of 44862635112 (57c31f27 era): the spin returned with the gate in place. The holder
+// (ClassRead) and the waiter (ClassCallback) were mouclass lanes; the DPC that started was
+// i8042prt's, in another domain, and it entered mouclass through its class service callback.
+// The gate counted only i8042prt's locks. A DPC may not start while the domain it runs in or
+// any class domain its service callbacks enter holds a spin lock.
+#[test]
+fn a_port_dpc_waits_for_the_class_domain_its_callback_enters() {
+    const CLASS_READ: u64 = 0x1000_f000_000;
+    let port_held = AtomicU64::new(0);
+    let class_held = AtomicU64::new(0);
+    let class_device_lock = AtomicU64::new(0);
+    assert_eq!(acquire(&class_device_lock, CLASS_READ), Ok(Acquire::Acquired));
+    note_acquired(&class_held);
+    let reachable = |counts: &[&AtomicU64]| counts.iter().map(|held| held.load(Ordering::Acquire)).sum();
+    assert!(dpc_may_start(port_held.load(Ordering::Acquire)), "the port domain alone looks free");
+    assert!(!dpc_may_start(reachable(&[&port_held, &class_held])),
+        "the class domain the DPC's callback enters is held");
+    release(&class_device_lock, CLASS_READ).unwrap();
+    note_released(&class_held).unwrap();
+    assert!(dpc_may_start(reachable(&[&port_held, &class_held])));
+}

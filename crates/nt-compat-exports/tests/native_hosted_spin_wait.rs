@@ -67,3 +67,18 @@ fn every_hosted_spin_lock_family_counts_what_the_domain_holds() {
     assert!(gate[..gate.find("\n}\n").unwrap()].contains("SH_HOSTED_SPIN_LOCKS_HELD"),
         "the DPC gate reads the held count, not an IRQL byte");
 }
+
+// Boot 1 of 44862635112: i8042prt's DPC entered mouclass through its class service callback while
+// mouclass's ClassRead held the device lock. The DPC gate also counts every class domain the
+// port's DPC can enter.
+#[test]
+fn the_dpc_gate_counts_the_class_domains_its_callbacks_enter() {
+    let launch = native("driver_launch.rs");
+    let gate = launch.split("unsafe fn hosted_domain_dpc_may_start(").nth(1).unwrap();
+    let gate = &gate[..gate.find("\n}\n").unwrap()];
+    assert!(gate.contains("hosted_class_callback_thunk::class_domains_entered_by(port)"),
+        "a class domain bound to the port's DPC fences it");
+    let thunk = native("hosted_class_callback_thunk.rs");
+    let entered = thunk.split("fn class_domains_entered_by(").nth(1).unwrap();
+    assert!(entered[..entered.find("\n}\n").unwrap()].contains("Phase::Published"));
+}

@@ -16762,24 +16762,37 @@ fn trace_connect_dpc_probe(stage: u64, first: u64, second: u64, third: u64) {
 /// Run a due, paced DPC pass. Self-requeued work retains its wake for a later scheduler boundary.
 static DPC_HELD_LOCK_DEFERRALS: AtomicU64 = AtomicU64::new(0);
 
-/// #423: whether a DPC of this hosted domain may start now. While the root runs, a spin lock the
+/// #423: whether a DPC of this hosted domain may start now. While the root runs, a spin lock a
 /// domain holds belongs to a lane stopped mid critical section (typically in a root call), and
-/// the DPC could only spin on it. Each instance's ordinary bank of the domain counts its held
-/// hosted spin locks. A refusal leaves the DPC queued for the next pass.
+/// the DPC could only spin on it. The DPC runs in its own domain and enters every class domain
+/// bound to it through a published class service callback (i8042prt's DPC runs mouclass's
+/// ClassCallback), so all of them must hold none. Each instance's ordinary bank counts its
+/// domain's held hosted spin locks. A refusal leaves the DPC queued for the next pass.
 pub(super) unsafe fn hosted_domain_dpc_may_start(domain_id: u64, domain_cookie: u64) -> bool {
     let Some(instances) = driver_instances() else { return true };
-    let held = instances.iter()
-        .filter(|inst| inst.hosted_domain_id == domain_id && inst.hosted_domain_cookie == domain_cookie
-            && inst.exec_shared_va != 0)
+    let port = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(domain_id),
+        cookie: domain_cookie,
+    };
+    let held_in = |domain: HostedDomainIdentity| instances.iter()
+        .filter(|inst| inst.hosted_domain_id == domain.domain_id.0
+            && inst.hosted_domain_cookie == domain.cookie && inst.exec_shared_va != 0)
         .map(|inst| read_volatile((inst.exec_shared_va + SH_HOSTED_SPIN_LOCKS_HELD) as *const u64))
         .max()
         .unwrap_or(0);
+    let mut held = held_in(port);
+    let mut holder = domain_id;
+    for class in hosted_class_callback_thunk::class_domains_entered_by(port) {
+        let class_held = held_in(class);
+        if class_held != 0 { holder = class.domain_id.0; }
+        held = held.saturating_add(class_held);
+    }
     let may_start = nt_kernel_exec::hosted_spin_wait::dpc_may_start(held);
     if !may_start {
         let sample = DPC_HELD_LOCK_DEFERRALS.fetch_add(1, Ordering::Relaxed) + 1;
         if sample <= 16 || sample.is_power_of_two() {
-            print_str(b"[hosted-dpc] deferred while the domain holds a spin lock sample/domain/held=");
-            for value in [sample, domain_id, held] {
+            print_str(b"[hosted-dpc] deferred while a reachable domain holds a spin lock sample/domain/holder-domain/held=");
+            for value in [sample, domain_id, holder, held] {
                 print_str(b"/");
                 print_hex_u64(value);
             }
