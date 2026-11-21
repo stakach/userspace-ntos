@@ -228,6 +228,7 @@ impl AddDevicePumpContinuation {
             Some(component_scheduler::HostedPumpRestore::Unattributed(_)) => 6,
             Some(component_scheduler::HostedPumpRestore::SchedulerYieldRetained(pending)) =>
                 7 | (u64::from(pending.retryable()) << 8),
+            Some(component_scheduler::HostedPumpRestore::ParkedDispatchWait(_)) => 8,
             None => 0,
         };
         trace_add_device_resume_gate(20, detail);

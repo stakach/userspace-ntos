@@ -901,10 +901,98 @@ unsafe fn observe_pump_receive_return(
     }
 }
 
+/// Read-only: the exact parked service wait of this pump's own lane, when its File owner may
+/// keep the receive half. Root-level File dispatches only; see the crate rule.
+unsafe fn parked_dispatch_wait_yield(
+    ch: &PumpChannel, route: PeerRoute,
+) -> Option<crate::win32k_glue::ServiceWaitYield> {
+    if !ch.caps.parked_dispatch_yield || ch.caps.kind != ReqKind::Irp
+        || ch.kernel_caller.is_some()
+        || crate::writable_fs::registry_journal::owns_volume()
+    {
+        return None;
+    }
+    let dispatch = runtime::dispatch(route).ok()?;
+    let parked = runtime::parked_service_wait_identity(route, dispatch).ok().flatten();
+    let decision = nt_component_suspension::parked_dispatch_receive(
+        nt_component_suspension::ParkedDispatch {
+            own_wait_parked: parked.is_some(),
+            owner_keeps_continuation: ch.caps.parked_dispatch_yield,
+            nested_in_lane: runtime::hold_snapshot().running.is_some(),
+            // The root boundary that resumes a kept pump is unreachable while an enclosing
+            // receive, even one whose own lane is parked, stays on the stack (#420).
+            enclosing_receive: PumpReceiveScope::enclosed(),
+        });
+    match decision {
+        nt_component_suspension::ParkedDispatchReceive::YieldToRoot => {
+            let (reply, token) = parked?;
+            Some(crate::win32k_glue::ServiceWaitYield { route, dispatch, reply, token })
+        }
+        nt_component_suspension::ParkedDispatchReceive::Continue => {
+            if parked.is_some() && PumpReceiveScope::enclosed() {
+                trace_enclosed_dispatch_wait(route, dispatch);
+            }
+            None
+        }
+    }
+}
+
+/// One live shared receive on this executor's stack (see `ExecutorLocal::receive_depth`).
+struct PumpReceiveScope;
+
+impl PumpReceiveScope {
+    fn enter() -> Self {
+        crate::executor::local().receive_depth.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+
+    /// Called from inside a receive: another pump's receive encloses it.
+    fn enclosed() -> bool {
+        crate::executor::local().receive_depth.load(Ordering::Acquire) > 1
+    }
+}
+
+impl Drop for PumpReceiveScope {
+    fn drop(&mut self) {
+        crate::executor::local().receive_depth.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Bounded evidence that a parked File dispatch kept receiving because another pump's receive
+/// encloses it: its own receive services the wake (#420, #427 A).
+fn trace_enclosed_dispatch_wait(route: PeerRoute, dispatch: nt_component_suspension::LaneDispatchIdentity) {
+    static TRACED: AtomicU64 = AtomicU64::new(0);
+    let n = TRACED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() { return; }
+    crate::print_str(b"[parked-dispatch] stage=enclosed n/route/lane/epoch/depth=");
+    for value in [n, route.badge(), u64::from(dispatch.lane().index), dispatch.epoch(),
+        crate::executor::local().receive_depth.load(Ordering::Relaxed)] {
+        crate::print_str(b"/");
+        crate::print_u64(value);
+    }
+    crate::print_str(b"\n");
+}
+
+static PARKED_DISPATCH_YIELDS: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded evidence that a parked ordinary dispatch left the root loop running.
+fn trace_parked_dispatch_yield(yielded: crate::win32k_glue::ServiceWaitYield) {
+    let n = PARKED_DISPATCH_YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() { return; }
+    crate::print_str(b"[parked-dispatch] stage=yield n/route/lane/epoch/reply/token=");
+    for value in [n, yielded.route.badge(), u64::from(yielded.dispatch.lane().index),
+        yielded.dispatch.epoch(), yielded.reply, yielded.token] {
+        crate::print_str(b"/");
+        crate::print_u64(value);
+    }
+    crate::print_str(b"\n");
+}
+
 pub(super) unsafe fn receive(
     ch: &PumpChannel, route: PeerRoute, retained_seh: bool, serviced_scheduler_yield: bool,
 ) -> PumpMessage {
     let census_scope = ReceiveCensusScope::enter(ch, route, retained_seh);
+    let _receive_scope = PumpReceiveScope::enter();
     // A retained exception walk and an ordinary syscall channel without kernel IRQ yield cannot
     // return a scheduler continuation. Give already-latched work one isolated pass here instead.
     let inline_irq_checkpoint =
@@ -947,6 +1035,13 @@ pub(super) unsafe fn receive(
                 }
                 Ok(None) => {}
                 Err(_) => panic!("service-wait yield lost its exact physical ownership"),
+            }
+            // An ordinary File dispatch whose own wait is parked leaves the root loop running;
+            // its File owner keeps this receive half until the wait's wake (#420, #427 A).
+            if let Some(yielded) = parked_dispatch_wait_yield(ch, route) {
+                trace_ps_create_receive(ch, b"dispatch-wait-yield", Some(route));
+                trace_parked_dispatch_yield(yielded);
+                return PumpMessage::hosted_service_wait_yield(yielded);
             }
             // A kernel job has no hosted Reply to leave at the root, so it cannot take the
             // yield above. Its own retained activation owns the same stop when the parked

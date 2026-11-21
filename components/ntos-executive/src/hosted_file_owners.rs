@@ -973,7 +973,10 @@ pub(super) unsafe fn resume_suspended_port_connect_pump(
             invocation, continuation,
         }) => (invocation, None, continuation, true, false),
         Err((invocation, continuation)) => {
-            let retryable = continuation.retry_without_new_child();
+            // A dispatch parked in its own wait again is live: it stays kept (#420, #427 A).
+            let retryable = !matches!(nt_component_suspension::kept_dispatch_turn(
+                continuation.retry_without_new_child(), continuation.awaiting_own_wake()),
+                nt_component_suspension::KeptDispatchTurn::Fence);
             (invocation, Some(key), continuation, false, retryable)
         }
     };
