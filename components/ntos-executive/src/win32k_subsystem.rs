@@ -3928,6 +3928,13 @@ extern "win64" fn s_mm_unsecure_virtual_memory(handle: u64) {
 
 #[cold]
 fn reject_ps_broker(operation: &'static str, status: i32) -> ! {
+    // Boot 44914465319 panicked here after a WM_MOUSEACTIVATE callback, and the serial line
+    // carried only `!@file:line`. Name the rejected query before failing fast.
+    print_str(b"[ps-broker-reject] op=");
+    print_str(operation.as_bytes());
+    print_str(b" status=0x");
+    print_hex(status as u32);
+    print_str(b"\n");
     panic!("executive Ps broker rejected {operation}: {status:#010x}")
 }
 
