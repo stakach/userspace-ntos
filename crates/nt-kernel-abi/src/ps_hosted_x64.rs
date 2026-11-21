@@ -286,6 +286,31 @@ pub fn initialize_process(
     if init.image_file_name[EPROCESS_IMAGE_FILE_NAME_BYTES] != 0 {
         return Err(ProjectionError::UnterminatedImageFileName);
     }
+    write_process(output, init);
+    Ok(())
+}
+
+/// `PsIdleProcess`: the boot processor's initial process, which `PspInitPhase0` names "Idle".
+/// It never passes through `PspCreateProcess`, so it has no CID: UniqueProcessId is 0, and it
+/// has no PEB or image section.
+pub fn initialize_idle_process(output: &mut [u8], body: GuestAddr) -> Result<(), ProjectionError> {
+    if output.len() < EPROCESS_BODY_BYTES {
+        return Err(ProjectionError::BufferTooSmall);
+    }
+    body_range(body, EPROCESS_BODY_BYTES)?;
+    let mut image_file_name = [0; 16];
+    image_file_name[..4].copy_from_slice(b"Idle");
+    write_process(output, ProcessInitialization {
+        body,
+        process_id: 0,
+        peb: GuestAddr::NULL,
+        image_file_name,
+        section_base_address: GuestAddr::NULL,
+    });
+    Ok(())
+}
+
+fn write_process(output: &mut [u8], init: ProcessInitialization) {
     let output = &mut output[..EPROCESS_BODY_BYTES];
     output.fill(0);
     output[0] = 3; // ProcessObject
@@ -296,7 +321,6 @@ pub fn initialize_process(
     write_u64(output, EPROCESS_PEB, init.peb.0);
     output[EPROCESS_IMAGE_FILE_NAME..EPROCESS_IMAGE_FILE_NAME + EPROCESS_IMAGE_FILE_NAME_BYTES]
         .copy_from_slice(&init.image_file_name[..EPROCESS_IMAGE_FILE_NAME_BYTES]);
-    Ok(())
 }
 
 /// Initialize the neutral fields established by KeInitThread and PspCreateThread. Stack,
@@ -307,6 +331,37 @@ pub fn initialize_thread(
     init: ThreadInitialization,
 ) -> Result<(), ProjectionError> {
     validate_thread_fields(output, init)?;
+    write_thread(output, init);
+    Ok(())
+}
+
+/// A processor's idle thread (`KPRCB->IdleThread`) in [`initialize_idle_process`]'s body.
+/// `KiInitializeKernel` builds it with `KeInitializeThread` alone: it has no CID (both halves
+/// are 0 on every processor), no TEB, and no `PS_CROSS_THREAD_FLAGS_SYSTEM` bit, which only
+/// `PspCreateThread` sets.
+pub fn initialize_idle_thread(
+    output: &mut [u8],
+    body: GuestAddr,
+    process_body: GuestAddr,
+) -> Result<(), ProjectionError> {
+    if output.len() < ETHREAD_BODY_BYTES {
+        return Err(ProjectionError::BufferTooSmall);
+    }
+    body_range(body, ETHREAD_BODY_BYTES)?;
+    body_range(process_body, EPROCESS_BODY_BYTES)?;
+    write_thread(output, ThreadInitialization {
+        body,
+        process_body,
+        process_id: 0,
+        thread_id: 0,
+        teb: GuestAddr::NULL,
+        system_thread: false,
+        suspend_count: 0,
+    });
+    Ok(())
+}
+
+fn write_thread(output: &mut [u8], init: ThreadInitialization) {
     let output = &mut output[..ETHREAD_BODY_BYTES];
     output.fill(0);
     output[0] = 6; // ThreadObject; the remaining dispatcher union bytes are flags, not Size.
@@ -336,7 +391,6 @@ pub fn initialize_thread(
     };
     output[ETHREAD_CROSS_THREAD_FLAGS..ETHREAD_CROSS_THREAD_FLAGS + 4]
         .copy_from_slice(&flags.to_le_bytes());
-    Ok(())
 }
 
 fn validate_thread_fields(

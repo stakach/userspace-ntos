@@ -19,8 +19,8 @@ pub struct PsBootstrapParts {
 }
 
 impl PsBootstrapState {
-    /// Construct a real initial System process and running system thread through ordinary Ps
-    /// allocation. Checked policy failures leave no published aggregate. The underlying process
+    /// Construct the Idle process with its per-processor idle threads, then a real initial System
+    /// process and running system thread through ordinary Ps allocation. Checked policy failures leave no published aggregate. The underlying process
     /// and token constructors retain their existing infallible allocation behavior.
     pub fn try_new(start_address: u64, parameter: u64) -> Result<Self, u32> {
         Self::try_new_with_active_processor_count(start_address, parameter, 1)
@@ -38,6 +38,8 @@ impl PsBootstrapState {
         let mut pm = ProcessManager::new_with_active_processor_count(active_processor_count)
             .ok_or(STATUS_INVALID_PARAMETER)?;
         let mut token_store = TokenStore::new();
+        // As in NT, PsIdleProcess and the idle threads precede System and consume no CID.
+        pm.create_idle_process()?;
         let pid = pm.create_process("System", None, None);
         let primary = token_store.insert(AccessToken::system());
         // TokenStore::insert's original reference becomes the process-owned primary reference.

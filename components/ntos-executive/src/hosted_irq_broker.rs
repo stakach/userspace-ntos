@@ -1684,6 +1684,38 @@ impl HostedIrqRootSession {
         values_result(status, &[start_io, serial, irp])
     }
 
+    /// PsGetCurrentThreadId and the other current-identity queries from the lane's DPC or ISR.
+    /// The lane runs on HOSTED_IRQ_LANE_PROCESSOR, so its current thread is that processor's
+    /// idle thread in PsIdleProcess, as for an NT DPC that interrupted no other thread.
+    unsafe fn current_identity_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let (_, inst) = match self.lane_driver(
+            lane_index, command, FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL,
+        ) {
+            Ok(driver) => driver,
+            Err(refused) => return refused,
+        };
+        match driver_ps_context::project_idle(inst, u32::from(HOSTED_IRQ_LANE_PROCESSOR)) {
+            Ok((pid, tid, process, thread, teb)) => {
+                let value = match command.arguments[0] {
+                    1 => tid,
+                    2 => pid,
+                    3 => thread,
+                    4 => process,
+                    5 => teb,
+                    // PsIdleProcess is the native kernel process, never a Wow64 process.
+                    6 => 0,
+                    _ => return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST),
+                };
+                service_result(STATUS_SUCCESS, Some(value))
+            }
+            Err(status) => service_result(status as i32, Some(0)),
+        }
+    }
+
     /// HalGet/SetBusDataByOffset from the lane's DPC, on instance-owned storage.
     unsafe fn pci_config_service(
         &mut self,
@@ -1961,6 +1993,9 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::PciConfig => {
                 self.pci_config_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::CurrentIdentity => {
+                self.current_identity_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::WmiWriteEvent => {
                 self.wmi_write_event_service(lane_index, command)

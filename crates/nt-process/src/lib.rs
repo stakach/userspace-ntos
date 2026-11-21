@@ -24,6 +24,9 @@ pub mod job;
 pub mod kernel_job_body;
 pub mod job_abi;
 mod initial_system;
+mod idle_process;
+pub use idle_process::{IdleProcess, IdleThread, IDLE_PROCESS_ID, IDLE_PROCESS_IMAGE_FILE_NAME,
+    IDLE_THREAD_ID};
 mod initial_thread_creation;
 mod fresh_hosted_thread;
 #[cfg(test)]
@@ -1269,6 +1272,8 @@ pub struct ProcessManager {
     process_exit_notify: process_exit_notify::ProcessExitNotifyLedger,
     /// One-time bootstrap designation with counted process/thread reference ownership.
     initial_system: Option<initial_system::InitialSystemRoot>,
+    /// `PsIdleProcess` and the per-processor idle threads, outside the CID tables.
+    idle: Option<idle_process::IdleSystem>,
     /// The IMAGE views mapped into each process — the modelled `PEB->Ldr` module list. A `pid` of
     /// `0` marks a free slot, so an unmap never shifts the table (and never reallocates).
     ///
@@ -2431,6 +2436,7 @@ impl ProcessManager {
 
     fn can_publish_process_kernel_object(&self, pid: ProcessId, eprocess: u64) -> bool {
         if eprocess == 0
+            || self.is_idle_kernel_object(eprocess)
             || self.retired_kernel_body_is_reserved(eprocess)
             || self.jobs.reserves_kernel_object(eprocess)
             || self.processes.iter().any(|(&owner, process)| {
@@ -2592,6 +2598,7 @@ impl ProcessManager {
 
     fn can_publish_thread_kernel_object(&self, tid: ThreadId, ethread: u64) -> bool {
         if ethread == 0
+            || self.is_idle_kernel_object(ethread)
             || self.retired_kernel_body_is_reserved(ethread)
             || self.jobs.reserves_kernel_object(ethread)
             || self.threads.iter().any(|(&owner, thread)| {
@@ -4109,6 +4116,7 @@ impl ProcessManager {
     /// pointer namespace. A second kind of object cannot claim the same body.
     pub fn publish_job_kernel_object(&mut self, id: job::JobId, body: u64) -> bool {
         if body == 0
+            || self.is_idle_kernel_object(body)
             || self.retired_kernel_body_is_reserved(body)
             || self
                 .processes
@@ -5705,6 +5713,8 @@ mod thread_lifetime_tests;
 
 #[cfg(test)]
 mod kernel_object_publication_tests;
+#[cfg(test)]
+mod idle_process_tests;
 #[cfg(test)]
 mod kernel_job_body_tests;
 

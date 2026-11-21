@@ -25,6 +25,8 @@ const DPC_LEGAL: &[(&str, &str)] = &[
     ("IoWMIWriteEvent", "write_event"),
     ("IoAllocateIrp", "s_io_allocate_irp"),
     ("ObfDereferenceObject", "s_obf_dereference_object"),
+    // A DPC runs in the processor's idle thread, in the Idle process.
+    ("PsGetCurrentThreadId/PsGetCurrentProcessId/IoGetCurrentProcess", "current_ps_value"),
 ];
 
 /// The driver-side entry points that publish a typed service on the current IRQ lane.

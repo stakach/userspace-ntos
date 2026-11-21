@@ -18736,17 +18736,28 @@ extern "win64" fn s_ps_get_current_thread_id() -> u64 {
 fn hosted_thread_correlation() -> u64 { current_ps_value(0) }
 
 fn current_ps_value(selector: u64) -> u64 {
-    let (_label, status, thread_id, _, _) = unsafe {
-        call_on4(
-            (FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL << 12) | 1,
-            selector,
-            0,
-            0,
-            0,
-        )
+    // A DPC or ISR runs in its processor's idle thread, which the root answers for on the lane.
+    let (status, value) = if unsafe { hosted_irq_lane_context() }.is_some() {
+        if selector == 0 {
+            // An idle thread has no hosted scheduler correlation handle; 0 is "none" to callers.
+            return 0;
+        }
+        match unsafe { hosted_irq_lane_request(
+            nt_hosted_runtime::HostedIrqServiceKind::CurrentIdentity,
+            FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL,
+            &[selector],
+        ) } {
+            Some(result) if result.value_count == 1 => (result.status as u32 as u64, result.values[0]),
+            _ => hosted_irq_lane_protocol_fault(selector),
+        }
+    } else {
+        let (_label, status, value, _, _) = unsafe {
+            call_on4((FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL << 12) | 1, selector, 0, 0, 0)
+        };
+        (status, value)
     };
     if status as u32 as i32 == STATUS_SUCCESS {
-        thread_id
+        value
     } else if selector != 0 {
         unsafe {
             crate::provider_bugcheck::report(
@@ -58945,6 +58956,10 @@ unsafe fn release_hosted_irq_lane_mechanism(lane: &mut HostedIrqLaneRuntime) -> 
     failures
 }
 
+/// The processor whose SchedControl configures every IRQ lane's scheduling context, so the
+/// processor each DPC and ISR runs on.
+pub(crate) const HOSTED_IRQ_LANE_PROCESSOR: u8 = 0;
+
 unsafe fn attach_hosted_irq_lane_sched_context(lane: &mut HostedIrqLaneRuntime) -> Result<(), u64> {
     let Some(sc) = try_alloc_slot() else {
         return Err(u64::MAX);
@@ -58964,7 +58979,9 @@ unsafe fn attach_hosted_irq_lane_sched_context(lane: &mut HostedIrqLaneRuntime) 
     // Publish ownership before either fallible operation. A failed configure or bind leaves the
     // live cap in the lane tombstone so ordered teardown can retry its deletion.
     lane.sched_context = sc;
-    let configure_error = sched_control_configure_r(SLOT_SCHED_CONTROL, sc, 10, 10);
+    let configure_error = sched_control_configure_r(
+        SLOT_SCHED_CONTROL + u64::from(HOSTED_IRQ_LANE_PROCESSOR), sc, 10, 10,
+    );
     if configure_error != 0 {
         return Err(configure_error);
     }

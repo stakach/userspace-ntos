@@ -173,6 +173,11 @@ pub enum HostedIrqServiceKind {
     /// `ObfDereferenceObject(Object)` as `(Object, HostedDereferenceObjectKind)`: drop one
     /// reference; any final deletion runs later on a PASSIVE_LEVEL root worker.
     DeferredDereference = 25,
+    /// `PsGetCurrentThreadId`, `PsGetCurrentProcessId`, `KeGetCurrentThread`,
+    /// `IoGetCurrentProcess`, `PsGetCurrentThreadTeb` and the Wow64 query, as one Ps selector
+    /// (1 TID, 2 PID, 3 ETHREAD, 4 EPROCESS, 5 TEB, 6 Wow64). A DPC runs in the processor's
+    /// idle thread, which has no hosted correlation handle (selector 0).
+    CurrentIdentity = 26,
 }
 
 impl HostedIrqServiceKind {
@@ -203,6 +208,7 @@ impl HostedIrqServiceKind {
             23 => Some(Self::WmiWriteEvent),
             24 => Some(Self::AllocateIrp),
             25 => Some(Self::DeferredDereference),
+            26 => Some(Self::CurrentIdentity),
             _ => None,
         }
     }
@@ -610,6 +616,12 @@ impl HostedIrqServiceCommand {
                         && self.arguments[0] != 0
                         && crate::HostedDereferenceObjectKind::from_raw(self.arguments[1]).is_some()
                         && self.arguments[2..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::CurrentIdentity => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 1
+                        && (1..=6).contains(&self.arguments[0])
+                        && self.arguments[1..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::PoolRetirement => {
                     self.authority_cookie == 0
@@ -2638,7 +2650,7 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
         assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
-        assert_eq!(HostedIrqServiceKind::from_raw(26), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(27), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2948,6 +2960,34 @@ mod tests {
         config.arguments[2] = 4 << 32;
         config.arguments[4] = 1;
         assert!(!config.valid());
+    }
+
+    #[test]
+    fn irq_current_identity_carries_one_ps_selector() {
+        // PsGetCurrentThreadId and friends (any IRQL): TID, PID, ETHREAD, EPROCESS, TEB, Wow64.
+        assert_eq!(HostedIrqServiceKind::from_raw(26), Some(HostedIrqServiceKind::CurrentIdentity));
+        let mut identity = service();
+        identity.kind = HostedIrqServiceKind::CurrentIdentity;
+        identity.authority_cookie = 0;
+        identity.argument_count = 1;
+        identity.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        for selector in 1..=6 {
+            identity.arguments[0] = selector;
+            assert!(identity.valid(), "selector {selector}");
+        }
+        for selector in [0, 7, u64::MAX] {
+            identity.arguments[0] = selector;
+            assert!(!identity.valid(), "a lane has no hosted correlation handle (selector {selector})");
+        }
+        identity.arguments[0] = 1;
+        identity.arguments[1] = 1;
+        assert!(!identity.valid());
+        identity.arguments[1] = 0;
+        identity.argument_count = 2;
+        assert!(!identity.valid());
+        identity.argument_count = 1;
+        identity.authority_cookie = 1;
+        assert!(!identity.valid());
     }
 
     #[test]

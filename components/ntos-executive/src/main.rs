@@ -2307,7 +2307,9 @@ static SYSTEM_PHYSICAL_PAGES: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_LOWEST_PHYSICAL_PAGE: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_HIGHEST_PHYSICAL_PAGE: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_PROCESSOR_COUNT: AtomicU64 = AtomicU64::new(1);
-static SYSTEM_PROCESSOR_APIC_IDS: [AtomicU32; 4] = [
+/// Processors the root provisions per-CPU state for (APIC ids, SchedControls, idle threads).
+const SYSTEM_PROCESSOR_CAPACITY: usize = 4;
+static SYSTEM_PROCESSOR_APIC_IDS: [AtomicU32; SYSTEM_PROCESSOR_CAPACITY] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];
 static SYSTEM_PROCESSOR_TOPOLOGY_READY: AtomicBool = AtomicBool::new(false);

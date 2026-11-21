@@ -208,3 +208,17 @@ fn primary_reference_is_released_by_normal_process_teardown_after_handoff() {
         Some(1)
     );
 }
+
+#[test]
+fn bootstrap_creates_the_idle_process_with_one_idle_thread_per_processor() {
+    let state = PsBootstrapState::try_new_with_active_processor_count(0x1000, 0, 4).unwrap();
+    let pm = state.process_manager();
+    let idle = pm.idle_process().unwrap();
+    assert_eq!((idle.process_id(), idle.image_file_name(), idle.thread_count()), (0, "Idle", 4));
+    assert_eq!(pm.idle_threads().map(|thread| thread.processor()).collect::<alloc::vec::Vec<_>>(), [0, 1, 2, 3]);
+    assert!(pm.idle_threads().all(|thread| thread.thread_id() == 0));
+    // System still receives the first allocated CID; Idle consumes none.
+    let system = pm.initial_system_identity().unwrap();
+    assert_ne!(system.process_id(), 0);
+    assert!(pm.process(0).is_none());
+}

@@ -20,12 +20,40 @@ static mut INITIAL_PROCESS: InitialObjectPage = InitialObjectPage([0; 4096]);
 static mut INITIAL_THREAD: InitialObjectPage = InitialObjectPage([0; 4096]);
 static INITIAL_PROCESS_BODY: AtomicU64 = AtomicU64::new(0);
 static mut INITIAL_SYSTEM_PROJECTION: Option<InitialSystemProjection> = None;
+// PsIdleProcess and each processor's KPRCB->IdleThread share the same image-page lifetime.
+static mut IDLE_PROCESS: InitialObjectPage = InitialObjectPage([0; 4096]);
+static mut IDLE_THREADS: [InitialObjectPage; SYSTEM_PROCESSOR_CAPACITY] =
+    [const { InitialObjectPage([0; 4096]) }; SYSTEM_PROCESSOR_CAPACITY];
+static mut IDLE_PROJECTION: Option<IdleProjection> = None;
 
 #[derive(Clone, Copy)]
 pub(crate) struct InitialSystemProjection {
     pub identity: nt_process::InitialSystemIdentity,
     pub process_body: u64,
     pub thread_body: u64,
+}
+
+/// The Idle process and idle-thread bodies, in processor order, in executive-image pages that
+/// every hosted driver's component address space maps.
+#[derive(Clone, Copy)]
+pub(crate) struct IdleProjection {
+    pub process_body: u64,
+    thread_bodies: [u64; SYSTEM_PROCESSOR_CAPACITY],
+    thread_count: usize,
+}
+
+impl IdleProjection {
+    pub(crate) fn thread_body(&self, processor: u32) -> Option<u64> {
+        self.thread_bodies[..self.thread_count].get(processor as usize).copied()
+    }
+}
+
+/// Published with, and fenced by, the initial System projection.
+pub(crate) fn idle_projection() -> Option<IdleProjection> {
+    if INITIAL_PROCESS_BODY.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    unsafe { core::ptr::addr_of!(IDLE_PROJECTION).read() }
 }
 
 /// Immutable projection metadata, published before any provider can execute. It is not a grant
@@ -81,7 +109,9 @@ unsafe fn publish_initial_objects(
     // collide with a hosted object; a failed invariant is fatal, never a partial live bootstrap.
     assert!(pm.publish_process_kernel_object(identity.process_id(), process as u64));
     assert!(pm.publish_thread_kernel_object(identity.thread_id(), thread as u64));
+    let idle = publish_idle_objects(pm)?;
     ps_object_backing::initialize(identity)?;
+    core::ptr::addr_of_mut!(IDLE_PROJECTION).write(Some(idle));
     core::ptr::addr_of_mut!(INITIAL_SYSTEM_PROJECTION).write(Some(InitialSystemProjection {
         identity,
         process_body: process as u64,
@@ -89,6 +119,29 @@ unsafe fn publish_initial_objects(
     }));
     INITIAL_PROCESS_BODY.store(process as u64, Ordering::Release);
     Ok(())
+}
+
+/// Initialize PsIdleProcess and one idle thread per processor the PM was built for, then
+/// publish them together. Like System's, these fresh bodies cannot collide with a hosted object.
+unsafe fn publish_idle_objects(pm: &mut nt_process::ProcessManager) -> Result<IdleProjection, u32> {
+    use nt_kernel_abi::{ps_hosted_x64 as abi, GuestAddr};
+
+    let thread_count = pm.idle_process().ok_or(0xc000_000du32)?.thread_count() as usize;
+    if thread_count == 0 || thread_count > SYSTEM_PROCESSOR_CAPACITY {
+        return Err(0xc000_000d);
+    }
+    let process = core::ptr::addr_of_mut!(IDLE_PROCESS);
+    abi::initialize_idle_process(&mut (*process).0, GuestAddr(process as u64))
+        .map_err(|_| 0xc000_000du32)?;
+    let mut thread_bodies = [0; SYSTEM_PROCESSOR_CAPACITY];
+    for (processor, body) in thread_bodies[..thread_count].iter_mut().enumerate() {
+        let thread = core::ptr::addr_of_mut!((*core::ptr::addr_of_mut!(IDLE_THREADS))[processor]);
+        abi::initialize_idle_thread(&mut (*thread).0, GuestAddr(thread as u64), GuestAddr(process as u64))
+            .map_err(|_| 0xc000_000du32)?;
+        *body = thread as u64;
+    }
+    assert!(pm.publish_idle_kernel_objects(process as u64, &thread_bodies[..thread_count]));
+    Ok(IdleProjection { process_body: process as u64, thread_bodies, thread_count })
 }
 
 /// Root bootstrap is serialized. No borrowed store reference may escape into provider IPC.

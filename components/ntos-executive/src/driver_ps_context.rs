@@ -35,6 +35,31 @@ pub(super) unsafe fn project(
     })
 }
 
+/// The identity a DPC or ISR on `inst`'s IRQ lane runs under: `KPRCB->IdleThread` of
+/// `processor` in PsIdleProcess, as `(pid, tid, EPROCESS, ETHREAD, TEB)`. Like the initial System
+/// bodies, both live in executive-image pages that every hosted driver's address space maps, so
+/// no provider mapping is granted; the PM's published bodies must be exactly those pages.
+pub(super) unsafe fn project_idle(
+    inst: DriverInstance,
+    processor: u32,
+) -> Result<(u64, u64, u64, u64, u64), u32> {
+    instance_domain_identity(inst).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let projection = crate::ps_bootstrap::idle_projection().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    crate::service_sec_image::with_provider_process_manager(|pm| {
+        let process = pm.idle_process().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let thread = pm.idle_thread(processor).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let process_body = process.kernel_object().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let thread_body = thread.kernel_object().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        if process_body != projection.process_body
+            || Some(thread_body) != projection.thread_body(processor)
+        {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        Ok((u64::from(thread.process_id()), u64::from(thread.thread_id()),
+            process_body, thread_body, thread.teb_base()))
+    })
+}
+
 pub(super) unsafe fn retire(inst: DriverInstance) -> Result<(), u32> {
     driver_ps_pool_alias::retire(inst)?;
     if !crate::ps_object_backing::references_provider_vspace(inst.pml4) { return Ok(()); }

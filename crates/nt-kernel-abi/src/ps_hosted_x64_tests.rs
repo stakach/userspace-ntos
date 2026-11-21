@@ -700,3 +700,47 @@ fn projected_fields_follow_the_pinned_libernt_layout() {
         );
     }
 }
+
+#[test]
+fn idle_process_has_cid_zero_and_the_nt_image_file_name() {
+    // PsIdleProcess: UniqueProcessId 0 and `strcpy(PsIdleProcess->ImageFileName, "Idle")`.
+    let body = GuestAddr(0x30_0000);
+    let mut bytes = [0xa5; EPROCESS_BODY_BYTES + 8];
+    initialize_idle_process(&mut bytes, body).unwrap();
+    let mut system = [0; EPROCESS_BODY_BYTES];
+    initialize_process(&mut system, ProcessInitialization { body, ..process() }).unwrap();
+    expected_u64(&mut system, EPROCESS_UNIQUE_PROCESS_ID, 0);
+    system[EPROCESS_IMAGE_FILE_NAME..EPROCESS_IMAGE_FILE_NAME + 4].copy_from_slice(b"Idle");
+    assert_eq!(&bytes[..EPROCESS_BODY_BYTES], system);
+    assert_eq!(&bytes[EPROCESS_BODY_BYTES..], [0xa5; 8]);
+    assert_eq!(initialize_idle_process(&mut bytes, GuestAddr::NULL), Err(ProjectionError::NullBody));
+    assert_eq!(
+        initialize_idle_process(&mut [0; EPROCESS_BODY_BYTES - 1], body),
+        Err(ProjectionError::BufferTooSmall),
+    );
+}
+
+#[test]
+fn idle_thread_has_cid_zero_no_teb_and_no_ps_system_thread_flag() {
+    // KiInitializeKernel builds each idle thread with KeInitializeThread only: no CID, no TEB
+    // and no PS_CROSS_THREAD_FLAGS_SYSTEM, since PspCreateThread never runs for it.
+    let init = thread();
+    let mut bytes = [0xa5; ETHREAD_BODY_BYTES + 8];
+    initialize_idle_thread(&mut bytes, init.body, init.process_body).unwrap();
+    let mut expected = [0; ETHREAD_BODY_BYTES];
+    initialize_thread(&mut expected, init).unwrap();
+    expected_u64(&mut expected, ETHREAD_CLIENT_ID_PROCESS, 0);
+    expected_u64(&mut expected, ETHREAD_CLIENT_ID_THREAD, 0);
+    expected[ETHREAD_CROSS_THREAD_FLAGS] = 0;
+    assert_eq!(&bytes[..ETHREAD_BODY_BYTES], expected);
+    assert_eq!(&bytes[ETHREAD_BODY_BYTES..], [0xa5; 8]);
+    assert_eq!(u64_at(&bytes, KTHREAD_TEB), 0);
+    assert_eq!(
+        initialize_idle_thread(&mut bytes, init.body, GuestAddr::NULL),
+        Err(ProjectionError::NullBody),
+    );
+    assert_eq!(
+        initialize_idle_thread(&mut bytes, GuestAddr(init.body.0 + 4), init.process_body),
+        Err(ProjectionError::UnalignedAddress),
+    );
+}
