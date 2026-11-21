@@ -1980,16 +1980,10 @@ pub(super) unsafe fn redrive_plain_suspended_pumps() -> usize {
     let mut selected = Vec::new();
     if count == 0 || selected.try_reserve(count).is_err() { return 0; }
     selected.extend(rows().iter().filter_map(|owner| {
-        // A row caller's selector names its key; a deferred pump is resumed under its own.
-        let selector = match owner.plain_pump.as_ref()? {
-            nt_hosted_runtime::KeptFilePump::Suspended(key) => Some(*key),
-            nt_hosted_runtime::KeptFilePump::DeferredCompletion => None,
-            nt_hosted_runtime::KeptFilePump::Returned(..) => return None,
-        };
+        // A kept pump is resumed under its current native key (crate policy).
         let Some(Payload::PumpSuspended(pump)) = owner.payload.as_ref() else { return None };
-        let key = pump.invocation.key();
+        let key = owner.plain_pump.as_ref()?.resume_key(pump.invocation.key())?;
         let retryable = owner.flight == Flight::PumpSuspended
-            && selector.is_none_or(|selector| selector == key)
             && pump.continuation.retry_without_new_child();
         if retryable { Some((owner.irp_id?, key)) } else { None }
     }));
