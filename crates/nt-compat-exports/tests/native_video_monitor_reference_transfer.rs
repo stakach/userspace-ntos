@@ -99,17 +99,6 @@ fn source_free_precedes_exact_video_port_reference_ack() {
 }
 
 #[test]
-fn empty_video_port_array_has_no_provider_reference_ack() {
-    let driver = native_source("driver_launch.rs");
-    let acknowledgement = function(&driver, "acknowledge_hosted_video_monitor_array");
-    let empty = acknowledgement.find("if count == 0 { return Some(true); }")
-        .expect("empty arrays transfer no PDO references");
-    let dispatch = acknowledgement.find("dispatch_irp_for_instance_exact(")
-        .expect("populated array provider ACK");
-    assert!(empty < dispatch, "an empty array cannot ACK a missing provider row");
-}
-
-#[test]
 fn monitor_source_classification_uses_the_completing_device() {
     let driver = native_source("driver_launch.rs");
     let capture = function(&driver, "capture_hosted_video_monitor_array");

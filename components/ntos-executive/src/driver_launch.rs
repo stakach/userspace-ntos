@@ -172,6 +172,8 @@ use hosted_pool_lock::{component_pool_lock, hosted_instance_pool_lock,
     hosted_instance_pool_quiescent, ExecutivePoolLockGuard};
 #[path = "component_scheduler.rs"]
 mod component_scheduler;
+#[path = "hosted_backend_pumps.rs"]
+mod hosted_backend_pumps;
 #[path = "hosted_dpc_scheduler.rs"]
 mod hosted_dpc_scheduler;
 #[path = "hosted_dpc_transition_trace.rs"]
@@ -187,9 +189,11 @@ pub(crate) use component_scheduler::{
 pub(crate) use component_scheduler::handoff_exact_component_once;
 pub(crate) use component_scheduler::service_continuation::{ServiceDelivery, ServiceStep};
 
-/// Root boundary (#420): continue each ordinary File row's kept pump once.
+/// Root boundary (#420): continue each ordinary File row's kept pump, and each kept backend
+/// dispatch, once.
 pub(crate) unsafe fn redrive_plain_file_pumps() -> usize {
     hosted_file_owners::redrive_plain_suspended_pumps()
+        .saturating_add(hosted_backend_pumps::redrive())
 }
 
 /// Hold one service-continuation row before a lane's service enters any dispatch (#420).
@@ -4796,6 +4800,8 @@ pub(crate) struct HostedVideoMonitorArray {
     driver_id: u64,
     video_port: bool,
     bytes: Vec<u8>,
+    /// A provider ACK whose pump is still running (#420); collected before anything else.
+    provider_ack: Option<nt_hosted_runtime::BackendTicket>,
 }
 
 impl HostedVideoMonitorArray {
@@ -4807,7 +4813,19 @@ impl HostedVideoMonitorArray {
 
     pub(crate) fn video_port(&self) -> bool { self.video_port }
 
-    pub(crate) unsafe fn acknowledge_hosted_video_monitor_array(&self, count: usize) -> Option<bool> {
+    /// `None` is "not yet": a refused entry, or a provider ACK still running, which a later
+    /// call collects exactly once.
+    pub(crate) unsafe fn acknowledge_hosted_video_monitor_array(&mut self, count: usize) -> Option<bool> {
+        if let Some(ticket) = self.provider_ack.take() {
+            return match hosted_backend_pumps::collect(ticket) {
+                hosted_backend_pumps::BackendCollected::Pending(ticket) => {
+                    self.provider_ack = Some(ticket);
+                    None
+                }
+                hosted_backend_pumps::BackendCollected::Collected(result, _) =>
+                    Self::monitor_ack_outcome(Some(result)),
+            };
+        }
         // The empty VideoPort array transfers no PDO references and has no provider row.
         // Freeing its exact source allocation completes retirement without an ACK RPC.
         if count == 0 { return Some(true); }
@@ -4821,12 +4839,23 @@ impl HostedVideoMonitorArray {
                 self.identity.domain, nt_io_manager::DeviceId(self.parent_device_id),
             ) != Some(parent_object)
         { return Some(false); }
-        let result = dispatch_irp_for_instance_exact(
+        let result = match hosted_backend_pumps::dispatch_exact(
             instance_index, FSD_DISPATCH_VIDEO_MONITOR_ARRAY_ACK,
             self.identity.allocation.pool_generation, parent_object, 0, 0,
             self.identity.allocation.component_address, parent_object, 0,
-            None, &[], &mut [], Some(crate::initial_system_driver_caller()),
-        );
+            &[], &mut [], crate::initial_system_driver_caller(),
+        ) {
+            Some(hosted_backend_pumps::BackendDispatch::Pending(ticket)) => {
+                self.provider_ack = Some(ticket);
+                return None;
+            }
+            Some(hosted_backend_pumps::BackendDispatch::Returned(result)) => Some(result),
+            None => None,
+        };
+        Self::monitor_ack_outcome(result)
+    }
+
+    fn monitor_ack_outcome(result: Option<HostedIrpTransportResult>) -> Option<bool> {
         match result {
             Some(HostedIrpTransportResult::Returned { status, information, .. })
                 if status.is_success() => Some(information == 1),
@@ -4897,7 +4926,7 @@ pub(crate) unsafe fn capture_hosted_video_monitor_array(
     }
     Ok(HostedVideoMonitorArray {
         pin, identity, parent_device_id: device_id, driver_id: completion_driver_id,
-        video_port: hosted_device_video_port_initialized(device_id), bytes,
+        video_port: hosted_device_video_port_initialized(device_id), bytes, provider_ack: None,
     })
 }
 
@@ -45636,6 +45665,7 @@ unsafe fn retain_hosted_relation_query_barrier(
         acpi_pci_link_candidates: Vec::new(),
         acpi_pci_catalog_update: None,
         publication: None,
+        provider_ack: None,
     });
 }
 
@@ -48160,15 +48190,27 @@ unsafe fn complete_hosted_relation_probe_without_publication(
     Ok(())
 }
 
+/// `Retry` covers a refused entry and a provider ACK still running; the query keeps the
+/// running ACK's ticket and a later call collects its true result exactly once (#420).
 unsafe fn acknowledge_hosted_video_relation(
     allocation: u64,
     generation: u64,
 ) -> Result<(), HostedRelationPublishError> {
-    let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
-        .as_ref()
+    let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_mut()
         .ok_or(HostedRelationPublishError::Barrier(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         ))?;
+    if let Some(ticket) = query.provider_ack.take() {
+        return match hosted_backend_pumps::collect(ticket) {
+            hosted_backend_pumps::BackendCollected::Pending(ticket) => {
+                query.provider_ack = Some(ticket);
+                Err(HostedRelationPublishError::Retry)
+            }
+            hosted_backend_pumps::BackendCollected::Collected(result, _) =>
+                hosted_video_relation_ack_outcome(Some(result)),
+        };
+    }
     let (route_instance, route, parent_object) =
         hosted_driver_device_route_by_device_id(query.completion_device_id.raw()).ok_or(
             HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
@@ -48182,7 +48224,7 @@ unsafe fn acknowledge_hosted_video_relation(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         ));
     }
-    let result = dispatch_irp_for_instance_exact(
+    let result = match hosted_backend_pumps::dispatch_exact(
         route_instance,
         FSD_DISPATCH_VIDEO_RELATION_ACK,
         generation,
@@ -48192,11 +48234,23 @@ unsafe fn acknowledge_hosted_video_relation(
         allocation,
         parent_object,
         0,
-        None,
         &[],
         &mut [],
-        Some(crate::initial_system_driver_caller()),
-    );
+        crate::initial_system_driver_caller(),
+    ) {
+        Some(hosted_backend_pumps::BackendDispatch::Pending(ticket)) => {
+            query.provider_ack = Some(ticket);
+            return Err(HostedRelationPublishError::Retry);
+        }
+        Some(hosted_backend_pumps::BackendDispatch::Returned(result)) => Some(result),
+        None => None,
+    };
+    hosted_video_relation_ack_outcome(result)
+}
+
+fn hosted_video_relation_ack_outcome(
+    result: Option<HostedIrpTransportResult>,
+) -> Result<(), HostedRelationPublishError> {
     match result {
         Some(HostedIrpTransportResult::Returned { status, information: 0 | 1, .. })
             if status.is_success() => Ok(()),
@@ -49655,7 +49709,9 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
 unsafe fn retire_hosted_device_relation_barrier() -> usize {
     let Some((claim, relation_owner, irp_id, status)) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
         .as_ref()
-        .filter(|query| query.phase == HostedDeviceRelationQueryPhase::Barrier)
+        // A provider ACK still running keeps the query until its ticket is collected (#420).
+        .filter(|query| query.phase == HostedDeviceRelationQueryPhase::Barrier
+            && query.provider_ack.is_none())
         .map(|query| {
             (
                 query.claim,
@@ -49934,6 +49990,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         acpi_pci_link_candidates: Vec::new(),
         acpi_pci_catalog_update: None,
         publication: None,
+        provider_ack: None,
     });
     match io_manager_mut()
         .dispatch_prepared_external_pnp(prepared)
@@ -54300,6 +54357,8 @@ struct HostedDeviceRelationQuery {
     acpi_pci_link_candidates: Vec<nt_pnp::AcpiPciLinkCandidateFact>,
     acpi_pci_catalog_update: Option<nt_pnp::PreparedAcpiPciScopeCatalogUpdate>,
     publication: Option<HostedRelationPublication>,
+    /// The provider relation ACK whose pump is still running (#420).
+    provider_ack: Option<nt_hosted_runtime::BackendTicket>,
 }
 
 #[derive(Clone, Copy)]

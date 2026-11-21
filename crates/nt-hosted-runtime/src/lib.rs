@@ -3952,4 +3952,6 @@ mod tests {
 }
 
 mod file_pump_return;
+mod backend_pump_rows;
+pub use backend_pump_rows::{BackendCollect, BackendTicket, KeptBackendPumps};
 pub use file_pump_return::{scoped_resume, FilePumpCollect, FilePumpReturned, KeptFilePump, ScopedResume};
