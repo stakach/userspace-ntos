@@ -61,6 +61,10 @@ mod object_directory_handle;
 pub mod user_object_handle;
 mod routed_file_handle;
 mod handle_attributes;
+mod inherit_handle_list;
+#[cfg(test)]
+#[path = "inherit_handle_list_tests.rs"]
+mod inherit_handle_list_tests;
 #[cfg(test)]
 #[path = "handle_attributes_tests.rs"]
 mod handle_attributes_tests;
