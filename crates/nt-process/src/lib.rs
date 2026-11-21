@@ -57,6 +57,10 @@ mod registry_key_handle;
 mod object_directory_handle;
 pub mod user_object_handle;
 mod routed_file_handle;
+mod handle_attributes;
+#[cfg(test)]
+#[path = "handle_attributes_tests.rs"]
+mod handle_attributes_tests;
 pub mod process_object_retirement;
 mod process_exit_notify;
 pub use process_exit_notify::{ProcessExitNotification, ProcessExitNotifyOwner};
@@ -1010,7 +1014,8 @@ struct HandleEntry {
 
 enum HandleSlot {
     Free,
-    Reserved(u64),
+    /// A reservation and the handle flags its creation request asked for.
+    Reserved { generation: u64, flags: HandleFlags },
     Bound { generation: u64, entry: HandleEntry },
     Occupied { generation: u64, entry: HandleEntry },
 }
@@ -1023,7 +1028,7 @@ impl HandleSlot {
     fn entry(&self) -> Option<&HandleEntry> {
         match self {
             Self::Occupied { entry, .. } => Some(entry),
-            Self::Free | Self::Reserved(_) | Self::Bound { .. } => None,
+            Self::Free | Self::Reserved { .. } | Self::Bound { .. } => None,
         }
     }
 
@@ -1033,14 +1038,14 @@ impl HandleSlot {
     fn reference_entry(&self) -> Option<&HandleEntry> {
         match self {
             Self::Bound { entry, .. } | Self::Occupied { entry, .. } => Some(entry),
-            Self::Free | Self::Reserved(_) => None,
+            Self::Free | Self::Reserved { .. } => None,
         }
     }
 
     fn entry_mut(&mut self) -> Option<&mut HandleEntry> {
         match self {
             Self::Occupied { entry, .. } => Some(entry),
-            Self::Free | Self::Reserved(_) | Self::Bound { .. } => None,
+            Self::Free | Self::Reserved { .. } | Self::Bound { .. } => None,
         }
     }
 
@@ -1714,6 +1719,15 @@ impl ProcessManager {
     /// Claim one exact, invisible handle slot before an external operation begins. Ordinary handle
     /// insertion skips it until commit or cancellation consumes the reservation.
     pub fn try_reserve_handle_slot(&mut self, pid: ProcessId) -> Result<HandleReservation, u32> {
+        self.try_reserve_handle_slot_with_flags(pid, HandleFlags::default())
+    }
+
+    /// Reserve a slot whose bound handle will carry `flags`.
+    fn try_reserve_handle_slot_with_flags(
+        &mut self,
+        pid: ProcessId,
+        flags: HandleFlags,
+    ) -> Result<HandleReservation, u32> {
         let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
         let generation = proc.next_handle_reservation_generation;
         let next_generation = generation
@@ -1721,7 +1735,7 @@ impl ProcessManager {
             .filter(|_| generation != 0)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let slot = if let Some(slot) = proc.handles.iter().position(HandleSlot::is_free) {
-            proc.handles[slot] = HandleSlot::Reserved(generation);
+            proc.handles[slot] = HandleSlot::Reserved { generation, flags };
             slot
         } else {
             if proc.handles.len() == proc.handles.capacity() {
@@ -1730,7 +1744,7 @@ impl ProcessManager {
                     .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
             }
             let slot = proc.handles.len();
-            proc.handles.push(HandleSlot::Reserved(generation));
+            proc.handles.push(HandleSlot::Reserved { generation, flags });
             slot
         };
         proc.next_handle_reservation_generation = next_generation;
@@ -1764,16 +1778,16 @@ impl ProcessManager {
             .ok_or(STATUS_INVALID_HANDLE)?;
         let slot = handle_to_slot(reservation.handle).ok_or(STATUS_INVALID_HANDLE)?;
         let entry = proc.handles.get_mut(slot).ok_or(STATUS_INVALID_HANDLE)?;
-        if !matches!(entry, HandleSlot::Reserved(generation) if *generation == reservation.generation)
-        {
-            return Err(STATUS_INVALID_HANDLE);
-        }
+        let flags = match *entry {
+            HandleSlot::Reserved { generation, flags } if generation == reservation.generation => flags,
+            _ => return Err(STATUS_INVALID_HANDLE),
+        };
         *entry = HandleSlot::Bound {
             generation: reservation.generation,
             entry: HandleEntry {
                 object,
                 granted_access,
-                flags: HandleFlags::default(),
+                flags,
             },
         };
         Ok(())
@@ -1825,7 +1839,7 @@ impl ProcessManager {
             .ok_or(STATUS_INVALID_HANDLE)?;
         let slot = handle_to_slot(reservation.handle).ok_or(STATUS_INVALID_HANDLE)?;
         let entry = proc.handles.get_mut(slot).ok_or(STATUS_INVALID_HANDLE)?;
-        if !matches!(entry, HandleSlot::Reserved(generation) if *generation == reservation.generation)
+        if !matches!(entry, HandleSlot::Reserved { generation, .. } if *generation == reservation.generation)
         {
             return Err(STATUS_INVALID_HANDLE);
         }
@@ -1863,7 +1877,7 @@ impl ProcessManager {
                     .handles
                     .iter()
                     .filter(|slot| {
-                        matches!(slot, HandleSlot::Reserved(_) | HandleSlot::Bound { .. })
+                        matches!(slot, HandleSlot::Reserved { .. } | HandleSlot::Bound { .. })
                     })
                     .count()
             })

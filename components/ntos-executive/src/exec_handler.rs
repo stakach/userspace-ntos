@@ -10455,12 +10455,15 @@ impl ExecNtHandler {
         self.mint_handle()
     }
 
+    /// Reserve the caller's handle for an object opened with `object_attributes`; the bound
+    /// handle carries their OBJ_INHERIT.
     fn reserve_current_process_handle_slot(
         &mut self,
+        object_attributes: u32,
     ) -> Result<nt_process::HandleReservation, u32> {
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         let capacity = self.pm.handle_capacity(pid);
-        let reservation = self.pm.try_reserve_handle_slot(pid)?;
+        let reservation = self.pm.try_reserve_handle_slot_for_attributes(pid, object_attributes)?;
         let reserved = self.pm.handle_capacity(pid);
         if reserved != capacity {
             PM_HANDLE_CAP_GROWTHS.fetch_add(1, Ordering::Relaxed);
@@ -27642,7 +27645,7 @@ impl ExecNtHandler {
             in_bytes.extend_from_slice(&w.to_le_bytes());
         }
         in_bytes.extend_from_slice(ea);
-        let reservation = self.reserve_current_process_handle_slot()?;
+        let reservation = self.reserve_current_process_handle_slot(object_attributes)?;
         let allocated_file = match related_file_id {
             Some(related_file_id) => driver_launch::allocate_hosted_relative_file(
                 related_file_id,
