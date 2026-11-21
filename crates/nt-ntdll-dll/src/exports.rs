@@ -11765,9 +11765,10 @@ pub unsafe extern "system" fn rtl_get_full_path_name_u(
         core::ptr::copy_nonoverlapping(full.as_ptr(), buffer, full.len());
         *buffer.add(full.len()) = 0;
         if !file_part.is_null() {
-            // FilePart = the char after the last backslash (or NULL if none).
+            // FilePart = the char after the last backslash (or NULL if none, or a DOS device).
             let mut fp = core::ptr::null_mut();
-            for i in (0..full.len()).rev() {
+            let device = nt_ntdll::rtl::path::is_dos_device_name(name_units);
+            for i in (0..full.len()).rev().filter(|_| !device) {
                 if *buffer.add(i) == b'\\' as u16 {
                     fp = buffer.add(i + 1);
                     break;

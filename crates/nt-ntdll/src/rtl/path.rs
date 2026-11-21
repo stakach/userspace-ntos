@@ -497,6 +497,10 @@ pub fn try_relative_nt_path_plan(
     }
     let full_dos = super::environment::full_path_units(name, cwd);
     let nt_path = dos_path_name_to_nt_path_name(&full_dos).ok_or(NtPathPlanError::InvalidName)?;
+    if dos_device_name(name).is_some() {
+        // ReactOS clears the part name for a DOS device; it is never under the current directory.
+        return finish(nt_path, None, None);
+    }
     let relative_offset = if input_type == DosPathType::Relative && has_current_directory_handle {
         let canonical_cwd = super::environment::full_path_units(&[b'.' as u16], cwd);
         let cwd_end = canonical_cwd
@@ -1001,6 +1005,24 @@ mod tests {
             let actual_part = plan.part_offset.map(|offset| s(&plan.nt_path[offset..]));
             assert_eq!(actual_part.as_deref(), part);
             assert_eq!(plan.relative_offset, None);
+        }
+    }
+
+    #[test]
+    fn relative_nt_plan_maps_reserved_dos_device_names_to_the_dos_devices_directory() {
+        // ReactOS RtlGetFullPathName_Ustr turns a reserved name in any directory into `\\.\<token>`,
+        // so cmd's `> nul` opens `\??\nul` (the smss `DOS Devices` link to `\Device\Null`).
+        for (input, expected) in [
+            ("nul", "\\??\\nul"),
+            ("NUL", "\\??\\NUL"),
+            ("C:\\Windows\\nul.txt", "\\??\\nul"),
+            ("sub\\con", "\\??\\con"),
+            ("COM1:", "\\??\\COM1"),
+        ] {
+            let plan = try_relative_nt_path_plan(&u(input), &u("C:\\Windows"), true).unwrap();
+            assert_eq!(s(&plan.nt_path), expected, "{input}");
+            assert_eq!(plan.relative_offset, None, "{input}");
+            assert_eq!(plan.part_offset, None, "{input}");
         }
     }
 

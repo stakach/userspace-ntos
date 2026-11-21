@@ -255,6 +255,13 @@ impl CurrentDirectory {
 /// collapse. Forward slashes are normalised to backslashes. Returns the full DOS path (no trailing
 /// NUL). This is what `RtlGetFullPathName_UstrEx` writes to its StaticString/DynamicString out-param.
 pub fn full_path_units(name: &[u16], cwd: &[u16]) -> Vec<u16> {
+    // RtlGetFullPathName_Ustr: a reserved DOS device name in any directory is `\\.\<token>`.
+    if let Some(span) = super::path::dos_device_name(name) {
+        let start = usize::from(span.offset_bytes) / 2;
+        let mut device: Vec<u16> = "\\\\.\\".encode_utf16().collect();
+        device.extend_from_slice(&name[start..start + usize::from(span.length_bytes) / 2]);
+        return device;
+    }
     // Convert both to lossy Strings for the pure logic (paths are ASCII-ish DOS paths; any non-BMP is
     // preserved via char round-trip). Using String keeps ONE canonicalization implementation.
     let mut name_s = String::from_utf16_lossy(name);
@@ -523,6 +530,11 @@ mod tests {
                 &u("C:\\Windows")
             )),
             "\\\\.\\pipe\\lsarpc"
+        );
+        assert_eq!(s(&full_path_units(&u("nul"), &u("C:\\Windows"))), "\\\\.\\nul");
+        assert_eq!(
+            s(&full_path_units(&u("D:\\dir\\aux.log"), &u("C:\\Windows"))),
+            "\\\\.\\aux"
         );
     }
 
