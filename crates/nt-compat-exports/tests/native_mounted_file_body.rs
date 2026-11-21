@@ -40,6 +40,19 @@ impl<'ast> Visit<'ast> for Operations {
         syn::visit::visit_expr_method_call(self, call);
     }
 
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = &*call.func {
+            if let Some(last) = path.path.segments.last() {
+                let name = last.ident.to_string();
+                if name == "release_io_reference" && self.close_depth == 0 {
+                    self.io_release_outside_close = true;
+                }
+                self.calls.push(name);
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+
     fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
         if let syn::Member::Named(name) = &field.member { self.fields.push(name.to_string()); }
         syn::visit::visit_expr_field(self, field);
@@ -73,4 +86,34 @@ fn installed_read_and_query_use_retained_body_not_handle_lease() {
         assert!(operations.fields.iter().any(|field| field == "installed_open"), "{name}");
         assert!(!operations.fields.iter().any(|field| field == "share_open"), "{name}");
     }
+}
+
+#[test]
+fn overlay_cleanup_keeps_body_for_paging_io_until_close() {
+    // A Section retains its FILE_OBJECT after the last handle closes: CLEANUP releases sharing
+    // and delete-on-close, but its paging writes reach the body until CLOSE (NT5 fastfat).
+    let mut operations = Operations::default();
+    operations.visit_impl_item_fn(&method("cleanup_or_close"));
+    let retain = operations.calls.iter().position(|name| name == "retain_io_reference");
+    let close = operations.calls.iter().position(|name| name == "close_checked");
+    assert!(retain.zip(close).is_some_and(|(retain, close)| retain < close),
+        "CLEANUP retains the overlay body before it closes the overlay handle");
+    assert!(operations.calls.iter().any(|name| name == "release_io_reference"));
+    assert!(operations.fields.iter().any(|name| name == "overlay_body"));
+    assert!(!operations.io_release_outside_close, "only CLOSE may release the body reference");
+}
+
+#[test]
+fn overlay_paging_io_uses_the_retained_body_after_cleanup() {
+    for name in ["opened_overlay_file", "read"] {
+        let mut operations = Operations::default();
+        operations.visit_impl_item_fn(&method(name));
+        assert!(operations.calls.iter().any(|call| call == "overlay_admits"), "{name}");
+        assert!(operations.calls.iter().any(|call| call == "is_paging_io"),
+            "{name}: only paging I/O may use a cleaned-up File body");
+    }
+    let mut admits = Operations::default();
+    admits.visit_impl_item_fn(&method("overlay_admits"));
+    assert!(admits.fields.iter().any(|name| name == "overlay_body"));
+    assert!(admits.fields.iter().any(|name| name == "overlay_open"));
 }

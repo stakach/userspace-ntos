@@ -131,7 +131,11 @@ struct MountedBinding {
     installed_open: Option<u32>,
     installed_handle_open: bool,
     directory_open: Option<u32>,
+    /// The overlay handle CREATE opened; CLEANUP closes it, releasing sharing and delete-on-close.
     overlay_open: bool,
+    /// The overlay body reference CLEANUP retains for the FILE_OBJECT's paging I/O (a Section
+    /// keeps its FILE_OBJECT after the last handle closes); CLOSE releases it.
+    overlay_body: bool,
     is_directory: bool,
     granted_access: u32,
     create_options: u32,
@@ -410,6 +414,7 @@ impl MountedVolumeBackend {
             installed_handle_open: false,
             directory_open: None,
             overlay_open: false,
+            overlay_body: false,
             is_directory: false,
             granted_access: parameters.desired_access.bits(),
             create_options: options,
@@ -796,7 +801,7 @@ impl MountedVolumeBackend {
                 debug_assert!(self.bindings[index].is_none());
                 self.bindings[index] = Some(MountedBinding {
                     context, volume_share: None, installed_open: None, installed_handle_open: false,
-                    directory_open: None, overlay_open: true,
+                    directory_open: None, overlay_open: true, overlay_body: false,
                     is_directory: captured.spec.is_directory,
                     granted_access: captured.owner.parameters.desired_access.bits(),
                     create_options: captured.owner.parameters.create_options.bits(),
@@ -1022,6 +1027,7 @@ impl MountedVolumeBackend {
             installed_handle_open: false,
             directory_open: Some(directory_open),
             overlay_open: false,
+            overlay_body: false,
             is_directory: true,
             granted_access: access,
             create_options: options,
@@ -1092,6 +1098,7 @@ impl MountedVolumeBackend {
             installed_handle_open: true,
             directory_open: None,
             overlay_open: false,
+            overlay_body: false,
             is_directory: false,
             granted_access: access,
             create_options: options,
@@ -1212,6 +1219,7 @@ impl MountedVolumeBackend {
             installed_handle_open: false,
             directory_open: None,
             overlay_open: true,
+            overlay_body: false,
             is_directory,
             granted_access: access,
             create_options: options,
@@ -1242,13 +1250,15 @@ impl MountedVolumeBackend {
         Ok((context, binding))
     }
 
-    /// Resolve the File body retained by CREATE, never the path used to open it.
+    /// Resolve the File body retained by CREATE, never the path used to open it. After CLEANUP
+    /// only paging I/O reaches the body, through the reference CLEANUP retained until CLOSE.
     fn opened_overlay_file(
         &self,
         context: nt_fs::LayeredOpenContextId,
         binding: MountedBinding,
-        file_id: nt_io_manager::FileId,
+        irp: &IrpProjection,
     ) -> Result<u64, NtStatus> {
+        let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
         if binding.is_directory {
             return Err(NtStatus::INVALID_DEVICE_REQUEST);
         }
@@ -1260,7 +1270,7 @@ impl MountedVolumeBackend {
         else {
             return Err(NtStatus::ACCESS_DENIED);
         };
-        if !binding.overlay_open {
+        if !binding.overlay_admits(irp.request_flags.is_paging_io()) {
             return Err(NtStatus::INVALID_HANDLE);
         }
         Ok(overlay_file)
@@ -1298,7 +1308,7 @@ impl MountedVolumeBackend {
             file_id: overlay_file,
         } = record.source
         {
-            if !binding.overlay_open {
+            if !binding.overlay_admits(irp.request_flags.is_paging_io()) {
                 return Err(NtStatus::INVALID_HANDLE);
             }
             let info = unsafe { crate::writable_fs::file_object_information(overlay_file) }
@@ -1614,8 +1624,7 @@ impl MountedVolumeBackend {
         if binding.granted_access & write_access == 0 {
             return Err(NtStatus::ACCESS_DENIED);
         }
-        let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
-        let overlay_file = self.opened_overlay_file(context, binding, file_id)?;
+        let overlay_file = self.opened_overlay_file(context, binding, irp)?;
         let info =
             unsafe { crate::writable_fs::file_object_information(overlay_file) }.map_err(status)?;
         let synchronous = binding.create_options
@@ -1672,8 +1681,7 @@ impl MountedVolumeBackend {
         if !nt_fs::file_flush_access_allowed(binding.granted_access, false) {
             return Err(NtStatus::ACCESS_DENIED);
         }
-        let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
-        let overlay_file = self.opened_overlay_file(context, binding, file_id)?;
+        let overlay_file = self.opened_overlay_file(context, binding, irp)?;
         let result = unsafe { crate::writable_fs::flush(overlay_file) };
         Ok(DispatchOutcome::Completed {
             status: status(result),
@@ -1717,11 +1725,23 @@ impl MountedVolumeBackend {
             .source
         {
             if binding.overlay_open {
+                if !binding.overlay_body {
+                    unsafe { crate::writable_fs::retain_io_reference(overlay_file) }
+                        .map_err(status)?;
+                    self.bindings[index].as_mut().expect("validated binding").overlay_body = true;
+                }
                 unsafe { crate::writable_fs::close_checked(overlay_file) }.map_err(status)?;
                 self.bindings[index]
                     .as_mut()
                     .expect("validated binding")
                     .overlay_open = false;
+            }
+            if close {
+                if self.bindings[index].is_some_and(|binding| binding.overlay_body) {
+                    unsafe { crate::writable_fs::release_io_reference(overlay_file) }
+                        .map_err(status)?;
+                    self.bindings[index].as_mut().expect("validated binding").overlay_body = false;
+                }
             }
         }
         if close {
@@ -1737,6 +1757,12 @@ impl MountedVolumeBackend {
             information: 0,
             file_context: None,
         })
+    }
+}
+
+impl MountedBinding {
+    fn overlay_admits(&self, paging_io: bool) -> bool {
+        self.overlay_open || (paging_io && self.overlay_body)
     }
 }
 

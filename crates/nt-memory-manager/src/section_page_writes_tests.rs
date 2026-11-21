@@ -194,17 +194,53 @@ fn an_uncertain_write_at_section_deletion_keeps_only_its_own_page() {
     assert_eq!(table.routed_lease_exact(identity), RoutedSectionLease::new(11));
 }
 
-#[test]
-fn the_mapped_page_writer_keeps_a_failing_page_of_a_live_section_dirty() {
+/// A live section's page whose unmapped write failed with page 0 still mapped elsewhere.
+fn live_section_with_failed_page(status: u32) -> (GenericSectionTable, usize, SectionIdentity) {
     let (mut table, section, identity) = routed_table(11);
     assert!(table.map_view(4, section, 0x20000, 0x1000, 0));
     assert!(table.unmap_view(3, 0x10000).is_some());
-    for _ in 0..40 {
-        let next = table.next_unmapped_page_write().unwrap();
-        assert_eq!((next.via, next.ticket.page_index, next.released), (identity, 1, false));
-        let write = table.begin_page_write(next.via, next.ticket).unwrap();
-        assert!(table.finish_page_write(write, PageWriteOutcome::Failed(IO_ERROR)));
-    }
+    let next = table.next_unmapped_page_write().unwrap();
+    assert_eq!((next.via, next.ticket.page_index, next.released), (identity, 1, false));
+    let write = table.begin_page_write(next.via, next.ticket).unwrap();
+    assert!(table.finish_page_write(write, PageWriteOutcome::Failed(status)));
+    (table, section, identity)
+}
+
+#[test]
+fn the_mapped_page_writer_parks_a_definitely_failed_page_of_a_live_section() {
+    // MiWriteComplete leaves the page modified; the modified writer does not reissue it at once.
+    let (mut table, section, identity) = live_section_with_failed_page(IO_ERROR);
+    assert_eq!(table.next_unmapped_page_write(), None, "no tight retry of a definite failure");
+    let pending = table.prepare_section_writeback(identity).unwrap();
+    assert!(pending.iter().any(|ticket| ticket.page_index == 1),
+        "the page stays dirty and an explicit flush still writes it");
+    assert!(table.mark_page_dirty(section, 1));
+    let next = table.next_unmapped_page_write().unwrap();
+    assert_eq!(next.ticket.page_index, 1, "a new modification starts a new write cycle");
+}
+
+#[test]
+fn a_parked_page_is_written_once_its_section_is_released() {
+    let (mut table, section, identity) = live_section_with_failed_page(IO_ERROR);
+    assert!(table.unmap_view(4, 0x20000).is_some());
+    let first = table.next_unmapped_page_write().unwrap();
+    assert_eq!(first.ticket.page_index, 0, "the newly unmapped page is ordinary work");
+    let write = table.begin_page_write(first.via, first.ticket).unwrap();
+    assert!(table.finish_page_write(write, PageWriteOutcome::Written));
+    assert_eq!(table.next_unmapped_page_write(), None);
+    assert!(!table.has_async_dirty_pages(), "the parked page keeps no page writer scanning");
+    assert!(table.release_handle(section));
+    let clean = table.next_unmapped_page_write().unwrap();
+    assert_eq!((clean.via, clean.ticket.page_index, clean.released), (identity, 1, true),
+        "MiCleanSection writes every modified page, including a parked one");
+}
+
+#[test]
+fn the_mapped_page_writer_retries_a_transient_failure() {
+    let (table, _, identity) = live_section_with_failed_page(RESOURCES);
+    let next = table.next_unmapped_page_write().unwrap();
+    assert_eq!((next.via, next.ticket.page_index), (identity, 1), "MmIsRetryIoStatus");
+    assert!(table.has_async_dirty_pages());
 }
 
 #[test]

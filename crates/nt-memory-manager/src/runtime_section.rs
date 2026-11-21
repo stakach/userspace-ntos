@@ -336,6 +336,9 @@ struct GenericSectionPage {
     writer: PageWriter,
     /// Retryable failures of section deletion's synchronous page write.
     write_failures: u8,
+    /// The mapped page writer's write failed definitively: the page stays modified, written by an
+    /// explicit flush, its next modification, or section deletion, never reissued at once.
+    write_parked: bool,
 }
 
 impl GenericSectionPage {
@@ -349,6 +352,7 @@ impl GenericSectionPage {
             dirty_epoch: 0,
             writer: PageWriter::Idle,
             write_failures: 0,
+            write_parked: false,
         }
     }
 }

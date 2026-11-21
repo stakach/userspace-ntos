@@ -122,6 +122,7 @@ impl GenericSectionTable {
                 page.dirty = true;
                 page.dirty_epoch = self.dirty_epoch;
                 page.write_failures = 0;
+                page.write_parked = false;
             }
         }
         debug_assert_eq!(self.dirty_epoch, last_epoch);

@@ -138,6 +138,7 @@ impl GenericSectionTable {
             PageWriteOutcome::Written => {
                 page.writer = PageWriter::Idle;
                 page.write_failures = 0;
+                page.write_parked = false;
                 if page.dirty && page.dirty_epoch == write.ticket.dirty_epoch {
                     page.dirty = false;
                 }
@@ -151,6 +152,10 @@ impl GenericSectionTable {
                     {
                         page.dirty = false; // The lost write is not retried.
                     }
+                } else if page.dirty_epoch == write.ticket.dirty_epoch
+                    && !retryable_write_status(status)
+                {
+                    page.write_parked = true;
                 }
             }
             PageWriteOutcome::Uncertain => {
@@ -195,6 +200,7 @@ impl GenericSectionTable {
             };
             if area.kind != GENERIC_SECTION_BACKING_ROUTED
                 || !Self::page_needs_write(area, page)
+                || self.page_writer_parked(area, page)
                 || self.area_page_mapped(area.id, page.page_index)
             {
                 continue;
@@ -270,7 +276,9 @@ impl GenericSectionTable {
                     area.id == page.control_area
                         && area.kind == GENERIC_SECTION_BACKING_ROUTED
                         && (matches!(page.writer, PageWriter::InFlight { .. })
-                            || (page.writer == PageWriter::Idle && Self::page_needs_write(*area, page)))
+                            || (page.writer == PageWriter::Idle
+                                && Self::page_needs_write(*area, page)
+                                && !self.page_writer_parked(*area, page)))
                 })
         })
     }
@@ -363,6 +371,12 @@ impl GenericSectionTable {
             return Err(STATUS_NOT_MAPPED_VIEW);
         }
         self.aliases_for_area_page(write.ticket.control_area, write.ticket.file_offset)
+    }
+
+    /// A parked page waits for its next write cycle while a section still holds its file data;
+    /// once every section is released, MiCleanSection writes it like any modified page.
+    fn page_writer_parked(&self, area: ControlArea, page: &GenericSectionPage) -> bool {
+        page.write_parked && self.control_area_live(area.id)
     }
 
     fn page_needs_write(area: ControlArea, page: &GenericSectionPage) -> bool {

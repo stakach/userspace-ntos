@@ -199,3 +199,21 @@ fn missing_backing_node_fails_without_mutation() {
     assert_eq!(fs.zw_begin_file_io(handle), Err(STATUS_DATA_ERROR));
     assert_eq!(state(&fs, handle), before);
 }
+
+#[test]
+fn a_retained_body_serves_paging_writes_after_cleanup_releases_sharing() {
+    // A Section's FILE_OBJECT outlives its last handle: the mounted backend retains one body
+    // reference before CLEANUP closes the handle, and its paging writes reach the file until CLOSE.
+    let (mut fs, handle) = open(FILE_NON_DIRECTORY_FILE);
+    fs.zw_retain_io_reference(handle).unwrap();
+    assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
+    assert_eq!(state(&fs, handle).1, 0, "the handle is gone");
+    let exclusive = fs.zw_create_file(PATH, FILE_READ_DATA | FILE_WRITE_DATA, 0, 0, FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE);
+    assert_eq!(exclusive.status, STATUS_SUCCESS, "CLEANUP released the sharing claim");
+    assert_eq!(fs.zw_close(exclusive.handle), STATUS_SUCCESS);
+    assert_eq!(fs.zw_write_file(handle, Some(0), b"page"), (STATUS_SUCCESS, 4));
+    fs.zw_release_io_reference(handle).unwrap();
+    assert!(fs.obj(handle).is_none(), "CLOSE released the last body reference");
+    assert_eq!(fs.zw_write_file(handle, Some(0), b"page").0, STATUS_INVALID_HANDLE);
+}

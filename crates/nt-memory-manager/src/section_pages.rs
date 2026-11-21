@@ -77,6 +77,7 @@ impl GenericSectionTable {
             dirty_epoch: epoch,
             writer: PageWriter::Idle,
             write_failures: 0,
+            write_parked: false,
         };
         if let Some(index) = self.pages.iter().position(|entry| !entry.live) {
             self.pages[index] = page;
@@ -102,6 +103,7 @@ impl GenericSectionTable {
             page.dirty = true;
             page.dirty_epoch = epoch;
             page.write_failures = 0;
+            page.write_parked = false;
             true
         } else {
             false
