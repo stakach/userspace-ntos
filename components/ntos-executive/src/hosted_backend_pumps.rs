@@ -8,11 +8,14 @@
 //! (`nt_hosted_runtime::KeptBackendPumps`).
 
 use super::*;
+use hosted_file_dispatch::BackendTail;
 use nt_hosted_runtime::{BackendCollect, BackendTicket, KeptBackendPumps};
 
 struct KeptBackend {
     continuation: FileIrpPumpContinuation,
     output: Vec<u8>,
+    /// Owed once, when the native pump returns.
+    tail: BackendTail,
 }
 
 type Returned = (HostedIrpTransportResult, Vec<u8>);
@@ -43,8 +46,9 @@ pub(super) enum BackendCollected {
 /// Dispatch `major` to `inst` exactly as `dispatch_irp_for_instance_exact`, except that an
 /// unfinished pump with no lane to keep it is kept here for the caller (#420). The row and the
 /// owned output are reserved before the provider can enter; a refused reservation is a
-/// certainly unentered `INSUFFICIENT_RESOURCES`. `None` is the exact dispatch's own "the
-/// instance is not available".
+/// certainly unentered `INSUFFICIENT_RESOURCES`. `tail` runs once, on whichever path the native
+/// return arrives. `None` is the exact dispatch's own "the instance is not available", when the
+/// tail leaves it as such.
 pub(super) unsafe fn dispatch_exact(
     inst: usize,
     major: u64,
@@ -55,26 +59,29 @@ pub(super) unsafe fn dispatch_exact(
     fsctl: u64,
     file_id: u64,
     requestor_tid: u64,
+    dispatch_request: Option<IrpDispatchRequest>,
     in_data: &[u8],
     out: &mut [u8],
     caller: nt_process::native_handle::NativeHandleCaller,
+    tail: BackendTail,
 ) -> Option<BackendDispatch> {
     let mut output = Vec::new();
     if kept().reserve().is_err() || output.try_reserve_exact(out.len()).is_err() {
-        return Some(BackendDispatch::Returned(HostedIrpTransportResult::NotDispatched {
+        return tail.finish(Some(HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
-        }));
+        })).map(BackendDispatch::Returned);
     }
     match dispatch_irp_for_instance_exact_retaining(
         inst, major, minor, device_object, canonical_irp_id, canonical_file_id, fsctl, file_id,
-        requestor_tid, None, in_data, out, caller,
+        requestor_tid, dispatch_request, in_data, out, caller,
     ) {
-        HostedIrpDispatchProgress::Returned(result) => result.map(BackendDispatch::Returned),
+        HostedIrpDispatchProgress::Returned(result) =>
+            tail.finish(result).map(BackendDispatch::Returned),
         HostedIrpDispatchProgress::ChildWorkYield(continuation) => {
             // The native output is copied only when the pump returns; size it exactly as the
             // caller's buffer.
             output.resize(out.len(), 0);
-            let ticket = kept().keep(KeptBackend { continuation, output });
+            let ticket = kept().keep(KeptBackend { continuation, output, tail });
             trace(b"kept", ticket.id());
             Some(BackendDispatch::Pending(ticket))
         }
@@ -87,6 +94,11 @@ pub(super) fn collect(ticket: BackendTicket) -> BackendCollected {
         BackendCollect::Pending(ticket) => BackendCollected::Pending(ticket),
         BackendCollect::Collected((result, output)) => BackendCollected::Collected(result, output),
     }
+}
+
+/// Whether the ticket's next collection would find its true result. Changes nothing.
+pub(super) fn collectable(ticket: &BackendTicket) -> bool {
+    kept().collectable(ticket)
 }
 
 /// Root boundary only: resume each kept backend pump once. A return is held for its caller; a
@@ -107,9 +119,11 @@ pub(super) unsafe fn redrive() -> usize {
     let mut progressed = 0;
     for id in ids {
         // A resume may keep or collect another row: hold no borrow across it.
-        let Some(KeptBackend { continuation, mut output }) = kept().take_pump(id) else { continue };
+        let Some(KeptBackend { continuation, mut output, tail }) = kept().take_pump(id)
+        else { continue };
         match continuation.resume_after_child(&mut output) {
             Ok(FileIrpResumeProgress::Completed(result)) => {
+                let result = tail.finish_returned(result);
                 if kept().returned(id, (result, output)).is_err() {
                     trace(b"unowned-return", id);
                     continue;
@@ -118,7 +132,7 @@ pub(super) unsafe fn redrive() -> usize {
                 progressed += 1;
             }
             Ok(FileIrpResumeProgress::ChildWorkYield(continuation)) | Err(continuation) => {
-                if kept().unfinished(id, KeptBackend { continuation, output }).is_err() {
+                if kept().unfinished(id, KeptBackend { continuation, output, tail }).is_err() {
                     trace(b"unowned-pump", id);
                 }
             }

@@ -44,7 +44,7 @@ pub(super) struct FileDispatchContinuation {
 /// What `execute_with_capture` does after its native dispatch returns. A kept pump carries it
 /// so the resumed return runs the same tail exactly once.
 #[derive(Clone, Copy)]
-struct ExecuteTail {
+pub(super) struct ExecuteTail {
     instance_index: usize,
     irp_id: u64,
     major: u8,
@@ -101,6 +101,59 @@ impl ExecuteTail {
             }
         }
         result
+    }
+
+    /// Reserve the SCSI data DMA this dispatch moves; its settlement is then owed by `finish`.
+    fn reserve_scsi_data(
+        &mut self,
+        request: &IrpDispatchRequest,
+        projection: &IrpProjection,
+    ) -> Result<(), nt_status::NtStatus> {
+        let IoParameters::Scsi(parameters) = &projection.parameters else { return Ok(()) };
+        if parameters.data_length == 0 { return Ok(()); }
+        unsafe {
+            hosted_scsi_dma_reservation::reserve_for_dispatch(
+                request, parameters.route.provider_pdo, u64::from(parameters.data_length),
+            )
+        }?;
+        self.scsi_data = true;
+        Ok(())
+    }
+}
+
+/// The effect a backend dispatch owes after its native return (#420). A kept backend pump
+/// carries it, so a resumed return runs the same tail exactly once.
+pub(super) enum BackendTail {
+    /// The caller owns every post-dispatch effect.
+    None,
+    /// `execute`'s SCSI DMA settlement and CREATE registry commit.
+    Execute(ExecuteTail),
+    /// A successful completion ACK finishes the source CREATE subject it retired.
+    Ack { instance_index: usize, irp_id: IrpId },
+}
+
+impl BackendTail {
+    /// `None` is the exact dispatch's own "the instance is not available".
+    pub(super) fn finish(
+        self,
+        result: Option<HostedIrpTransportResult>,
+    ) -> Option<HostedIrpTransportResult> {
+        match self {
+            Self::None => result,
+            Self::Execute(tail) => Some(tail.finish(result)),
+            Self::Ack { instance_index, irp_id } => {
+                let result = result.unwrap_or(HostedIrpTransportResult::NotDispatched {
+                    status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+                });
+                finish_source_create_ack(instance_index, irp_id, &result);
+                Some(result)
+            }
+        }
+    }
+
+    /// The tail of a pump that genuinely returned.
+    pub(super) fn finish_returned(self, result: HostedIrpTransportResult) -> HostedIrpTransportResult {
+        self.finish(Some(result)).expect("a returned dispatch keeps its result")
     }
 }
 
@@ -576,13 +629,12 @@ pub(super) fn borrowed_control_result(
     }
 }
 
-pub(super) fn control(
+/// Only the completion-storage selectors are controls; the storage instance is resolved once.
+fn control_storage(
     instance_index: usize,
     irp_id: IrpId,
     operation: u64,
-    offset: u64,
-    output: &mut [u8],
-) -> HostedIrpTransportResult {
+) -> Result<usize, HostedIrpTransportResult> {
     if !matches!(
         operation,
         FSD_DISPATCH_ACK_COMPLETION
@@ -591,11 +643,52 @@ pub(super) fn control(
             | FSD_DISPATCH_CANCEL_IRP
     ) || irp_id.raw() == 0
     {
-        return HostedIrpTransportResult::NotDispatched {
+        return Err(HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus::INVALID_PARAMETER,
-        };
+        });
     }
-    let storage_instance = hosted_completion_storage_instance(instance_index);
+    Ok(hosted_completion_storage_instance(instance_index))
+}
+
+fn control_tail(instance_index: usize, irp_id: IrpId, operation: u64) -> BackendTail {
+    if operation == FSD_DISPATCH_ACK_COMPLETION {
+        BackendTail::Ack { instance_index, irp_id }
+    } else {
+        BackendTail::None
+    }
+}
+
+/// A successful ACK retired the source CREATE's retained IRP; finish its subject.
+fn finish_source_create_ack(instance_index: usize, irp_id: IrpId, result: &HostedIrpTransportResult) {
+    if !matches!(result, HostedIrpTransportResult::Returned {
+        status: nt_status::NtStatus::SUCCESS,
+        information: 0,
+        file_context: 0,
+    }) {
+        return;
+    }
+    if let Some(source) = instance(instance_index) {
+        if let Some(identity) = hosted_source_create_security::lookup_retained_irp(source, irp_id) {
+            hosted_create_subject_registration::finish(
+                source,
+                identity,
+                hosted_create_subject_registration::SourceCreateCompletion::AcknowledgedTerminal,
+            );
+        }
+    }
+}
+
+pub(super) fn control(
+    instance_index: usize,
+    irp_id: IrpId,
+    operation: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> HostedIrpTransportResult {
+    let storage_instance = match control_storage(instance_index, irp_id, operation) {
+        Ok(storage_instance) => storage_instance,
+        Err(refused) => return refused,
+    };
     let mutable_probe = matches!(operation,
         FSD_DISPATCH_COPY_MUTABLE_INPUT | FSD_DISPATCH_ACK_COMPLETION);
     let probe_stage = if operation == FSD_DISPATCH_COPY_MUTABLE_INPUT { 20 } else { 22 };
@@ -630,24 +723,34 @@ pub(super) fn control(
             probe_stage + 1, irp_id, instance_index, storage_instance as u64, Some(&result),
         );
     }
-    if operation == FSD_DISPATCH_ACK_COMPLETION
-        && matches!(result, HostedIrpTransportResult::Returned {
-            status: nt_status::NtStatus::SUCCESS,
-            information: 0,
-            file_context: 0,
-        })
-    {
-        if let Some(source) = instance(instance_index) {
-            if let Some(identity) = hosted_source_create_security::lookup_retained_irp(source, irp_id) {
-                hosted_create_subject_registration::finish(
-                    source,
-                    identity,
-                    hosted_create_subject_registration::SourceCreateCompletion::AcknowledgedTerminal,
-                );
-            }
-        }
+    control_tail(instance_index, irp_id, operation).finish_returned(result)
+}
+
+/// [`control`] for a caller whose row keeps a ticket (#420): an unfinished pump with no lane
+/// to keep it stays kept with its ACK tail, and the row's next turn collects the true result.
+pub(super) fn control_kept(
+    instance_index: usize,
+    irp_id: IrpId,
+    operation: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> hosted_backend_pumps::BackendDispatch {
+    let storage_instance = match control_storage(instance_index, irp_id, operation) {
+        Ok(storage_instance) => storage_instance,
+        Err(refused) => return hosted_backend_pumps::BackendDispatch::Returned(refused),
+    };
+    unsafe {
+        hosted_backend_pumps::dispatch_exact(
+            storage_instance, operation, 0, 0, irp_id.raw(), 0, offset, 0, 0, None, &[], output,
+            crate::initial_system_driver_caller(),
+            control_tail(instance_index, irp_id, operation),
+        )
     }
-    result
+    .unwrap_or(hosted_backend_pumps::BackendDispatch::Returned(
+        HostedIrpTransportResult::NotDispatched {
+            status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+        },
+    ))
 }
 
 /// Issue a retained PnP ACK to its captured physical completion store. The dependent driver
@@ -704,6 +807,51 @@ pub(super) fn execute(
 ) -> HostedIrpTransportResult {
     execute_with_capture(instance_index, caller, projection, input, output,
         ExternalFileIrpOutputCapture::Information)
+}
+
+/// [`execute`] for a caller whose row keeps a ticket (#420): an unfinished pump with no lane to
+/// keep it stays kept with its execute tail, and the row's next turn collects the true result.
+pub(super) fn execute_kept(
+    instance_index: usize,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    projection: &IrpProjection,
+    input: &[u8],
+    output: &mut [u8],
+) -> hosted_backend_pumps::BackendDispatch {
+    use hosted_backend_pumps::BackendDispatch;
+    let (request, route_instance, route_inst, device_object) =
+        match prepare_dispatch_request(
+            instance_index, projection, input.len(), output.len(),
+            ExternalFileIrpOutputCapture::Information,
+        ) {
+            Ok(prepared) => prepared,
+            Err(status) => return BackendDispatch::Returned(
+                HostedIrpTransportResult::NotDispatched { status }),
+        };
+    let mut tail = ExecuteTail::none(instance_index, projection.irp_id.raw(), projection.major,
+        route_instance, route_inst);
+    if let Err(status) = tail.reserve_scsi_data(&request, projection) {
+        return BackendDispatch::Returned(HostedIrpTransportResult::NotDispatched { status });
+    }
+    unsafe {
+        hosted_backend_pumps::dispatch_exact(
+            route_instance,
+            projection.major as u64,
+            projection.minor as u64,
+            device_object,
+            projection.irp_id.raw(),
+            projection.file_id.map(FileId::raw).unwrap_or(0),
+            projection_fsctl(projection),
+            projection.user_data,
+            projection.requestor_tid,
+            Some(request),
+            input,
+            output,
+            caller,
+            BackendTail::Execute(tail),
+        )
+    }
+    .expect("an execute tail always yields a result")
 }
 
 fn prepare_dispatch_request(
@@ -803,19 +951,8 @@ fn execute_retaining(
         };
     let mut tail = ExecuteTail::none(instance_index, projection.irp_id.raw(), projection.major,
         route_instance, route_inst);
-    if let IoParameters::Scsi(parameters) = &projection.parameters {
-        if parameters.data_length != 0 {
-            if let Err(status) = unsafe {
-                hosted_scsi_dma_reservation::reserve_for_dispatch(
-                    &request, parameters.route.provider_pdo,
-                    u64::from(parameters.data_length),
-                )
-            } {
-                return FileExecuteProgress::Returned(
-                    HostedIrpTransportResult::NotDispatched { status });
-            }
-            tail.scsi_data = true;
-        }
+    if let Err(status) = tail.reserve_scsi_data(&request, projection) {
+        return FileExecuteProgress::Returned(HostedIrpTransportResult::NotDispatched { status });
     }
     let progress = unsafe {
         dispatch_irp_for_instance_exact_retaining(
@@ -861,18 +998,8 @@ fn execute_with_capture(
         };
     let mut tail = ExecuteTail::none(instance_index, projection.irp_id.raw(), projection.major,
         route_instance, route_inst);
-    if let IoParameters::Scsi(parameters) = &projection.parameters {
-        if parameters.data_length != 0 {
-            if let Err(status) = unsafe {
-                hosted_scsi_dma_reservation::reserve_for_dispatch(
-                    &request, parameters.route.provider_pdo,
-                    u64::from(parameters.data_length),
-                )
-            } {
-                return HostedIrpTransportResult::NotDispatched { status };
-            }
-            tail.scsi_data = true;
-        }
+    if let Err(status) = tail.reserve_scsi_data(&request, projection) {
+        return HostedIrpTransportResult::NotDispatched { status };
     }
     let result = unsafe {
         dispatch_irp_for_instance_exact(

@@ -46,6 +46,24 @@ struct Work {
     post_retirement_pending_terminal: Option<bool>,
     ack: Option<RetainedAck>,
     cancel_requested: bool,
+    /// A provider dispatch or ACK whose pump is still running (#420). Every turn collects it
+    /// first; cancellation and retirement wait while it is held.
+    provider_running: Option<ProviderRunning>,
+}
+
+enum ProviderRunning {
+    /// The subsidiary IRP's dispatch; its driver publishes an inline terminal.
+    Dispatch { ticket: nt_hosted_runtime::BackendTicket, driver_id: DriverId },
+    /// The subsidiary's completion ACK.
+    Ack(nt_hosted_runtime::BackendTicket),
+}
+
+impl ProviderRunning {
+    fn ticket(&self) -> &nt_hosted_runtime::BackendTicket {
+        match self {
+            Self::Dispatch { ticket, .. } | Self::Ack(ticket) => ticket,
+        }
+    }
 }
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
@@ -293,6 +311,7 @@ pub(super) unsafe fn submit(
         post_retirement_pending_terminal: None,
         ack: None,
         cancel_requested: false,
+        provider_running: None,
     };
     let index = if let Some(index) = slot {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
@@ -348,6 +367,9 @@ impl Work {
     }
 
     unsafe fn ready_for_nested_step(&self) -> bool {
+        if let Some(running) = &self.provider_running {
+            return hosted_backend_pumps::collectable(running.ticket());
+        }
         if self.post_retirement_pending_terminal.is_some() {
             return true;
         }
@@ -493,8 +515,47 @@ impl Work {
         let provider = self
             .provider_instance_if_exact()
             .expect("entered lower File provider identity");
-        let result =
-            hosted_file_dispatch::execute(provider, Some(self.caller), &projection, &[], &mut []);
+        match hosted_file_dispatch::execute_kept(provider, self.caller, &projection, &[], &mut []) {
+            hosted_backend_pumps::BackendDispatch::Returned(result) =>
+                self.provider_dispatched(result, projection.driver_id),
+            hosted_backend_pumps::BackendDispatch::Pending(ticket) => {
+                self.provider_running =
+                    Some(ProviderRunning::Dispatch { ticket, driver_id: projection.driver_id });
+            }
+        }
+    }
+
+    /// Collect a running provider dispatch or ACK. `false`: still running, and this turn has
+    /// no other effect.
+    unsafe fn collect_provider(&mut self) -> bool {
+        let Some(running) = self.provider_running.take() else { return true };
+        let (ticket, driver_id) = match running {
+            ProviderRunning::Dispatch { ticket, driver_id } => (ticket, Some(driver_id)),
+            ProviderRunning::Ack(ticket) => (ticket, None),
+        };
+        let result = match hosted_backend_pumps::collect(ticket) {
+            hosted_backend_pumps::BackendCollected::Pending(ticket) => {
+                self.provider_running = Some(match driver_id {
+                    Some(driver_id) => ProviderRunning::Dispatch { ticket, driver_id },
+                    None => ProviderRunning::Ack(ticket),
+                });
+                return false;
+            }
+            hosted_backend_pumps::BackendCollected::Collected(result, _) => result,
+        };
+        match driver_id {
+            Some(driver_id) => {
+                self.provider_dispatched(result, driver_id);
+                true
+            }
+            None => self.provider_ack_returned(result),
+        }
+    }
+
+    /// The subsidiary dispatch's true return, exactly once.
+    unsafe fn provider_dispatched(&mut self, result: HostedIrpTransportResult, driver_id: DriverId) {
+        let identity = self.forward.as_ref().expect("entered lower File owner").identity();
+        let subsidiary = identity.subsidiary_irp;
         let outcome = match result {
             HostedIrpTransportResult::NotDispatched { status } => {
                 FileLifecycleDispatchReturn::NotEntered(status)
@@ -540,7 +601,6 @@ impl Work {
                 information,
             } => {
                 self.initial_status = Some(status.raw());
-                let driver_id = projection.driver_id;
                 if io_manager_mut().completed_irp(subsidiary).is_none() {
                     assert!(
                         io_manager_mut().publish_driver_completion(
@@ -674,49 +734,20 @@ impl Work {
             let Some(provider) = provider else {
                 return false;
             };
-            let result = hosted_file_dispatch::control(
+            match hosted_file_dispatch::control_kept(
                 provider,
                 identity.subsidiary_irp,
                 FSD_DISPATCH_ACK_COMPLETION,
                 0,
                 &mut [],
-            );
-            match result {
-                HostedIrpTransportResult::Returned {
-                    status: nt_status::NtStatus::SUCCESS,
-                    information: 0,
-                    file_context: 0,
-                } => {
-                    self.provider_acknowledged = true;
-                    forward
-                        .acknowledge(
-                            io_manager_mut(),
-                            identity,
-                            CompletionAcknowledgement::Acknowledged,
-                        )
-                        .expect("lower File physical ACK identity");
+            ) {
+                hosted_backend_pumps::BackendDispatch::Returned(result) => {
+                    if !self.provider_ack_returned(result) {
+                        return false;
+                    }
                 }
-                HostedIrpTransportResult::NotDispatched { .. } => return false,
-                HostedIrpTransportResult::Indeterminate { transport_status } => {
-                    forward
-                        .acknowledge(
-                            io_manager_mut(),
-                            identity,
-                            CompletionAcknowledgement::Indeterminate { transport_status },
-                        )
-                        .expect("lower File uncertain ACK identity");
-                    return false;
-                }
-                HostedIrpTransportResult::Returned { status, .. } => {
-                    forward
-                        .acknowledge(
-                            io_manager_mut(),
-                            identity,
-                            CompletionAcknowledgement::Indeterminate {
-                                transport_status: status,
-                            },
-                        )
-                        .expect("lower File unexpected ACK identity");
+                hosted_backend_pumps::BackendDispatch::Pending(ticket) => {
+                    self.provider_running = Some(ProviderRunning::Ack(ticket));
                     return false;
                 }
             }
@@ -733,6 +764,30 @@ impl Work {
             }
         }
         self.finish_post_retirement()
+    }
+
+    /// The subsidiary ACK's true return, exactly once. `true` only when it acknowledged.
+    unsafe fn provider_ack_returned(&mut self, result: HostedIrpTransportResult) -> bool {
+        let forward = self.forward.as_mut().expect("acknowledging lower File owner");
+        let identity = forward.identity();
+        let acknowledgement = match result {
+            HostedIrpTransportResult::Returned {
+                status: nt_status::NtStatus::SUCCESS,
+                information: 0,
+                file_context: 0,
+            } => CompletionAcknowledgement::Acknowledged,
+            HostedIrpTransportResult::NotDispatched { .. } => return false,
+            HostedIrpTransportResult::Indeterminate { transport_status } =>
+                CompletionAcknowledgement::Indeterminate { transport_status },
+            HostedIrpTransportResult::Returned { status, .. } =>
+                CompletionAcknowledgement::Indeterminate { transport_status: status },
+        };
+        let acknowledged = acknowledgement == CompletionAcknowledgement::Acknowledged;
+        forward
+            .acknowledge(io_manager_mut(), identity, acknowledgement)
+            .expect("lower File ACK identity");
+        self.provider_acknowledged = acknowledged;
+        acknowledged
     }
 
     unsafe fn finish_post_retirement(&mut self) -> bool {
@@ -821,6 +876,11 @@ impl Work {
     }
 
     unsafe fn advance(&mut self, handler: *mut ExecNtHandler) -> bool {
+        // A running provider effect is collected before anything else may observe or cancel
+        // its IRP.
+        if !self.collect_provider() {
+            return false;
+        }
         if self.origin.inline_held() {
             return self.advance_inline_held();
         }

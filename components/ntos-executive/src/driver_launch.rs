@@ -4843,7 +4843,8 @@ impl HostedVideoMonitorArray {
             instance_index, FSD_DISPATCH_VIDEO_MONITOR_ARRAY_ACK,
             self.identity.allocation.pool_generation, parent_object, 0, 0,
             self.identity.allocation.component_address, parent_object, 0,
-            &[], &mut [], crate::initial_system_driver_caller(),
+            None, &[], &mut [], crate::initial_system_driver_caller(),
+            hosted_file_dispatch::BackendTail::None,
         ) {
             Some(hosted_backend_pumps::BackendDispatch::Pending(ticket)) => {
                 self.provider_ack = Some(ticket);
@@ -48234,9 +48235,11 @@ unsafe fn acknowledge_hosted_video_relation(
         allocation,
         parent_object,
         0,
+        None,
         &[],
         &mut [],
         crate::initial_system_driver_caller(),
+        hosted_file_dispatch::BackendTail::None,
     ) {
         Some(hosted_backend_pumps::BackendDispatch::Pending(ticket)) => {
             query.provider_ack = Some(ticket);

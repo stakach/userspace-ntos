@@ -8,6 +8,9 @@ enum QueryOwner {
     Retained(nt_io_manager::RetainedExternalPnp),
     RetainedIndeterminate(nt_io_manager::RetainedExternalPnp),
     DispatchReturned(nt_io_manager::ExternalPnpReturn),
+    /// The provider ACK is running (#420): its pump is kept, and the next drain collects its
+    /// true result into this exact invocation. Domain retirement waits.
+    AckRunning(nt_io_manager::ExternalPnpCompletionInvocation, nt_hosted_runtime::BackendTicket),
     AckReturned(nt_io_manager::ExternalPnpCompletionReturn),
     Indeterminate,
 }
@@ -229,10 +232,41 @@ unsafe fn complete(index: usize) -> bool {
             return false;
         }
     };
-    let returned = invocation.invoke(|_| {
-        hosted_file_dispatch::acknowledgement_result(hosted_file_dispatch::control(
-            provider, irp, FSD_DISPATCH_ACK_COMPLETION, 0, &mut []))
-    });
+    let result = match hosted_file_dispatch::control_kept(
+        provider, irp, FSD_DISPATCH_ACK_COMPLETION, 0, &mut [],
+    ) {
+        hosted_backend_pumps::BackendDispatch::Returned(result) => result,
+        hosted_backend_pumps::BackendDispatch::Pending(ticket) => {
+            queries()[index].owner = QueryOwner::AckRunning(invocation, ticket);
+            return true;
+        }
+    };
+    finish_ack(index, invocation, result);
+    true
+}
+
+/// The running ACK's next turn: its true result, exactly once, or nothing yet.
+unsafe fn collect_ack(index: usize) -> bool {
+    let owner = core::mem::replace(&mut queries()[index].owner, QueryOwner::InFlight);
+    let QueryOwner::AckRunning(invocation, ticket) = owner else { unreachable!() };
+    match hosted_backend_pumps::collect(ticket) {
+        hosted_backend_pumps::BackendCollected::Pending(ticket) => {
+            queries()[index].owner = QueryOwner::AckRunning(invocation, ticket);
+            false
+        }
+        hosted_backend_pumps::BackendCollected::Collected(result, _) => {
+            finish_ack(index, invocation, result);
+            true
+        }
+    }
+}
+
+unsafe fn finish_ack(
+    index: usize,
+    invocation: nt_io_manager::ExternalPnpCompletionInvocation,
+    result: HostedIrpTransportResult,
+) {
+    let returned = invocation.invoke(|_| hosted_file_dispatch::acknowledgement_result(result));
     match io_manager_mut().finish_external_pnp_completion(returned) {
         Ok((receipt, payload)) if payload.is_empty() => {
             if commit(index, &receipt) { queries().remove(index); }
@@ -241,7 +275,6 @@ unsafe fn complete(index: usize) -> bool {
         Ok(_) => queries()[index].owner = QueryOwner::Indeterminate,
         Err(rejection) => queries()[index].owner = QueryOwner::AckReturned(rejection.into_owner()),
     }
-    true
 }
 
 pub(super) unsafe fn drain() -> usize {
@@ -253,6 +286,8 @@ pub(super) unsafe fn drain() -> usize {
             begin(index)
         } else if matches!(&queries()[index].owner, QueryOwner::Retained(_)) {
             complete(index)
+        } else if matches!(&queries()[index].owner, QueryOwner::AckRunning(..)) {
+            collect_ack(index)
         } else { false };
         progress += usize::from(advanced);
         if queries().len() == before { index += 1; }

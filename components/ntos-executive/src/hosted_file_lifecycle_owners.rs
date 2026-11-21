@@ -2,10 +2,12 @@
 //! removal and process rundown; only the live system caller executes the driver.
 
 use super::*;
+use hosted_backend_pumps::{BackendCollected, BackendDispatch};
+use nt_hosted_runtime::BackendTicket;
 use nt_io_manager::owned_file_lifecycle::{
-    FileLifecycleAckOutcome, FileLifecycleAckResult, FileLifecycleAckReturn,
-    FileLifecycleOutcome, FileLifecycleResult, FileLifecycleReturn, PreparedFileLifecycle,
-    RetainedFileLifecycle,
+    FileLifecycleAckInvocation, FileLifecycleAckOutcome, FileLifecycleAckResult,
+    FileLifecycleAckReturn, FileLifecycleInvocation, FileLifecycleOutcome, FileLifecycleResult,
+    FileLifecycleReturn, PreparedFileLifecycle, RetainedFileLifecycle,
 };
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
 
@@ -15,8 +17,13 @@ use ready_scan::{first_ready, PassClock};
 
 enum Payload {
     Prepared(PreparedFileLifecycle),
+    /// The provider is running the lifecycle IRP (#420); the row's next turn collects its true
+    /// return into this exact invocation. Cancellation and retirement wait.
+    Running(FileLifecycleInvocation, BackendTicket),
     Returned(FileLifecycleReturn),
     Retained(RetainedFileLifecycle),
+    /// The provider is running the completion ACK (#420), collected as `Running` is.
+    AckRunning(FileLifecycleAckInvocation, BackendTicket),
     AckReturned(FileLifecycleAckReturn),
 }
 
@@ -147,6 +154,8 @@ fn receive_owner_fields(row: &Row, rows: &[Row]) -> [u64; 6] {
         Some(Payload::Returned(_)) => 2,
         Some(Payload::Retained(_)) => 3,
         Some(Payload::AckReturned(_)) => 4,
+        Some(Payload::Running(..)) => 5,
+        Some(Payload::AckRunning(..)) => 6,
     };
     [
         row.file_id.raw(), payload,
@@ -246,8 +255,31 @@ fn dispatch_prepared(
     };
     // The projection retains the original requestor TID. The system caller is
     // execution authority only, and does not reauthenticate an exited thread.
-    let result = hosted_file_dispatch::execute(route, Some(executor), &projection, &[], &mut []);
-    let outcome = match result {
+    match hosted_file_dispatch::execute_kept(route, executor, &projection, &[], &mut []) {
+        BackendDispatch::Returned(result) => finish_returned(file_id, invocation.returned(outcome(result))),
+        BackendDispatch::Pending(ticket) => {
+            rows()[index(file_id).expect("lifecycle File owner missing")].payload =
+                Some(Payload::Running(invocation, ticket));
+            true
+        }
+    }
+}
+
+/// The running lifecycle IRP's next turn: its true return, exactly once, or nothing yet.
+fn collect_running(file_id: FileId, invocation: FileLifecycleInvocation, ticket: BackendTicket) -> bool {
+    match hosted_backend_pumps::collect(ticket) {
+        BackendCollected::Pending(ticket) => {
+            rows()[index(file_id).expect("lifecycle File owner missing")].payload =
+                Some(Payload::Running(invocation, ticket));
+            false
+        }
+        BackendCollected::Collected(result, _) =>
+            finish_returned(file_id, invocation.returned(outcome(result))),
+    }
+}
+
+fn outcome(result: HostedIrpTransportResult) -> FileLifecycleOutcome {
+    match result {
         HostedIrpTransportResult::NotDispatched { status } => {
             FileLifecycleOutcome::NotEntered { status }
         }
@@ -263,8 +295,7 @@ fn dispatch_prepared(
         HostedIrpTransportResult::Indeterminate { transport_status } => {
             FileLifecycleOutcome::Indeterminate { transport_status }
         }
-    };
-    finish_returned(file_id, invocation.returned(outcome))
+    }
 }
 
 fn ack_outcome(result: HostedIrpTransportResult) -> FileLifecycleAckOutcome {
@@ -330,18 +361,36 @@ fn drive_retained(file_id: FileId, owner: RetainedFileLifecycle) -> bool {
         }
     };
     let result = match route_live(ack.projection()) {
-        Some(route) => hosted_file_dispatch::control(
+        Some(route) => match hosted_file_dispatch::control_kept(
             route,
             ack.irp_id(),
             FSD_DISPATCH_ACK_COMPLETION,
             0,
             &mut [],
-        ),
+        ) {
+            BackendDispatch::Returned(result) => result,
+            BackendDispatch::Pending(ticket) => {
+                rows()[index(file_id).unwrap()].payload = Some(Payload::AckRunning(ack, ticket));
+                return true;
+            }
+        },
         None => HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
         },
     };
     finish_ack(file_id, ack.returned(ack_outcome(result)))
+}
+
+/// The running ACK's next turn: its true result, exactly once, or nothing yet.
+fn collect_ack_running(file_id: FileId, ack: FileLifecycleAckInvocation, ticket: BackendTicket) -> bool {
+    match hosted_backend_pumps::collect(ticket) {
+        BackendCollected::Pending(ticket) => {
+            rows()[index(file_id).unwrap()].payload = Some(Payload::AckRunning(ack, ticket));
+            false
+        }
+        BackendCollected::Collected(result, _) =>
+            finish_ack(file_id, ack.returned(ack_outcome(result))),
+    }
 }
 
 fn drive_payload(file_id: FileId, executor: NativeHandleCaller) -> bool {
@@ -358,8 +407,10 @@ fn drive_payload(file_id: FileId, executor: NativeHandleCaller) -> bool {
     rows()[slot].retry_after = 0;
     let progress = match payload {
         Payload::Prepared(prepared) => dispatch_prepared(file_id, prepared, executor),
+        Payload::Running(invocation, ticket) => collect_running(file_id, invocation, ticket),
         Payload::Returned(returned) => finish_returned(file_id, returned),
         Payload::Retained(owner) => drive_retained(file_id, owner),
+        Payload::AckRunning(ack, ticket) => collect_ack_running(file_id, ack, ticket),
         Payload::AckReturned(returned) => finish_ack(file_id, returned),
     };
     rows()[index(file_id).expect("executing lifecycle owner retained")].executing = false;
@@ -403,6 +454,8 @@ fn nested_ready_at<F: FnMut() -> u64>(slot: usize, clock: &mut PassClock<F>) -> 
     match row.payload.as_ref() {
         Some(Payload::Prepared(prepared)) => projection_ready(prepared.projection()),
         Some(Payload::Returned(_)) | Some(Payload::AckReturned(_)) => true,
+        Some(Payload::Running(_, ticket)) | Some(Payload::AckRunning(_, ticket)) =>
+            hosted_backend_pumps::collectable(ticket),
         Some(Payload::Retained(owner)) => !owner.acknowledgement_is_uncertain()
             && projection_ready(owner.projection())
             && (io_manager_mut().retained_file_lifecycle_ack_ready(owner)

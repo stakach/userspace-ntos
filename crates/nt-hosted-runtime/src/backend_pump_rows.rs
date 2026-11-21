@@ -110,6 +110,13 @@ impl<P, T> KeptBackendPumps<P, T> {
         }
     }
 
+    /// Whether the ticket's holder would collect a return now. A readiness check only: it
+    /// changes nothing, so a holder may ask before deciding to take its turn.
+    pub fn collectable(&self, ticket: &BackendTicket) -> bool {
+        self.rows.iter().any(|row| row.id == ticket.0
+            && matches!(row.state, KeptFilePump::Returned(..)))
+    }
+
     pub fn is_empty(&self) -> bool { self.rows.is_empty() }
 }
 
@@ -162,6 +169,22 @@ mod tests {
         table.returned(id, 9).unwrap();
         assert!(matches!(table.collect(first), Some(BackendCollect::Pending(_))));
         assert_eq!(table.collect(second), Some(BackendCollect::Collected(9)));
+    }
+
+    #[test]
+    fn a_ticket_is_collectable_only_once_its_pump_has_returned() {
+        let (mut table, ticket) = kept_one();
+        let id = ticket.id();
+        assert!(!table.collectable(&ticket), "a kept pump has not returned");
+        let pump = table.take_pump(id).unwrap();
+        assert!(!table.collectable(&ticket), "a resuming pump has not returned");
+        table.unfinished(id, pump).unwrap();
+        assert!(!table.collectable(&ticket), "a pump that stopped again has not returned");
+        table.take_pump(id).unwrap();
+        table.returned(id, 5).unwrap();
+        assert!(table.collectable(&ticket), "a held return is ready for its holder");
+        assert!(table.collectable(&ticket), "asking changes nothing");
+        assert_eq!(table.collect(ticket), Some(BackendCollect::Collected(5)));
     }
 
     #[test]
