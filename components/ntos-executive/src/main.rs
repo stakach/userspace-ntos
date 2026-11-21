@@ -70,6 +70,7 @@ mod registry_query_audit;
 mod hot_service_cost_census;
 mod hot_service_latency_census;
 mod reply_tail_step_census;
+mod process_deletion_demand;
 mod pending_file_completion_scan;
 mod registry_open_phase_census;
 mod copy_in_census;
@@ -24523,6 +24524,8 @@ struct ExecNtHandler {
     /// can precede the last process/thread handle or dispatcher reference; this bounded table keeps
     /// that final delete work owned until the common service-loop boundary observes zero refs.
     process_deletion_candidates: nt_user_host::ProcessDeletionCandidateTable<MAX_PI>,
+    /// Whether the service-loop retirement drain has anything new to look for.
+    process_deletion_demand: process_deletion_demand::ProcessDeletionDemand,
     ps_object_retirements: ps_object_retirement::Retirements,
     /// Loop-owned hosted process identity catalog. The handler stores a pointer instead of owning a
     /// second catalog so process identity, image open, and spawn all consult the same runtime table.

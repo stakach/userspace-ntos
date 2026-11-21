@@ -1260,6 +1260,10 @@ pub struct ProcessManager {
     alpc_publication_identity: u64,
     processes: IdTable<NtProcess>,
     threads: IdTable<NtThread>,
+    /// Advances whenever process-retirement work appears: a process becomes signaled, or an
+    /// unstarted process's abandonment is requested. A retirement drain that saw no change
+    /// since its last complete pass has nothing new to find.
+    deletion_demand_epoch: u64,
     /// Withdrawn Ps objects remain owned until their exact cleanup ticket is finished.
     process_object_retirements: Vec<Option<process_object_retirement::RetiredProcessObjects>>,
     sections: Vec<Option<ImageSection>>,
@@ -3948,6 +3952,7 @@ impl ProcessManager {
             proc.state = ProcessState::Terminated;
             proc.exit_status = Some(exit_status);
         }
+        self.deletion_demand_epoch = self.deletion_demand_epoch.wrapping_add(1);
         self.process_exit_notify.queue_exit(pid, sequence, process_object, exit_status);
         for index in 0..thread_count {
             let Some(tid) = self
@@ -4082,6 +4087,11 @@ impl ProcessManager {
 
     pub fn thread_wait_references(&self, tid: ThreadId) -> Option<u32> {
         self.threads.get(&tid).map(|thread| thread.wait_references)
+    }
+
+    /// See the `deletion_demand_epoch` field.
+    pub fn deletion_demand_epoch(&self) -> u64 {
+        self.deletion_demand_epoch
     }
 
     pub fn is_process_signaled(&self, pid: ProcessId) -> bool {

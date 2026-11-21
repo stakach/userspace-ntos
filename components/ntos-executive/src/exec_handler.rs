@@ -4417,6 +4417,8 @@ impl ExecNtHandler {
             process_deletion_candidates,
             nt_user_host::ProcessDeletionCandidateTable::new()
         );
+        write_field!(process_deletion_demand,
+            crate::process_deletion_demand::ProcessDeletionDemand::new());
         write_field!(ps_object_retirements, crate::ps_object_retirement::Retirements::default());
         write_field!(hosted_images, hosted_images);
         write_field!(execution_roles, nt_exe_image::execution_role::ExecutionRoleLedger::new());
@@ -8638,6 +8640,7 @@ impl ExecNtHandler {
             HostedThreadSpawnFailure::Unstarted => self.thread_runtime.cancel_spawn(prepared),
             HostedThreadSpawnFailure::Retained(partial) => {
                 let id = self.thread_runtime.retain_failed_spawn(prepared, partial);
+                self.process_deletion_demand.mark();
                 let result = unsafe { self.thread_runtime.reconcile_failed_spawn(id) };
                 print_str(b"[thread-reconcile] pending tid=");
                 print_u64(id.identity().tid);
@@ -21945,7 +21948,13 @@ impl ExecNtHandler {
     /// Retry every exact hosted-process deletion owner once. Dead objects may outlive their old
     /// execution pi and coexist with a replacement there, so the drain never indexes by pi alone.
     pub(crate) fn drain_hosted_process_deletion_candidates(&mut self) -> usize {
-        self.drain_failed_thread_constructions();
+        let Some(pass) = self.process_deletion_demand.begin(
+            self.pm.deletion_demand_epoch(), self.process_deletion_candidates.live_len() != 0,
+        ) else {
+            self.ps_object_retirements.print_census_changes();
+            return 0;
+        };
+        let mut retained = self.drain_failed_thread_constructions();
         let mut deleted = 0usize;
         let _durable = allocator::enter_durable();
         // A final process-handle close may have recorded abandonment before an exit-notify or
@@ -21958,6 +21967,9 @@ impl ExecNtHandler {
                 let _ = self.try_terminate_unstarted_process(pid);
             }
         }
+        // A request that is not yet eligible (a pointer or handle still owns the process) can
+        // become eligible without new Ps demand, so keep looking while any request remains.
+        retained |= self.pm.any_unstarted_abandonment_requested();
         // A transient reservation failure cannot strand a signaled process whose deletion row
         // was never queued. Rediscover that exact live mechanism on each service-loop drain.
         for pi in 0..MAX_PI {
@@ -21968,14 +21980,24 @@ impl ExecNtHandler {
                 && self.process_deletion_candidates.get_exact(
                     pi, mechanism.pid, mechanism.generation,
                 ).is_none()
-                && self.try_delete_hosted_process_object(mechanism.pid)
-                    == HostedProcessDeletionOutcome::Complete
             {
-                deleted += 1;
+                if self.try_delete_hosted_process_object(mechanism.pid)
+                    == HostedProcessDeletionOutcome::Complete
+                {
+                    deleted += 1;
+                } else if self.process_mechanisms.get(pi).is_some_and(|live| {
+                    live.pid == mechanism.pid && live.generation == mechanism.generation
+                }) && self.process_deletion_candidates.get_exact(
+                    pi, mechanism.pid, mechanism.generation,
+                ).is_none() {
+                    // Still signaled with no queued row: rediscover it at the next boundary.
+                    retained = true;
+                }
             }
         }
         let mut candidates = Vec::new();
         if candidates.try_reserve(self.process_deletion_candidates.live_len()).is_err() {
+            self.process_deletion_demand.finish(pass, true);
             return deleted;
         }
         candidates.extend(self.process_deletion_candidates.iter());
@@ -21989,15 +22011,20 @@ impl ExecNtHandler {
                 deleted += 1;
             }
         }
+        // Live candidates drive the next boundary through their own count.
+        self.process_deletion_demand.finish(pass, retained);
         self.ps_object_retirements.print_census_changes();
         deleted
     }
 
-    fn drain_failed_thread_constructions(&mut self) {
+    /// Returns whether a failed construction is still waiting to be retired.
+    fn drain_failed_thread_constructions(&mut self) -> bool {
+        let (mut pending, mut retired_count) = (0usize, 0usize);
         for index in 0..self.thread_runtime.slot_count() {
             let Some((id, runtime)) = self.thread_runtime.pending_construction_at(index) else {
                 continue;
             };
+            pending += 1;
             if self.capture_thread_process_identity(runtime.pi, runtime.tid) != Some(runtime.process)
                 || self.capture_hosted_thread_reservations(
                     runtime.pi, runtime.tid, runtime.badge, runtime.role,
@@ -22020,8 +22047,10 @@ impl ExecNtHandler {
                 print_str(b"[thread-retirement] retired pending tid=");
                 print_u64(runtime.tid);
                 print_str(b"; mechanisms, memory and reservations released\n");
+                retired_count += 1;
             }
         }
+        pending > retired_count
     }
 
     pub(crate) fn duplicate_process_handle_with_access(

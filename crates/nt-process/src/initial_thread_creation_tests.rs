@@ -349,3 +349,31 @@ fn pending_creation_cannot_be_invalidated_by_raw_state_setter() {
     }
     pm.commit_initial_thread_creation(&plan).unwrap();
 }
+
+#[test]
+fn retirement_work_advances_the_deletion_demand_epoch() {
+    let mut pm = ProcessManager::new();
+    let creator = pm.create_process("creator.exe", None, None);
+    let child = pm.create_process("child.exe", Some(creator), None);
+    let main = pm.create_thread(child, 0, 0, false).unwrap();
+    assert!(pm.publish_process_kernel_object(child, 0x7000));
+    assert!(pm.publish_thread_kernel_object(main, 0x8000));
+    let handle = pm.insert_handle(creator, HandleObject::Process(child), 0).unwrap();
+    let idle = pm.deletion_demand_epoch();
+    assert!(!pm.any_unstarted_abandonment_requested());
+
+    // Handle traffic alone creates no retirement work.
+    pm.close_handle(creator, handle).unwrap();
+    assert_eq!(pm.deletion_demand_epoch(), idle);
+
+    assert!(pm.request_unstarted_process_abandonment(child));
+    let requested = pm.deletion_demand_epoch();
+    assert_ne!(requested, idle, "an abandonment request is new retirement work");
+    assert!(pm.any_unstarted_abandonment_requested());
+
+    pm.terminate_process(child, STATUS_INVALID_PARAMETER).unwrap();
+    assert_ne!(pm.deletion_demand_epoch(), requested, "a signaled process is new retirement work");
+    let signaled = pm.deletion_demand_epoch();
+    pm.terminate_process(child, STATUS_INVALID_PARAMETER).unwrap();
+    assert_eq!(pm.deletion_demand_epoch(), signaled, "an already signaled process adds nothing");
+}

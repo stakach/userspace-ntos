@@ -79,7 +79,13 @@ impl ProcessManager {
             || self.handle_object_reference_count(HandleObject::Process(pid)) != 0
         { return false; }
         self.processes.get_mut(&pid).unwrap().unstarted_abandonment_requested = true;
+        self.deletion_demand_epoch = self.deletion_demand_epoch.wrapping_add(1);
         true
+    }
+
+    /// Whether any process still carries an abandonment request, eligible yet or not.
+    pub fn any_unstarted_abandonment_requested(&self) -> bool {
+        self.processes.iter().any(|(_, process)| process.unstarted_abandonment_requested)
     }
 
     /// A failed host preflight remains discoverable without replaying any uncertain effect.
