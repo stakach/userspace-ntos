@@ -266,7 +266,7 @@ jobs:
             fi
           fi
           if [ "${{ inputs.boot_runs || '1' }}" = '2' ]; then
-            for path in native-kvm-smoke.log native-kvm-smoke.ppm native-kvm-qemu-int-tail.log native-kvm-stall-state.json native-kvm-volume-dispatch-state.json native-kvm-cpu-samples.jsonl native-kvm-blockstats.jsonl native-kvm-stationary.txt native-kvm-post-setup-idle.txt; do
+            for path in native-kvm-smoke.log native-kvm-smoke.ppm native-kvm-qemu-int-tail.log native-kvm-guest-reset-state.json native-kvm-stall-state.json native-kvm-volume-dispatch-state.json native-kvm-cpu-samples.jsonl native-kvm-blockstats.jsonl native-kvm-stationary.txt native-kvm-post-setup-idle.txt; do
               if [ -f "$path" ]; then
                 cp "$path" "${path%.*}-boot1.${path##*.}"
               fi
@@ -327,6 +327,8 @@ jobs:
             native-kvm-smoke-boot1.ppm
             native-kvm-qemu-int-tail.log
             native-kvm-qemu-int-tail-boot1.log
+            native-kvm-guest-reset-state.json
+            native-kvm-guest-reset-state-boot1.json
             native-kvm-stall-state.json
             native-kvm-stall-state-boot1.json
             native-kvm-volume-dispatch-state.json

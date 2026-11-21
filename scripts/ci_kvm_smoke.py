@@ -14,8 +14,12 @@ import time
 
 if __package__:
     from .ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script
+    from .ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
+                                     read_run_state, request_quit)
 else:
     from ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script
+    from ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
+                                    read_run_state, request_quit)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +30,7 @@ QMP_SOCKET = ROOT / "native-kvm-smoke-qmp.sock"
 INTERRUPT_TRACE = MICRO / "native-kvm-qemu-int.log"
 INTERRUPT_TRACE_TAIL = ROOT / "native-kvm-qemu-int-tail.log"
 STALL_STATE = ROOT / "native-kvm-stall-state.json"
+GUEST_RESET_STATE = ROOT / "native-kvm-guest-reset-state.json"
 VOLUME_DISPATCH_STATE = ROOT / "native-kvm-volume-dispatch-state.json"
 CPU_SAMPLES = ROOT / "native-kvm-cpu-samples.jsonl"
 BLOCKSTATS = ROOT / "native-kvm-blockstats.jsonl"
@@ -849,6 +854,12 @@ def stop_process_group(process, deadline=None):
 
     if live_members():
         if time.monotonic() < deadline:
+            # A guest reset leaves QEMU paused; quit through QMP before signalling.
+            if QMP_SOCKET.exists() and request_quit(QMP_SOCKET):
+                quit_deadline = min(time.monotonic() + 10, deadline)
+                while live_members() and time.monotonic() < quit_deadline:
+                    time.sleep(0.1)
+        if live_members() and time.monotonic() < deadline:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -891,6 +902,7 @@ def main():
     INTERRUPT_TRACE.unlink(missing_ok=True)
     INTERRUPT_TRACE_TAIL.unlink(missing_ok=True)
     STALL_STATE.unlink(missing_ok=True)
+    GUEST_RESET_STATE.unlink(missing_ok=True)
     VOLUME_DISPATCH_STATE.unlink(missing_ok=True)
     CPU_SAMPLES.unlink(missing_ok=True)
     BLOCKSTATS.unlink(missing_ok=True)
@@ -904,6 +916,8 @@ def main():
         "./scripts/run_specs.sh",
         "-qmp",
         f"unix:{QMP_SOCKET},server=on,wait=off",
+        # run_specs.sh passes -no-reboot; a triple fault now pauses with its registers intact.
+        *QEMU_SHUTDOWN_ACTION,
     ]
     # The workflow names the CPU model. `-cpu host` alone never exposes invariant TSC:
     # QEMU treats the bit as unmigratable, so the workflow requests `invtsc=on`. KVM
@@ -963,6 +977,9 @@ def main():
             except (OSError, RuntimeError, ValueError) as error:
                 print(f"QMP {reason} framebuffer capture failed: {error}", flush=True)
         def signal_guest(sig):
+            # A paused guest reset may ignore SIGTERM; QMP quit still exits and flushes.
+            if sig == signal.SIGTERM and QMP_SOCKET.exists():
+                request_quit(QMP_SOCKET)
             try:
                 os.killpg(process.pid, sig)
             except ProcessLookupError:
@@ -1009,6 +1026,12 @@ def main():
                     capture_terminal_evidence(terminal_reason)
                     break
                 if process.poll() is not None:
+                    break
+                if QMP_SOCKET.exists() and guest_shutdown_paused(read_run_state(QMP_SOCKET)):
+                    terminal_reason = "reset (triple fault or reset request)"
+                    print(f"Guest {terminal_reason}; registers retained in "
+                          f"{GUEST_RESET_STATE.name}", flush=True)
+                    capture_stall_state(GUEST_RESET_STATE)
                     break
                 with LOG.open("rb") as serial_stream:
                     serial_stream.seek(progress_offset)
