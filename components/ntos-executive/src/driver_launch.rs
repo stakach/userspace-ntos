@@ -75888,6 +75888,11 @@ impl FileIrpPumpContinuation {
         self.pump.as_ref().is_some_and(component_scheduler::HostedPumpRestore::scheduler_yield_pending)
     }
 
+    /// The provider parked a wait inside this dispatch and its wake has not come (#420).
+    pub(super) fn awaiting_own_wake(&self) -> bool {
+        self.pump.as_ref().is_some_and(component_scheduler::HostedPumpRestore::awaiting_own_wake)
+    }
+
     /// A child is selected at the outer root boundary, after this File's Rust stack unwound.
     /// The sealed observation is retained here so a later restore refusal cannot run it twice.
     pub(super) fn record_child_step(
@@ -76620,13 +76625,20 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
             component_scheduler::hosted_component_pump_observed_child_work(&ch, Some(caller), owner),
         (Some(FilePumpMode::ChildWork), None, Some(caller)) =>
             component_scheduler::hosted_component_pump_with_caller_child_work(&ch, caller),
-        (Some(FilePumpMode::Retained), owner, Some(caller)) =>
+        (Some(FilePumpMode::Retained), owner, Some(caller)) => {
+            // The File row keeps this pump, so a wait the provider parks inside the dispatch
+            // may leave the root loop running (#420, #427 A).
+            let ch = crate::spawn_hosts::PumpChannel {
+                caps: crate::spawn_hosts::HostCaps { parked_dispatch_yield: true, ..ch.caps },
+                ..ch
+            };
             component_scheduler::service_continuation::settle_for_file_owner(match owner {
                 Some(owner) => component_scheduler::hosted_component_pump_observed_retained(
                     &ch, Some(caller), owner),
                 None => component_scheduler::hosted_component_pump_with_caller_retained(
                     &ch, caller),
-            }),
+            })
+        }
         (None, Some(owner), caller) =>
             component_scheduler::HostedPumpRestore::Restored(
                 component_scheduler::hosted_component_pump_observed(&ch, caller, owner)),

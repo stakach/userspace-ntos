@@ -471,7 +471,9 @@ unsafe fn settle_delete_pump(
             row.phase = Phase::Uncertain;
             DeleteCallbackProgress::Uncertain
         }
-        component_scheduler::HostedPumpRestore::ChildWorkPending(_) => {
+        component_scheduler::HostedPumpRestore::ChildWorkPending(_)
+        // Only a File owner's channel may park a dispatch wait (#420); never this lane's.
+        | component_scheduler::HostedPumpRestore::ParkedDispatchWait(_) => {
             // This lane cannot own a File continuation. The physical row remains retained;
             // no completion or Reply ACK is inferred from this impossible result.
             (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;

@@ -137,6 +137,11 @@ mod scheduler_yield_restore;
 pub use scheduler_yield_restore::{RestoreRetry, SchedulerServiceEnd, SchedulerYieldStep};
 mod deferred_reply;
 pub use deferred_reply::{DeferralCapacity, DeferredReplies};
+mod parked_dispatch;
+pub use parked_dispatch::{
+    kept_dispatch_turn, parked_dispatch_receive, settle_unfinished, KeptDispatchTurn,
+    ParkedDispatch, ParkedDispatchReceive, UnfinishedSettle,
+};
 mod root_pump_wait;
 pub use root_pump_wait::{await_root_pump, await_root_pump_refusable, RootPass, RootPumpWait};
 mod kept_tail_chain;

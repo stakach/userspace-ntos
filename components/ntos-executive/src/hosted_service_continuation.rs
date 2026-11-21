@@ -195,6 +195,9 @@ impl Drop for ContinuingScope {
     fn drop(&mut self) { unsafe { *core::ptr::addr_of_mut!(CONTINUING) = self.0; } }
 }
 
+/// Whether a service step is running at this root boundary (its pumps are its own).
+pub(super) unsafe fn continuing_service() -> bool { continuing().is_some() }
+
 unsafe fn continuing() -> Option<nested::NestedRestoreTicket> {
     // Only at the root boundary that runs the step; a nested scope has its own owner.
     if component_scheduler::is_active() { return None; }
@@ -329,8 +332,15 @@ pub(in crate::driver_launch) unsafe fn settle_for_file_owner(
 ) -> HostedPumpRestore {
     let unfinished = !matches!(pump, HostedPumpRestore::Restored(_)
         | HostedPumpRestore::Unattributed(_) | HostedPumpRestore::Retained { .. });
-    if unfinished && !pump.has_outer_parent() && continuing().is_none()
-        && (component_scheduler::is_active() || !crate::service_sec_image::root_wait_may_block())
+    // A pump parked in its own wait is kept even where root could block: the root progress
+    // loop delivers no hosted syscall, and its wake may need one (#420, #427 A).
+    if unfinished && nt_component_suspension::settle_unfinished(
+        matches!(pump, HostedPumpRestore::ParkedDispatchWait(_)),
+        pump.has_outer_parent(),
+        continuing().is_some(),
+        component_scheduler::is_active(),
+        crate::service_sec_image::root_wait_may_block(),
+    ) == nt_component_suspension::UnfinishedSettle::Keep
     {
         trace_file_owner(b"retained");
         return pump;
