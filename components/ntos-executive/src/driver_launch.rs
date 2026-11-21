@@ -9375,13 +9375,24 @@ extern "win64" fn s_io_allocate_irp(stack_size: u8, _charge_quota: u8) -> u64 {
             pool_free(irp);
             return 0;
         }
-        let (label, status, ticket, generation, _) = call_on4(
-            (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
-            1,
-            irp,
-            total,
-            stack_count,
+        // IoAllocateIrp is callable at DISPATCH_LEVEL, so a DPC registers through its IRQ lane.
+        let lane = hosted_irq_lane_request(
+            nt_hosted_runtime::HostedIrqServiceKind::AllocateIrp,
+            FSD_SERVICE_SOURCE_IRP_LABEL,
+            &[irp, total, stack_count],
         );
+        let (label, status, ticket, generation, _) = match lane {
+            Some(result) if result.value_count == 2 =>
+                (0, result.status as u32 as u64, result.values[0], result.values[1], 0),
+            Some(_) => hosted_irq_lane_protocol_fault(irp),
+            None => call_on4(
+                (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+                1,
+                irp,
+                total,
+                stack_count,
+            ),
+        };
         if label == 0 && status as u32 as i32 == STATUS_SUCCESS && ticket != 0 && generation != 0 {
             return irp;
         }

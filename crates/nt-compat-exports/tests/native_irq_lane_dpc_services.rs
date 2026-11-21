@@ -23,6 +23,7 @@ const DPC_LEGAL: &[(&str, &str)] = &[
     ("MmBuildMdlForNonPagedPool", "s_mm_build_mdl_for_nonpaged_pool"),
     ("HalGetBusDataByOffset/HalSetBusDataByOffset", "hosted_pci_config_call"),
     ("IoWMIWriteEvent", "write_event"),
+    ("IoAllocateIrp", "s_io_allocate_irp"),
 ];
 
 /// The driver-side entry points that publish a typed service on the current IRQ lane.

@@ -1699,6 +1699,22 @@ impl HostedIrqRootSession {
         service_result(status, Some(transferred))
     }
 
+    /// IoAllocateIrp from the lane's DPC: register its pool packet in the source IRP ledger.
+    unsafe fn allocate_irp_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let (index, inst) = match self.lane_driver(lane_index, command, FSD_SERVICE_SOURCE_IRP_LABEL) {
+            Ok(driver) => driver,
+            Err(refused) => return refused,
+        };
+        let [irp, bytes, stack_count, ..] = command.arguments;
+        let (status, ticket, generation) =
+            hosted_source_irp_ledger::register_for(index, inst, irp, bytes, stack_count);
+        values_result(status, &[ticket, generation])
+    }
+
     /// IoWMIWriteEvent from the lane's DPC.
     unsafe fn wmi_write_event_service(
         &mut self,
@@ -1911,6 +1927,9 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::StartNextPacketReturned => {
                 self.start_next_packet_returned_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::AllocateIrp => {
+                self.allocate_irp_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::PciConfig => {
                 self.pci_config_service(lane_index, command)

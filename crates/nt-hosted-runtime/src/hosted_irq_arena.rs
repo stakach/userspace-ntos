@@ -168,6 +168,8 @@ pub enum HostedIrqServiceKind {
     PciConfig = 22,
     /// `IoWMIWriteEvent(WnodeEventItem)`.
     WmiWriteEvent = 23,
+    /// `IoAllocateIrp`: register the lane's pool packet `(IRP, bytes, StackSize)`.
+    AllocateIrp = 24,
 }
 
 impl HostedIrqServiceKind {
@@ -196,6 +198,7 @@ impl HostedIrqServiceKind {
             21 => Some(Self::ReleaseSemaphore),
             22 => Some(Self::PciConfig),
             23 => Some(Self::WmiWriteEvent),
+            24 => Some(Self::AllocateIrp),
             _ => None,
         }
     }
@@ -588,6 +591,14 @@ impl HostedIrqServiceCommand {
                         && self.arguments[2] >> 32 != 0
                         && self.arguments[3] <= 1
                         && self.arguments[4..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::AllocateIrp => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 3
+                        && self.arguments[0] != 0
+                        && self.arguments[1] != 0
+                        && (1..=32).contains(&self.arguments[2])
+                        && self.arguments[3..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::PoolRetirement => {
                     self.authority_cookie == 0
@@ -2616,7 +2627,7 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
         assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
-        assert_eq!(HostedIrqServiceKind::from_raw(24), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(25), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2902,6 +2913,32 @@ mod tests {
         assert!(event.valid());
         event.arguments[0] = 0;
         assert!(!event.valid());
+    }
+
+    #[test]
+    fn irq_allocate_irp_registers_one_exact_packet() {
+        // IoAllocateIrp: IRQL <= DISPATCH_LEVEL. The lane registers its pool packet with the root.
+        assert_eq!(HostedIrqServiceKind::from_raw(24), Some(HostedIrqServiceKind::AllocateIrp));
+        let mut allocate = service();
+        allocate.kind = HostedIrqServiceKind::AllocateIrp;
+        allocate.authority_cookie = 0;
+        allocate.argument_count = 3;
+        allocate.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        allocate.arguments[..3].copy_from_slice(&[0x9000, 0xd0 + 0x48, 1]);
+        assert!(allocate.valid());
+        allocate.arguments[2] = 33;
+        assert!(!allocate.valid(), "StackSize is 1..=32");
+        allocate.arguments[2] = 0;
+        assert!(!allocate.valid());
+        allocate.arguments[2] = 1;
+        allocate.arguments[0] = 0;
+        assert!(!allocate.valid(), "the packet address is required");
+        allocate.arguments[0] = 0x9000;
+        allocate.arguments[1] = 0;
+        assert!(!allocate.valid(), "the packet size is required");
+        allocate.arguments[1] = 0x118;
+        allocate.arguments[3] = 1;
+        assert!(!allocate.valid());
     }
 
     #[test]

@@ -1833,6 +1833,33 @@ fn set_hard_error_or_verify_device_locked(
     }
 }
 
+/// IoAllocateIrp's registration of one exact pool packet for an authenticated driver instance:
+/// its primary channel, or the IRQ lane of a DPC. Returns `(status, ticket, generation)`.
+pub(super) fn register_for(
+    instance_index: usize,
+    inst: DriverInstance,
+    component_address: u64,
+    bytes: u64,
+    stack_count: u64,
+) -> (i32, u64, u64) {
+    let Some(stack_count) = u8::try_from(stack_count).ok() else {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    };
+    let _guard = lock();
+    let Some(allocation) = allocation(instance_index, inst, component_address, bytes, stack_count)
+    else {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    };
+    match ledger().register(allocation) {
+        Ok(ticket) => (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get()),
+        Err(SourceIrpLedgerError::AlreadyLive) => {
+            (nt_status::NtStatus::OBJECT_NAME_COLLISION.raw(), 0, 0)
+        }
+        Err(SourceIrpLedgerError::Exhausted) => (STATUS_INSUFFICIENT_RESOURCES, 0, 0),
+        Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
+    }
+}
+
 pub(super) fn service(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -1867,25 +1894,7 @@ pub(super) fn service(
             mutate_local_irp_packet(
                 instance_index, inst, op, component_address, bytes, stack_count,
             ),
-        1 => {
-            let Some(stack_count) = u8::try_from(stack_count).ok() else {
-                return (STATUS_INVALID_PARAMETER, 0, 0);
-            };
-            let _guard = lock();
-            let Some(allocation) =
-                allocation(instance_index, inst, component_address, bytes, stack_count)
-            else {
-                return (STATUS_INVALID_PARAMETER, 0, 0);
-            };
-            match ledger().register(allocation) {
-                Ok(ticket) => (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get()),
-                Err(SourceIrpLedgerError::AlreadyLive) => {
-                    (nt_status::NtStatus::OBJECT_NAME_COLLISION.raw(), 0, 0)
-                }
-                Err(SourceIrpLedgerError::Exhausted) => (STATUS_INSUFFICIENT_RESOURCES, 0, 0),
-                Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
-            }
-        }
+        1 => register_for(instance_index, inst, component_address, bytes, stack_count),
         4 if bytes == 0 && stack_count == 0 => {
             let Some(domain) = instance_domain_identity(inst) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
