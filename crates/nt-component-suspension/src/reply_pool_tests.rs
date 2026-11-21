@@ -636,3 +636,60 @@ fn nested_dependent_admission_refusals_name_their_invariant() {
         assert_eq!(class.name(), name);
     }
 }
+
+/// #427: condrv's primary dispatch waits (KeWaitForSingleObject) for conhost's GET_NEXT_REQUEST,
+/// a second IRP to the same driver. A primary parked in its wait releases the execution token,
+/// so the instance's worker lane admits that IRP while the primary stays unready.
+#[test]
+fn worker_admits_a_dispatch_while_the_primary_dispatch_is_parked_in_a_wait() {
+    let mut lanes = Lanes::new(2, 2);
+    let mut peers = PeerRegistry::new(20, 2);
+    let (primary_lane, mut primary_registration) = lanes.allocate_shared_staged(&mut peers, 1, 2, LaneBinding {
+        executor_id: 10,
+        receive_endpoint: 20,
+        reply_object: 30,
+    }).unwrap();
+    let (worker_lane, mut registration) = lanes.allocate_shared_staged(&mut peers, 1, 2, LaneBinding {
+        executor_id: 11,
+        receive_endpoint: 20,
+        reply_object: 31,
+    }).unwrap();
+    let primary = peers.publish_lane(&mut primary_registration, 1, 2, &lanes).unwrap();
+    let worker = peers.publish_lane(&mut registration, 1, 2, &lanes).unwrap();
+    for (lane, reply) in [(primary_lane, 30), (worker_lane, 31)] {
+        lanes.begin_startup(lane, reply,
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
+        lanes.complete_startup(lane, reply,
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)).unwrap();
+    }
+    let mut receiver = IngressReceiver::new(20, 40, 3).unwrap();
+    let mut pool = IngressReplyPool::new(20, 3).unwrap();
+    for reply in [41, 42, 43] {
+        pool.insert(ComponentIngress::new(20, reply).unwrap(), &receiver, &lanes, free)
+            .ok().unwrap();
+    }
+    let rebind = |_: u64, reply: u64| Ok::<_, u8>(if reply == 30 || reply == 31 {
+        ReplyBindingObservation::Free
+    } else {
+        ReplyBindingObservation::BoundToTarget
+    });
+    call(&mut receiver, &lanes);
+    pool.retain(&mut receiver, &lanes, &mut peers, primary.badge(), free, bound).unwrap();
+    let primary_dispatch = pool.admit(&mut receiver, primary, &mut lanes, &peers, 1, 2, rebind)
+        .unwrap();
+    let primary_reply = lanes.binding(primary_dispatch.lane).unwrap().reply_object;
+    // The primary dispatch parks in its provider wait.
+    lanes.suspend_running(primary_dispatch.lane, primary_reply, 77).unwrap();
+    assert!(!lanes.execution_busy());
+
+    // Nothing runs while the primary waits, so the next Call is received with no owner (#420's
+    // root event boundary), not on behalf of the parked dispatch.
+    call(&mut receiver, &lanes);
+    pool.retain(&mut receiver, &lanes, &mut peers, worker.badge(), free, bound).unwrap();
+    assert!(!pool.ready_for_admission(&receiver, primary, &lanes));
+    assert!(pool.ready_for_admission(&receiver, worker, &lanes));
+    let worker_dispatch = pool.admit(&mut receiver, worker, &mut lanes, &peers, 1, 2, rebind)
+        .unwrap();
+    assert_ne!(worker_dispatch.lane, primary_dispatch.lane);
+    assert_eq!(lanes.active_dispatch_identity(primary_dispatch.lane), Ok(Some(primary_dispatch)));
+}

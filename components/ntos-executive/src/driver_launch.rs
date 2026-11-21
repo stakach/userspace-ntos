@@ -65053,6 +65053,17 @@ unsafe fn allocate_hosted_driver_component_slot(instance: usize) -> Option<usize
     }
 }
 
+/// Whether `instance`'s dispatch on `route` is parked in a provider wait (a captured
+/// KeWaitForSingleObject/KeWaitForMultipleObjects inside the dispatch it is running).
+unsafe fn hosted_driver_dispatch_waiting(
+    instance: usize,
+    route: nt_component_suspension::peer_registry::PeerRoute,
+) -> bool {
+    (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS)).as_ref().is_some_and(|waiters| {
+        waiters.iter().any(|waiter| waiter.instance == instance && waiter.shared.route == route)
+    })
+}
+
 unsafe fn hosted_driver_waiters_mut() -> &'static mut Vec<HostedDriverRawWaiter> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_WAITERS);
     if slot.is_none() {
@@ -76232,14 +76243,31 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
                 Ok(false)
             )
         });
+    // #427: NT runs a driver's dispatches concurrently, one per calling thread. condrv's
+    // client request waits inside its dispatch until conhost's GET_NEXT_REQUEST, a second IRP
+    // to the same driver, answers it. While the primary lane is parked in such a wait, the next
+    // ordinary IRP is admitted on the instance's idle dispatch-worker lane.
+    let parked_primary_worker = dispatch_request.is_some()
+        && provider_route.is_none()
+        && !(class_hook_request || class_hook_control || connect_control || nested_class_create)
+        && hosted_ingress_sources::primary_route(dispatch_index).is_some_and(|route| {
+            let primary_admits = matches!(
+                crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route),
+                Ok(true)
+            );
+            let waiting = !primary_admits && hosted_driver_dispatch_waiting(dispatch_index, route);
+            let worker_admits = waiting && hosted_class_irp_lane::prepare(dispatch_index).is_ok();
+            nt_hosted_runtime::select_ordinary_irp_lane(primary_admits, waiting, worker_admits)
+                == nt_hosted_runtime::OrdinaryIrpLane::Worker
+        });
     let class_selection = if class_hook_request || class_hook_control || connect_control
-        || nested_class_create {
+        || nested_class_create || parked_primary_worker {
         if provider_route.is_some() {
             return Some(HostedIrpTransportResult::NotDispatched {
                 status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             });
         }
-        let selection = if class_hook_request || nested_class_create {
+        let selection = if class_hook_request || nested_class_create || parked_primary_worker {
             hosted_class_irp_lane::select_new(dispatch_index)
         } else if connect_control {
             hosted_class_irp_lane::select_completion_control(dispatch_index, canonical_irp_id)
