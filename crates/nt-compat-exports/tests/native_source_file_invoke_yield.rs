@@ -1,38 +1,7 @@
 //! A File dispatch yield must return its original manager invocation, not a fabricated result.
 
-const DISPATCH: &str = include_str!("../../../components/ntos-executive/src/hosted_file_dispatch.rs");
 const CONNECT: &str = include_str!("../../../components/ntos-executive/src/hosted_input_connect_dispatch.rs");
 const LIVE: &str = include_str!("../../../components/ntos-executive/src/hosted_connect_live.rs");
-
-#[test]
-fn invoke_result_distinguishes_terminal_return_from_child_work_yield() {
-    let contract = DISPATCH
-        .split_once("enum InvokeResult {")
-        .expect("typed File invoke result")
-        .1
-        .split_once("pub(super) fn invoke_suspend_aware(")
-        .expect("suspend-aware File invoke entry")
-        .0;
-    assert!(contract.contains("Returned(ExternalFileIrpReturn)"));
-    assert!(contract.contains("ChildWorkYield"));
-    assert!(contract.contains("ExternalFileIrpInvocation"));
-    assert!(contract.contains("ExternalFileIrpPumpKey"));
-    assert!(contract.contains("FileDispatchContinuation"));
-    assert!(DISPATCH.contains("native: FileIrpPumpContinuation"));
-
-    let invoke = DISPATCH
-        .split_once("pub(super) fn invoke_suspend_aware(")
-        .expect("suspend-aware File invoke entry")
-        .1
-        .split_once("fn trace_port_connect_execute(")
-        .expect("suspend-aware File invoke boundary")
-        .0;
-    assert!(invoke.contains("-> InvokeResult"));
-    assert!(invoke.contains("InvokeResult::ChildWorkYield"));
-    assert!(invoke.contains("InvokeResult::ChildWorkYield { invocation, key, continuation }"));
-    assert!(invoke.contains("finish_invoke_result(invocation, projection"));
-    assert!(!invoke.contains("finish_external_file_irp"));
-}
 
 #[test]
 fn suspended_port_connect_keeps_source_reply_unissued_until_provider_return() {

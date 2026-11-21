@@ -37,8 +37,25 @@ pub(super) struct FileDispatchContinuation {
     instance_index: usize,
     /// The invocation's output contract, selected once at preparation.
     capture: ExternalFileIrpOutputCapture,
-    /// Effects owed after the native dispatch returns (#420).
-    tail: ExecuteTail,
+    /// The lane the IRP's dispatch used; its tail controls use the same one.
+    mode: FilePumpMode,
+    /// Which native dispatch of this invocation is running (#420).
+    stage: FileStage,
+}
+
+/// A File invocation's running native dispatch: the IRP itself, with the effects owed after
+/// its return, or one of the controls its METHOD_NEITHER terminal owes afterwards (#420).
+enum FileStage {
+    Dispatch(ExecuteTail),
+    Tail(nt_hosted_runtime::FileTailStage<FileTerminal>),
+}
+
+/// The IRP's genuine non-pending return, carried through its tail controls.
+#[derive(Clone, Copy)]
+struct FileTerminal {
+    status: nt_status::NtStatus,
+    information: u64,
+    file_context: Option<u64>,
 }
 
 /// What `execute_with_capture` does after its native dispatch returns. A kept pump carries it
@@ -178,38 +195,46 @@ impl FileDispatchContinuation {
     }
 
     /// The caller has already run or retained one exact outer-loop child step. Reborrow the
-    /// output from the move-only invocation only for the receive half; no stack slice survives.
+    /// running stage's buffer from the move-only invocation only for the receive half; no stack
+    /// slice survives. The return is received by that stage exactly once.
     pub(super) unsafe fn resume_after_child(
         self,
         mut invocation: ExternalFileIrpInvocation,
     ) -> Result<InvokeResult, (ExternalFileIrpInvocation, Self)> {
-        let Self { native, instance_index, capture, tail } = self;
+        let Self { native, instance_index, capture, mode, stage } = self;
         let progress = {
-            let (_, output) = invocation.buffers_mut().split();
-            native.resume_after_child(output)
+            let mut empty = [0u8; 0];
+            let buffer: &mut [u8] = match &stage {
+                FileStage::Dispatch(_) => invocation.buffers_mut().split().1,
+                FileStage::Tail(tail) => match tail.buffer() {
+                    nt_hosted_runtime::FileTailBuffer::MutableInput => invocation.input_mut(),
+                    nt_hosted_runtime::FileTailBuffer::Empty => &mut empty,
+                },
+            };
+            native.resume_after_child(buffer)
         };
         match progress {
-            Ok(FileIrpResumeProgress::Completed(result)) => {
-                let projection = invocation.projection().clone();
-                let result = tail.finish(Some(result));
-                Ok(InvokeResult::Returned(finish_invoke_result(
-                    invocation, projection, instance_index, capture, result,
-                    capture == ExternalFileIrpOutputCapture::MethodNeitherInput,
-                )))
-            }
-            Ok(FileIrpResumeProgress::ChildWorkYield(native)) => {
-                let continuation = Self { native, instance_index, capture, tail };
-                match ExternalFileIrpPumpKey::new(&invocation, continuation.epoch()) {
-                    Some(key) => Ok(InvokeResult::ChildWorkYield {
-                        invocation, key, continuation,
-                    }),
-                    None => Ok(InvokeResult::UnkeyedChildWorkYield {
-                        invocation, continuation,
-                    }),
-                }
-            }
-            Err(native) => Err((invocation, Self { native, instance_index, capture, tail })),
+            Ok(FileIrpResumeProgress::Completed(result)) => Ok(match stage {
+                FileStage::Dispatch(tail) => finish_invoke_result(
+                    invocation, instance_index, capture, mode, tail.finish(Some(result))),
+                FileStage::Tail(tail) =>
+                    tail_control_returned(invocation, instance_index, capture, mode, tail, result),
+            }),
+            Ok(FileIrpResumeProgress::ChildWorkYield(native)) => Ok(yielded(
+                invocation, Self { native, instance_index, capture, mode, stage })),
+            Err(native) => Err((invocation, Self { native, instance_index, capture, mode, stage })),
         }
+    }
+}
+
+/// Key a stopped stage's continuation to its invocation.
+fn yielded(
+    invocation: ExternalFileIrpInvocation,
+    continuation: FileDispatchContinuation,
+) -> InvokeResult {
+    match ExternalFileIrpPumpKey::new(&invocation, continuation.epoch()) {
+        Some(key) => InvokeResult::ChildWorkYield { invocation, key, continuation },
+        None => InvokeResult::UnkeyedChildWorkYield { invocation, continuation },
     }
 }
 
@@ -238,7 +263,6 @@ pub(super) fn invoke_retaining(
             status: nt_status::NtStatus::INVALID_PARAMETER,
         }));
     }
-    let trace_connect = capture == ExternalFileIrpOutputCapture::MethodNeitherInput;
     let progress = {
         let (input, output) = invocation.buffers_mut().split();
         if let IoParameters::Scsi(parameters) = &projection.parameters {
@@ -261,116 +285,167 @@ pub(super) fn invoke_retaining(
         }
     };
     match progress {
-        FileExecuteProgress::Returned(result) => InvokeResult::Returned(finish_invoke_result(
-            invocation, projection, instance_index, capture, result, trace_connect)),
-        FileExecuteProgress::ChildWorkYield(continuation) => {
-            match ExternalFileIrpPumpKey::new(&invocation, continuation.epoch()) {
-                Some(key) => InvokeResult::ChildWorkYield { invocation, key, continuation },
-                None => InvokeResult::UnkeyedChildWorkYield { invocation, continuation },
-            }
-        }
+        FileExecuteProgress::Returned(result) => finish_invoke_result(
+            invocation, instance_index, capture, FilePumpMode::Retained, result),
+        FileExecuteProgress::ChildWorkYield(continuation) => yielded(invocation, continuation),
     }
 }
 
+/// The IRP's native dispatch returned `result`. A METHOD_NEITHER terminal then owes its copy
+/// and ACK controls; each runs on the IRP's own lane and, if its pump stops, stays with this
+/// File owner's continuation as its stage instead of fencing (#420).
 fn finish_invoke_result(
-    mut invocation: ExternalFileIrpInvocation,
-    projection: IrpProjection,
+    invocation: ExternalFileIrpInvocation,
     instance_index: usize,
     capture: ExternalFileIrpOutputCapture,
+    mode: FilePumpMode,
     result: HostedIrpTransportResult,
-    trace_connect: bool,
-) -> ExternalFileIrpReturn {
-    if trace_connect {
+) -> InvokeResult {
+    let mutable_input = capture == ExternalFileIrpOutputCapture::MethodNeitherInput;
+    if mutable_input {
+        let projection = invocation.projection();
         trace_port_connect_execute(1, projection.irp_id, projection.device_id);
     }
-    let outcome = match result {
-        HostedIrpTransportResult::NotDispatched { status } => {
-            ExternalFileIrpOutcome::NotEntered { status }
+    match result {
+        HostedIrpTransportResult::NotDispatched { status } =>
+            conclude(invocation, capture, ExternalFileIrpOutcome::NotEntered { status }),
+        HostedIrpTransportResult::Returned { status: nt_status::NtStatus::PENDING, .. } =>
+            conclude(invocation, capture, ExternalFileIrpOutcome::Pending),
+        HostedIrpTransportResult::Returned { status, information, file_context } => {
+            let terminal = FileTerminal {
+                status,
+                information,
+                file_context: major::is_create_major(invocation.projection().major)
+                    .then_some(file_context),
+            };
+            follow_tail(invocation, instance_index, capture, mode,
+                nt_hosted_runtime::FileTailStage::first(terminal, mutable_input))
         }
-        HostedIrpTransportResult::Returned {
-            status: nt_status::NtStatus::PENDING,
-            ..
-        } => ExternalFileIrpOutcome::Pending,
-        HostedIrpTransportResult::Returned {
-            status,
-            information,
-            file_context,
-        } => {
-            if capture == ExternalFileIrpOutputCapture::MethodNeitherInput {
-                let expected = invocation.input_mut().len() as u64;
-                trace_mutable_control_probe(10, invocation.irp_id(), instance_index, expected, None);
-                let copied = control(
-                    instance_index,
-                    invocation.irp_id(),
-                    FSD_DISPATCH_COPY_MUTABLE_INPUT,
-                    0,
-                    invocation.input_mut(),
-                );
-                trace_mutable_control_probe(11, invocation.irp_id(), instance_index, expected, Some(&copied));
-                if !matches!(copied, HostedIrpTransportResult::Returned {
-                    status: nt_status::NtStatus::SUCCESS,
-                    information,
-                    file_context: 0,
-                } if information == expected)
-                {
-                    let transport_status = match copied {
-                        HostedIrpTransportResult::NotDispatched { status }
-                        | HostedIrpTransportResult::Indeterminate {
-                            transport_status: status,
-                        }
-                        | HostedIrpTransportResult::Returned { status, .. } => status,
-                    };
-                    return invocation
-                        .returned(ExternalFileIrpOutcome::Indeterminate { transport_status });
-                }
-                // Synchronous completion already released the IRP graph. The sidecar survives
-                // until this exact copy is acknowledged through the same terminal selector.
-                trace_mutable_control_probe(12, invocation.irp_id(), instance_index, 0, None);
-                let ack = control(
-                    instance_index,
-                    invocation.irp_id(),
-                    FSD_DISPATCH_ACK_COMPLETION,
-                    0,
-                    &mut [],
-                );
-                trace_mutable_control_probe(13, invocation.irp_id(), instance_index, 0, Some(&ack));
-                if !matches!(
-                    ack,
-                    HostedIrpTransportResult::Returned {
-                        status: nt_status::NtStatus::SUCCESS,
-                        information: 0,
-                        file_context: 0,
-                    }
-                ) {
-                    let transport_status = match ack {
-                        HostedIrpTransportResult::NotDispatched { status }
-                        | HostedIrpTransportResult::Indeterminate {
-                            transport_status: status,
-                        }
-                        | HostedIrpTransportResult::Returned { status, .. } => status,
-                    };
-                    return invocation
-                        .returned(ExternalFileIrpOutcome::Indeterminate { transport_status });
-                }
+        HostedIrpTransportResult::Indeterminate { transport_status } =>
+            conclude(invocation, capture, ExternalFileIrpOutcome::Indeterminate { transport_status }),
+    }
+}
+
+fn follow_tail(
+    invocation: ExternalFileIrpInvocation,
+    instance_index: usize,
+    capture: ExternalFileIrpOutputCapture,
+    mode: FilePumpMode,
+    next: nt_hosted_runtime::FileTailNext<FileTerminal, nt_status::NtStatus>,
+) -> InvokeResult {
+    match next {
+        nt_hosted_runtime::FileTailNext::Issue(stage) =>
+            issue_tail_control(invocation, instance_index, capture, mode, stage),
+        nt_hosted_runtime::FileTailNext::Finish(FileTerminal { status, information, file_context }) =>
+            conclude(invocation, capture,
+                ExternalFileIrpOutcome::Returned { status, information, file_context }),
+        nt_hosted_runtime::FileTailNext::Indeterminate(transport_status) =>
+            conclude(invocation, capture, ExternalFileIrpOutcome::Indeterminate { transport_status }),
+    }
+}
+
+fn tail_operation(stage: &nt_hosted_runtime::FileTailStage<FileTerminal>) -> u64 {
+    match stage {
+        nt_hosted_runtime::FileTailStage::CopyMutableInput(_) => FSD_DISPATCH_COPY_MUTABLE_INPUT,
+        nt_hosted_runtime::FileTailStage::AckCompletion(_) => FSD_DISPATCH_ACK_COMPLETION,
+    }
+}
+
+fn issue_tail_control(
+    mut invocation: ExternalFileIrpInvocation,
+    instance_index: usize,
+    capture: ExternalFileIrpOutputCapture,
+    mode: FilePumpMode,
+    stage: nt_hosted_runtime::FileTailStage<FileTerminal>,
+) -> InvokeResult {
+    let irp_id = invocation.irp_id();
+    let operation = tail_operation(&stage);
+    let storage_instance = match control_storage(instance_index, irp_id, operation) {
+        Ok(storage_instance) => storage_instance,
+        Err(refused) =>
+            return tail_control_returned(invocation, instance_index, capture, mode, stage, refused),
+    };
+    let expected = invocation.input_mut().len() as u64;
+    trace_mutable_control_probe(
+        if operation == FSD_DISPATCH_COPY_MUTABLE_INPUT { 10 } else { 12 },
+        irp_id, instance_index, expected, None,
+    );
+    let progress = {
+        let mut empty = [0u8; 0];
+        let buffer: &mut [u8] = match stage.buffer() {
+            nt_hosted_runtime::FileTailBuffer::MutableInput => invocation.input_mut(),
+            nt_hosted_runtime::FileTailBuffer::Empty => &mut empty,
+        };
+        unsafe {
+            let caller = crate::initial_system_driver_caller();
+            match mode {
+                FilePumpMode::Retained => dispatch_irp_for_instance_exact_retaining(
+                    storage_instance, operation, 0, 0, irp_id.raw(), 0, 0, 0, 0, None, &[],
+                    buffer, caller),
+                FilePumpMode::ChildWork => dispatch_irp_for_instance_exact_suspend_aware(
+                    storage_instance, operation, 0, 0, irp_id.raw(), 0, 0, 0, 0, None, &[],
+                    buffer, Some(caller)),
             }
-            ExternalFileIrpOutcome::Returned {
-            status,
-            information,
-            file_context: major::is_create_major(projection.major).then_some(file_context),
-            }
-        }
-        HostedIrpTransportResult::Indeterminate { transport_status } => {
-            ExternalFileIrpOutcome::Indeterminate { transport_status }
         }
     };
-    if trace_connect {
-        trace_port_connect_execute(2, projection.irp_id, projection.device_id);
+    match progress {
+        HostedIrpDispatchProgress::Returned(result) => tail_control_returned(
+            invocation, instance_index, capture, mode, stage,
+            result.unwrap_or(HostedIrpTransportResult::NotDispatched {
+                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+            })),
+        HostedIrpDispatchProgress::ChildWorkYield(native) => yielded(invocation,
+            FileDispatchContinuation {
+                native, instance_index, capture, mode, stage: FileStage::Tail(stage),
+            }),
     }
+}
+
+/// A tail control's genuine return, received exactly once by its stage.
+fn tail_control_returned(
+    mut invocation: ExternalFileIrpInvocation,
+    instance_index: usize,
+    capture: ExternalFileIrpOutputCapture,
+    mode: FilePumpMode,
+    stage: nt_hosted_runtime::FileTailStage<FileTerminal>,
+    result: HostedIrpTransportResult,
+) -> InvokeResult {
+    let irp_id = invocation.irp_id();
+    let operation = tail_operation(&stage);
+    let result = control_tail(instance_index, irp_id, operation).finish_returned(result);
+    let expected = invocation.input_mut().len() as u64;
+    let copy = operation == FSD_DISPATCH_COPY_MUTABLE_INPUT;
+    trace_mutable_control_probe(if copy { 11 } else { 13 }, irp_id, instance_index,
+        if copy { expected } else { 0 }, Some(&result));
+    let exact = match result {
+        HostedIrpTransportResult::Returned {
+            status: nt_status::NtStatus::SUCCESS, information, file_context: 0,
+        } => information == if copy { expected } else { 0 },
+        _ => false,
+    };
+    let outcome = if exact {
+        Ok(())
+    } else {
+        Err(match result {
+            HostedIrpTransportResult::NotDispatched { status }
+            | HostedIrpTransportResult::Indeterminate { transport_status: status }
+            | HostedIrpTransportResult::Returned { status, .. } => status,
+        })
+    };
+    follow_tail(invocation, instance_index, capture, mode, stage.returned(outcome))
+}
+
+fn conclude(
+    invocation: ExternalFileIrpInvocation,
+    capture: ExternalFileIrpOutputCapture,
+    outcome: ExternalFileIrpOutcome,
+) -> InvokeResult {
+    let trace = capture == ExternalFileIrpOutputCapture::MethodNeitherInput;
+    let (irp_id, device_id) = (invocation.projection().irp_id, invocation.projection().device_id);
+    if trace { trace_port_connect_execute(2, irp_id, device_id); }
     let returned = invocation.returned(outcome);
-    if trace_connect {
-        trace_port_connect_execute(3, projection.irp_id, projection.device_id);
-    }
-    returned
+    if trace { trace_port_connect_execute(3, irp_id, device_id); }
+    InvokeResult::Returned(returned)
 }
 
 /// Bounded observation of an exact METHOD_NEITHER terminal's copy and ACK handoff.
@@ -429,15 +504,9 @@ pub(super) fn invoke_suspend_aware(
         )
     };
     match progress {
-        FileExecuteProgress::Returned(result) => InvokeResult::Returned(
-            finish_invoke_result(invocation, projection, instance_index, capture, result, true),
-        ),
-        FileExecuteProgress::ChildWorkYield(continuation) => {
-            let Some(key) = ExternalFileIrpPumpKey::new(&invocation, continuation.epoch()) else {
-                return InvokeResult::UnkeyedChildWorkYield { invocation, continuation };
-            };
-            InvokeResult::ChildWorkYield { invocation, key, continuation }
-        }
+        FileExecuteProgress::Returned(result) => finish_invoke_result(
+            invocation, instance_index, capture, FilePumpMode::ChildWork, result),
+        FileExecuteProgress::ChildWorkYield(continuation) => yielded(invocation, continuation),
     }
 }
 
@@ -923,8 +992,9 @@ fn execute_port_connect_suspend_aware(
             FileExecuteProgress::ChildWorkYield(FileDispatchContinuation {
                 native, instance_index,
                 capture: ExternalFileIrpOutputCapture::MethodNeitherInput,
-                tail: ExecuteTail::none(instance_index, projection.irp_id.raw(), projection.major,
-                    route_instance, route_inst),
+                mode: FilePumpMode::ChildWork,
+                stage: FileStage::Dispatch(ExecuteTail::none(instance_index,
+                    projection.irp_id.raw(), projection.major, route_instance, route_inst)),
             })
         }
     }
@@ -976,7 +1046,8 @@ fn execute_retaining(
             FileExecuteProgress::Returned(tail.finish(result)),
         HostedIrpDispatchProgress::ChildWorkYield(native) =>
             FileExecuteProgress::ChildWorkYield(FileDispatchContinuation {
-                native, instance_index, capture, tail,
+                native, instance_index, capture, mode: FilePumpMode::Retained,
+                stage: FileStage::Dispatch(tail),
             }),
     }
 }

@@ -3953,5 +3953,7 @@ mod tests {
 
 mod file_pump_return;
 mod backend_pump_rows;
+mod file_dispatch_tail;
+pub use file_dispatch_tail::{FileTailBuffer, FileTailNext, FileTailStage};
 pub use backend_pump_rows::{BackendCollect, BackendTicket, KeptBackendPumps};
 pub use file_pump_return::{scoped_resume, FilePumpCollect, FilePumpReturned, KeptFilePump, ScopedResume};
