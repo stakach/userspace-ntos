@@ -34,9 +34,9 @@ on:
         type: boolean
         default: false
       multicore:
-        description: Build with NTOS_GUEST_WORKER_MULTICORE=1 (worker threads on their affinity cores) instead of the core-0 default
+        description: Place worker threads on their affinity cores (the default); clear to build with NTOS_GUEST_WORKER_MULTICORE=0 and keep every guest thread on core 0
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
