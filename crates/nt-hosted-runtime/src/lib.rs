@@ -43,6 +43,7 @@ mod gop_bar_projection;
 mod hosted_driver_thread_object;
 mod hosted_current_thread_kpcr;
 mod hosted_event_projection;
+mod hosted_lane_dereference;
 mod event_terminal_receipt;
 mod win32k_bulk_stage;
 mod rpc_op6_trace;
@@ -115,6 +116,8 @@ pub use hosted_driver_thread_object::{HostedDriverThreadObjectKey,
 pub use hosted_current_thread_kpcr::HostedCurrentThreadKpcr;
 pub use hosted_event_projection::{HostedEventProjectionKey, HostedEventProjectionLifetime,
     HostedEventWaitDelivery};
+pub use hosted_lane_dereference::{HostedDereferenceObjectKind, HostedLaneDeferredDeletions,
+    HostedLaneDereference};
 pub use event_terminal_receipt::EventTerminalReceiptSampler;
 pub use rpc_op6_trace::{RpcOp6ExchangeTracker, RpcOp6TraceCounts};
 pub use rpc_op6_client_capture::{RpcCaptureDirection, RpcCaptureEvent, RpcClientKey, RpcOp6ClientCapture, RPC_SAMPLE_CAP};

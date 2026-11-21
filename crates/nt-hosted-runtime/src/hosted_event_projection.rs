@@ -84,6 +84,24 @@ impl HostedEventProjectionLifetime {
         Some(self.references)
     }
 
+    /// A DISPATCH_LEVEL dereference from the IRQ lane. While another reference, wait, or
+    /// pending acknowledgement still owns the body, the release completes at once. The last
+    /// owner leaves its acknowledgement pending: the body stays owned until the deferred
+    /// PASSIVE_LEVEL worker completes it with `complete_dereference_ack`.
+    pub fn lane_dereference(&mut self) -> Option<crate::HostedLaneDereference> {
+        let mut begun = *self;
+        if !begun.begin_dereference() { return None; }
+        let mut completed = begun;
+        let references = completed.complete_dereference_ack()?;
+        if completed.retirable() {
+            *self = begun;
+            Some(crate::HostedLaneDereference::DeferredFinal)
+        } else {
+            *self = completed;
+            Some(crate::HostedLaneDereference::Completed(references))
+        }
+    }
+
     pub fn retain_wait(&mut self) -> bool {
         if self.references == 0 || self.waits == u32::MAX { return false; }
         self.waits += 1;

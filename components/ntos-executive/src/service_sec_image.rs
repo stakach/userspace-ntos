@@ -4636,6 +4636,9 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
     // the Reply. The dynamic delete drain waits for that primary's exact ready receipt, then
     // invokes DeleteProcedure on a separate PASSIVE worker.
     unsafe { driver_launch::hosted_driver_dynamic_delete::drain(); }
+    // A DPC's final Event dereference on its IRQ lane retires here, at PASSIVE_LEVEL, once the
+    // lane acknowledged that exact service.
+    unsafe { driver_launch::hosted_driver_event_reference::drain_lane_deletions(); }
     unsafe { driver_launch::hosted_provider_export_lane::drain(); }
     unsafe { spawn_hosts::shared_ingress::owner::runtime::nested::drain_abort(); }
     unsafe { win32k_glue::drain_win32k_startup_restores(); }

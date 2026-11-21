@@ -291,6 +291,8 @@ mod hosted_hard_error_verify_device;
 mod hosted_driver_apc_region;
 #[path = "hosted_start_io.rs"]
 mod hosted_start_io;
+#[path = "hosted_lane_dereference.rs"]
+mod hosted_lane_dereference;
 #[path = "hosted_kd_debug.rs"]
 mod hosted_kd_debug;
 
@@ -18545,13 +18547,42 @@ extern "win64" fn s_obf_reference_object(object: u64) -> u64 {
 
 extern "win64" fn s_obf_dereference_object(object: u64) -> u64 {
     unsafe {
-        if consumer_device_object_in_local_pool(object) {
+        let kind = if consumer_device_object_in_local_pool(object) {
+            nt_hosted_runtime::HostedDereferenceObjectKind::Device
+        } else if consumer_file_object_in_local_pool(object) {
+            nt_hosted_runtime::HostedDereferenceObjectKind::File
+        } else if hosted_driver_event_reference::contains(object) {
+            nt_hosted_runtime::HostedDereferenceObjectKind::Event
+        } else {
+            nt_hosted_runtime::HostedDereferenceObjectKind::Object
+        };
+        // ObfDereferenceObject is callable at DISPATCH_LEVEL, so a DPC drops its reference
+        // through its IRQ lane. The root defers any final deletion to a PASSIVE_LEVEL worker.
+        let service_id = hosted_lane_dereference::service_id(kind);
+        match hosted_irq_lane_request(
+            nt_hosted_runtime::HostedIrqServiceKind::DeferredDereference,
+            service_id,
+            &[object, kind as u64],
+        ) {
+            Some(result) if result.value_count == 1 && result.status == STATUS_SUCCESS => {
+                return result.values[0];
+            }
+            Some(result) if result.value_count == 1 => {
+                // The primary path bugchecks on the same refusals; the lane records it first.
+                s_ke_bug_check_ex(0xc4, service_id, kind as u64, object,
+                    result.status as u32 as u64);
+                hosted_irq_lane_protocol_fault(object)
+            }
+            Some(_) => hosted_irq_lane_protocol_fault(object),
+            None => {}
+        }
+        if kind == nt_hosted_runtime::HostedDereferenceObjectKind::Device {
             return hosted_device_pointer_count_mutation(
                 object,
                 HOSTED_DEVICE_OP_DEREFERENCE_POINTER,
             );
         }
-        if !consumer_file_object_in_local_pool(object) {
+        if kind != nt_hosted_runtime::HostedDereferenceObjectKind::File {
             if let Some(references) = hosted_driver_event_reference::release_if_owned(object) {
                 return references;
             }
@@ -61568,6 +61599,55 @@ fn trace_hosted_pointer_service(
     print_str(b" reason="); print_str(reason); print_str(b"\n");
 }
 
+/// ObfReference/ObfDereferenceObject on a DEVICE_OBJECT of an authenticated driver instance:
+/// its primary channel, or the IRQ lane of a DPC. The caller reference is split from the
+/// registration's anchor, so a dereference never releases the Device itself and has no deletion
+/// effect. Returns `(status, device reference count)`.
+pub(super) fn hosted_device_pointer_mutation_for(
+    inst: DriverInstance,
+    op: u64,
+    pdo_object: u64,
+) -> (i32, u64) {
+    let device_id = match instance_hosted_device(inst, pdo_object) {
+        Ok(device_id) => device_id,
+        Err(status) => {
+            trace_hosted_pointer_service(op, pdo_object, None, None,
+                status.raw() as u32, b"authentication");
+            return (status.raw(), 0);
+        }
+    };
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+        cookie: inst.hosted_domain_cookie,
+    };
+    let registration = match hosted_device_pointer_registration(domain, pdo_object, device_id) {
+        Ok(registration) => registration,
+        Err(status) => {
+            trace_hosted_pointer_service(op, pdo_object, None, None,
+                status.raw() as u32, b"registration-missing");
+            return (status.raw(), 0);
+        }
+    };
+    let before = io_manager_mut().hosted_device_pointer_count(registration);
+    let result = if op == HOSTED_DEVICE_OP_REFERENCE_POINTER {
+        io_manager_mut().reference_hosted_device_pointer(registration)
+    } else {
+        io_manager_mut().dereference_hosted_device_pointer(registration)
+    };
+    let status = result.as_ref().err().map_or(0, |status| status.raw() as u32);
+    let reason: &[u8] = if status == 0 { b"complete" }
+        else if before.is_err() { b"stale-registration" }
+        else if op == HOSTED_DEVICE_OP_DEREFERENCE_POINTER && before == Ok(0) {
+            b"missing-caller-reference"
+        } else { b"mutation-refused" };
+    trace_hosted_pointer_service(op, pdo_object, Some(registration),
+        before.ok(), status, reason);
+    match result {
+        Ok(_) => (STATUS_SUCCESS, io_manager_mut().device_reference_count(device_id)),
+        Err(status) => (status.raw(), 0),
+    }
+}
+
 pub(crate) fn service_hosted_device(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -61847,50 +61927,13 @@ pub(crate) fn service_hosted_device(
                 STATUS_INVALID_PARAMETER as u32, b"reserved-arguments");
             return (STATUS_INVALID_PARAMETER, 0, 0, 0);
         }
-        let (_, inst, device_id) =
-            match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
-                Ok(identity) => identity,
-                Err(status) => {
-                    trace_hosted_pointer_service(op, pdo_object, None, None,
-                        status.raw() as u32, b"authentication");
-                    return (status.raw(), 0, 0, 0);
-                }
-            };
-        let domain = HostedDomainIdentity {
-            domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
-            cookie: inst.hosted_domain_cookie,
+        let Some((_, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            trace_hosted_pointer_service(op, pdo_object, None, None,
+                STATUS_INVALID_PARAMETER as u32, b"authentication");
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
         };
-        let registration = match hosted_device_pointer_registration(domain, pdo_object, device_id) {
-            Ok(registration) => registration,
-            Err(status) => {
-                trace_hosted_pointer_service(op, pdo_object, None, None,
-                    status.raw() as u32, b"registration-missing");
-                return (status.raw(), 0, 0, 0);
-            }
-        };
-        let before = io_manager_mut().hosted_device_pointer_count(registration);
-        let result = if op == HOSTED_DEVICE_OP_REFERENCE_POINTER {
-            io_manager_mut().reference_hosted_device_pointer(registration)
-        } else {
-            io_manager_mut().dereference_hosted_device_pointer(registration)
-        };
-        let status = result.as_ref().err().map_or(0, |status| status.raw() as u32);
-        let reason: &[u8] = if status == 0 { b"complete" }
-            else if before.is_err() { b"stale-registration" }
-            else if op == HOSTED_DEVICE_OP_DEREFERENCE_POINTER && before == Ok(0) {
-                b"missing-caller-reference"
-            } else { b"mutation-refused" };
-        trace_hosted_pointer_service(op, pdo_object, Some(registration),
-            before.ok(), status, reason);
-        return match result {
-            Ok(_) => (
-                STATUS_SUCCESS,
-                io_manager_mut().device_reference_count(device_id),
-                0,
-                0,
-            ),
-            Err(status) => (status.raw(), 0, 0, 0),
-        };
+        let (status, count) = hosted_device_pointer_mutation_for(inst, op, pdo_object);
+        return (status, count, 0, 0);
     }
     if op == HOSTED_DEVICE_OP_SET_INTERFACE_STATE {
         let Some((_, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {

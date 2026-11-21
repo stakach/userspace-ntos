@@ -37,6 +37,13 @@ pub(crate) fn release_reference_service(
     if let Err(status) = unsafe { crate::service_sec_image::with_provider_process_manager(|pm| {
         pm.validate_native_handle_caller(caller)
     }) } { return (status as i32, 0); }
+    release_reference_for(index, inst, body)
+}
+
+/// Release one borrowed reference of an authenticated driver instance: from its primary channel
+/// after caller validation, or from a DPC on its IRQ lane. A final release only marks the
+/// registry row ready; `drain` delivers its DeleteProcedure on a separate PASSIVE worker.
+pub(super) fn release_reference_for(index: usize, inst: DriverInstance, body: u64) -> (i32, u64) {
     unsafe {
         let Some(lease) = hosted_driver_dynamic_type::registry_mut()
             .and_then(|registry| registry.lease_for_live_body(body)) else {

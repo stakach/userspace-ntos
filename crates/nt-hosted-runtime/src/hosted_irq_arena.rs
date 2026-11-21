@@ -170,6 +170,9 @@ pub enum HostedIrqServiceKind {
     WmiWriteEvent = 23,
     /// `IoAllocateIrp`: register the lane's pool packet `(IRP, bytes, StackSize)`.
     AllocateIrp = 24,
+    /// `ObfDereferenceObject(Object)` as `(Object, HostedDereferenceObjectKind)`: drop one
+    /// reference; any final deletion runs later on a PASSIVE_LEVEL root worker.
+    DeferredDereference = 25,
 }
 
 impl HostedIrqServiceKind {
@@ -199,6 +202,7 @@ impl HostedIrqServiceKind {
             22 => Some(Self::PciConfig),
             23 => Some(Self::WmiWriteEvent),
             24 => Some(Self::AllocateIrp),
+            25 => Some(Self::DeferredDereference),
             _ => None,
         }
     }
@@ -599,6 +603,13 @@ impl HostedIrqServiceCommand {
                         && self.arguments[1] != 0
                         && (1..=32).contains(&self.arguments[2])
                         && self.arguments[3..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::DeferredDereference => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 2
+                        && self.arguments[0] != 0
+                        && crate::HostedDereferenceObjectKind::from_raw(self.arguments[1]).is_some()
+                        && self.arguments[2..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::PoolRetirement => {
                     self.authority_cookie == 0
@@ -2627,7 +2638,7 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
         assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
-        assert_eq!(HostedIrqServiceKind::from_raw(25), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(26), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2791,6 +2802,44 @@ mod tests {
         beep.authority_cookie = 0;
         beep.argument_count = 0;
         assert!(!beep.valid(), "missing frequency");
+    }
+
+    #[test]
+    fn irq_deferred_dereference_carries_one_object_and_its_kind() {
+        // ObfDereferenceObject: IRQL <= DISPATCH_LEVEL. Every local classification is admitted.
+        assert_eq!(HostedIrqServiceKind::from_raw(25),
+            Some(HostedIrqServiceKind::DeferredDereference));
+        let mut dereference = service();
+        dereference.kind = HostedIrqServiceKind::DeferredDereference;
+        dereference.authority_cookie = 0;
+        dereference.argument_count = 2;
+        dereference.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        dereference.arguments[0] = 0x9000;
+        for kind in [
+            crate::HostedDereferenceObjectKind::Device,
+            crate::HostedDereferenceObjectKind::File,
+            crate::HostedDereferenceObjectKind::Event,
+            crate::HostedDereferenceObjectKind::Object,
+        ] {
+            dereference.arguments[1] = kind as u64;
+            assert!(dereference.valid(), "{kind:?}");
+        }
+        dereference.arguments[1] = 0;
+        assert!(!dereference.valid(), "the kind is required");
+        dereference.arguments[1] = 5;
+        assert!(!dereference.valid(), "unknown kind");
+        dereference.arguments[1] = crate::HostedDereferenceObjectKind::File as u64;
+        dereference.arguments[0] = 0;
+        assert!(!dereference.valid(), "the object is required");
+        dereference.arguments[0] = 0x9000;
+        dereference.arguments[2] = 1;
+        assert!(!dereference.valid(), "trailing argument");
+        dereference.arguments[2] = 0;
+        dereference.argument_count = 1;
+        assert!(!dereference.valid(), "missing kind");
+        dereference.argument_count = 2;
+        dereference.authority_cookie = 1;
+        assert!(!dereference.valid(), "unexpected authority cookie");
     }
 
     #[test]

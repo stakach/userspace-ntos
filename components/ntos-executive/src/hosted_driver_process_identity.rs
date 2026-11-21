@@ -135,6 +135,42 @@ pub(super) fn retain_process_if_known(body: u64) -> Option<u64> {
     Some(body)
 }
 
+/// Release one Ps lookup lease of an authenticated driver domain: from its primary channel after
+/// caller validation, or from a DPC on its IRQ lane. The lease is the authority, as at domain
+/// retirement; the count drop has no deletion effect. Returns `(status, references remaining)`;
+/// a body that is not a canonical Process reports `STATUS_UNSUPPORTED_OBJECT`.
+pub(super) fn release_for(inst: DriverInstance, domain: HostedDomainIdentity, body: u64) -> (i32, u64) {
+    unsafe {
+        let known = crate::service_sec_image::with_provider_process_manager(|pm| {
+            Ok::<_, u32>(pm.pid_for_kernel_process_object(body).is_some())
+        });
+        match known {
+            Ok(false) => return (STATUS_UNSUPPORTED_OBJECT, 0),
+            Err(status) => return (status as i32, 0),
+            Ok(true) => {}
+        }
+        let leases = &mut *core::ptr::addr_of_mut!(PROCESS_LEASES);
+        let Some(index) = leases.iter().position(|lease| {
+            lease.domain == domain && lease.pml4 == inst.pml4 && lease.body == body
+        }) else {
+            return (STATUS_INVALID_HANDLE, 0);
+        };
+        match crate::service_sec_image::with_provider_process_manager(|pm| {
+            pm.release_kernel_object_pointer(body)
+        }) {
+            Ok(references) => {
+                leases.swap_remove(index);
+                (STATUS_SUCCESS, u64::from(references))
+            }
+            Err(status) => (status as i32, 0),
+        }
+    }
+}
+
+pub(super) const fn unowned(status: i32) -> bool {
+    status == STATUS_UNSUPPORTED_OBJECT
+}
+
 /// The pump has authenticated badge, exact Reply, and source channel before
 /// invoking this service. This function revalidates the driver instance and
 /// canonical native caller before any process-manager effect.
@@ -214,31 +250,12 @@ pub(crate) fn service(
                 }
             }
             RELEASE => {
-                let known = crate::service_sec_image::with_provider_process_manager(|pm| {
-                    pm.validate_native_handle_caller(caller)?;
-                    Ok(pm.pid_for_kernel_process_object(value).is_some())
-                });
-                match known {
-                    Ok(false) => return (STATUS_UNSUPPORTED_OBJECT, 0),
-                    Err(status) => return (status as i32, 0),
-                    Ok(true) => {}
+                if let Err(status) = crate::service_sec_image::with_provider_process_manager(|pm|
+                    pm.validate_native_handle_caller(caller))
+                {
+                    return (status as i32, 0);
                 }
-                let leases = &mut *core::ptr::addr_of_mut!(PROCESS_LEASES);
-                let Some(index) = leases.iter().position(|lease| {
-                    lease.domain == domain && lease.pml4 == inst.pml4 && lease.body == value
-                }) else {
-                    return (STATUS_INVALID_HANDLE, 0);
-                };
-                match crate::service_sec_image::with_provider_process_manager(|pm| {
-                    pm.validate_native_handle_caller(caller)?;
-                    pm.release_kernel_object_pointer(value)
-                }) {
-                    Ok(references) => {
-                        leases.swap_remove(index);
-                        (STATUS_SUCCESS, u64::from(references))
-                    }
-                    Err(status) => (status as i32, 0),
-                }
+                release_for(inst, domain, value)
             }
             RETAIN => {
                 let leases = &mut *core::ptr::addr_of_mut!(PROCESS_LEASES);

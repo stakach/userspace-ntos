@@ -631,20 +631,36 @@ pub(super) unsafe fn dereference_pointer(
 ) -> i32 {
     let result = (|| -> Result<(), i32> {
         let (_, domain) = authenticate(ch, reply_cap)?;
-        let id = row_for_pointer(domain, address).ok_or(STATUS_INVALID_PARAMETER)?;
-        let identity = row(id).file.ok_or(STATUS_INVALID_HANDLE)?;
-        row(id)
-            .projection
-            .as_mut()
-            .ok_or(STATUS_INVALID_HANDLE)?
-            .dereference(io_manager_mut(), identity)
-            .map_err(|status| status.raw())?;
-        if row(id).phase == Phase::Retiring {
+        if let Some(id) = release_pointer(domain, address)? {
             let _ = retire(id);
         }
         Ok(())
     })();
     result.map_or_else(|status| status, |_| STATUS_SUCCESS)
+}
+
+/// ObfDereferenceObject from a DPC on the IRQ lane of the authenticated domain. One pointer
+/// reference drops at once; a row left retiring stays owned here until `redrive` retires it from
+/// the PASSIVE_LEVEL service-loop maintenance, so no deletion runs inside the DPC.
+pub(super) unsafe fn dereference_pointer_deferred(
+    domain: HostedDomainIdentity,
+    address: u64,
+) -> i32 {
+    release_pointer(domain, address).map_or_else(|status| status, |_| STATUS_SUCCESS)
+}
+
+/// Release one canonical File pointer reference. Returns the row when its handle has already
+/// closed, so its final retirement is now due.
+unsafe fn release_pointer(domain: HostedDomainIdentity, address: u64) -> Result<Option<u64>, i32> {
+    let id = row_for_pointer(domain, address).ok_or(STATUS_INVALID_PARAMETER)?;
+    let identity = row(id).file.ok_or(STATUS_INVALID_HANDLE)?;
+    row(id)
+        .projection
+        .as_mut()
+        .ok_or(STATUS_INVALID_HANDLE)?
+        .dereference(io_manager_mut(), identity)
+        .map_err(|status| status.raw())?;
+    Ok((row(id).phase == Phase::Retiring).then_some(id))
 }
 
 /// Called only after the typed process-table close receipt is committed. A pointer reference may

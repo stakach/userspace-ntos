@@ -43,6 +43,10 @@ struct PendingDereference {
 
 static mut PENDING_DEREFERENCES: Vec<PendingDereference> = Vec::new();
 
+/// Final dereferences from DPCs on an IRQ lane, owned until the PASSIVE_LEVEL drain runs them.
+static mut LANE_DELETIONS: nt_hosted_runtime::HostedLaneDeferredDeletions<HostedEventProjectionKey> =
+    nt_hosted_runtime::HostedLaneDeferredDeletions::new();
+
 #[derive(Clone, Copy)]
 pub(super) struct EventProjectionWaitLease {
     key: HostedEventProjectionKey,
@@ -315,6 +319,115 @@ pub(super) fn clear_if_owned(body: u64) -> Option<u64> { state_if_owned(body, CL
 pub(super) fn pulse_if_owned(body: u64) -> Option<u64> { state_if_owned(body, PULSE) }
 pub(super) fn read_if_owned(body: u64) -> Option<u64> { state_if_owned(body, READ) }
 
+/// Complete one acknowledged dereference of a validated row: the primary channel's exact ACK, or
+/// a lane's deferred final dereference on the PASSIVE_LEVEL drain. Storage retires only once
+/// no reference, wait, or other acknowledgement owns the body. Returns the remaining count.
+unsafe fn complete_dereference(row_index: usize) -> Result<u32, i32> {
+    let rows = &mut *core::ptr::addr_of_mut!(PROJECTIONS);
+    let row = &mut rows[row_index];
+    let mut next = row.lifetime;
+    let count = next.complete_dereference_ack().ok_or(STATUS_INVALID_HANDLE)?;
+    let handler = crate::service_sec_image::registry_live_handler_pointer()
+        .map_err(|status| status as i32)?;
+    if next.retirable() {
+        let pin = row.pin.as_mut().expect("validated Event projection pin");
+        hosted_device_allocations::retire_owned_temporary_pool_allocation(pin)
+            .map_err(|status| status.raw())?;
+        row.pin = None;
+    }
+    let id = nt_kernel_exec::EventObjectId(nt_types::ObjectId(row.id));
+    if (&mut *handler).provider_dereference_native_event_pointer(id).is_err() {
+        crate::provider_bugcheck::report(0xc4, [LABEL, row.body, row.id, 8]);
+    }
+    row.lifetime = next;
+    if next.retirable() { rows.swap_remove(row_index); }
+    Ok(count)
+}
+
+/// ObfDereferenceObject on a projected Event from a DPC on the IRQ lane of an authenticated
+/// instance. A reference that leaves the body owned completes at once. The last one stays
+/// pending, owned by `LANE_DELETIONS` under the exact service token before this returns; the
+/// body retires on the PASSIVE_LEVEL drain once the lane has acknowledged that token.
+/// Returns `(status, references remaining)`.
+pub(super) unsafe fn lane_dereference(
+    index: usize,
+    inst: DriverInstance,
+    body: u64,
+    lane: nt_hosted_runtime::HostedIrqLaneIdentity,
+    token: nt_hosted_runtime::HostedIrqArenaToken,
+) -> (i32, u64) {
+    let Some(domain) = instance_domain_identity(inst) else {
+        return (STATUS_INVALID_HANDLE, 0);
+    };
+    let rows = &mut *core::ptr::addr_of_mut!(PROJECTIONS);
+    let Some(row) = rows.iter_mut().find(|row| row.body == body
+        && row.instance == index && row.domain == domain && row.pml4 == inst.pml4) else {
+        return (STATUS_UNOWNED_OBJECT, 0);
+    };
+    if !row.key.matches(domain.domain_id.raw(), domain.cookie, inst.pml4,
+        row.id, row.body, row.allocation.pool_generation)
+        || row.pin.is_none()
+        || row.lifetime.references() == 0
+        || hosted_device_allocations::capture_range_allocation(inst,
+            row.body, BODY_ALLOCATION_BYTES).ok() != Some(row.allocation)
+    { return (STATUS_INVALID_HANDLE, 0); }
+    let handler = match crate::service_sec_image::registry_live_handler_pointer() {
+        Ok(handler) => handler,
+        Err(status) => return (status as i32, 0),
+    };
+    let deletions = &mut *core::ptr::addr_of_mut!(LANE_DELETIONS);
+    if !deletions.try_reserve() {
+        return (STATUS_INSUFFICIENT_RESOURCES, 0);
+    }
+    let mut next = row.lifetime;
+    match next.lane_dereference() {
+        None => (STATUS_INVALID_HANDLE, 0),
+        Some(nt_hosted_runtime::HostedLaneDereference::Completed(count)) => {
+            // Another owner still holds a native pointer, so this one is never the last.
+            let id = nt_kernel_exec::EventObjectId(nt_types::ObjectId(row.id));
+            if (&mut *handler).provider_dereference_native_event_pointer(id).is_err() {
+                crate::provider_bugcheck::report(0xc4, [LABEL, row.body, row.id, 9]);
+            }
+            row.lifetime = next;
+            (STATUS_SUCCESS, u64::from(count))
+        }
+        Some(nt_hosted_runtime::HostedLaneDereference::DeferredFinal) => {
+            if !deletions.record(lane, token, row.key) {
+                return (STATUS_INVALID_HANDLE, 0);
+            }
+            row.lifetime = next;
+            (STATUS_SUCCESS, 0)
+        }
+    }
+}
+
+/// The lane exchange after a service: only a proven worker acknowledgement releases that
+/// service's deferred final dereference to the drain. An uncertain one stays parked.
+pub(super) unsafe fn observe_lane_acknowledgement(
+    lane: nt_hosted_runtime::HostedIrqLaneIdentity,
+    token: nt_hosted_runtime::HostedIrqArenaToken,
+    acknowledged: bool,
+) {
+    (&mut *core::ptr::addr_of_mut!(LANE_DELETIONS)).observe(lane, token, acknowledged);
+}
+
+/// PASSIVE_LEVEL service-loop drain: retire each acknowledged lane final dereference once.
+/// A refused retirement changed nothing and is retried on a later turn.
+pub(crate) unsafe fn drain_lane_deletions() -> usize {
+    let deletions = &mut *core::ptr::addr_of_mut!(LANE_DELETIONS);
+    if deletions.is_empty() { return 0; }
+    deletions.run_ready(|key| {
+        let live_row = {
+            let rows = &*core::ptr::addr_of!(PROJECTIONS);
+            rows.iter().position(|row| row.key == key && row.pin.is_some()
+                && instance(row.instance).is_some_and(|inst|
+                    instance_domain_identity(inst) == Some(row.domain)
+                    && inst.pml4 == row.pml4))
+        };
+        live_row.is_some_and(|row_index| complete_dereference(row_index).is_ok())
+    })
+}
+
 pub(crate) fn service(
     channel: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -494,7 +607,7 @@ pub(crate) fn service(
                 && row.domain == domain && row.pml4 == inst.pml4) else {
                 return (STATUS_INVALID_HANDLE, 0, 0, 0);
             };
-            let row = &mut rows[row_index];
+            let row = &rows[row_index];
             if row.pin.is_none() || !row.key.matches(domain.domain_id.raw(),
                 domain.cookie, inst.pml4, row.id, row.body,
                 row.allocation.pool_generation)
@@ -504,29 +617,13 @@ pub(crate) fn service(
                 receipt.key == row.key && receipt.route == physical_caller.route
                 && receipt.thread_handle == physical_caller.thread_handle)
             else { return (STATUS_INVALID_HANDLE, 0, 0, 0); };
-            let mut next = row.lifetime;
-            let Some(count) = next.complete_dereference_ack() else {
-                return (STATUS_INVALID_HANDLE, 0, 0, 0);
-            };
-            let handler = match crate::service_sec_image::registry_live_handler_pointer() {
-                Ok(handler) => handler,
-                Err(status) => return (status as i32, 0, 0, 0),
-            };
-            if next.retirable() {
-                let pin = row.pin.as_mut().expect("validated Event projection pin");
-                if let Err(status) = hosted_device_allocations::retire_owned_temporary_pool_allocation(pin) {
-                    return (status.raw(), 0, 0, 0);
+            match complete_dereference(row_index) {
+                Ok(count) => {
+                    pending.swap_remove(pending_index);
+                    (STATUS_SUCCESS, u64::from(count), 0, 0)
                 }
-                row.pin = None;
+                Err(status) => (status, 0, 0, 0),
             }
-            let id = nt_kernel_exec::EventObjectId(nt_types::ObjectId(row.id));
-            if (&mut *handler).provider_dereference_native_event_pointer(id).is_err() {
-                crate::provider_bugcheck::report(0xc4, [LABEL, row.body, row.id, 8]);
-            }
-            row.lifetime = next;
-            pending.swap_remove(pending_index);
-            if next.retirable() { rows.swap_remove(row_index); }
-            (STATUS_SUCCESS, u64::from(count), 0, 0)
         },
         SET | RESET | CLEAR | PULSE | READ => unsafe {
             if arg1 == 0 || arg2 != 0 || arg3 != 0 {

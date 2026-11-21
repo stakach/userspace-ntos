@@ -24,6 +24,7 @@ const DPC_LEGAL: &[(&str, &str)] = &[
     ("HalGetBusDataByOffset/HalSetBusDataByOffset", "hosted_pci_config_call"),
     ("IoWMIWriteEvent", "write_event"),
     ("IoAllocateIrp", "s_io_allocate_irp"),
+    ("ObfDereferenceObject", "s_obf_dereference_object"),
 ];
 
 /// The driver-side entry points that publish a typed service on the current IRQ lane.

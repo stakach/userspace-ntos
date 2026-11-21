@@ -1715,6 +1715,31 @@ impl HostedIrqRootSession {
         values_result(status, &[ticket, generation])
     }
 
+    /// ObfDereferenceObject from the lane's DPC: drop one reference; final deletion is deferred
+    /// to a PASSIVE_LEVEL root worker (see `hosted_lane_dereference`).
+    unsafe fn deferred_dereference_service(
+        &mut self,
+        lane_index: usize,
+        service: nt_hosted_runtime::HostedIrqArenaToken,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let [object, kind, ..] = command.arguments;
+        let Some(kind) = nt_hosted_runtime::HostedDereferenceObjectKind::from_raw(kind) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let (index, inst) =
+            match self.lane_driver(lane_index, command, hosted_lane_dereference::service_id(kind)) {
+                Ok(driver) => driver,
+                Err(refused) => return refused,
+            };
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let (status, count) =
+            hosted_lane_dereference::dereference_for(index, inst, lane.identity, service, object, kind);
+        values_result(status, &[count])
+    }
+
     /// IoWMIWriteEvent from the lane's DPC.
     unsafe fn wmi_write_event_service(
         &mut self,
@@ -1931,6 +1956,9 @@ impl HostedIrqRootSession {
             nt_hosted_runtime::HostedIrqServiceKind::AllocateIrp => {
                 self.allocate_irp_service(lane_index, command)
             }
+            nt_hosted_runtime::HostedIrqServiceKind::DeferredDereference => {
+                self.deferred_dereference_service(lane_index, service, command)
+            }
             nt_hosted_runtime::HostedIrqServiceKind::PciConfig => {
                 self.pci_config_service(lane_index, command)
             }
@@ -2035,6 +2063,19 @@ impl HostedIrqRootSession {
             return Err(arena_status(error));
         }
         let exchange = self.exchange(lane_index, service);
+        if command.kind == nt_hosted_runtime::HostedIrqServiceKind::DeferredDereference {
+            // Only the worker's acknowledgement of this exact service releases a deferred final
+            // dereference to its PASSIVE_LEVEL drain; an uncertain exchange parks it for good.
+            let acknowledged = exchange.is_ok()
+                && arena.service[service.depth as usize]
+                    .root_acknowledged(lane.identity, service)
+                    == Ok(true);
+            hosted_driver_event_reference::observe_lane_acknowledgement(
+                lane.identity,
+                service,
+                acknowledged,
+            );
+        }
         if let Some(index) = self.class_acks.iter().position(|receipt| {
             receipt.lane == lane.identity && receipt.token == service
         }) {
