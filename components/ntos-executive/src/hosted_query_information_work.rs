@@ -519,7 +519,7 @@ impl Work {
             return;
         }
         bytes.resize(length, 0);
-        if !matches!(copy_completed_irp_output_exact(irp.raw(), 0, &mut bytes), Ok(copied) if copied == length)
+        if !matches!(crate::completion_retry::retried(copy_completed_irp_output_exact(irp.raw(), 0, &mut bytes)), Ok(copied) if copied == length)
         {
             return;
         }
@@ -576,7 +576,7 @@ impl Work {
             }
         }
         if let Some(irp) = self.canonical_irp {
-            if acknowledge_completed_irp(irp.raw()).is_err() {
+            if crate::completion_retry::retried(acknowledge_completed_irp(irp.raw())).is_err() {
                 return false;
             }
             self.canonical_irp = None;

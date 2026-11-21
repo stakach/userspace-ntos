@@ -447,7 +447,7 @@ impl Work {
         let mut bytes = Vec::new();
         if bytes.try_reserve_exact(length).is_err() { return; }
         bytes.resize(length, 0);
-        if !matches!(copy_completed_irp_output_exact(irp.raw(), 0, &mut bytes), Ok(copied) if copied == length) {
+        if !matches!(crate::completion_retry::retried(copy_completed_irp_output_exact(irp.raw(), 0, &mut bytes)), Ok(copied) if copied == length) {
             return;
         }
         let output = ReadCompletion::from_owned(completion.status, completion.information, bytes);
@@ -490,7 +490,7 @@ impl Work {
             }
         }
         if let Some(irp) = self.canonical_irp {
-            if acknowledge_completed_irp(irp.raw()).is_err() { return false; }
+            if crate::completion_retry::retried(acknowledge_completed_irp(irp.raw())).is_err() { return false; }
             self.canonical_irp = None;
         }
         if !self.release_source((self.origin.pending() || self.origin.inline_held()) && !stopped) {

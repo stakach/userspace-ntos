@@ -3956,6 +3956,10 @@ mod tests {
 mod file_pump_return;
 mod backend_pump_rows;
 mod backend_irp_operations;
+mod completion_step;
+mod copy_receipts;
+pub use copy_receipts::CopyReceipts;
+pub use completion_step::{CompletionRetryWake, CompletionStep};
 mod file_dispatch_tail;
 pub use file_dispatch_tail::{FileTailBuffer, FileTailNext, FileTailStage};
 pub use backend_pump_rows::{BackendCollect, BackendTicket, KeptBackendPumps};

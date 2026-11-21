@@ -642,7 +642,7 @@ impl Work {
             return;
         }
         output.resize(capacity, 0);
-        if copy_completed_irp_output_exact(irp.raw(), 0, &mut output) != Ok(capacity) {
+        if crate::completion_retry::retried(copy_completed_irp_output_exact(irp.raw(), 0, &mut output)) != Ok(capacity) {
             return;
         }
         self.observe_terminal(completion.status as i32, completion.information, &output);
@@ -684,7 +684,7 @@ impl Work {
         }
         if let Some(irp) = self.canonical_irp {
             if !self.provider_acknowledged {
-                if acknowledge_completed_irp_strict(irp.raw()).is_err() {
+                if crate::completion_retry::retried(acknowledge_completed_irp_strict(irp.raw())).is_err() {
                     return false;
                 }
                 self.source

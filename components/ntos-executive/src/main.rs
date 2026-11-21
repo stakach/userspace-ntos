@@ -184,6 +184,7 @@ mod process_creation_trace;
 mod process_image_snapshot_work;
 mod hosted_spawn_uncertainty;
 mod provider_process_termination;
+mod completion_retry;
 mod section_pagein_work;
 mod provider_section_map_work;
 mod native_image_pagein_work;
@@ -3198,6 +3199,8 @@ const DELAY_TIMER_SOURCE_SECTION_EXTEND: u64 = 51;
 /// A kernel job's scheduler yield whose lane stayed held retries its parent restore (#333).
 const DELAY_TIMER_SOURCE_KERNEL_YIELD_RETRY: u64 = 52;
 const DELAY_TIMER_SOURCE_ALPC_TIMEOUT: u64 = 53;
+/// A kept backend pump returned while a row's copy or ACK waited for it (#420).
+const DELAY_TIMER_SOURCE_COMPLETION_RETRY: u64 = 54;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -17912,6 +17915,7 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(18, section_metadata_work::wake_due(now_100ns))
         + subdrain!(24, process_image_snapshot_work::wake_due(now_100ns))
         + subdrain!(20, section_pagein_work::wake_due(now_100ns))
+        + subdrain!(20, u64::from(completion_retry::next_deadline().is_some()))
         + subdrain!(13, provider_section_map_work::wake_due(now_100ns))
         + subdrain!(25, native_image_pagein_work::wake_due(now_100ns))
         + subdrain!(25, vm_lock_pagein_work::wake_due(now_100ns))

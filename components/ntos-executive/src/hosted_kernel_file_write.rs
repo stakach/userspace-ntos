@@ -211,7 +211,7 @@ impl Work {
             if completed_irp_exact(irp.raw()).is_none() {
                 return false;
             }
-            if acknowledge_completed_irp(irp.raw()).is_err() {
+            if crate::completion_retry::retried(acknowledge_completed_irp(irp.raw())).is_err() {
                 return false;
             }
             self.pending_irp = None;
@@ -233,7 +233,7 @@ impl Work {
                 return false;
             }
             if let Some(irp) = self.pending_irp {
-                if acknowledge_completed_irp(irp.raw()).is_err() {
+                if crate::completion_retry::retried(acknowledge_completed_irp(irp.raw())).is_err() {
                     return false;
                 }
                 self.pending_irp = None;

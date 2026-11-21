@@ -77,6 +77,27 @@ impl<T> IrpOperations<T> {
         self.rows.iter().any(|row| row.key.irp == irp)
     }
 
+    /// Before `key` is admitted, give up the different operation running against its IRP when
+    /// `abandonable` says nothing waits for its result: a copy whose pump has returned reads
+    /// completion storage and has no other effect. The removed operation is returned for its
+    /// caller to collect and drop. A running operation, an identical key, an ACK or a cancel
+    /// (whose effects matter) is never given up.
+    pub fn abandon_returned(
+        &mut self,
+        key: IrpOperationKey,
+        abandonable: impl FnOnce(&IrpOperationKey, &T) -> bool,
+    ) -> Option<(IrpOperationKey, T)> {
+        let index = self.rows.iter().position(|row| row.key.irp == key.irp)?;
+        let row = &self.rows[index];
+        let State::Running(kept) = &row.state else { return None; };
+        if row.key == key || !abandonable(&row.key, kept) { return None; }
+        let row = self.rows.swap_remove(index);
+        match row.state {
+            State::Running(kept) => Some((row.key, kept)),
+            _ => unreachable!("checked running above"),
+        }
+    }
+
     /// Hold room for one more row before an operation enters, so keeping it never allocates.
     pub fn reserve(&mut self) -> Result<(), ()> {
         self.rows.try_reserve(1).map_err(|_| ())
@@ -221,6 +242,27 @@ mod tests {
         assert_eq!(ops.admit(copy), IrpOperationAdmission::Busy,
             "an uncertain collected effect is never replayed");
         assert!(!ops.settled(copy), "a quarantined row cannot be settled");
+    }
+
+    #[test]
+    fn a_returned_copy_nobody_collects_gives_way_to_the_irps_next_operation() {
+        let mut ops = IrpOperations::new();
+        let copy = key(5, COPY, 0, 16);
+        let ack = key(5, ACK, 0, 0);
+        kept(&mut ops, copy);
+        assert_eq!(ops.abandon_returned(ack, |_, _| false), None,
+            "a copy whose pump still runs keeps the IRP");
+        assert_eq!(ops.admit(ack), IrpOperationAdmission::Busy);
+        assert_eq!(ops.abandon_returned(copy, |_, _| true), None,
+            "the identical call collects; it never abandons its own operation");
+        assert_eq!(ops.abandon_returned(ack, |running, _| running.operation == COPY),
+            Some((copy, "pump")), "the caller collects and drops the returned copy");
+        assert_eq!(ops.admit(ack), IrpOperationAdmission::Issue,
+            "the ACK runs once the abandoned copy is gone");
+        ops.reserve().unwrap();
+        ops.keep(ack, "ack");
+        assert_eq!(ops.abandon_returned(key(5, COPY, 0, 16), |running, _| running.operation == COPY),
+            None, "a running ACK is never abandoned");
     }
 
     #[test]

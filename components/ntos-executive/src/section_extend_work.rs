@@ -7,6 +7,7 @@
 //! Reply is parked at ingress, the IRP is owned through its exact terminal completion and strict
 //! acknowledgement, and the section grows only once the file covers it.
 
+use nt_hosted_runtime::CompletionStep;
 use super::*;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -63,7 +64,8 @@ fn has_rows() -> bool {
 }
 
 pub(crate) fn next_deadline() -> Option<u64> {
-    (ACTIVE.load(Ordering::Acquire) || has_rows()).then(|| NEXT.load(Ordering::Acquire))
+    (ACTIVE.load(Ordering::Acquire) || has_rows())
+        .then(|| crate::completion_retry::row_deadline(NEXT.load(Ordering::Acquire)))
 }
 
 pub(crate) fn wake_due(now: u64) -> u64 {
@@ -254,7 +256,11 @@ unsafe fn advance(handler: &mut ExecNtHandler, row: &mut Extend) {
             };
         }
         Phase::Acknowledge { irp, status } => {
-            if driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp).is_err() {
+            // A refused or still-running ACK keeps the IRP owned; retry it.
+            if !matches!(crate::completion_retry::step_status(
+                driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp)),
+                CompletionStep::Done(_))
+            {
                 return;
             }
             let (status, size) = commit(handler, row.section, row.new_size, status);

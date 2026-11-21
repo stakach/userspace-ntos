@@ -1,5 +1,6 @@
 //! Retained native Section publication and routed File metadata I/O.
 
+use nt_hosted_runtime::CompletionStep;
 use crate::*;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -631,6 +632,10 @@ enum Step {
 
 pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_execution::Queue) {
     // No retained row means no due decision to make, so the clock is not read.
+    if has_work() && completion_retry::due() {
+        // A kept pump returned while a row's copy or ACK waited for it (#420).
+        WAKE.publish(monotonic_time_100ns());
+    }
     let Some((wake_attempt, _)) =
         WAKE.begin_redrive_with_clock(has_work(), || monotonic_time_100ns()) else {
         return;
@@ -1108,12 +1113,12 @@ unsafe fn advance(
         } => {
             let mut bytes = [0u8; 24];
             let remaining = length - offset;
-            let copied = match driver_launch::copy_completed_irp_output_exact(
+            let copied = match completion_retry::step(driver_launch::copy_completed_irp_output_exact(
                 irp.raw(),
                 offset as u64,
                 &mut bytes[..remaining],
-            ) {
-                Ok(copied) if copied != 0 && copied <= remaining => copied,
+            )) {
+                CompletionStep::Done(copied) if copied != 0 && copied <= remaining => copied,
                 _ => return Step::Wait,
             };
             assert!(work.metadata.append(
@@ -1137,11 +1142,15 @@ unsafe fn advance(
         Phase::AckPending { irp } => {
             // The backend ACK is entered once. An uncertain result retains all owners.
             work.phase = Phase::Indeterminate;
-            if driver_launch::io_manager_mut()
-                .acknowledge_completed_irp_strict(irp)
-                .is_err()
-            {
-                return Step::Wait;
+            match completion_retry::step_status(
+                driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp),
+            ) {
+                CompletionStep::Done(_) => {}
+                CompletionStep::Retry => {
+                    work.phase = Phase::AckPending { irp };
+                    return Step::Wait;
+                }
+                CompletionStep::Failed(_) => return Step::Wait,
             }
             assert!(work
                 .metadata
@@ -1201,11 +1210,15 @@ unsafe fn advance(
         Phase::ExtendAck { irp, status } => {
             // The backend ACK is entered once. An uncertain result retains all owners.
             work.phase = Phase::Indeterminate;
-            if driver_launch::io_manager_mut()
-                .acknowledge_completed_irp_strict(irp)
-                .is_err()
-            {
-                return Step::Wait;
+            match completion_retry::step_status(
+                driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp),
+            ) {
+                CompletionStep::Done(_) => {}
+                CompletionStep::Retry => {
+                    work.phase = Phase::ExtendAck { irp, status };
+                    return Step::Wait;
+                }
+                CompletionStep::Failed(_) => return Step::Wait,
             }
             finish_file_extension(work, status);
             Step::Progress
@@ -1431,12 +1444,12 @@ unsafe fn advance(
         } => {
             let mut bytes = [0u8; IMAGE_HEADER_READ_SIZE];
             let remaining = length - offset;
-            let copied = match driver_launch::copy_completed_irp_output_exact(
+            let copied = match completion_retry::step(driver_launch::copy_completed_irp_output_exact(
                 irp.raw(),
                 offset as u64,
                 &mut bytes[..remaining.min(IMAGE_HEADER_READ_SIZE)],
-            ) {
-                Ok(copied) if copied != 0 && copied <= remaining => copied,
+            )) {
+                CompletionStep::Done(copied) if copied != 0 && copied <= remaining => copied,
                 _ => return Step::Wait,
             };
             work.image_header.extend_from_slice(&bytes[..copied]);
@@ -1454,11 +1467,15 @@ unsafe fn advance(
         }
         Phase::HeaderAckPending { irp } => {
             work.phase = Phase::Indeterminate;
-            if driver_launch::io_manager_mut()
-                .acknowledge_completed_irp_strict(irp)
-                .is_err()
-            {
-                return Step::Wait;
+            match completion_retry::step_status(
+                driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp),
+            ) {
+                CompletionStep::Done(_) => {}
+                CompletionStep::Retry => {
+                    work.phase = Phase::HeaderAckPending { irp };
+                    return Step::Wait;
+                }
+                CompletionStep::Failed(_) => return Step::Wait,
             }
             if work.status == 0 && !work.cancelled {
                 crate::note_boot_progress(crate::BootProgress::ImageSnapshotCaptured);

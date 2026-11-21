@@ -4,6 +4,7 @@
 //! that snapshot through pending IRPs after native disk handoff. This owner keeps the original
 //! syscall Reply, parent/requestor references and Section view until every read is acknowledged.
 
+use nt_hosted_runtime::CompletionStep;
 use crate::*;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -294,6 +295,10 @@ pub(crate) unsafe fn redrive(
     catalog: &nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     loaded_images: *mut HostedLoadedImageTable,
 ) -> bool {
+    if has_work() && completion_retry::due() {
+        // A kept pump returned while a row's copy or ACK waited for it (#420).
+        WAKE.publish(monotonic_time_100ns());
+    }
     let Some(wake_attempt) = WAKE.begin_redrive(monotonic_time_100ns(), has_work()) else {
         return false;
     };
@@ -614,12 +619,13 @@ unsafe fn advance_read(work: &mut Work) -> Step {
     if let Some((key, offset, remaining)) = read.copy_position() {
         let mut bytes = [0u8; 4096];
         let limit = remaining.min(bytes.len());
-        let copied = match driver_launch::copy_completed_irp_output_exact(
-            key, offset as u64, &mut bytes[..limit])
+        let copied = match completion_retry::step(driver_launch::copy_completed_irp_output_exact(
+            key, offset as u64, &mut bytes[..limit]))
         {
-            Ok(copied) if copied != 0 && copied <= limit => copied,
-            Ok(_) => { assert!(read.fail_copy(key, nt_memory_manager::routed_image_read::STATUS_IO_DEVICE_ERROR)); return Step::Progress; }
-            Err(status) => { assert!(read.fail_copy(key, status)); return Step::Progress; }
+            CompletionStep::Done(copied) if copied != 0 && copied <= limit => copied,
+            CompletionStep::Done(_) => { assert!(read.fail_copy(key, nt_memory_manager::routed_image_read::STATUS_IO_DEVICE_ERROR)); return Step::Progress; }
+            CompletionStep::Retry => return Step::Wait,
+            CompletionStep::Failed(status) => { assert!(read.fail_copy(key, status)); return Step::Progress; }
         };
         if !read.copy_fragment(key, offset, &bytes[..copied]) {
             read.quarantine();
@@ -631,9 +637,14 @@ unsafe fn advance_read(work: &mut Work) -> Step {
         // The backend may have consumed this ACK even if its return is an error.
         // Retain all owners and never replay it after entry.
         work.phase = Phase::Indeterminate;
-        if driver_launch::io_manager_mut()
-            .acknowledge_completed_irp_strict(nt_io_manager::IrpId(key)).is_err()
-        { return Step::Wait; }
+        match completion_retry::step_status(driver_launch::io_manager_mut()
+            .acknowledge_completed_irp_strict(nt_io_manager::IrpId(key)))
+        {
+            CompletionStep::Done(_) => {}
+            // Still running: the identical ACK collects it; nothing was replayed.
+            CompletionStep::Retry => { work.phase = Phase::Read; return Step::Wait; }
+            CompletionStep::Failed(_) => return Step::Wait,
+        }
         if !read.acknowledge(key) {
             read.quarantine();
             return Step::Wait;

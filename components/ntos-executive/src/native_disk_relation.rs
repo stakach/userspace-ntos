@@ -194,13 +194,13 @@ impl NativeDiskProof {
                 };
                 if packet.try_reserve_exact(capacity).is_err() { return ProofProgress::Pending; }
                 packet.resize(capacity, 0);
-                if copy_completed_irp_output_exact(entered.irp.raw(), 0, &mut packet) != Ok(capacity) {
+                if crate::completion_retry::retried(copy_completed_irp_output_exact(entered.irp.raw(), 0, &mut packet)) != Ok(capacity) {
                     return ProofProgress::Pending;
                 }
             }
             entered.terminal = Some(ProofTerminal { status, packet });
         }
-        if acknowledge_completed_irp_strict(entered.irp.raw()).is_err() {
+        if crate::completion_retry::retried(acknowledge_completed_irp_strict(entered.irp.raw())).is_err() {
             return ProofProgress::Pending;
         }
         let mut entered = self.entered.take().expect("acknowledged disk proof disappeared");

@@ -11,6 +11,7 @@
 //! A flushing caller's Reply is parked here at syscall ingress, before any write effect, and is
 //! answered only after every page it started has settled.
 
+use nt_hosted_runtime::CompletionStep;
 use super::*;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -108,7 +109,7 @@ pub(crate) fn next_deadline() -> Option<u64> {
             (&*core::ptr::addr_of!(WRITES)).iter().any(Option::is_some)
                 || (&*core::ptr::addr_of!(FLUSHES)).iter().any(Option::is_some)
         })
-    .then(|| NEXT.load(Ordering::Acquire))
+    .then(|| crate::completion_retry::row_deadline(NEXT.load(Ordering::Acquire)))
 }
 
 pub(crate) fn wake_due(now: u64) -> u64 {
@@ -413,7 +414,9 @@ unsafe fn advance_write(handler: &ExecNtHandler, table: &mut GenericSectionTable
         }
         WritePhase::Acknowledge { irp, outcome } => {
             // The page stays owned until the canonical completion is released; retry on refusal.
-            if driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp).is_ok() {
+            if let CompletionStep::Done(_) = crate::completion_retry::step_status(
+                driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp))
+            {
                 job.phase = WritePhase::Settled(outcome);
             }
             false

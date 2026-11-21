@@ -27,6 +27,13 @@ const EXECUTIVE_TRANSFER_CEILING_SECTORS: u32 = nt_fs::ASYNC_SNAPSHOT_MAX_BATCH_
 enum State {
     Unqueried,
     Entered { irp: IrpId, requestor_tid: u64 },
+    /// The terminal output is copied; only the IRP's ACK remains, and it alone is retried.
+    Copied {
+        irp: IrpId,
+        status: nt_status::NtStatus,
+        information: u64,
+        output: [u8; STORAGE_ADAPTER_DESCRIPTOR_QUERY_LEN],
+    },
     Known { sectors: u32 },
     Refused,
 }
@@ -83,7 +90,9 @@ pub(super) unsafe fn service(route: native_disk_relation::NativeStorageRoute) ->
     let slot = &mut *core::ptr::addr_of_mut!(OWNER);
     if slot.as_ref().is_none_or(|owner| owner.route != route) {
         // A previous route's IRP is still owned by its retained state; never drop it.
-        if slot.as_ref().is_some_and(|owner| matches!(owner.state, State::Entered { .. })) {
+        if slot.as_ref().is_some_and(|owner| matches!(owner.state,
+            State::Entered { .. } | State::Copied { .. }))
+        {
             return 0;
         }
         *slot = Some(Owner { route, state: State::Unqueried });
@@ -93,6 +102,8 @@ pub(super) unsafe fn service(route: native_disk_relation::NativeStorageRoute) ->
         State::Known { .. } | State::Refused => 0,
         State::Unqueried => dispatch(owner),
         State::Entered { irp, requestor_tid } => poll(owner, irp, requestor_tid),
+        State::Copied { irp, status, information, output } =>
+            acknowledge(owner, irp, status, information, &output),
     }
 }
 
@@ -153,12 +164,26 @@ unsafe fn poll(owner: &mut Owner, irp: IrpId, requestor_tid: u64) -> usize {
     if status.is_success() {
         let wanted = usize::try_from(completion.information).unwrap_or(usize::MAX)
             .min(output.len());
-        if copy_completed_irp_output_exact(irp.raw(), 0, &mut output[..wanted]) != Ok(wanted) {
+        if crate::completion_retry::retried(copy_completed_irp_output_exact(irp.raw(), 0, &mut output[..wanted])) != Ok(wanted) {
             return 0;
         }
     }
-    if acknowledge_completed_irp_strict(irp.raw()).is_err() { return 0; }
-    settle(owner, status, &output, completion.information);
+    owner.state = State::Copied { irp, status, information: completion.information, output };
+    acknowledge(owner, irp, status, completion.information, &output);
+    1
+}
+
+/// A refused or still-running ACK is retried alone; the copy is never repeated against an IRP
+/// whose ACK may be running.
+unsafe fn acknowledge(
+    owner: &mut Owner,
+    irp: IrpId,
+    status: nt_status::NtStatus,
+    information: u64,
+    output: &[u8],
+) -> usize {
+    if crate::completion_retry::retried(acknowledge_completed_irp_strict(irp.raw())).is_err() { return 0; }
+    settle(owner, status, output, information);
     1
 }
 

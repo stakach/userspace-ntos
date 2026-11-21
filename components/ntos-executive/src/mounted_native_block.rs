@@ -909,7 +909,7 @@ unsafe fn poll_pending() -> usize {
             let Some(capacity) = packet_capacity(&pending.command) else { return 0; };
             if packet.try_reserve_exact(capacity).is_err() { return 0; }
             packet.resize(capacity, 0);
-            if copy_completed_irp_output_exact(pending.irp.raw(), 0, &mut packet) != Ok(capacity) {
+            if crate::completion_retry::retried(copy_completed_irp_output_exact(pending.irp.raw(), 0, &mut packet)) != Ok(capacity) {
                 return 0;
             }
         }
@@ -920,7 +920,7 @@ unsafe fn poll_pending() -> usize {
             pending.dispatch_returned_ticks, pending.terminal_ticks,
         );
     }
-    if acknowledge_completed_irp_strict(pending.irp.raw()).is_err() {
+    if crate::completion_retry::retried(acknowledge_completed_irp_strict(pending.irp.raw())).is_err() {
         return 0;
     }
     let mut pending = slot.take().expect("acknowledged native sector owner disappeared");

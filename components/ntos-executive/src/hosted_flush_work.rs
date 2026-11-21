@@ -520,7 +520,7 @@ impl Work {
             }
         }
         if let Some(irp) = self.canonical_irp {
-            if acknowledge_completed_irp(irp.raw()).is_err() {
+            if crate::completion_retry::retried(acknowledge_completed_irp(irp.raw())).is_err() {
                 return false;
             }
             self.canonical_irp = None;

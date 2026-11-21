@@ -634,6 +634,8 @@ pub(super) unsafe fn maintain(
     let alpc_reply_committed;
     {
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
+        // Rows whose copy or ACK waits on a kept pump that has returned run in this pass (#420).
+        crate::completion_retry::begin_pass();
         crate::native_alpc_create_work::redrive(&mut nt_handler);
         crate::native_alpc_close_work::redrive(&mut nt_handler);
         crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
@@ -672,6 +674,7 @@ pub(super) unsafe fn maintain(
         crate::driver_launch::redrive_hosted_read_forward(nt_handler as *mut _);
         crate::driver_launch::redrive_hosted_flush_forward(nt_handler as *mut _);
         crate::driver_launch::redrive_hosted_query_information_forward(nt_handler as *mut _);
+        crate::completion_retry::end_pass();
         trace_connect_root_checkpoint(0, None);
         crate::driver_launch::redrive_hosted_connect_forward();
         trace_connect_root_checkpoint(1, None);

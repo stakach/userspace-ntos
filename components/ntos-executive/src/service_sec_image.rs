@@ -114,6 +114,34 @@ mod process_information_native;
 pub(crate) use process_information_native::service_win32k_process_query_request;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Completion copies taken by File delivery paths that repeat every step before their ACK
+/// (#420). Root-only; an IRP's receipts are released when its delivery ACK settles.
+static mut FILE_DELIVERY_COPY_RECEIPTS: nt_hosted_runtime::CopyReceipts =
+    nt_hosted_runtime::CopyReceipts::new();
+
+/// Copy a completed IRP's output for a repeating delivery path: each exact copy reaches the
+/// backend once, so a retry behind a still-running ACK never waits on its own IRP.
+unsafe fn copy_file_delivery_output_once(irp_id: u64, offset: u64, output: &mut [u8])
+    -> Result<usize, u32>
+{
+    (&mut *core::ptr::addr_of_mut!(FILE_DELIVERY_COPY_RECEIPTS)).copy(
+        irp_id, offset, output,
+        |output| crate::completion_retry::retried(
+            driver_launch::copy_completed_irp_output_exact(irp_id, offset, output)),
+        nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32,
+    )
+}
+
+/// The delivery ACK of a completed IRP. A still-running ACK is retried by the next delivery
+/// pass; a settled one releases the IRP's copy receipts.
+unsafe fn acknowledge_file_delivery_irp(irp_id: u64) -> Result<(), u32> {
+    let result = crate::completion_retry::retried(driver_launch::acknowledge_completed_irp(irp_id));
+    if result.is_ok() {
+        (&mut *core::ptr::addr_of_mut!(FILE_DELIVERY_COPY_RECEIPTS)).release(irp_id);
+    }
+    result
+}
 static UNLEASED_COMPLETION_EVENT_TRACES: AtomicU64 = AtomicU64::new(0);
 
 /// A completed request named an Event index it holds no lease on. Admission always leases, so
@@ -16144,7 +16172,7 @@ unsafe fn pending_file_io_redrive_pass(
                 file_information.resize(wanted, 0u8);
                 let mut copied = 0usize;
                 while copied < wanted {
-                    match driver_launch::copy_completed_irp_output_exact(
+                    match copy_file_delivery_output_once(
                         pending.irp_id, copied as u64, &mut file_information[copied..],
                     ) {
                         Ok(count) if count != 0 => copied += count,
@@ -16169,7 +16197,7 @@ unsafe fn pending_file_io_redrive_pass(
                     query.return_length_va,
                 )
             };
-            if driver_launch::acknowledge_completed_irp(pending.irp_id).is_err() {
+            if acknowledge_file_delivery_irp(pending.irp_id).is_err() {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 restore_file_io_mirrors!();
                 continue;
@@ -16184,7 +16212,7 @@ unsafe fn pending_file_io_redrive_pass(
         if let nt_io_manager::PendingFileIoOperation::AttributeQuery(operation) = pending.operation {
             if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
                 let create = completed.expect("attribute CREATE lost its exact completion");
-                if driver_launch::acknowledge_completed_irp(pending.irp_id).is_err() {
+                if acknowledge_file_delivery_irp(pending.irp_id).is_err() {
                     FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                     restore_file_io_mirrors!();
                     continue;
@@ -16268,11 +16296,7 @@ unsafe fn pending_file_io_redrive_pass(
                         terminal_status = nt_fs::STATUS_INFO_LENGTH_MISMATCH;
                         terminal_information = 0;
                     } else {
-                        match driver_launch::copy_completed_irp_output_exact(
-                            pending.irp_id,
-                            0,
-                            &mut basic,
-                        ) {
+                        match copy_file_delivery_output_once(pending.irp_id, 0, &mut basic) {
                             Ok(FILE_BASIC_INFORMATION_LEN) => {}
                             Ok(_) => {
                                 terminal_status = nt_fs::STATUS_INFO_LENGTH_MISMATCH;
@@ -16294,7 +16318,7 @@ unsafe fn pending_file_io_redrive_pass(
                                 }
                             };
                         if (terminal_status as i32) >= 0 {
-                            if driver_launch::acknowledge_completed_irp(pending.irp_id).is_err() {
+                            if acknowledge_file_delivery_irp(pending.irp_id).is_err() {
                                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                                 restore_file_io_mirrors!();
                                 continue;
@@ -16443,7 +16467,7 @@ unsafe fn pending_file_io_redrive_pass(
                         terminal_status = status.raw() as u32;
                         terminal_information = 0;
                     } else {
-                        if driver_launch::acknowledge_completed_irp(pending.irp_id).is_err() {
+                        if acknowledge_file_delivery_irp(pending.irp_id).is_err() {
                             assert!((&mut *core::ptr::addr_of_mut!(PENDING_SET_FILE_NAMES))
                                 .restore_update(transaction_id, transaction));
                             FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
@@ -16670,9 +16694,9 @@ unsafe fn pending_file_io_redrive_pass(
                             offset as usize, &mut work[..chunk],
                         )
                     }
-                    _ => driver_launch::copy_completed_irp_output_exact(
+                    _ => crate::completion_retry::retried(driver_launch::copy_completed_irp_output_exact(
                         pending.irp_id, offset as u64, &mut work[..chunk],
-                    ),
+                    )),
                 };
                 let copied = match copy_result {
                     Ok(copied) if copied != 0 => copied,
@@ -16935,7 +16959,7 @@ unsafe fn pending_file_io_redrive_pass(
                         local_file_object.expect("local notify lost its File route"), operation.notify_id, pending.irp_id,
                     )
                 }
-                _ if backend_ack_required => driver_launch::acknowledge_completed_irp(pending.irp_id),
+                _ if backend_ack_required => acknowledge_file_delivery_irp(pending.irp_id),
                 _ => Ok(()),
             };
             if acknowledged.is_err() {

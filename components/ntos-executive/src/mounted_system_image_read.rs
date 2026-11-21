@@ -2,6 +2,7 @@
 //!
 //! A caller keeps this owner through exact File completion and strict IRP acknowledgement.
 
+use nt_hosted_runtime::CompletionStep;
 use alloc::{string::String, vec::Vec};
 use nt_io_manager::{
     CreateOptions, CreateParameters, DeviceId, ExternalDispatchResult, FileId,
@@ -266,9 +267,16 @@ impl MountedSystemImageRead {
                 SnapshotStep::Progress
             }
             Phase::CreateAck(irp, status, context) => {
-                if driver_launch::acknowledge_completed_irp_strict(irp).is_err() {
-                    self.phase = Phase::Indeterminate;
-                    return SnapshotStep::Indeterminate;
+                match crate::completion_retry::step(driver_launch::acknowledge_completed_irp_strict(irp)) {
+                    CompletionStep::Done(()) => {}
+                    CompletionStep::Retry => {
+                        self.phase = Phase::CreateAck(irp, status, context);
+                        return SnapshotStep::Wait;
+                    }
+                    CompletionStep::Failed(_) => {
+                        self.phase = Phase::Indeterminate;
+                        return SnapshotStep::Indeterminate;
+                    }
                 }
                 if self.cancelled {
                     self.close(Err(CANCELLED))
@@ -333,17 +341,23 @@ impl MountedSystemImageRead {
                 SnapshotStep::Progress
             }
             Phase::QueryCopy(irp, mut bytes, copied) => {
-                let copied_now = match driver_launch::copy_completed_irp_output_exact(
-                    irp,
-                    copied as u64,
-                    &mut bytes[copied..],
+                let copied_now = match crate::completion_retry::step(
+                    driver_launch::copy_completed_irp_output_exact(
+                        irp,
+                        copied as u64,
+                        &mut bytes[copied..],
+                    ),
                 ) {
-                    Ok(n) if n != 0 && n <= 24 - copied => n,
-                    Ok(_) => {
+                    CompletionStep::Done(n) if n != 0 && n <= 24 - copied => n,
+                    CompletionStep::Done(_) => {
                         self.phase = Phase::QueryAck(irp, Err(IO_ERROR));
                         return SnapshotStep::Progress;
                     }
-                    Err(status) => {
+                    CompletionStep::Retry => {
+                        self.phase = Phase::QueryCopy(irp, bytes, copied);
+                        return SnapshotStep::Wait;
+                    }
+                    CompletionStep::Failed(status) => {
                         self.phase = Phase::QueryAck(irp, Err(status));
                         return SnapshotStep::Progress;
                     }
@@ -373,9 +387,16 @@ impl MountedSystemImageRead {
                 SnapshotStep::Progress
             }
             Phase::QueryAck(irp, result) => {
-                if driver_launch::acknowledge_completed_irp_strict(irp).is_err() {
-                    self.phase = Phase::Indeterminate;
-                    return SnapshotStep::Indeterminate;
+                match crate::completion_retry::step(driver_launch::acknowledge_completed_irp_strict(irp)) {
+                    CompletionStep::Done(()) => {}
+                    CompletionStep::Retry => {
+                        self.phase = Phase::QueryAck(irp, result);
+                        return SnapshotStep::Wait;
+                    }
+                    CompletionStep::Failed(_) => {
+                        self.phase = Phase::Indeterminate;
+                        return SnapshotStep::Indeterminate;
+                    }
                 }
                 match result {
                     Ok(extent) if !self.cancelled => self.read_ready(extent),
@@ -431,17 +452,16 @@ impl MountedSystemImageRead {
                 return SnapshotStep::Progress;
             }
             output.resize(remaining, 0);
-            let copied = match driver_launch::copy_completed_irp_output_exact(
-                irp,
-                offset as u64,
-                &mut output,
+            let copied = match crate::completion_retry::step(
+                driver_launch::copy_completed_irp_output_exact(irp, offset as u64, &mut output),
             ) {
-                Ok(n) if n != 0 && n <= remaining => n,
-                Ok(_) => {
+                CompletionStep::Done(n) if n != 0 && n <= remaining => n,
+                CompletionStep::Done(_) => {
                     assert!(self.read.as_mut().unwrap().fail_copy(irp, IO_ERROR));
                     return SnapshotStep::Progress;
                 }
-                Err(status) => {
+                CompletionStep::Retry => return SnapshotStep::Wait,
+                CompletionStep::Failed(status) => {
                     assert!(self.read.as_mut().unwrap().fail_copy(irp, status));
                     return SnapshotStep::Progress;
                 }
@@ -463,10 +483,14 @@ impl MountedSystemImageRead {
             .as_ref()
             .and_then(RoutedImageRead::acknowledgment_key)
         {
-            if driver_launch::acknowledge_completed_irp_strict(irp).is_err() {
-                self.read.as_mut().unwrap().quarantine();
-                self.phase = Phase::Indeterminate;
-                return SnapshotStep::Indeterminate;
+            match crate::completion_retry::step(driver_launch::acknowledge_completed_irp_strict(irp)) {
+                CompletionStep::Done(()) => {}
+                CompletionStep::Retry => return SnapshotStep::Wait,
+                CompletionStep::Failed(_) => {
+                    self.read.as_mut().unwrap().quarantine();
+                    self.phase = Phase::Indeterminate;
+                    return SnapshotStep::Indeterminate;
+                }
             }
             if !self.read.as_mut().unwrap().acknowledge(irp) {
                 self.phase = Phase::Indeterminate;

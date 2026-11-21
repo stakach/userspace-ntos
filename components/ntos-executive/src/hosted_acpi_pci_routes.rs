@@ -481,8 +481,11 @@ unsafe fn drain_hosted_acpi_pci_route_indeterminate_irps() -> usize {
                     .and_then(|records| records.get_mut(index))
                     .expect("ACPI PCI route recovery record disappeared");
                 assert_eq!(record.irp_id, retained.irp_id);
-                record.status = status;
-                record.failure_count = record.failure_count.saturating_add(1);
+                // A still-running ACK is not a failure: the identical retry collects it.
+                if status != nt_status::NtStatus::PENDING {
+                    record.status = status;
+                    record.failure_count = record.failure_count.saturating_add(1);
+                }
                 let delay_100ns = 10_000u64 << u32::from(record.failure_count.min(10));
                 assert!(record
                     .wake
@@ -1071,9 +1074,16 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                     return progress;
                 }
                 payload.resize(output_len, 0);
-                let (disposition, table) = match io_manager_mut()
-                    .copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload)
-                {
+                let copied = match crate::completion_retry::step_status(
+                    io_manager_mut()
+                        .copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload),
+                ) {
+                    // Still running: stay in this phase; the identical copy collects it.
+                    nt_hosted_runtime::CompletionStep::Retry => return progress,
+                    nt_hosted_runtime::CompletionStep::Done(copied) => Ok(copied),
+                    nt_hosted_runtime::CompletionStep::Failed(status) => Err(nt_status::NtStatus(status as i32)),
+                };
+                let (disposition, table) = match copied {
                     Ok(copied) if copied == output_len => hosted_acpi_pci_prt_query(query_index)
                         .map(|method_query| {
                             classify_hosted_acpi_pci_prt_result(
@@ -1123,12 +1133,17 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .irp_id;
-                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
-                    Ok(_) => {
+                match crate::completion_retry::step_status(
+                    io_manager_mut().acknowledge_completed_irp_strict(irp_id),
+                ) {
+                    // Still running: stay in this phase; the identical ACK collects it.
+                    nt_hosted_runtime::CompletionStep::Retry => return progress,
+                    nt_hosted_runtime::CompletionStep::Done(_) => {
                         apply_hosted_acpi_pci_prt_disposition(query_index, disposition);
                         progress = progress.saturating_add(1);
                     }
-                    Err(status) => {
+                    nt_hosted_runtime::CompletionStep::Failed(status) => {
+                        let status = nt_status::NtStatus(status as i32);
                         retain_hosted_acpi_pci_route_indeterminate_irp(irp_id, status);
                         return progress.saturating_add(1);
                     }

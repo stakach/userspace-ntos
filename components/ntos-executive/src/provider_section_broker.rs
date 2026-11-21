@@ -1,5 +1,6 @@
 //! Dispatch-bound publication of win32k-created native data sections.
 
+use nt_hosted_runtime::CompletionStep;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
@@ -742,12 +743,14 @@ impl MetadataWork {
             } => {
                 let mut bytes = [0u8; 24];
                 let remaining = length - offset;
-                let copied = match driver_launch::copy_completed_irp_output_exact(
-                    irp.raw(),
-                    offset as u64,
-                    &mut bytes[..remaining],
+                let copied = match crate::completion_retry::step(
+                    driver_launch::copy_completed_irp_output_exact(
+                        irp.raw(),
+                        offset as u64,
+                        &mut bytes[..remaining],
+                    ),
                 ) {
-                    Ok(copied) if copied != 0 && copied <= remaining => copied,
+                    CompletionStep::Done(copied) if copied != 0 && copied <= remaining => copied,
                     _ => return MetadataStep::Wait,
                 };
                 assert!(self.metadata.append(
@@ -770,11 +773,15 @@ impl MetadataWork {
             }
             MetadataPhase::AckPending { irp } => {
                 self.phase = MetadataPhase::Indeterminate;
-                if driver_launch::io_manager_mut()
-                    .acknowledge_completed_irp_strict(irp)
-                    .is_err()
-                {
-                    return MetadataStep::Wait;
+                match crate::completion_retry::step_status(
+                    driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp),
+                ) {
+                    CompletionStep::Done(_) => {}
+                    CompletionStep::Retry => {
+                        self.phase = MetadataPhase::AckPending { irp };
+                        return MetadataStep::Wait;
+                    }
+                    CompletionStep::Failed(_) => return MetadataStep::Wait,
                 }
                 assert!(self
                     .metadata
@@ -911,7 +918,7 @@ pub(crate) fn next_deadline() -> Option<u64> {
                 .iter()
                 .any(|entry| entry.metadata.is_some())
         })
-    .then(|| NEXT_RETRY.load(Ordering::Acquire))
+    .then(|| crate::completion_retry::row_deadline(NEXT_RETRY.load(Ordering::Acquire)))
 }
 
 pub(crate) fn wake_due(now: u64) -> u64 {

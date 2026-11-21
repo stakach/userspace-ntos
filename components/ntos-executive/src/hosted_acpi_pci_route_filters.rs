@@ -364,9 +364,15 @@ unsafe fn copy_hosted_acpi_pci_crs_filter_completion(
         return false;
     }
     payload.resize(output_len, 0);
-    let (disposition, matches) = match io_manager_mut()
-        .copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload)
-    {
+    let copied = match crate::completion_retry::step_status(
+        io_manager_mut().copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload),
+    ) {
+        // Still running: stay in this phase; the identical copy collects it.
+        nt_hosted_runtime::CompletionStep::Retry => return false,
+        nt_hosted_runtime::CompletionStep::Done(copied) => Ok(copied),
+        nt_hosted_runtime::CompletionStep::Failed(status) => Err(nt_status::NtStatus(status as i32)),
+    };
+    let (disposition, matches) = match copied {
         Ok(copied) if copied == output_len => classify_hosted_acpi_pci_crs_filter_result(
             output_len,
             status,
@@ -408,13 +414,15 @@ unsafe fn acknowledge_hosted_acpi_pci_crs_filter(
         .as_ref()
         .unwrap()
         .irp_id;
-    match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
-        Ok(_) => {
+    match crate::completion_retry::step_status(io_manager_mut().acknowledge_completed_irp_strict(irp_id)) {
+        // Still running: stay in this phase; the identical ACK collects it.
+        nt_hosted_runtime::CompletionStep::Retry => false,
+        nt_hosted_runtime::CompletionStep::Done(_) => {
             apply_hosted_acpi_pci_crs_filter_disposition(endpoint_index, disposition);
             true
         }
-        Err(status) => {
-            retain_hosted_acpi_pci_route_indeterminate_irp(irp_id, status);
+        nt_hosted_runtime::CompletionStep::Failed(status) => {
+            retain_hosted_acpi_pci_route_indeterminate_irp(irp_id, nt_status::NtStatus(status as i32));
             true
         }
     }

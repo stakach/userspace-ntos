@@ -48454,11 +48454,13 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .irp_id;
-                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                match crate::completion_retry::retried_status(io_manager_mut().acknowledge_completed_irp_strict(irp_id)) {
                     Ok(_) => {
                         set_hosted_relation_query_disposition(disposition);
                         progress = progress.saturating_add(1);
                     }
+                    // Still running: stay in this phase; the identical ACK collects it.
+                    Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(status) => {
                         (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                             .as_mut()
@@ -48622,11 +48624,13 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .irp_id;
-                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                match crate::completion_retry::retried_status(io_manager_mut().acknowledge_completed_irp_strict(irp_id)) {
                     Ok(_) => {
                         apply_hosted_query_id_disposition(child_index, id_type, disposition);
                         progress = progress.saturating_add(1);
                     }
+                    // Still running: stay in this phase; the identical ACK collects it.
+                    Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(status) => {
                         (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                             .as_mut()
@@ -48784,11 +48788,13 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .irp_id;
-                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                match crate::completion_retry::retried_status(io_manager_mut().acknowledge_completed_irp_strict(irp_id)) {
                     Ok(_) => {
                         apply_hosted_bus_property_disposition(child_index, minor, disposition);
                         progress = progress.saturating_add(1);
                     }
+                    // Still running: stay in this phase; the identical ACK collects it.
+                    Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(status) => {
                         (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                             .as_mut()
@@ -48868,7 +48874,9 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .unwrap()
                     .irp_id;
                 let mut payload = [0u8; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE];
-                match io_manager_mut().copy_completed_pnp_payload(irp_id, 0, &mut payload) {
+                match crate::completion_retry::retried_status(
+                    io_manager_mut().copy_completed_pnp_payload(irp_id, 0, &mut payload),
+                ) {
                     Ok(copied) if copied == payload.len() => {
                         let disposition =
                             match nt_pnp_manager::copy_device_capabilities_x64(&payload)
@@ -48898,7 +48906,9 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                         return progress.saturating_add(1);
                     }
                     Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
-                    | Err(nt_status::NtStatus::DEVICE_NOT_READY) => return progress,
+                    | Err(nt_status::NtStatus::DEVICE_NOT_READY)
+                    // Still running: the identical copy collects it.
+                    | Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(status) => {
                         apply_hosted_device_capabilities_disposition(
                             child_index,
@@ -48916,11 +48926,13 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .irp_id;
-                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                match crate::completion_retry::retried_status(io_manager_mut().acknowledge_completed_irp_strict(irp_id)) {
                     Ok(_) => {
                         apply_hosted_device_capabilities_disposition(child_index, disposition);
                         progress = progress.saturating_add(1);
                     }
+                    // Still running: stay in this phase; the identical ACK collects it.
+                    Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(status) => {
                         (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                             .as_mut()
@@ -49035,9 +49047,9 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     return progress;
                 }
                 payload.resize(output_len, 0);
-                let disposition = match io_manager_mut()
-                    .copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload)
-                {
+                let disposition = match crate::completion_retry::retried_status(
+                    io_manager_mut().copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload),
+                ) {
                     Ok(copied) if copied == output_len => classify_hosted_acpi_namespace_result(
                         child_index,
                         output_len,
@@ -49049,7 +49061,9 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                         nt_status::NtStatus::INVALID_DEVICE_REQUEST,
                     ),
                     Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
-                    | Err(nt_status::NtStatus::DEVICE_NOT_READY) => return progress,
+                    | Err(nt_status::NtStatus::DEVICE_NOT_READY)
+                    // Still running: the identical copy collects it.
+                    | Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(copy_status) => HostedNamespaceDisposition::Barrier(copy_status),
                 };
                 (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
@@ -49069,11 +49083,13 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .irp_id;
-                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                match crate::completion_retry::retried_status(io_manager_mut().acknowledge_completed_irp_strict(irp_id)) {
                     Ok(_) => {
                         apply_hosted_acpi_namespace_disposition(child_index, disposition);
                         progress = progress.saturating_add(1);
                     }
+                    // Still running: stay in this phase; the identical ACK collects it.
+                    Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(status) => {
                         (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                             .as_mut()
@@ -49187,9 +49203,9 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                 let disposition = if status == nt_status::NtStatus::OBJECT_NAME_NOT_FOUND {
                     classify_hosted_acpi_pci_root_method_result(status, information, &[])
                 } else {
-                    match io_manager_mut()
-                        .copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload)
-                    {
+                    match crate::completion_retry::retried_status(
+                        io_manager_mut().copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload),
+                    ) {
                         Ok(copied) if copied == payload.len() => {
                             classify_hosted_acpi_pci_root_method_result(status, information, &payload)
                         }
@@ -49197,7 +49213,9 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
                         ),
                         Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
-                        | Err(nt_status::NtStatus::DEVICE_NOT_READY) => return progress,
+                        | Err(nt_status::NtStatus::DEVICE_NOT_READY)
+                        // Still running: the identical copy collects it.
+                        | Err(nt_status::NtStatus::PENDING) => return progress,
                         Err(copy_status) => {
                             HostedAcpiPciRootMethodDisposition::Barrier(copy_status)
                         }
@@ -49222,7 +49240,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .irp_id;
-                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                match crate::completion_retry::retried_status(io_manager_mut().acknowledge_completed_irp_strict(irp_id)) {
                     Ok(_) => {
                         apply_hosted_acpi_pci_root_method_disposition(
                             child_index,
@@ -49231,6 +49249,8 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                         );
                         progress = progress.saturating_add(1);
                     }
+                    // Still running: stay in this phase; the identical ACK collects it.
+                    Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(status) => {
                         (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                             .as_mut()
@@ -49343,9 +49363,9 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     return progress;
                 }
                 payload.resize(output_len, 0);
-                let disposition = match io_manager_mut()
-                    .copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload)
-                {
+                let disposition = match crate::completion_retry::retried_status(
+                    io_manager_mut().copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload),
+                ) {
                     Ok(copied) if copied == output_len => {
                         classify_hosted_acpi_pci_namespace_filter_result(
                             child_index,
@@ -49360,7 +49380,9 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                         nt_status::NtStatus::INVALID_DEVICE_REQUEST,
                     ),
                     Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
-                    | Err(nt_status::NtStatus::DEVICE_NOT_READY) => return progress,
+                    | Err(nt_status::NtStatus::DEVICE_NOT_READY)
+                    // Still running: the identical copy collects it.
+                    | Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(copy_status) => HostedAcpiPciNamespaceDisposition::Barrier(copy_status),
                 };
                 if disposition == HostedAcpiPciNamespaceDisposition::RetryResources {
@@ -49385,7 +49407,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .irp_id;
-                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                match crate::completion_retry::retried_status(io_manager_mut().acknowledge_completed_irp_strict(irp_id)) {
                     Ok(_) => {
                         apply_hosted_acpi_pci_namespace_disposition(
                             child_index,
@@ -49394,6 +49416,8 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                         );
                         progress = progress.saturating_add(1);
                     }
+                    // Still running: stay in this phase; the identical ACK collects it.
+                    Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(status) => {
                         (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                             .as_mut()
@@ -49511,9 +49535,9 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .unwrap()
                     .irp_id;
                 let mut payload = [0u8; nt_acpi::ACPI_EVAL_EXTENDED_INTEGER_LEN];
-                let disposition = match io_manager_mut()
-                    .copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload)
-                {
+                let disposition = match crate::completion_retry::retried_status(
+                    io_manager_mut().copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload),
+                ) {
                     Ok(copied) if copied == payload.len() => {
                         classify_hosted_acpi_pci_address_method_result(
                             status,
@@ -49525,7 +49549,9 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                         nt_status::NtStatus::INVALID_DEVICE_REQUEST,
                     ),
                     Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
-                    | Err(nt_status::NtStatus::DEVICE_NOT_READY) => return progress,
+                    | Err(nt_status::NtStatus::DEVICE_NOT_READY)
+                    // Still running: the identical copy collects it.
+                    | Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(copy_status) => HostedAcpiPciAddressMethodDisposition::Barrier(copy_status),
                 };
                 (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
@@ -49547,7 +49573,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .irp_id;
-                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                match crate::completion_retry::retried_status(io_manager_mut().acknowledge_completed_irp_strict(irp_id)) {
                     Ok(_) => {
                         apply_hosted_acpi_pci_address_method_disposition(
                             child_index,
@@ -49556,6 +49582,8 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                         );
                         progress = progress.saturating_add(1);
                     }
+                    // Still running: stay in this phase; the identical ACK collects it.
+                    Err(nt_status::NtStatus::PENDING) => return progress,
                     Err(status) => {
                         (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                             .as_mut()
@@ -49744,9 +49772,10 @@ unsafe fn retire_hosted_device_relation_barrier() -> usize {
     }
     if irp_id.raw() != 0 && io_manager_mut().irp(irp_id).is_some() {
         if io_manager_mut().completed_irp(irp_id).is_none()
-            || io_manager_mut()
-                .acknowledge_completed_irp_strict(irp_id)
-                .is_err()
+            || crate::completion_retry::retried_status(
+                io_manager_mut().acknowledge_completed_irp_strict(irp_id),
+            )
+            .is_err()
         {
             return 0;
         }
@@ -50276,8 +50305,15 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
                 progress = progress.saturating_add(1);
             }
             HostedFilterRequirementsPhase::AwaitingAck { disposition } => {
-                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                match crate::completion_retry::retried_status(
+                    io_manager_mut().acknowledge_completed_irp_strict(irp_id),
+                ) {
                     Ok(_) => set_hosted_filter_requirements_disposition(irp_id, false, disposition),
+                    // Still running: stay in this phase; the identical ACK collects it.
+                    Err(nt_status::NtStatus::PENDING) => {
+                        index += 1;
+                        continue;
+                    }
                     Err(status) => set_hosted_filter_requirements_indeterminate(irp_id, status),
                 }
                 progress = progress.saturating_add(1);
@@ -51011,7 +51047,14 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                 continue;
             }
             HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck => {
-                if let Err(status) = io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                if let Err(status) = crate::completion_retry::retried_status(
+                    io_manager_mut().acknowledge_completed_irp_strict(irp_id),
+                ) {
+                    if status == nt_status::NtStatus::PENDING {
+                        // Still running: stay in this phase; the identical ACK collects it.
+                        index += 1;
+                        continue;
+                    }
                     set_hosted_pnp_indeterminate(irp_id, status)
                         .expect("hosted PnP acknowledgement failure lost its transaction");
                     progress = progress.saturating_add(1);

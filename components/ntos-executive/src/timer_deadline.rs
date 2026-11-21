@@ -127,6 +127,7 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
         (process_image_snapshot_work::next_deadline(),
             DELAY_TIMER_SOURCE_PROCESS_IMAGE_SNAPSHOT),
         (section_pagein_work::next_deadline(), DELAY_TIMER_SOURCE_SECTION_PAGEIN),
+        (completion_retry::next_deadline(), DELAY_TIMER_SOURCE_COMPLETION_RETRY),
         (provider_section_map_work::next_deadline(), DELAY_TIMER_SOURCE_PROVIDER_SECTION_MAP),
         (native_image_pagein_work::next_deadline(), DELAY_TIMER_SOURCE_NATIVE_IMAGE_PAGEIN),
         (vm_lock_pagein_work::next_deadline(), DELAY_TIMER_SOURCE_VM_LOCK_PAGEIN),

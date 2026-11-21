@@ -1,6 +1,7 @@
 //! Retained routed SEC_IMAGE page-ins for faults and syscall copy probes.
 //! A selected Receive child's fault is owned here too, with its held parent still parked.
 
+use nt_hosted_runtime::CompletionStep;
 use crate::*;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -555,7 +556,7 @@ pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
 pub(crate) fn next_deadline() -> Option<u64> {
     (EXECUTING_TID.load(Ordering::Acquire) != 0
         || unsafe { (&*core::ptr::addr_of!(WORK)).iter().any(Option::is_some) })
-        .then(|| NEXT.load(Ordering::Acquire))
+        .then(|| completion_retry::row_deadline(NEXT.load(Ordering::Acquire)))
 }
 
 pub(crate) fn wake_due(now: u64) -> u64 {
@@ -698,11 +699,13 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
     if let Some((key, offset, remaining)) = read.copy_position() {
         let mut bytes = [0u8; 4096];
         let limit = remaining.min(bytes.len());
-        let copied = match driver_launch::copy_completed_irp_output_exact(
+        let copied = match completion_retry::step(driver_launch::copy_completed_irp_output_exact(
             key, offset as u64, &mut bytes[..limit],
-        ) {
-            Ok(copied) if copied != 0 && copied <= limit => copied,
-            Ok(_) => {
+        )) {
+            CompletionStep::Done(copied) if copied != 0 && copied <= limit => copied,
+            // Still running: the identical copy collects it on a later turn.
+            CompletionStep::Retry => return,
+            CompletionStep::Done(_) => {
                 if !read.fail_copy(key, nt_memory_manager::routed_image_read::STATUS_IO_DEVICE_ERROR) {
                     read.quarantine();
                     work.phase = Phase::Indeterminate;
@@ -711,7 +714,7 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
                 }
                 return;
             }
-            Err(status) => {
+            CompletionStep::Failed(status) => {
                 if !read.fail_copy(key, status) {
                     read.quarantine();
                     work.phase = Phase::Indeterminate;
@@ -731,9 +734,13 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
     }
     if let Some(key) = read.acknowledgment_key() {
         work.phase = Phase::Indeterminate;
-        if driver_launch::io_manager_mut()
-            .acknowledge_completed_irp_strict(nt_io_manager::IrpId(key)).is_err()
-        { return; }
+        match completion_retry::step_status(driver_launch::io_manager_mut()
+            .acknowledge_completed_irp_strict(nt_io_manager::IrpId(key)))
+        {
+            CompletionStep::Done(_) => {}
+            CompletionStep::Retry => { work.phase = Phase::Read; return; }
+            CompletionStep::Failed(_) => return,
+        }
         if !read.acknowledge(key) { read.quarantine(); return; }
         work.phase = Phase::Read;
         work.drive_progress = true;

@@ -3,6 +3,7 @@
 //! The source IRP remains in Mup's VSpace. A separate canonical File IRP runs in the provider;
 //! only its exact terminal is copied back before Mup's own completion routine is invoked.
 
+use nt_hosted_runtime::CompletionStep;
 use super::*;
 use super::hosted_forward_projection::{ForwardProjection, ForwardSource};
 use super::hosted_query_path_capture::CapturedSourceForward;
@@ -503,7 +504,7 @@ impl Work {
             }
         }
         if let Some(irp) = self.canonical_irp {
-            if acknowledge_completed_irp(irp.raw()).is_err() {
+            if crate::completion_retry::retried(acknowledge_completed_irp(irp.raw())).is_err() {
                 return false;
             }
             self.canonical_irp = None;
@@ -555,7 +556,7 @@ impl Work {
             }
         }
         if let Some(irp) = self.canonical_irp {
-            if acknowledge_completed_irp(irp.raw()).is_err() {
+            if crate::completion_retry::retried(acknowledge_completed_irp(irp.raw())).is_err() {
                 return false;
             }
             self.canonical_irp = None;
@@ -593,10 +594,14 @@ impl Work {
         );
         assert_eq!(completion.major, CapturedSourceForward::MAJOR);
         let response = if (completion.status as i32) >= 0 {
-            assert_eq!(
+            match crate::completion_retry::step(
                 copy_completed_irp_output_exact(irp.raw(), 0, &mut self.response),
-                Ok(4)
-            );
+            ) {
+                CompletionStep::Done(4) => {}
+                // Still running: the identical copy collects it on the next poll.
+                CompletionStep::Retry => return,
+                copied => panic!("query-path terminal copy: {copied:?}"),
+            }
             &self.response[..]
         } else {
             &[][..]

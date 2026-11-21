@@ -176,8 +176,10 @@ pub(super) unsafe fn submit(
 }
 
 impl Work {
+    /// Once the stop is acknowledged the external token is finished, but the row stays
+    /// cancelled until its cleanup (a still-running backend ACK included) completes.
     fn cancelled(&self) -> bool {
-        unsafe {
+        self.stop_acknowledged || unsafe {
             runtime::retained_service_cancelled(
                 self.route, self.dispatch, self.reply, self.token,
             )
@@ -391,7 +393,8 @@ impl Work {
                         .expect("IO_REPARSE enters internal backend ACK");
                     self.backend_ack_entered = true;
                 }
-                acknowledge_completed_irp(irp.raw())?;
+                // A still-running ACK is retried by the next sweep; its entry is not repeated.
+                crate::completion_retry::retried(acknowledge_completed_irp(irp.raw()))?;
                 delivery.acknowledge_backend().expect("reparse backend ACK receipt");
                 delivery.finish().expect("reparsed hop retired without client Reply");
             } else {
@@ -508,7 +511,8 @@ impl Work {
             delivery.enter_backend_ack().expect("terminal CREATE backend ACK permission");
             self.backend_ack_entered = true;
         }
-        acknowledge_completed_irp(irp.raw())?;
+        // A still-running ACK is retried by the next sweep; its entry is not repeated.
+        crate::completion_retry::retried(acknowledge_completed_irp(irp.raw()))?;
         delivery.acknowledge_backend().expect("CREATE backend ACK receipt");
         delivery.finish().expect("CREATE terminal delivery finished");
         Ok(())
@@ -544,19 +548,22 @@ impl Work {
                 self.route, self.dispatch, self.reply, self.token,
             ).map_err(|_| STATUS_INVALID_HANDLE as u32)? {
                 if self.cancelled() {
-                    if let Some(delivery) = self.delivery.as_mut() {
-                        if delivery.phase() == Phase::ReplyEntered {
-                            delivery.cancel_unacknowledged_reply_after_stop(
-                                StopUnacknowledgedProof::SealedStop,
-                            ).expect("sealed unacknowledged CREATE Reply");
-                            self.stop_acknowledged = true;
+                    if !self.stop_acknowledged {
+                        if let Some(delivery) = self.delivery.as_mut() {
+                            if delivery.phase() == Phase::ReplyEntered {
+                                delivery.cancel_unacknowledged_reply_after_stop(
+                                    StopUnacknowledgedProof::SealedStop,
+                                ).expect("sealed unacknowledged CREATE Reply");
+                            }
                         }
+                        // The state machine owns the exact stop receipt now. Complete the
+                        // external wait token once, then retire any handle and backend IRP;
+                        // a still-running backend ACK retries without repeating this.
+                        runtime::acknowledge_retained_service_cancellation(
+                            self.route, self.dispatch, self.reply, self.token,
+                        ).map_err(|_| STATUS_INVALID_HANDLE as u32)?;
+                        self.stop_acknowledged = true;
                     }
-                    // The state machine owns the exact stop receipt now. Complete the external
-                    // wait token once, then retire any handle and backend IRP.
-                    runtime::acknowledge_retained_service_cancellation(
-                        self.route, self.dispatch, self.reply, self.token,
-                    ).map_err(|_| STATUS_INVALID_HANDLE as u32)?;
                     return self.finish_cancelled(handler);
                 }
                 // The entered Reply is uncertain. Never send it again or release its handle.

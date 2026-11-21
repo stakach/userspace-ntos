@@ -111,6 +111,7 @@ pub(super) fn control(
     certain: impl Fn(&HostedIrpTransportResult) -> bool,
 ) -> Result<HostedIrpTransportResult, nt_status::NtStatus> {
     let key = IrpOperationKey { instance, irp: irp_id.raw(), operation, offset, len: output.len() };
+    drop_returned_copy(key);
     let result = match operations().admit(key) {
         IrpOperationAdmission::Busy => return Err(nt_status::NtStatus::PENDING),
         IrpOperationAdmission::Collect(Kept::Control(ticket)) =>
@@ -159,6 +160,29 @@ pub(super) fn control(
     operations().quarantine_issued(key);
     trace(b"quarantined", key);
     Err(nt_status::NtStatus::PENDING)
+}
+
+/// A row that changed course (a cancelled caller) may leave a kept copy nobody collects. Once
+/// that copy's pump has returned, it has no effect left: collect and drop it so the IRP's next
+/// operation (its ACK) is admitted. A copy still running, or any other kept operation, keeps
+/// the IRP; an uncertain copy return quarantines it.
+fn drop_returned_copy(next: IrpOperationKey) {
+    let abandonable = |running: &IrpOperationKey, kept: &Kept| {
+        running.operation == FSD_DISPATCH_COPY_COMPLETION
+            && matches!(kept, Kept::Control(ticket) if hosted_backend_pumps::collectable(ticket))
+    };
+    let Some((copy, Kept::Control(ticket))) = operations().abandon_returned(next, abandonable)
+    else { return };
+    match hosted_backend_pumps::collect(ticket) {
+        BackendCollected::Collected(result, _) if certain_control_result(&result) =>
+            trace(b"copy-abandoned", copy),
+        BackendCollected::Collected(..) => {
+            // The removed row's room is still reserved.
+            operations().quarantine_issued(copy);
+            trace(b"quarantined", copy);
+        }
+        BackendCollected::Pending(_) => unreachable!("an abandoned copy had returned"),
+    }
 }
 
 /// Publish each kept dispatch whose pump has returned as its pending IRP's ordinary

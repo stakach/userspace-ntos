@@ -405,7 +405,7 @@ impl Work {
         }
         let mut opaque = [0u8; 8];
         if completion.status as i32 >= 0
-            && copy_completed_irp_output_exact(irp.raw(), 0, &mut opaque) != Ok(8)
+            && crate::completion_retry::retried(copy_completed_irp_output_exact(irp.raw(), 0, &mut opaque)) != Ok(8)
         {
             return;
         }
@@ -435,7 +435,7 @@ impl Work {
 
     unsafe fn retire_terminal(&mut self, stopped: bool) -> bool {
         if let Some(irp) = self.canonical_irp {
-            if acknowledge_completed_irp(irp.raw()).is_err() { return false; }
+            if crate::completion_retry::retried(acknowledge_completed_irp(irp.raw())).is_err() { return false; }
             self.canonical_irp = None;
         }
         if !self.source_released {

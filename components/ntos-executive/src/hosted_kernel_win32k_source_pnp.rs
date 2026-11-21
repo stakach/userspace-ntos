@@ -767,7 +767,12 @@ impl Work {
         if let Some(irp) = self.canonical_irp {
             if self.ack_claimed { return false; }
             self.ack_claimed = true;
-            if acknowledge_completed_irp_strict(irp.raw()).is_err() { return false; }
+            match crate::completion_retry::step(acknowledge_completed_irp_strict(irp.raw())) {
+                nt_hosted_runtime::CompletionStep::Done(()) => {}
+                // Still running: no effect is uncertain, and the identical ACK collects it.
+                nt_hosted_runtime::CompletionStep::Retry => { self.ack_claimed = false; return false; }
+                nt_hosted_runtime::CompletionStep::Failed(_) => return false,
+            }
             super::source_observability::canonical(super::source_observability::Kind::Pnp);
             self.canonical_irp = None;
         }
@@ -896,9 +901,14 @@ impl Work {
             if let Some(irp) = self.canonical_irp {
                 if self.ack_claimed { return false; }
                 self.ack_claimed = true;
-                if acknowledge_completed_irp_strict(irp.raw()).is_err() {
-                    self.indeterminate = true;
-                    return false;
+                match crate::completion_retry::step(acknowledge_completed_irp_strict(irp.raw())) {
+                    nt_hosted_runtime::CompletionStep::Done(()) => {}
+                    // Still running: no effect is uncertain, and the identical ACK collects it.
+                    nt_hosted_runtime::CompletionStep::Retry => { self.ack_claimed = false; return false; }
+                    nt_hosted_runtime::CompletionStep::Failed(_) => {
+                        self.indeterminate = true;
+                        return false;
+                    }
                 }
                 self.canonical_irp = None;
             }

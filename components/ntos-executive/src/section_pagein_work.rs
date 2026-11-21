@@ -17,6 +17,7 @@ use nt_memory_manager::local_pagein_drive::{
 };
 use nt_memory_manager::CompletedFileQuery;
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
+use nt_hosted_runtime::CompletionStep;
 
 const RETRY_DELAY: u64 = 1_000_000;
 const LOCAL_FAULT_STEPS: usize = 16;
@@ -338,7 +339,7 @@ pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
 pub(crate) fn next_deadline() -> Option<u64> {
     (EXECUTING_TID.load(Ordering::Acquire) != 0
         || unsafe { (&*core::ptr::addr_of!(WORK)).iter().any(Option::is_some) })
-    .then(|| NEXT.load(Ordering::Acquire))
+    .then(|| completion_retry::row_deadline(NEXT.load(Ordering::Acquire)))
 }
 
 pub(crate) fn wake_due(now: u64) -> u64 {
@@ -523,18 +524,19 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
         }
         Phase::QueryCopying(irp, offset) => {
             let (irp, offset) = (*irp, *offset);
-            let copied = match driver_launch::copy_completed_irp_output_exact(
+            let copied = match completion_retry::step(driver_launch::copy_completed_irp_output_exact(
                 irp.raw(),
                 offset as u64,
                 &mut work.query_output[offset..],
-            ) {
-                Ok(copied) if copied != 0 && copied <= 24 - offset => copied,
-                Ok(_) => {
+            )) {
+                CompletionStep::Done(copied) if copied != 0 && copied <= 24 - offset => copied,
+                CompletionStep::Done(_) => {
                     work.query_status = nt_memory_manager::data_section::STATUS_IO_DEVICE_ERROR;
                     work.phase = Phase::QueryAckPending(irp);
                     return false;
                 }
-                Err(status) => {
+                CompletionStep::Retry => return false,
+                CompletionStep::Failed(status) => {
                     work.query_status = status;
                     work.phase = Phase::QueryAckPending(irp);
                     return false;
@@ -551,11 +553,15 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
         Phase::QueryAckPending(irp) => {
             let irp = *irp;
             work.phase = Phase::Indeterminate;
-            if driver_launch::io_manager_mut()
-                .acknowledge_completed_irp_strict(irp)
-                .is_err()
-            {
-                return false;
+            match completion_retry::step_status(
+                driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp),
+            ) {
+                CompletionStep::Done(_) => {}
+                CompletionStep::Retry => {
+                    work.phase = Phase::QueryAckPending(irp);
+                    return false;
+                }
+                CompletionStep::Failed(_) => return false,
             }
             work.phase = if cancelled {
                 Phase::Cancel
@@ -744,13 +750,14 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 work.phase = Phase::Indeterminate;
                 return false;
             };
-            let copied = match driver_launch::copy_completed_irp_output_exact(
+            let copied = match completion_retry::step(driver_launch::copy_completed_irp_output_exact(
                 irp.raw(),
                 offset as u64,
                 &mut bytes[..copy_len],
-            ) {
-                Ok(copied) if copied != 0 && copied <= copy_len => copied,
-                Ok(_) => {
+            )) {
+                CompletionStep::Done(copied) if copied != 0 && copied <= copy_len => copied,
+                CompletionStep::Retry => return false,
+                CompletionStep::Done(_) => {
                     assert!((&mut *core::ptr::addr_of_mut!(READS)).fail_copy(
                         work.read_id.unwrap(),
                         irp.raw(),
@@ -759,7 +766,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                     work.phase = Phase::AckPending(irp);
                     return false;
                 }
-                Err(status) => {
+                CompletionStep::Failed(status) => {
                     assert!((&mut *core::ptr::addr_of_mut!(READS)).fail_copy(
                         work.read_id.unwrap(),
                         irp.raw(),
@@ -791,11 +798,15 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
         Phase::AckPending(irp) => {
             let irp = *irp;
             work.phase = Phase::Indeterminate;
-            if driver_launch::io_manager_mut()
-                .acknowledge_completed_irp_strict(irp)
-                .is_err()
-            {
-                return false;
+            match completion_retry::step_status(
+                driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp),
+            ) {
+                CompletionStep::Done(_) => {}
+                CompletionStep::Retry => {
+                    work.phase = Phase::AckPending(irp);
+                    return false;
+                }
+                CompletionStep::Failed(_) => return false,
             }
             assert!((&mut *core::ptr::addr_of_mut!(READS))
                 .acknowledge_backend(work.read_id.unwrap(), irp.raw()));

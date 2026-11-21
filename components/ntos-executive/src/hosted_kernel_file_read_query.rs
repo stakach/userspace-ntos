@@ -1,5 +1,6 @@
 //! Driver File reads and information/directory queries on an authenticated routed File.
 
+use nt_hosted_runtime::CompletionStep;
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::file_directory_query_wire as directory_wire;
@@ -354,6 +355,7 @@ unsafe fn submit_captured(
         output,
         entered: false,
         pending_irp: None,
+       
         terminal: None,
         terminal_inline: false,
         prior_file_signal: None,
@@ -455,7 +457,7 @@ impl Work {
                 let _ = cancel_irp_if_pending(irp.raw());
             }
             if completed_irp_exact(irp.raw()).is_none()
-                || acknowledge_completed_irp(irp.raw()).is_err()
+                || crate::completion_retry::retried(acknowledge_completed_irp(irp.raw())).is_err()
             {
                 return false;
             }
@@ -491,7 +493,7 @@ impl Work {
                 return false;
             }
             if let Some(irp) = self.pending_irp {
-                if acknowledge_completed_irp(irp.raw()).is_err() {
+                if crate::completion_retry::retried(acknowledge_completed_irp(irp.raw())).is_err() {
                     return false;
                 }
                 self.pending_irp = None;
@@ -606,8 +608,11 @@ impl Work {
                 0
             };
             if transfer != 0 {
-                match copy_completed_irp_output_exact(irp.raw(), 0, &mut self.output[..transfer]) {
-                    Ok(bytes) if bytes == transfer => {}
+                match crate::completion_retry::step(
+                    copy_completed_irp_output_exact(irp.raw(), 0, &mut self.output[..transfer]),
+                ) {
+                    CompletionStep::Done(bytes) if bytes == transfer => {}
+                    CompletionStep::Retry => return false,
                     _ if self.cancelled() => return self.finish_cancelled(handler),
                     _ => return false,
                 }

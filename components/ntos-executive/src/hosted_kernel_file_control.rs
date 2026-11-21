@@ -1,5 +1,6 @@
 //! Hosted ZwFsControlFile and file-handle wait, using canonical RoutedFile ownership.
 
+use nt_hosted_runtime::CompletionStep;
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
@@ -206,13 +207,25 @@ impl FileWork {
         self.actor.release(&mut (*handler).pm).expect("hosted FSCTL actor identity");
     }
 
+    /// ACK the terminal IRP once. `false` is a still-running ACK: retry it on a later turn,
+    /// before any other effect of this step.
+    unsafe fn acknowledge_irp(&mut self, context: &str) -> bool {
+        let Some(irp) = self.pending_irp else { return true; };
+        match crate::completion_retry::step(acknowledge_completed_irp(irp.raw())) {
+            CompletionStep::Done(()) => {
+                self.pending_irp = None;
+                true
+            }
+            CompletionStep::Retry => false,
+            CompletionStep::Failed(status) => panic!("{context}: status {status:#x}"),
+        }
+    }
+
     unsafe fn finish_cancelled(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if !self.acknowledge_irp("cancelled terminal FSCTL ACK") { return false; }
         runtime::acknowledge_retained_service_cancellation(
             self.route, self.dispatch, self.reply, self.token,
         ).expect("sealed hosted FSCTL cancellation");
-        if let Some(irp) = self.pending_irp {
-            acknowledge_completed_irp(irp.raw()).expect("cancelled terminal FSCTL ACK");
-        }
         self.release(handler);
         true
     }
@@ -226,12 +239,10 @@ impl FileWork {
                 if self.cancelled() { return self.finish_cancelled(handler); }
                 return false;
             }
+            if !self.acknowledge_irp("hosted FSCTL backend ACK") { return false; }
             runtime::retire_stopped_acknowledged_retained_service(
                 self.route, self.dispatch, self.reply, self.token,
             ).expect("hosted FSCTL Reply retirement");
-            if let Some(irp) = self.pending_irp {
-                acknowledge_completed_irp(irp.raw()).expect("hosted FSCTL backend ACK");
-            }
             self.release(handler);
             return true;
         }
@@ -281,8 +292,12 @@ impl FileWork {
                 ) as usize
             } else { 0 };
             if transfer != 0 {
-                match copy_completed_irp_output_exact(irp.raw(), 0, &mut self.output[..transfer]) {
-                    Ok(bytes) if bytes == transfer => self.copied = bytes,
+                match crate::completion_retry::step(
+                    copy_completed_irp_output_exact(irp.raw(), 0, &mut self.output[..transfer]),
+                ) {
+                    CompletionStep::Done(bytes) if bytes == transfer => self.copied = bytes,
+                    // A refused copy, or one still running, is retried; a copy left behind by
+                    // cancellation is dropped once it returns, before the IRP's ACK.
                     _ => return false,
                 }
             }

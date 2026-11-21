@@ -135,6 +135,7 @@ pub(super) unsafe fn redrive() -> usize {
                     continue;
                 }
                 trace(b"returned", id);
+                crate::completion_retry::returned();
                 progressed += 1;
             }
             Ok(FileIrpResumeProgress::ChildWorkYield(continuation)) | Err(continuation) => {

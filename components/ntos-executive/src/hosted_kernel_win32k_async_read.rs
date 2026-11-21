@@ -37,6 +37,8 @@ struct Work {
     terminal_captured: bool,
     ack_claimed: bool,
     cancel_ack_claimed: bool,
+    /// The claimed IRP ACK answered still running: only the identical ACK is retried.
+    ack_retry: bool,
     prior_file_signal: Option<bool>,
 }
 
@@ -262,6 +264,7 @@ pub(crate) unsafe fn submit(
         terminal_captured: false,
         ack_claimed: false,
         cancel_ack_claimed: false,
+        ack_retry: false,
         prior_file_signal: None,
     };
     let index = if let Some(index) = slot {
@@ -312,6 +315,9 @@ impl Work {
         if self.inline_error {
             return true;
         }
+        if self.ack_retry {
+            return true;
+        }
         if self.ack_claimed || self.cancel_ack_claimed {
             return false;
         }
@@ -356,8 +362,11 @@ impl Work {
                 return false;
             }
             self.cancel_ack_claimed = true;
-            if acknowledge_completed_irp(irp.raw()).is_err() {
-                return false;
+            match crate::completion_retry::step(acknowledge_completed_irp(irp.raw())) {
+                nt_hosted_runtime::CompletionStep::Done(()) => {}
+                // Still running: no effect is uncertain, and the identical ACK collects it.
+                nt_hosted_runtime::CompletionStep::Retry => { self.cancel_ack_claimed = false; return false; }
+                nt_hosted_runtime::CompletionStep::Failed(_) => return false,
             }
             self.irp = None;
         }
@@ -396,7 +405,7 @@ impl Work {
         };
         if let Some(irp) = self.irp {
             if transfer != 0 {
-                match copy_completed_irp_output_exact(irp.raw(), 0, &mut self.output[..transfer]) {
+                match crate::completion_retry::retried(copy_completed_irp_output_exact(irp.raw(), 0, &mut self.output[..transfer])) {
                     Ok(bytes) if bytes == transfer => {}
                     _ => return false,
                 }
@@ -614,7 +623,7 @@ impl Work {
         // `acknowledge_completed_irp` may have had an uncertain native effect. A claimed ACK is
         // never replayed, nor are the already published stack bytes or File event.
         if self.ack_claimed {
-            return false;
+            return self.ack_retry && self.acknowledge_and_retire(handler);
         }
         let bytes = self
             .delivery
@@ -675,9 +684,23 @@ impl Work {
             .begin_irp_ack(&self.token)
             .expect("win32k read IRP ACK claim");
         self.ack_claimed = true;
+        self.acknowledge_and_retire(handler)
+    }
+
+    /// ACK the claimed IRP, then retire. A still-running ACK keeps the claim and is retried
+    /// alone on a later turn; nothing published before the claim is repeated.
+    unsafe fn acknowledge_and_retire(&mut self, handler: *mut ExecNtHandler) -> bool {
         if let Some(irp) = self.irp {
-            if acknowledge_completed_irp(irp.raw()).is_err() {
-                return false;
+            match crate::completion_retry::step(acknowledge_completed_irp(irp.raw())) {
+                nt_hosted_runtime::CompletionStep::Done(()) => self.ack_retry = false,
+                nt_hosted_runtime::CompletionStep::Retry => {
+                    self.ack_retry = true;
+                    return false;
+                }
+                nt_hosted_runtime::CompletionStep::Failed(_) => {
+                    self.ack_retry = false;
+                    return false;
+                }
             }
             self.irp = None;
         }

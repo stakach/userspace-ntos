@@ -3,6 +3,7 @@
 
 use crate::spawn_hosts::shared_ingress::owner::runtime::{self, PhysicalSource};
 use crate::*;
+use nt_hosted_runtime::CompletionStep;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
@@ -380,19 +381,20 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
             };
         }
         Phase::QueryCopying(irp, offset) => {
-            match driver_launch::copy_completed_irp_output_exact(
+            match completion_retry::step(driver_launch::copy_completed_irp_output_exact(
                 irp.raw(),
                 offset as u64,
                 &mut work.query_output[offset..],
-            ) {
-                Ok(n) if n != 0 && n <= 24 - offset => {
+            )) {
+                CompletionStep::Done(n) if n != 0 && n <= 24 - offset => {
                     work.phase = if offset + n == 24 {
                         Phase::QueryAck(irp)
                     } else {
                         Phase::QueryCopying(irp, offset + n)
                     };
                 }
-                _ => {
+                CompletionStep::Retry => {}
+                CompletionStep::Done(_) | CompletionStep::Failed(_) => {
                     work.query_status = STATUS_IO_DEVICE_ERROR;
                     work.phase = Phase::QueryAck(irp);
                 }
@@ -400,10 +402,12 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
         }
         Phase::QueryAck(irp) => {
             work.phase = Phase::Indeterminate;
-            if driver_launch::io_manager_mut()
-                .acknowledge_completed_irp_strict(irp)
-                .is_ok()
-            {
+            let acknowledged = completion_retry::step_status(
+                driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp),
+            );
+            if matches!(acknowledged, CompletionStep::Retry) {
+                work.phase = Phase::QueryAck(irp);
+            } else if matches!(acknowledged, CompletionStep::Done(_)) {
                 work.phase = if cancelled {
                     work.result.0 = CANCELLED;
                     Phase::Abort
@@ -635,12 +639,12 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                 work.phase = Phase::Indeterminate;
                 return;
             };
-            match driver_launch::copy_completed_irp_output_exact(
+            match completion_retry::step(driver_launch::copy_completed_irp_output_exact(
                 irp.raw(),
                 offset as u64,
                 &mut bytes[..length],
-            ) {
-                Ok(n) if n != 0 && n <= length => {
+            )) {
+                CompletionStep::Done(n) if n != 0 && n <= length => {
                     if !(&mut *core::ptr::addr_of_mut!(READS)).append(
                         work.read.unwrap(),
                         irp.raw(),
@@ -659,7 +663,8 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                         Phase::ReadCopying(irp, offset + n)
                     };
                 }
-                _ => {
+                CompletionStep::Retry => {}
+                CompletionStep::Done(_) | CompletionStep::Failed(_) => {
                     let _ = (&mut *core::ptr::addr_of_mut!(READS)).fail_copy(
                         work.read.unwrap(),
                         irp.raw(),
@@ -671,12 +676,18 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
         }
         Phase::ReadAck(irp) => {
             work.phase = Phase::Indeterminate;
-            if driver_launch::io_manager_mut()
-                .acknowledge_completed_irp_strict(irp)
-                .is_err()
-            {
-                trace_read(work, b"ack-uncertain", irp.raw(), work.result.0);
-                return;
+            match completion_retry::step_status(
+                driver_launch::io_manager_mut().acknowledge_completed_irp_strict(irp),
+            ) {
+                CompletionStep::Done(_) => {}
+                CompletionStep::Retry => {
+                    work.phase = Phase::ReadAck(irp);
+                    return;
+                }
+                CompletionStep::Failed(_) => {
+                    trace_read(work, b"ack-uncertain", irp.raw(), work.result.0);
+                    return;
+                }
             }
             assert!((&mut *core::ptr::addr_of_mut!(READS))
                 .acknowledge_backend(work.read.unwrap(), irp.raw()));
@@ -895,7 +906,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
 pub(crate) fn next_deadline() -> Option<u64> {
     (EXECUTING.load(Ordering::Acquire)
         || unsafe { (&*core::ptr::addr_of!(WORK)).iter().any(Option::is_some) })
-    .then(|| NEXT.load(Ordering::Acquire))
+    .then(|| completion_retry::row_deadline(NEXT.load(Ordering::Acquire)))
 }
 
 /// Read-only receipt for a root Receive with no armed timer. A redriver may
@@ -948,7 +959,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         return;
     }
     let now = monotonic_time_100ns();
-    if NEXT.load(Ordering::Acquire) > now
+    if completion_retry::row_deadline(NEXT.load(Ordering::Acquire)) > now
         && !(&*core::ptr::addr_of!(WORK))
             .iter()
             .flatten()
@@ -964,7 +975,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
             continue;
         };
         let exact_ready = exact_pending_read_ready(&work);
-        if work.retry_at > now && !exact_ready {
+        if completion_retry::row_deadline(work.retry_at) > now && !exact_ready {
             (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
             continue;
         }
