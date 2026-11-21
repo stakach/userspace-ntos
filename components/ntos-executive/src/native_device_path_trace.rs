@@ -60,6 +60,64 @@ fn claim(pi: usize, generation: Option<u64>) -> bool {
     claim_from(Budget::Dispatch, pi, generation)
 }
 
+/// Records per related-file CREATE (staged, published, handoff, direct reply, completed, final).
+const RECORDS_PER_RELATED_CREATE: u8 = 8;
+/// Related-file CREATEs traced outside the per-generation budget. Boot 44868930483 spent cmd.exe's
+/// 16 pended-CREATE records on earlier opens just before its ConDrv `Reference` open, which is
+/// relative to the Server handle; a related-file CREATE is rare, so each one is always traced.
+const RELATED_CREATES: usize = 64;
+static mut RELATED: [(u64, u8); RELATED_CREATES] = [(0, 0); RELATED_CREATES];
+static mut RELATED_NEXT: usize = 0;
+
+fn claim_related(file: u64) -> Option<bool> {
+    // SAFETY: only the single root dispatch executor records this trace.
+    let related = unsafe { &mut *core::ptr::addr_of_mut!(RELATED) };
+    let slot = related.iter_mut().find(|(traced, _)| *traced == file && file != 0)?;
+    if slot.1 >= RECORDS_PER_RELATED_CREATE {
+        return Some(false);
+    }
+    slot.1 += 1;
+    Some(true)
+}
+
+fn claim_pended(pi: usize, generation: Option<u64>, file: u64) -> bool {
+    claim_related(file).unwrap_or_else(|| claim_from(Budget::PendedCreate, pi, generation))
+}
+
+/// A CREATE or open that this dispatch staged as a pended File transfer.
+#[derive(Clone, Copy)]
+pub(crate) struct StagedCreate {
+    generation: Option<u64>,
+    file: u64,
+}
+
+/// Name a staged pended CREATE. One opened relative to a RootDirectory handle is traced on its
+/// own per-File budget from here to its final reply.
+pub(crate) fn staged_create(
+    handler: &ExecNtHandler,
+    service: Option<NativeService>,
+    args: &[u64],
+    generation: Option<u64>,
+) -> Option<StagedCreate> {
+    if !matches!(service, Some(NativeService::NtCreateFile | NativeService::NtOpenFile)) {
+        return None;
+    }
+    let file = handler.pending_file_io_transfer?.route.hosted_file_id().unwrap_or(0);
+    let mut header = [0u8; 0x10];
+    let root = args.get(2)
+        .filter(|&&attributes| attributes != 0 && unsafe { handler.xas_read(attributes, &mut header) })
+        .map_or(0, |_| u64::from_le_bytes(header[8..16].try_into().unwrap()));
+    if root != 0 && file != 0 {
+        // SAFETY: only the single root dispatch executor records this trace.
+        unsafe {
+            let next = &mut *core::ptr::addr_of_mut!(RELATED_NEXT);
+            (&mut *core::ptr::addr_of_mut!(RELATED))[*next % RELATED_CREATES] = (file, 0);
+            *next = next.wrapping_add(1);
+        }
+    }
+    Some(StagedCreate { generation, file })
+}
+
 /// The object name and root of an OBJECT_ATTRIBUTES in the caller, up to 96 UTF-16 units.
 unsafe fn object_name(handler: &ExecNtHandler, attributes: u64, out: &mut [u16; 96]) -> Option<(u64, usize)> {
     let mut header = [0u8; 0x18];
@@ -178,7 +236,7 @@ pub(crate) fn pended_create(
     status: u32,
     handle: u64,
 ) {
-    if !claim_from(Budget::PendedCreate, pi, generation) {
+    if !claim_pended(pi, generation, file) {
         return;
     }
     print_str(b"[device-path] pi=");
@@ -207,14 +265,16 @@ pub(crate) fn pended_create(
 /// completion was ever delivered for it, yet cmd resumed. `published` gives (published, wait),
 /// `handoff` (wait, still parked), and `direct-reply` (the status replied, the Reply) when the
 /// syscall tail answered the caller itself.
-pub(crate) fn pended_create_step(phase: &[u8], pi: usize, generation: Option<u64>, first: u64, second: u64) {
-    if !claim_from(Budget::PendedCreate, pi, generation) {
+pub(crate) fn pended_create_step(phase: &[u8], pi: usize, staged: StagedCreate, first: u64, second: u64) {
+    if !claim_pended(pi, staged.generation, staged.file) {
         return;
     }
     print_str(b"[device-path] pi=");
     print_u64(pi as u64);
     print_str(b" pended-create ");
     print_str(phase);
+    print_str(b" file=0x");
+    print_hex_u64(staged.file);
     print_str(b" 0x");
     print_hex_u64(first);
     print_str(b" 0x");

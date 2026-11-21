@@ -1072,9 +1072,9 @@ pub(super) unsafe fn syscall_tail(
     // scheduling remains here; completion may already have retired the published owner.
     if let Some(published) = sc.published_file_io.take() {
         let wait_for_completion = published.wait_for_completion;
-        if let Some(generation) = sc.pended_create_generation.take() {
+        if let Some(staged) = sc.pended_create.take() {
             crate::native_device_path_trace::pended_create_step(
-                b"handoff", pi, Some(generation), wait_for_completion as u64,
+                b"handoff", pi, staged, wait_for_completion as u64,
                 published.still_waiting() as u64,
             );
         }
@@ -1355,11 +1355,11 @@ pub(super) unsafe fn syscall_tail(
     // restart without IPC register fanout. NtContinue already bypassed this tail.
     let len = 1;
     let r0 = sc.result;
-    if sc.pended_create_generation.take().is_some() {
+    if let Some(staged) = sc.pended_create.take() {
         // The staged CREATE never reached the published-File handoff: this reply is the
         // caller's status.
         crate::native_device_path_trace::pended_create_step(
-            b"direct-reply", pi, nt_handler.hosted_process_generation(pi), r0, reply_main,
+            b"direct-reply", pi, staged, r0, reply_main,
         );
     }
     if let Some(n) = lsa_logon_trace_seq {

@@ -113,7 +113,7 @@ pub(super) struct SyscallOutcome {
     pub(super) park_io_completion_deadline: nt_delay_execution::Deadline,
     pub(super) published_file_io: Option<file_dispatch_handoff::PublishedFileIo>,
     /// #421: this NtCreateFile/NtOpenFile staged a pended CREATE; trace its caller handoff.
-    pub(super) pended_create_generation: Option<u64>,
+    pub(super) pended_create: Option<crate::native_device_path_trace::StagedCreate>,
     pub(super) transfer_pending_driver_start: Option<PendingDriverStartTransfer>,
     pub(super) transfer_native_directory_open: Option<crate::native_directory_open_work::PendingNativeDirectoryOpen>,
     pub(super) transfer_native_file_target: Option<crate::native_file_target_open_work::PendingNativeFileTargetOpen>,
@@ -167,7 +167,7 @@ impl SyscallOutcome {
             park_io_completion_iosb_out: 0,
             park_io_completion_deadline: nt_delay_execution::Deadline::Infinite,
             published_file_io: None,
-            pended_create_generation: None,
+            pended_create: None,
             transfer_pending_driver_start: None,
             transfer_native_directory_open: None,
             transfer_native_file_target: None,
