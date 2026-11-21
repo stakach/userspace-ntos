@@ -5,15 +5,15 @@
 //! routine observes IoStatus. A pending provider IRP stays owned until its exact terminal.
 
 use super::*;
+use super::hosted_forward_projection::{ForwardProjection, ForwardSource};
+use super::hosted_flush_capture::CapturedSourceFlush;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::hosted_forward_progress::HostedForwardWorkProgress;
 use nt_io_manager::{
-    detached_file_irp::{ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest},
     retained_flush_forward::{
         FlushCompletion, FlushForwardOutcome, FlushForwardResult, RetainedFlushForward,
         TerminalFlushForward,
     },
-    IoParameters,
 };
 use nt_io_manager::source_irp_ledger::SourceIrpForwardIdentity;
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
@@ -56,13 +56,7 @@ static mut EXECUTING: Vec<(usize, DriverInstance, SourceIrpForwardIdentity, bool
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn status_for_capture(error: hosted_flush_capture::CaptureError) -> i32 {
-    use hosted_flush_capture::CaptureError;
-    match error {
-        CaptureError::InvalidCaller
-        | CaptureError::InvalidSourceIrp
-        | CaptureError::InvalidFile => STATUS_INVALID_HANDLE_LOCAL,
-        CaptureError::InvalidTarget => STATUS_INVALID_DEVICE_REQUEST_LOCAL,
-    }
+    CapturedSourceFlush::refusal_status(error)
 }
 
 fn source_work_index(source_instance: DriverInstance, incoming: SourceIrpForwardIdentity) -> Option<usize> {
@@ -163,12 +157,12 @@ pub(super) unsafe fn submit(
     if !reconcile_source_acks(route) {
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }
-    let mut source = match hosted_flush_capture::capture(
-        ch,
-        active_reply_cap,
-        source_irp_address,
-        target_device_address,
-    ) {
+    let captured = ForwardSource::for_pump_channel(ch, active_reply_cap)
+        .ok_or(hosted_flush_capture::CaptureError::InvalidCaller)
+        .and_then(|source| CapturedSourceFlush::capture(
+            source, source_irp_address, target_device_address,
+        ));
+    let mut source = match captured {
         Ok(source) => source,
         Err(error) => {
             return Some(status_for_capture(error));
@@ -179,15 +173,9 @@ pub(super) unsafe fn submit(
         source.release().expect("duplicate FLUSH capture rollback");
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }
-    let Some((target_index, _, _)) =
-        hosted_driver_device_route_by_device_id(source.device_id().raw())
+    let Some((_, provider_instance)) =
+        hosted_forward_projection::target_provider(source.device_id())
     else {
-        source.release().expect("unentered FLUSH route rejection");
-        return Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
-    };
-    let provider_index = hosted_provider_dispatch_route_for_instance(target_index)
-        .map_or(target_index, |route| route.provider_instance);
-    let Some(provider_instance) = instance(provider_index) else {
         source
             .release()
             .expect("unentered FLUSH provider rejection");
@@ -367,22 +355,7 @@ impl Work {
     }
 
     unsafe fn provider_index_if_exact(&self) -> Option<usize> {
-        let Some((target_index, _, _)) =
-            hosted_driver_device_route_by_device_id(self.source.device_id().raw())
-        else {
-            return None;
-        };
-        let provider_index = hosted_provider_dispatch_route_for_instance(target_index)
-            .map_or(target_index, |route| route.provider_instance);
-        instance(provider_index)
-            .filter(|live| {
-                live.pml4 == self.provider_instance.pml4
-                    && live.exec_pool_va == self.provider_instance.exec_pool_va
-                    && live.hosted_domain_id == self.provider_instance.hosted_domain_id
-                    && live.hosted_domain_cookie == self.provider_instance.hosted_domain_cookie
-                    && live.driver_id == self.provider_instance.driver_id
-            })
-            .map(|_| provider_index)
+        hosted_forward_projection::target_provider_is(self.source.device_id(), self.provider_instance)
     }
 
     unsafe fn provider_dispatch_ready(&self) -> bool {
@@ -410,25 +383,9 @@ impl Work {
                     self.initial_status = Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
                     return;
                 }
-                let request = ExternalFileIrpRequest {
-                    client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
-                    device_id: self.source.device_id(),
-                    file_id: Some(self.source.file_id()),
-                    user_data: 0,
-                    requestor_tid: u64::from(self.caller.original_thread().thread_id()),
-                    major: major::IRP_MJ_FLUSH_BUFFERS,
-                    parameters: IoParameters::FlushBuffers,
-                    stack_flags: self.source.stack_flags(),
-                    request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
-                    initial_information: 0,
-                };
-                let result = hosted_file_owners::dispatch(
-                    self.caller,
-                    request,
-                    &[],
-                    &[],
-                    ExternalFileIrpDispatchPolicy::File,
-                );
+                let requestor_tid = u64::from(self.caller.original_thread().thread_id());
+                let result = self.source.target_request(&(), requestor_tid)
+                    .dispatch_primary(self.caller);
                 match hosted_file_owners::keep_or_ready(&mut self.kept_pump, result) {
                     Some(result) => result,
                     None => return,
@@ -537,29 +494,9 @@ impl Work {
     }
 
     unsafe fn publish_source(&mut self) {
-        let completion = self
-            .terminal
-            .as_ref()
-            .expect("FLUSH provider terminal")
-            .completion();
-        let irp = self
-            .source
-            .source_irp_exec()
-            .expect("live source FLUSH IRP");
-        self.source
-            .validate_packet()
-            .expect("source FLUSH packet changed before completion");
-        write_unaligned(
-            (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut u32,
-            completion.status(),
-        );
-        write_unaligned(
-            (irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64,
-            0,
-        );
-        self.source
-            .arm_callback_free()
-            .expect("deferred source FLUSH IRP free");
+        let completion = self.terminal.as_ref().expect("FLUSH provider terminal").completion();
+        self.source.publish(completion.status(), 0, &[])
+            .expect("FLUSH publication has no refusal");
     }
 
     unsafe fn retire_after_terminal(&mut self, stopped: bool) -> bool {

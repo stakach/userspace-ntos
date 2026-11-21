@@ -4,21 +4,17 @@
 //! only its exact terminal is copied back before Mup's own completion routine is invoked.
 
 use super::*;
+use super::hosted_forward_projection::{ForwardProjection, ForwardSource};
+use super::hosted_query_path_capture::CapturedSourceForward;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use core::num::NonZeroU64;
-use nt_io_manager::{
-    detached_file_irp::{ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest},
-    redir_query_path::{IOCTL_REDIR_QUERY_PATH, IRP_MJ_DEVICE_CONTROL},
-    retained_query_path_forward::{
-        QueryPathForwardOutcome, QueryPathForwardResult, RetainedQueryPathForward,
-        TerminalQueryPathForward,
-    },
-    DeviceControlParameters, IoParameters, StackFlags,
+use nt_io_manager::retained_query_path_forward::{
+    QueryPathForwardOutcome, QueryPathForwardResult, RetainedQueryPathForward,
+    TerminalQueryPathForward,
 };
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
 
 const STATUS_INVALID_HANDLE_LOCAL: i32 = 0xc000_0008u32 as i32;
-const STATUS_INVALID_PARAMETER_LOCAL: i32 = 0xc000_000du32 as i32;
 const STATUS_INVALID_DEVICE_REQUEST_LOCAL: i32 = 0xc000_0010u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES_LOCAL: i32 = 0xc000_009au32 as i32;
 const STATUS_DEVICE_BUSY_LOCAL: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
@@ -65,17 +61,7 @@ static mut EXECUTING: Vec<(usize, DriverInstance, u64)> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn status_for_capture(error: hosted_query_path_capture::CaptureError) -> i32 {
-    use hosted_query_path_capture::CaptureError;
-    match error {
-        CaptureError::InvalidCaller
-        | CaptureError::MissingSecurityContext
-        | CaptureError::InvalidSourceIrp
-        | CaptureError::InvalidFile => STATUS_INVALID_HANDLE_LOCAL,
-        CaptureError::InvalidSourceBuffer | CaptureError::QueryPath(_) => {
-            STATUS_INVALID_PARAMETER_LOCAL
-        }
-        CaptureError::InvalidTarget => STATUS_INVALID_DEVICE_REQUEST_LOCAL,
-    }
+    CapturedSourceForward::refusal_status(error)
 }
 
 fn source_work_index(source_instance: DriverInstance, source_irp_address: u64) -> Option<usize> {
@@ -123,12 +109,12 @@ pub(super) unsafe fn submit(
     if source_work_index(source_instance, source_irp_address).is_some() {
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }
-    let mut source = match hosted_query_path_capture::capture(
-        ch,
-        active_reply_cap,
-        source_irp_address,
-        target_device_address,
-    ) {
+    let captured = ForwardSource::for_pump_channel(ch, active_reply_cap)
+        .ok_or(hosted_query_path_capture::CaptureError::InvalidCaller)
+        .and_then(|source| CapturedSourceForward::capture(
+            source, source_irp_address, target_device_address,
+        ));
+    let mut source = match captured {
         Ok(source) => source,
         Err(error) => return Some(status_for_capture(error)),
     };
@@ -144,17 +130,9 @@ pub(super) unsafe fn submit(
             return Some(STATUS_INVALID_HANDLE_LOCAL);
         }
     };
-    let Some((target_index, _, _)) =
-        hosted_driver_device_route_by_device_id(source.device_id().raw())
+    let Some((_, provider_instance)) =
+        hosted_forward_projection::target_provider(source.device_id())
     else {
-        source
-            .release()
-            .expect("unentered query-path route rejection");
-        return Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
-    };
-    let provider_index = hosted_provider_dispatch_route_for_instance(target_index)
-        .map_or(target_index, |route| route.provider_instance);
-    let Some(provider_instance) = instance(provider_index) else {
         source
             .release()
             .expect("unentered query-path provider rejection");
@@ -314,20 +292,8 @@ impl Work {
     }
 
     unsafe fn provider_still_exact(&self) -> bool {
-        let Some((target_index, _, _)) =
-            hosted_driver_device_route_by_device_id(self.source.device_id().raw())
-        else {
-            return false;
-        };
-        let provider_index = hosted_provider_dispatch_route_for_instance(target_index)
-            .map_or(target_index, |route| route.provider_instance);
-        instance(provider_index).is_some_and(|live| {
-            live.pml4 == self.provider_instance.pml4
-                && live.exec_pool_va == self.provider_instance.exec_pool_va
-                && live.hosted_domain_id == self.provider_instance.hosted_domain_id
-                && live.hosted_domain_cookie == self.provider_instance.hosted_domain_cookie
-                && live.driver_id == self.provider_instance.driver_id
-        })
+        hosted_forward_projection::target_provider_is(self.source.device_id(), self.provider_instance)
+            .is_some()
     }
 
     unsafe fn dispatch(&mut self, handler: *mut ExecNtHandler) {
@@ -386,31 +352,11 @@ impl Work {
                     self.abort_pending = true;
                     return;
                 }
-                let request = ExternalFileIrpRequest {
-                    client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
-                    device_id: self.source.device_id(),
-                    file_id: Some(self.source.file_id()),
-                    user_data: 0,
-                    requestor_tid: u64::from(self.caller.original_thread().thread_id()),
-                    major: IRP_MJ_DEVICE_CONTROL,
-                    parameters: IoParameters::DeviceControl(DeviceControlParameters {
-                        ioctl_code: IOCTL_REDIR_QUERY_PATH,
-                        input_len: input.len() as u32,
-                        output_len: 4,
-                    }),
-                    stack_flags: StackFlags::empty(),
-                    request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
-                    initial_information: 0,
-                };
-                // `dispatch` returns Err only for a proven not-entered canonical IRP. The source
-                // target is still owned here, so that path can roll back without invoking Mup.
-                let result = hosted_file_owners::dispatch(
-                    self.caller,
-                    request,
-                    &input,
-                    &[0; 4],
-                    ExternalFileIrpDispatchPolicy::FileDeviceControl,
-                );
+                let requestor_tid = u64::from(self.caller.original_thread().thread_id());
+                // `dispatch_primary` returns Err only for a proven not-entered canonical IRP. The
+                // source target is still owned here, so that path can roll back without Mup.
+                let result = self.source.target_request(&input, requestor_tid)
+                    .dispatch_primary(self.caller);
                 match hosted_file_owners::keep_or_ready(&mut self.kept_pump, result) {
                     Some(result) => result,
                     None => return,
@@ -645,7 +591,7 @@ impl Work {
             completion.requestor_tid,
             u64::from(self.caller.original_thread().thread_id())
         );
-        assert_eq!(completion.major, IRP_MJ_DEVICE_CONTROL);
+        assert_eq!(completion.major, CapturedSourceForward::MAJOR);
         let response = if (completion.status as i32) >= 0 {
             assert_eq!(
                 copy_completed_irp_output_exact(irp.raw(), 0, &mut self.response),
@@ -681,28 +627,8 @@ impl Work {
             .as_ref()
             .expect("query-path provider terminal")
             .completion();
-        if (completion.status as i32) >= 0 {
-            let output = self
-                .source
-                .source_output_exec()
-                .expect("live Mup query-path output");
-            core::ptr::copy_nonoverlapping(self.response.as_ptr(), output as *mut u8, 4);
-        }
-        let irp = self
-            .source
-            .source_irp_exec()
-            .expect("live Mup query-path IRP");
-        write_unaligned(
-            (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut u32,
-            completion.status,
-        );
-        write_unaligned(
-            (irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64,
-            completion.information,
-        );
-        self.source
-            .arm_callback_free()
-            .expect("Mup deferred IRP free admission");
+        self.source.publish(completion.status, completion.information, &self.response)
+            .expect("query-path publication has no refusal");
     }
 
     unsafe fn advance(&mut self, handler: *mut ExecNtHandler) -> bool {

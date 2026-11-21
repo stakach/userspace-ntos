@@ -370,13 +370,12 @@ unsafe fn authenticate(
 
 /// Capture the exact source FILE_OBJECT and its registered related DEVICE_OBJECT before a
 /// cross-domain forward. The source driver must still own a pointer reference to the File.
+/// `domain` is the forward source's authenticated domain.
 pub(super) unsafe fn capture_forward_file(
-    ch: &crate::spawn_hosts::PumpChannel,
-    reply_cap: u64,
+    domain: HostedDomainIdentity,
     file_address: u64,
     device_address: u64,
 ) -> Result<ForwardFileOwner, i32> {
-    let (_, domain) = authenticate(ch, reply_cap)?;
     let id = row_for_pointer(domain, file_address).ok_or(STATUS_INVALID_HANDLE)?;
     let owner = row(id);
     let projection = owner.projection.as_ref().ok_or(STATUS_INVALID_HANDLE)?;

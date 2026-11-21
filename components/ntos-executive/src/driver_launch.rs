@@ -362,6 +362,8 @@ pub(crate) mod hosted_source_completion_lane;
 pub(crate) mod hosted_class_irp_lane;
 #[path = "hosted_forward_origin.rs"]
 mod hosted_forward_origin;
+#[path = "hosted_forward_projection.rs"]
+mod hosted_forward_projection;
 #[path = "hosted_flush_work.rs"]
 mod hosted_flush_work;
 #[path = "hosted_query_information_work.rs"]
@@ -10150,6 +10152,71 @@ unsafe fn forward_hosted_power(
 }
 
 /// `NTSTATUS IofCallDriver(PDEVICE_OBJECT, PIRP)`.
+/// The driver side of a primary forward protocol whose per-major marshalling lives behind
+/// `hosted_forward_projection::ForwardProjection` at the root.
+#[derive(Clone, Copy)]
+struct ForwardProjectionCaller {
+    label: u64,
+    /// The op 1 reply is the typed three-way disposition (Pending and MPR capable).
+    typed: bool,
+}
+
+impl ForwardProjectionCaller {
+    fn for_major(major: u8) -> Option<Self> {
+        let (label, typed) = match major {
+            major::IRP_MJ_DEVICE_CONTROL => (FSD_SERVICE_QUERY_PATH_FORWARD_LABEL, false),
+            major::IRP_MJ_WRITE => (FSD_SERVICE_WRITE_FORWARD_LABEL, false),
+            major::IRP_MJ_READ => (FSD_SERVICE_READ_FORWARD_LABEL, true),
+            major::IRP_MJ_FLUSH_BUFFERS => (FSD_SERVICE_FLUSH_FORWARD_LABEL, true),
+            major::IRP_MJ_QUERY_INFORMATION => (FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL, true),
+            _ => return None,
+        };
+        Some(Self { label, typed })
+    }
+
+    /// Submit `irp` (op 1), then unwind its completion routines locally and acknowledge a
+    /// synchronous terminal (op 2), hold an inline MPR (op 4), or arm a Pending dispatch (op 3).
+    unsafe fn forward(self, device: u64, irp: u64, next: u64, location_after_forward: u8) -> i32 {
+        let (reply_label, status, accepted, token, _) =
+            call_on4((self.label << 12) | 4, 1, device, irp, 0);
+        let disposition = if self.typed {
+            nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::decode(
+                status as u32 as i32, accepted,
+            )
+        } else { None };
+        if reply_label != 0 || (self.typed && disposition.is_none())
+            || (self.typed && status as u32 == STATUS_PENDING && token == 0)
+            || (!self.typed && accepted > 1) {
+            crate::provider_bugcheck::report(0xc4, [self.label, 1, irp, reply_label]);
+        }
+        if accepted == 0 {
+            return status as u32 as i32;
+        }
+        write_unaligned(
+            (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+            location_after_forward,
+        );
+        write_unaligned((irp + 0xb8) as *mut u64, next);
+        write_unaligned((next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64, device);
+        if self.typed && status as u32 == STATUS_PENDING {
+            let control = (next + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8;
+            write_unaligned(control, read_unaligned(control) | WDM_X64_SL_PENDING_RETURNED);
+            hosted_forward_origin::arm_pending(self.label, irp, token);
+            return STATUS_PENDING as i32;
+        }
+        let completion = complete_hosted_irp_with_owner(irp);
+        if self.typed && completion.outcome == HostedIrpUnwindOutcome::MoreProcessingRequired {
+            hosted_forward_origin::acknowledge_inline_held(self.label, irp, token);
+            return status as u32 as i32;
+        }
+        let (ack_label, ack_status, _, _, _) = call_on4((self.label << 12) | 4, 2, irp, 0, 0);
+        if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
+            crate::provider_bugcheck::report(0xc4, [self.label, 2, irp, ack_status]);
+        }
+        status as u32 as i32
+    }
+}
+
 extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
     unsafe {
         let Some((_, previous_location, _)) = validate_hosted_irp_packet(irp) else {
@@ -10212,76 +10279,8 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                         return forward_hosted_internal_control(device, irp, next, current_location_after_forward);
                     }
                 }
-                if major == IRP_MJ_DEVICE_CONTROL
-                    || major == major::IRP_MJ_WRITE as u64
-                    || major == major::IRP_MJ_READ as u64
-                    || major == major::IRP_MJ_FLUSH_BUFFERS as u64
-                    || major == major::IRP_MJ_QUERY_INFORMATION as u64
-                {
-                    let forward_label = if major == IRP_MJ_DEVICE_CONTROL {
-                        FSD_SERVICE_QUERY_PATH_FORWARD_LABEL
-                    } else if major == major::IRP_MJ_READ as u64 {
-                        FSD_SERVICE_READ_FORWARD_LABEL
-                    } else if major == major::IRP_MJ_FLUSH_BUFFERS as u64 {
-                        FSD_SERVICE_FLUSH_FORWARD_LABEL
-                    } else if major == major::IRP_MJ_QUERY_INFORMATION as u64 {
-                        FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL
-                    } else {
-                        FSD_SERVICE_WRITE_FORWARD_LABEL
-                    };
-                    let (reply_label, status, accepted, token, _) =
-                        call_on4((forward_label << 12) | 4, 1, device, irp, 0);
-                    let typed_forward = matches!(
-                        major as u8,
-                        major::IRP_MJ_READ
-                            | major::IRP_MJ_FLUSH_BUFFERS
-                            | major::IRP_MJ_QUERY_INFORMATION
-                    );
-                    let disposition = if typed_forward {
-                        nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::decode(
-                            status as u32 as i32, accepted,
-                        )
-                    } else { None };
-                    if reply_label != 0 || (typed_forward && disposition.is_none())
-                        || (typed_forward && status as u32 == STATUS_PENDING && token == 0)
-                        || (!typed_forward && accepted > 1) {
-                        crate::provider_bugcheck::report(
-                            0xc4,
-                            [forward_label, 1, irp, reply_label],
-                        );
-                    }
-                    if accepted == 0 {
-                        return status as u32 as i32;
-                    }
-                    write_unaligned(
-                        (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
-                        current_location_after_forward,
-                    );
-                    write_unaligned((irp + 0xb8) as *mut u64, next);
-                    write_unaligned(
-                        (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
-                        device,
-                    );
-                    if typed_forward && status as u32 == STATUS_PENDING {
-                        let control = (next + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8;
-                        write_unaligned(
-                            control,
-                            read_unaligned(control) | WDM_X64_SL_PENDING_RETURNED,
-                        );
-                        hosted_forward_origin::arm_pending(forward_label, irp, token);
-                        return STATUS_PENDING as i32;
-                    }
-                    let completion = complete_hosted_irp_with_owner(irp);
-                    if typed_forward && completion.outcome == HostedIrpUnwindOutcome::MoreProcessingRequired {
-                        hosted_forward_origin::acknowledge_inline_held(forward_label, irp, token);
-                        return status as u32 as i32;
-                    }
-                    let (ack_label, ack_status, _, _, _) =
-                        call_on4((forward_label << 12) | 4, 2, irp, 0, 0);
-                    if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
-                        crate::provider_bugcheck::report(0xc4, [forward_label, 2, irp, ack_status]);
-                    }
-                    return status as u32 as i32;
+                if let Some(projection) = ForwardProjectionCaller::for_major(major as u8) {
+                    return projection.forward(device, irp, next, current_location_after_forward);
                 }
                 return 0xC000_0010u32 as i32;
             }

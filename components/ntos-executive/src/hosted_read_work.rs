@@ -7,19 +7,18 @@
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::hosted_forward_progress::HostedForwardWorkProgress;
+use super::hosted_forward_projection::{ForwardProjection, ForwardSource};
+use super::hosted_read_capture::CapturedSourceRead;
 use nt_io_manager::{
-    detached_file_irp::{ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest},
     retained_read_forward::{
         RetainedReadForward, TerminalReadForward, ReadCompletion, ReadForwardOutcome,
         ReadForwardResult,
     },
-    IoParameters, ReadWriteParameters,
 };
 use nt_io_manager::source_irp_ledger::SourceIrpForwardIdentity;
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
 
 const STATUS_INVALID_HANDLE_LOCAL: i32 = 0xc000_0008u32 as i32;
-const STATUS_INVALID_PARAMETER_LOCAL: i32 = 0xc000_000du32 as i32;
 const STATUS_INVALID_DEVICE_REQUEST_LOCAL: i32 = 0xc000_0010u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES_LOCAL: i32 = 0xc000_009au32 as i32;
 const STATUS_DEVICE_BUSY_LOCAL: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
@@ -58,16 +57,7 @@ static mut EXECUTING: Vec<(usize, DriverInstance, SourceIrpForwardIdentity, bool
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn status_for_capture(error: hosted_read_capture::CaptureError) -> i32 {
-    use hosted_read_capture::CaptureError;
-    match error {
-        CaptureError::InvalidCaller | CaptureError::InvalidSourceIrp | CaptureError::InvalidFile => {
-            STATUS_INVALID_HANDLE_LOCAL
-        }
-        CaptureError::InvalidSourceBuffer | CaptureError::UnsupportedBuffer => {
-            STATUS_INVALID_PARAMETER_LOCAL
-        }
-        CaptureError::InvalidTarget => STATUS_INVALID_DEVICE_REQUEST_LOCAL,
-    }
+    CapturedSourceRead::refusal_status(error)
 }
 
 fn source_work_index(source_instance: DriverInstance, incoming: SourceIrpForwardIdentity) -> Option<usize> {
@@ -168,9 +158,12 @@ pub(super) unsafe fn submit(
     if !reconcile_source_acks(route) {
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }
-    let mut source = match hosted_read_capture::capture(
-        ch, active_reply_cap, source_irp_address, target_device_address,
-    ) {
+    let captured = ForwardSource::for_pump_channel(ch, active_reply_cap)
+        .ok_or(hosted_read_capture::CaptureError::InvalidCaller)
+        .and_then(|source| CapturedSourceRead::capture(
+            source, source_irp_address, target_device_address,
+        ));
+    let mut source = match captured {
         Ok(source) => source,
         Err(error) => {
             return Some(status_for_capture(error));
@@ -181,15 +174,8 @@ pub(super) unsafe fn submit(
         source.release().expect("duplicate READ capture rollback");
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }
-    let Some((target_index, _, _)) =
-        hosted_driver_device_route_by_device_id(source.device_id().raw())
+    let Some((_, provider_instance)) = hosted_forward_projection::target_provider(source.device_id())
     else {
-        source.release().expect("unentered READ route rejection");
-        return Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
-    };
-    let provider_index = hosted_provider_dispatch_route_for_instance(target_index)
-        .map_or(target_index, |route| route.provider_instance);
-    let Some(provider_instance) = instance(provider_index) else {
         source.release().expect("unentered READ provider rejection");
         return Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
     };
@@ -343,18 +329,7 @@ impl Work {
     }
 
     unsafe fn provider_index_if_exact(&self) -> Option<usize> {
-        let Some((target_index, _, _)) =
-            hosted_driver_device_route_by_device_id(self.source.device_id().raw())
-        else { return None; };
-        let provider_index = hosted_provider_dispatch_route_for_instance(target_index)
-            .map_or(target_index, |route| route.provider_instance);
-        instance(provider_index).filter(|live| {
-            live.pml4 == self.provider_instance.pml4
-                && live.exec_pool_va == self.provider_instance.exec_pool_va
-                && live.hosted_domain_id == self.provider_instance.hosted_domain_id
-                && live.hosted_domain_cookie == self.provider_instance.hosted_domain_cookie
-                && live.driver_id == self.provider_instance.driver_id
-        }).map(|_| provider_index)
+        hosted_forward_projection::target_provider_is(self.source.device_id(), self.provider_instance)
     }
 
     unsafe fn provider_dispatch_ready(&self) -> bool {
@@ -378,30 +353,9 @@ impl Work {
                     self.initial_status = Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
                     return;
                 }
-                let read = *self.source.read();
-                let mut initial_output = Vec::new();
-                if initial_output.try_reserve_exact(read.length() as usize).is_err() {
-                    self.initial_status = Some(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
-                    return;
-                }
-                initial_output.resize(read.length() as usize, 0);
-                let request = ExternalFileIrpRequest {
-                    client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
-                    device_id: self.source.device_id(),
-                    file_id: Some(self.source.file_id()),
-                    user_data: 0,
-                    requestor_tid: u64::from(self.caller.original_thread().thread_id()),
-                    major: major::IRP_MJ_READ,
-                    parameters: IoParameters::Read(ReadWriteParameters {
-                        length: read.length(), key: read.key(), offset: read.byte_offset(),
-                    }),
-                    stack_flags: read.stack_flags(),
-                    request_flags: read.request_flags(),
-                    initial_information: 0,
-                };
-                let result = hosted_file_owners::dispatch(
-                    self.caller, request, &[], &initial_output, ExternalFileIrpDispatchPolicy::File,
-                );
+                let requestor_tid = u64::from(self.caller.original_thread().thread_id());
+                let result = self.source.target_request(&(), requestor_tid)
+                    .dispatch_primary(self.caller);
                 match hosted_file_owners::keep_or_ready(&mut self.kept_pump, result) {
                     Some(result) => result,
                     None => return,
@@ -510,21 +464,11 @@ impl Work {
 
     unsafe fn publish_source(&mut self) {
         let completion = self.terminal.as_ref().expect("READ provider terminal").completion();
-        let irp = self.source.source_irp_exec().expect("live source READ IRP");
-        let (status, information) = match self.source.write_output(completion) {
-            Ok(()) => (completion.status(), completion.information()),
-            Err(error) => {
-                let status = status_for_capture(error);
-                self.initial_status = Some(status);
-                (status as u32, 0)
-            }
-        };
-        write_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut u32, status);
-        write_unaligned(
-            (irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64,
-            information,
-        );
-        self.source.arm_callback_free().expect("deferred source READ IRP free");
+        if let Err(error) = self.source.publish(
+            completion.status(), completion.information(), completion.bytes(),
+        ) {
+            self.initial_status = Some(status_for_capture(error));
+        }
     }
 
     unsafe fn retire_after_terminal(&mut self, stopped: bool) -> bool {

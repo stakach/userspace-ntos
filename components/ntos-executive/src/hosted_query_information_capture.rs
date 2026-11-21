@@ -2,7 +2,12 @@
 
 use super::hosted_source_pool_memory::SourcePoolMemory;
 use super::*;
+use super::hosted_forward_projection::{
+    write_source_io_status, ForwardProjection, ForwardRequest, ForwardSource,
+};
 use nt_io_manager::{
+    detached_file_irp::{ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest},
+    forward_projection::next_stack_location,
     hosted_forward_target::HostedForwardTarget,
     retained_query_information_forward::{
         CapturedQueryInformation, PreparedQueryInformationForward, QueryInformationCompletion,
@@ -10,7 +15,7 @@ use nt_io_manager::{
     },
     retained_query_path_forward::SourceIrpTicket,
     source_irp_ledger::{SourceIrpAllocation, SourceIrpForwardIdentity},
-    HostedDomainIdentity, StackFlags,
+    HostedDomainIdentity, InformationParameters, IoParameters, StackFlags,
 };
 use nt_kernel_abi::{IoStackLocation, Irp};
 
@@ -116,14 +121,9 @@ impl CapturedSourceQueryInformation {
         .ok_or(CaptureError::InvalidSourceIrp)
     }
 
-    pub(super) unsafe fn write_output(
-        &self,
-        completion: &QueryInformationCompletion,
-    ) -> Result<(), CaptureError> {
+    unsafe fn write_output(&self, information: u64, bytes: &[u8]) -> Result<(), CaptureError> {
         self.validate_source()?;
-        if completion.information() > u64::from(self.length)
-            || completion.bytes().len() as u64 != completion.information()
-        {
+        if information > u64::from(self.length) || bytes.len() as u64 != information {
             return Err(CaptureError::InvalidSourceBuffer);
         }
         let inst = instance(self.instance_index).ok_or(CaptureError::InvalidSourceIrp)?;
@@ -146,7 +146,7 @@ impl CapturedSourceQueryInformation {
         {
             return Err(CaptureError::InvalidSourceIrp);
         }
-        if !completion.bytes().is_empty() && !memory.write(self.system_buffer, completion.bytes()) {
+        if !bytes.is_empty() && !memory.write(self.system_buffer, bytes) {
             return Err(CaptureError::InvalidSourceBuffer);
         }
         Ok(())
@@ -267,36 +267,13 @@ impl CapturedSourceQueryInformation {
     }
 }
 
-fn source_stack_address(allocation: SourceIrpAllocation, irp: &Irp) -> Result<u64, CaptureError> {
-    if irp.type_ != WDM_X64_IO_TYPE_IRP as i16 || irp.size as u64 != allocation.bytes {
-        return Err(CaptureError::InvalidSourceIrp);
-    }
-    let location =
-        u8::try_from(irp.current_location).map_err(|_| CaptureError::InvalidSourceIrp)?;
-    if location < 2
-        || location > allocation.stack_count.saturating_add(1)
-        || irp.stack_count != allocation.stack_count as i8
-    {
-        return Err(CaptureError::InvalidSourceIrp);
-    }
-    let stack_base = allocation.component_address + WDM_X64_IRP_SIZE as u64;
-    let current_stack = stack_base + (location as u64 - 1) * WDM_X64_IO_STACK_LOCATION_SIZE as u64;
-    if irp.current_stack_location.0 != current_stack {
-        return Err(CaptureError::InvalidSourceIrp);
-    }
-    Ok(current_stack - WDM_X64_IO_STACK_LOCATION_SIZE as u64)
-}
-
-pub(super) unsafe fn capture(
-    ch: &crate::spawn_hosts::PumpChannel,
-    reply_cap: u64,
+unsafe fn capture(
+    source: ForwardSource,
     source_irp_address: u64,
     target_device_address: u64,
 ) -> Result<CapturedSourceQueryInformation, CaptureError> {
-    let (instance_index, inst) =
-        instance_for_pump_channel(ch, reply_cap).ok_or(CaptureError::InvalidCaller)?;
-    let domain: HostedDomainIdentity =
-        instance_domain_identity(inst).ok_or(CaptureError::InvalidCaller)?;
+    let (instance_index, inst) = (source.index(), source.instance());
+    let domain: HostedDomainIdentity = source.domain();
     let (source, allocation) =
         hosted_source_irp_ledger::pin(instance_index, domain, source_irp_address)
             .ok_or(CaptureError::InvalidSourceIrp)?;
@@ -306,7 +283,8 @@ pub(super) unsafe fn capture(
             let irp = memory
                 .read_value::<Irp>(source_irp_address)
                 .ok_or(CaptureError::InvalidSourceIrp)?;
-            let stack_address = source_stack_address(allocation, &irp)?;
+            let stack_address = next_stack_location(allocation, &irp)
+                .ok_or(CaptureError::InvalidSourceIrp)?;
             let stack = memory
                 .read_value::<IoStackLocation>(stack_address)
                 .ok_or(CaptureError::InvalidSourceIrp)?;
@@ -320,8 +298,7 @@ pub(super) unsafe fn capture(
             return Err(CaptureError::InvalidSourceIrp);
         }
         let mut source_file = hosted_consumer_file_objects::capture_forward_file(
-            ch,
-            reply_cap,
+            domain,
             initial_stack.file_object.0,
             target_device_address,
         )
@@ -396,4 +373,64 @@ pub(super) unsafe fn capture(
         );
     }
     result
+}
+
+impl ForwardProjection for CapturedSourceQueryInformation {
+    const MAJOR: u8 = major::IRP_MJ_QUERY_INFORMATION;
+    type Error = CaptureError;
+    type TargetInput = ();
+
+    unsafe fn capture(
+        source: ForwardSource,
+        source_irp: u64,
+        target_device: u64,
+    ) -> Result<Self, CaptureError> {
+        capture(source, source_irp, target_device)
+    }
+
+    fn refusal_status(error: CaptureError) -> i32 {
+        match error {
+            CaptureError::InvalidCaller
+            | CaptureError::InvalidSourceIrp
+            | CaptureError::InvalidFile => STATUS_INVALID_HANDLE,
+            CaptureError::InvalidSourceBuffer => STATUS_INVALID_PARAMETER,
+            CaptureError::InvalidTarget => STATUS_INVALID_DEVICE_REQUEST,
+        }
+    }
+
+    fn target_request<'a>(&'a self, _: &'a (), requestor_tid: u64) -> ForwardRequest<'a> {
+        ForwardRequest {
+            request: ExternalFileIrpRequest {
+                client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
+                device_id: self.device_id(),
+                file_id: Some(self.file_id()),
+                user_data: 0,
+                requestor_tid,
+                major: major::IRP_MJ_QUERY_INFORMATION,
+                parameters: IoParameters::QueryInformation(InformationParameters {
+                    info_class: self.information_class(),
+                    length: self.length(),
+                }),
+                stack_flags: self.stack_flags(),
+                request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
+                initial_information: 0,
+            },
+            input: &[],
+            output_length: self.length() as usize,
+            policy: ExternalFileIrpDispatchPolicy::File,
+        }
+    }
+
+    unsafe fn publish(&self, status: u32, information: u64, output: &[u8])
+        -> Result<(), CaptureError>
+    {
+        let irp = self.source_irp_exec().expect("live source QUERY_INFORMATION IRP");
+        let written = self.write_output(information, output);
+        match written {
+            Ok(()) => write_source_io_status(irp, status, information),
+            Err(error) => write_source_io_status(irp, Self::refusal_status(error) as u32, 0),
+        }
+        self.arm_callback_free().expect("deferred source QUERY_INFORMATION IRP free");
+        written
+    }
 }

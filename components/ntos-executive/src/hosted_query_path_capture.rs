@@ -5,18 +5,22 @@
 //! retained target registration. The outer CREATE owns the security graph separately.
 
 use super::*;
+use super::hosted_forward_projection::{
+    write_source_io_status, ForwardProjection, ForwardRequest, ForwardSource,
+};
 use nt_io_manager::{
+    detached_file_irp::{ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest},
     hosted_forward_target::HostedForwardTarget,
     redir_query_path::{
         capture_query_path, CapturedQueryPath, QueryPathError, QueryPathStack,
-        QUERY_PATH_REQUEST_X64_SIZE,
+        IOCTL_REDIR_QUERY_PATH, IRP_MJ_DEVICE_CONTROL, QUERY_PATH_REQUEST_X64_SIZE,
     },
     retained_query_path_forward::{
         PreparedQueryPathForward, QueryPathForwardIdentity, SourceIrpTicket,
         TerminalQueryPathForward,
     },
     source_irp_ledger::SourceIrpAllocation,
-    HostedDomainIdentity,
+    DeviceControlParameters, HostedDomainIdentity, IoParameters, StackFlags,
 };
 
 const IRP_REQUESTOR_MODE_OFFSET: u64 = 0x40;
@@ -24,6 +28,8 @@ const IRP_CURRENT_LOCATION_OFFSET: u64 = 0x43;
 const IRP_CURRENT_STACK_OFFSET: u64 = 0xb8;
 const IRP_ORIGINAL_FILE_OFFSET: u64 = 0xc0;
 const IRP_USER_BUFFER_OFFSET: u64 = 0x70;
+/// Mup's QUERY_PATH output: the provider's matched prefix length.
+pub(super) const QUERY_PATH_RESPONSE_BYTES: usize = 4;
 const MAX_INPUT_BYTES: u64 = QUERY_PATH_REQUEST_X64_SIZE as u64 + 65_532;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,16 +259,13 @@ unsafe fn source_stack(
 /// Capture only an authenticated source-domain `IofCallDriver` invocation. The request's raw
 /// security pointer is only a lookup key for the retained outer CREATE owner; absence is an
 /// explicit dependency rather than a fabricated context.
-pub(super) unsafe fn capture(
-    ch: &crate::spawn_hosts::PumpChannel,
-    reply_cap: u64,
+unsafe fn capture(
+    source: ForwardSource,
     source_irp_address: u64,
     target_device_address: u64,
 ) -> Result<CapturedSourceForward, CaptureError> {
-    let (instance_index, inst) =
-        instance_for_pump_channel(ch, reply_cap).ok_or(CaptureError::InvalidCaller)?;
-    let domain: HostedDomainIdentity =
-        instance_domain_identity(inst).ok_or(CaptureError::InvalidCaller)?;
+    let (instance_index, inst) = (source.index(), source.instance());
+    let domain: HostedDomainIdentity = source.domain();
     let (source, allocation) =
         hosted_source_irp_ledger::pin(instance_index, domain, source_irp_address)
             .ok_or(CaptureError::InvalidSourceIrp)?;
@@ -310,8 +313,7 @@ pub(super) unsafe fn capture(
             return Err(CaptureError::InvalidFile);
         }
         let mut source_file = hosted_consumer_file_objects::capture_forward_file(
-            ch,
-            reply_cap,
+            domain,
             stack_file,
             stack_device,
         )
@@ -358,4 +360,73 @@ pub(super) unsafe fn capture(
         );
     }
     result
+}
+
+impl ForwardProjection for CapturedSourceForward {
+    const MAJOR: u8 = IRP_MJ_DEVICE_CONTROL;
+    type Error = CaptureError;
+    /// The QUERY_PATH input materialized against the provider's security graph.
+    type TargetInput = [u8];
+
+    unsafe fn capture(
+        source: ForwardSource,
+        source_irp: u64,
+        target_device: u64,
+    ) -> Result<Self, CaptureError> {
+        capture(source, source_irp, target_device)
+    }
+
+    fn refusal_status(error: CaptureError) -> i32 {
+        match error {
+            CaptureError::InvalidCaller
+            | CaptureError::MissingSecurityContext
+            | CaptureError::InvalidSourceIrp
+            | CaptureError::InvalidFile => STATUS_INVALID_HANDLE,
+            CaptureError::InvalidSourceBuffer | CaptureError::QueryPath(_) => {
+                STATUS_INVALID_PARAMETER
+            }
+            CaptureError::InvalidTarget => STATUS_INVALID_DEVICE_REQUEST,
+        }
+    }
+
+    fn target_request<'a>(&'a self, input: &'a [u8], requestor_tid: u64) -> ForwardRequest<'a> {
+        ForwardRequest {
+            request: ExternalFileIrpRequest {
+                client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
+                device_id: self.device_id(),
+                file_id: Some(self.file_id()),
+                user_data: 0,
+                requestor_tid,
+                major: IRP_MJ_DEVICE_CONTROL,
+                parameters: IoParameters::DeviceControl(DeviceControlParameters {
+                    ioctl_code: IOCTL_REDIR_QUERY_PATH,
+                    input_len: input.len() as u32,
+                    output_len: QUERY_PATH_RESPONSE_BYTES as u32,
+                }),
+                stack_flags: StackFlags::empty(),
+                request_flags: nt_io_manager::irp_request_flags::IrpRequestFlags::NONE,
+                initial_information: 0,
+            },
+            input,
+            output_length: QUERY_PATH_RESPONSE_BYTES,
+            policy: ExternalFileIrpDispatchPolicy::FileDeviceControl,
+        }
+    }
+
+    /// A successful QUERY_PATH writes Mup's response before its IoStatus.
+    unsafe fn publish(&self, status: u32, information: u64, output: &[u8])
+        -> Result<(), CaptureError>
+    {
+        if (status as i32) >= 0 {
+            assert_eq!(output.len(), QUERY_PATH_RESPONSE_BYTES, "query-path response");
+            let source_output = self.source_output_exec().expect("live Mup query-path output");
+            core::ptr::copy_nonoverlapping(
+                output.as_ptr(), source_output as *mut u8, QUERY_PATH_RESPONSE_BYTES,
+            );
+        }
+        let irp = self.source_irp_exec().expect("live Mup query-path IRP");
+        write_source_io_status(irp, status, information);
+        self.arm_callback_free().expect("Mup deferred IRP free admission");
+        Ok(())
+    }
 }
