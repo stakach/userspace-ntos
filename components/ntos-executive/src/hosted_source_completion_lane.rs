@@ -754,9 +754,7 @@ unsafe fn settle_dispatch_pump(
             row.phase = Phase::Uncertain;
             SourceCompletionDispatch::Uncertain
         }
-        component_scheduler::HostedPumpRestore::ChildWorkPending(_)
-        // Only a File owner's channel may park a dispatch wait (#420); never this lane's.
-        | component_scheduler::HostedPumpRestore::ParkedDispatchWait(_) => {
+        component_scheduler::HostedPumpRestore::ChildWorkPending(_) => {
             (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
             SourceCompletionDispatch::Uncertain
         }

@@ -575,7 +575,6 @@ unsafe fn win32k_lane_channel(
             kernel_irq_yield: false,
             hosted_receive_yield: false,
             nested_service_wait_yield: false,
-            parked_dispatch_yield: false,
             wide_arg_marshal: true,
             assert_skip: true,
             sparse_vspace: true,

@@ -150,9 +150,6 @@ pub(crate) struct HostCaps {
     pub hosted_receive_yield: bool,
     /// A nested GUI SSDT may yield only its exact parked service wait to root ingress.
     pub nested_service_wait_yield: bool,
-    /// An ordinary IRP dispatch entered at root level whose File owner keeps its continuation:
-    /// a service wait it parks on its own lane yields to the root loop (#420, #427 A).
-    pub parked_dispatch_yield: bool,
     /// win32k: carry wide (>4) stack args through caller RSP or explicit `SH_REQ_A4..` staging.
     // Capability-surface documentation (§2.3) — see `usermode_callback`; not read by the pump.
     #[allow(dead_code)]
@@ -2845,30 +2842,6 @@ pub(crate) unsafe fn component_pump_continue_service_wait(
     previous: &PumpResult,
 ) -> Result<PumpResult, u32> {
     service_wait_continuation_authority(ch, previous)?;
-    component_pump_continue_receive_half(ch, previous, false, false, false)
-}
-
-/// Continue only the receive half of an ordinary File dispatch whose own wait was parked
-/// (#420, #427 A). The wake already replied the parked Call; the shared receive collects the
-/// provider's next Call. A refusal here is proven pre-effect.
-pub(crate) unsafe fn component_pump_continue_dispatch_wait(
-    ch: &PumpChannel,
-    previous: &PumpResult,
-) -> Result<PumpResult, u32> {
-    use shared_ingress::owner::runtime;
-    let current = previous.service_wait_yield.is_some_and(|wait| {
-        previous.reply_cap == wait.reply
-            && ch.reply_cap == wait.reply
-            && wait.route.identity().lane == wait.dispatch.lane()
-            && runtime::channel_route(ch).ok().flatten() == Some(wait.route)
-            && runtime::dispatch(wait.route).ok() == Some(wait.dispatch)
-            && runtime::current_reply(wait.route).ok() == Some(wait.reply)
-    });
-    if !previous.is_service_wait_yield() || ch.kernel_caller.is_some()
-        || ch.caps.kind != ReqKind::Irp || !ch.caps.parked_dispatch_yield || !current
-    {
-        return Err(nt_process::STATUS_INVALID_PARAMETER);
-    }
     component_pump_continue_receive_half(ch, previous, false, false, false)
 }
 

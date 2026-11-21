@@ -187,8 +187,6 @@ impl FileDispatchContinuation {
         self.native.scheduler_yield_pending()
     }
 
-    pub(super) fn awaiting_own_wake(&self) -> bool { self.native.awaiting_own_wake() }
-
     pub(super) fn record_child_step(
         &mut self,
         step: crate::service_sec_image::NestedChildStep,

@@ -275,9 +275,6 @@ pub(super) enum HostedPumpRestore {
     /// The parent was retained mid scheduler-yield. Unlike `Retained`, the pump is unfinished:
     /// its owner resumes it with [`resume_scheduler_yield`], which continues the lane's receive.
     SchedulerYieldRetained(PendingSchedulerYield),
-    /// An ordinary File dispatch whose provider parked a service wait inside it (#420, #427 A).
-    /// Its owner resumes it with [`resume_dispatch_wait`] once that wait's wake is acknowledged.
-    ParkedDispatchWait(PendingDispatchWait),
 }
 
 /// Read-only witness of the physical source held by a typed child-work continuation.
@@ -316,14 +313,8 @@ impl HostedPumpRestore {
         match self {
             Self::ChildWorkPending(pending) => pending.retryable(),
             Self::SchedulerYieldRetained(pending) => pending.retryable(),
-            Self::ParkedDispatchWait(pending) => pending.ready(),
             _ => false,
         }
-    }
-
-    /// The pump stopped in its own parked service wait: live, not uncertain, until its wake.
-    pub(super) fn awaiting_own_wake(&self) -> bool {
-        matches!(self, Self::ParkedDispatchWait(pending) if !pending.ready())
     }
 
     /// The retained pump stopped at a scheduler yield while its lane still runs: only its own
@@ -351,7 +342,6 @@ impl HostedPumpRestore {
                 parent.is_some(),
             Self::ChildWorkPending(pending) => pending.parent.is_some(),
             Self::SchedulerYieldRetained(pending) => pending.entered.parent.is_some(),
-            Self::ParkedDispatchWait(pending) => pending.entered.parent.is_some(),
             Self::Restored(_) | Self::Unattributed(_) | Self::Retained { .. } => false,
         }
     }
@@ -368,7 +358,6 @@ impl HostedPumpRestore {
                 pending.parent.take()
             }
             Self::SchedulerYieldRetained(pending) => pending.entered.parent.take(),
-            Self::ParkedDispatchWait(pending) => pending.entered.parent.take(),
             Self::Restored(_) | Self::Unattributed(_) | Self::Retained { .. } => None,
         }
     }
@@ -380,7 +369,6 @@ impl HostedPumpRestore {
             | Self::Retained { result, .. } => *result,
             Self::ChildWorkPending(pending) => pending.result,
             Self::SchedulerYieldRetained(pending) => pending.entered.result,
-            Self::ParkedDispatchWait(pending) => pending.entered.result,
         }
     }
 }
@@ -537,10 +525,6 @@ unsafe fn hosted_component_pump_inner(
         timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::Setup,
             crate::disk_census_ticks());
     }
-    // Only a File dispatch entered at root level may leave a parked wait at the root: a
-    // parked outer parent or a continuing service step is held by this very pump (#420).
-    channel.caps.parked_dispatch_yield &= parent.is_none()
-        && !service_continuation::continuing_service();
     let channel = &mut channel;
     // From here the dispatch is admitted but the component has not been entered. A refusal
     // leaves that dispatch fenced on its lane; its request is never published or replayed.
@@ -708,19 +692,6 @@ unsafe fn drive_entered_pump(
         };
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 4, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 4, Some(&result));
-    }
-    // The provider parked a wait inside this File dispatch: leave the root loop running and
-    // keep the receive half for the File owner (#420, #427 A).
-    if let Some(wait) = result.service_wait_yield.filter(|wait|
-        channel.caps.parked_dispatch_yield && parent.is_none() && route == Some(wait.route))
-    {
-        return HostedPumpRestore::ParkedDispatchWait(PendingDispatchWait {
-            entered: EnteredPump {
-                channel: *channel, route, caller, parent, result, step,
-                resume: ReceiveResume::SchedulerService, ordinals,
-            },
-            wait,
-        });
     }
     match result.nested_child_work {
         Some(crate::spawn_hosts::NestedChildWorkState::Ready(yielded)) => {
@@ -900,80 +871,6 @@ pub(super) unsafe fn resume_scheduler_yield(mut pending: PendingSchedulerYield) 
     drive_entered_pump(&scope, entered, None, None)
 }
 
-/// An ordinary File dispatch stopped in its own parked service wait (#420, #427 A). The parked
-/// Call, its Reply and the lane's suspension stay with the shared ingress owner; this keeps
-/// the pump's receive half, which nothing but the acknowledged wake may continue.
-#[must_use = "keep the parked dispatch until its wait's wake resumes it"]
-pub(super) struct PendingDispatchWait {
-    entered: EnteredPump,
-    wait: crate::win32k_glue::ServiceWaitYield,
-}
-
-impl PendingDispatchWait {
-    /// Read-only: the wake acknowledged the exact parked Call and the provider's next Call is
-    /// retained, at a boundary where no lane runs.
-    fn ready(&self) -> bool {
-        use crate::spawn_hosts::shared_ingress::owner::runtime;
-        let wait = self.wait;
-        unsafe {
-            runtime::running_lane().is_none()
-                && matches!(runtime::service_wait_resume_ready_exact(
-                    wait.route, wait.dispatch, wait.reply, wait.token), Ok(true))
-        }
-    }
-}
-
-/// Continue a parked File dispatch's receive half once, exactly where it yielded. Nothing is
-/// sent again: the wake already replied the parked Call, and this receive collects the
-/// provider's next Call. A stale identity is an uncertain result, never a replay.
-pub(super) unsafe fn resume_dispatch_wait(pending: PendingDispatchWait) -> HostedPumpRestore {
-    use crate::spawn_hosts::shared_ingress::owner::runtime;
-    if !pending.ready() {
-        return HostedPumpRestore::ParkedDispatchWait(pending);
-    }
-    let PendingDispatchWait { mut entered, wait } = pending;
-    let authentic = runtime::dispatch(wait.route).ok() == Some(wait.dispatch)
-        && entered.caller.is_none_or(|caller| crate::provider_registry_caller::resolve_retained(
-            wait.route, wait.dispatch, entered.channel.pml4).ok() == Some(caller))
-        && crate::driver_launch::driver_thread_projection::enter(
-            &entered.channel, entered.caller).is_ok();
-    let scope = ComponentSchedulerScope::enter();
-    entered.channel.reply_cap = wait.reply;
-    let previous = entered.result;
-    entered.result = if authentic {
-        crate::spawn_hosts::component_pump_continue_dispatch_wait(&entered.channel, &previous)
-            .unwrap_or_else(|_| {
-                let mut result = previous;
-                result.service_wait_yield = None;
-                refusal::retain_uncertain(refusal::Invariant::YieldedReceiveContinuation,
-                    &entered.channel, &mut result, entered.parent.is_some());
-                result
-            })
-    } else {
-        let mut result = previous;
-        result.service_wait_yield = None;
-        refusal::retain_uncertain(refusal::Invariant::YieldedReceiveContinuation,
-            &entered.channel, &mut result, entered.parent.is_some());
-        result
-    };
-    trace_dispatch_wait_resume(wait, authentic);
-    entered.step = SchedulerYieldStep::Service;
-    drive_entered_pump(&scope, entered, None, None)
-}
-
-fn trace_dispatch_wait_resume(wait: crate::win32k_glue::ServiceWaitYield, authentic: bool) {
-    static TRACED: AtomicU64 = AtomicU64::new(0);
-    let n = TRACED.fetch_add(1, Ordering::Relaxed) + 1;
-    if n > 16 && !n.is_power_of_two() { return; }
-    print_str(b"[parked-dispatch] stage=resume n/route/lane/token/authentic=");
-    for value in [n, wait.route.badge(), u64::from(wait.dispatch.lane().index), wait.token,
-        u64::from(authentic)] {
-        print_str(b"/");
-        print_u64(value);
-    }
-    print_str(b"\n");
-}
-
 /// Shared completion contract for uninterrupted and resumed receive slices. A failed exact
 /// authentication leaves the caller responsible for retaining the entered result.
 unsafe fn authenticate_component_completion(
@@ -1057,8 +954,6 @@ pub(super) unsafe fn retry_child_work(pump: HostedPumpRestore) -> HostedPumpRest
             resume_pending_child_work(pending),
         HostedPumpRestore::SchedulerYieldRetained(pending) if pending.retryable() =>
             resume_scheduler_yield(pending),
-        HostedPumpRestore::ParkedDispatchWait(pending) if pending.ready() =>
-            resume_dispatch_wait(pending),
         other => other,
     }
 }
