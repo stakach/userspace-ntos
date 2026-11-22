@@ -6,8 +6,9 @@
 
 use super::*;
 use nt_kernel_exec::hosted_process_exit_notify::{
-    HostedImageIdentity, HostedProcessExitDelivery, HostedProcessNotifyBinding,
-    HostedProcessNotifyTransport, ProcessExitDispatchResult, ProcessNotifyRegisterError,
+    CallbackInvocation, HostedImageIdentity, HostedProcessExitDelivery, HostedProcessNotifyBinding,
+    HostedProcessNotifyTransport, ProcessExitDispatchResult, ProcessExitDrain, ProcessExitHost,
+    ProcessExitRow, ProcessNotifyRegisterError, RunningProcessExit,
 };
 
 pub(crate) const LABEL: u64 = 0x7C7;
@@ -213,13 +214,90 @@ pub(super) unsafe fn retire_instance_images(instance_index: usize) -> Result<(),
     Ok(())
 }
 
-/// Dispatch one already-claimed PM ticket. The native terminal hook must call
-/// `complete_exit_notification` only after this returns `Ok(())`; an error retains the PM ticket
-/// in-flight and must never trigger a callback retry.
-pub(crate) unsafe fn dispatch_exit_notification(
+/// The one exit callback whose provider pump has not returned yet, with its PM ticket (#420).
+static mut EXIT_ROW: ProcessExitRow<nt_process::ProcessExitNotification, RunningComponentTarget> =
+    ProcessExitRow::new();
+
+/// Process Manager's exit tickets and the hosted transport, for one drain turn.
+struct ExitHost<'a> {
+    pm: &'a mut nt_process::ProcessManager,
+    /// This turn's root-row witness, taken where it was proven.
+    row: Option<component_scheduler::service_continuation::RootRow>,
+}
+
+impl ProcessExitHost<nt_process::ProcessExitNotification, RunningComponentTarget> for ExitHost<'_> {
+    type Error = i32;
+
+    fn may_enter(&mut self) -> bool {
+        // A root row enters a provider only outside every lane, scheduler scope and step.
+        self.row = unsafe { component_scheduler::service_continuation::RootRow::current() };
+        self.row.is_some()
+    }
+
+    fn claim(&mut self) -> Option<nt_process::ProcessExitNotification> {
+        self.pm.take_process_exit_notification()
+    }
+
+    fn dispatch(&mut self, ticket: &nt_process::ProcessExitNotification)
+        -> ProcessExitDispatchResult<i32, RunningComponentTarget> {
+        let Some(row) = self.row.take() else {
+            return ProcessExitDispatchResult::CallbackUncertain(STATUS_INVALID_HANDLE);
+        };
+        match unsafe { dispatch_exit_notification(&row, *ticket) } {
+            Ok(result) => result,
+            Err(status) => ProcessExitDispatchResult::CallbackUncertain(status),
+        }
+    }
+
+    fn resume(
+        &mut self,
+        ticket: &nt_process::ProcessExitNotification,
+        running: RunningProcessExit<RunningComponentTarget>,
+    ) -> ProcessExitDispatchResult<i32, RunningComponentTarget> {
+        let process_object = ticket.process_object;
+        running.resume(
+            |target| unsafe { callback_invocation(target.poll()) },
+            || unsafe { release_process_object(process_object) },
+        )
+    }
+
+    fn complete(&mut self, ticket: nt_process::ProcessExitNotification) -> Result<(), i32> {
+        complete_exit_notification(self.pm, ticket).map_err(|status| status as i32)
+    }
+}
+
+/// Drain the exit callbacks one turn (#420). A running callback is resumed first and keeps its
+/// ticket in flight; no other ticket is claimed until it returns and is acknowledged once.
+pub(crate) unsafe fn drain_exit_notifications(
+    pm: &mut nt_process::ProcessManager,
+) -> ProcessExitDrain<i32> {
+    (&mut *core::ptr::addr_of_mut!(EXIT_ROW)).drain(&mut ExitHost { pm, row: None })
+}
+
+unsafe fn callback_invocation(
+    target: RootComponentTarget,
+) -> Result<CallbackInvocation<RunningComponentTarget>, i32> {
+    match target {
+        RootComponentTarget::Returned(Ok(_)) => Ok(CallbackInvocation::Returned),
+        RootComponentTarget::Returned(Err(_)) => Err(STATUS_UNSUCCESSFUL),
+        RootComponentTarget::Running(running) => Ok(CallbackInvocation::Running(running)),
+    }
+}
+
+/// The callback returned: the EPROCESS reference its projection took is released.
+unsafe fn release_process_object(process_object: u64) -> Result<(), i32> {
+    crate::service_sec_image::with_provider_process_manager(|pm| {
+        pm.release_kernel_object_pointer(process_object).map(|_| ())
+    }).map_err(|status| status as i32)
+}
+
+/// Enter one already-claimed PM ticket's callback under a root row. `Err` is a refusal before
+/// the provider is entered; the ticket then stays in flight and is never retried.
+unsafe fn dispatch_exit_notification(
+    row: &component_scheduler::service_continuation::RootRow,
     ticket: nt_process::ProcessExitNotification,
-) -> Result<(), i32> {
-    let row = {
+) -> Result<ProcessExitDispatchResult<i32, RunningComponentTarget>, i32> {
+    let registration = {
         let registrations = &*core::ptr::addr_of!(REGISTRATIONS);
         registrations.iter().copied().find(|row| {
             row.callback == ticket.callback
@@ -227,11 +305,11 @@ pub(crate) unsafe fn dispatch_exit_notification(
                 && row.binding.image.publication_generation == ticket.owner.image_generation
         })
     }.ok_or(STATUS_INVALID_HANDLE)?;
-    let inst = instance(row.instance).ok_or(STATUS_INVALID_HANDLE)?;
+    let inst = instance(registration.instance).ok_or(STATUS_INVALID_HANDLE)?;
     let live_binding = {
         let images = &*core::ptr::addr_of!(IMAGES);
         images.iter().copied().find(|image| {
-            image.instance == row.instance && image.binding == row.binding
+            image.instance == registration.instance && image.binding == registration.binding
         }).map(|image| image.binding)
     }.ok_or(STATUS_INVALID_HANDLE)?;
     if transport(inst) != live_binding.transport || !inst.ready || inst.faulted {
@@ -246,8 +324,8 @@ pub(crate) unsafe fn dispatch_exit_notification(
         process_id: ticket.process_id,
         process_object: ticket.process_object,
     };
-    let plan = row.binding.plan_exit(view, live_binding).ok_or(STATUS_INVALID_HANDLE)?;
-    let code = ExecVaWindow::try_for_instance(row.instance)
+    let plan = registration.binding.plan_exit(view, live_binding).ok_or(STATUS_INVALID_HANDLE)?;
+    let code = ExecVaWindow::try_for_instance(registration.instance)
         .map(|window| window.code_va).ok_or(STATUS_INVALID_HANDLE)?;
     let target = crate::ps_object_provider::ProviderRoot::hosted(
         instance_domain_identity(inst).ok_or(STATUS_INVALID_HANDLE)?, inst.pml4,
@@ -277,26 +355,14 @@ pub(crate) unsafe fn dispatch_exit_notification(
         Ok(())
     }).map_err(|status| status as i32);
     projected?;
-    let result = plan.execute(
-        |call, _transport| {
-            dispatch_hosted_component_target(
-                row.instance, inst, code, call.callback,
-                [call.process_object, u64::from(call.process_id), call.create_info, 0],
-                [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
-                crate::initial_system_driver_caller(),
-            ).map(|_| ()).map_err(|_| STATUS_UNSUCCESSFUL)
-        },
-        || Ok::<(), i32>(()),
-    );
-    match result {
-        ProcessExitDispatchResult::Completed => {
-            crate::service_sec_image::with_provider_process_manager(|pm| {
-                pm.release_kernel_object_pointer(ticket.process_object).map(|_| ())
-            }).map_err(|status| status as i32)
-        }
-        ProcessExitDispatchResult::CallbackUncertain(status)
-        | ProcessExitDispatchResult::AcknowledgementPending(status) => Err(status),
-    }
+    Ok(plan.execute(
+        |call, _transport| callback_invocation(dispatch_hosted_component_target_at_root(
+            row, registration.instance, inst, code, call.callback,
+            [call.process_object, u64::from(call.process_id), call.create_info, 0],
+            crate::initial_system_driver_caller(),
+        )),
+        || release_process_object(ticket.process_object),
+    ))
 }
 
 pub(crate) fn complete_exit_notification(

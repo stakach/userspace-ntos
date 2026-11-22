@@ -32,6 +32,9 @@ impl<'ast> Visit<'ast> for Calls {
 pub struct Functions(
     pub BTreeMap<String, Vec<(String, BTreeSet<Callee>)>>,
     pub BTreeMap<String, String>,
+    /// Each out-of-line module's file, with the file that declares it: the parent whose items a
+    /// `use super::*` glob brings into scope.
+    pub BTreeMap<String, String>,
 );
 
 impl Functions {
@@ -58,6 +61,20 @@ impl Functions {
             self.1.get(module).cloned().unwrap_or_else(|| format!("{module}.rs")));
         all.into_iter().filter(|(f, _)| *f == file).collect()
     }
+
+    /// [`Functions::resolve_exact`], where an unqualified name missing from the caller's file
+    /// resolves in each enclosing module's file in turn (the `use super::*` glob).
+    pub fn resolve_scoped(&self, caller_file: &str, callee: &Callee)
+        -> Vec<&(String, BTreeSet<Callee>)> {
+        let mut found = self.resolve_exact(caller_file, callee);
+        let mut file = caller_file;
+        while found.is_empty() && callee.0.is_none() {
+            let Some(parent) = self.2.get(file) else { break };
+            found = self.resolve_exact(parent, callee);
+            file = parent;
+        }
+        found
+    }
 }
 
 struct Collector<'a> {
@@ -75,12 +92,17 @@ impl<'ast> Visit<'ast> for Collector<'_> {
     }
 
     fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        let mut child = format!("{}.rs", module.ident);
         for attribute in &module.attrs {
             let syn::Meta::NameValue(path) = &attribute.meta else { continue };
             if !path.path.is_ident("path") { continue; }
             if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(file), .. }) = &path.value {
                 self.functions.1.insert(module.ident.to_string(), file.value());
+                child = file.value();
             }
+        }
+        if module.content.is_none() {
+            self.functions.2.insert(child, self.file.to_owned());
         }
         syn::visit::visit_item_mod(self, module);
     }
@@ -115,6 +137,12 @@ pub fn chain(functions: &Functions, start_file: &str, start: &str, target: &str)
 pub fn exact_chain(functions: &Functions, start_file: &str, start: &str, target: &str,
     opaque: &[&str]) -> Option<Vec<String>> {
     walk(functions, start_file, start, target, opaque, Functions::resolve_exact)
+}
+
+/// [`exact_chain`] over [`Functions::resolve_scoped`] calls.
+pub fn scoped_chain(functions: &Functions, start_file: &str, start: &str, target: &str,
+    opaque: &[&str]) -> Option<Vec<String>> {
+    walk(functions, start_file, start, target, opaque, Functions::resolve_scoped)
 }
 
 fn walk<'f>(functions: &'f Functions, start_file: &str, start: &str, target: &str,

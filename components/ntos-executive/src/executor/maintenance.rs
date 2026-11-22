@@ -54,6 +54,9 @@ pub(super) unsafe fn maintain(
         }
         if !queued_callback_fences_providers {
             hosted_spawn_uncertainty::redrive(&mut *delay_queue, &mut nt_handler);
+            // An exit callback still running in its provider continues here, at a root
+            // boundary, as does a ticket no earlier turn could enter (#420).
+            crate::process_terminal_receipt::drain_hosted_process_exit_notifications(&mut *nt_handler);
             // Driver ZwTerminateProcess already applied Ps policy; reclaim its mechanisms here.
             for (pi, identity) in crate::provider_process_termination::take() {
                 if nt_handler.capture_process_identity(pi as usize) == Some(identity) {

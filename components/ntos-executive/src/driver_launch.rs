@@ -33820,6 +33820,7 @@ unsafe fn service_hosted_provider_export_explicit(
         caller_rsp,
         args,
         HostedProviderMarshalWindowSource::LEGACY_SHARED_BANK,
+        true,
         |singleton, provider_inst, exec_code_va, marshalled_args, caller_rsp, reentrant| {
             if let Some(selection) = reentrant {
                 hosted_provider_export_lane::dispatch(
@@ -34024,6 +34025,7 @@ unsafe fn service_hosted_provider_export_with_dispatch<F>(
     caller_rsp: u64,
     mut args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     mut marshal_window_source: HostedProviderMarshalWindowSource,
+    worker_lane: bool,
     dispatch: F,
 ) -> ProviderExportService
 where
@@ -34163,6 +34165,13 @@ where
     let reentrant = if nt_hosted_runtime::hosted_provider_export_needs_worker(
         dxg_callback, primary_admits,
     ) {
+        // An in-place dispatch (an IRQ arena's) cannot run on a worker lane, so it starts
+        // none: the worker's startup pump would have no owner here (#420).
+        if !worker_lane {
+            print_str(b"[provider-export] reject stage=dxg-worker-in-place\n");
+            return ProviderExportService::Replied(
+                hosted_provider_export_failure(STATUS_INVALID_DEVICE_REQUEST));
+        }
         let Some(owner) = hosted_provider_object_owner_for_pair(singleton.instance, dependent_index)
         else {
             print_str(b"[provider-export] reject stage=dxg-worker-owner\n");
@@ -34329,7 +34338,7 @@ where
 {
     match service_hosted_provider_export_with_dispatch(
         dependent_channel, provider_export_rva, provider_publication_cookie, caller_rsp, args,
-        marshal_window_source,
+        marshal_window_source, false,
         |singleton, provider_inst, exec_code_va, args, caller_rsp, reentrant|
             ExportDispatch::Returned(dispatch(singleton, provider_inst, exec_code_va, args,
                 caller_rsp, reentrant)),
@@ -34681,24 +34690,86 @@ unsafe fn dispatch_hosted_component_target(
     stack_args: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<u64, HostedComponentDispatchError> {
-    use component_scheduler::service_continuation::ServicePump;
+    use component_scheduler::service_continuation::{InService, LaneService};
+    // Only a provider-callback service in keep mode dispatches a target here; it keeps an
+    // unfinished target with the rest of its callback (#420). Anything else enters nothing.
+    let service = match LaneService::current() {
+        Some(service) if provider_callback_continuation::keeps() => service,
+        _ => return Err(HostedComponentDispatchError::Status(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw())),
+    };
     let (ch, shared) = prepare_hosted_component_target(
         instance_index, inst, exec_code_va, target, args, stack_args,
     );
     let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
-    let pr = match component_scheduler::service_continuation::settle(pump) {
-        ServicePump::Finished(pr) | ServicePump::Fenced(pr) => pr,
-        // Only a provider-callback service keeps the target; its tails then wait for it.
-        ServicePump::Kept(kept) if provider_callback_continuation::keeps() => {
+    let pr = match component_scheduler::service_continuation::settle_in_service(&service, pump) {
+        InService::Finished(pr) => pr,
+        // Its tails then wait for it.
+        InService::Kept(kept) => {
             if provider_callback_continuation::keep_target(kept, instance_index, shared) {
                 return Err(HostedComponentDispatchError::Kept);
             }
             return Err(HostedComponentDispatchError::Status(STATUS_UNSUCCESSFUL));
         }
-        ServicePump::Kept(kept) => kept.fence(),
-        ServicePump::RootTurn(turn) => turn.fence_unowned(),
     };
     finish_hosted_component_target(instance_index, shared, pr)
+}
+
+/// A root row's component target (#420): returned, or still running for the row to keep.
+enum RootComponentTarget {
+    Returned(Result<u64, HostedComponentDispatchError>),
+    Running(RunningComponentTarget),
+}
+
+/// A root row's target still running in its provider, and what reading its return needs.
+#[must_use = "a running component target is owed its finish"]
+struct RunningComponentTarget {
+    turn: component_scheduler::service_continuation::RootTurnPump,
+    instance_index: usize,
+    shared: u64,
+}
+
+impl RunningComponentTarget {
+    /// Continue once without waiting, from the row's next root boundary.
+    unsafe fn poll(self) -> RootComponentTarget {
+        let Self { turn, instance_index, shared } = self;
+        root_component_target(turn.poll(), instance_index, shared)
+    }
+}
+
+unsafe fn root_component_target(
+    progress: component_scheduler::service_continuation::RootTurnProgress,
+    instance_index: usize,
+    shared: u64,
+) -> RootComponentTarget {
+    use component_scheduler::service_continuation::RootTurnProgress as Progress;
+    match progress {
+        Progress::Finished(pr) | Progress::Fenced(pr) =>
+            RootComponentTarget::Returned(finish_hosted_component_target(instance_index, shared, pr)),
+        Progress::Pending(turn) =>
+            RootComponentTarget::Running(RunningComponentTarget { turn, instance_index, shared }),
+    }
+}
+
+/// Dispatch a component target for a root row, which keeps an unfinished one (#420).
+unsafe fn dispatch_hosted_component_target_at_root(
+    row: &component_scheduler::service_continuation::RootRow,
+    instance_index: usize,
+    inst: DriverInstance,
+    exec_code_va: u64,
+    target: u64,
+    args: [u64; 4],
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> RootComponentTarget {
+    let (ch, shared) = prepare_hosted_component_target(
+        instance_index, inst, exec_code_va, target, args,
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    );
+    let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
+    root_component_target(
+        component_scheduler::service_continuation::settle_at_root(row, pump),
+        instance_index, shared,
+    )
 }
 
 unsafe fn finish_hosted_component_target(
@@ -71917,24 +71988,6 @@ unsafe fn prepare_device_projection_control_for_instance(
     Ok((ch, sh))
 }
 
-unsafe fn dispatch_device_projection_control_for_instance(
-    index: usize,
-    driver_object: u64,
-    selector: u64,
-    pdo_object: u64,
-    previous_device_head: u64,
-    delete_pdo: bool,
-    class_projection: Option<hosted_upper_filter_projection::PreparedUpperFilterProjection>,
-    caller: nt_process::native_handle::NativeHandleCaller,
-) -> Result<u64, nt_status::NtStatus> {
-    let (ch, sh) = prepare_device_projection_control_for_instance(
-        index, driver_object, selector, pdo_object, previous_device_head,
-        delete_pdo, class_projection,
-    )?;
-    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
-    finish_device_projection_control(index, sh, pr)
-}
-
 unsafe fn finish_device_projection_control(
     index: usize, sh: u64, pr: crate::spawn_hosts::PumpResult,
 ) -> Result<u64, nt_status::NtStatus> {
@@ -72022,6 +72075,33 @@ impl PendingProjectionControl {
     }
 }
 
+/// The same dispatch for a root row (#420): its pump parks no lane, so it finishes, is waited
+/// for where the turn may block, or comes back as [`ProjectionControl::Pending`] for the row.
+pub(crate) unsafe fn dispatch_device_projection_control_at_root(
+    row: &component_scheduler::service_continuation::RootRow,
+    index: usize,
+    driver_object: u64,
+    selector: u64,
+    pdo_object: u64,
+    previous_device_head: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> ProjectionControl {
+    use component_scheduler::service_continuation::RootTurnProgress as Progress;
+    let (ch, sh) = match prepare_device_projection_control_for_instance(
+        index, driver_object, selector, pdo_object, previous_device_head, false, None,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => return ProjectionControl::Done(Err(status)),
+    };
+    let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
+    match component_scheduler::service_continuation::settle_at_root(row, pump) {
+        Progress::Finished(pr) | Progress::Fenced(pr) =>
+            ProjectionControl::Done(finish_device_projection_control(index, sh, pr)),
+        Progress::Pending(turn) =>
+            ProjectionControl::Pending(PendingProjectionControl { turn, index, sh }),
+    }
+}
+
 /// The same dispatch for a root-level owner with a retained row: a pump still running in a
 /// turn that may not block comes back as [`ProjectionControl::Pending`].
 pub(crate) unsafe fn dispatch_device_projection_control_retained(
@@ -72054,39 +72134,30 @@ unsafe fn create_hosted_pdo_projection(
     projection_instance: usize,
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<u64, nt_status::NtStatus> {
-    // A DXG AddDevice alias is created inside a provider callback service, which keeps an
-    // unfinished projection pump with the rest of its callback (#420).
-    if provider_callback_continuation::keeps() {
-        use component_scheduler::service_continuation::ServicePump;
-        let (ch, sh) = prepare_device_projection_control_for_instance(
-            projection_instance, 0, FSD_DISPATCH_CREATE_PDO_PROJECTION, 0, 0, false, None,
-        )?;
-        let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
-        let pr = match component_scheduler::service_continuation::settle(pump) {
-            ServicePump::Finished(pr) | ServicePump::Fenced(pr) => pr,
-            ServicePump::Kept(kept) => {
-                return if provider_callback_continuation::keep_pdo_projection(
-                    kept, projection_instance, sh)
-                {
-                    Err(nt_status::NtStatus(CALLBACK_KEPT))
-                } else {
-                    Err(nt_status::NtStatus::UNSUCCESSFUL)
-                };
-            }
-            ServicePump::RootTurn(turn) => turn.fence_unowned(),
-        };
-        return finish_pdo_projection(finish_device_projection_control(projection_instance, sh, pr));
+    use component_scheduler::service_continuation::{InService, LaneService};
+    // A DXG AddDevice alias is created only inside a provider callback service in keep mode,
+    // which keeps an unfinished projection pump with the rest of its callback (#420). Keep mode
+    // is off only for an IRQ arena's callback, at DISPATCH_LEVEL, where AddDevice never runs:
+    // there nothing is entered.
+    let service = match LaneService::current() {
+        Some(service) if provider_callback_continuation::keeps() => service,
+        _ => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+    };
+    let (ch, sh) = prepare_device_projection_control_for_instance(
+        projection_instance, 0, FSD_DISPATCH_CREATE_PDO_PROJECTION, 0, 0, false, None,
+    )?;
+    let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
+    match component_scheduler::service_continuation::settle_in_service(&service, pump) {
+        InService::Finished(pr) =>
+            finish_pdo_projection(finish_device_projection_control(projection_instance, sh, pr)),
+        InService::Kept(kept) => if provider_callback_continuation::keep_pdo_projection(
+            kept, projection_instance, sh)
+        {
+            Err(nt_status::NtStatus(CALLBACK_KEPT))
+        } else {
+            Err(nt_status::NtStatus::UNSUCCESSFUL)
+        },
     }
-    finish_pdo_projection(dispatch_device_projection_control_for_instance(
-        projection_instance,
-        0,
-        FSD_DISPATCH_CREATE_PDO_PROJECTION,
-        0,
-        0,
-        false,
-        None,
-        caller,
-    ))
 }
 
 /// One PDO projection pump for a lane's service that keeps its own continuation (#420).
@@ -72116,7 +72187,12 @@ pub(crate) unsafe fn begin_pdo_projection(
     projection_instance: usize,
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> PdoProjection {
-    use component_scheduler::service_continuation::ServicePump;
+    use component_scheduler::service_continuation::{InService, LaneService};
+    // Only a lane's service (a CONNECT submit, or its step continuing at a root boundary)
+    // projects a PDO this way; anything else enters nothing.
+    let Some(service) = LaneService::current() else {
+        return PdoProjection::Done(Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST));
+    };
     let (ch, sh) = match prepare_device_projection_control_for_instance(
         projection_instance, 0, FSD_DISPATCH_CREATE_PDO_PROJECTION, 0, 0, false, None,
     ) {
@@ -72125,11 +72201,9 @@ pub(crate) unsafe fn begin_pdo_projection(
     };
     let finish = PdoProjectionFinish { index: projection_instance, sh };
     let pump = component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller);
-    match component_scheduler::service_continuation::settle(pump) {
-        ServicePump::Finished(pr) | ServicePump::Fenced(pr) => PdoProjection::Done(finish.after(pr)),
-        ServicePump::Kept(kept) => PdoProjection::Kept(kept, finish),
-        // A lane's service always has its parked parent or its continuing step.
-        ServicePump::RootTurn(turn) => PdoProjection::Done(finish.after(turn.fence_unowned())),
+    match component_scheduler::service_continuation::settle_in_service(&service, pump) {
+        InService::Finished(pr) => PdoProjection::Done(finish.after(pr)),
+        InService::Kept(kept) => PdoProjection::Kept(kept, finish),
     }
 }
 

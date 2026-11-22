@@ -255,13 +255,19 @@ impl RootTurnPump {
     /// Continue the pump once from a root turn; a frame that may block waits for it here.
     pub(crate) unsafe fn resume(self) -> RootTurnProgress {
         if crate::service_sec_image::root_wait_may_block() {
-            return match await_at_root(self.pump) {
-                ServicePump::Finished(result) => RootTurnProgress::Finished(result),
-                ServicePump::RootTurn(pump) => RootTurnProgress::Pending(pump),
-                ServicePump::Fenced(result) => RootTurnProgress::Fenced(result),
-                ServicePump::Kept(kept) => RootTurnProgress::Fenced(kept.fence()),
-            };
+            return await_root(self.pump);
         }
+        self.retry_once()
+    }
+
+    /// Continue the pump once without waiting, from a root boundary that polls its rows. A
+    /// pump parked in its own wait whose wake has not come is handed back unchanged.
+    pub(crate) unsafe fn poll(self) -> RootTurnProgress {
+        if self.pump.awaiting_own_wake() { return RootTurnProgress::Pending(self); }
+        self.retry_once()
+    }
+
+    unsafe fn retry_once(self) -> RootTurnProgress {
         match retry(self.pump) {
             PumpProgress::Finished(result) => RootTurnProgress::Finished(result),
             PumpProgress::Unfinished(pump) => RootTurnProgress::Pending(Self { pump }),
@@ -302,6 +308,88 @@ pub(in crate::driver_launch) unsafe fn settle(pump: HostedPumpRestore) -> Servic
                 None => settle_parentless(unfinished),
             },
         },
+    }
+}
+
+/// Witness of a root row (#420): no lane holds the execution token, no component scheduler
+/// scope is active and no service step is continuing. A pump entered under it parks no outer
+/// parent, so it finishes, or is waited for, or comes back for the row to keep: it can never be
+/// a lane's kept pump, and never meets a scheduler scope with no owner.
+pub(crate) struct RootRow(());
+
+impl RootRow {
+    /// Only where this holds may a root row enter a component; elsewhere it enters nothing.
+    pub(crate) unsafe fn current() -> Option<Self> {
+        (crate::spawn_hosts::shared_ingress::owner::runtime::running_lane().is_none()
+            && !component_scheduler::is_active()
+            && (*core::ptr::addr_of!(CONTINUING)).is_none())
+        .then_some(Self(()))
+    }
+}
+
+/// Settle a pump a root row entered under `row`. A root turn that may block waits for the true
+/// result; one that may not hands the pump back for the row to keep and continue later.
+pub(in crate::driver_launch) unsafe fn settle_at_root(
+    _row: &RootRow, pump: HostedPumpRestore,
+) -> RootTurnProgress {
+    match pump {
+        HostedPumpRestore::Restored(result) | HostedPumpRestore::Unattributed(result) =>
+            RootTurnProgress::Finished(result),
+        HostedPumpRestore::Retained { result, ticket, .. } => {
+            crate::spawn_hosts::defer_reply_until_ticket_restored(ticket);
+            RootTurnProgress::Finished(result)
+        }
+        unfinished => {
+            // No lane was running, so the pump's park found no parent to hold.
+            assert!(!unfinished.has_outer_parent(), "a root row's pump parked no lane");
+            await_root(unfinished)
+        }
+    }
+}
+
+/// Witness of a lane's service (#420): a lane holds the execution token, or a service step is
+/// continuing for one. A pump entered under it parks that lane or belongs to that step, so an
+/// unfinished one is always kept for the service and never waited for at root.
+pub(crate) struct LaneService(());
+
+impl LaneService {
+    /// Only where this holds may a lane's service enter a component it keeps.
+    pub(crate) unsafe fn current() -> Option<Self> {
+        (crate::spawn_hosts::shared_ingress::owner::runtime::running_lane().is_some()
+            || continuing().is_some())
+        .then_some(Self(()))
+    }
+}
+
+/// How a lane service's pump ended.
+#[must_use = "a kept pump is owed a registered step or a fence"]
+pub(crate) enum InService {
+    /// The dispatch finished; this is its true result.
+    Finished(crate::spawn_hosts::PumpResult),
+    /// Unfinished while the lane (or the step continuing for it) is parked for it.
+    Kept(KeptPump),
+}
+
+/// Settle a pump a lane's service entered under `service`.
+pub(in crate::driver_launch) unsafe fn settle_in_service(
+    _service: &LaneService, pump: HostedPumpRestore,
+) -> InService {
+    match pump {
+        HostedPumpRestore::Restored(result) | HostedPumpRestore::Unattributed(result) =>
+            InService::Finished(result),
+        HostedPumpRestore::Retained { result, ticket, .. } => {
+            crate::spawn_hosts::defer_reply_until_ticket_restored(ticket);
+            InService::Finished(result)
+        }
+        mut unfinished => {
+            let parent = match unfinished.take_outer_parent() {
+                Some(parent) => KeptParent::Parked(parent),
+                // No lane was parked, so the witness is the continuing step.
+                None => KeptParent::Continuing(
+                    continuing().expect("a lane service's pump parks its lane or continues its step")),
+            };
+            InService::Kept(KeptPump { pump: unfinished, parent })
+        }
     }
 }
 
@@ -480,12 +568,20 @@ impl Drop for RootWaitScope {
 /// does, wherever this frame may block. A frame that may not block (a timer delivery or a
 /// component-resume pass is running above it) gets the pump back as a root-turn continuation.
 unsafe fn await_at_root(pump: HostedPumpRestore) -> ServicePump {
-    // The wait receives on the root thread inside a handler that may still read its own
-    // delivered request from the buffer afterwards.
-    crate::ipc_message::preserving_received(|| await_at_root_unguarded(pump))
+    match await_root(pump) {
+        RootTurnProgress::Finished(result) => ServicePump::Finished(result),
+        RootTurnProgress::Pending(pump) => ServicePump::RootTurn(pump),
+        RootTurnProgress::Fenced(result) => ServicePump::Fenced(result),
+    }
 }
 
-unsafe fn await_at_root_unguarded(pump: HostedPumpRestore) -> ServicePump {
+unsafe fn await_root(pump: HostedPumpRestore) -> RootTurnProgress {
+    // The wait receives on the root thread inside a handler that may still read its own
+    // delivered request from the buffer afterwards.
+    crate::ipc_message::preserving_received(|| await_root_unguarded(pump))
+}
+
+unsafe fn await_root_unguarded(pump: HostedPumpRestore) -> RootTurnProgress {
     let _waiting = RootWaitScope::enter();
     if crate::dispatcher_bootstrap::is_owned() {
         let mut pump = Some(pump);
@@ -504,18 +600,18 @@ unsafe fn await_at_root_unguarded(pump: HostedPumpRestore) -> ServicePump {
         });
         let pump = pump.take();
         return match (waited, finished, pump) {
-            (Ok(_), Some(result), _) => { trace_root(b"boot-finished"); ServicePump::Finished(result) }
-            (_, _, Some(pump)) if fenced => ServicePump::Fenced(fence_pump(pump, b"boot-uncertain")),
+            (Ok(_), Some(result), _) => { trace_root(b"boot-finished"); RootTurnProgress::Finished(result) }
+            (_, _, Some(pump)) if fenced => RootTurnProgress::Fenced(fence_pump(pump, b"boot-uncertain")),
             // The bootstrap owner refused a receive transition: a refusal, not an effect. The
             // pump stays owned and unchanged for the caller's retained owner.
-            (_, _, Some(pump)) => { trace_root(b"boot-refused"); ServicePump::RootTurn(RootTurnPump { pump }) }
-            (_, Some(result), None) => ServicePump::Finished(result),
+            (_, _, Some(pump)) => { trace_root(b"boot-refused"); RootTurnProgress::Pending(RootTurnPump { pump }) }
+            (_, Some(result), None) => RootTurnProgress::Finished(result),
             (_, None, None) => unreachable!("a root wait always keeps its pump or its result"),
         };
     }
     if !crate::service_sec_image::root_wait_may_block() {
         trace_root(b"root-turn");
-        return ServicePump::RootTurn(RootTurnPump { pump });
+        return RootTurnProgress::Pending(RootTurnPump { pump });
     }
     let waited = nt_component_suspension::await_root_pump_refusable(
         pump,
@@ -529,14 +625,14 @@ unsafe fn await_at_root_unguarded(pump: HostedPumpRestore) -> ServicePump {
     match waited {
         nt_component_suspension::RootPumpWait::Finished(result) => {
             trace_root(b"finished");
-            ServicePump::Finished(result)
+            RootTurnProgress::Finished(result)
         }
         nt_component_suspension::RootPumpWait::Fenced(pump) =>
-            ServicePump::Fenced(fence_pump(pump, b"root-uncertain")),
+            RootTurnProgress::Fenced(fence_pump(pump, b"root-uncertain")),
         // A root pass stopped before its receive; its owner keeps that step's entered state.
         nt_component_suspension::RootPumpWait::Retained(pump) => {
             trace_root(b"root-pass-refused");
-            ServicePump::RootTurn(RootTurnPump { pump })
+            RootTurnProgress::Pending(RootTurnPump { pump })
         }
     }
 }

@@ -494,6 +494,10 @@ pub(super) unsafe fn dispatch_configure(
     prepared: PreparedReverseClassProjection,
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<ConfigurePump, nt_status::NtStatus> {
+    use component_scheduler::service_continuation::{InService, LaneService};
+    // Only a CONNECT submit's lane service, or its step continuing at a root boundary,
+    // configures; it keeps an unfinished pump (#420). Anything else enters nothing.
+    let service = LaneService::current().ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let id = prepared.owner_id;
     let row = owner(id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
     let index = row.port_instance;
@@ -594,15 +598,11 @@ pub(super) unsafe fn dispatch_configure(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
-    use component_scheduler::service_continuation::ServicePump;
     let finish = ConfigureFinish { id, index, sh, port_do: current.port_domain_port_do };
     let pump = component_scheduler::hosted_component_pump_with_caller_retained(&channel, caller);
-    Ok(match component_scheduler::service_continuation::settle(pump) {
-        ServicePump::Finished(result) | ServicePump::Fenced(result) =>
-            ConfigurePump::Done(finish.after(result)),
-        ServicePump::Kept(kept) => ConfigurePump::Kept(kept, finish),
-        // A lane's service always has its parked parent or its continuing step.
-        ServicePump::RootTurn(turn) => ConfigurePump::Done(finish.after(turn.fence_unowned())),
+    Ok(match component_scheduler::service_continuation::settle_in_service(&service, pump) {
+        InService::Finished(result) => ConfigurePump::Done(finish.after(result)),
+        InService::Kept(kept) => ConfigurePump::Kept(kept, finish),
     })
 }
 

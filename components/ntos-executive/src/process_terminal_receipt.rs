@@ -3,26 +3,34 @@
 use crate::*;
 use nt_user_host::process_identity::ProcessGeneration;
 
-/// Drain only freshly claimed Process Manager tickets. A callback failure retains the exact
-/// in-flight ticket and blocks EPROCESS deletion; this path never retries an uncertain effect.
+/// Drain Process Manager's exit tickets (#420). A callback still running in its provider keeps
+/// its ticket in flight and is resumed here, before any other ticket is claimed; the root's
+/// maintenance runs this too, so it continues without another exit. A callback failure retains
+/// the exact in-flight ticket and blocks EPROCESS deletion; this path never retries an uncertain
+/// effect.
 pub(crate) fn drain_hosted_process_exit_notifications(handler: &mut ExecNtHandler) {
-    while let Some(ticket) = handler.pm.take_process_exit_notification() {
-        let result = unsafe {
-            crate::driver_launch::hosted_driver_process_notify::dispatch_exit_notification(ticket)
-        };
-        if let Err(status) = result {
+    use nt_kernel_exec::hosted_process_exit_notify::ProcessExitDrain;
+    let drained = unsafe {
+        crate::driver_launch::hosted_driver_process_notify::drain_exit_notifications(&mut handler.pm)
+    };
+    match drained {
+        ProcessExitDrain::Idle => {}
+        ProcessExitDrain::Running => trace_running(),
+        ProcessExitDrain::Retained(status) => {
             print_str(b"[process-notify] callback retained status=0x");
             print_hex(status as u32);
             print_str(b"\n");
-            return;
-        }
-        if let Err(status) = handler.pm.complete_process_exit_notification(ticket) {
-            print_str(b"[process-notify] acknowledgement retained status=0x");
-            print_hex(status);
-            print_str(b"\n");
-            return;
         }
     }
+}
+
+fn trace_running() {
+    static TRACED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let n = TRACED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() { return; }
+    print_str(b"[process-notify] callback running n=");
+    print_u64(n);
+    print_str(b"\n");
 }
 
 pub(crate) fn note_native_process_terminal(

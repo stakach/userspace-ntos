@@ -152,25 +152,143 @@ pub struct ProcessExitDispatchPlan {
     transport: HostedProcessNotifyTransport,
 }
 
+/// How one provider call ended for its transport: returned, or still running in the provider
+/// with `P` the host's continuation for it (#420).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProcessExitDispatchResult<E> {
+pub enum CallbackInvocation<P> {
+    Returned,
+    Running(P),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessExitDispatchResult<E, P = ()> {
     Completed,
+    /// The callback is still running. Its ticket stays in flight; only
+    /// [`RunningProcessExit::resume`] continues it, and no acknowledgement is made before it
+    /// returns.
+    CallbackRunning(RunningProcessExit<P>),
     CallbackUncertain(E),
     AcknowledgementPending(E),
 }
 
-impl ProcessExitDispatchPlan {
-    pub fn execute<E>(
+/// A provider callback that has not returned yet, and owes its acknowledgement once it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a running exit callback is owed its resume"]
+pub struct RunningProcessExit<P> {
+    running: P,
+}
+
+impl<P> RunningProcessExit<P> {
+    /// Continue the callback once. The acknowledgement runs only on its true return.
+    pub fn resume<E>(
         self,
-        invoke: impl FnOnce(ProcessExitCall, HostedProcessNotifyTransport) -> Result<(), E>,
+        resume: impl FnOnce(P) -> Result<CallbackInvocation<P>, E>,
         acknowledge: impl FnOnce() -> Result<(), E>,
-    ) -> ProcessExitDispatchResult<E> {
-        if let Err(error) = invoke(self.call, self.transport) {
-            return ProcessExitDispatchResult::CallbackUncertain(error);
-        }
-        match acknowledge() {
+    ) -> ProcessExitDispatchResult<E, P> {
+        settle(resume(self.running), acknowledge)
+    }
+}
+
+fn settle<E, P>(
+    invoked: Result<CallbackInvocation<P>, E>,
+    acknowledge: impl FnOnce() -> Result<(), E>,
+) -> ProcessExitDispatchResult<E, P> {
+    match invoked {
+        Err(error) => ProcessExitDispatchResult::CallbackUncertain(error),
+        Ok(CallbackInvocation::Running(running)) =>
+            ProcessExitDispatchResult::CallbackRunning(RunningProcessExit { running }),
+        Ok(CallbackInvocation::Returned) => match acknowledge() {
             Ok(()) => ProcessExitDispatchResult::Completed,
             Err(error) => ProcessExitDispatchResult::AcknowledgementPending(error),
+        },
+    }
+}
+
+impl ProcessExitDispatchPlan {
+    pub fn execute<E, P>(
+        self,
+        invoke: impl FnOnce(ProcessExitCall, HostedProcessNotifyTransport)
+            -> Result<CallbackInvocation<P>, E>,
+        acknowledge: impl FnOnce() -> Result<(), E>,
+    ) -> ProcessExitDispatchResult<E, P> {
+        settle(invoke(self.call, self.transport), acknowledge)
+    }
+}
+
+/// What the host of a [`ProcessExitRow`] provides: Process Manager's tickets and the provider
+/// transport.
+pub trait ProcessExitHost<T, P> {
+    type Error;
+    /// Whether a callback may be entered in this turn. A refusal claims no ticket.
+    fn may_enter(&mut self) -> bool;
+    /// Claim the next ticket, once.
+    fn claim(&mut self) -> Option<T>;
+    /// Attempt the claimed ticket's one provider call.
+    fn dispatch(&mut self, ticket: &T) -> ProcessExitDispatchResult<Self::Error, P>;
+    /// Continue the ticket's running call once.
+    fn resume(&mut self, ticket: &T, running: RunningProcessExit<P>)
+        -> ProcessExitDispatchResult<Self::Error, P>;
+    /// Acknowledge a completed ticket to Process Manager.
+    fn complete(&mut self, ticket: T) -> Result<(), Self::Error>;
+}
+
+/// How one drain turn stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessExitDrain<E> {
+    /// No ticket was waiting, or none may be entered in this turn.
+    Idle,
+    /// A callback is still running; no other ticket was claimed.
+    Running,
+    /// The ticket stays in flight: its callback was uncertain or its acknowledgement failed.
+    Retained(E),
+}
+
+/// The host's one exit-callback row (#420). A callback that has not returned keeps its ticket
+/// here; every drain resumes it before claiming any other ticket, and acknowledges it exactly
+/// once, on its true return.
+pub struct ProcessExitRow<T, P> {
+    running: Option<(T, RunningProcessExit<P>)>,
+}
+
+impl<T, P> Default for ProcessExitRow<T, P> {
+    fn default() -> Self { Self::new() }
+}
+
+impl<T, P> ProcessExitRow<T, P> {
+    pub const fn new() -> Self { Self { running: None } }
+
+    pub fn is_running(&self) -> bool { self.running.is_some() }
+
+    pub fn drain<H: ProcessExitHost<T, P>>(&mut self, host: &mut H) -> ProcessExitDrain<H::Error> {
+        if let Some((ticket, running)) = self.running.take() {
+            if !host.may_enter() {
+                self.running = Some((ticket, running));
+                return ProcessExitDrain::Running;
+            }
+            let resumed = host.resume(&ticket, running);
+            if let Some(stop) = self.settle(host, ticket, resumed) { return stop; }
+        }
+        loop {
+            if !host.may_enter() { return ProcessExitDrain::Idle; }
+            let Some(ticket) = host.claim() else { return ProcessExitDrain::Idle };
+            let dispatched = host.dispatch(&ticket);
+            if let Some(stop) = self.settle(host, ticket, dispatched) { return stop; }
+        }
+    }
+
+    fn settle<H: ProcessExitHost<T, P>>(
+        &mut self, host: &mut H, ticket: T, result: ProcessExitDispatchResult<H::Error, P>,
+    ) -> Option<ProcessExitDrain<H::Error>> {
+        match result {
+            ProcessExitDispatchResult::Completed =>
+                host.complete(ticket).err().map(ProcessExitDrain::Retained),
+            ProcessExitDispatchResult::CallbackRunning(running) => {
+                self.running = Some((ticket, running));
+                Some(ProcessExitDrain::Running)
+            }
+            ProcessExitDispatchResult::CallbackUncertain(error)
+            | ProcessExitDispatchResult::AcknowledgementPending(error) =>
+                Some(ProcessExitDrain::Retained(error)),
         }
     }
 }

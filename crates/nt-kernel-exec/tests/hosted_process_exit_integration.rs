@@ -1,6 +1,6 @@
 use nt_kernel_exec::hosted_process_exit_notify::{
     HostedImageIdentity, HostedProcessExitDelivery, HostedProcessNotifyBinding,
-    HostedProcessNotifyTransport, ProcessExitDispatchResult,
+    HostedProcessNotifyTransport, ProcessExitDispatchResult, CallbackInvocation,
 };
 use nt_process::{ProcessExitNotifyOwner, ProcessManager, STATUS_DEVICE_BUSY};
 
@@ -60,7 +60,7 @@ fn exact_driver_transport_registers_and_completes_a_real_pm_exit_ticket() {
                 assert_eq!(call.process_object, 0x9000_0000);
                 assert_eq!(call.process_id, pid);
                 assert_eq!(call.create_info, 0);
-                Ok::<(), u32>(())
+                Ok::<_, u32>(CallbackInvocation::<()>::Returned)
             },
             || processes.complete_process_exit_notification(ticket),
         ),
@@ -102,7 +102,7 @@ fn uncertain_provider_call_keeps_ticket_and_image_retirement_blocked() {
     };
     let plan = binding.plan_exit(view, binding).unwrap();
     assert_eq!(
-        plan.execute(|_, _| Err::<(), u32>(0xDEAD), || panic!("uncertain callback cannot acknowledge")),
+        plan.execute(|_, _| Err::<CallbackInvocation<()>, u32>(0xDEAD), || panic!("uncertain callback cannot acknowledge")),
         ProcessExitDispatchResult::CallbackUncertain(0xDEAD)
     );
     assert!(processes.take_process_exit_notification().is_none());
