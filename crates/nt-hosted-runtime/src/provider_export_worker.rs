@@ -95,11 +95,16 @@ pub enum HostedInstanceLane {
 
 /// Identify exactly one authenticated physical lane of the instance, or none: a lane of another
 /// instance, or an unauthenticated one, matches none of these.
-pub const fn hosted_instance_lane(primary: bool, provider_worker: bool, ordinary_worker: bool)
-    -> Option<HostedInstanceLane> {
-    match (primary, provider_worker, ordinary_worker) {
-        (true, false, false) => Some(HostedInstanceLane::Primary),
-        (false, true, false) | (false, false, true) => Some(HostedInstanceLane::Worker),
+pub const fn hosted_instance_lane(
+    primary: bool,
+    provider_worker: bool,
+    ordinary_worker: bool,
+    completion_worker: bool,
+) -> Option<HostedInstanceLane> {
+    match (primary, provider_worker, ordinary_worker, completion_worker) {
+        (true, false, false, false) => Some(HostedInstanceLane::Primary),
+        (false, true, false, false) | (false, false, true, false) | (false, false, false, true) =>
+            Some(HostedInstanceLane::Worker),
         _ => None,
     }
 }

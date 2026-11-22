@@ -116,11 +116,11 @@ fn provider_export_completion_retains_worker_after_guarded_failure_or_wall() {
 #[test]
 fn an_ordinary_worker_lane_emulates_cr8_against_its_own_irql() {
     use nt_hosted_runtime::{hosted_instance_lane, HostedInstanceLane};
-    assert_eq!(hosted_instance_lane(false, false, true), Some(HostedInstanceLane::Worker));
-    assert_eq!(hosted_instance_lane(false, true, false), Some(HostedInstanceLane::Worker));
-    assert_eq!(hosted_instance_lane(true, false, false), Some(HostedInstanceLane::Primary));
-    assert_eq!(hosted_instance_lane(false, false, false), None, "an unauthenticated lane");
-    assert_eq!(hosted_instance_lane(true, false, true), None, "one lane, one authority");
+    assert_eq!(hosted_instance_lane(false, false, true, false), Some(HostedInstanceLane::Worker));
+    assert_eq!(hosted_instance_lane(false, true, false, false), Some(HostedInstanceLane::Worker));
+    assert_eq!(hosted_instance_lane(true, false, false, false), Some(HostedInstanceLane::Primary));
+    assert_eq!(hosted_instance_lane(false, false, false, false), None, "an unauthenticated lane");
+    assert_eq!(hosted_instance_lane(true, false, true, false), None, "one lane, one authority");
 }
 
 /// Boot 44985671350 boot 1: with storahci's primary parked, a disk SRB ran on its worker lane,
@@ -131,11 +131,11 @@ fn an_ordinary_worker_lane_emulates_cr8_against_its_own_irql() {
 #[test]
 fn every_authenticated_lane_of_an_instance_may_synchronise_with_its_interrupt() {
     use nt_hosted_runtime::{hosted_instance_lane, HostedInstanceLane};
-    assert_eq!(hosted_instance_lane(false, false, true), Some(HostedInstanceLane::Worker));
-    assert_eq!(hosted_instance_lane(false, true, false), Some(HostedInstanceLane::Worker));
-    assert_eq!(hosted_instance_lane(true, false, false), Some(HostedInstanceLane::Primary));
+    assert_eq!(hosted_instance_lane(false, false, true, false), Some(HostedInstanceLane::Worker));
+    assert_eq!(hosted_instance_lane(false, true, false, false), Some(HostedInstanceLane::Worker));
+    assert_eq!(hosted_instance_lane(true, false, false, false), Some(HostedInstanceLane::Primary));
     // A foreign instance's lane matches none of this instance's lanes.
-    assert_eq!(hosted_instance_lane(false, false, false), None);
+    assert_eq!(hosted_instance_lane(false, false, false, false), None);
 }
 
 /// Boot 44997226178 boot 1: after 5b142e2c9 admitted storahci's worker lane to the interrupt
@@ -152,13 +152,13 @@ fn an_interrupt_lock_checks_the_calling_lanes_own_irql() {
     let irql_at = |bank: u64| if bank == WORKER_BANK { SYNCHRONIZE_IRQL } else { 0 };
 
     // storahci's worker raised to SynchronizeIrql; its parked primary is still at PASSIVE.
-    let lane = hosted_instance_lane(false, false, true).unwrap();
+    let lane = hosted_instance_lane(false, false, true, false).unwrap();
     let bank = hosted_lane_irql_bank(lane, PRIMARY_BANK, WORKER_BANK);
     assert_eq!(bank, WORKER_BANK);
     assert!(interrupt_lock_irql_matches(SYNCHRONIZE_IRQL, irql_at(bank)));
 
     // The primary's own acquisition keeps reading the primary bank.
-    let lane = hosted_instance_lane(true, false, false).unwrap();
+    let lane = hosted_instance_lane(true, false, false, false).unwrap();
     assert_eq!(hosted_lane_irql_bank(lane, PRIMARY_BANK, PRIMARY_BANK), PRIMARY_BANK);
     // A caller that did not raise, or a passive interrupt, is refused.
     assert!(!interrupt_lock_irql_matches(SYNCHRONIZE_IRQL, 0));
@@ -175,10 +175,20 @@ fn a_dispatch_projects_device_resources_into_its_own_lane_bank() {
     use nt_hosted_runtime::{hosted_instance_lane, hosted_resource_projection_bank};
     const PRIMARY_BANK: u64 = 0x1000;
     const WORKER_BANK: u64 = 0x9000;
-    let worker = hosted_instance_lane(false, false, true).unwrap();
+    let worker = hosted_instance_lane(false, false, true, false).unwrap();
     assert_eq!(hosted_resource_projection_bank(worker, PRIMARY_BANK, WORKER_BANK), Some(WORKER_BANK));
-    let primary = hosted_instance_lane(true, false, false).unwrap();
+    let primary = hosted_instance_lane(true, false, false, false).unwrap();
     assert_eq!(hosted_resource_projection_bank(primary, PRIMARY_BANK, PRIMARY_BANK), Some(PRIMARY_BANK));
     // A worker's projection can never target the primary bank.
     assert_eq!(hosted_resource_projection_bank(worker, PRIMARY_BANK, PRIMARY_BANK), None);
+}
+
+/// #427 audit gap 11: a driver's completion routine runs on the source-completion lane, and a
+/// CR8 access or interrupt lock there was refused because that lane was not an authenticated lane
+/// of its instance. Every lane a driver's code runs on is.
+#[test]
+fn a_completion_lane_is_an_authenticated_lane_of_its_instance() {
+    use nt_hosted_runtime::{hosted_instance_lane, HostedInstanceLane};
+    assert_eq!(hosted_instance_lane(false, false, false, true), Some(HostedInstanceLane::Worker));
+    assert_eq!(hosted_instance_lane(false, false, true, true), None, "one lane, one authority");
 }

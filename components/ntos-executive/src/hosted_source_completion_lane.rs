@@ -18,6 +18,14 @@ const SELECTOR: u64 = u64::MAX - LABEL;
 const COMMAND: u64 = 0x100;
 const BANK_OFFSET: u64 = FSD_WORKER_KPCR_OFFSET + 0x1000;
 const _: () = assert!(BANK_OFFSET + 0x1000 <= FSD_WORKER_STRIDE);
+/// This lane's bank marker in its worker's scratch page (#427). The class IRP lane's bank sits at
+/// the same worker offset, so the two kinds need distinct marker words to stay distinguishable;
+/// both lie above a KeWaitForMultipleObjects array copy.
+const SCRATCH_BANK_OFFSET: u64 = 0xfe8;
+const _: () = assert!(HOSTED_DRIVER_WAIT_OBJECT_MAX as u64 * 8 <= SCRATCH_BANK_OFFSET);
+const _: () = assert!(SCRATCH_BANK_OFFSET + 8 <= 0xff0);
+/// The one-frame bank holds the lane's own IRQL byte.
+const _: () = assert!(SH_HOSTED_CURRENT_IRQL < 0x1000);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceCompletionCommand {
@@ -185,6 +193,11 @@ pub(super) unsafe fn instance_for_shared(shared: u64) -> Option<(usize, DriverIn
     let inst = instance(row.instance)?;
     (instance_domain_identity(inst) == Some(row.domain) && inst.pml4 == row.pml4)
         .then_some((row.instance, inst))
+}
+
+/// This lane's bank, when the current thread is a source-completion worker (#427).
+pub(super) fn current_component_bank() -> Option<u64> {
+    current_worker_lane_bank(SCRATCH_BANK_OFFSET, BANK_OFFSET)
 }
 
 pub(super) unsafe fn matches_channel(
@@ -415,6 +428,8 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<Startup, u32> 
         .unwrap()
         .ingress_route = Some(route);
     worker.ingress_route = Some(route);
+    // A completion routine's IRQL lives in this lane's own bank, as CR8 emulation reads it.
+    write_volatile((spawn.exec_scratch_va + SCRATCH_BANK_OFFSET) as *mut u64, shared);
     // The worker reads only its own bank, not root-private lane storage.
     for (offset, value) in [
         (0x80, ordinal),

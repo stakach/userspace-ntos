@@ -15179,12 +15179,13 @@ unsafe fn hosted_current_irql() -> u8 {
     read_volatile(hosted_lane_irql_byte())
 }
 
-/// The current lane's IRQL byte: a dispatch worker keeps its own, as inline CR8 emulation does
-/// for it (#427); the primary's lives in the instance's shared bank.
+/// The current lane's IRQL byte: a dispatch or completion worker keeps its own, as inline CR8
+/// emulation does for it (#427); the primary's lives in the instance's shared bank.
 #[inline]
 unsafe fn hosted_lane_irql_byte() -> *mut u8 {
     let bank = hosted_provider_export_lane::current_component_bank()
         .or_else(hosted_class_irp_lane::current_component_bank)
+        .or_else(hosted_source_completion_lane::current_component_bank)
         .unwrap_or(FSD_SHARED_VADDR);
     (bank + SH_HOSTED_CURRENT_IRQL) as *mut u8
 }
@@ -16333,6 +16334,17 @@ fn hosted_worker_component_base_from_rsp(rsp: u64) -> Option<u64> {
     }
     let slot = relative / FSD_WORKER_STRIDE;
     FSD_WORKER_VADDR.checked_add(slot.checked_mul(FSD_WORKER_STRIDE)?)
+}
+
+/// The bank a dedicated worker lane published in its scratch page, when the current thread is
+/// that lane (#427). `marker` is the lane kind's own scratch word and `bank_offset` its bank's
+/// place in the worker; a worker of another kind has a different (or zero) marker there.
+fn current_worker_lane_bank(marker: u64, bank_offset: u64) -> Option<u64> {
+    let rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags)); }
+    let base = hosted_worker_component_base_from_rsp(rsp)?;
+    let bank = unsafe { read_volatile((base + FSD_WORKER_SCRATCH_OFFSET + marker) as *const u64) };
+    (bank == base + bank_offset).then_some(bank)
 }
 
 fn current_hosted_worker_scratch_va() -> Option<u64> {
@@ -68443,12 +68455,13 @@ pub(crate) fn service_hosted_driver_interrupt(
         };
     };
     // Any authenticated lane of this instance may synchronise with its interrupt: the primary,
-    // a provider-export worker or an ordinary dispatch worker (#427). Another instance's lane
-    // matches none of them.
+    // a provider-export worker, an ordinary dispatch worker or a source-completion worker
+    // (#427). Another instance's lane matches none of them.
     let Some(lane) = nt_hosted_runtime::hosted_instance_lane(
         ch.shared_va == inst.exec_shared_va,
         unsafe { hosted_provider_export_lane::matches_channel(instance_index, inst, ch) },
         unsafe { hosted_class_irp_lane::matches_channel(instance_index, inst, ch) },
+        unsafe { hosted_source_completion_lane::matches_channel(instance_index, inst, ch) },
     ) else {
         return HostedDriverInterruptServiceResult::Reply {
             status: STATUS_ACCESS_DENIED,

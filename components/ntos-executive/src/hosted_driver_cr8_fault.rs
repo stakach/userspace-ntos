@@ -120,8 +120,9 @@ unsafe fn service_irq_fault(
     Cr8FaultOutcome::Applied
 }
 
-/// The exact physical lane a CR8 fault came from: the primary, a provider-export worker, or an
-/// ordinary dispatch worker (#427). Each has its own IRQL; none borrows another's.
+/// The exact physical lane a CR8 fault came from: the primary, a provider-export worker, an
+/// ordinary dispatch worker or a source-completion worker (#427). Each has its own IRQL; none
+/// borrows another's.
 unsafe fn cr8_lane(
     index: usize, inst: DriverInstance, caller: &HostedDriverCaller,
     channel: &crate::spawn_hosts::PumpChannel,
@@ -132,6 +133,7 @@ unsafe fn cr8_lane(
         primary,
         hosted_provider_export_lane::matches_channel(index, inst, channel),
         hosted_class_irp_lane::matches_channel(index, inst, channel),
+        hosted_source_completion_lane::matches_channel(index, inst, channel),
     )
 }
 

@@ -845,11 +845,7 @@ pub(super) unsafe fn finish_worker_retirement(instance_index: usize, handle: u64
 /// Only the dedicated class worker has this bank. Every ordinary worker has the scratch page,
 /// so a zero marker on unrelated workers is safe to read. The parent primary has no worker stack.
 pub(super) fn current_component_bank() -> Option<u64> {
-    let rsp: u64;
-    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags)); }
-    let base = hosted_worker_component_base_from_rsp(rsp)?;
-    let marker = unsafe { read_volatile((base + FSD_WORKER_SCRATCH_OFFSET + SCRATCH_BANK_OFFSET) as *const u64) };
-    (marker == base + BANK_OFFSET).then_some(marker)
+    current_worker_lane_bank(SCRATCH_BANK_OFFSET, BANK_OFFSET)
 }
 
 pub(super) fn current_jump_buffer() -> Option<*mut u64> {
