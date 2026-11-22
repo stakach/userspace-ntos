@@ -125,10 +125,10 @@ unsafe fn service_irq_fault(
 unsafe fn cr8_lane(
     index: usize, inst: DriverInstance, caller: &HostedDriverCaller,
     channel: &crate::spawn_hosts::PumpChannel,
-) -> Option<nt_hosted_runtime::HostedCr8Lane> {
+) -> Option<nt_hosted_runtime::HostedInstanceLane> {
     let primary = caller.runtime.is_none() && channel.tcb == inst.tcb
         && channel.shared_va == inst.exec_shared_va;
-    nt_hosted_runtime::hosted_cr8_lane(
+    nt_hosted_runtime::hosted_instance_lane(
         primary,
         hosted_provider_export_lane::matches_channel(index, inst, channel),
         hosted_class_irp_lane::matches_channel(index, inst, channel),
@@ -169,8 +169,8 @@ pub(crate) unsafe fn service(
     };
     let Some(shared) = nt_hosted_runtime::select_hosted_cr8_bank(
         inst.exec_shared_va, channel.shared_va,
-        lane == nt_hosted_runtime::HostedCr8Lane::Primary,
-        lane == nt_hosted_runtime::HostedCr8Lane::Worker) else {
+        lane == nt_hosted_runtime::HostedInstanceLane::Primary,
+        lane == nt_hosted_runtime::HostedInstanceLane::Worker) else {
         return Cr8FaultOutcome::Rejected;
     };
     if channel.ingress_route != Some(caller.route)

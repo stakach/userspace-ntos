@@ -82,22 +82,24 @@ pub const fn hosted_provider_worker_admissible(
     !faulted && singleton_published && primary_route
 }
 
-/// Which lane's IRQL an authenticated CR8 access reads and writes.
+/// Which authenticated lane of a hosted instance a service request came from. Every lane a
+/// driver's code runs on is a full execution context of that instance: it has its own IRQL for
+/// CR8 emulation, and may use the instance's services (e.g. synchronise with its interrupt).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HostedCr8Lane {
+pub enum HostedInstanceLane {
     /// The instance's primary lane and its shared bank.
     Primary,
     /// A dispatch worker (provider-export or ordinary/class) and its own bank.
     Worker,
 }
 
-/// Authorise CR8 emulation for exactly one authenticated physical lane. Every lane a driver's
-/// code runs on is a full execution context with its own IRQL; none borrows another's.
-pub const fn hosted_cr8_lane(primary: bool, provider_worker: bool, ordinary_worker: bool)
-    -> Option<HostedCr8Lane> {
+/// Identify exactly one authenticated physical lane of the instance, or none: a lane of another
+/// instance, or an unauthenticated one, matches none of these.
+pub const fn hosted_instance_lane(primary: bool, provider_worker: bool, ordinary_worker: bool)
+    -> Option<HostedInstanceLane> {
     match (primary, provider_worker, ordinary_worker) {
-        (true, false, false) => Some(HostedCr8Lane::Primary),
-        (false, true, false) | (false, false, true) => Some(HostedCr8Lane::Worker),
+        (true, false, false) => Some(HostedInstanceLane::Primary),
+        (false, true, false) | (false, false, true) => Some(HostedInstanceLane::Worker),
         _ => None,
     }
 }

@@ -115,10 +115,25 @@ fn provider_export_completion_retains_worker_after_guarded_failure_or_wall() {
 /// class/ordinary worker is a full execution context: its IRQL lives in its own bank.
 #[test]
 fn an_ordinary_worker_lane_emulates_cr8_against_its_own_irql() {
-    use nt_hosted_runtime::{hosted_cr8_lane, HostedCr8Lane};
-    assert_eq!(hosted_cr8_lane(false, false, true), Some(HostedCr8Lane::Worker));
-    assert_eq!(hosted_cr8_lane(false, true, false), Some(HostedCr8Lane::Worker));
-    assert_eq!(hosted_cr8_lane(true, false, false), Some(HostedCr8Lane::Primary));
-    assert_eq!(hosted_cr8_lane(false, false, false), None, "an unauthenticated lane");
-    assert_eq!(hosted_cr8_lane(true, false, true), None, "one lane, one authority");
+    use nt_hosted_runtime::{hosted_instance_lane, HostedInstanceLane};
+    assert_eq!(hosted_instance_lane(false, false, true), Some(HostedInstanceLane::Worker));
+    assert_eq!(hosted_instance_lane(false, true, false), Some(HostedInstanceLane::Worker));
+    assert_eq!(hosted_instance_lane(true, false, false), Some(HostedInstanceLane::Primary));
+    assert_eq!(hosted_instance_lane(false, false, false), None, "an unauthenticated lane");
+    assert_eq!(hosted_instance_lane(true, false, true), None, "one lane, one authority");
+}
+
+/// Boot 44985671350 boot 1: with storahci's primary parked, a disk SRB ran on its worker lane,
+/// and storport's StorPortSynchronizeAccess → KeAcquireInterruptSpinLock was refused by the
+/// interrupt service (`[provider-bugcheck] code=0xC4 p1=0x785 p2=3 p4=0xC0000022`): only the
+/// primary's bank was accepted. Any authenticated lane of the instance may synchronise with
+/// that instance's interrupt; a lane of no instance (or another's) may not.
+#[test]
+fn every_authenticated_lane_of_an_instance_may_synchronise_with_its_interrupt() {
+    use nt_hosted_runtime::{hosted_instance_lane, HostedInstanceLane};
+    assert_eq!(hosted_instance_lane(false, false, true), Some(HostedInstanceLane::Worker));
+    assert_eq!(hosted_instance_lane(false, true, false), Some(HostedInstanceLane::Worker));
+    assert_eq!(hosted_instance_lane(true, false, false), Some(HostedInstanceLane::Primary));
+    // A foreign instance's lane matches none of this instance's lanes.
+    assert_eq!(hosted_instance_lane(false, false, false), None);
 }

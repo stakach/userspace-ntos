@@ -68364,7 +68364,14 @@ pub(crate) fn service_hosted_driver_interrupt(
             grant_generation: 0,
         };
     };
-    if ch.shared_va != inst.exec_shared_va {
+    // Any authenticated lane of this instance may synchronise with its interrupt: the primary,
+    // a provider-export worker or an ordinary dispatch worker (#427). Another instance's lane
+    // matches none of them.
+    if nt_hosted_runtime::hosted_instance_lane(
+        ch.shared_va == inst.exec_shared_va,
+        unsafe { hosted_provider_export_lane::matches_channel(instance_index, inst, ch) },
+        unsafe { hosted_class_irp_lane::matches_channel(instance_index, inst, ch) },
+    ).is_none() {
         return HostedDriverInterruptServiceResult::Reply {
             status: STATUS_ACCESS_DENIED,
             interrupt_id: 0,
