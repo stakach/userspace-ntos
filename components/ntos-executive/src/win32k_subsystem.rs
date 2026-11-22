@@ -12174,7 +12174,12 @@ unsafe fn callback_request_context_for_request(
     }) {
         return None;
     }
-    if request.client_pi >= 12 && supplied_ethread != 0 {
+    if request.client_pi >= 12 && supplied_ethread != 0
+        && crate::steady_trace::admit(crate::steady_trace::Stream::Win32kInitPhase, &[
+            &(request.client_pi as u64).to_le_bytes(), &request.client_tid.to_le_bytes(),
+            &thread_ctx_w32thread(thread_index).to_le_bytes(),
+        ])
+    {
         print_str(b"[win32k-init-phase] callback pi/tid/pti=");
         print_u64(request.client_pi as u64);
         print_str(b"/");

@@ -4114,15 +4114,19 @@ pub(crate) unsafe fn service_user_callback(
                 print_str(b"\n");
             }
             if callback_trace {
-                print_str(b"[user-callback] selected real callback api=");
-                print_u64(request.api_index as u64);
-                if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC {
-                    print_str(b" msg=0x");
-                    print_hex(window_message);
+                if crate::steady_trace::admit(crate::steady_trace::Stream::UserCallback, &[
+                    b"selected", &request.api_index.to_le_bytes(), &window_message.to_le_bytes(),
+                ]) {
+                    print_str(b"[user-callback] selected real callback api=");
+                    print_u64(request.api_index as u64);
+                    if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC {
+                        print_str(b" msg=0x");
+                        print_hex(window_message);
+                    }
+                    print_str(b" depth=");
+                    print_u64((&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len() as u64);
+                    print_str(b"\n");
                 }
-                print_str(b" depth=");
-                print_u64((&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len() as u64);
-                print_str(b"\n");
             }
             if callback_client_is_explorer(client)
                 && request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
@@ -4141,9 +4145,11 @@ pub(crate) unsafe fn service_user_callback(
         );
         capture_suspended_published_win32k_context(client);
         if callback_trace {
-            print_str(
-                b"[user-callback] B component continuation parked in callback receive loop\n",
-            );
+            if crate::steady_trace::admit(crate::steady_trace::Stream::UserCallback, &[b"parked"]) {
+                print_str(
+                    b"[user-callback] B component continuation parked in callback receive loop\n",
+                );
+            }
         }
         Some(UserCallbackDisposition::SuspendComponent)
     } else {
@@ -4616,11 +4622,13 @@ unsafe fn redirect_pending_user_callback(
         return false;
     }
     USER_CALLBACK_REAL_REDIRECTS.fetch_add(1, Ordering::Relaxed);
-    print_str(b"[user-callback] A client redirected to real apfnDispatch[");
-    print_u64(request.api_index as u64);
-    print_str(b"] payload=0x");
-    print_hex(request.input_length);
-    print_str(b" bytes\n");
+    if crate::steady_trace::admit(crate::steady_trace::Stream::UserCallback, &[b"redirect", &request.api_index.to_le_bytes()]) {
+        print_str(b"[user-callback] A client redirected to real apfnDispatch[");
+        print_u64(request.api_index as u64);
+        print_str(b"] payload=0x");
+        print_hex(request.input_length);
+        print_str(b" bytes\n");
+    }
     true
 }
 
@@ -6089,9 +6097,11 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID.store(0, Ordering::Relaxed);
     }
     if callback_trace {
-        print_str(
-            b"[user-callback] A real callback completed through NtCallbackReturn; resuming B component\n",
-        );
+        if crate::steady_trace::admit(crate::steady_trace::Stream::UserCallback, &[b"completed"]) {
+            print_str(
+                b"[user-callback] A real callback completed through NtCallbackReturn; resuming B component\n",
+            );
+        }
     }
     let completed_logical_caller = completed_client.logical_caller;
     let completed_frame = {
@@ -6165,7 +6175,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         record_completed_user_callback(completed_client, request, callback_status);
         USER_CALLBACK_REAL_RETURNS.fetch_add(1, Ordering::Relaxed);
         if callback_trace {
-            print_str(b"[user-callback] B yielded another callback; reused outer trap context\n");
+            if crate::steady_trace::admit(crate::steady_trace::Stream::UserCallback, &[b"yielded"]) {
+                print_str(b"[user-callback] B yielded another callback; reused outer trap context\n");
+            }
         }
         return Some(CompletedUserCallback::Completed {
             outer_dispatch: None,

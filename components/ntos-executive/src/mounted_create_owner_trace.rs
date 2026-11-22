@@ -20,7 +20,11 @@ pub(crate) fn receive_boundary_snapshot() {
         RECEIVE_OWNER_SAMPLES.store(0, Ordering::Release);
     }
     let sample = RECEIVE_OWNER_SAMPLES.fetch_add(1, Ordering::AcqRel) + 1;
-    if sample > 32 && !sample.is_power_of_two() { return; }
+    // A few samples per parked CREATE, then powers of two; the rest are only counted.
+    if sample > 4 && !sample.is_power_of_two() {
+        crate::steady_trace::note_mounted_receive_suppressed();
+        return;
+    }
     let claimable = crate::mounted_volume::mounted_sector_claimable();
     let now = crate::monotonic_time_100ns();
     let retry = crate::driver_launch::mounted_native_block_next_deadline(now);

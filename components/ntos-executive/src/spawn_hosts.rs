@@ -6006,17 +6006,25 @@ unsafe fn component_pump_loop(
 unsafe fn pump_service_user_callback(
     ch: &PumpChannel,
 ) -> Option<crate::win32k_glue::UserCallbackDisposition> {
-    print_str(b"[callback-pump-stage] enter\n");
+    if crate::steady_trace::admit(crate::steady_trace::Stream::CallbackPumpStage, &[b"enter"]) {
+        print_str(b"[callback-pump-stage] enter\n");
+    }
     let lane =
         crate::win32k_glue::win32k_physical_lane_for_channel(ch.tcb, ch.fault_ep, ch.reply_cap)?;
     let outcome = crate::win32k_glue::service_user_callback(lane);
-    print_str(b"[callback-pump-stage] return disposition=");
-    print_u64(match outcome {
+    let disposition: u64 = match outcome {
         Some(crate::win32k_glue::UserCallbackDisposition::SuspendComponent) => 1,
         Some(crate::win32k_glue::UserCallbackDisposition::ReplyImmediately) => 2,
         None => 0,
-    });
-    print_str(b"\n");
+    };
+    // No disposition is a failure and always prints.
+    if disposition == 0
+        || crate::steady_trace::admit(crate::steady_trace::Stream::CallbackPumpStage, &[b"return", &disposition.to_le_bytes()])
+    {
+        print_str(b"[callback-pump-stage] return disposition=");
+        print_u64(disposition);
+        print_str(b"\n");
+    }
     outcome
 }
 

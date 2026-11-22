@@ -70,6 +70,7 @@ mod registry_query_audit;
 mod hot_service_cost_census;
 mod hot_service_latency_census;
 mod reply_tail_step_census;
+mod steady_trace;
 mod hosted_resume_census;
 mod process_deletion_demand;
 mod pending_file_completion_scan;
@@ -7640,6 +7641,7 @@ pub(crate) fn census_tick_static(now: u64) {
     hot_service_cost_census::print_wait_outcome_census();
     hot_service_latency_census::print_census();
     reply_tail_step_census::print_census();
+    steady_trace::print_census();
     hosted_resume_census::print_census();
     registry_open_phase_census::print_census();
     {
