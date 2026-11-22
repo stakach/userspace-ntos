@@ -141,6 +141,14 @@ struct Row {
     admission_epoch: u64,
 }
 
+/// Counts dispatches refused admission with nothing entered, for callers that retry them
+/// (#427): a nested child refused this way is waiting, not uncertain.
+static ADMISSION_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn admission_refusals() -> u64 {
+    ADMISSION_REFUSALS.load(Ordering::Acquire)
+}
+
 /// Advanced whenever a worker lane's IRP claim ends (#427).
 static LANE_EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -2458,6 +2466,7 @@ fn settle_returned_dispatch(
                 return Ok(DispatchResult::Outstanding { irp_id });
             }
             // This caller re-prepares a busy refusal itself.
+            ADMISSION_REFUSALS.fetch_add(1, Ordering::AcqRel);
             if discard(id, prepared).is_err() {
                 return Ok(DispatchResult::Outstanding { irp_id });
             }

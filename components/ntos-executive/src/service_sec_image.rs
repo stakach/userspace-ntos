@@ -7879,14 +7879,19 @@ pub(crate) unsafe fn drive_one_nested_file_child_step() -> NestedChildStep {
     if !ready {
         return NestedChildStep { outcome: NestedChildStepOutcome::NoReady };
     }
+    let refusals = crate::driver_launch::hosted_admission_refusals();
     let progressed = redrive_nested_hosted_file_work();
     trace_nested_child_selection(1, u64::from(progressed));
     trace_nested_child_readiness(2);
-    if progressed {
-        NestedChildStep { outcome: NestedChildStepOutcome::Progressed }
-    } else {
-        NestedChildStep { outcome: NestedChildStepOutcome::Indeterminate }
-    }
+    // A child no lane admitted yet entered nothing: it waits for a lane, and its parent
+    // restores. Only an effect that reached a driver is uncertain (#427).
+    let refused = crate::driver_launch::hosted_admission_refusals() != refusals;
+    let outcome = match nt_component_suspension::nested_child_redrive(progressed, refused) {
+        nt_component_suspension::NestedChildRedrive::Progressed => NestedChildStepOutcome::Progressed,
+        nt_component_suspension::NestedChildRedrive::Waiting => NestedChildStepOutcome::NoReady,
+        nt_component_suspension::NestedChildRedrive::Uncertain => NestedChildStepOutcome::Indeterminate,
+    };
+    NestedChildStep { outcome }
 }
 
 /// Run one locally ready retained child while the exact parent invocation is parked. A caller

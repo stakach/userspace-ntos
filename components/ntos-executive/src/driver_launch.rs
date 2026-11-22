@@ -77305,6 +77305,11 @@ pub(crate) fn reconcile_retained_hosted_file_read_exact(
         .map_err(|(status, selector)| (status.raw() as u32, selector))
 }
 
+/// Dispatches refused admission with nothing entered so far (#427).
+pub(crate) fn hosted_admission_refusals() -> u64 {
+    hosted_file_owners::admission_refusals()
+}
+
 /// How far a hosted File IRP's dispatch has got for its caller (#427).
 pub(crate) fn hosted_dispatch_progress(irp_id: u64) -> Option<nt_hosted_runtime::DispatchProgress> {
     hosted_file_owners::dispatch_progress(IrpId(irp_id))
