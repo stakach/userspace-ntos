@@ -137,3 +137,30 @@ fn every_authenticated_lane_of_an_instance_may_synchronise_with_its_interrupt() 
     // A foreign instance's lane matches none of this instance's lanes.
     assert_eq!(hosted_instance_lane(false, false, false), None);
 }
+
+/// Boot 44997226178 boot 1: after 5b142e2c9 admitted storahci's worker lane to the interrupt
+/// service, KeAcquireInterruptSpinLock was still refused with STATUS_INVALID_DEVICE_REQUEST
+/// (`[provider-bugcheck] code=0xC4 p1=0x785 p2=3 p4=0xC0000010`): the lock checked that the
+/// caller had raised to the interrupt's SynchronizeIrql by reading the PRIMARY bank's IRQL,
+/// while the worker (b7182adba) raises its own. The check reads the calling lane's IRQL.
+#[test]
+fn an_interrupt_lock_checks_the_calling_lanes_own_irql() {
+    use nt_hosted_runtime::{hosted_instance_lane, hosted_lane_irql_bank, interrupt_lock_irql_matches};
+    const PRIMARY_BANK: u64 = 0x1000;
+    const WORKER_BANK: u64 = 0x9000;
+    const SYNCHRONIZE_IRQL: u8 = 5;
+    let irql_at = |bank: u64| if bank == WORKER_BANK { SYNCHRONIZE_IRQL } else { 0 };
+
+    // storahci's worker raised to SynchronizeIrql; its parked primary is still at PASSIVE.
+    let lane = hosted_instance_lane(false, false, true).unwrap();
+    let bank = hosted_lane_irql_bank(lane, PRIMARY_BANK, WORKER_BANK);
+    assert_eq!(bank, WORKER_BANK);
+    assert!(interrupt_lock_irql_matches(SYNCHRONIZE_IRQL, irql_at(bank)));
+
+    // The primary's own acquisition keeps reading the primary bank.
+    let lane = hosted_instance_lane(true, false, false).unwrap();
+    assert_eq!(hosted_lane_irql_bank(lane, PRIMARY_BANK, PRIMARY_BANK), PRIMARY_BANK);
+    // A caller that did not raise, or a passive interrupt, is refused.
+    assert!(!interrupt_lock_irql_matches(SYNCHRONIZE_IRQL, 0));
+    assert!(!interrupt_lock_irql_matches(1, 1));
+}

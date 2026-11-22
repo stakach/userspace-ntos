@@ -104,6 +104,21 @@ pub const fn hosted_instance_lane(primary: bool, provider_worker: bool, ordinary
     }
 }
 
+/// The bank holding the authenticated lane's own IRQL byte: the primary's shared bank, or a
+/// worker's own bank.
+pub const fn hosted_lane_irql_bank(lane: HostedInstanceLane, primary_shared: u64, channel_shared: u64) -> u64 {
+    match lane {
+        HostedInstanceLane::Primary => primary_shared,
+        HostedInstanceLane::Worker => channel_shared,
+    }
+}
+
+/// A thread may take an interrupt's lock only once it has raised to that interrupt's
+/// SynchronizeIrql, which is at least DISPATCH_LEVEL.
+pub const fn interrupt_lock_irql_matches(synchronize_irql: u8, lane_irql: u8) -> bool {
+    synchronize_irql >= 2 && lane_irql == synchronize_irql
+}
+
 /// Pick the IRQL byte's containing bank only after native code has authenticated one exact
 /// physical lane. Provider workers cannot borrow the parked primary's IRQL state.
 pub const fn select_hosted_cr8_bank(primary_shared: u64, channel_shared: u64,

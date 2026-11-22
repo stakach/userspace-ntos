@@ -67998,6 +67998,7 @@ unsafe fn hosted_interrupt_connection_for_thread_lock(
 unsafe fn hosted_interrupt_thread_irql_matches(
     inst: DriverInstance,
     connection: HostedIrqConnection,
+    irql_bank: u64,
 ) -> bool {
     let Some(projection) = hosted_pool_allocation_exec_va(
         inst.exec_pool_va,
@@ -68008,9 +68009,11 @@ unsafe fn hosted_interrupt_thread_irql_matches(
     };
     let synchronize_irql =
         read_unaligned((projection + HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL) as *const u8);
-    synchronize_irql >= DISPATCH_LEVEL
-        && read_volatile((inst.exec_shared_va + SH_HOSTED_CURRENT_IRQL) as *const u8)
-            == synchronize_irql
+    // The calling lane's own IRQL: a worker raises its own bank, never the primary's (#427).
+    nt_hosted_runtime::interrupt_lock_irql_matches(
+        synchronize_irql,
+        read_volatile((irql_bank + SH_HOSTED_CURRENT_IRQL) as *const u8),
+    )
 }
 
 unsafe fn reserve_hosted_interrupt_lock_holder_slot() -> bool {
@@ -68123,9 +68126,10 @@ unsafe fn acquire_hosted_interrupt_lock_for_thread(
     connection: HostedIrqConnection,
     old_irql: u8,
     active_reply_cap: u64,
+    irql_bank: u64,
 ) -> HostedDriverInterruptServiceResult {
     if old_irql > connection.route.tokens.synchronize_irql
-        || !hosted_interrupt_thread_irql_matches(inst, connection)
+        || !hosted_interrupt_thread_irql_matches(inst, connection, irql_bank)
     {
         return HostedDriverInterruptServiceResult::Reply {
             status: STATUS_INVALID_DEVICE_REQUEST,
@@ -68288,8 +68292,9 @@ unsafe fn release_hosted_interrupt_lock_for_thread(
     caller: HostedDriverCaller,
     connection: HostedIrqConnection,
     old_irql: u8,
+    irql_bank: u64,
 ) -> i32 {
-    if !hosted_interrupt_thread_irql_matches(inst, connection) {
+    if !hosted_interrupt_thread_irql_matches(inst, connection, irql_bank) {
         return STATUS_INVALID_DEVICE_REQUEST;
     }
     let Some(holder_index) = (*core::ptr::addr_of!(HOSTED_INTERRUPT_LOCK_HOLDERS))
@@ -68367,17 +68372,18 @@ pub(crate) fn service_hosted_driver_interrupt(
     // Any authenticated lane of this instance may synchronise with its interrupt: the primary,
     // a provider-export worker or an ordinary dispatch worker (#427). Another instance's lane
     // matches none of them.
-    if nt_hosted_runtime::hosted_instance_lane(
+    let Some(lane) = nt_hosted_runtime::hosted_instance_lane(
         ch.shared_va == inst.exec_shared_va,
         unsafe { hosted_provider_export_lane::matches_channel(instance_index, inst, ch) },
         unsafe { hosted_class_irp_lane::matches_channel(instance_index, inst, ch) },
-    ).is_none() {
+    ) else {
         return HostedDriverInterruptServiceResult::Reply {
             status: STATUS_ACCESS_DENIED,
             interrupt_id: 0,
             grant_generation: 0,
         };
-    }
+    };
+    let irql_bank = nt_hosted_runtime::hosted_lane_irql_bank(lane, inst.exec_shared_va, ch.shared_va);
     if matches!(
         operation,
         HOSTED_INTERRUPT_OP_ACQUIRE_LOCK | HOSTED_INTERRUPT_OP_RELEASE_LOCK
@@ -68418,6 +68424,7 @@ pub(crate) fn service_hosted_driver_interrupt(
                     connection,
                     old_irql as u8,
                     active_reply_cap,
+                    irql_bank,
                 )
             }
         } else {
@@ -68430,6 +68437,7 @@ pub(crate) fn service_hosted_driver_interrupt(
                         caller,
                         connection,
                         old_irql as u8,
+                        irql_bank,
                     )
                 },
                 interrupt_id: 0,
