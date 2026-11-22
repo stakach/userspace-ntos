@@ -58,6 +58,7 @@ impl PeerInstallation {
             .lane_mut(route.identity().lane)
             .expect("preflight autonomous source")
             .phase = LanePhase::Idle;
+        lanes.lane_became_idle();
         self.phase = PeerInstallationPhase::ResumeAcknowledged;
         Ok(())
     }

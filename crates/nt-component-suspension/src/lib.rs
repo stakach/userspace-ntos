@@ -450,6 +450,9 @@ pub struct ComponentSuspensionLanes<C, R, T = ()> {
     max_lanes: usize,
     max_depth_per_lane: usize,
     running: Option<LaneHandle>,
+    /// Advanced each time a lane becomes admissible (Idle), so work queued for a lane is
+    /// retried on exactly that event (#427).
+    idle_epoch: u64,
 }
 
 pub struct ComponentSuspensionStack<C, R> {
@@ -792,6 +795,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             max_lanes,
             max_depth_per_lane,
             running: None,
+            idle_epoch: 0,
         }
     }
 
@@ -1132,7 +1136,17 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         lane.phase = LanePhase::Idle;
         lane.dispatch = None;
         self.running = None;
+        self.lane_became_idle();
         Ok(())
+    }
+
+    /// Advanced each time any lane becomes admissible again.
+    pub const fn idle_epoch(&self) -> u64 {
+        self.idle_epoch
+    }
+
+    pub(crate) fn lane_became_idle(&mut self) {
+        self.idle_epoch = self.idle_epoch.wrapping_add(1);
     }
 
     /// Park a running lane in an external continuation such as a user-mode callback.

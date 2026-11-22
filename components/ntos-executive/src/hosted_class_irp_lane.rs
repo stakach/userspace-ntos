@@ -753,8 +753,8 @@ pub(super) unsafe fn finish(instance_index: usize, selection: &Selection, comple
 pub(super) unsafe fn release_irp(instance_index: usize, irp: u64) {
     if let Some(index) = index_for(instance_index) {
         let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
-        if row.phase == Phase::Ready {
-            row.current_irp.release(irp);
+        if row.phase == Phase::Ready && row.current_irp.release(irp) {
+            hosted_file_owners::lane_freed();
         }
     }
 }

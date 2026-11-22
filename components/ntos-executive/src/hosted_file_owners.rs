@@ -141,12 +141,19 @@ struct Row {
     admission_epoch: u64,
 }
 
-/// Advanced whenever a hosted dispatch lane may have become free (#427).
+/// Advanced whenever a worker lane's IRP claim ends (#427).
 static LANE_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-/// A hosted lane may now admit a queued IRP.
+/// A worker claim ended, so that lane may now admit a queued IRP. A lane returning to Idle
+/// advances the lanes' own idle epoch.
 pub(super) fn lane_freed() {
     LANE_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Changes whenever any hosted lane becomes admissible or a worker claim ends (#427).
+fn admission_epoch() -> u64 {
+    LANE_EPOCH.load(Ordering::Acquire)
+        .wrapping_add(unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::lane_idle_epoch() })
 }
 
 static mut ROWS: Vec<Row> = Vec::new();
@@ -2208,7 +2215,7 @@ fn queue_unadmitted(id: u64, prepared: PreparedExternalFileIrp) {
     row.payload = Some(Payload::Prepared(prepared));
     row.flight = Flight::QueuedDispatch;
     row.blocked_status = None;
-    row.admission_epoch = LANE_EPOCH.load(Ordering::Acquire);
+    row.admission_epoch = admission_epoch();
 }
 
 fn queued_admissions() -> Vec<nt_hosted_runtime::QueuedIrp> {
@@ -2247,7 +2254,7 @@ pub(super) fn queued_admission_due() -> bool {
     }
     let _transient = crate::allocator::enter_transient();
     !nt_hosted_runtime::queued_admission_candidates(
-        &queued_admissions(), LANE_EPOCH.load(Ordering::Acquire)).is_empty()
+        &queued_admissions(), admission_epoch()).is_empty()
 }
 
 fn queued_cancel(row: &Row) -> bool {
@@ -2264,7 +2271,7 @@ fn queued_cancel(row: &Row) -> bool {
 pub(super) fn redrive_queued_dispatches() -> usize {
     let _durable = crate::allocator::enter_durable();
     let candidates = nt_hosted_runtime::queued_admission_candidates(
-        &queued_admissions(), LANE_EPOCH.load(Ordering::Acquire));
+        &queued_admissions(), admission_epoch());
     candidates.into_iter()
         .filter(|id| matches!(redrive_queued(*id), QueuedReadRedriveOutcome::Progressed))
         .count()

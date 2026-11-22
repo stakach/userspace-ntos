@@ -766,3 +766,28 @@ fn a_primary_parked_in_its_own_dispatch_diverts_any_major_to_the_worker() {
     assert_eq!(lane, nt_hosted_runtime::OrdinaryIrpLane::Worker);
     assert!(nt_hosted_runtime::worker_lane_dispatches_major(0x1b), "IRP_MJ_PNP is not excluded");
 }
+
+/// An IRP queued because no lane admitted it is retried when ANY lane becomes admissible again,
+/// not only when a File row retires (#427): here the primary was busy in a non-File dispatch,
+/// and its return to Idle must make the queued IRP a candidate.
+#[test]
+fn a_lane_returning_to_idle_advances_the_admission_epoch() {
+    let mut lanes = Lanes::new(2, 2);
+    let mut peers = PeerRegistry::new(20, 2);
+    let (primary, _) = lanes.allocate_shared_staged(&mut peers, 1, 2,
+        LaneBinding { executor_id: 10, receive_endpoint: 20, reply_object: 30 }).unwrap();
+    let before_startup = lanes.idle_epoch();
+    lanes.begin_startup(primary, 30, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
+    lanes.complete_startup(primary, 30,
+        |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)).unwrap();
+    assert_ne!(lanes.idle_epoch(), before_startup, "a started lane became admissible");
+
+    // A non-File dispatch occupies the primary; an IRP is refused and queued at this epoch.
+    lanes.begin_dispatch(primary, 30).unwrap();
+    let refused_at = lanes.idle_epoch();
+    let queue = [nt_hosted_runtime::QueuedIrp { id: 1, driver: 6, refused_at, cancel_queued: false }];
+    assert!(nt_hosted_runtime::queued_admission_candidates(&queue, lanes.idle_epoch()).is_empty());
+    lanes.finish_dispatch(primary, 30).unwrap();
+    assert_eq!(nt_hosted_runtime::queued_admission_candidates(&queue, lanes.idle_epoch()), [1],
+        "the queued IRP waited for an unrelated File retirement");
+}

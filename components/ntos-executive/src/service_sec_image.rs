@@ -13972,10 +13972,7 @@ fn trace_running_lane_gate(
 pub(crate) unsafe fn drain_root_restores() {
     trace_root_restore_drain(
         crate::spawn_hosts::shared_ingress::owner::runtime::nested::drain_root_restore_queue());
-    // A kept dispatch that finished or yielded may have freed its lane (#427).
-    if crate::driver_launch::drive_kept_pumps() != 0 {
-        crate::driver_launch::hosted_lane_freed();
-    }
+    let _ = crate::driver_launch::drive_kept_pumps();
 }
 
 /// Whether a root-level owner may block in the root progress loop here (#420): the live

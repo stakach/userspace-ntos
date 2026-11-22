@@ -169,6 +169,11 @@ pub(crate) unsafe fn root_idle_receive_after_child_yield(
     ) == nt_user_host::component_pump::RootReceiveDisposition::ResumeRetainedDispatch
 }
 
+/// Advanced each time a hosted lane becomes admissible again (#427).
+pub(crate) unsafe fn lane_idle_epoch() -> u64 {
+    lanes().idle_epoch()
+}
+
 unsafe fn lanes() -> &'static mut ComponentLanes {
     &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)
 }

@@ -76161,12 +76161,6 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
     yielded: Option<(&mut Option<FileIrpPumpContinuation>, FilePumpMode)>,
 ) -> Option<HostedIrpTransportResult> {
-    // Whatever this dispatch did, a lane may be free once it returns (#427).
-    struct LaneFreedOnReturn;
-    impl Drop for LaneFreedOnReturn {
-        fn drop(&mut self) { hosted_file_owners::lane_freed(); }
-    }
-    let _lane_freed = LaneFreedOnReturn;
     if yielded.is_some() && caller.is_none() {
         return Some(HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus::INVALID_PARAMETER,
@@ -77325,11 +77319,6 @@ pub(crate) fn reconcile_retained_hosted_file_read_exact(
 /// How far a hosted File IRP's dispatch has got for its caller (#427).
 pub(crate) fn hosted_dispatch_progress(irp_id: u64) -> Option<nt_hosted_runtime::DispatchProgress> {
     hosted_file_owners::dispatch_progress(IrpId(irp_id))
-}
-
-/// A hosted dispatch lane may have become free (#427).
-pub(crate) fn hosted_lane_freed() {
-    hosted_file_owners::lane_freed();
 }
 
 /// Queued not-admitted ordinary IRPs a freed lane or a queued cancel may now move (#427).
