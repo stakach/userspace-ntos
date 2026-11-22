@@ -6,11 +6,14 @@
 //! page, the provider finishes, and the completion copies back.
 
 use nt_kernel_exec::win32k_staged_output::{
-    OutputRange, ParkedStagedOutputs, StageBytes, StagedOutputPlan, TakeError,
+    OutputRange, ParkedStagedOutputs, StageBytes, StageWindow, StageWindows, StagedOutputPlan,
+    TakeError,
 };
 
 const STAGE_VA: u64 = 0x100_071a_0000;
 const SIZE_VA: u64 = STAGE_VA + 0x80;
+/// The shared argument frames.
+const SHARED: StageWindow = StageWindow { base: STAGE_VA, bytes: 0x1000 };
 
 /// NtGdiGetTextExtent's output: the caller's SIZE and its staged stand-in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,7 +86,7 @@ fn a_parked_text_extent_returns_the_size_the_provider_wrote_after_the_page_was_r
     page.write(STAGE_VA, &[0xcc; 0x200]);
     // The parked provider resumes and writes its SIZE through the staged pointer.
     page.write(SIZE_VA, &size(64, 16));
-    assert!(parked.capture(41, |va, out| page.read(va, out)));
+    assert!(parked.capture(41, SHARED, |va, out| page.read(va, out)));
     // A later dispatch may reuse the page again before the completion is delivered.
     page.write(STAGE_VA, &[0xdd; 0x200]);
     assert_eq!(complete(&mut parked, 41), Some(Ok((0x7_0000_8f10, size(64, 16)))));
@@ -104,7 +107,7 @@ fn a_capture_outside_the_staged_memory_fails() {
     let page = Page::new();
     let mut parked = ParkedStagedOutputs::new();
     parked.retain(9, TextExtentPlan { client_size: 0x1000, staged_size: STAGE_VA + 0x2000 }).unwrap();
-    assert!(!parked.capture(9, |va, out| page.read(va, out)));
+    assert!(!parked.capture(9, SHARED, |va, out| page.read(va, out)));
     assert_eq!(complete(&mut parked, 9), Some(Err(TakeError::Uncaptured)));
 }
 
@@ -112,7 +115,7 @@ fn a_capture_outside_the_staged_memory_fails() {
 fn dispatches_without_staged_output_complete_untouched() {
     let page = Page::new();
     let mut parked: ParkedStagedOutputs<TextExtentPlan> = ParkedStagedOutputs::new();
-    assert!(parked.capture(3, |va, out| page.read(va, out)));
+    assert!(parked.capture(3, SHARED, |va, out| page.read(va, out)));
     assert_eq!(complete(&mut parked, 3), None);
 }
 
@@ -124,4 +127,66 @@ fn a_dispatch_retains_one_plan_and_discard_forgets_it() {
     assert!(parked.retain(5, plan).is_err());
     parked.discard(5);
     assert!(parked.is_empty());
+}
+
+/// KVM run 45002865841: every NtGdiCreateDIBSection returned NULL after win32k had created the
+/// section, so no theme part, icon or Start glyph drew (#428). Its BITMAPINFO and `ppvBits`
+/// stand-in live in the call's own bulk lease, not the shared argument frames, and the copy-back
+/// refused any address outside the shared frames.
+mod a_dib_section_staged_in_its_bulk_lease {
+    use super::*;
+
+    const LEASE: StageWindow = StageWindow { base: 0x100_2000_0000, bytes: 0x2000 };
+    const BITS_VA: u64 = LEASE.base + 0x430;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct DibSectionBits {
+        client: u64,
+        staged: u64,
+        lease: StageWindow,
+    }
+
+    impl StagedOutputPlan for DibSectionBits {
+        fn output_ranges(&self, out: &mut Vec<OutputRange>) {
+            out.push(OutputRange { va: self.staged, len: 8 });
+        }
+
+        fn bulk_window(&self) -> Option<StageWindow> {
+            Some(self.lease)
+        }
+    }
+
+    #[test]
+    fn its_immediate_copy_back_may_read_the_lease() {
+        let plan = DibSectionBits { client: 0x7_0000_1000, staged: BITS_VA, lease: LEASE };
+        let windows = StageWindows::of(&plan, SHARED);
+        assert!(windows.contains(BITS_VA, 8));
+        assert!(windows.contains(SIZE_VA, 8), "the shared frames stay readable");
+        assert!(!windows.contains(LEASE.base + LEASE.bytes - 4, 8), "a straddling read");
+        assert!(!windows.contains(LEASE.base + LEASE.bytes, 8), "past the lease");
+    }
+
+    #[test]
+    fn a_parked_one_captures_the_bits_pointer_from_the_lease() {
+        let bits = 0x0000_7ff0_1234_0000u64.to_le_bytes();
+        let mut parked = ParkedStagedOutputs::new();
+        parked.retain(12, DibSectionBits { client: 0x7_0000_1000, staged: BITS_VA, lease: LEASE })
+            .unwrap();
+        assert!(parked.capture(12, SHARED, |va, out| {
+            assert_eq!(va, BITS_VA);
+            out.copy_from_slice(&bits);
+            true
+        }));
+        let (plan, captured) = parked.take(12).unwrap().unwrap();
+        assert_eq!(captured.bytes(plan.staged, 8), Some(&bits[..]));
+    }
+
+    #[test]
+    fn a_plan_without_a_lease_reads_only_the_shared_frames() {
+        let plan = TextExtentPlan { client_size: 0x1000, staged_size: BITS_VA };
+        assert!(!StageWindows::of(&plan, SHARED).contains(BITS_VA, 8));
+        let mut parked = ParkedStagedOutputs::new();
+        parked.retain(13, plan).unwrap();
+        assert!(!parked.capture(13, SHARED, |_, _| panic!("read outside the staged memory")));
+    }
 }

@@ -18,18 +18,29 @@ use super::*;
 use nt_kernel_exec::gdi_text_metrics::{TextMetricsCall, TextMetricsSummary};
 use nt_kernel_exec::user_window_list::BuildHwndListCall;
 use nt_kernel_exec::win32k_staged_output::{
-    OutputRange, ParkedStagedOutputs, StageBytes, StagedOutputPlan, TakeError,
+    OutputRange, ParkedStagedOutputs, StageBytes, StageWindow, StageWindows, StagedOutputPlan,
+    TakeError,
 };
 
-/// The executive's view of the shared argument frames as the provider left them.
-struct LiveStage;
+/// The shared argument frames, mapped in both the executive and win32k.
+const SHARED_STAGE: StageWindow = StageWindow {
+    base: win32k_subsystem::WIN32K_ARG_VADDR,
+    bytes: win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000,
+};
+
+/// The executive's view of one plan's staged memory as the provider left it: the shared frames,
+/// plus the call's own bulk lease, which stays mapped until its dispatch completes (#428).
+struct LiveStage(StageWindows);
+
+impl LiveStage {
+    fn of(plan: &StagedOutput) -> Self {
+        Self(StageWindows::of(plan, SHARED_STAGE))
+    }
+}
 
 impl StageBytes for LiveStage {
     fn bytes(&self, va: u64, len: usize) -> Option<&[u8]> {
-        let start = win32k_subsystem::WIN32K_ARG_VADDR;
-        let end = start + win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000;
-        let last = va.checked_add(len as u64)?;
-        (va >= start && last <= end)
+        self.0.contains(va, len)
             .then(|| unsafe { core::slice::from_raw_parts(va as *const u8, len) })
     }
 }
@@ -59,8 +70,8 @@ pub(crate) enum StagedOutput {
     },
     /// NtGdiGetCharWidthW's width buffer.
     CharWidth { client: u64, staged: u64, bytes: usize },
-    /// NtGdiCreateDIBSection's `ppvBits`.
-    DibSectionBits { client: u64, staged: u64 },
+    /// NtGdiCreateDIBSection's `ppvBits`, staged in the call's own bulk lease.
+    DibSectionBits { client: u64, staged: u64, lease: StageWindow },
     /// NtUserMessageCall's `ResultInfo`.
     MessageCall { client: u64, staged: u64, bytes: usize },
 }
@@ -106,6 +117,13 @@ impl StagedOutputPlan for StagedOutput {
             Self::CharWidth { staged, bytes, .. } | Self::MessageCall { staged, bytes, .. } => {
                 push(staged, bytes)
             }
+        }
+    }
+
+    fn bulk_window(&self) -> Option<StageWindow> {
+        match *self {
+            Self::DibSectionBits { lease, .. } => Some(lease),
+            _ => None,
         }
     }
 }
@@ -165,7 +183,7 @@ impl StagedOutput {
         let copy = |client: u64, staged: u64, len: usize| out(client, staged, len, false);
         let ok = match *self {
             Self::OpenDcw { client, staged } => result == 0 || write(client, staged, 8),
-            Self::DibSectionBits { client, staged } => result == 0 || copy(client, staged, 8),
+            Self::DibSectionBits { client, staged, .. } => result == 0 || copy(client, staged, 8),
             Self::BuildHwndList(call) => {
                 let list = win32k_subsystem::WIN32K_ARG_VADDR;
                 match stage.read_u32(list + WIN32K_BUILD_HWND_LIST_COUNT_OFFSET) {
@@ -223,7 +241,7 @@ pub(crate) unsafe fn copy_back_immediate(
     pi: usize,
     scratch_base: u64,
 ) -> Result<(), CopyBackFailed> {
-    plan.copy_back(&LiveStage, result, pi, b"immediate", scratch_base)
+    plan.copy_back(&LiveStage::of(&plan), result, pi, b"immediate", scratch_base)
 }
 
 static mut PARKED: ParkedStagedOutputs<StagedOutput> = ParkedStagedOutputs::new();
@@ -243,8 +261,10 @@ pub(crate) fn retain_parked(dispatch_id: u64, plan: StagedOutput) {
 
 /// The provider finished a parked dispatch: bind its outputs before the page is reused.
 pub(crate) unsafe fn capture_completed(dispatch_id: u64) {
-    let captured = parked().capture(dispatch_id, |va, out| {
-        LiveStage.bytes(va, out.len()).map(|bytes| out.copy_from_slice(bytes)).is_some()
+    // The crate admits only the plan's own windows; each is mapped while the dispatch is retained.
+    let captured = parked().capture(dispatch_id, SHARED_STAGE, |va, out| {
+        out.copy_from_slice(core::slice::from_raw_parts(va as *const u8, out.len()));
+        true
     });
     if !captured {
         print_str(b"[win32k-staged-output] completion outside the staged page id=");

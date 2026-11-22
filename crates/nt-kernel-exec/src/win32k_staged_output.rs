@@ -11,7 +11,8 @@
 //! * the completion copies the captured bytes back, and a completion whose output was never
 //!   captured fails instead of reporting success ([`ParkedStagedOutputs::take`]).
 //!
-//! The plan type is the caller's: it only has to name the ranges it reads back.
+//! The plan type is the caller's: it names the ranges it reads back and, when it staged in a
+//! per-call bulk lease rather than the shared argument frames, that lease ([`StageWindows`]).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -44,6 +45,44 @@ pub trait StageBytes {
 /// A plan that knows which staged ranges its copy-back reads.
 pub trait StagedOutputPlan: Copy {
     fn output_ranges(&self, out: &mut Vec<OutputRange>);
+
+    /// The call's own bulk lease, when it staged outputs there instead of in the shared frames.
+    fn bulk_window(&self) -> Option<StageWindow> {
+        None
+    }
+}
+
+/// A span of provider memory the executive also maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageWindow {
+    pub base: u64,
+    pub bytes: u64,
+}
+
+impl StageWindow {
+    /// Whether all `len` bytes at `va` lie inside this window.
+    pub fn contains(&self, va: u64, len: usize) -> bool {
+        let Some(end) = va.checked_add(len as u64) else { return false };
+        va >= self.base && self.base.checked_add(self.bytes).is_some_and(|limit| end <= limit)
+    }
+}
+
+/// Where one plan's staged outputs may be read: the shared argument frames and, if the call
+/// staged there, its own bulk lease (which stays mapped until the dispatch completes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageWindows {
+    shared: StageWindow,
+    bulk: Option<StageWindow>,
+}
+
+impl StageWindows {
+    pub fn of<P: StagedOutputPlan>(plan: &P, shared: StageWindow) -> Self {
+        Self { shared, bulk: plan.bulk_window() }
+    }
+
+    pub fn contains(&self, va: u64, len: usize) -> bool {
+        self.shared.contains(va, len) || self.bulk.is_some_and(|bulk| bulk.contains(va, len))
+    }
 }
 
 /// The declared output ranges of a plan, copied when the provider completed.
@@ -54,17 +93,19 @@ pub struct CapturedStage {
 
 impl CapturedStage {
     /// Copy each of `plan`'s ranges through `read` (`read(va, buffer)` fills `buffer` from the
-    /// staged memory at `va`; `false` when `va` is not staged memory).
+    /// staged memory at `va`). A range outside the plan's [`StageWindows`] is never read.
     pub fn capture<P: StagedOutputPlan>(
         plan: &P,
+        shared: StageWindow,
         mut read: impl FnMut(u64, &mut [u8]) -> bool,
     ) -> Option<Self> {
+        let windows = StageWindows::of(plan, shared);
         let mut ranges = Vec::new();
         plan.output_ranges(&mut ranges);
         let mut captured = Vec::with_capacity(ranges.len());
         for range in ranges {
             let mut bytes = vec![0u8; range.len];
-            if !read(range.va, &mut bytes) {
+            if !windows.contains(range.va, range.len) || !read(range.va, &mut bytes) {
                 return None;
             }
             captured.push((range, bytes));
@@ -122,12 +163,18 @@ impl<P: StagedOutputPlan> ParkedStagedOutputs<P> {
     }
 
     /// The provider finished `dispatch_id`: copy its declared outputs out of the staged memory
-    /// now. `true` when the dispatch has no retained plan or its outputs were captured.
-    pub fn capture(&mut self, dispatch_id: u64, read: impl FnMut(u64, &mut [u8]) -> bool) -> bool {
+    /// (`shared`, plus the plan's own bulk lease) now. `true` when the dispatch has no retained
+    /// plan or its outputs were captured.
+    pub fn capture(
+        &mut self,
+        dispatch_id: u64,
+        shared: StageWindow,
+        read: impl FnMut(u64, &mut [u8]) -> bool,
+    ) -> bool {
         let Some(row) = self.rows.iter_mut().find(|row| row.dispatch_id == dispatch_id) else {
             return true;
         };
-        row.captured = CapturedStage::capture(&row.plan, read);
+        row.captured = CapturedStage::capture(&row.plan, shared, read);
         row.captured.is_some()
     }
 

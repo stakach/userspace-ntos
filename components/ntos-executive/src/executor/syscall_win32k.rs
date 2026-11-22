@@ -3668,9 +3668,12 @@ pub(super) unsafe fn syscall_win32k_route(
             } else if char_width_staged_stack {
                 let (client, staged, bytes) = char_width_copyout;
                 Some(StagedOutput::CharWidth { client, staged, bytes })
-            } else if create_dib_section_staged_stack {
+            } else if let Some(stage) = bulk_stage.filter(|_| create_dib_section_staged_stack) {
                 let (client, staged) = create_dib_section_bits_copyout;
-                Some(StagedOutput::DibSectionBits { client, staged })
+                let lease = nt_kernel_exec::win32k_staged_output::StageWindow {
+                    base: stage.base(), bytes: stage.bytes(),
+                };
+                Some(StagedOutput::DibSectionBits { client, staged, lease })
             } else if message_call_staged_stack {
                 let (client, staged, bytes) = message_call_copyout;
                 Some(StagedOutput::MessageCall { client, staged, bytes })
