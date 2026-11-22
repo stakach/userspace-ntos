@@ -562,6 +562,7 @@ pub(super) unsafe fn syscall_win32k_route(
     let mut user_rect_probe_failed = false;
     let mut text_metrics_copyout: Option<nt_kernel_exec::gdi_text_metrics::TextMetricsCall> = None;
     let mut text_metrics_probe_failed = false;
+    let mut staged_output: Option<crate::service_sec_image::win32k_staged_output::StagedOutput> = None;
     let mut get_text_extent_stack_args = [0u64; 1];
     let mut get_text_extent_stack_arg_count = 0usize;
     let mut get_text_extent_copyout = (0u64, 0u64);
@@ -3644,6 +3645,39 @@ pub(super) unsafe fn syscall_win32k_route(
         trace_cursor_lookup_owner(
             "pre-dispatch", client, lp.msg.m0, dispatch_id, None, false, false, false,
         );
+        staged_output = {
+            use crate::service_sec_image::win32k_staged_output::StagedOutput;
+            if open_dcw_staged_stack && open_dcw_dhpdev_copyout.0 != 0 {
+                let (client, staged) = open_dcw_dhpdev_copyout;
+                Some(StagedOutput::OpenDcw { client, staged })
+            } else if let Some(call) = build_hwnd_list_call.filter(|_| build_hwnd_list_staged_stack) {
+                Some(StagedOutput::BuildHwndList(call))
+            } else if get_icon_info_staged_stack {
+                Some(StagedOutput::IconInfo(get_icon_info_copyout))
+            } else if let Some(call) = text_metrics_copyout {
+                Some(StagedOutput::TextMetrics(call))
+            } else if get_text_extent_staged_stack {
+                let (client_size, staged_size) = get_text_extent_copyout;
+                Some(StagedOutput::TextExtent { client_size, staged_size })
+            } else if text_extent_staged_stack {
+                let (client_fit, staged_fit, client_dx, staged_dx, client_size, staged_size, dx_bytes) =
+                    text_extent_copyout;
+                Some(StagedOutput::TextExtentEx {
+                    client_fit, staged_fit, client_dx, staged_dx, client_size, staged_size, dx_bytes,
+                })
+            } else if char_width_staged_stack {
+                let (client, staged, bytes) = char_width_copyout;
+                Some(StagedOutput::CharWidth { client, staged, bytes })
+            } else if create_dib_section_staged_stack {
+                let (client, staged) = create_dib_section_bits_copyout;
+                Some(StagedOutput::DibSectionBits { client, staged })
+            } else if message_call_staged_stack {
+                let (client, staged, bytes) = message_call_copyout;
+                Some(StagedOutput::MessageCall { client, staged, bytes })
+            } else {
+                None
+            }
+        };
         let mut r = dispatch_win32k_for_client_with_completion_args(
             &mut nt_handler,
             dispatch_id,
@@ -3706,96 +3740,15 @@ pub(super) unsafe fn syscall_win32k_route(
                 );
             }
         }
-        if open_dcw_staged_stack && r.1 && r.0 != 0 {
-            let (client_out, staged_out) = open_dcw_dhpdev_copyout;
-            let dhpdev = core::ptr::read_unaligned(staged_out as *const u64);
-            if client_out != 0
-                && !img_spawn::client_write_u64_mapped(
-                    pi as u64,
-                    client_out,
-                    dhpdev,
-                    scratch_base,
-                )
+        // One copy-back for every output staged in the shared argument page. A dispatch that
+        // parked instead retains its plan below and returns it from its completion.
+        if let (Some(plan), true) = (staged_output, r.1) {
+            if crate::service_sec_image::win32k_staged_output::copy_back_immediate(
+                plan, r.0, pi, scratch_base,
+            )
+            .is_err()
             {
-                let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                if failures < 8 {
-                    print_str(
-                        b"[win32k-svc] NtGdiOpenDCW pUMDHPDEV copy-out failed pi=",
-                    );
-                    print_u64(pi as u64);
-                    print_str(b" buffer=0x");
-                    print_hex_u64(client_out);
-                    print_str(b"\n");
-                }
-                r = (0xC000_0001, false);
-            }
-        }
-        if let Some(call) = build_hwnd_list_call.filter(|_| build_hwnd_list_staged_stack && r.1) {
-            let (client_list, client_needed) = (call.list, call.needed);
-            let staged_list = win32k_subsystem::WIN32K_ARG_VADDR;
-            let copy_out = call.copy_out(
-                r.0 as u32,
-                core::ptr::read_unaligned(
-                    (staged_list + WIN32K_BUILD_HWND_LIST_COUNT_OFFSET) as *const u32,
-                ),
-                WIN32K_BUILD_HWND_LIST_MAX_HANDLES,
-            );
-            let handles_to_copy = copy_out.handles;
-            let needed_ok = copy_out.needed.is_none_or(|needed| {
-                img_spawn::client_write_mapped(
-                    pi as u64,
-                    client_needed,
-                    &needed.to_le_bytes(),
-                    scratch_base,
-                )
-            });
-            let handles_ok = handles_to_copy == 0
-                || img_spawn::client_copyout_mapped(
-                    pi as u64,
-                    client_list,
-                    core::slice::from_raw_parts(
-                        staged_list as *const u8,
-                        handles_to_copy * 8,
-                    ),
-                    scratch_base,
-                );
-            if !needed_ok || !handles_ok {
-                let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                if failures < 8 {
-                    print_str(b"[win32k-svc] NtUserBuildHwndList copy-out failed pi=");
-                    print_u64(pi as u64);
-                    print_str(b" list=0x");
-                    print_hex_u64(client_list);
-                    print_str(b" needed=0x");
-                    print_hex_u64(client_needed);
-                    print_str(b" handles=");
-                    print_u64(handles_to_copy as u64);
-                    print_str(b"\n");
-                }
-                r = (0xC000_0005, false);
-            }
-        }
-        if get_icon_info_staged_stack && r.1 && r.0 != 0 {
-            if !copy_back_get_icon_info(
-                pi as u64,
-                get_icon_info_copyout,
-                scratch_base,
-            ) {
-                let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                if failures < 8 {
-                    print_str(b"[win32k-svc] NtUserGetIconInfo copy-out failed pi=");
-                    print_u64(pi as u64);
-                    print_str(b" info=0x");
-                    print_hex_u64(get_icon_info_copyout.iconinfo_client);
-                    print_str(b" module=");
-                    print_u64(get_icon_info_copyout.module.is_some() as u64);
-                    print_str(b" resource=");
-                    print_u64(get_icon_info_copyout.resource.is_some() as u64);
-                    print_str(b" bpp=0x");
-                    print_hex_u64(get_icon_info_copyout.bpp_client);
-                    print_str(b"\n");
-                }
-                r = (0, true);
+                r = plan.failure_result();
             }
         }
         if r.1 {
@@ -3817,159 +3770,6 @@ pub(super) unsafe fn syscall_win32k_route(
                 ) {
                     r = (0, true);
                 }
-            }
-        }
-        if let (Some(call), true) = (text_metrics_copyout, r.1) {
-            if !crate::service_sec_image::copy_back_text_metrics(
-                pi, call, win32k_subsystem::WIN32K_ARG_VADDR as *const u8, r.0, b"immediate", scratch_base,
-            ) {
-                r = (0, true);
-            }
-        }
-        if get_text_extent_staged_stack && r.1 && r.0 != 0 {
-            let (client_size, staged_size) = get_text_extent_copyout;
-            let size_ok = img_spawn::client_write_mapped(
-                pi as u64,
-                client_size,
-                core::slice::from_raw_parts(staged_size as *const u8, 8),
-                scratch_base,
-            );
-            if !size_ok {
-                let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                if failures < 8 {
-                    print_str(b"[win32k-svc] NtGdiGetTextExtent copy-out failed pi=");
-                    print_u64(pi as u64);
-                    print_str(b" size=0x");
-                    print_hex_u64(client_size);
-                    print_str(b"\n");
-                }
-                r = (0, true);
-            }
-        }
-        if text_extent_staged_stack && r.1 && r.0 != 0 {
-            let (
-                client_fit,
-                staged_fit,
-                client_dx,
-                staged_dx,
-                client_size,
-                staged_size,
-                dx_bytes,
-            ) = text_extent_copyout;
-            let size_ok = img_spawn::client_write_mapped(
-                pi as u64,
-                client_size,
-                core::slice::from_raw_parts(staged_size as *const u8, 8),
-                scratch_base,
-            );
-            let fit_ok = client_fit == 0
-                || img_spawn::client_write_mapped(
-                    pi as u64,
-                    client_fit,
-                    core::slice::from_raw_parts(staged_fit as *const u8, 4),
-                    scratch_base,
-                );
-            let dx_ok = client_dx == 0
-                || dx_bytes == 0
-                || img_spawn::client_copyout_mapped(
-                    pi as u64,
-                    client_dx,
-                    core::slice::from_raw_parts(staged_dx as *const u8, dx_bytes),
-                    scratch_base,
-                );
-            if !size_ok || !fit_ok || !dx_ok {
-                let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                if failures < 8 {
-                    print_str(
-                        b"[win32k-svc] NtGdiGetTextExtentExW copy-out failed pi=",
-                    );
-                    print_u64(pi as u64);
-                    print_str(b" fit=0x");
-                    print_hex_u64(client_fit);
-                    print_str(b" dx=0x");
-                    print_hex_u64(client_dx);
-                    print_str(b" size=0x");
-                    print_hex_u64(client_size);
-                    print_str(b" dx-bytes=");
-                    print_u64(dx_bytes as u64);
-                    print_str(b"\n");
-                }
-                r = (0, true);
-            }
-        }
-        if char_width_staged_stack && r.1 && r.0 != 0 {
-            let (client_buffer, staged_buffer, output_bytes) = char_width_copyout;
-            let out_ok = output_bytes == 0
-                || img_spawn::client_copyout_mapped(
-                    pi as u64,
-                    client_buffer,
-                    core::slice::from_raw_parts(
-                        staged_buffer as *const u8,
-                        output_bytes,
-                    ),
-                    scratch_base,
-                );
-            if !out_ok {
-                let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                if failures < 8 {
-                    print_str(b"[win32k-svc] NtGdiGetCharWidthW copy-out failed pi=");
-                    print_u64(pi as u64);
-                    print_str(b" out=0x");
-                    print_hex_u64(client_buffer);
-                    print_str(b" bytes=");
-                    print_u64(output_bytes as u64);
-                    print_str(b"\n");
-                }
-                r = (0, true);
-            }
-        }
-        if create_dib_section_staged_stack && r.1 && r.0 != 0 {
-            let (client_bits_out, staged_bits_out) = create_dib_section_bits_copyout;
-            let bits_ok = client_bits_out == 0
-                || img_spawn::client_copyout_mapped(
-                    pi as u64,
-                    client_bits_out,
-                    core::slice::from_raw_parts(staged_bits_out as *const u8, 8),
-                    scratch_base,
-                );
-            if !bits_ok {
-                let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                if failures < 8 {
-                    print_str(
-                        b"[win32k-svc] NtGdiCreateDIBSection bits copy-out failed pi=",
-                    );
-                    print_u64(pi as u64);
-                    print_str(b" out=0x");
-                    print_hex_u64(client_bits_out);
-                    print_str(b"\n");
-                }
-                r = (0, true);
-            }
-        }
-        if message_call_staged_stack && r.1 {
-            let (client_result, staged_result, output_bytes) = message_call_copyout;
-            let result_ok = output_bytes == 0
-                || img_spawn::client_copyout_mapped(
-                    pi as u64,
-                    client_result,
-                    core::slice::from_raw_parts(
-                        staged_result as *const u8,
-                        output_bytes,
-                    ),
-                    scratch_base,
-                );
-            if !result_ok {
-                let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                if failures < 8 {
-                    print_str(
-                        b"[win32k-svc] NtUserMessageCall result copy-out failed pi=",
-                    );
-                    print_u64(pi as u64);
-                    print_str(b" result=0x");
-                    print_hex_u64(client_result);
-                    print_str(b"\n");
-                }
-                r = (0, true);
             }
         }
         if r.1 {
@@ -4169,6 +3969,11 @@ pub(super) unsafe fn syscall_win32k_route(
         if !bound {
             print_str(b"[win32k-bulk] exact DIB lease settlement failed\n");
             park();
+        }
+    }
+    if dispatch_entered && (handoff.parked || callback_suspended) {
+        if let (Some(plan), Some(context)) = (staged_output, dispatch_context) {
+            crate::service_sec_image::win32k_staged_output::retain_parked(context.dispatch_id, plan);
         }
     }
     if handoff.parked { sc.redirected_user_callback = true; }

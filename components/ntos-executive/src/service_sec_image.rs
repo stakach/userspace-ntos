@@ -6,6 +6,8 @@ use crate::fault_stack_diagnostics::read_fault_stack_word;
 use crate::*;
 use nt_user_host::hosted_return_target::HostedReturnTarget;
 
+#[path = "win32k_staged_output.rs"]
+pub(crate) mod win32k_staged_output;
 #[path = "executor/loop_state.rs"]
 mod loop_state;
 use loop_state::{Diag, Images, Ingress, LoopExit, LoopState, Message, Parks, Procs, Turn};
@@ -3454,61 +3456,6 @@ unsafe fn take_ready_deferred_user_callback_return() -> Option<DeferredCallbackR
     None
 }
 
-/// Per-process budget for successful GetTextMetricsW results; zero cells and failures are
-/// always traced, so a console that divides by its font cell leaves the cause in the log.
-static TEXT_METRICS_RESULT_TRACE: [core::sync::atomic::AtomicU8; 64] =
-    [const { core::sync::atomic::AtomicU8::new(0) }; 64];
-const TEXT_METRICS_SUCCESS_TRACE_PER_PROCESS: u8 = 2;
-
-/// Return a completed NtGdiGetTextMetricsW's staged TMW (at `staged`, provider memory) to the
-/// caller, as win32k does: exactly `cj` bytes, only when it returned TRUE. `false` when the
-/// caller's buffer could not be written, which win32k reports as FALSE.
-pub(crate) unsafe fn copy_back_text_metrics(
-    pi: usize,
-    call: nt_kernel_exec::gdi_text_metrics::TextMetricsCall,
-    staged: *const u8,
-    result: u64,
-    path: &[u8],
-    scratch_base: u64,
-) -> bool {
-    use nt_kernel_exec::gdi_text_metrics::TextMetricsSummary;
-    let bytes = call.copy_back_bytes(result);
-    let output = core::slice::from_raw_parts(staged, bytes);
-    let summary = TextMetricsSummary::read(output);
-    let copied = bytes == 0 || img_spawn::client_write_mapped(pi as u64, call.output, output, scratch_base);
-    let suspicious = bytes == 0 || !copied || summary.map_or(true, |summary| summary.has_zero_cell());
-    let budget = &TEXT_METRICS_RESULT_TRACE[pi.min(TEXT_METRICS_RESULT_TRACE.len() - 1)];
-    if suspicious || budget.fetch_add(1, Ordering::Relaxed) < TEXT_METRICS_SUCCESS_TRACE_PER_PROCESS {
-        print_str(b"[gdi-text-metrics] pi=");
-        print_u64(pi as u64);
-        print_str(b" path=");
-        print_str(path);
-        print_str(b" result=0x");
-        print_hex(result as u32);
-        print_str(b" cj=");
-        print_u64(call.bytes as u64);
-        print_str(b" copied=");
-        print_u64(copied as u64);
-        let print_i32 = |value: i32| {
-            if value < 0 {
-                print_str(b"-");
-            }
-            print_u64(u64::from(value.unsigned_abs()));
-        };
-        if let Some(summary) = summary {
-            print_str(b" tmHeight=");
-            print_i32(summary.height);
-            print_str(b" tmExternalLeading=");
-            print_i32(summary.external_leading);
-            print_str(b" tmAveCharWidth=");
-            print_i32(summary.ave_char_width);
-            print_str(b" tmMaxCharWidth=");
-            print_i32(summary.max_char_width);
-        }
-        print_str(b"\n");
-    }
-    copied
-}
 
 unsafe fn process_completed_user_callback_outer_dispatch(
     nt_handler: &mut ExecNtHandler,
@@ -3626,24 +3573,12 @@ unsafe fn process_completed_user_callback_outer_dispatch(
             winlogon_credential_observe_retrieved(hwnd, message.unwrap_or(0), wparam);
         }
     }
-    if let Some((call, bytes)) = nt_kernel_exec::gdi_text_metrics::completed_copy_back(
-        dispatch.ssn, dispatch.args, dispatch.status,
-    ) {
-        // The TMW was bound to this completion when the provider finished; a missing binding
-        // would hand gdi32 its uninitialized buffer as a successful result.
-        if dispatch.arg_snapshot_len as usize != bytes
-            || !copy_back_text_metrics(
-                completion_pi, call, dispatch.arg_snapshot.as_ptr(), dispatch.status,
-                b"completed", completion_scratch_base,
-            )
-        {
-            print_str(b"[gdi-text-metrics] completed TMW not returned pi=");
-            print_u64(completion_pi as u64);
-            print_str(b" snapshot=");
-            print_u64(dispatch.arg_snapshot_len as u64);
-            print_str(b" expected=");
-            print_u64(bytes as u64);
-            print_str(b"\n");
+    // Outputs staged in the shared argument page: retained when the dispatch parked and
+    // captured when the provider finished; a lost capture fails the completion.
+    if let Some(context) = dispatch.dispatch_context {
+        if !win32k_staged_output::copy_back_completed(
+            context.dispatch_id, dispatch.status, completion_pi, completion_scratch_base,
+        ) {
             return false;
         }
     }
@@ -10120,7 +10055,7 @@ struct CapturedGetAtomName {
 }
 
 #[derive(Clone, Copy)]
-struct CapturedUnicodeStringOut {
+pub(crate) struct CapturedUnicodeStringOut {
     desc_client: u64,
     buffer_client: u64,
     maximum_client: u16,
@@ -10131,7 +10066,7 @@ struct CapturedUnicodeStringOut {
 }
 
 #[derive(Clone, Copy)]
-struct CapturedGetIconInfo {
+pub(crate) struct CapturedGetIconInfo {
     iconinfo_client: u64,
     iconinfo_out: u64,
     bpp_client: u64,
@@ -10448,97 +10383,6 @@ unsafe fn stage_unicode_string_output_for_win32k(
         buffer_cap,
         original_desc: raw,
     })
-}
-
-unsafe fn copy_back_unicode_string_output(
-    pi: u64,
-    capture: CapturedUnicodeStringOut,
-    scratch_base: u64,
-) -> bool {
-    let mut staged = [0u8; 16];
-    core::ptr::copy_nonoverlapping(
-        capture.desc_out as *const u8,
-        staged.as_mut_ptr(),
-        staged.len(),
-    );
-    let length = u16::from_le_bytes([staged[0], staged[1]]);
-    let maximum = u16::from_le_bytes([staged[2], staged[3]]);
-    let staged_buffer = u64::from_le_bytes(staged[8..16].try_into().unwrap());
-
-    let mut out_desc = capture.original_desc;
-    out_desc[0..2].copy_from_slice(&length.to_le_bytes());
-    let client_maximum =
-        if staged_buffer == capture.buffer_out && length != 0 && maximum == capture.buffer_cap {
-            capture.maximum_client
-        } else {
-            maximum
-        };
-    out_desc[2..4].copy_from_slice(&client_maximum.to_le_bytes());
-
-    let (client_buffer, buffer_ok) = if staged_buffer == capture.buffer_out {
-        if length == 0 {
-            (capture.buffer_client, true)
-        } else if capture.buffer_client == 0
-            || length > capture.maximum_client
-            || length > capture.buffer_cap
-        {
-            (capture.buffer_client, false)
-        } else {
-            (
-                capture.buffer_client,
-                img_spawn::client_copyout_mapped(
-                    pi,
-                    capture.buffer_client,
-                    core::slice::from_raw_parts(capture.buffer_out as *const u8, length as usize),
-                    scratch_base,
-                ),
-            )
-        }
-    } else if is_int_resource_value(staged_buffer) || staged_buffer == 0 {
-        (staged_buffer, true)
-    } else {
-        (capture.buffer_client, false)
-    };
-    out_desc[8..16].copy_from_slice(&client_buffer.to_le_bytes());
-
-    buffer_ok
-        && img_spawn::client_write_mapped(
-            pi,
-            capture.desc_client,
-            &out_desc,
-            scratch_base,
-        )
-}
-
-unsafe fn copy_back_get_icon_info(
-    pi: u64,
-    capture: CapturedGetIconInfo,
-    scratch_base: u64,
-) -> bool {
-    let iconinfo_ok = capture.iconinfo_client == 0
-        || img_spawn::client_copyout_mapped(
-            pi,
-            capture.iconinfo_client,
-            core::slice::from_raw_parts(
-                capture.iconinfo_out as *const u8,
-                GET_ICON_INFO_ICONINFO_BYTES,
-            ),
-            scratch_base,
-        );
-    let bpp_ok = capture.bpp_client == 0
-        || img_spawn::client_copyout_mapped(
-            pi,
-            capture.bpp_client,
-            core::slice::from_raw_parts(capture.bpp_out as *const u8, 4),
-            scratch_base,
-        );
-    let module_ok = capture.module.is_none_or(|module| {
-        copy_back_unicode_string_output(pi, module, scratch_base)
-    });
-    let resource_ok = capture.resource.is_none_or(|resource| {
-        copy_back_unicode_string_output(pi, resource, scratch_base)
-    });
-    iconinfo_ok && bpp_ok && module_ok && resource_ok
 }
 
 unsafe fn capture_register_class_graph(

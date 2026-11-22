@@ -6,9 +6,8 @@
 //!
 //! win32k accepts `cj <= sizeof(TMW_INTERNAL)`, fills a private `TMW_INTERNAL` and copies
 //! exactly `cj` bytes to the caller only when it returns TRUE. The executive stages the output
-//! in provider memory, so every way the dispatch can complete, immediately or after the provider
-//! parked on a wait or a user callback, must copy those bytes back: gdi32 returns the caller's
-//! `TEXTMETRICW` from that buffer whenever the call returns TRUE.
+//! in provider memory and returns it through `win32k_staged_output` on every completion path:
+//! gdi32 returns the caller's `TEXTMETRICW` from that buffer whenever the call returns TRUE.
 
 /// The pinned LiberNT win32k's service number (`win32ss/w32ksvc64.h`).
 pub const GET_TEXT_METRICS_W_SSN: u64 = 0x1076;
@@ -53,17 +52,6 @@ impl TextMetricsCall {
     pub fn copy_back_bytes(&self, result: u64) -> usize {
         if result as u32 != 0 { self.bytes } else { 0 }
     }
-}
-
-/// The staged bytes a completed dispatch of service `ssn` with the caller's `args` and the
-/// provider's `result` returns to the caller: `(call, bytes)` for `NtGdiGetTextMetricsW`, on
-/// whichever path the dispatch completed. `None` for other services and refused calls.
-pub fn completed_copy_back(ssn: u64, args: [u64; 4], result: u64) -> Option<(TextMetricsCall, usize)> {
-    if ssn != GET_TEXT_METRICS_W_SSN {
-        return None;
-    }
-    let call = TextMetricsCall::capture(args).ok()?;
-    Some((call, call.copy_back_bytes(result)))
 }
 
 /// The metrics a console or text layout divides by, read from a returned `TEXTMETRICW`.
@@ -123,21 +111,6 @@ mod tests {
         assert_eq!(call.copy_back_bytes(0), 0);
         // BOOL: the upper half of the return register is undefined.
         assert_eq!(call.copy_back_bytes(0xffff_ffff_0000_0000), 0);
-    }
-
-    /// KVM run 44981790454: conhost's `set_console_font` got a zero `tmAveCharWidth` from a
-    /// TRUE GetTextMetricsW, then divided by it. A dispatch that parked on a provider wait or a
-    /// user callback completes away from the immediate copy-back, and must still return the TMW.
-    #[test]
-    fn a_completed_text_metrics_dispatch_returns_its_staged_output() {
-        let args = [0x0101_0042, 0x7_0000_8f00, 68, 0];
-        assert_eq!(
-            completed_copy_back(GET_TEXT_METRICS_W_SSN, args, 1),
-            Some((TextMetricsCall { output: 0x7_0000_8f00, bytes: 68 }, 68))
-        );
-        assert_eq!(completed_copy_back(GET_TEXT_METRICS_W_SSN, args, 0).map(|(_, n)| n), Some(0));
-        assert_eq!(completed_copy_back(GET_TEXT_METRICS_W_SSN, [0, 0, 68, 0], 1), None);
-        assert_eq!(completed_copy_back(0x1023, args, 1), None);
     }
 
     #[test]

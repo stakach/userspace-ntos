@@ -78,6 +78,7 @@ pub mod user_string;
 pub mod user_window_list;
 pub mod uuid_v1;
 pub mod win32k_lane_context;
+pub mod win32k_staged_output;
 mod work_item;
 pub mod x86_io;
 pub mod x86_cr8;

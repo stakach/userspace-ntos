@@ -1686,17 +1686,6 @@ unsafe fn release_dispatch_output_stage(context: nt_user_callback::DispatchConte
     }
 }
 
-/// A GetTextMetricsW that completed away from its immediate copy-back still owns the TMW win32k
-/// wrote into the dispatch page; bind it to the completion before the page is reused.
-unsafe fn capture_text_metrics_output(completed: &mut CompletedWin32kDispatch) {
-    if let Some((_, bytes)) = nt_kernel_exec::gdi_text_metrics::completed_copy_back(
-        completed.ssn, completed.args, completed.status,
-    ) {
-        if bytes != 0 {
-            let _ = completed.capture_arg_snapshot(bytes as u64);
-        }
-    }
-}
 
 unsafe fn capture_paint_dispatch_output(
     context: nt_user_callback::DispatchContext,
@@ -5171,6 +5160,7 @@ unsafe fn complete_resumed_dispatch(
     completed.logical_caller = client.logical_caller;
     completed.dispatch_return = pump.dispatch_return;
     completed.batch_records = completed_gdi_batch_records(pump.dispatch_return, pump.result, pump.completed);
+    crate::service_sec_image::win32k_staged_output::capture_completed(dispatch.dispatch_id);
     if dispatch.paint_output.is_some() {
         capture_paint_dispatch_output(dispatch, &mut completed);
     } else if matches!(
@@ -5192,9 +5182,6 @@ unsafe fn complete_resumed_dispatch(
         } else {
             completed.provider_output_len = u32::MAX;
         }
-    } else if dispatch.ssn == nt_kernel_exec::gdi_text_metrics::GET_TEXT_METRICS_W_SSN {
-        capture_text_metrics_output(&mut completed);
-        release_dispatch_output_stage(dispatch);
     } else {
         let _ = capture_resumed_userconnect_snapshot(
             &mut completed, arg_snapshot_len, &arg_snapshot,
@@ -5394,6 +5381,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     completed.logical_caller = client.logical_caller;
     completed.dispatch_return = pump.dispatch_return;
     completed.batch_records = completed_gdi_batch_records(pump.dispatch_return, pump.result, pump.completed);
+    crate::service_sec_image::win32k_staged_output::capture_completed(pending.dispatch.dispatch_id);
     if pending.dispatch.paint_output.is_some() {
         capture_paint_dispatch_output(pending.dispatch, &mut completed);
     } else if matches!(
@@ -5415,9 +5403,6 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         } else {
             completed.provider_output_len = u32::MAX;
         }
-    } else if pending.dispatch.ssn == nt_kernel_exec::gdi_text_metrics::GET_TEXT_METRICS_W_SSN {
-        capture_text_metrics_output(&mut completed);
-        release_dispatch_output_stage(pending.dispatch);
     } else {
         let _ = capture_resumed_userconnect_snapshot(
             &mut completed, pending.arg_snapshot_len, &pending.arg_snapshot,
@@ -6412,6 +6397,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     outer_dispatch.batch_records = completed_gdi_batch_records(
         component.dispatch_return, component.result, component.completed,
     );
+    crate::service_sec_image::win32k_staged_output::capture_completed(dispatch_context.dispatch_id);
     if dispatch_context.paint_output.is_some() {
         capture_paint_dispatch_output(dispatch_context, &mut outer_dispatch);
     } else if matches!(
@@ -6452,9 +6438,6 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         } else {
             let _ = outer_dispatch.capture_arg_snapshot(dispatch_context.args[2]);
         }
-    } else if dispatch_context.ssn == nt_kernel_exec::gdi_text_metrics::GET_TEXT_METRICS_W_SSN {
-        capture_text_metrics_output(&mut outer_dispatch);
-        release_dispatch_output_stage(dispatch_context);
     } else {
         release_dispatch_output_stage(dispatch_context);
     }
