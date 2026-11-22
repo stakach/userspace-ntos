@@ -541,7 +541,7 @@ pub(super) unsafe fn nested_work_ready() -> bool {
 
 pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
     let attempts = (&*core::ptr::addr_of!(WORK)).len();
-    nt_io_manager::hosted_forward_progress::redrive_ready_pass(attempts, || {
+    crate::service_sec_image::nested_ready_pass(attempts, || {
         redrive_one(handler, true)
     })
 }

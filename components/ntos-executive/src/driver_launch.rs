@@ -77305,9 +77305,13 @@ pub(crate) fn reconcile_retained_hosted_file_read_exact(
         .map_err(|(status, selector)| (status.raw() as u32, selector))
 }
 
-/// Dispatches refused admission with nothing entered so far (#427).
-pub(crate) fn hosted_admission_refusals() -> u64 {
-    hosted_file_owners::admission_refusals()
+/// File IRP dispatch admission so far: refusals with nothing entered, and admitted
+/// invocations that concluded or stopped (#427).
+pub(crate) fn hosted_admission_counts() -> nt_component_suspension::AdmissionCounts {
+    nt_component_suspension::AdmissionCounts {
+        refusals: hosted_file_owners::admission_refusals(),
+        admitted: hosted_file_dispatch::admitted_exits(),
+    }
 }
 
 /// How far a hosted File IRP's dispatch has got for its caller (#427).

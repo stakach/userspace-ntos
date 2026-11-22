@@ -229,11 +229,24 @@ impl FileDispatchContinuation {
     }
 }
 
+/// Admitted File IRP invocations that concluded or stopped (#427). A dispatch no lane admitted
+/// concludes before anything enters, so nothing nests inside it and it is not counted.
+static ADMITTED_EXITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn admitted_exits() -> u64 {
+    ADMITTED_EXITS.load(core::sync::atomic::Ordering::Acquire)
+}
+
+fn admitted_exit() {
+    ADMITTED_EXITS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
 /// Key a stopped stage's continuation to its invocation.
 fn yielded(
     invocation: ExternalFileIrpInvocation,
     continuation: FileDispatchContinuation,
 ) -> InvokeResult {
+    admitted_exit();
     match ExternalFileIrpPumpKey::new(&invocation, continuation.epoch()) {
         Some(key) => InvokeResult::ChildWorkYield { invocation, key, continuation },
         None => InvokeResult::UnkeyedChildWorkYield { invocation, continuation },
@@ -445,6 +458,7 @@ fn conclude(
     capture: ExternalFileIrpOutputCapture,
     outcome: ExternalFileIrpOutcome,
 ) -> InvokeResult {
+    if !matches!(outcome, ExternalFileIrpOutcome::NotAdmitted) { admitted_exit(); }
     let trace = capture == ExternalFileIrpOutputCapture::MethodNeitherInput;
     let (irp_id, device_id) = (invocation.projection().irp_id, invocation.projection().device_id);
     if trace { trace_port_connect_execute(2, irp_id, device_id); }

@@ -1251,7 +1251,7 @@ pub(super) unsafe fn receive(
             }
             observed_nested_file = true;
             crate::driver_launch::trace_port_connect_outer_probe(40, ch, u64::from(parent.is_some()));
-            let progressed = crate::service_sec_image::redrive_nested_hosted_file_work();
+            let progressed = crate::service_sec_image::redrive_nested_hosted_file_work().1;
             note_nested_progress(ch, Stage::NestedFileWork, progressed);
             if source_sample {
                 crate::print_str(b"[inline-source-work] stage/parked/progressed=after-child/");

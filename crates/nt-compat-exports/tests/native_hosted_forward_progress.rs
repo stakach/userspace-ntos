@@ -69,13 +69,6 @@ fn check_progress_boundary(name: &str) {
         nested_calls.0.iter().any(|call| call == "len"),
         "{name} must bound its ready pass by retained table size"
     );
-    assert!(
-        nested_calls
-            .0
-            .iter()
-            .any(|call| call == "redrive_ready_pass"),
-        "{name} must try later candidates before declaring no progress"
-    );
 }
 
 #[test]

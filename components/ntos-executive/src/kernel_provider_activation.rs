@@ -293,7 +293,7 @@ unsafe fn drive_kernel_job(
             }
         }
         }
-        if redrive_nested_hosted_file_work() { continue; }
+        if redrive_nested_hosted_file_work().1 { continue; }
         {
             // Root level: no continuation keeps a parent this service could not restore, so
             // the dropped handle makes the root its owner. Drain it before receiving (#333).

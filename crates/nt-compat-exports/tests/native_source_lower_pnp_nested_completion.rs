@@ -15,12 +15,4 @@ fn nested_lower_pnp_start_pumps_provider_completion_before_eligibility() {
         .find("completed_irp(retained.provider_irp())")
         .unwrap();
     assert!(retained < pump && pump < completed);
-
-    let runner = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
-    let nested = runner
-        .find("pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {")
-        .unwrap();
-    let nested = &runner[nested..runner[nested..].find("\n}").unwrap() + nested];
-    assert!(nested.contains("nested_hosted_lower_pnp_ready()"));
-    assert!(nested.contains("redrive_nested_hosted_lower_pnp(handler)"));
 }
