@@ -28,6 +28,9 @@ const STATUS_CANCELLED: u32 = 0xC000_0120;
 const MAX_NAME_UNITS: usize = 1024;
 const RETRY_DELAY_100NS: u64 = 1_000_000;
 const MAX_DEFINITE_CLOSE_RETRIES: u8 = 8;
+/// More than any row's forward phases (publication: start, canonical, rollback, ready, entered,
+/// settled; effect: start, canonical, ready, entered, settled).
+const PHASES_PER_ROW: usize = 8;
 static REDRIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NEXT_RETRY: AtomicU64 = AtomicU64::new(0);
 static NEXT_SCAN: AtomicU64 = AtomicU64::new(0);
@@ -972,12 +975,25 @@ pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) -> bool {
 pub(crate) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
     if handler.is_null() || REDRIVE_ACTIVE.swap(true, Ordering::AcqRel) { return false; }
     trace_redrive_entry(b"nested");
-    let progressed = redrive_one(&mut *handler) | redrive_effect_one(&mut *handler);
+    // A row that becomes ready in this pass (a publication reaching its Reply) acts now. A
+    // later pass is time-gated by NEXT_RETRY, and a parked AddDevice turn whose provider waits
+    // on this Reply sees no ready child meanwhile (boot 44975664572). Every row has finitely
+    // many forward phases, so the bound is reached only if rows keep progressing; then the
+    // rows stay due now for the next nested child step.
+    let bound = {
+        let broker = &*core::ptr::addr_of!(BROKER);
+        (broker.pending.len() + broker.effects.len())
+            .saturating_mul(PHASES_PER_ROW + MAX_DEFINITE_CLOSE_RETRIES as usize)
+            .saturating_add(1)
+    };
+    let pass = nt_hosted_runtime::drive_until_settled(bound,
+        || redrive_one(&mut *handler) | redrive_effect_one(&mut *handler));
     trace_redrive_entry(b"nested-return");
-    NEXT_RETRY.store(crate::monotonic_time_100ns().saturating_add(RETRY_DELAY_100NS), Ordering::Release);
+    let delay = if pass == nt_hosted_runtime::RedrivePass::Exhausted { 0 } else { RETRY_DELAY_100NS };
+    NEXT_RETRY.store(crate::monotonic_time_100ns().saturating_add(delay), Ordering::Release);
     REDRIVE_ACTIVE.store(false, Ordering::Release);
     crate::service_sec_image::rearm_registered_active_delay_timer_with_handler(&*handler);
-    progressed
+    pass.progressed()
 }
 
 fn trace_redrive_entry(source: &[u8]) {
