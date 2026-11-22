@@ -72,3 +72,36 @@ fn the_preserved_work_still_returns_its_result() {
     assert_eq!(progress, 3);
     assert!(bank.borrow().iter().all(|word| *word == 7));
 }
+
+/// `drive()` and `await_at_root` guard themselves too, inside maintenance's guard. A nested
+/// save restores the buffer its own scope found, and the outer one restores the received Call.
+#[test]
+fn a_kept_pump_drive_nested_in_maintenance_restores_in_stack_order() {
+    let bank = RefCell::new([0u64; IPC_BUFFER_WORDS]);
+    let info = received_map_view(&bank);
+    let read = |index| bank.borrow()[index];
+    let write = |index, word| bank.borrow_mut()[index] = word;
+    preserving_message_buffer(read, write, || {
+        // Maintenance's own work receives first.
+        bank.borrow_mut()[11] = 0x5151;
+        preserving_message_buffer(read, write, || resume_parked_dispatch(&bank));
+        assert_eq!(bank.borrow()[11], 0x5151, "the inner drive restores what it found");
+    });
+    assert_eq!(capture(info, &bank).word(11), Some(0x20), "the outer scope restores the Call");
+}
+
+/// A root-level handler waits for its kept pump (`await_at_root`) and reads more of its own
+/// request afterwards. The wait's receives must not replace it.
+#[test]
+fn a_root_wait_inside_a_handler_keeps_its_request_for_after_the_wait() {
+    let bank = RefCell::new([0u64; IPC_BUFFER_WORDS]);
+    let info = received_map_view(&bank);
+    let early = capture(info, &bank).word(4);
+    preserving_message_buffer(
+        |index| bank.borrow()[index],
+        |index, word| bank.borrow_mut()[index] = word,
+        || { for _ in 0..3 { resume_parked_dispatch(&bank); } },
+    );
+    let late = capture(info, &bank);
+    assert_eq!((early, late.word(4), late.word(11)), (Some(0x1004), Some(0x1004), Some(0x20)));
+}

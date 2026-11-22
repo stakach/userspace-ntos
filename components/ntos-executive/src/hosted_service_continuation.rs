@@ -480,6 +480,12 @@ impl Drop for RootWaitScope {
 /// does, wherever this frame may block. A frame that may not block (a timer delivery or a
 /// component-resume pass is running above it) gets the pump back as a root-turn continuation.
 unsafe fn await_at_root(pump: HostedPumpRestore) -> ServicePump {
+    // The wait receives on the root thread inside a handler that may still read its own
+    // delivered request from the buffer afterwards.
+    crate::ipc_message::preserving_received(|| await_at_root_unguarded(pump))
+}
+
+unsafe fn await_at_root_unguarded(pump: HostedPumpRestore) -> ServicePump {
     let _waiting = RootWaitScope::enter();
     if crate::dispatcher_bootstrap::is_owned() {
         let mut pump = Some(pump);
@@ -596,6 +602,12 @@ pub(crate) unsafe fn take_reply(ticket: nested::NestedRestoreTicket) -> Option<S
 
 /// Root boundary only: drive each intercepted service's kept pump once, then each fenced one.
 pub(crate) unsafe fn drive() -> usize {
+    // Resuming a kept pump receives on the root thread. Whatever caller runs this may hold a
+    // delivered, not yet captured request in the buffer; guard it here for every caller.
+    crate::ipc_message::preserving_received(|| drive_unguarded())
+}
+
+unsafe fn drive_unguarded() -> usize {
     // Ordinary File rows own their kept pumps; their callers collect each return (#420).
     let mut finished = crate::driver_launch::redrive_plain_file_pumps();
     if services().has_drivable() {
