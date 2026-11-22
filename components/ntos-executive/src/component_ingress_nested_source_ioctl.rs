@@ -432,9 +432,22 @@ pub(crate) unsafe fn restore_settled_source_ioctl_parent(
                     return Err(Error::Admission);
                 }
             }
-            match win32k_glue::restore_shared_resume_snapshot_effect(
+            // #419: take back the page the parent parked for its child before writing it.
+            if crate::win32k_shared_page_authority::audit_reacquire(
+                identity, Some(page), b"source-ioctl-restore",
+            ).is_err() && crate::win32k_shared_page_authority::ENFORCING {
+                // The child still holds the page: nothing is written, and this restore retries.
+                return Err(Error::Admission);
+            }
+            let effect = win32k_glue::restore_shared_resume_snapshot_effect(
                 source.shared_resume, source.dispatch, source.client,
-            ) {
+            );
+            crate::win32k_shared_page_authority::audit_restored(identity, match effect {
+                win32k_glue::SharedResumeRestoreEffect::Applied(applied) =>
+                    applied.lease_snapshot(source.client),
+                _ => None,
+            }, b"source-ioctl-restore");
+            match effect {
                 win32k_glue::SharedResumeRestoreEffect::NoPageWrite => {
                     source.checkpoint.finish_restore(
                         lanes(), nt_component_suspension::NestedPreEntryRestoreEffect::NoEffect,

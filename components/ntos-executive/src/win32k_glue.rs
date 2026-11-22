@@ -59,7 +59,8 @@ pub(crate) use pending_dispatch::{
 };
 use pending_dispatch::{
     capture_initial_arg_snapshot, capture_lpc_wait_repark, capture_provider_wait_repark,
-    capture_shared_resume_snapshot, park_callback_suspended_page, reacquire_parked_callback_page,
+    capture_shared_resume_snapshot, park_callback_suspended_page, park_deferred_source_ioctl_page,
+    reacquire_parked_callback_page,
     settle_pump_page,
     SuspendedPumpSnapshot,
     LPC_WAIT_LAST_PUMP_SUSPENDED, LPC_WAIT_PENDING_DISPATCH, PROVIDER_WAIT_LAST_PUMP_SUSPENDED,
@@ -4974,7 +4975,14 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     }
     use crate::spawn_hosts::shared_ingress::owner::runtime::nested;
-    match nested::park_resuming_source_ioctl(pending.dispatch, pending.client) {
+    let source_ioctl = nested::park_resuming_source_ioctl(pending.dispatch, pending.client);
+    if !matches!(source_ioctl, nested::SourceIoctlPark::NoChild) {
+        // #419: no pump runs for this dispatch now, so no pump settlement parks the page it
+        // just restored. Park it here, before a child (or this parent's own settled restore)
+        // takes the page.
+        park_deferred_source_ioctl_page(pending.dispatch, pending.client);
+    }
+    match source_ioctl {
         nested::SourceIoctlPark::NoChild => {}
         nested::SourceIoctlPark::RequeuedNoEffect => {
             return ProviderWaitPumpCompletion::NestedSourceDeferred;
