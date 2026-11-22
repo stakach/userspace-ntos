@@ -560,7 +560,7 @@ pub(super) unsafe fn syscall_win32k_route(
     let mut paint_output_stage_failed = false;
     let mut paintstruct_probe_failed = false;
     let mut user_rect_probe_failed = false;
-    let mut text_metrics_copyout = (0u64, 0u64, 0usize);
+    let mut text_metrics_copyout: Option<nt_kernel_exec::gdi_text_metrics::TextMetricsCall> = None;
     let mut text_metrics_probe_failed = false;
     let mut get_text_extent_stack_args = [0u64; 1];
     let mut get_text_extent_stack_arg_count = 0usize;
@@ -2139,30 +2139,15 @@ pub(super) unsafe fn syscall_win32k_route(
         // NtGdiGetTextMetricsW writes a caller-owned TMW_INTERNAL. Let win32k probe and
         // fill provider-owned memory, then copy the exact caller-requested byte count
         // back across the hosted-process boundary.
-        let cj = a2 as u32 as usize;
-        if (cj != 0 && d_a1 == 0) || cj > WIN32K_TEXT_METRICS_STAGE_BYTES {
-            text_metrics_probe_failed = true;
-        } else {
-            let staged_tmwi = win32k_subsystem::WIN32K_ARG_VADDR;
-            core::ptr::write_bytes(
-                staged_tmwi as *mut u8,
-                0,
-                WIN32K_TEXT_METRICS_STAGE_BYTES,
-            );
-            d_a1 = staged_tmwi;
-            d_a2 = cj as u32 as u64;
-            text_metrics_copyout = (a1, staged_tmwi, cj);
-            let n = TEXT_METRICS_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
-            if n < 24 {
-                print_str(b"[w32marshal] NtGdiGetTextMetricsW pi=");
-                print_u64(pi as u64);
-                print_str(b" hdc=0x");
-                print_hex_u64(a0);
-                print_str(b" out=0x");
-                print_hex_u64(a1);
-                print_str(b" bytes=");
-                print_u64(cj as u64);
-                print_str(b"\n");
+        use nt_kernel_exec::gdi_text_metrics::{TextMetricsCall, TMW_INTERNAL_BYTES};
+        match TextMetricsCall::capture([a0, a1, a2, a3]) {
+            Err(_) => text_metrics_probe_failed = true,
+            Ok(call) => {
+                let staged_tmwi = win32k_subsystem::WIN32K_ARG_VADDR;
+                core::ptr::write_bytes(staged_tmwi as *mut u8, 0, TMW_INTERNAL_BYTES);
+                d_a1 = staged_tmwi;
+                d_a2 = call.bytes as u64;
+                text_metrics_copyout = Some(call);
             }
         }
     } else if lp.msg.m0 == NTGDI_GET_TEXT_EXTENT_SSN && uses_client_gdi {
@@ -3834,30 +3819,10 @@ pub(super) unsafe fn syscall_win32k_route(
                 }
             }
         }
-        if lp.msg.m0 == NTGDI_GET_TEXT_METRICS_W_SSN && r.1 && r.0 != 0 {
-            let (client_tmwi, staged_tmwi, output_bytes) = text_metrics_copyout;
-            let tmwi_ok = output_bytes == 0
-                || (client_tmwi != 0
-                    && img_spawn::client_write_mapped(
-                        pi as u64,
-                        client_tmwi,
-                        core::slice::from_raw_parts(
-                            staged_tmwi as *const u8,
-                            output_bytes,
-                        ),
-                        scratch_base,
-                    ));
-            if !tmwi_ok {
-                let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                if failures < 8 {
-                    print_str(b"[win32k-svc] NtGdiGetTextMetricsW copy-out failed pi=");
-                    print_u64(pi as u64);
-                    print_str(b" out=0x");
-                    print_hex_u64(client_tmwi);
-                    print_str(b" bytes=");
-                    print_u64(output_bytes as u64);
-                    print_str(b"\n");
-                }
+        if let (Some(call), true) = (text_metrics_copyout, r.1) {
+            if !crate::service_sec_image::copy_back_text_metrics(
+                pi, call, win32k_subsystem::WIN32K_ARG_VADDR as *const u8, r.0, b"immediate", scratch_base,
+            ) {
                 r = (0, true);
             }
         }

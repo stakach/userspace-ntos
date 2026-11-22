@@ -383,7 +383,6 @@ static GET_ICON_INFO_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_BITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_DIB_SECTION_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_DIBITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
-static TEXT_METRICS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static OPEN_DCW_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -1057,7 +1056,6 @@ const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
 const WIN32K_BUILD_HWND_LIST_COUNT_OFFSET: u64 = 0x0ff0;
 const WIN32K_BUILD_HWND_LIST_MAX_HANDLES: u32 = (WIN32K_BUILD_HWND_LIST_COUNT_OFFSET / 8) as u32;
 const WIN32K_CREATE_BITMAP_STAGE_BYTES: usize = 0x4000;
-const WIN32K_TEXT_METRICS_STAGE_BYTES: usize = 68;
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
 const WIN32K_PAINTSTRUCT_STAGE_BYTES: usize = 72;
@@ -1080,7 +1078,7 @@ const NTGDI_ALPHA_BLEND_SSN: u64 = 0x107d;
 const NTGDI_STRETCH_DIBITS_INTERNAL_SSN: u64 = 0x1082;
 const NTUSER_FILL_WINDOW_SSN: u64 = 0x108a;
 const NTGDI_RECTANGLE_SSN: u64 = 0x1091;
-const NTGDI_GET_TEXT_METRICS_W_SSN: u64 = 0x1076;
+const NTGDI_GET_TEXT_METRICS_W_SSN: u64 = nt_kernel_exec::gdi_text_metrics::GET_TEXT_METRICS_W_SSN;
 const NTGDI_GET_TEXT_EXTENT_SSN: u64 = 0x1095;
 const FNID_DEFWINDOWPROC: u64 = 0x029e;
 const FNID_SENDMESSAGE: u64 = 0x02b1;
@@ -3456,6 +3454,62 @@ unsafe fn take_ready_deferred_user_callback_return() -> Option<DeferredCallbackR
     None
 }
 
+/// Per-process budget for successful GetTextMetricsW results; zero cells and failures are
+/// always traced, so a console that divides by its font cell leaves the cause in the log.
+static TEXT_METRICS_RESULT_TRACE: [core::sync::atomic::AtomicU8; 64] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; 64];
+const TEXT_METRICS_SUCCESS_TRACE_PER_PROCESS: u8 = 2;
+
+/// Return a completed NtGdiGetTextMetricsW's staged TMW (at `staged`, provider memory) to the
+/// caller, as win32k does: exactly `cj` bytes, only when it returned TRUE. `false` when the
+/// caller's buffer could not be written, which win32k reports as FALSE.
+pub(crate) unsafe fn copy_back_text_metrics(
+    pi: usize,
+    call: nt_kernel_exec::gdi_text_metrics::TextMetricsCall,
+    staged: *const u8,
+    result: u64,
+    path: &[u8],
+    scratch_base: u64,
+) -> bool {
+    use nt_kernel_exec::gdi_text_metrics::TextMetricsSummary;
+    let bytes = call.copy_back_bytes(result);
+    let output = core::slice::from_raw_parts(staged, bytes);
+    let summary = TextMetricsSummary::read(output);
+    let copied = bytes == 0 || img_spawn::client_write_mapped(pi as u64, call.output, output, scratch_base);
+    let suspicious = bytes == 0 || !copied || summary.map_or(true, |summary| summary.has_zero_cell());
+    let budget = &TEXT_METRICS_RESULT_TRACE[pi.min(TEXT_METRICS_RESULT_TRACE.len() - 1)];
+    if suspicious || budget.fetch_add(1, Ordering::Relaxed) < TEXT_METRICS_SUCCESS_TRACE_PER_PROCESS {
+        print_str(b"[gdi-text-metrics] pi=");
+        print_u64(pi as u64);
+        print_str(b" path=");
+        print_str(path);
+        print_str(b" result=0x");
+        print_hex(result as u32);
+        print_str(b" cj=");
+        print_u64(call.bytes as u64);
+        print_str(b" copied=");
+        print_u64(copied as u64);
+        let print_i32 = |value: i32| {
+            if value < 0 {
+                print_str(b"-");
+            }
+            print_u64(u64::from(value.unsigned_abs()));
+        };
+        if let Some(summary) = summary {
+            print_str(b" tmHeight=");
+            print_i32(summary.height);
+            print_str(b" tmExternalLeading=");
+            print_i32(summary.external_leading);
+            print_str(b" tmAveCharWidth=");
+            print_i32(summary.ave_char_width);
+            print_str(b" tmMaxCharWidth=");
+            print_i32(summary.max_char_width);
+        }
+        print_str(b"\n");
+    }
+    copied
+}
+
 unsafe fn process_completed_user_callback_outer_dispatch(
     nt_handler: &mut ExecNtHandler,
     completion_pi: usize,
@@ -3570,6 +3624,27 @@ unsafe fn process_completed_user_callback_outer_dispatch(
             let hwnd = u64::from_le_bytes(dispatch.arg_snapshot[0..8].try_into().unwrap());
             let wparam = u64::from_le_bytes(dispatch.arg_snapshot[16..24].try_into().unwrap());
             winlogon_credential_observe_retrieved(hwnd, message.unwrap_or(0), wparam);
+        }
+    }
+    if let Some((call, bytes)) = nt_kernel_exec::gdi_text_metrics::completed_copy_back(
+        dispatch.ssn, dispatch.args, dispatch.status,
+    ) {
+        // The TMW was bound to this completion when the provider finished; a missing binding
+        // would hand gdi32 its uninitialized buffer as a successful result.
+        if dispatch.arg_snapshot_len as usize != bytes
+            || !copy_back_text_metrics(
+                completion_pi, call, dispatch.arg_snapshot.as_ptr(), dispatch.status,
+                b"completed", completion_scratch_base,
+            )
+        {
+            print_str(b"[gdi-text-metrics] completed TMW not returned pi=");
+            print_u64(completion_pi as u64);
+            print_str(b" snapshot=");
+            print_u64(dispatch.arg_snapshot_len as u64);
+            print_str(b" expected=");
+            print_u64(bytes as u64);
+            print_str(b"\n");
+            return false;
         }
     }
     if dispatch.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE && dispatch.status == 0 {

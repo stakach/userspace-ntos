@@ -34,6 +34,7 @@ mod ex_cache_aware_rundown;
 mod ex_work_queue;
 pub mod executive_sync;
 pub mod gdi_bitmap;
+pub mod gdi_text_metrics;
 pub mod hosted_spin_wait;
 mod hosted_dpc;
 pub mod hosted_kmutex;
