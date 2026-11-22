@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded CI startup probe with a framebuffer capture; not desktop acceptance."""
+"""Bounded CI KVM boot, gated on the sealed Explorer desktop and the scripted interaction (#31)."""
 
 import argparse
 import json
@@ -16,10 +16,12 @@ if __package__:
     from .ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script
     from .ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
                                      read_run_state, request_quit)
+    from .ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
 else:
     from ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script
     from ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
                                     read_run_state, request_quit)
+    from ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -38,12 +40,14 @@ STOPPED_MARKER = ROOT / "native-kvm-qemu-stopped"
 STATIONARY_MARKER = ROOT / "native-kvm-stationary.txt"
 POST_SETUP_IDLE_MARKER = ROOT / "native-kvm-post-setup-idle.txt"
 INTERACTION_LOG = ROOT / "native-kvm-interact.jsonl"
+VERDICT = ROOT / "native-kvm-verdict.json"
+# The boot ran its whole bound without a fault or a desktop: a setup disk worth continuing.
+BOUND_REACHED_MARKER = ROOT / "native-kvm-bound-reached.txt"
 
 # Fixed 60-second QMP samples repeatedly hit the same clock-publication RIP,
 # while the guest's own cycle counter showed that path used only a few seconds.
 # Vary the phase so a periodic guest path cannot masquerade as a CPU hotspot.
 CPU_SAMPLE_DELAYS = (17, 31, 43, 59)
-EXECUTIVE_PANIC = re.compile(rb"!@(src/[A-Za-z0-9_./-]+\.rs:[1-9][0-9]*)\r?\n")
 TERMINAL_BOOT_STOP = re.compile(
     rb"(?:^|[\r\n])("
     rb"\[quiesce\] every live process parked/waiting \(no signaler left\) -> run gate"
@@ -87,9 +91,7 @@ PROCESS_EXIT = re.compile(
 USER_HIVE_LOADED = re.compile(
     rb"\[cm-load\] NtLoadKey MOUNTED \\Registry\\User\\(S-1-5-21-[0-9-]+) "
 )
-DESKTOP_EPOCH_SEALED = re.compile(
-    rb"\[quiesce\] Explorer runtime paint milestones complete; boot-progress epoch sealed"
-)
+DESKTOP_EPOCH_SEALED = DESKTOP_SEALED
 # The same record as a capture group, so a serial detector can wait for the sealed desktop.
 DESKTOP_EPOCH_SEALED_RECORD = re.compile(b"(" + DESKTOP_EPOCH_SEALED.pattern + b")")
 SPEC_PASS = re.compile(rb" {0,2}PASS ([A-Za-z0-9_]+)")
@@ -885,9 +887,10 @@ def main():
     parser.add_argument("--seconds", type=int, default=180)
     parser.add_argument("--trace-interrupts", action="store_true")
     parser.add_argument("--interact", nargs="?", const=DEFAULT_SCRIPT, type=Path,
-                        metavar="STEPS_JSON",
+                            metavar="STEPS_JSON",
                         help="after the sealed Explorer desktop, drive guest input from a step "
-                             "list and capture a screenshot after each step (evidence only)")
+                             "list and capture a screenshot after each step; the gate requires "
+                             "every step to complete")
     args = parser.parse_args()
     if not 1 <= args.seconds <= 3600:
         parser.error("--seconds must be between 1 and 3600")
@@ -910,6 +913,8 @@ def main():
     STATIONARY_MARKER.unlink(missing_ok=True)
     POST_SETUP_IDLE_MARKER.unlink(missing_ok=True)
     INTERACTION_LOG.unlink(missing_ok=True)
+    VERDICT.unlink(missing_ok=True)
+    BOUND_REACHED_MARKER.unlink(missing_ok=True)
     for stale in ROOT.glob("native-kvm-interact-*.ppm"):
         stale.unlink()
     command = [
@@ -976,7 +981,9 @@ def main():
                 print(f"QMP {reason} framebuffer captured: {SCREENSHOT.name}", flush=True)
             except (OSError, RuntimeError, ValueError) as error:
                 print(f"QMP {reason} framebuffer capture failed: {error}", flush=True)
+        bound_stop = threading.Event()
         def signal_guest(sig):
+            bound_stop.set()
             # A paused guest reset may ignore SIGTERM; QMP quit still exits and flushes.
             if sig == signal.SIGTERM and QMP_SOCKET.exists():
                 request_quit(QMP_SOCKET)
@@ -1170,33 +1177,42 @@ def main():
                 INTERRUPT_TRACE.unlink()
 
     if interaction is not None:
-        # Interaction is evidence only; its outcome never changes the boot verdict.
         print(f"Interaction outcome: {interaction.summary()}"
               + ("" if interaction.armed else " (desktop seal never observed)"), flush=True)
-    output = LOG.read_text(errors="replace")
+    serial = LOG.read_bytes()
     panic_site = panic_site or panic_detector.poll()
     if quiesce_fence is not None and terminal_reason is None:
         terminal_reason = QUIESCE_VERDICT_REASONS["unproven"]
     terminal_reason = terminal_reason or terminal_detector.poll()
-    if panic_site:
-        raise SystemExit(f"executive panic at {panic_site}; inspect native-kvm-smoke.log")
+    runner_failures = []
     if terminal_reason:
-        raise SystemExit(f"guest terminal {terminal_reason}; inspect native-kvm-smoke.log")
+        runner_failures.append(f"guest terminal {terminal_reason}")
+    if b"boot: reading Simpleboot memory map" not in serial:
+        runner_failures.append("guest startup marker absent")
+    if not captured:
+        runner_failures.append("no QMP framebuffer captured")
     if stationary_reason:
-        # Still a failed boot: the guest stopped making progress. The marker only lets the
-        # workflow keep this stopped disk so later boots need not replay setup.
-        evidence = post_setup_idle_evidence(LOG.read_bytes())
+        # The marker lets the workflow keep a stopped disk whose setup completed, so later
+        # boots need not replay setup; it is not a pass on its own.
+        evidence = post_setup_idle_evidence(serial)
         if evidence:
             POST_SETUP_IDLE_MARKER.write_text(evidence + "\n")
             print(f"Post-setup idle stop: {evidence}", flush=True)
-        raise SystemExit(f"guest stationary: {stationary_reason}; inspect native-kvm-stationary.txt")
-    if "boot: reading Simpleboot memory map" not in output:
-        raise SystemExit("guest startup marker absent; inspect native-kvm-smoke.log")
-    if not captured:
-        raise SystemExit("no QMP framebuffer captured; inspect native-kvm-smoke.log")
-    print("KVM smoke passed: guest started and QMP framebuffer was captured")
-    print("This probe does not establish Explorer desktop acceptance")
-
+    elif (bound_stop.is_set() and not panic_site and not terminal_reason
+            and not runner_failures):
+        BOUND_REACHED_MARKER.write_text(f"ran the whole {args.seconds}s bound\n")
+    outcome = (InteractionOutcome(requested=False) if interaction is None else
+               InteractionOutcome(requested=True, completed=interaction.index,
+                                  total=len(interaction_script.steps),
+                                  errors=interaction.failures))
+    verdict = boot_verdict(serial, outcome, runner_failures)
+    VERDICT.write_text(json.dumps({**verdict.to_json(), "stationary": stationary_reason,
+                                   "panic_site": panic_site}, indent=2) + "\n")
+    if not verdict.passed:
+        raise SystemExit("KVM desktop gate failed: " + "; ".join(verdict.reasons)
+                         + "; inspect native-kvm-smoke.log and native-kvm-verdict.json")
+    print("KVM desktop gate passed: Explorer sealed the desktop, the scripted interaction "
+          f"completed ({outcome.describe()}) and the log records no fault")
 
 if __name__ == "__main__":
     main()

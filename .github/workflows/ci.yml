@@ -59,6 +59,8 @@ jobs:
         run: cargo test --manifest-path rust-micro/crates/sel4-rt/Cargo.toml --lib 2>&1 | tee sel4-rt-specs.log
       - name: ntdll native-transport specs
         run: cargo test -p nt-ntdll --features native_transport --locked 2>&1 | tee native-transport-specs.log
+      - name: KVM runner and desktop gate specs
+        run: python3 -m unittest discover -s scripts/tests -p 'test_ci_kvm_smoke_*.py' 2>&1 | tee kvm-runner-specs.log
       - name: Native acceptance log verifier specs
         run: |
           python3 -m unittest discover -s tests/native/file_acceptance -p test_verify_log.py 2>&1 | tee file-log-specs.log
@@ -84,4 +86,5 @@ jobs:
             font-log-specs.log
             mup-log-specs.log
             mup-source-lifetime-specs.log
+            kvm-runner-specs.log
           if-no-files-found: warn

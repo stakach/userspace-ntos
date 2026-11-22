@@ -177,9 +177,26 @@ class ContinuationTests(unittest.TestCase):
             disk.publish(1, 3600, stop)
 
     def test_publish_records_how_the_boot_stopped(self):
-        self.publish_stop("bounded")
+        self.publish_stop("desktop")
         published = json.loads((self.paths["OUT"] / "manifest.json").read_text())
-        self.assertEqual(published["stop"], "bounded")
+        self.assertEqual(published["stop"], "desktop")
+
+    def test_the_pre_gate_bounded_kind_is_never_published(self):
+        with self.assertRaises(disk.ContinuationError):
+            self.publish_stop("bounded")
+        self.assertFalse(self.paths["OUT"].exists())
+
+    def test_bound_reached_publish_needs_the_runner_marker(self):
+        marker = self.root / "bound-reached.txt"
+        self.enterContext(patch.object(disk, "BOUND_REACHED_MARKER", marker))
+        with self.assertRaises(disk.ContinuationError):
+            self.publish_stop("bound-reached")
+        self.assertFalse(self.paths["OUT"].exists())
+        marker.write_text("ran the whole 3600s bound\n")
+        self.publish_stop("bound-reached")
+        published = json.loads((self.paths["OUT"] / "manifest.json").read_text())
+        self.assertEqual(published["stop"], "bound-reached")
+        self.assertIn("3600s", published["bound_reached_evidence"])
 
     def test_post_setup_idle_publish_needs_the_runner_evidence_marker(self):
         marker = self.root / "post-setup-idle.txt"
@@ -193,9 +210,9 @@ class ContinuationTests(unittest.TestCase):
         self.assertEqual(published["stop"], "post-setup-idle")
         self.assertIn("pid=360", published["post_setup_idle_evidence"])
 
-    def test_failed_source_run_is_accepted_only_with_a_post_setup_idle_disk(self):
+    def test_failed_source_run_is_accepted_only_with_a_marked_disk(self):
         self.run["conclusion"] = "failure"
-        for stop in (None, "bounded"):
+        for stop in (None, "bounded", "desktop"):
             with self.subTest(stop=stop):
                 manifest = dict(self.manifest)
                 if stop:
@@ -205,6 +222,13 @@ class ContinuationTests(unittest.TestCase):
                     self.restore()
                 self.assertEqual(self.paths["DISK"].read_bytes(), self.baseline)
         manifest = dict(self.manifest, stop="post-setup-idle")
+        self.paths["IN"].joinpath("manifest.json").write_text(json.dumps(manifest))
+        self.restore()
+        self.assertEqual(self.paths["DISK"].read_bytes(), self.advanced)
+
+    def test_failed_source_run_continues_a_bound_reached_disk(self):
+        self.run["conclusion"] = "failure"
+        manifest = dict(self.manifest, stop="bound-reached")
         self.paths["IN"].joinpath("manifest.json").write_text(json.dumps(manifest))
         self.restore()
         self.assertEqual(self.paths["DISK"].read_bytes(), self.advanced)

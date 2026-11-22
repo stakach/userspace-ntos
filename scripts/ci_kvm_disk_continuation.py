@@ -24,10 +24,21 @@ IN = ROOT / "native-kvm-continuation-in"
 RECEIPT = ROOT / "native-kvm-continuation-receipt.json"
 ROLLBACK_MARKER = ROOT / "native-kvm-continuation-rolled-back"
 POST_SETUP_IDLE_MARKER = ROOT / "native-kvm-post-setup-idle.txt"
+BOUND_REACHED_MARKER = ROOT / "native-kvm-bound-reached.txt"
 # How the source boot ended, and the only run conclusion each kind of disk may come from.
-# A post-setup-idle disk comes from a boot the runner failed as stationary after setup
-# completed and a user logged on; every other failed boot is rolled back, never published.
-STOP_CONCLUSIONS = {"bounded": "success", "post-setup-idle": "failure"}
+# A desktop disk comes from boots that passed the desktop gate. A failed run publishes only
+# a disk the runner marked: post-setup-idle (stationary after setup completed and a user
+# logged on) or bound-reached (the whole bound ran without a fault before any desktop).
+# Every other failed boot is rolled back, never published. `bounded` is the pre-gate kind,
+# when a run that reached its bound concluded success.
+STOP_CONCLUSIONS = {"desktop": "success", "post-setup-idle": "failure",
+                    "bound-reached": "failure", "bounded": "success"}
+
+
+def stop_marker(stop):
+    """The runner's evidence marker a failed run's stop kind must be published with."""
+    return {"post-setup-idle": POST_SETUP_IDLE_MARKER,
+            "bound-reached": BOUND_REACHED_MARKER}.get(stop)
 MIGRATION_CANDIDATE = DISK.with_name("disk.migration-candidate.img")
 WORKFLOW = ".github/workflows/native-kvm-smoke.yml"
 MAX_DISK_BYTES = 2 * 1024**3
@@ -436,17 +447,19 @@ def patch_migration_esp(candidate: Path, source: Path, current: dict) -> dict:
     return changes
 
 
-def publish(boot_runs: int, boot_seconds: int, stop: str = "bounded") -> None:
+def publish(boot_runs: int, boot_seconds: int, stop: str = "desktop") -> None:
     stopped()
     evidence = None
-    if stop == "post-setup-idle":
+    if stop == "bounded":
+        raise ContinuationError("bounded is a pre-gate stop kind; publish desktop or a marked stop")
+    if marker := stop_marker(stop):
         try:
-            require_regular(POST_SETUP_IDLE_MARKER, 4096)
+            require_regular(marker, 4096)
         except (OSError, ContinuationError) as error:
-            raise ContinuationError("post-setup idle evidence marker absent") from error
-        evidence = POST_SETUP_IDLE_MARKER.read_text().strip()
+            raise ContinuationError(f"{stop} evidence marker absent") from error
+        evidence = marker.read_text().strip()
         if not evidence:
-            raise ContinuationError("post-setup idle evidence marker is empty")
+            raise ContinuationError(f"{stop} evidence marker is empty")
     build = expected_build_after_boot()
     final_hash_path = ROOT / f"native-kvm-image-after-boot{boot_runs}.sha256"
     recorded = final_hash_path.read_text().split()[0]
@@ -470,7 +483,7 @@ def publish(boot_runs: int, boot_seconds: int, stop: str = "bounded") -> None:
                 ["qemu-system-x86_64", "--version"], text=True).splitlines()[0],
         }
         if evidence:
-            manifest["post_setup_idle_evidence"] = evidence
+            manifest[f"{stop.replace('-', '_')}_evidence"] = evidence
         manifest["generated_hive_sha256"] = digest(ROOT / "rust-micro/.tmp/hive.dat")
         if RECEIPT.exists():
             manifest["disk_origin"] = read_json_receipt()
@@ -628,7 +641,8 @@ def main() -> None:
     publish_command = subcommands.add_parser("publish")
     publish_command.add_argument("--boot-runs", type=int, choices=(1, 2), required=True)
     publish_command.add_argument("--boot-seconds", type=int, required=True)
-    publish_command.add_argument("--stop", choices=sorted(STOP_CONCLUSIONS), default="bounded")
+    publish_command.add_argument("--stop", choices=sorted(set(STOP_CONCLUSIONS) - {"bounded"}),
+                                 default="desktop")
     restore_command = subcommands.add_parser("restore")
     restore_command.add_argument("--run-id", type=int, required=True)
     restore_command.add_argument("--attempt", type=int, required=True)
