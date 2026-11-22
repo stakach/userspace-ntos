@@ -1,7 +1,7 @@
 //! Borrowed backend dispatches whose pump stopped unfinished (#420).
 //!
-//! A backend caller (a video ACK, a lifecycle ACK or `execute`) borrows its output and has no
-//! File row. When its pump stops with no lane to keep it, where the root cannot wait for it,
+//! A backend caller (a video ACK, a lifecycle ACK, `execute`, or the video START intercept's
+//! FindAdapter) borrows its output and has no File row. When its pump stops with no lane to keep it, where the root cannot wait for it,
 //! the native continuation and an owned copy of the output stay here instead of becoming an
 //! uncertain result. The root boundary resumes each kept pump; the caller keeps the ticket in
 //! its own row and collects the true result on a later turn, exactly once
@@ -11,8 +11,37 @@ use super::*;
 use hosted_file_dispatch::BackendTail;
 use nt_hosted_runtime::{BackendCollect, BackendTicket, KeptBackendPumps};
 
+/// The native half a kept backend pump resumes.
+enum Continuation {
+    /// An exact IRP dispatch or completion-storage control.
+    File(FileIrpPumpContinuation),
+    /// The video START intercept's FindAdapter, on its own channel.
+    VideoFindAdapter(hosted_video_find_adapter::Kept),
+}
+
+impl Continuation {
+    fn retryable(&self) -> bool {
+        match self {
+            Self::File(continuation) => continuation.retry_without_new_child(),
+            Self::VideoFindAdapter(kept) => kept.retryable(),
+        }
+    }
+
+    /// Resume once. `Err` is a pump that has not returned yet; it stays kept.
+    unsafe fn resume(self, output: &mut [u8]) -> Result<HostedIrpTransportResult, Self> {
+        match self {
+            Self::File(continuation) => match continuation.resume_after_child(output) {
+                Ok(FileIrpResumeProgress::Completed(result)) => Ok(result),
+                Ok(FileIrpResumeProgress::ChildWorkYield(continuation)) | Err(continuation) =>
+                    Err(Self::File(continuation)),
+            },
+            Self::VideoFindAdapter(kept) => kept.resume().map_err(Self::VideoFindAdapter),
+        }
+    }
+}
+
 struct KeptBackend {
-    continuation: FileIrpPumpContinuation,
+    continuation: Continuation,
     output: Vec<u8>,
     /// Owed once, when the native pump returns.
     tail: BackendTail,
@@ -81,11 +110,30 @@ pub(super) unsafe fn dispatch_exact(
             // The native output is copied only when the pump returns; size it exactly as the
             // caller's buffer.
             output.resize(out.len(), 0);
-            let ticket = kept().keep(KeptBackend { continuation, output, tail });
+            let ticket = kept().keep(KeptBackend {
+                continuation: Continuation::File(continuation), output, tail,
+            });
             trace(b"kept", ticket.id());
             Some(BackendDispatch::Pending(ticket))
         }
     }
+}
+
+/// Hold room for one FindAdapter pump before it enters, so [`keep_channel`] never allocates.
+pub(super) fn reserve_channel() -> Result<(), ()> {
+    kept().reserve()
+}
+
+/// Keep the video START intercept's unfinished FindAdapter pump, after a successful
+/// [`reserve_channel`]. It writes no output; its return is collected like any kept dispatch's.
+pub(super) fn keep_channel(pump: hosted_video_find_adapter::Kept) -> BackendTicket {
+    let ticket = kept().keep(KeptBackend {
+        continuation: Continuation::VideoFindAdapter(pump),
+        output: Vec::new(),
+        tail: BackendTail::None,
+    });
+    trace(b"kept", ticket.id());
+    ticket
 }
 
 /// Run first in the caller's turn, before any other effect.
@@ -118,7 +166,7 @@ pub(super) unsafe fn redrive() -> usize {
         _ => return 0,
     }
     let mut ids = Vec::new();
-    let ready = |kept: &KeptBackend| kept.continuation.retry_without_new_child();
+    let ready = |kept: &KeptBackend| kept.continuation.retryable();
     let count = kept().resumable(ready).count();
     if count == 0 || ids.try_reserve(count).is_err() { return 0; }
     ids.extend(kept().resumable(ready));
@@ -127,8 +175,8 @@ pub(super) unsafe fn redrive() -> usize {
         // A resume may keep or collect another row: hold no borrow across it.
         let Some(KeptBackend { continuation, mut output, tail }) = kept().take_pump(id)
         else { continue };
-        match continuation.resume_after_child(&mut output) {
-            Ok(FileIrpResumeProgress::Completed(result)) => {
+        match continuation.resume(&mut output) {
+            Ok(result) => {
                 let result = tail.finish_returned(result);
                 if kept().returned(id, (result, output)).is_err() {
                     trace(b"unowned-return", id);
@@ -138,7 +186,7 @@ pub(super) unsafe fn redrive() -> usize {
                 crate::completion_retry::returned();
                 progressed += 1;
             }
-            Ok(FileIrpResumeProgress::ChildWorkYield(continuation)) | Err(continuation) => {
+            Err(continuation) => {
                 if kept().unfinished(id, KeptBackend { continuation, output, tail }).is_err() {
                     trace(b"unowned-pump", id);
                 }

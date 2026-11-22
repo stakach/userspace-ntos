@@ -21,8 +21,13 @@ pub use control::{
     classify_start_io_status, video_port_control_owner, VideoControlCompletion,
     VideoControlProtocolError, VideoPortControlOwner,
 };
+mod find_adapter;
 mod lifecycle;
 mod pnp;
+pub use find_adapter::{
+    find_adapter_start, vp_status_to_nt, FindAdapterPump, FindAdapterStart, VP_ERROR_DEV_NOT_EXIST,
+    VP_ERROR_INVALID_PARAMETER, VP_ERROR_NOT_ENOUGH_MEMORY, VP_NO_ERROR,
+};
 pub use child_ids::{write_monitor_child_id, MonitorChildIdError, MonitorChildIdResult};
 pub use lifecycle::{
     validate_device_control_requestor, VideoAdapterDiscoveryState,

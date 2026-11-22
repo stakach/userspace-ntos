@@ -178,6 +178,8 @@ use hosted_pool_lock::{component_pool_lock, hosted_instance_pool_lock,
 mod component_scheduler;
 #[path = "hosted_backend_pumps.rs"]
 mod hosted_backend_pumps;
+#[path = "hosted_video_find_adapter.rs"]
+mod hosted_video_find_adapter;
 #[path = "hosted_backend_irp_operations.rs"]
 mod hosted_backend_irp_operations;
 #[path = "hosted_dpc_scheduler.rs"]
@@ -5768,7 +5770,6 @@ const STATUS_TIMEOUT_I32: i32 = 0x0000_0102;
 const STATUS_REVISION_MISMATCH: i32 = 0xC000_0059u32 as i32;
 const VP_NO_ERROR: u32 = 0;
 const VP_ERROR_INVALID_FUNCTION: u32 = 1;
-const VP_ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const VP_ERROR_DEV_NOT_EXIST: u32 = 55;
 const VP_ERROR_INVALID_PARAMETER: u32 = 87;
 const VP_ERROR_MORE_DATA: u32 = 234;
@@ -61307,16 +61308,6 @@ fn hosted_dma_status(error: DmaError) -> nt_status::NtStatus {
     }
 }
 
-fn video_port_status(status: u32) -> Result<(), nt_status::NtStatus> {
-    match status {
-        VP_NO_ERROR => Ok(()),
-        VP_ERROR_NOT_ENOUGH_MEMORY => Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES),
-        VP_ERROR_INVALID_PARAMETER => Err(nt_status::NtStatus::INVALID_PARAMETER),
-        VP_ERROR_DEV_NOT_EXIST => Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED),
-        _ => Err(nt_status::NtStatus::UNSUCCESSFUL),
-    }
-}
-
 unsafe fn clear_hosted_resource_projection(
     binding: HostedDeviceBinding,
     sh: u64,
@@ -73519,188 +73510,46 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
         };
     }
 
-    let root_status = if hosted_root_bus_mut()
-        .pdo(nt_io_manager::DeviceId(binding.pdo_device_id))
-        .is_some()
-    {
-        match hosted_root_bus_mut().dispatch_pnp_outcome(
-            nt_io_manager::DeviceId(binding.pdo_device_id),
-            IRP_MN_START_DEVICE as u8,
-        ) {
-            nt_root_bus::RootPdoPnpDispatch::Handled(status) => nt_status::NtStatus(status),
-            nt_root_bus::RootPdoPnpDispatch::Unhandled => {
-                return PnpBackendDispatch::NotDispatched {
-                    status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-                };
+    // Admitted as the IRP's one backend operation before the provider proof is consumed. An
+    // unfinished FindAdapter keeps its pump and the IRP is pending (#420).
+    let not_dispatched = |status| hosted_backend_pumps::BackendDispatch::Returned(
+        HostedIrpTransportResult::NotDispatched { status });
+    let result = hosted_backend_irp_operations::dispatch(index, irp, || {
+        let root_status = if hosted_root_bus_mut()
+            .pdo(nt_io_manager::DeviceId(binding.pdo_device_id))
+            .is_some()
+        {
+            match hosted_root_bus_mut().dispatch_pnp_outcome(
+                nt_io_manager::DeviceId(binding.pdo_device_id),
+                IRP_MN_START_DEVICE as u8,
+            ) {
+                nt_root_bus::RootPdoPnpDispatch::Handled(status) => nt_status::NtStatus(status),
+                nt_root_bus::RootPdoPnpDispatch::Unhandled => {
+                    return Some(not_dispatched(nt_status::NtStatus::INVALID_DEVICE_REQUEST));
+                }
             }
-        }
-    } else {
-        let proof = hosted_pnp_transactions_mut()
-            .iter_mut()
-            .find(|transaction| {
-                transaction.irp_id == irp.irp_id
-                    && transaction.minor == nt_pnp_manager::PnpMinor::StartDevice
-                    && transaction.binding.pdo_device_id == binding.pdo_device_id
-                    && transaction.binding.device_id == binding.device_id
-            })
-            .and_then(|transaction| transaction.video_provider_proof.take());
-        let Some(status) = proof else {
-            return PnpBackendDispatch::NotDispatched {
-                status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        } else {
+            let proof = hosted_pnp_transactions_mut()
+                .iter_mut()
+                .find(|transaction| {
+                    transaction.irp_id == irp.irp_id
+                        && transaction.minor == nt_pnp_manager::PnpMinor::StartDevice
+                        && transaction.binding.pdo_device_id == binding.pdo_device_id
+                        && transaction.binding.device_id == binding.device_id
+                })
+                .and_then(|transaction| transaction.video_provider_proof.take());
+            let Some(status) = proof else {
+                return Some(not_dispatched(nt_status::NtStatus::INVALID_DEVICE_REQUEST));
             };
+            status
         };
-        status
-    };
-    if !root_status.is_success() {
-        return PnpBackendDispatch::Returned {
-            status: root_status,
-            information: 0,
-        };
-    }
-
-    dispatch_video_find_adapter_pnp_for_instance(index, inst, binding.device_id, caller)
-}
-
-unsafe fn dispatch_video_find_adapter_pnp_for_instance(
-    index: usize,
-    inst: DriverInstance,
-    device_id: u64,
-    caller: nt_process::native_handle::NativeHandleCaller,
-) -> PnpBackendDispatch {
-    let sh = inst.exec_shared_va;
-    if read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) == 0 {
-        return PnpBackendDispatch::Indeterminate {
-            transport_status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        };
-    }
-    let Some((route_index, route_inst, device_object)) =
-        hosted_driver_device_route_by_device_id(device_id)
-    else {
-        return PnpBackendDispatch::NotDispatched {
-            status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        };
-    };
-    if route_index != index || route_inst.driver_id != inst.driver_id {
-        return PnpBackendDispatch::NotDispatched {
-            status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        };
-    }
-    write_volatile((sh + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, device_object);
-    let interface_type = read_volatile((sh + SH_RESOURCE_INTERFACE_TYPE) as *const u32);
-    let bus_number = read_volatile((sh + SH_RESOURCE_BUS_NUMBER) as *const u32);
-    let interrupt_vector = read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
-    let interrupt_mode = if interface_type == HOSTED_INTERFACE_TYPE_PCIBUS {
-        VIDEO_INTERRUPT_MODE_LEVEL_SENSITIVE
-    } else {
-        VIDEO_INTERRUPT_MODE_LATCHED
-    };
-    let config = VideoPortConfigInfoX64::new_pnp(
-        bus_number,
-        interface_type,
-        interrupt_vector,
-        interrupt_vector,
-        interrupt_mode,
-        0,
-        0,
-    );
-    let mut raw = [0u8; VIDEO_PORT_CONFIG_INFO_X64_SIZE];
-    if config.write(&mut raw).is_err() {
-        return PnpBackendDispatch::Indeterminate {
-            transport_status: nt_status::NtStatus::INVALID_PARAMETER,
-        };
-    }
-    let mut idx = 0usize;
-    while idx < raw.len() {
-        write_volatile((inst.exec_arg_va + idx as u64) as *mut u8, raw[idx]);
-        idx += 1;
-    }
-
-    write_volatile(
-        (sh + SH_REQ_MAJOR) as *mut u64,
-        FSD_DISPATCH_VIDEO_FIND_ADAPTER,
-    );
-    write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
-    write_volatile((sh + SH_REQ_FSCTL) as *mut u64, 0);
-    write_volatile(
-        (sh + SH_REQ_INLEN) as *mut u64,
-        VIDEO_PORT_CONFIG_INFO_X64_SIZE as u64,
-    );
-    write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, 0);
-    write_volatile((sh + SH_REQ_FILEID) as *mut u64, 0);
-    write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
-    write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
-
-    let Some(exec_window) = ExecVaWindow::try_for_instance(index) else {
-        return PnpBackendDispatch::Indeterminate {
-            transport_status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
-        };
-    };
-    let ch = crate::spawn_hosts::PumpChannel {
-        initial_root_dispatch: None,
-        fault_ep: inst.fault_ep,
-        pml4: inst.pml4,
-        physical_domain: instance_domain_identity(inst),
-        ingress_route: hosted_ingress_sources::primary_route(index),
-        code_va: 0,
-        image_frames: 0,
-        exec_code_va: exec_window.code_va,
-        root_image_rights: 3,
-        root_image_map_owner: inst.map_cap_bank.owner,
-        shared_va: sh,
-        dispatch_label: FSD_DISPATCH_LABEL,
-        demand_cap: 256,
-        trace_faults: false,
-        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
-        tcb: inst.tcb,
-        reply_cap: inst.reply_cap,
-        child_work_capable: false,
-        client_pi: 0,
-        client_generation: 0,
-        logical_caller: None,
-        kernel_caller: None,
-        caps: crate::spawn_hosts::HostCaps {
-            dispatch_server: true,
-            kind: crate::spawn_hosts::ReqKind::Irp,
-            io_port_faults: shared_has_port_resources(sh),
-            ..crate::spawn_hosts::HostCaps::default()
-        },
-    };
-    let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
-    if !pr.completed {
-        register_instance_ready(index, false);
-        return PnpBackendDispatch::Indeterminate {
-            transport_status: nt_status::NtStatus::UNSUCCESSFUL,
-        };
-    }
-    let component_status = nt_status::NtStatus(pr.status);
-    if !component_status.is_success() {
-        return PnpBackendDispatch::Returned {
-            status: component_status,
-            information: 0,
-        };
-    }
-    let video_status = pr.result as u32;
-    let again = read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8);
-    if video_status != VP_NO_ERROR || again != 0 {
-        print_str(b"[driver-launch] hosted video FindAdapter returned device_id=");
-        print_u64(device_id);
-        print_str(b" status=0x");
-        print_hex(video_status);
-        print_str(b" calls=");
-        print_u64(read_volatile(
-            (sh + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64,
-        ));
-        print_str(b" again=");
-        print_u64(again as u64);
-        print_str(b"\n");
-    }
-    PnpBackendDispatch::Returned {
-        status: match video_port_status(video_status) {
-            Ok(()) => nt_status::NtStatus::SUCCESS,
-            Err(status) => status,
-        },
-        information: 0,
-    }
+        if !root_status.is_success() {
+            return Some(hosted_backend_pumps::BackendDispatch::Returned(
+                HostedIrpTransportResult::Returned { status: root_status, information: 0, file_context: 0 }));
+        }
+        Some(hosted_video_find_adapter::dispatch(index, inst, binding.device_id, caller))
+    });
+    pnp_backend_dispatch(result)
 }
 
 unsafe fn hosted_instance_video_port_initialized(inst: DriverInstance) -> bool {
