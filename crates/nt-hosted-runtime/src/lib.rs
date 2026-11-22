@@ -37,7 +37,7 @@ mod provider_export_worker;
 mod ordinary_irp_lane;
 pub use ordinary_irp_lane::{
     queued_admission_candidates, select_ordinary_irp_lane, OrdinaryIrpLane, QueuedIrp,
-    WorkerIrpClaim,
+    worker_lane_dispatches_major, WorkerIrpClaim,
 };
 mod driver_load_slice;
 pub use driver_load_slice::{driver_load_step, DriverLoadSliceEnd, DriverLoadStep};

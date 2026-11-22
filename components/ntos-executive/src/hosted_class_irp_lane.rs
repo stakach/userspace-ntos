@@ -855,8 +855,9 @@ unsafe fn execute(request: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
             _ => unreachable!(),
         };
     }
-    if request.sel != major::IRP_MJ_INTERNAL_DEVICE_CONTROL as u64
-        && request.sel != major::IRP_MJ_CREATE as u64 {
+    // Ordinary IRPs reach this lane while the primary is parked (#427 B), not only the HOOK
+    // and class CREATE it was built for; it dispatches every major the primary does.
+    if !nt_hosted_runtime::worker_lane_dispatches_major(request.sel) {
         return (STATUS_INVALID_PARAMETER, 0);
     }
     let driver = read_volatile((shared + SH_DRVOBJ) as *const u64);

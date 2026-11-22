@@ -35,6 +35,16 @@ pub const fn select_ordinary_irp_lane(
     }
 }
 
+/// Major-function slots in a WDM `DRIVER_OBJECT` (`IRP_MJ_MAXIMUM_FUNCTION + 1`).
+const IRP_MAJOR_FUNCTION_COUNT: u64 = 0x1c;
+
+/// Whether a dispatch-worker lane runs an IRP of this major through the driver's MajorFunction
+/// table. A worker that takes the primary's ordinary IRPs must dispatch every major the
+/// primary does; lane controls (copy, ACK, cancel, callbacks) are handled before this.
+pub const fn worker_lane_dispatches_major(major: u64) -> bool {
+    major < IRP_MAJOR_FUNCTION_COUNT
+}
+
 /// The ordinary IRP a dispatch-worker lane has entered. Its later controls (copy, ACK) must reach
 /// this lane, whose bank holds it, so the lane admits no other IRP until the claim is released:
 /// by the IRP's ACK on this lane or by the retirement of its File owner, whichever comes first.
