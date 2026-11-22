@@ -70,6 +70,7 @@ mod registry_query_audit;
 mod hot_service_cost_census;
 mod hot_service_latency_census;
 mod reply_tail_step_census;
+mod component_pump_label_census;
 mod steady_trace;
 mod hosted_resume_census;
 mod process_deletion_demand;
@@ -7643,6 +7644,7 @@ pub(crate) fn census_tick_static(now: u64) {
     reply_tail_step_census::print_census();
     steady_trace::print_census();
     hosted_resume_census::print_census();
+    component_pump_label_census::print_census();
     registry_open_phase_census::print_census();
     {
         let frames = client_frame_registry_stats();

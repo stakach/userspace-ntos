@@ -3429,6 +3429,7 @@ unsafe fn component_pump_loop(
         outcome.provider_messages += 1;
         let label = msg.label();
         let _file_cycle = file_pump_diagnostic::MessageCycle::enter(ch, label);
+        let _label_cycle = crate::component_pump_label_census::LabelCycle::enter(label);
         crate::driver_launch::trace_port_connect_worker_message(
             ch.tcb, *reply_cap, msg.mi, msg.badge,
             [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4], seh.retained(),
