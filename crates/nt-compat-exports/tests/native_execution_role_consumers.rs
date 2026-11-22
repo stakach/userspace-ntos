@@ -30,7 +30,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("diag/post_loop.rs", 1),
     ("exec_file_create.rs", 1),
     ("exec_handler.rs", 23),
-    ("exec_installer_progress.rs", 1),
     ("executor/admission.rs", 1),
     ("executor/exceptions.rs", 4),
     ("executor/syscall.rs", 2),

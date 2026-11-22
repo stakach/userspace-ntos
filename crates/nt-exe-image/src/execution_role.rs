@@ -217,20 +217,30 @@ impl<const N: usize> ExecutionRoleLedger<N> {
             .is_some_and(HostedProcessRole::is_noninteractive_service_class)
     }
 
-    /// Follow only live, exact-generation creator records. A retired link cuts the chain.
-    pub fn installer_service_ancestor(
+    /// Find the worker's immediate creator and nearest service ancestor. Every link must
+    /// still be running under its committed identity, even before its ledger row is retired.
+    pub fn installer_service_owner(
         &self,
         target: SpawnTarget,
         process: ProcessIdentity,
-    ) -> Option<ProcessIdentity> {
-        let mut current = self.entry(target, process)?;
+        mut is_live: impl FnMut(SpawnTarget, ProcessIdentity) -> bool,
+    ) -> Option<(ProcessIdentity, ProcessIdentity)> {
+        let worker = self.entry(target, process)?;
+        if !is_live(worker.target, worker.process) {
+            return None;
+        }
+        let parent = worker.creator?;
+        let mut ancestor = parent;
         for _ in 0..N {
-            if current.role.is_noninteractive_service_class() {
-                return Some(current.process);
+            let current = self.entries.iter().flatten()
+                .find(|entry| entry.pending.is_none() && entry.process == ancestor)?;
+            if !is_live(current.target, current.process) {
+                return None;
             }
-            let creator = current.creator?;
-            current = self.entries.iter().flatten()
-                .find(|entry| entry.pending.is_none() && entry.process == creator)?;
+            if current.role.is_noninteractive_service_class() {
+                return Some((parent, current.process));
+            }
+            ancestor = current.creator?;
         }
         None
     }

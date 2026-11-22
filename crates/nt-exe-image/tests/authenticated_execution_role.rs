@@ -492,7 +492,7 @@ fn forged_parent_wrong_backing_stale_generation_and_repeat_cannot_transfer_role(
         Some(application_identity)
     );
     assert_eq!(
-        roles.installer_service_ancestor(forged_worker, forged_worker_identity),
+        roles.installer_service_owner(forged_worker, forged_worker_identity, |_, _| true),
         None,
         "forged PM parent must not turn an Application child into installer service work"
     );
@@ -512,17 +512,53 @@ fn forged_parent_wrong_backing_stale_generation_and_repeat_cannot_transfer_role(
         )
         .unwrap();
     assert_eq!(
-        roles.installer_service_ancestor(genuine_worker, genuine_worker_identity),
-        Some(services_identity),
+        roles.installer_service_owner(genuine_worker, genuine_worker_identity, |_, _| true),
+        Some((services_identity, services_identity)),
         "actual creator chain controls installer ancestry"
     );
+
+    let helper = child(&mut catalog, b"helper.exe", None);
+    let helper_identity = process(212, 10);
+    roles
+        .record_foreign_initial_thread(
+            &catalog,
+            lineage(
+                genuine_worker_identity,
+                helper_identity,
+                helper,
+                SectionFileIdentity { mount, file_id: 17 },
+                Some(application_identity),
+            ),
+        )
+        .unwrap();
+
+    let live = [
+        (helper, helper_identity),
+        (genuine_worker, genuine_worker_identity),
+        (dynamic_services, services_identity),
+    ];
+    assert_eq!(
+        roles.installer_service_owner(helper, helper_identity, |target, identity| {
+            live.contains(&(target, identity))
+        }),
+        Some((genuine_worker_identity, services_identity)),
+    );
+    for stale in live {
+        assert_eq!(
+            roles.installer_service_owner(helper, helper_identity, |target, identity| {
+                live.contains(&(target, identity)) && (target, identity) != stale
+            }),
+            None,
+            "a stopped or replaced generation must cut the creator chain: {stale:?}"
+        );
+    }
 
     roles
         .retire_exact(dynamic_services, services_identity)
         .unwrap();
     assert_eq!(roles.creator_of(dynamic_services, services_identity), None);
     assert_eq!(
-        roles.installer_service_ancestor(genuine_worker, genuine_worker_identity),
+        roles.installer_service_owner(genuine_worker, genuine_worker_identity, |_, _| true),
         None,
         "retiring the service generation invalidates descendant authority"
     );
@@ -587,7 +623,7 @@ fn pending_initial_thread_has_no_authority_until_exact_one_shot_commit() {
     let services_token = roles.reserve_foreign_initial_thread_role(&catalog, services_evidence)
         .unwrap();
     assert!(!roles.can_own_installer_service_work(dynamic_services, services_identity));
-    assert_eq!(roles.installer_service_ancestor(dynamic_services, services_identity), None);
+    assert_eq!(roles.installer_service_owner(dynamic_services, services_identity, |_, _| true), None);
     assert!(roles.commit_foreign_initial_thread(&catalog, services_token,
         dynamic_services, process(120, 3)).is_err());
     assert!(!roles.can_own_installer_service_work(dynamic_services, services_identity));
@@ -609,10 +645,13 @@ fn pending_initial_thread_has_no_authority_until_exact_one_shot_commit() {
         SectionFileIdentity { mount, file_id: 13 }, Some(smss_identity));
     let worker_token = roles.reserve_foreign_initial_thread_lineage(&catalog, worker_evidence)
         .unwrap();
-    assert_eq!(roles.installer_service_ancestor(worker, worker_identity), None);
+    assert_eq!(roles.installer_service_owner(worker, worker_identity, |_, _| true), None);
     roles.commit_foreign_initial_thread(&catalog, worker_token, worker, worker_identity)
         .unwrap();
-    assert_eq!(roles.installer_service_ancestor(worker, worker_identity), Some(services_identity));
+    assert_eq!(
+        roles.installer_service_owner(worker, worker_identity, |_, _| true),
+        Some((services_identity, services_identity)),
+    );
 
     // A pending child can complete after its verified caller exits. The reserved caller
     // identity survives, but a retired service can no longer supply ancestry authority.
@@ -626,7 +665,7 @@ fn pending_initial_thread_has_no_authority_until_exact_one_shot_commit() {
     roles.commit_foreign_initial_thread(&catalog, late_token, late_worker,
         late_worker_identity).unwrap();
     assert_eq!(roles.creator_of(late_worker, late_worker_identity), Some(services_identity));
-    assert_eq!(roles.installer_service_ancestor(late_worker, late_worker_identity), None);
+    assert_eq!(roles.installer_service_owner(late_worker, late_worker_identity, |_, _| true), None);
     assert!(roles.reserve_foreign_initial_thread_lineage(&catalog, late_evidence).is_err());
     let forged_after = child(&mut catalog, b"forged-after.exe", None);
     assert!(roles.reserve_foreign_initial_thread_lineage(&catalog,

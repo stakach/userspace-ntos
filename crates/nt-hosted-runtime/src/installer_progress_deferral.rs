@@ -14,7 +14,7 @@ const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xc000_0034;
 pub struct InstallerOwner<Process> {
     pub worker: Process,
     pub parent: Process,
-    /// A live registered noninteractive service ancestor reached by the current PM parent chain.
+    /// A live noninteractive service ancestor reached through committed creator identities.
     pub service: Process,
 }
 
@@ -87,8 +87,8 @@ impl<Process: Copy + Eq> InstallerProgressDeferral<Process> {
         }
     }
 
-    /// `owner` must be resolved from the admitted caller's exact process identity and current
-    /// parent relation. Call this only at the completed `NtOpenKey` result boundary.
+    /// `owner` must be resolved from the admitted caller's exact process identity and live
+    /// creator chain. Call this only at the completed `NtOpenKey` result boundary.
     pub fn observe_completed_probe(
         &mut self,
         owner: InstallerOwner<Process>,

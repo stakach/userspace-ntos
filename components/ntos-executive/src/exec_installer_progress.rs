@@ -8,36 +8,24 @@ type InstallerOwner = nt_hosted_runtime::InstallerOwner<ProcessIdentity>;
 impl ExecNtHandler {
     fn live_installer_owner_for_pi(&self, worker_pi: usize) -> Option<InstallerOwner> {
         let worker = self.capture_process_identity(worker_pi)?;
-        let process = self.pm.process(worker.pid)?;
-        if process.state != nt_process::ProcessState::Running {
-            return None;
-        }
-        let parent_pid = process.parent?;
-        let parent_pi = self.process_mechanisms.pi_for_pid(parent_pid)
-            .or_else(|| self.temporary_pi_for_pid(parent_pid))?;
-        let parent = self.capture_process_identity(parent_pi)?;
-        if parent.pid != parent_pid {
-            return None;
-        }
-        let mut ancestor_pi = parent_pi;
-        // The installer can be a Win32 child of a service-host child. Follow PM's exact parent
-        // relation to registered service metadata, with a finite bound and no image-name routing.
-        for _ in 0..MAX_PI {
-            let ancestor = self.capture_process_identity(ancestor_pi)?;
-            let process = self.pm.process(ancestor.pid)?;
-            if process.state != nt_process::ProcessState::Running {
-                return None;
-            }
-            // Historical image observations cannot grant installer service ownership.
-            let image = self.hosted_process_image(ancestor_pi)?;
-            if image.can_own_installer_service_work() {
-                return Some(InstallerOwner { worker, parent, service: ancestor });
-            }
-            let next_pid = process.parent?;
-            ancestor_pi = self.process_mechanisms.pi_for_pid(next_pid)
-                .or_else(|| self.temporary_pi_for_pid(next_pid))?;
-        }
-        None
+        let target = nt_exe_image::SpawnTarget::from_image(self.hosted_process_image(worker_pi)?);
+        let (parent, service) = self.execution_roles.installer_service_owner(
+            target,
+            worker,
+            |target, process| {
+                self.hosted_process_image(target.pi).map(nt_exe_image::SpawnTarget::from_image)
+                    == Some(target)
+                    && self.capture_process_identity(target.pi) == Some(process)
+                    && process.generation
+                        == nt_types::ProcessGeneration::Hosted(target.generation)
+                    && self.process_mechanisms.get(target.pi).is_some_and(|mechanism| {
+                        mechanism.top_badge == target.top_badge
+                    })
+                    && self.pm.process(process.pid)
+                        .is_some_and(|entry| entry.state == nt_process::ProcessState::Running)
+            },
+        )?;
+        Some(InstallerOwner { worker, parent, service })
     }
 
     /// Called only at the exact `NtOpenKey` completion boundary. A missing IniFileMapping child is
@@ -57,8 +45,8 @@ impl ExecNtHandler {
         }
     }
 
-    /// The service-loop deadline may only use a recent completed probe while the same worker and
-    /// parent are still running with their original process generations and parent relation.
+    /// The service-loop deadline may use a recent completed probe only while the worker
+    /// and every link to the same service owner are still running in their original generations.
     pub(crate) fn grant_installer_inf_progress(
         &mut self,
         epoch: u64,
@@ -68,8 +56,7 @@ impl ExecNtHandler {
         let Some(owner) = self.installer_progress.as_ref().map(|progress| progress.owner()) else {
             return false;
         };
-        let current_pi = self.process_mechanisms.pi_for_pid(owner.worker.pid)
-            .or_else(|| self.temporary_pi_for_pid(owner.worker.pid));
+        let current_pi = self.process_mechanisms.pi_for_pid(owner.worker.pid);
         let live = current_pi.and_then(|pi| self.live_installer_owner_for_pi(pi));
         let progress = self.installer_progress.as_mut().expect("checked installer state");
         progress.observe_epoch(epoch, now_100ns);
