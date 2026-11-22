@@ -44,3 +44,33 @@ fn the_worker_lane_dispatches_every_major_the_primary_does() {
     assert!(!dispatches(0x1c), "not a major function");
     assert!(!dispatches(u64::MAX - 0x7bd), "lane controls are not IRP majors");
 }
+
+mod control_routing {
+    use nt_hosted_runtime::{select_control_lane, worker_claim_after_return, ClaimAfterReturn, ControlLane};
+
+    /// conhost's GET_NEXT_REQUEST pends on condrv's primary; cmd's request then runs on the
+    /// primary, completes it and waits there. The server IRP's copy and ACK must not need the
+    /// parked primary, or conhost never sees the request.
+    #[test]
+    fn a_primary_irps_controls_run_on_an_idle_worker_while_the_primary_is_parked() {
+        assert_eq!(select_control_lane(false, false, true), ControlLane::Worker);
+        assert_eq!(select_control_lane(false, true, true), ControlLane::Primary);
+        assert_eq!(select_control_lane(false, false, false), ControlLane::Busy);
+    }
+
+    #[test]
+    fn a_claimed_irps_controls_stay_on_its_worker() {
+        assert_eq!(select_control_lane(true, true, false), ControlLane::Worker);
+        assert_eq!(select_control_lane(true, false, false), ControlLane::Worker);
+    }
+
+    /// Boot 44963863150: a worker claim outlived pi=28's `Connection` CREATE, and every later
+    /// condrv IRP was refused busy. Only state resident in the lane's bank (METHOD_NEITHER
+    /// mutable input) keeps a claim past the dispatch's return; a CREATE, a synchronous terminal
+    /// or a buffered PENDING IRP, whose completion lives in the instance's pending list, does not.
+    #[test]
+    fn only_bank_resident_state_keeps_a_claim_past_the_return() {
+        assert_eq!(worker_claim_after_return(true), ClaimAfterReturn::Keep);
+        assert_eq!(worker_claim_after_return(false), ClaimAfterReturn::Release);
+    }
+}

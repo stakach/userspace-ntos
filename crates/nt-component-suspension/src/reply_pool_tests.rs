@@ -791,3 +791,41 @@ fn a_lane_returning_to_idle_advances_the_admission_epoch() {
     assert_eq!(nt_hosted_runtime::queued_admission_candidates(&queue, lanes.idle_epoch()), [1],
         "the queued IRP waited for an unrelated File retirement");
 }
+
+#[test]
+fn a_pending_server_irps_completion_control_reaches_a_lane_while_the_primary_is_parked() {
+    // conhost's GET_NEXT_REQUEST pended on the primary (no worker claim); cmd's request then
+    // completed it from the primary and waits there for conhost's answer.
+    let (lanes, receiver, pool, primary, worker) = condrv_with_parked_primary();
+    let claim = nt_hosted_runtime::WorkerIrpClaim::idle();
+    const SERVER_IRP: u64 = 0x170;
+    let lane = nt_hosted_runtime::select_control_lane(
+        claim.owns(SERVER_IRP),
+        pool.ready_for_admission(&receiver, primary, &lanes),
+        pool.ready_for_admission(&receiver, worker, &lanes) && claim.admits_new(),
+    );
+    assert_eq!(lane, nt_hosted_runtime::ControlLane::Worker,
+        "the server IRP's copy/ACK waited on the dispatch that waits for it");
+}
+
+#[test]
+fn a_worker_claimed_create_that_returned_leaves_the_worker_to_the_next_ordinary_irp() {
+    // pi=28's `Connection` CREATE ran on the worker while the primary was parked and returned.
+    let (lanes, receiver, pool, primary, worker) = condrv_with_parked_primary();
+    let mut claim = nt_hosted_runtime::WorkerIrpClaim::idle();
+    const CREATE_IRP: u64 = 0x28;
+    assert!(claim.enter(CREATE_IRP));
+    if nt_hosted_runtime::worker_claim_after_return(false)
+        == nt_hosted_runtime::ClaimAfterReturn::Release
+    {
+        claim.release(CREATE_IRP);
+    }
+    let primary_admits = pool.ready_for_admission(&receiver, primary, &lanes);
+    let lane = nt_hosted_runtime::select_ordinary_irp_lane(
+        primary_admits,
+        !primary_admits,
+        pool.ready_for_admission(&receiver, worker, &lanes) && claim.admits_new(),
+    );
+    assert_eq!(lane, nt_hosted_runtime::OrdinaryIrpLane::Worker,
+        "cmd's next console request stayed busy behind a returned CREATE");
+}

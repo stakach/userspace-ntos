@@ -75745,6 +75745,8 @@ pub(super) struct FileIrpPumpContinuation {
     class_hook_request: bool,
     class_hook_control: bool,
     connect_ack_control: bool,
+    /// An ordinary IRP admitted on the worker while the primary was parked (#427).
+    ordinary_worker: bool,
     measure_rpc: bool,
     pump_started: u64,
     trace_dispatch: bool,
@@ -76182,8 +76184,27 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
             }
             lane == nt_hosted_runtime::OrdinaryIrpLane::Worker
         });
+    // A copy, ACK or cancel of an IRP no worker has claimed. Its completion lives in the
+    // instance's pending list, so an idle worker runs it when the primary is parked; it must
+    // never wait on the dispatch that is waiting for it (#427).
+    let foreign_control = dispatch_request.is_none()
+        && provider_route.is_none()
+        && matches!(major, FSD_DISPATCH_COPY_COMPLETION | FSD_DISPATCH_ACK_COMPLETION
+            | FSD_DISPATCH_CANCEL_IRP)
+        && !(class_hook_control || connect_control)
+        // Bank-resident state (METHOD_NEITHER input) is read only from the lane it entered.
+        && !hosted_file_owners::retains_lane_bank(IrpId(canonical_irp_id))
+        && hosted_ingress_sources::primary_route(dispatch_index).is_some_and(|route| {
+            let primary_admits = matches!(
+                crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route),
+                Ok(true)
+            );
+            let idle_worker = !primary_admits && hosted_class_irp_lane::prepare(dispatch_index).is_ok();
+            nt_hosted_runtime::select_control_lane(false, primary_admits, idle_worker)
+                == nt_hosted_runtime::ControlLane::Worker
+        });
     let class_selection = if class_hook_request || class_hook_control || connect_control
-        || nested_class_create || parked_primary_worker {
+        || nested_class_create || parked_primary_worker || foreign_control {
         if provider_route.is_some() {
             return Some(HostedIrpTransportResult::NotDispatched {
                 status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -76193,6 +76214,8 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
             hosted_class_irp_lane::select_new(dispatch_index)
         } else if connect_control {
             hosted_class_irp_lane::select_completion_control(dispatch_index, canonical_irp_id)
+        } else if foreign_control {
+            hosted_class_irp_lane::select_foreign_control(dispatch_index)
         } else {
             hosted_class_irp_lane::select_control(dispatch_index, canonical_irp_id)
         };
@@ -76599,6 +76622,7 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
         class_hook_request,
         class_hook_control,
         connect_ack_control,
+        ordinary_worker: parked_primary_worker,
         measure_rpc,
         pump_started,
         trace_dispatch,
@@ -76628,7 +76652,7 @@ impl FileIrpPumpContinuation {
             dispatch_index, dependent_inst, d, inst, shared_va: sh, ingress_route,
             executor_tcb, canonical_irp_id, major, fsctl, provider_binding,
             dispatch_request, bugchecks_before, trace_connect_pump, class_hook_request,
-            class_hook_control, connect_ack_control, measure_rpc, pump_started,
+            class_hook_control, connect_ack_control, ordinary_worker, measure_rpc, pump_started,
             trace_dispatch, ready_for_child: _, child_step: _,
         } = self;
         let pr = match pump {
@@ -76657,6 +76681,15 @@ impl FileIrpPumpContinuation {
         hosted_class_irp_lane::finish(dispatch_index, selection, pr.completed && !guarded_abort);
         if (class_hook_control || connect_ack_control) && major == FSD_DISPATCH_ACK_COMPLETION
             && pr.completed && !guarded_abort && pr.status == STATUS_SUCCESS {
+            hosted_class_irp_lane::release_irp(dispatch_index, canonical_irp_id);
+        }
+        // An ordinary IRP that returned keeps its worker only for state in that lane's bank;
+        // a CREATE, a terminal or a buffered PENDING IRP frees it now (#427).
+        if ordinary_worker && pr.completed && !guarded_abort
+            && nt_hosted_runtime::worker_claim_after_return(
+                hosted_file_owners::retains_lane_bank(IrpId(canonical_irp_id)))
+                == nt_hosted_runtime::ClaimAfterReturn::Release
+        {
             hosted_class_irp_lane::release_irp(dispatch_index, canonical_irp_id);
         }
     }

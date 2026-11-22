@@ -88,7 +88,10 @@ impl Selection {
 }
 
 #[derive(Clone, Copy)]
-enum SelectionPurpose { New, Control(u64), Callback }
+enum SelectionPurpose { New, Control(u64), Callback,
+    /// A copy, ACK or cancel of an IRP this lane holds no claim on (#427): an idle worker runs
+    /// it while the primary is parked; it claims nothing.
+    ForeignControl }
 
 unsafe fn index_for(instance_index: usize) -> Option<usize> {
     let inst = instance(instance_index)?;
@@ -366,6 +369,7 @@ unsafe fn select(instance_index: usize, purpose: SelectionPurpose) -> Option<Sel
     match purpose {
         SelectionPurpose::New if !row.current_irp.admits_new() => return None,
         SelectionPurpose::Control(irp) if !row.current_irp.owns(irp) => return None,
+        SelectionPurpose::ForeignControl if !row.current_irp.admits_new() => return None,
         SelectionPurpose::Callback if !row.current_irp.admits_new()
             || (row.phase == Phase::Ready && row.delete_ticket.is_some())
             || (row.phase == Phase::DeletePrepared && row.delete_ticket.is_none())
@@ -700,6 +704,11 @@ pub(super) unsafe fn select_control(instance_index: usize, irp: u64) -> Option<S
     select(instance_index, SelectionPurpose::Control(irp))
 }
 
+/// An idle, unclaimed worker for another lane's IRP control (#427).
+pub(super) unsafe fn select_foreign_control(instance_index: usize) -> Option<Selection> {
+    select(instance_index, SelectionPurpose::ForeignControl)
+}
+
 /// A canonical completed CONNECT first enters this worker for its ACK. A refused ACK leaves
 /// the same IRP reserved here, so only its exact retry can use the lane thereafter.
 pub(super) unsafe fn select_completion_control(instance_index: usize, irp: u64) -> Option<Selection> {
@@ -732,6 +741,8 @@ pub(super) unsafe fn mark_entered(instance_index: usize, selection: &Selection,
         SelectionPurpose::Callback if row.phase != Phase::DeletePrepared
             || irp.is_some() || !row.current_irp.admits_new()
             || row.delete_ticket.is_none() => return false,
+        SelectionPurpose::ForeignControl if row.phase != Phase::Ready || irp.is_some()
+            || !row.current_irp.admits_new() => return false,
         _ => {}
     }
     row.phase = Phase::Entered;

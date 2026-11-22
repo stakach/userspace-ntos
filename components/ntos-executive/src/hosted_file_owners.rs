@@ -2232,6 +2232,12 @@ fn queued_admissions() -> Vec<nt_hosted_runtime::QueuedIrp> {
         .collect()
 }
 
+/// Whether this IRP keeps state in the lane bank it entered: METHOD_NEITHER mutable input, whose
+/// copy control reads that bank (#427).
+pub(super) fn retains_lane_bank(irp_id: IrpId) -> bool {
+    find(irp_id).is_some_and(|id| row(id).output_capture == ExternalFileIrpOutputCapture::MethodNeitherInput)
+}
+
 /// How far this IRP's dispatch has got, for its caller (#427): a queued not-admitted or kept
 /// (suspended) dispatch has not returned to its caller yet.
 pub(super) fn dispatch_progress(irp_id: IrpId) -> Option<nt_hosted_runtime::DispatchProgress> {

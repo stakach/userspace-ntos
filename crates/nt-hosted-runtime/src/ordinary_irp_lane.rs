@@ -35,6 +35,48 @@ pub const fn select_ordinary_irp_lane(
     }
 }
 
+/// Where a copy, ACK or cancel control of an entered IRP runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlLane {
+    Primary,
+    Worker,
+    /// No lane can run it now; the control is retried.
+    Busy,
+}
+
+/// Choose the lane for a control of an IRP. A pending IRP's completion lives in the instance's
+/// pending list, not a lane bank, so it may run on any admissible lane: the worker whose claim
+/// holds the IRP's bank-resident state, else the primary if it admits, else an idle unclaimed
+/// worker. A primary parked in a provider wait therefore never blocks another IRP's completion.
+pub const fn select_control_lane(
+    claimed_by_worker: bool,
+    primary_admits: bool,
+    idle_worker_admits: bool,
+) -> ControlLane {
+    if claimed_by_worker {
+        ControlLane::Worker
+    } else if primary_admits {
+        ControlLane::Primary
+    } else if idle_worker_admits {
+        ControlLane::Worker
+    } else {
+        ControlLane::Busy
+    }
+}
+
+/// Whether a worker's claim on the IRP it entered outlives the dispatch's return.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaimAfterReturn {
+    Keep,
+    Release,
+}
+
+/// Only state resident in the lane's bank (METHOD_NEITHER mutable input, whose copy control
+/// reads that bank) keeps the claim; every other IRP frees the worker when its dispatch returns.
+pub const fn worker_claim_after_return(bank_resident: bool) -> ClaimAfterReturn {
+    if bank_resident { ClaimAfterReturn::Keep } else { ClaimAfterReturn::Release }
+}
+
 /// The ordinary IRP a dispatch-worker lane has entered. Its later controls (copy, ACK) must reach
 /// this lane, whose bank holds it, so the lane admits no other IRP until the claim is released:
 /// by the IRP's ACK on this lane or by the retirement of its File owner, whichever comes first.
