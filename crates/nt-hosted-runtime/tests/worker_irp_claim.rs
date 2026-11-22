@@ -31,3 +31,16 @@ fn a_pending_irp_keeps_its_lane_for_its_own_controls_until_released() {
     assert!(!claim.owns(0x61));
     assert!(!claim.release(0x61), "a second release is not a second effect");
 }
+
+/// Boot 44963863150: cmd's console requests reached condrv's worker lane while the primary was
+/// parked, but the worker's dispatch accepted only the i8042 HOOK and class CREATE majors and
+/// answered IRP_MJ_DEVICE_CONTROL with a fabricated STATUS_INVALID_PARAMETER before condrv ran.
+#[test]
+fn the_worker_lane_dispatches_every_major_the_primary_does() {
+    use nt_hosted_runtime::worker_lane_dispatches_major as dispatches;
+    for major in 0..0x1cu64 {
+        assert!(dispatches(major), "major {major:#x}");
+    }
+    assert!(!dispatches(0x1c), "not a major function");
+    assert!(!dispatches(u64::MAX - 0x7bd), "lane controls are not IRP majors");
+}

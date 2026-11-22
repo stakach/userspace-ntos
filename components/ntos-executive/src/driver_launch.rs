@@ -65125,13 +65125,14 @@ unsafe fn allocate_hosted_driver_component_slot(instance: usize) -> Option<usize
 
 /// Whether `instance`'s dispatch on `route` is parked in a provider wait (a captured
 /// KeWaitForSingleObject/KeWaitForMultipleObjects inside the dispatch it is running).
-unsafe fn hosted_driver_dispatch_waiting(
-    instance: usize,
-    route: nt_component_suspension::peer_registry::PeerRoute,
-) -> bool {
-    (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS)).as_ref().is_some_and(|waiters| {
-        waiters.iter().any(|waiter| waiter.instance == instance && waiter.shared.route == route)
-    })
+/// Bounded evidence of an ordinary IRP admitted on the worker while the primary is parked (#427).
+fn trace_ordinary_irp_lane(instance: usize, major: u64, irp: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 32 && !n.is_power_of_two() { return; }
+    print_str(b"[ordinary-irp-lane] n/instance/major/irp/lane=");
+    print_u64(n); print_str(b"/"); print_u64(instance as u64); print_str(b"/");
+    print_hex_u64(major); print_str(b"/"); print_hex_u64(irp); print_str(b"/worker\n");
 }
 
 unsafe fn hosted_driver_waiters_mut() -> &'static mut Vec<HostedDriverRawWaiter> {
@@ -76336,10 +76337,15 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
                 crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route),
                 Ok(true)
             );
-            let waiting = !primary_admits && hosted_driver_dispatch_waiting(dispatch_index, route);
+            // Only the primary's own parked dispatch counts, never another waiter on its route.
+            let waiting = !primary_admits
+                && crate::spawn_hosts::shared_ingress::owner::runtime::primary_dispatch_parked(route);
             let worker_admits = waiting && hosted_class_irp_lane::prepare(dispatch_index).is_ok();
-            nt_hosted_runtime::select_ordinary_irp_lane(primary_admits, waiting, worker_admits)
-                == nt_hosted_runtime::OrdinaryIrpLane::Worker
+            let lane = nt_hosted_runtime::select_ordinary_irp_lane(primary_admits, waiting, worker_admits);
+            if lane == nt_hosted_runtime::OrdinaryIrpLane::Worker {
+                trace_ordinary_irp_lane(dispatch_index, major, canonical_irp_id);
+            }
+            lane == nt_hosted_runtime::OrdinaryIrpLane::Worker
         });
     let class_selection = if class_hook_request || class_hook_control || connect_control
         || nested_class_create || parked_primary_worker {

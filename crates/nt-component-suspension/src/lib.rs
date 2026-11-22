@@ -45,6 +45,8 @@ pub mod badge;
 pub mod source_registry;
 mod message;
 mod service_wait;
+mod primary_wait;
+pub use primary_wait::primary_dispatch_parked;
 mod resume_refusal;
 pub use resume_refusal::RefusedClientDelivery;
 pub use service_wait::{ServiceWaitOccupancy, ServiceWaitTokenIssuer};

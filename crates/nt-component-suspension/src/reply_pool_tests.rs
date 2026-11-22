@@ -693,3 +693,76 @@ fn worker_admits_a_dispatch_while_the_primary_dispatch_is_parked_in_a_wait() {
     assert_ne!(worker_dispatch.lane, primary_dispatch.lane);
     assert_eq!(lanes.active_dispatch_identity(primary_dispatch.lane), Ok(Some(primary_dispatch)));
 }
+
+/// condrv's two lanes after cmd's request parked the primary in its KeWait (#427): the primary
+/// dispatch is suspended, and the next Call is retained for the worker route.
+fn condrv_with_parked_primary() -> (Lanes, IngressReceiver<u64>, IngressReplyPool<u64>, PeerRoute, PeerRoute) {
+    let mut lanes = Lanes::new(2, 2);
+    let mut peers = PeerRegistry::new(20, 2);
+    let (primary_lane, mut primary_registration) = lanes.allocate_shared_staged(&mut peers, 1, 2,
+        LaneBinding { executor_id: 10, receive_endpoint: 20, reply_object: 30 }).unwrap();
+    let (worker_lane, mut worker_registration) = lanes.allocate_shared_staged(&mut peers, 1, 2,
+        LaneBinding { executor_id: 11, receive_endpoint: 20, reply_object: 31 }).unwrap();
+    let primary = peers.publish_lane(&mut primary_registration, 1, 2, &lanes).unwrap();
+    let worker = peers.publish_lane(&mut worker_registration, 1, 2, &lanes).unwrap();
+    for (lane, reply) in [(primary_lane, 30), (worker_lane, 31)] {
+        lanes.begin_startup(lane, reply, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
+        lanes.complete_startup(lane, reply,
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)).unwrap();
+    }
+    let mut receiver = IngressReceiver::new(20, 40, 3).unwrap();
+    let mut pool = IngressReplyPool::new(20, 3).unwrap();
+    for reply in [41, 42, 43] {
+        pool.insert(ComponentIngress::new(20, reply).unwrap(), &receiver, &lanes, free).ok().unwrap();
+    }
+    let rebind = |_: u64, reply: u64| Ok::<_, u8>(if reply == 30 || reply == 31 {
+        ReplyBindingObservation::Free
+    } else {
+        ReplyBindingObservation::BoundToTarget
+    });
+    call(&mut receiver, &lanes);
+    pool.retain(&mut receiver, &lanes, &mut peers, primary.badge(), free, bound).unwrap();
+    let parked = pool.admit(&mut receiver, primary, &mut lanes, &peers, 1, 2, rebind).unwrap();
+    let parked_reply = lanes.binding(parked.lane).unwrap().reply_object;
+    lanes.suspend_running(parked.lane, parked_reply, 77).unwrap();
+    call(&mut receiver, &lanes);
+    pool.retain(&mut receiver, &lanes, &mut peers, worker.badge(), free, bound).unwrap();
+    (lanes, receiver, pool, primary, worker)
+}
+
+/// Boot 44969720271: dxgkrnl's PsCreateSystemThread thread waited for the whole boot, and a
+/// waiter row alone made its primary count as "waiting". A system-thread or DPC wait is not a
+/// parked dispatch: the primary is idle, and its IRPs stay on it.
+#[test]
+fn a_system_thread_waiter_never_makes_an_idle_primary_parked() {
+    let mut lanes = Lanes::new(2, 2);
+    let mut peers = PeerRegistry::new(20, 2);
+    let (primary, _) = lanes.allocate_shared_staged(&mut peers, 1, 2,
+        LaneBinding { executor_id: 10, receive_endpoint: 20, reply_object: 30 }).unwrap();
+    lanes.begin_startup(primary, 30, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
+    lanes.complete_startup(primary, 30,
+        |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)).unwrap();
+    // The system thread's wait carries no dispatch of the primary.
+    assert!(!crate::primary_dispatch_parked(&lanes, primary, None));
+}
+
+/// condrv: cmd's request is the primary's current dispatch, parked in its own KeWait. That
+/// primary diverts the next IRP, whatever its major, to the idle worker.
+#[test]
+fn a_primary_parked_in_its_own_dispatch_diverts_any_major_to_the_worker() {
+    let (lanes, receiver, pool, primary, worker) = condrv_with_parked_primary();
+    let parked = lanes.active_dispatch_identity(primary.identity().lane).unwrap();
+    assert!(parked.is_some());
+    assert!(crate::primary_dispatch_parked(&lanes, primary.identity().lane, parked));
+    // Another dispatch's parked wait is not this primary's.
+    let mut other = parked.unwrap();
+    other = LaneDispatchIdentity { epoch: other.epoch + 1, ..other };
+    assert!(!crate::primary_dispatch_parked(&lanes, primary.identity().lane, Some(other)));
+    let lane = nt_hosted_runtime::select_ordinary_irp_lane(
+        pool.ready_for_admission(&receiver, primary, &lanes),
+        crate::primary_dispatch_parked(&lanes, primary.identity().lane, parked),
+        pool.ready_for_admission(&receiver, worker, &lanes),
+    );
+    assert_eq!(lane, nt_hosted_runtime::OrdinaryIrpLane::Worker);
+    assert!(nt_hosted_runtime::worker_lane_dispatches_major(0x1b), "IRP_MJ_PNP is not excluded");
+}

@@ -208,6 +208,17 @@ impl<K: Copy + PartialEq> Default for InFlightCallers<K> {
     }
 }
 
+/// Major-function slots in a WDM `DRIVER_OBJECT` (`IRP_MJ_MAXIMUM_FUNCTION + 1`).
+const IRP_MAJOR_FUNCTION_COUNT: u64 = 0x1c;
+
+/// Whether a dispatch-worker lane runs an IRP of this major through the driver's MajorFunction
+/// table. NT runs a driver's dispatches concurrently whatever their major, so a worker that
+/// takes the primary's IRPs dispatches every major the primary does; lane controls (copy, ACK,
+/// cancel, callbacks) are handled before this.
+pub const fn worker_lane_dispatches_major(major: u64) -> bool {
+    major < IRP_MAJOR_FUNCTION_COUNT
+}
+
 #[cfg(test)]
 mod tests {
     use super::{select_ordinary_irp_lane as select, OrdinaryIrpLane as Lane};

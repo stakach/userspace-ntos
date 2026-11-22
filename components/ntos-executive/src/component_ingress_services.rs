@@ -746,6 +746,15 @@ pub(crate) unsafe fn parked_service_wait_identity(
     Ok(Some((wait.reply, wait.token)))
 }
 
+/// The route's lane is parked in its own current dispatch's service wait (#427). A waiter of a
+/// system thread or DPC on the same route is not.
+pub(crate) unsafe fn primary_dispatch_parked(route: PeerRoute) -> bool {
+    let Ok(current) = dispatch(route) else { return false };
+    let parked = matches!(parked_service_wait_identity(route, current), Ok(Some(_)))
+        .then_some(current);
+    nt_component_suspension::primary_dispatch_parked(lanes(), route.identity().lane, parked)
+}
+
 /// Readiness for the exact saved wait, before entering any resume effect.
 pub(crate) unsafe fn service_wait_resume_ready_exact(
     route: PeerRoute,
