@@ -255,7 +255,15 @@ pub(super) unsafe fn before_post_action(
         let reservation = nt_handler
             .pending_file_io_reservation
             .expect("accepted File IRP has no pre-dispatch reservation");
-        let wait_for_completion = nt_handler.pending_file_io_wait && !terminating;
+        // The caller is inside IoCallDriver until the driver returns (#427): a kept or queued
+        // dispatch parks even an asynchronous caller, which only a STATUS_PENDING return frees.
+        let in_flight = matches!(pending.route, nt_io_manager::PendingFileRoute::Hosted(_))
+            && driver_launch::hosted_dispatch_progress(pending.irp_id)
+                == Some(nt_hosted_runtime::DispatchProgress::InFlight);
+        let wait_for_completion =
+            nt_hosted_runtime::parks_file_caller(nt_handler.pending_file_io_wait, in_flight)
+                && !terminating;
+        let async_in_flight = in_flight && !nt_handler.pending_file_io_wait && !terminating;
         // The source remains in the handler until publication succeeds. Continuing synchronous
         // calls attach their reply in this same commit, never exposing an unarmed delivery row.
         let identity = reservation.identity();
@@ -286,6 +294,9 @@ pub(super) unsafe fn before_post_action(
         if wait_for_completion {
             // Publish Waiting before any reentrant completion can make this thread Ready.
             thread_wait_state_park_badge_waiting(nt_handler, pending.badge);
+        }
+        if async_in_flight {
+            hold_async_in_flight(identity, pending.irp_id);
         }
         super::pending_pipe_read_trace::parked(
             nt_handler, identity, pending, wait_for_completion,
@@ -333,4 +344,65 @@ pub(super) unsafe fn finish_after_inline_retirement(
         nt_handler.abandon_new_file_io_exact(owner.identity, owner.irp_id);
     }
     handoff.published
+}
+
+/// Asynchronous callers parked only because their dispatch was still in flight (#427).
+static mut ASYNC_IN_FLIGHT: nt_hosted_runtime::InFlightCallers<nt_io_manager::PendingFileIoIdentity> =
+    nt_hosted_runtime::InFlightCallers::new();
+
+fn hold_async_in_flight(identity: nt_io_manager::PendingFileIoIdentity, irp_id: u64) {
+    let _durable = crate::allocator::enter_durable();
+    unsafe { (*core::ptr::addr_of_mut!(ASYNC_IN_FLIGHT)).hold(identity, irp_id) };
+}
+
+/// The hosted dispatch of `irp_id` returned to its File owner, pending or completed.
+pub(super) fn dispatch_returned(irp_id: u64) {
+    let callers = unsafe { &mut *core::ptr::addr_of_mut!(ASYNC_IN_FLIGHT) };
+    if callers.held() != 0 && callers.dispatch_returned(irp_id) {
+        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+    }
+}
+
+/// Release each held asynchronous caller whose driver has returned. A STATUS_PENDING return
+/// replies STATUS_PENDING now and leaves the row to deliver the completion through the IOSB,
+/// Event, APC or IOCP; a completed IRP is replied with its own status by ordinary delivery.
+/// Only callers readied by a return are visited; with none ready this does nothing.
+pub(super) unsafe fn release_returned_async_callers(nt_handler: &mut ExecNtHandler) -> usize {
+    let callers = &mut *core::ptr::addr_of_mut!(ASYNC_IN_FLIGHT);
+    if !callers.any_ready() { return 0; }
+    let _durable = crate::allocator::enter_durable();
+    let mut released = 0;
+    for (identity, irp_id) in callers.take_ready() {
+        let Some(pending) = (&*core::ptr::addr_of!(PENDING_FILE_IO)).get_exact(identity)
+            .filter(|pending| pending.irp_id == irp_id)
+        else { continue };
+        let progress = driver_launch::hosted_dispatch_progress(irp_id)
+            .unwrap_or(nt_hosted_runtime::DispatchProgress::Completed);
+        match nt_hosted_runtime::in_flight_caller_reply(false, progress) {
+            // Returned but not yet settled: the settling transition readies it again.
+            nt_hosted_runtime::InFlightReply::Hold => callers.hold(identity, irp_id),
+            nt_hosted_runtime::InFlightReply::Completion => {}
+            nt_hosted_runtime::InFlightReply::Pending => {
+                let slot = identity.slot();
+                let Some(Some(cap)) = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                    .claim_reply_cap_exact(slot, irp_id)
+                else { continue };
+                if !reply_parked_syscall(cap, nt_status::NtStatus::PENDING.raw() as u32 as u64) {
+                    (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                        .restore_reply_cap_exact(slot, irp_id, cap)
+                        .expect("in-flight File reply lost its exact capability owner");
+                    callers.retry(identity, irp_id);
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    continue;
+                }
+                (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                    .mark_reply_published_exact(slot, irp_id)
+                    .expect("in-flight File reply publication owner disappeared");
+                release_reply_pool_cap(cap);
+                thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
+                released += 1;
+            }
+        }
+    }
+    released
 }

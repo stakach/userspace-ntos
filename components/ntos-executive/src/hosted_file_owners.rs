@@ -766,6 +766,10 @@ fn keep(id: u64, payload: Payload) {
     row.flight = Flight::Idle;
     row.blocked_status = None;
     row.retry_after = 0;
+    // A held caller's dispatch has returned: pending (Retained) or completed (#427).
+    if let Some(irp) = row.irp_id {
+        crate::service_sec_image::hosted_file_dispatch_returned(irp.raw());
+    }
 }
 
 fn retry_later(id: u64, payload: Payload, status: nt_status::NtStatus) {
@@ -2217,6 +2221,23 @@ fn queued_admissions() -> Vec<nt_hosted_runtime::QueuedIrp> {
             cancel_queued: queued_cancel(row),
         })
         .collect()
+}
+
+/// How far this IRP's dispatch has got, for its caller (#427): a queued not-admitted or kept
+/// (suspended) dispatch has not returned to its caller yet.
+pub(super) fn dispatch_progress(irp_id: IrpId) -> Option<nt_hosted_runtime::DispatchProgress> {
+    use nt_hosted_runtime::DispatchProgress;
+    let id = find(irp_id)?;
+    let owner = row(id);
+    Some(match owner.flight {
+        Flight::Preparing | Flight::QueuedDispatch | Flight::Dispatch | Flight::PumpSuspended =>
+            DispatchProgress::InFlight,
+        _ if io_manager_mut().completed_irp(irp_id).is_some() => DispatchProgress::Completed,
+        Flight::Idle if matches!(owner.payload, Some(Payload::Retained(_))) =>
+            DispatchProgress::ReturnedPending,
+        // A returned terminal not yet published, or completion delivery under way.
+        _ => DispatchProgress::InFlight,
+    })
 }
 
 /// Queued not-admitted rows a lane change or a queued cancel may now move.

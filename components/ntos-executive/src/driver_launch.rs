@@ -77334,6 +77334,11 @@ pub(crate) fn reconcile_retained_hosted_file_read_exact(
         .map_err(|(status, selector)| (status.raw() as u32, selector))
 }
 
+/// How far a hosted File IRP's dispatch has got for its caller (#427).
+pub(crate) fn hosted_dispatch_progress(irp_id: u64) -> Option<nt_hosted_runtime::DispatchProgress> {
+    hosted_file_owners::dispatch_progress(IrpId(irp_id))
+}
+
 /// A hosted dispatch lane may have become free (#427).
 pub(crate) fn hosted_lane_freed() {
     hosted_file_owners::lane_freed();

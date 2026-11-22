@@ -113,6 +113,111 @@ pub fn queued_admission_candidates(queue: &[QueuedIrp], epoch: u64) -> alloc::ve
     candidates
 }
 
+/// How far a File caller's IRP has got. The caller's thread is inside IoCallDriver until the
+/// driver returns, so a dispatch that is kept (parked in a provider wait) or still queued for a
+/// lane is `InFlight`, never a STATUS_PENDING return.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchProgress {
+    InFlight,
+    /// The driver returned STATUS_PENDING; its completion is still to come.
+    ReturnedPending,
+    /// The IRP's terminal status is published.
+    Completed,
+}
+
+/// What a File caller's parked Reply receives now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InFlightReply {
+    /// Keep the caller blocked.
+    Hold,
+    /// Release an asynchronous caller with STATUS_PENDING; its row keeps the completion.
+    Pending,
+    /// Reply with the IRP's own terminal status.
+    Completion,
+}
+
+/// Whether the syscall parks its caller's Reply: a synchronous File always waits for the
+/// completion, and any caller whose dispatch is still in flight waits for the driver's return.
+pub const fn parks_file_caller(synchronous: bool, in_flight: bool) -> bool {
+    synchronous || in_flight
+}
+
+/// The reply a parked File caller is owed at `progress`.
+pub const fn in_flight_caller_reply(synchronous: bool, progress: DispatchProgress) -> InFlightReply {
+    match progress {
+        DispatchProgress::InFlight => InFlightReply::Hold,
+        DispatchProgress::ReturnedPending if synchronous => InFlightReply::Hold,
+        DispatchProgress::ReturnedPending => InFlightReply::Pending,
+        DispatchProgress::Completed => InFlightReply::Completion,
+    }
+}
+
+/// Asynchronous File callers held only because their dispatch was in flight, each linked to its
+/// exact IRP. A driver return readies its caller; a boundary services only ready callers, and
+/// with none ready it does nothing.
+pub struct InFlightCallers<K> {
+    held: alloc::vec::Vec<(K, u64, bool)>,
+    ready: usize,
+}
+
+impl<K: Copy + PartialEq> InFlightCallers<K> {
+    pub const fn new() -> Self {
+        Self { held: alloc::vec::Vec::new(), ready: 0 }
+    }
+
+    pub fn hold(&mut self, caller: K, irp: u64) {
+        self.held.push((caller, irp, false));
+    }
+
+    pub fn held(&self) -> usize {
+        self.held.len()
+    }
+
+    /// O(1): whether any held caller's driver has returned.
+    pub const fn any_ready(&self) -> bool {
+        self.ready != 0
+    }
+
+    /// `irp`'s dispatch returned (pending or completed); ready the caller linked to it.
+    pub fn dispatch_returned(&mut self, irp: u64) -> bool {
+        let mut readied = false;
+        for (_, held_irp, ready) in &mut self.held {
+            if *held_irp == irp && !*ready {
+                *ready = true;
+                self.ready += 1;
+                readied = true;
+            }
+        }
+        readied
+    }
+
+    /// Remove and return the ready callers; held ones are not visited when none is ready.
+    pub fn take_ready(&mut self) -> alloc::vec::Vec<(K, u64)> {
+        if self.ready == 0 {
+            return alloc::vec::Vec::new();
+        }
+        let mut taken = alloc::vec::Vec::new();
+        self.held.retain(|(caller, irp, ready)| {
+            if *ready { taken.push((*caller, *irp)); }
+            !*ready
+        });
+        self.ready = 0;
+        taken
+    }
+
+    /// A ready caller whose reply could not be sent yet stays ready for the next boundary.
+    pub fn retry(&mut self, caller: K, irp: u64) {
+        self.held.push((caller, irp, true));
+        self.ready += 1;
+    }
+}
+
+impl<K: Copy + PartialEq> Default for InFlightCallers<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{select_ordinary_irp_lane as select, OrdinaryIrpLane as Lane};

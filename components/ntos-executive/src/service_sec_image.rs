@@ -4733,6 +4733,11 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
             if !driver_launch::queued_hosted_admission_due() { break; }
         }
     }
+    // An asynchronous caller held while its dispatch was in flight is released by a genuine
+    // STATUS_PENDING return (#427).
+    if unsafe { file_dispatch_handoff::release_returned_async_callers(nt_handler) } != 0 {
+        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+    }
     if FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel) {
         let t = begin();
         let mut progressed = 0u64;
@@ -13829,6 +13834,11 @@ unsafe fn trace_queued_callback_root_failure(
         top.map(|selector| crate::driver_launch::queued_callback_root_retired(selector)),
         action, u8::from(crate::driver_launch::unsettled_queued_callback()));
     sel4_rt::print_record(record.bytes());
+}
+
+/// A hosted File IRP's dispatch returned to its owner; ready any caller held on it (#427).
+pub(crate) fn hosted_file_dispatch_returned(irp_id: u64) {
+    file_dispatch_handoff::dispatch_returned(irp_id);
 }
 
 pub(crate) fn root_queued_callback_exclusive_pending() -> bool {
