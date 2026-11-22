@@ -2505,6 +2505,80 @@ mod tests {
         ));
     }
 
+    /// The seed table is ReactOS userenv's `UserShellFolders[]`, row for row: the completeness
+    /// check reads the same table as the writer, so only the source can catch a wrong row.
+    #[test]
+    fn user_profile_shell_folder_table_matches_reactos_userenv_setup() {
+        const SETUP_C: &str =
+            include_str!("../../../references/reactos/dll/win32/userenv/setup.c");
+        let table = SETUP_C
+            .split_once("UserShellFolders[] =")
+            .and_then(|(_, rest)| rest.split_once("{NULL, NULL"))
+            .map(|(rows, _)| rows)
+            .expect("ReactOS UserShellFolders table");
+        let mut rows = Vec::new();
+        for line in table.lines().map(str::trim).filter(|line| line.starts_with("{L\"")) {
+            let fields: Vec<&str> = line
+                .trim_start_matches('{')
+                .trim_end_matches("},")
+                .split(',')
+                .map(str::trim)
+                .collect();
+            assert_eq!(fields.len(), 6, "{line}");
+            let literal = |field: &str| {
+                field.trim_start_matches("L\"").trim_end_matches('"').replace(r"\\", r"\")
+            };
+            rows.push((
+                literal(fields[0]),
+                literal(fields[1]),
+                fields[4] == "TRUE",
+                fields[5] == "TRUE",
+            ));
+        }
+        let ours: Vec<_> = REACTOS_USER_PROFILE_SHELL_FOLDERS
+            .iter()
+            .map(|folder| {
+                (String::from(folder.value_name), String::from(folder.path),
+                 folder.shell_folder, folder.user_shell_folder)
+            })
+            .collect();
+        assert_eq!(ours, rows);
+        assert_eq!(rows.iter().filter(|row| row.2).count(), 17);
+        assert_eq!(rows.iter().filter(|row| row.3).count(), 17);
+    }
+
+    #[test]
+    fn a_profile_missing_one_user_shell_folder_is_not_complete() {
+        let mut hives = MutableHiveSet::new();
+        hives
+            .mount(r"\Registry\User\.Default", 5, Hive::new(HiveKind::Default))
+            .unwrap();
+        seed_reactos_default_user_shell_folders_in_mutable_hives(&mut hives, r"C:\Users\Default");
+        let shell = hives
+            .resolve_key(
+                r"\Registry\User\.Default\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+            )
+            .expect("shell key");
+        let user_shell = hives
+            .resolve_key(
+                r"\Registry\User\.Default\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            )
+            .expect("user shell key");
+        let hive = hives.hive(5).expect("default hive");
+        assert_eq!(hive.value_count(shell.key), 17);
+        assert_eq!(hive.value_count(user_shell.key), 17);
+        assert!(hives.query_value(user_shell, "Temp").is_none());
+
+        assert!(hives.delete_value(user_shell, "Cookies"));
+        let target = MutableHiveRgsSeedTarget { hives: &mut hives };
+        assert!(!reactos_user_profile_shell_folders_complete_in_target(
+            &target,
+            r"\Registry\User\.Default",
+            r"C:\Users\Default",
+            "%USERPROFILE%",
+        ));
+    }
+
     #[test]
     fn user_profile_setup_table_includes_physical_temp_directory() {
         let temp = REACTOS_USER_PROFILE_SHELL_FOLDERS

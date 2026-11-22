@@ -1786,6 +1786,19 @@ impl LiveApplySetupSeedTarget {
 
     fn system_rel_path(&self, path: &str) -> String {
         let components: Vec<&str> = path.split('\\').filter(|part| !part.is_empty()).collect();
+        if self.hive.kind == HiveKind::Default {
+            // The default user hive is mounted at \Registry\User\.Default.
+            let start = if components.len() >= 3
+                && components[0].eq_ignore_ascii_case("Registry")
+                && components[1].eq_ignore_ascii_case("User")
+                && components[2].eq_ignore_ascii_case(".Default")
+            {
+                3
+            } else {
+                0
+            };
+            return components[start..].join("\\");
+        }
         let start = if components.len() >= 3
             && components[0].eq_ignore_ascii_case("Registry")
             && components[1].eq_ignore_ascii_case("Machine")
@@ -1909,6 +1922,56 @@ fn manager_live_apply_replays_reactos_print_setup_seed() {
     let (ty, data) = booted.query_value(monitor, "Driver").expect("Driver");
     assert_eq!(ty, RegistryValueType::Sz);
     assert_eq!(data, utf16le_sz("localmon.dll"));
+}
+
+/// #310: the default-user profile seed (17 Shell Folders + 17 User Shell Folders) must come back
+/// intact from the hive log, and seeding a complete hive again writes no value.
+#[test]
+fn manager_live_apply_replays_reactos_default_user_shell_folders_seed() {
+    const ROOT: &str = r"\Registry\User\.Default";
+    const PROFILE: &str = r"C:\Users\Default";
+    let mut target = LiveApplySetupSeedTarget::new(HiveKind::Default);
+    let stats = seed_reactos_user_profile_shell_folders_into_target(
+        &mut target, ROOT, PROFILE, "%USERPROFILE%");
+    assert_eq!(
+        stats,
+        ReactOsProfileShellFolderSeedStats { shell_folder_values: 17, user_shell_folder_values: 17 }
+    );
+    let logged = target.provider.as_ref().unwrap().get_status().unwrap().log_len;
+    assert!(logged > 0);
+
+    // Seeding again over the complete hive writes no value.
+    let again = seed_reactos_user_profile_shell_folders_into_target(
+        &mut target, ROOT, PROFILE, "%USERPROFILE%");
+    assert_eq!(again, ReactOsProfileShellFolderSeedStats::default());
+
+    let booted = target.booted(HiveKind::Default);
+    let shell = booted
+        .open_key(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
+        .expect("replayed Shell Folders");
+    let user_shell = booted
+        .open_key(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
+        .expect("replayed User Shell Folders");
+    assert_eq!(booted.value_count(shell), 17);
+    assert_eq!(booted.value_count(user_shell), 17);
+    for folder in REACTOS_USER_PROFILE_SHELL_FOLDERS {
+        let shell_value = booted.query_value(shell, folder.value_name);
+        let user_value = booted.query_value(user_shell, folder.value_name);
+        if folder.shell_folder {
+            let (ty, data) = shell_value.expect(folder.value_name);
+            assert_eq!(ty, RegistryValueType::Sz, "{}", folder.value_name);
+            assert_eq!(data, utf16le_sz(&alloc::format!(r"{}\{}", PROFILE, folder.path)));
+        } else {
+            assert!(shell_value.is_none(), "{} is not a Shell Folder", folder.value_name);
+        }
+        if folder.user_shell_folder {
+            let (ty, data) = user_value.expect(folder.value_name);
+            assert_eq!(ty, RegistryValueType::ExpandSz, "{}", folder.value_name);
+            assert_eq!(data, utf16le_sz(&alloc::format!(r"%USERPROFILE%\{}", folder.path)));
+        } else {
+            assert!(user_value.is_none(), "{} is not a User Shell Folder", folder.value_name);
+        }
+    }
 }
 
 #[test]
