@@ -72,6 +72,14 @@ impl DebugFilterPage {
         Some(debug_filter::enabled(system, selected, level))
     }
 
+    /// Whether `DbgPrintEx(component, level, ...)` emits its message. As in ReactOS
+    /// `vDbgPrintExWithPrefixInternal`, component `MAXULONG` (plain `DbgPrint`) is never
+    /// filtered; every other message is masked unless its filter state is enabled.
+    pub fn print_allowed(&self, component: u32, level: u32) -> Option<bool> {
+        if component == u32::MAX { return Some(true); }
+        self.query(component, level)
+    }
+
     /// Mutate a mask through the root's writable alias after a privilege check.
     /// Guest mappings of this frame are read-only.
     pub fn set(&self, component: u32, level: u32, state: bool,
@@ -141,6 +149,21 @@ mod tests {
         // The last table entry (DPFLTR_ENDOFTABLE_ID) is a real, distinct mask.
         page.set(DPFLTR_ENDOFTABLE_ID, 4, true, true).unwrap();
         assert_eq!(page.query(DPFLTR_ENDOFTABLE_ID + 1, 4), Some(false));
+    }
+
+    #[test]
+    fn contract_debug_print_ex_masks_trace_unless_its_component_enables_it() {
+        // ReactOS TRACE_(I8042PRT, ...) is DbgPrintEx(DPFLTR_I8042PRT_ID, DPFLTR_TRACE_LEVEL, ...).
+        const DPFLTR_I8042PRT_ID: u32 = 15; // psdk/dpfilter.h
+        const DPFLTR_ERROR_LEVEL: u32 = 0;
+        const DPFLTR_TRACE_LEVEL: u32 = 2;
+        let page = DebugFilterPage::new();
+        assert_eq!(page.print_allowed(DPFLTR_I8042PRT_ID, DPFLTR_TRACE_LEVEL), Some(false));
+        assert_eq!(page.print_allowed(DPFLTR_I8042PRT_ID, DPFLTR_ERROR_LEVEL), Some(true));
+        // Plain DbgPrint passes MAXULONG and bypasses the filter, even at a masked level.
+        assert_eq!(page.print_allowed(u32::MAX, DPFLTR_TRACE_LEVEL), Some(true));
+        page.set(DPFLTR_I8042PRT_ID, DPFLTR_TRACE_LEVEL, true, true).unwrap();
+        assert_eq!(page.print_allowed(DPFLTR_I8042PRT_ID, DPFLTR_TRACE_LEVEL), Some(true));
     }
 
     #[test]
