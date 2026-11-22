@@ -18,5 +18,6 @@ fn class_start_can_dispatch_nested_interface_create() {
 
     let lane = include_str!("../../../components/ntos-executive/src/hosted_class_irp_lane.rs");
     let execute = &lane[lane.find("unsafe fn execute(").expect("missing class lane executor")..];
+    assert!(execute.contains("major::IRP_MJ_CREATE"));
     assert!(execute.contains("run_irp_with_bank"));
 }

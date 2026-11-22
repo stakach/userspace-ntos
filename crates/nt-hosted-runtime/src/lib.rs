@@ -38,7 +38,7 @@ mod ordinary_irp_lane;
 pub use ordinary_irp_lane::{
     in_flight_caller_reply, parks_file_caller, DispatchProgress, InFlightCallers, InFlightReply,
     queued_admission_candidates, select_ordinary_irp_lane, OrdinaryIrpLane, QueuedIrp,
-    worker_lane_dispatches_major, WorkerIrpClaim,
+    WorkerIrpClaim,
 };
 mod driver_load_slice;
 pub use driver_load_slice::{driver_load_step, DriverLoadSliceEnd, DriverLoadStep};
