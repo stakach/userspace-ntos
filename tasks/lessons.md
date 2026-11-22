@@ -965,3 +965,12 @@ diagnosis-free failure.
   "fixed", the missing `CSRSS: Error while replying` line hid a new rejection. Find the
   stuck caller (here, SSN 0x703 rows in the ingress census) before blaming the most
   recent lifetime change.
+
+## Report Ids From Tool Output, Never From Memory
+- Report ids by pasting them from tool output in the same turn; never from memory. Several
+  CI run and issue-comment ids sent to the coordinator were retyped or guessed and were wrong
+  (one was a 404). Write the message only after the tool call that prints the id has returned,
+  never in the same batch, and copy the exact string from that output.
+- Look ids up from the hash when a script needs them
+  (`gh run list ... --jq '.[] | select(.headSha|startswith("<hash>")) | .databaseId'`), instead
+  of typing a run id into a wait loop.

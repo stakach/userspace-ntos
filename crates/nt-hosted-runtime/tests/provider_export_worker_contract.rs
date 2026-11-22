@@ -107,3 +107,18 @@ fn provider_export_completion_retains_worker_after_guarded_failure_or_wall() {
     assert_eq!(classify_hosted_provider_export_completion(false, 0),
         HostedProviderExportCompletion::Retain(0xc000_0001u32 as i32));
 }
+
+/// Boot 44978356639 boot 2: with storahci's primary parked in StartDevice, a disk SRB
+/// (IRP_MJ_INTERNAL_DEVICE_CONTROL) ran on storahci's dispatch-worker lane, and storport's
+/// inlined KeRaiseIrql (`mov %cr8, %r15` at storport+0x5d35) raised #GP. Only the primary and
+/// provider-export workers were authorised for CR8 emulation, so the fault walled the lane. A
+/// class/ordinary worker is a full execution context: its IRQL lives in its own bank.
+#[test]
+fn an_ordinary_worker_lane_emulates_cr8_against_its_own_irql() {
+    use nt_hosted_runtime::{hosted_cr8_lane, HostedCr8Lane};
+    assert_eq!(hosted_cr8_lane(false, false, true), Some(HostedCr8Lane::Worker));
+    assert_eq!(hosted_cr8_lane(false, true, false), Some(HostedCr8Lane::Worker));
+    assert_eq!(hosted_cr8_lane(true, false, false), Some(HostedCr8Lane::Primary));
+    assert_eq!(hosted_cr8_lane(false, false, false), None, "an unauthenticated lane");
+    assert_eq!(hosted_cr8_lane(true, false, true), None, "one lane, one authority");
+}

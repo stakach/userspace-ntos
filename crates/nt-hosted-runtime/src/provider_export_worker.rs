@@ -82,6 +82,26 @@ pub const fn hosted_provider_worker_admissible(
     !faulted && singleton_published && primary_route
 }
 
+/// Which lane's IRQL an authenticated CR8 access reads and writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedCr8Lane {
+    /// The instance's primary lane and its shared bank.
+    Primary,
+    /// A dispatch worker (provider-export or ordinary/class) and its own bank.
+    Worker,
+}
+
+/// Authorise CR8 emulation for exactly one authenticated physical lane. Every lane a driver's
+/// code runs on is a full execution context with its own IRQL; none borrows another's.
+pub const fn hosted_cr8_lane(primary: bool, provider_worker: bool, ordinary_worker: bool)
+    -> Option<HostedCr8Lane> {
+    match (primary, provider_worker, ordinary_worker) {
+        (true, false, false) => Some(HostedCr8Lane::Primary),
+        (false, true, false) | (false, false, true) => Some(HostedCr8Lane::Worker),
+        _ => None,
+    }
+}
+
 /// Pick the IRQL byte's containing bank only after native code has authenticated one exact
 /// physical lane. Provider workers cannot borrow the parked primary's IRQL state.
 pub const fn select_hosted_cr8_bank(primary_shared: u64, channel_shared: u64,

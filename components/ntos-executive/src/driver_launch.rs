@@ -15175,7 +15175,17 @@ unsafe fn hosted_current_irql() -> u8 {
             .current_irql(identity)
             .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(0));
     }
-    read_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *const u8)
+    read_volatile(hosted_lane_irql_byte())
+}
+
+/// The current lane's IRQL byte: a dispatch worker keeps its own, as inline CR8 emulation does
+/// for it (#427); the primary's lives in the instance's shared bank.
+#[inline]
+unsafe fn hosted_lane_irql_byte() -> *mut u8 {
+    let bank = hosted_provider_export_lane::current_component_bank()
+        .or_else(hosted_class_irp_lane::current_component_bank)
+        .unwrap_or(FSD_SHARED_VADDR);
+    (bank + SH_HOSTED_CURRENT_IRQL) as *mut u8
 }
 
 /// The IRQ worker's authenticated GS context selects its private request bank. Other hosted
@@ -15210,7 +15220,7 @@ unsafe fn hosted_raise_irql(irql: u8) -> u8 {
                 .worker_raise_irql(identity, transaction, old, irql)
                 .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(0));
         } else {
-            write_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8, irql);
+            write_volatile(hosted_lane_irql_byte(), irql);
         }
     }
     old
@@ -15228,7 +15238,7 @@ unsafe fn hosted_lower_irql(irql: u8) {
             .worker_lower_irql(identity, transaction, current, irql)
             .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(0));
     } else {
-        write_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8, irql);
+        write_volatile(hosted_lane_irql_byte(), irql);
     }
 }
 

@@ -120,6 +120,21 @@ unsafe fn service_irq_fault(
     Cr8FaultOutcome::Applied
 }
 
+/// The exact physical lane a CR8 fault came from: the primary, a provider-export worker, or an
+/// ordinary dispatch worker (#427). Each has its own IRQL; none borrows another's.
+unsafe fn cr8_lane(
+    index: usize, inst: DriverInstance, caller: &HostedDriverCaller,
+    channel: &crate::spawn_hosts::PumpChannel,
+) -> Option<nt_hosted_runtime::HostedCr8Lane> {
+    let primary = caller.runtime.is_none() && channel.tcb == inst.tcb
+        && channel.shared_va == inst.exec_shared_va;
+    nt_hosted_runtime::hosted_cr8_lane(
+        primary,
+        hosted_provider_export_lane::matches_channel(index, inst, channel),
+        hosted_class_irp_lane::matches_channel(index, inst, channel),
+    )
+}
+
 pub(crate) unsafe fn service(
     channel: &crate::spawn_hosts::PumpChannel,
     active_reply_cap: u64,
@@ -149,13 +164,13 @@ pub(crate) unsafe fn service(
     };
     // A provider-export worker has its own IRQL byte in its exact retained bank. Other worker
     // and IRQ lanes cannot borrow either that byte or the primary's dispatch authority.
-    let provider_worker = unsafe {
-        hosted_provider_export_lane::matches_channel(index, inst, channel)
+    let Some(lane) = cr8_lane(index, inst, &caller, channel) else {
+        return Cr8FaultOutcome::Rejected;
     };
-    let primary = caller.runtime.is_none() && channel.tcb == inst.tcb
-        && channel.shared_va == inst.exec_shared_va;
     let Some(shared) = nt_hosted_runtime::select_hosted_cr8_bank(
-        inst.exec_shared_va, channel.shared_va, primary, provider_worker) else {
+        inst.exec_shared_va, channel.shared_va,
+        lane == nt_hosted_runtime::HostedCr8Lane::Primary,
+        lane == nt_hosted_runtime::HostedCr8Lane::Worker) else {
         return Cr8FaultOutcome::Rejected;
     };
     if channel.ingress_route != Some(caller.route)
@@ -222,12 +237,7 @@ pub(crate) unsafe fn service(
     if crate::driver_launch::hosted_exception_stack::fault_source_identity(
         channel, active_reply_cap, badge,
     ) != source || hosted_current_irql(shared) != Some((irql_address, current_irql))
-        || nt_hosted_runtime::select_hosted_cr8_bank(
-            inst.exec_shared_va, channel.shared_va,
-            caller.runtime.is_none() && channel.tcb == inst.tcb
-                && channel.shared_va == inst.exec_shared_va,
-            hosted_provider_export_lane::matches_channel(index, inst, channel),
-        ) != Some(shared)
+        || cr8_lane(index, inst, &caller, channel) != Some(lane)
         || hosted_driver_process_notify::published_image_for_callback(index, inst, words[0])
             != Some(image)
     { return Cr8FaultOutcome::Rejected; }

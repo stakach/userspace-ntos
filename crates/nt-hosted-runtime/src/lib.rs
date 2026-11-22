@@ -114,7 +114,7 @@ pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderW
     HostedWorkerBankLayout, classify_hosted_provider_export_completion,
     hosted_provider_export_worker_phase, HostedProviderExportPumpEnd,
     HostedProviderExportWorkerPhase,
-    select_hosted_cr8_bank, select_hosted_provider_export_worker, hosted_provider_export_needs_worker,
+    hosted_cr8_lane, select_hosted_cr8_bank, select_hosted_provider_export_worker, HostedCr8Lane, hosted_provider_export_needs_worker,
     hosted_provider_worker_admissible};
 pub use gop_bar_projection::{GopBarProjection, GopLegacyVgaPortAuthority,
     GopPciBarAuthority};
