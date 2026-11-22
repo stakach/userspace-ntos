@@ -8,8 +8,11 @@ use nt_driver_start::{add_device_turn_call, AddDeviceTurnCall};
 
 #[test]
 fn a_call_to_the_target_driver_is_admitted_during_another_drivers_add_device() {
-    assert_eq!(add_device_turn_call(false, false), AddDeviceTurnCall::Admit,
-        "the child's target driver could not run while another driver's AddDevice was parked");
+    assert_eq!(
+        add_device_turn_call(false, false),
+        AddDeviceTurnCall::Admit,
+        "the child's target driver could not run while another driver's AddDevice was parked"
+    );
 }
 
 #[test]

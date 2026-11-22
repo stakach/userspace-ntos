@@ -42,8 +42,9 @@ pub const fn root_add_device_stop_action(stop: RootAddDeviceStop) -> RootAddDevi
         RootAddDeviceStop::ParentRetained => RootAddDeviceStopAction::FailDevnode,
         // Two parents claim one turn, or the root's own timer could not be acknowledged:
         // neither is about the devnode, and failing it would not repair the root.
-        RootAddDeviceStop::Settle
-        | RootAddDeviceStop::Notification => RootAddDeviceStopAction::Terminal,
+        RootAddDeviceStop::Settle | RootAddDeviceStop::Notification => {
+            RootAddDeviceStopAction::Terminal
+        }
     }
 }
 

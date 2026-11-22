@@ -16,28 +16,57 @@ type Lanes = ComponentSuspensionLanes<(), (), ()>;
 fn a_waiting_child_is_selected_exactly_when_its_target_lane_goes_idle() {
     let mut lanes = Lanes::new(2, 2);
     let mut peers = PeerRegistry::new(20, 2);
-    let (target, _) = lanes.allocate_shared_staged(&mut peers, 1, 2,
-        LaneBinding { executor_id: 10, receive_endpoint: 20, reply_object: 30 }).unwrap();
-    lanes.begin_startup(target, 30, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
-    lanes.complete_startup(target, 30,
-        |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)).unwrap();
+    let (target, _) = lanes
+        .allocate_shared_staged(
+            &mut peers,
+            1,
+            2,
+            LaneBinding {
+                executor_id: 10,
+                receive_endpoint: 20,
+                reply_object: 30,
+            },
+        )
+        .unwrap();
+    lanes
+        .begin_startup(target, 30, |_, _| {
+            Ok::<_, u8>(ReplyBindingObservation::Free)
+        })
+        .unwrap();
+    lanes
+        .complete_startup(target, 30, |_, _| {
+            Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)
+        })
+        .unwrap();
 
     // The target is busy in its own work; the child step is refused admission.
     lanes.begin_dispatch(target, 30).unwrap();
     let mut wait = AddDeviceChildWait::new();
-    assert_eq!(wait.action(lanes.idle_epoch()), AddDeviceChildAction::RunChild);
+    assert_eq!(
+        wait.action(lanes.idle_epoch()),
+        AddDeviceChildAction::RunChild
+    );
     wait.observe(true, lanes.idle_epoch());
 
     // Every root event while the target is busy runs nothing and arms no retry.
     for _ in 0..3 {
-        assert_eq!(wait.action(lanes.idle_epoch()), AddDeviceChildAction::AwaitLaneIdle,
-            "a child was polled while its target lane was busy");
-        assert!(!arm_add_device_retry_shot(true), "a retry shot polled the busy target");
+        assert_eq!(
+            wait.action(lanes.idle_epoch()),
+            AddDeviceChildAction::AwaitLaneIdle,
+            "a child was polled while its target lane was busy"
+        );
+        assert!(
+            !arm_add_device_retry_shot(true),
+            "a retry shot polled the busy target"
+        );
     }
 
     // The target goes idle: the next root pass runs the child, with no timer.
     lanes.finish_dispatch(target, 30).unwrap();
-    assert_eq!(wait.action(lanes.idle_epoch()), AddDeviceChildAction::RunChild);
+    assert_eq!(
+        wait.action(lanes.idle_epoch()),
+        AddDeviceChildAction::RunChild
+    );
 }
 
 #[test]

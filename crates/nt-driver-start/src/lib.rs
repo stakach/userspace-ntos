@@ -16,11 +16,11 @@ pub use add_device_root_policy::{
     root_add_device_stop_action, FailedAddDevice, RootAddDeviceStop, RootAddDeviceStopAction,
     CM_PROB_FAILED_ADD, DN_HAS_PROBLEM, STATUS_UNSUCCESSFUL, UNCERTAIN_ADD_DEVICE,
 };
-pub use add_device_turn_call::{add_device_turn_call, AddDeviceTurnCall};
 pub use add_device_selection::{
     select_add_device_row, AddDeviceReadiness, AddDeviceSelection, AddDeviceSelectionEvidence,
     AwaitingBusPdo,
 };
+pub use add_device_turn_call::{add_device_turn_call, AddDeviceTurnCall};
 pub use nt_component_suspension::{
     RootChildArrival as RootArrival, RootChildTurn as AddDeviceRootTurn,
     RootChildTurnAction as RootTurnAction, RootChildTurnError as RootTurnError,
