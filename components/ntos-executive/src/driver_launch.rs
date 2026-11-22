@@ -379,6 +379,9 @@ pub(crate) fn published_native_storage_mount() -> Option<nt_memory_manager::Sect
 pub(crate) mod hosted_source_completion_lane;
 #[path = "hosted_class_irp_lane.rs"]
 pub(crate) mod hosted_class_irp_lane;
+#[path = "hosted_irp_transport.rs"]
+mod hosted_irp_transport;
+use hosted_irp_transport::{IrpTransport, PrimaryPumpIrpTransport};
 #[path = "hosted_forward_origin.rs"]
 mod hosted_forward_origin;
 #[path = "hosted_forward_projection.rs"]
@@ -2229,33 +2232,6 @@ unsafe fn trace_hosted_hal_translate_bus_address(
     print_str(b"/");
     print_u64(port_len);
     print_str(b"\n");
-}
-
-unsafe fn pool_pull_request_bytes(
-    service_label: u64,
-    transfer_id: u64,
-    dst: u64,
-    len: u64,
-) -> bool {
-    let arg = hosted_provider_export_lane::current_component_arg()
-        .or_else(hosted_class_irp_lane::current_component_arg).unwrap_or(FSD_ARG_VADDR);
-    let mut offset = 0u64;
-    while offset < len {
-        let chunk = (len - offset).min(FSD_ARG_BYTES);
-        let (_, status, _, _, _) =
-            call_on4((service_label << 12) | 3, transfer_id, offset, chunk, 0);
-        if status as u32 as i32 != STATUS_SUCCESS {
-            return false;
-        }
-        let mut index = 0u64;
-        while index < chunk {
-            let byte = read_volatile((arg + index) as *const u8);
-            write_volatile((dst + offset + index) as *mut u8, byte);
-            index += 1;
-        }
-        offset += chunk;
-    }
-    true
 }
 
 unsafe fn pool_push_request_bytes(
@@ -40458,11 +40434,17 @@ fn trace_port_connect_handler(stage: u64, irp: u64, device: u64, code: u64, hand
 }
 
 unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
-    run_irp_with_bank(major, handler, FSD_SHARED_VADDR,
+    run_irp_with_bank(&PrimaryPumpIrpTransport, major, handler, FSD_SHARED_VADDR,
         FSD_DATA_VADDR + FSD_DATA_IRP_DISPATCH_REQUEST_OFF)
 }
 
-unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_address: u64) -> (i32, u64) {
+unsafe fn run_irp_with_bank(
+    transport: &dyn IrpTransport,
+    major: u64,
+    handler: u64,
+    shared: u64,
+    request_address: u64,
+) -> (i32, u64) {
     let devobj = read_volatile((shared + SH_ACTIVE_DEVICE_OBJECT) as *const u64);
     let request = read_volatile(
         request_address as *const IrpDispatchRequest,
@@ -40790,12 +40772,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         data
     };
     if inlen != 0
-        && !pool_pull_request_bytes(
-            FSD_SERVICE_PULL_IRP_INPUT_LABEL,
-            canonical_irp_id,
-            input_data,
-            inlen,
-        )
+        && !transport.pull_input(canonical_irp_id, input_data, inlen)
     {
         pool_free_request_buffers(data, aux_data, 0);
         if owns_fo {
@@ -40839,12 +40816,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         write_unaligned((file_name + create_file_name_len) as *mut u16, 0);
     }
     if nt_io_abi::initial_output_required(request.major, request.ioctl_code, request.output_len)
-        && !pool_pull_request_bytes(
-            FSD_SERVICE_PULL_IRP_OUTPUT_LABEL,
-            canonical_irp_id,
-            data,
-            outlen,
-        )
+        && !transport.pull_output(canonical_irp_id, data, outlen)
     {
         pool_free_request_buffers(data, aux_data, 0);
         if owns_fo {
@@ -40856,7 +40828,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     }
     if major == IRP_MJ_DEVICE_CONTROL && uses_file_object && request._reserved0 == 0 {
         if let Some(result) = try_fast_io_device_control(
-            devobj, fo, canonical_irp_id, fsctl as u32, input_data, inlen,
+            transport, devobj, fo, canonical_irp_id, fsctl as u32, input_data, inlen,
             if output_is_separate { data } else { 0 }, outlen,
         ) {
             pool_free_request_buffers(data, aux_data, 0);
@@ -41727,53 +41699,40 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
 
     // The broker binds this caller-owned packet to the active canonical dispatch and exact
     // pending-node generation before any driver code can forward it to a lower provider.
-    let (words, registration_status, ticket, generation, _) = call_on4_raw(
-        (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
-        6,
-        owner_node,
-        canonical_irp_id,
-        irp,
-    );
-    if words != 3 {
-        crate::provider_bugcheck::report(
-            0xc4,
-            [FSD_SERVICE_SOURCE_IRP_LABEL, 6, irp, registration_status],
-        );
-    }
-    if registration_status as u32 as i32 != STATUS_SUCCESS {
-        if mutable_input_reserved
-            && !hosted_mutable_input_completion::abort_before_entry(canonical_irp_id)
-        {
-            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 6, irp, 0]);
+    let binding = match transport.bind_packet(owner_node, canonical_irp_id, irp) {
+        Ok(binding) => binding,
+        Err(registration_status) => {
+            if mutable_input_reserved
+                && !hosted_mutable_input_completion::abort_before_entry(canonical_irp_id)
+            {
+                transport.packet_binding_violation(irp, 0);
+            }
+            write_volatile((shared + SH_ACTIVE_IRP) as *mut u64, 0);
+            write_volatile((shared + SH_ACTIVE_IOSL) as *mut u64, 0);
+            write_volatile((shared + SH_ACTIVE_DATA) as *mut u64, 0);
+            write_volatile((shared + SH_ACTIVE_DATA_CAP) as *mut u64, 0);
+            write_volatile((shared + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
+            let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
+            let consuming = hosted_irp_state_with_kind(state, HOSTED_IRP_CONSUMING);
+            pending_irp_owner_state(owner_node).store(consuming, Ordering::Release);
+            if owns_fo {
+                fo_release(canonical_file_id);
+            }
+            let entry = read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
+            release_pending_irp_graph_component(entry);
+            tombstone_pending_irp_owner(owner_node, consuming);
+            return (registration_status, 0);
         }
-        write_volatile((shared + SH_ACTIVE_IRP) as *mut u64, 0);
-        write_volatile((shared + SH_ACTIVE_IOSL) as *mut u64, 0);
-        write_volatile((shared + SH_ACTIVE_DATA) as *mut u64, 0);
-        write_volatile((shared + SH_ACTIVE_DATA_CAP) as *mut u64, 0);
-        write_volatile((shared + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
-        let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
-        let consuming = hosted_irp_state_with_kind(state, HOSTED_IRP_CONSUMING);
-        pending_irp_owner_state(owner_node).store(consuming, Ordering::Release);
-        if owns_fo {
-            fo_release(canonical_file_id);
-        }
-        let entry = read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
-        release_pending_irp_graph_component(entry);
-        tombstone_pending_irp_owner(owner_node, consuming);
-        return (registration_status as u32 as i32, 0);
-    }
-    if ticket == 0 || generation == 0 {
-        crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 6, irp, ticket]);
-    }
+    };
     write_volatile(
         (pending_irp_entry_address(owner_node)
             + core::mem::offset_of!(PendingIrp, source_ticket_id) as u64) as *mut u64,
-        ticket,
+        binding.ticket,
     );
     write_volatile(
         (pending_irp_entry_address(owner_node)
             + core::mem::offset_of!(PendingIrp, source_ticket_generation) as u64) as *mut u64,
-        generation,
+        binding.generation,
     );
 
     // Call the driver's MajorFunction handler THROUGH the bugcheck escape: if the driver raises its
@@ -42108,7 +42067,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     copy_len,
                 )
             };
-            if copy_len != 0 && !pool_push_request_bytes(canonical_irp_id, source, 0, 0, copy_len) {
+            if copy_len != 0 && !transport.push_output(canonical_irp_id, source, copy_len) {
                 st = 0xC000_0001u32 as i32; // STATUS_UNSUCCESSFUL
                 info = 0;
             }
@@ -42148,6 +42107,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
 /// visible output is pushed back exactly as an inline IRP completion would be. `None` (no
 /// routine, FALSE, or no memory for a separate output) falls through to the IRP path.
 unsafe fn try_fast_io_device_control(
+    transport: &dyn IrpTransport,
     devobj: u64,
     file_object: u64,
     canonical_irp_id: u64,
@@ -42195,7 +42155,7 @@ unsafe fn try_fast_io_device_control(
         let copy_len = fast_io::output_copy_len(
             control_code & 3, status, information, output_len,
         );
-        if copy_len != 0 && !pool_push_request_bytes(canonical_irp_id, output, 0, 0, copy_len) {
+        if copy_len != 0 && !transport.push_output(canonical_irp_id, output, copy_len) {
             Some((0xC000_0001u32 as i32, 0)) // STATUS_UNSUCCESSFUL
         } else {
             Some((status as i32, information))

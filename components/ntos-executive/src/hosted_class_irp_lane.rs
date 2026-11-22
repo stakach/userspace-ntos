@@ -928,5 +928,5 @@ unsafe fn execute(request: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     let handler = read_unaligned((driver + WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64
         + request.sel * 8) as *const u64);
     if handler == 0 { return (STATUS_INVALID_DEVICE_REQUEST as i32, 0); }
-    run_irp_with_bank(request.sel, handler, shared, shared + REQUEST_OFFSET)
+    run_irp_with_bank(&PrimaryPumpIrpTransport, request.sel, handler, shared, shared + REQUEST_OFFSET)
 }
