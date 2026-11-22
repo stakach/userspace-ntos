@@ -311,7 +311,7 @@ pub(super) unsafe fn maintain(
                 }
                 lp.ingress.root_add_device_turn = Some(turn);
                 match release_root_add_device_turn(&mut lp.ingress.root_add_device_turn, owner) {
-                    Ok(retained) => root_event_consumed |= retained,
+                    Ok(()) => {}
                     Err(reason) => {
                         lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         lp.exit.stop_ssn = 0;
@@ -495,32 +495,28 @@ pub(super) unsafe fn maintain(
         if !root_event_consumed && lp.msg.badge != DELAY_TIMER_BADGE
             && hosted_irq_lines_from_badge(lp.msg.badge) == 0
         {
-            let Some(permit) = ParkedRootAddDevicePermit::for_exact(&nt_handler, reservation)
-            else {
-                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                lp.exit.stop_ssn = 0;
-                lp.exit.record(b"add-device-permit");
-                return ControlFlow::Break(Turn::Exit);
-            };
-            let reply = local().reply_main_slot.load(Ordering::Relaxed);
-            let ticket = match crate::spawn_hosts::shared_ingress::owner::runtime::
-                defer_hosted_delivery_for_add_device(reply, lp.msg.badge, &permit)
-            {
-                Ok(ticket) => ticket,
-                Err(_) => {
-                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    lp.exit.stop_ssn = 0;
-                    lp.exit.record(b"add-device-ingress-defer");
-                    return ControlFlow::Break(Turn::Exit);
+            // NT serialises only this devnode's enumeration (#420). Any other lane's Call,
+            // the child's target driver's included, runs now: the parked parent keeps its own
+            // Reply, banks and lane. Only the root's ordinary Call deferrals apply.
+            let win32k_busy = crate::spawn_hosts::shared_ingress::owner::runtime::
+                is_win32k_native_call(lp.msg.mi, lp.msg.m0) && component_shared_publication_is_busy();
+            match nt_driver_start::add_device_turn_call(
+                win32k_busy, crate::writable_fs::registry_journal::owns_volume(),
+            ) {
+                nt_driver_start::AddDeviceTurnCall::Admit => {
+                    let ingress = match nt_handler.admit_hosted_thread_ingress(lp.msg.badge) {
+                        Ok(runtime) => Some(runtime),
+                        Err(_) => return ControlFlow::Break(lp.reject_hosted_ingress()),
+                    };
+                    nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
+                    return ControlFlow::Continue((ingress, native_ingress_request));
                 }
-            };
-            if turn.retain_ingress(reservation, ticket).is_err() {
-                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                lp.exit.stop_ssn = 0;
-                lp.exit.record(b"add-device-ingress-retain");
-                return ControlFlow::Break(Turn::Exit);
+                // Its ingress row delivers it again once that gate clears.
+                nt_driver_start::AddDeviceTurnCall::Defer =>
+                    crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+                        local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge,
+                    ).expect("unexecuted Call retains its exact ingress owner"),
             }
-            root_event_consumed = true;
         }
         let prepared = prepare_parked_add_device_receive(&mut lp.ingress.root_add_device_turn);
         trace_connect_add_device_boundary(4, u64::from(prepared));

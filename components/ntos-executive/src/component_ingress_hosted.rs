@@ -566,9 +566,9 @@ pub(crate) unsafe fn take_hosted_with(
         return Ok(None);
     }
     let pending_receive = receive_child_pending();
-    if (crate::service_sec_image::root_add_device_exclusive_pending() && !pending_receive)
-        || ((crate::service_sec_image::root_queued_callback_exclusive_pending()
-            || crate::driver_launch::unsettled_queued_callback()) && !pending_receive) {
+    // A parked AddDevice serialises only its own devnode (#420); its turn admits these Calls.
+    if (crate::service_sec_image::root_queued_callback_exclusive_pending()
+            || crate::driver_launch::unsettled_queued_callback()) && !pending_receive {
         return Ok(None);
     }
     let Some(index) = nt_component_suspension::oldest_external_ingress(
@@ -1051,27 +1051,15 @@ pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(),
 }
 
 enum ParkedRootParentProof<'a> {
-    AddDevice(&'a crate::service_sec_image::ParkedRootAddDevicePermit),
     QueuedCallback(&'a crate::service_sec_image::ParkedRootQueuedCallbackPermit),
 }
 
 impl ParkedRootParentProof<'_> {
     unsafe fn is_exact(&self) -> bool {
         match self {
-            Self::AddDevice(_) => crate::service_sec_image::root_add_device_exclusive_pending(),
             Self::QueuedCallback(permit) => permit.is_exact(),
         }
     }
-}
-
-/// The exact parked AddDevice permit is issued only after the selected batch has entered and
-/// retained its physical provider parent. No unrelated hosted Call is admitted by this park.
-pub(crate) unsafe fn defer_hosted_delivery_for_add_device(
-    reply: u64,
-    badge: u64,
-    permit: &crate::service_sec_image::ParkedRootAddDevicePermit,
-) -> Result<DeferredParkedIngress, Error> {
-    defer_hosted_delivery_inner(reply, badge, Some(ParkedRootParentProof::AddDevice(permit)))
 }
 
 /// A queued callback may hold an exact physical provider parent while a different, unexecuted

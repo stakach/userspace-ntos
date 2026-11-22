@@ -13748,10 +13748,9 @@ enum RootAddDeviceOwner {
     DriverStart(nt_driver_start::PendingOperationReservation),
     PnpRebalance(nt_driver_start::PendingOperationReservation),
 }
-type RootAddDeviceTurn = nt_driver_start::AddDeviceRootTurn<
-    RootAddDeviceOwner,
-    crate::spawn_hosts::shared_ingress::owner::runtime::DeferredParkedIngress,
->;
+/// The turn retains no ingress: a Call received while it is parked runs or is deferred to its
+/// own ingress row like any other (#420).
+type RootAddDeviceTurn = nt_driver_start::AddDeviceRootTurn<RootAddDeviceOwner, core::convert::Infallible>;
 type RootQueuedCallbackTurn = nt_component_suspension::RootChildTurn<
     crate::driver_launch::QueuedCallbackSelector,
     Vec<crate::spawn_hosts::shared_ingress::owner::runtime::DeferredParkedIngress>,
@@ -13841,33 +13840,26 @@ pub(crate) fn root_queued_callback_retry_wake_due(now: u64) -> u64 {
     ).is_ok())
 }
 
-/// End the root's exclusive AddDevice turn for `owner`. Its retained ingress ticket must
-/// still name its deferred Call. Returns whether a Call was retained, or the exit reason.
+/// End the root's exclusive AddDevice turn for `owner`, or name the exit reason.
 unsafe fn release_root_add_device_turn(
     current: &mut Option<RootAddDeviceTurn>,
     owner: RootAddDeviceOwner,
-) -> Result<bool, &'static [u8]> {
+) -> Result<(), &'static [u8]> {
     use nt_driver_start::{root_add_device_stop_action as action, RootAddDeviceStop as Stop};
     let Some(turn) = current.take() else { return Err(b"add-device-settle") };
-    if turn.retained_ingress(owner).ok().flatten().is_some_and(|ticket|
-        !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_parked_ingress_is_exact(ticket))
-    {
-        *current = Some(turn);
-        debug_assert_eq!(action(Stop::IngressChanged), nt_driver_start::RootAddDeviceStopAction::Terminal);
-        return Err(b"add-device-ingress-changed");
-    }
-    let retained = match turn.settle(owner) {
-        Ok(retained) => retained,
+    match turn.settle(owner) {
+        Ok(None) => {}
+        Ok(Some(never)) => match never {},
         Err(turn) => {
             *current = Some(turn);
             debug_assert_eq!(action(Stop::Settle), nt_driver_start::RootAddDeviceStopAction::Terminal);
             return Err(b"add-device-settle");
         }
-    };
+    }
     ROOT_ADD_DEVICE_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
     ROOT_ADD_DEVICE_AWAITING_LANE.store(false, Ordering::Release);
     ROOT_ADD_DEVICE_EXCLUSIVE.store(false, Ordering::Release);
-    Ok(retained.is_some())
+    Ok(())
 }
 
 /// The parked AddDevice turn stopped with an uncertain parent (#420). Fail its devnode, keep
@@ -13885,7 +13877,7 @@ unsafe fn fail_parked_root_add_device(
     {
         return Ok(false);
     }
-    release_root_add_device_turn(current, owner).map(|_| true)
+    release_root_add_device_turn(current, owner).map(|()| true)
 }
 
 pub(crate) fn root_add_device_exclusive_pending() -> bool {
@@ -14169,15 +14161,6 @@ unsafe fn service_parked_add_device_notification(
         ack_parked_add_device_retry_timer()?;
     }
     Ok(())
-}
-
-pub(crate) struct ParkedRootAddDevicePermit(());
-
-impl ParkedRootAddDevicePermit {
-    fn for_exact(handler: &ExecNtHandler, owner: RootAddDeviceOwner) -> Option<Self> {
-        root_add_device_still_parked(handler, owner).then_some(Self(()))
-    }
-
 }
 
 /// Proof that the newest physical queue callback still needs a local child or a certified

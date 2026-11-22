@@ -100,15 +100,6 @@ fn queued_wait_retains_an_unrelated_call_and_its_original_reply() {
         defer.contains("ParkedRootParentProof::QueuedCallback(permit)"),
         "queued ingress must carry a typed callback permit"
     );
-    let proof = between(
-        INGRESS,
-        "impl ParkedRootParentProof<'_> {",
-        "pub(crate) unsafe fn defer_hosted_delivery_for_add_device(",
-    );
-    assert!(
-        proof.contains("Self::QueuedCallback(permit) => permit.is_exact()"),
-        "the typed proof must reselect the live callback before retaining a Call"
-    );
     let owner = function_body(INGRESS, "unsafe fn defer_hosted_delivery_inner(");
     assert!(
         owner.contains("proof.is_exact()")

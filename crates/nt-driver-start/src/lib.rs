@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 mod add_device_child_wait;
 mod add_device_root_policy;
 mod add_device_selection;
+mod add_device_turn_call;
 pub mod preload_catalog;
 pub use add_device_child_wait::{
     arm_add_device_retry_shot, AddDeviceChildAction, AddDeviceChildWait,
@@ -15,6 +16,7 @@ pub use add_device_root_policy::{
     root_add_device_stop_action, FailedAddDevice, RootAddDeviceStop, RootAddDeviceStopAction,
     CM_PROB_FAILED_ADD, DN_HAS_PROBLEM, STATUS_UNSUCCESSFUL, UNCERTAIN_ADD_DEVICE,
 };
+pub use add_device_turn_call::{add_device_turn_call, AddDeviceTurnCall};
 pub use add_device_selection::{
     select_add_device_row, AddDeviceReadiness, AddDeviceSelection, AddDeviceSelectionEvidence,
     AwaitingBusPdo,

@@ -20,8 +20,6 @@ pub enum RootAddDeviceStop {
     /// The parent's selected child was quarantined, or the parent was refused with nothing
     /// left to retry: its AddDevice effect is uncertain.
     ParentRetained,
-    /// The turn's retained ingress ticket no longer names its deferred Call.
-    IngressChanged,
     /// The turn is owned by another parent than the one settling it.
     Settle,
     /// The parked parent's own timer or IRQ notification could not be acknowledged.
@@ -42,11 +40,9 @@ pub const fn root_add_device_stop_action(stop: RootAddDeviceStop) -> RootAddDevi
     match stop {
         // The devnode's own AddDevice is uncertain: fence it, as NT fails the devnode.
         RootAddDeviceStop::ParentRetained => RootAddDeviceStopAction::FailDevnode,
-        // A deferred Call lost its ticket, two parents claim one turn, or the root's own
-        // timer could not be acknowledged: none is about the devnode, and failing it would
-        // not repair the root.
-        RootAddDeviceStop::IngressChanged
-        | RootAddDeviceStop::Settle
+        // Two parents claim one turn, or the root's own timer could not be acknowledged:
+        // neither is about the devnode, and failing it would not repair the root.
+        RootAddDeviceStop::Settle
         | RootAddDeviceStop::Notification => RootAddDeviceStopAction::Terminal,
     }
 }

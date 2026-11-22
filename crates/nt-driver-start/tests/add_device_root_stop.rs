@@ -40,9 +40,7 @@ fn only_a_devnode_still_at_its_cursor_can_fail_its_add_device() {
 
 #[test]
 fn a_broken_root_invariant_still_ends_the_service_loop() {
-    for stop in [RootAddDeviceStop::IngressChanged, RootAddDeviceStop::Settle,
-        RootAddDeviceStop::Notification]
-    {
+    for stop in [RootAddDeviceStop::Settle, RootAddDeviceStop::Notification] {
         assert_eq!(root_add_device_stop_action(stop), RootAddDeviceStopAction::Terminal, "{stop:?}");
     }
 }
