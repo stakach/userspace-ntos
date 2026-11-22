@@ -15,7 +15,13 @@
 
 use crate::{AMD64_CONTEXT_SIZE, CONTEXT_RIP_OFFSET, CONTEXT_RSP_OFFSET};
 
+mod floating_point;
 mod privileged_instruction;
+pub use floating_point::{
+    FloatingPointState, STATUS_FLOAT_DIVIDE_BY_ZERO, STATUS_FLOAT_INEXACT_RESULT,
+    STATUS_FLOAT_INVALID_OPERATION, STATUS_FLOAT_OVERFLOW, STATUS_FLOAT_STACK_CHECK,
+    STATUS_FLOAT_UNDERFLOW,
+};
 pub use privileged_instruction::{is_privileged_instruction, PRIVILEGED_INSTRUCTION_WINDOW};
 
 pub const EXCEPTION_RECORD_SIZE: usize = 0x98;
@@ -128,6 +134,11 @@ pub enum HardwareFault {
     PageFault { error_code: u32, address: u64, outcome: PageFaultOutcome },
     /// #AC.
     AlignmentCheck,
+    /// #MF: `status` is the pending, unmasked x87 exception; `instruction` and `data` are the
+    /// x87 instruction and operand pointers (FIP/FDP).
+    X87FloatingPoint { status: u32, stack_fault: bool, instruction: u64, data: u64 },
+    /// #XM: `status` is the pending, unmasked SIMD exception of `mxcsr`.
+    SimdFloatingPoint { status: u32, mxcsr: u32 },
 }
 
 impl HardwareFault {
@@ -146,6 +157,21 @@ impl HardwareFault {
             17 => Self::AlignmentCheck,
             _ => return None,
         })
+    }
+
+    /// A user #MF (16) or #XM (19), given the faulting thread's floating-point state. `None`
+    /// for other vectors, and when no unmasked exception is pending (ReactOS bugchecks then).
+    pub fn floating_point(vector: u64, state: &FloatingPointState) -> Option<Self> {
+        match vector {
+            16 => state.x87_status().map(|(status, stack_fault)| Self::X87FloatingPoint {
+                status,
+                stack_fault,
+                instruction: state.instruction_pointer,
+                data: state.data_pointer,
+            }),
+            19 => state.simd_status().map(|status| Self::SimdFloatingPoint { status, mxcsr: state.mxcsr }),
+            _ => None,
+        }
     }
 
     /// A user #GP, given the instruction bytes readable at the faulting RIP
@@ -199,6 +225,17 @@ pub fn classify(fault: HardwareFault, rip: u64) -> (ExceptionRecord, u64) {
             (record, rip)
         }
         AlignmentCheck => (ExceptionRecord::new(STATUS_DATATYPE_MISALIGNMENT, rip, &[]), rip),
+        // KiNpxHandler: reported at the x87 instruction; a stack fault adds its operand.
+        X87FloatingPoint { status, stack_fault: true, instruction, data } => {
+            (ExceptionRecord::new(status, instruction, &[0, data]), rip)
+        }
+        X87FloatingPoint { status, stack_fault: false, instruction, .. } => {
+            (ExceptionRecord::new(status, instruction, &[0]), rip)
+        }
+        // trap.S KiXmmException: two parameters, 0 and MXCSR.
+        SimdFloatingPoint { status, mxcsr } => {
+            (ExceptionRecord::new(status, rip, &[0, u64::from(mxcsr)]), rip)
+        }
     }
 }
 
@@ -311,6 +348,36 @@ mod tests {
         for vector in [2, 7, 8, 14, 16, 18, 19, 255] {
             assert_eq!(HardwareFault::from_vector(vector), None, "vector {vector}");
         }
+    }
+
+    #[test]
+    fn floating_point_faults_report_the_pending_unmasked_exception() {
+        let state = |control_word, status_word, mxcsr| FloatingPointState {
+            control_word,
+            status_word,
+            instruction_pointer: 0x1_4000_2000,
+            data_pointer: 0x3000,
+            mxcsr,
+        };
+        // #XM: divide-by-zero unmasked (MXCSR.ZM clear) and flagged.
+        let mxcsr = (0x1f80 & !(1 << 9)) | (1 << 2);
+        let simd = HardwareFault::floating_point(19, &state(0x037f, 0, mxcsr)).unwrap();
+        let (record, delivered_rip) = classify(simd, 0x1000);
+        assert_eq!((record.code, record.address, delivered_rip), (STATUS_FLOAT_DIVIDE_BY_ZERO, 0x1000, 0x1000));
+        assert_eq!(record.parameters[..record.parameter_count as usize], [0, u64::from(mxcsr)]);
+        // #MF: an unmasked x87 overflow, reported at the x87 instruction.
+        let x87 = HardwareFault::floating_point(16, &state(0x0377, 1 << 3, 0x1f80)).unwrap();
+        let (record, delivered_rip) = classify(x87, 0x1000);
+        assert_eq!((record.code, record.address, delivered_rip), (STATUS_FLOAT_OVERFLOW, 0x1_4000_2000, 0x1000));
+        assert_eq!(record.parameters[..record.parameter_count as usize], [0]);
+        // An x87 stack fault also reports its operand.
+        let stack = HardwareFault::floating_point(16, &state(0x037e, (1 << 6) | 1, 0x1f80)).unwrap();
+        let record = classify(stack, 0x1000).0;
+        assert_eq!((record.code, record.parameter_count, record.parameters[1]), (STATUS_FLOAT_STACK_CHECK, 2, 0x3000));
+        // Nothing pending and unmasked, or another vector: not a floating-point exception.
+        assert_eq!(HardwareFault::floating_point(19, &state(0x037f, 0, 0x1f80 | 0x3f)), None);
+        assert_eq!(HardwareFault::floating_point(16, &state(0x037f, 0x3f, 0x1f80)), None);
+        assert_eq!(HardwareFault::floating_point(0, &state(0, 0x3f, 0x3f)), None);
     }
 
     fn context(rsp: u64, rip: u64) -> [u8; AMD64_CONTEXT_SIZE] {

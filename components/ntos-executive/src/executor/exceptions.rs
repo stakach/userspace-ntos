@@ -55,10 +55,16 @@ pub(super) unsafe fn cpu_exception(
     if skipped {
         return ControlFlow::Break(Turn::Next);
     }
-    // DbgkForwardException: a debugged process's debugger sees the trap first (m3 is the
-    // delivered exception NUMBER — the x86 vector — which maps to the NTSTATUS
-    // `KiDispatchException` would report). No-op when nothing debugs this process.
-    if dbgk_forward_exception(nt_handler, pi, nt_process::dbgk::ExceptionRecord::new( nt_process::dbgk::exception_code_for_trap(lp.msg.m3 as u32), fip, )) && dbgk_block_and_park(
+    // m3 is the delivered exception NUMBER — the x86 vector. The exception it raises is the
+    // record both the debugger and the thread's own handlers see.
+    let fault = crate::user_exception_delivery::cpu_fault(nt_handler, pi, lp.msg.badge, lp.msg.m3, fip);
+    let debug_record = fault.map_or_else(
+        || nt_process::dbgk::ExceptionRecord::new(nt_process::dbgk::exception_code_for_trap(lp.msg.m3 as u32), fip),
+        |fault| crate::user_exception_delivery::debug_record(fault, fip),
+    );
+    // DbgkForwardException: a debugged process's debugger sees the trap first. No-op when
+    // nothing debugs this process.
+    if dbgk_forward_exception(nt_handler, pi, debug_record) && dbgk_block_and_park(
         &mut lp.exit, &mut lp.parks, &mut lp.ingress, nt_handler, procs, pfilled,
         filled_pages, pi, nt_process::dbgk::DBGK_BLOCK_USER_EXCEPTION, fip, lp.msg.m1, lp.msg.m2, &mut lp.msg,
     )? {
@@ -67,7 +73,7 @@ pub(super) unsafe fn cpu_exception(
         return ControlFlow::Break(Turn::Next);
     }
     // NT first-chance delivery (#285), after the debugger's first chance.
-    if let Some(fault) = crate::user_exception_delivery::cpu_fault(nt_handler, pi, lp.msg.m3, fip) {
+    if let Some(fault) = fault {
         if deliver_to_user(
             &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi,
             event_runtime.tcb, fault, fip, ntdll, &mut lp.msg,
@@ -444,8 +450,18 @@ pub(super) unsafe fn debug_exception(
     )? {
         return ControlFlow::Break(Turn::Next);
     }
-    // Unhandled #DB/#BP (a RtlRaiseException the loader/process can't recover, or a
-    // debugger-declined single-step) — a crash. Park+log.
+    // NT first-chance delivery of an `int 3` to the thread's own handlers, after the
+    // debugger's first chance: STATUS_BREAKPOINT at the int 3 (KiBreakpointTrap).
+    if debug_reason == nt_process::dbgk::SEL4_DEBUG_REASON_SOFTWARE_BREAK_REQUEST
+        && deliver_to_user(
+            &mut lp.exit, &mut lp.ingress, nt_handler, procs, pfilled, filled_pages, pi, tcb,
+            nt_thread_start::user_exception::HardwareFault::Breakpoint, debug_ip, ntdll, &mut lp.msg,
+        )?
+    {
+        return ControlFlow::Break(Turn::Next);
+    }
+    // Undeliverable #BP, or a debugger-declined #DB single-step or hardware breakpoint — a
+    // crash. Park+log.
     return ControlFlow::Break(lp.park_and_log(pi, b"debug-exception(4)", debug_ip, debug_ip));
 }
 

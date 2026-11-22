@@ -50,15 +50,28 @@ pub(crate) fn trace_delivery() -> bool {
     DELIVERY_TRACE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16
 }
 
-/// The CPU exception a user `vector` raised at `ip` reports. A #GP decodes the instruction
-/// bytes the thread can read there (KiGeneralProtectionFaultUserMode).
+/// The CPU exception a user `vector` raised at `ip` by the thread behind `badge` reports. A
+/// #GP decodes the instruction bytes the thread can read there
+/// (KiGeneralProtectionFaultUserMode); an x87 or SIMD floating-point fault reads the thread's
+/// floating-point status (KiNpxHandler, KiXmmExceptionHandler).
 pub(crate) unsafe fn cpu_fault(
     handler: &mut ExecNtHandler,
     pi: usize,
+    badge: u64,
     vector: u64,
     ip: u64,
 ) -> Option<HardwareFault> {
     const GENERAL_PROTECTION: u64 = 13;
+    const X87_FLOATING_POINT: u64 = 16;
+    const SIMD_FLOATING_POINT: u64 = 19;
+    if matches!(vector, X87_FLOATING_POINT | SIMD_FLOATING_POINT) {
+        let (_, tcb) = faulting_thread(handler, pi, badge).ok()?;
+        let context = crate::thread_context::LegacyThreadContext::read(tcb).ok()?;
+        let state = nt_thread_start::user_exception::FloatingPointState::from_fx_save(
+            &context.floating_point,
+        )?;
+        return HardwareFault::floating_point(vector, &state);
+    }
     if vector != GENERAL_PROTECTION {
         return HardwareFault::from_vector(vector);
     }
@@ -71,6 +84,24 @@ pub(crate) unsafe fn cpu_fault(
         .find(|len| handler.process_memory_read_status(pi, ip, &mut bytes[..*len]).is_ok())
         .unwrap_or(0);
     Some(HardwareFault::general_protection(&bytes[..readable]))
+}
+
+/// The executable thread of `pi` behind the faulting `badge`, and its bound TCB.
+unsafe fn faulting_thread(
+    handler: &ExecNtHandler,
+    pi: usize,
+    badge: u64,
+) -> Result<(crate::hosted_thread_runtime::HostedThreadRuntime, u64), NotDelivered> {
+    let runtime = handler
+        .thread_runtime
+        .executable_by_badge(badge)
+        .filter(|runtime| runtime.pi == pi)
+        .ok_or(NotDelivered::UnknownThread)?;
+    let tcb = handler
+        .hosted_thread_tcb(runtime.tid)
+        .filter(|tcb| *tcb > 1)
+        .ok_or(NotDelivered::UnknownThread)?;
+    Ok((runtime, tcb))
 }
 
 /// The DBGKM_EXCEPTION record a debugger sees for `fault` at `ip`: the same record the
@@ -92,15 +123,7 @@ pub(crate) unsafe fn deliver_user_exception(
     reply: u64,
     ntdll: (u64, &nt_pe_loader::PeFile<'_>),
 ) -> Result<u32, NotDelivered> {
-    let runtime = handler
-        .thread_runtime
-        .executable_by_badge(badge)
-        .filter(|runtime| runtime.pi == pi)
-        .ok_or(NotDelivered::UnknownThread)?;
-    let tcb = handler
-        .hosted_thread_tcb(runtime.tid)
-        .filter(|tcb| *tcb > 1)
-        .ok_or(NotDelivered::UnknownThread)?;
+    let (runtime, tcb) = faulting_thread(handler, pi, badge)?;
     let (record, delivered_ip) = nt_thread_start::user_exception::classify(fault, ip);
     let snapshot =
         crate::thread_context::LegacyThreadContext::read(tcb).map_err(|_| NotDelivered::ThreadState)?;
