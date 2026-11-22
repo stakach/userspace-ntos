@@ -13836,6 +13836,11 @@ unsafe fn trace_queued_callback_root_failure(
     sel4_rt::print_record(record.bytes());
 }
 
+/// Census totals of asynchronous callers held while their dispatch was in flight (#427).
+pub(crate) fn print_inflight_caller_census() {
+    file_dispatch_handoff::print_inflight_caller_census();
+}
+
 /// A hosted File IRP's dispatch returned to its owner; ready any caller held on it (#427).
 pub(crate) fn hosted_file_dispatch_returned(irp_id: u64) {
     file_dispatch_handoff::dispatch_returned(irp_id);

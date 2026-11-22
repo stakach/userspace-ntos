@@ -308,6 +308,15 @@ pub(super) fn file_read_write_dispatch_for_diagnostic(irp_id: IrpId) -> bool {
 }
 
 pub(super) fn print_rpc_phase() {
+    let queue: [u64; 4] = core::array::from_fn(|stage| IRP_QUEUE_COUNTS[stage].load(Ordering::Relaxed));
+    if queue.iter().any(|count| *count != 0) {
+        print_str(b"[irp-queue-census] queued/retried/admitted/refused=");
+        for (index, count) in queue.iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(*count);
+        }
+        print_str(b"\n");
+    }
     let scsi_calls = SCSI_RPC_TOTALS.calls.load(Ordering::Relaxed);
     if scsi_calls != 0 {
         print_str(b"[scsi-rpc-phase] calls/uninvoked/prepare/invoke/finish_Mtick=");
@@ -2211,8 +2220,35 @@ fn queued_ahead(id: u64) -> bool {
         && other.flight == Flight::QueuedDispatch && other.primary_driver == driver)
 }
 
+/// `[irp-queue]` stages: queued, retried, admitted, refused (#427).
+const IRP_QUEUE_STAGES: [&[u8]; 4] = [b"queued", b"retried", b"admitted", b"refused"];
+static IRP_QUEUE_COUNTS: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Bounded evidence of a not-admitted IRP's queue (#427): every stage's first sightings and
+/// then powers of two, with totals in the census. A refusal is always printed.
+fn trace_irp_queue(stage: usize, id: u64, major: u8) {
+    let n = IRP_QUEUE_COUNTS[stage].fetch_add(1, Ordering::Relaxed) + 1;
+    if stage != 3 && n > 16 && !n.is_power_of_two() { return; }
+    let owner = row(id);
+    let instance = owner.primary_driver
+        .and_then(|driver| instance_by_driver_id(driver.raw()))
+        .map_or(u64::MAX, |(index, _)| index as u64);
+    print_str(b"[irp-queue] stage=");
+    print_str(IRP_QUEUE_STAGES[stage]);
+    print_str(b" n="); print_u64(n);
+    print_str(b" instance/major/irp="); print_u64(instance); print_str(b"/");
+    print_hex_u64(u64::from(major)); print_str(b"/");
+    print_hex_u64(owner.irp_id.map_or(0, |irp| irp.raw()));
+    if let Some(status) = owner.blocked_status.filter(|_| stage == 3) {
+        print_str(b" status="); print_hex_u64(status.raw() as u32 as u64);
+    }
+    print_str(b"\n");
+}
+
 /// Retain a not-admitted preparation; nothing was entered, so it may be begun again.
 fn queue_unadmitted(id: u64, prepared: PreparedExternalFileIrp) {
+    trace_irp_queue(0, id, prepared.projection().major);
     let row = row(id);
     row.payload = Some(Payload::Prepared(prepared));
     row.flight = Flight::QueuedDispatch;
@@ -2700,6 +2736,8 @@ fn redrive_queued(id: u64) -> QueuedReadRedriveOutcome {
         }
     };
     let major = prepared.projection().major;
+    let queued = row(id).queue_not_admitted;
+    if queued { trace_irp_queue(1, id, major); }
     let mut phase = FileRpcPhaseGuard::new(major);
     // The same last point before a disk provider may enter as a first dispatch's.
     unsafe { mounted_native_block::before_external_scsi_effect(&prepared, &row(id).stack) };
@@ -2729,6 +2767,7 @@ fn redrive_queued(id: u64) -> QueuedReadRedriveOutcome {
                     let (error, prepared) = rejection.into_parts();
                     let error = if status == nt_status::NtStatus::CANCELLED { error } else { status };
                     block(id, Payload::Prepared(prepared), error);
+                    if queued { trace_irp_queue(3, id, major); }
                     QueuedReadRedriveOutcome::Retained(error)
                 }
             };
@@ -2776,9 +2815,13 @@ fn redrive_queued(id: u64) -> QueuedReadRedriveOutcome {
         Err(rejection) => {
             let (status, returned) = rejection.into_parts();
             block(id, Payload::Returned(returned), status);
+            if queued { trace_irp_queue(3, id, major); }
             return QueuedReadRedriveOutcome::Retained(status);
         }
     };
+    if queued && !matches!(result, ExternalFileIrpResult::NotAdmitted { .. }) {
+        trace_irp_queue(2, id, major);
+    }
     let result = match result.into_no_entry_receipt() {
         Ok(receipt) => {
             keep(id, Payload::NoEntry(receipt));
@@ -2793,6 +2836,7 @@ fn redrive_queued(id: u64) -> QueuedReadRedriveOutcome {
         ExternalFileIrpResult::NotEntered { status, prepared } => {
             // An invalid success-shaped refusal has no terminal authority; retain it.
             block(id, Payload::Prepared(prepared), status);
+            if queued { trace_irp_queue(3, id, major); }
             QueuedReadRedriveOutcome::Retained(status)
         }
         ExternalFileIrpResult::NotAdmitted { prepared } => {

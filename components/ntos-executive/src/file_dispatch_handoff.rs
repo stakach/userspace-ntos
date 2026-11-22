@@ -350,7 +350,40 @@ pub(super) unsafe fn finish_after_inline_retirement(
 static mut ASYNC_IN_FLIGHT: nt_hosted_runtime::InFlightCallers<nt_io_manager::PendingFileIoIdentity> =
     nt_hosted_runtime::InFlightCallers::new();
 
+/// `[inflight-caller]` stages (#427): held, released with STATUS_PENDING, released to its
+/// completion's ordinary delivery, and a reply that could not be sent yet.
+const INFLIGHT_STAGES: [&[u8]; 4] =
+    [b"held", b"released-pending", b"released-completion", b"reply-retry"];
+static INFLIGHT_COUNTS: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Bounded evidence of an asynchronous caller held while its dispatch was in flight: each
+/// stage's first sightings and then powers of two, totals in the census; a retry always prints.
+fn trace_inflight_caller(stage: usize, identity: nt_io_manager::PendingFileIoIdentity, irp_id: u64) {
+    let n = INFLIGHT_COUNTS[stage].fetch_add(1, Ordering::Relaxed) + 1;
+    if stage != 3 && n > 16 && !n.is_power_of_two() { return; }
+    print_str(b"[inflight-caller] stage=");
+    print_str(INFLIGHT_STAGES[stage]);
+    print_str(b" n="); print_u64(n);
+    print_str(b" slot/generation/irp="); print_u64(identity.slot() as u64); print_str(b"/");
+    print_u64(identity.generation()); print_str(b"/"); print_hex_u64(irp_id);
+    print_str(b"\n");
+}
+
+/// Census totals of held and released asynchronous in-flight callers (#427).
+pub(super) fn print_inflight_caller_census() {
+    let counts: [u64; 4] = core::array::from_fn(|stage| INFLIGHT_COUNTS[stage].load(Ordering::Relaxed));
+    if counts.iter().all(|count| *count == 0) { return; }
+    print_str(b"[inflight-caller-census] held/released-pending/released-completion/reply-retry=");
+    for (index, count) in counts.iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(*count);
+    }
+    print_str(b"\n");
+}
+
 fn hold_async_in_flight(identity: nt_io_manager::PendingFileIoIdentity, irp_id: u64) {
+    trace_inflight_caller(0, identity, irp_id);
     let _durable = crate::allocator::enter_durable();
     unsafe { (*core::ptr::addr_of_mut!(ASYNC_IN_FLIGHT)).hold(identity, irp_id) };
 }
@@ -381,7 +414,7 @@ pub(super) unsafe fn release_returned_async_callers(nt_handler: &mut ExecNtHandl
         match nt_hosted_runtime::in_flight_caller_reply(false, progress) {
             // Returned but not yet settled: the settling transition readies it again.
             nt_hosted_runtime::InFlightReply::Hold => callers.hold(identity, irp_id),
-            nt_hosted_runtime::InFlightReply::Completion => {}
+            nt_hosted_runtime::InFlightReply::Completion => trace_inflight_caller(2, identity, irp_id),
             nt_hosted_runtime::InFlightReply::Pending => {
                 let slot = identity.slot();
                 let Some(Some(cap)) = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
@@ -392,6 +425,7 @@ pub(super) unsafe fn release_returned_async_callers(nt_handler: &mut ExecNtHandl
                         .restore_reply_cap_exact(slot, irp_id, cap)
                         .expect("in-flight File reply lost its exact capability owner");
                     callers.retry(identity, irp_id);
+                    trace_inflight_caller(3, identity, irp_id);
                     FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                     continue;
                 }
@@ -400,6 +434,7 @@ pub(super) unsafe fn release_returned_async_callers(nt_handler: &mut ExecNtHandl
                     .expect("in-flight File reply publication owner disappeared");
                 release_reply_pool_cap(cap);
                 thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
+                trace_inflight_caller(1, identity, irp_id);
                 released += 1;
             }
         }

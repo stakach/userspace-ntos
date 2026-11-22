@@ -263,6 +263,7 @@ use scsi_srb_pump_owner::{ScsiSrbPumpOwnerIdentity, ScsiSrbPumpOwners, ScsiSrbPu
 
 pub(crate) fn print_hosted_file_rpc_phase() {
     hosted_file_owners::print_rpc_phase();
+    crate::service_sec_image::print_inflight_caller_census();
     print_scsi_srb_pump_timing();
 }
 #[path = "mounted_native_block.rs"]
