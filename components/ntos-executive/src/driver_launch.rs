@@ -168,6 +168,10 @@ pub(crate) fn hosted_seh_linkage(
 
 #[path = "hosted_pool_lock.rs"]
 mod hosted_pool_lock;
+#[path = "hosted_device_reply_lock.rs"]
+mod hosted_device_reply_lock;
+use hosted_device_reply_lock::component_device_reply_lock;
+use hosted_device_reply_lock::dpc_may_start as hosted_device_reply_dpc_may_start;
 use hosted_pool_lock::{component_pool_lock, hosted_instance_pool_lock,
     hosted_instance_pool_quiescent, ExecutivePoolLockGuard};
 #[path = "component_scheduler.rs"]
@@ -3399,7 +3403,6 @@ unsafe fn poll_hosted_detached_pnp_completion(
 /// 16-byte allocation headers in the arena. Corrupt lists fail closed before any mutation.
 const POOL_FREE_LIST_MAX: u64 = (FSD_POOL_FRAMES * 0x1000) / 16;
 const COMPONENT_POOL_LOCK_OFF: u64 = 0x10;
-const COMPONENT_DEVICE_REPLY_LOCK_OFF: u64 = 0x18;
 const COMPONENT_POOL_GENERATION_OFF: u64 = 0x20;
 /// Rejected double frees, invalid free lists, and invalid free pointers are counter-backed so a
 /// regression is a gate failure rather than a silent allocator stall.
@@ -3416,27 +3419,6 @@ unsafe fn next_component_pool_generation(pool_va: u64) -> Option<u64> {
     Some(next)
 }
 
-struct ComponentDeviceReplyLockGuard;
-
-impl Drop for ComponentDeviceReplyLockGuard {
-    fn drop(&mut self) {
-        unsafe {
-            (&*((FSD_POOL_VADDR + COMPONENT_DEVICE_REPLY_LOCK_OFF) as *const AtomicU64))
-                .store(0, Ordering::Release);
-        }
-    }
-}
-
-unsafe fn component_device_reply_lock() -> ComponentDeviceReplyLockGuard {
-    let lock = &*((FSD_POOL_VADDR + COMPONENT_DEVICE_REPLY_LOCK_OFF) as *const AtomicU64);
-    while lock
-        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        crate::yield_now();
-    }
-    ComponentDeviceReplyLockGuard
-}
 
 /// A simple free-list allocator: an FSD alloc/frees file objects; a leak-forever bump would exhaust
 /// under FSCTL churn. Header = 16 B ([+0]=capacity, [+8]=next-free). `pool_free` inserts in

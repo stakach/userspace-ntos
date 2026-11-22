@@ -130,3 +130,21 @@ fn a_dispatch_level_pool_free_never_waits_on_the_device_reply_lock() {
              root Call that root cannot answer until the DPC returns");
     }
 }
+
+#[test]
+fn a_dpc_is_admitted_only_when_no_lane_holds_the_device_reply_lock() {
+    // nt-hosted-runtime device_reply_lock proves the admission and release-wake policy; this pins
+    // that the native DPC dispatch and the component guard use it.
+    let functions = executive_functions();
+    let calls = |file: &str, name: &str| functions.0.get(name).into_iter().flatten()
+        .filter(|(f, _)| f == file)
+        .flat_map(|(_, calls)| calls.iter().map(|(_, callee)| callee.clone()))
+        .collect::<Vec<_>>();
+    assert!(calls("hosted_irq_broker.rs", "dispatch_next_dpc").iter()
+        .any(|call| call == "hosted_device_reply_dpc_may_start"),
+        "no DPC starts over a device-reply holder");
+    assert!(calls("hosted_device_reply_lock.rs", "dpc_may_start").iter()
+        .any(|call| call == "admit_dpc_over_device_reply_lock"));
+    assert!(calls("hosted_device_reply_lock.rs", "component_device_reply_lock").iter()
+        .any(|call| call == "try_acquire_device_reply_lock"));
+}

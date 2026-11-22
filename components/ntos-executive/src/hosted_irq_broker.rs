@@ -2599,6 +2599,13 @@ unsafe fn dispatch_next_dpc(
     {
         return Ok(HostedDpcRootDispatchOutcome::DeferredBusy);
     }
+    // Nor over a lane holding the device-reply lock across a root Call: the DPC's own device
+    // services would wait on it. The holder's release wakes root for the next pass (#420).
+    if instance(lane.projection_instance)
+        .is_some_and(|inst| !super::hosted_device_reply_dpc_may_start(inst.exec_pool_va))
+    {
+        return Ok(HostedDpcRootDispatchOutcome::DeferredBusy);
+    }
     // The domain is one processor: no DPC starts while one of its lanes is stopped at
     // DISPATCH_LEVEL holding a spin lock across a root call (#423).
     if !super::hosted_domain_dpc_may_start(owner.domain_id, owner.domain_cookie) {
