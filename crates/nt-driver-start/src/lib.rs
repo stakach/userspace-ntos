@@ -4,8 +4,13 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+mod add_device_root_policy;
 mod add_device_selection;
 pub mod preload_catalog;
+pub use add_device_root_policy::{
+    root_add_device_stop_action, FailedAddDevice, RootAddDeviceStop, RootAddDeviceStopAction,
+    CM_PROB_FAILED_ADD, DN_HAS_PROBLEM, STATUS_UNSUCCESSFUL, UNCERTAIN_ADD_DEVICE,
+};
 pub use add_device_selection::{
     select_add_device_row, AddDeviceReadiness, AddDeviceSelection, AddDeviceSelectionEvidence,
     AwaitingBusPdo,
@@ -152,6 +157,20 @@ impl DriverStartBatch {
                 self.phase = BatchPhase::Complete;
                 Ok(())
             }
+            BatchPhase::OwnershipLost { .. } => Err(BatchError::OwnershipLost),
+            _ => Err(BatchError::WrongPhase),
+        }
+    }
+
+    /// The devnode at the cursor entered AddDevice, and that effect is now uncertain. The
+    /// batch keeps its cursor and never dispatches, completes or replays it again.
+    pub fn fail_entered_add_device(&mut self, status: u32) -> Result<(), BatchError> {
+        match self.phase {
+            BatchPhase::Ready if self.next_devnode < self.devnode_count => {
+                self.phase = BatchPhase::OwnershipLost { status };
+                Ok(())
+            }
+            BatchPhase::Complete => Err(BatchError::Complete),
             BatchPhase::OwnershipLost { .. } => Err(BatchError::OwnershipLost),
             _ => Err(BatchError::WrongPhase),
         }

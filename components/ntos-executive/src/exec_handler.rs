@@ -20010,7 +20010,7 @@ impl ExecNtHandler {
             .unwrap_or((0, 0))
     }
 
-    fn pnp_store_runtime_status(&mut self, instance: &str, status: u32, problem: u32) -> u32 {
+    pub(crate) fn pnp_store_runtime_status(&mut self, instance: &str, status: u32, problem: u32) -> u32 {
         if status == 0 && problem == 0 {
             if let Some(slot) = self.pnp_status_slot(instance) {
                 self.pnp_status.records[slot] = PnpRuntimeStatusRecord::empty();

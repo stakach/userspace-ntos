@@ -13834,6 +13834,52 @@ pub(crate) fn root_queued_callback_retry_wake_due(now: u64) -> u64 {
     ).is_ok())
 }
 
+/// End the root's exclusive AddDevice turn for `owner`. Its retained ingress ticket must
+/// still name its deferred Call. Returns whether a Call was retained, or the exit reason.
+unsafe fn release_root_add_device_turn(
+    current: &mut Option<RootAddDeviceTurn>,
+    owner: RootAddDeviceOwner,
+) -> Result<bool, &'static [u8]> {
+    use nt_driver_start::{root_add_device_stop_action as action, RootAddDeviceStop as Stop};
+    let Some(turn) = current.take() else { return Err(b"add-device-settle") };
+    if turn.retained_ingress(owner).ok().flatten().is_some_and(|ticket|
+        !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_parked_ingress_is_exact(ticket))
+    {
+        *current = Some(turn);
+        debug_assert_eq!(action(Stop::IngressChanged), nt_driver_start::RootAddDeviceStopAction::Terminal);
+        return Err(b"add-device-ingress-changed");
+    }
+    let retained = match turn.settle(owner) {
+        Ok(retained) => retained,
+        Err(turn) => {
+            *current = Some(turn);
+            debug_assert_eq!(action(Stop::Settle), nt_driver_start::RootAddDeviceStopAction::Terminal);
+            return Err(b"add-device-settle");
+        }
+    };
+    ROOT_ADD_DEVICE_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
+    ROOT_ADD_DEVICE_EXCLUSIVE.store(false, Ordering::Release);
+    Ok(retained.is_some())
+}
+
+/// The parked AddDevice turn stopped with an uncertain parent (#420). Fail its devnode, keep
+/// the parent fenced, and release the turn so the service loop continues. `Ok(false)` means the
+/// devnode could not be failed and the stop remains the loop's.
+unsafe fn fail_parked_root_add_device(
+    handler: &mut ExecNtHandler,
+    current: &mut Option<RootAddDeviceTurn>,
+    owner: RootAddDeviceOwner,
+) -> Result<bool, &'static [u8]> {
+    use nt_driver_start::{root_add_device_stop_action, RootAddDeviceStop, RootAddDeviceStopAction};
+    if root_add_device_stop_action(RootAddDeviceStop::ParentRetained)
+        != RootAddDeviceStopAction::FailDevnode
+        || !fail_uncertain_root_add_device(handler, owner)
+    {
+        return Ok(false);
+    }
+    release_root_add_device_turn(current, owner).map(|_| true)
+}
+
 pub(crate) fn root_add_device_exclusive_pending() -> bool {
     ROOT_ADD_DEVICE_EXCLUSIVE.load(Ordering::Acquire)
 }
@@ -14428,6 +14474,42 @@ fn root_add_device_needs_child_step(
     }
 }
 
+/// The parked parent's AddDevice is uncertain: fail its devnode as NT does (ReactOS
+/// `PiCallDriverAddDevice`: `CM_PROB_FAILED_ADD`) and publish its batch's failure (#420). The
+/// parent, its Reply, banks and its driver's rows stay fenced in the batch row. Returns whether
+/// the devnode failed; if not, the turn still owns an AddDevice it can continue.
+unsafe fn fail_uncertain_root_add_device(
+    handler: &mut ExecNtHandler, owner: RootAddDeviceOwner,
+) -> bool {
+    let instance = match owner {
+        RootAddDeviceOwner::DriverStart(reservation) => handler.pending_driver_starts
+            .get_mut(reservation.slot()).filter(|pending| pending.reservation == reservation)
+            .and_then(|pending| pending.batch.fail_uncertain_add_device().map(alloc::string::String::from)),
+        RootAddDeviceOwner::PnpRebalance(reservation) => handler.pending_pnp_operations
+            .get_mut(reservation.slot()).filter(|pending| pending.reservation == reservation)
+            .and_then(|pending| match &mut pending.operation {
+                OwnedPendingPnpOperation::Rebalance(batch) =>
+                    batch.fail_uncertain_add_device().map(alloc::string::String::from),
+                OwnedPendingPnpOperation::Removal(_) => None,
+            }),
+    };
+    let Some(instance) = instance else { return false };
+    let failure = nt_driver_start::UNCERTAIN_ADD_DEVICE;
+    let recorded = handler.pnp_store_runtime_status(
+        &instance, failure.devnode_status, failure.problem);
+    print_str(b"[pnp-add-device-failed] devnode=");
+    print_str(instance.as_bytes());
+    print_str(b" status=0x");
+    print_hex(failure.status);
+    print_str(b" problem=0x");
+    print_hex(failure.problem);
+    print_str(b" recorded=0x");
+    print_hex(recorded);
+    print_str(b"\n");
+    redrive_flat_root_add_device_selected(handler, owner);
+    true
+}
+
 unsafe fn redrive_flat_root_add_device_selected(
     handler: &mut ExecNtHandler, owner: RootAddDeviceOwner,
 ) -> u64 {
@@ -14443,7 +14525,7 @@ unsafe fn redrive_flat_root_add_device_selected(
 /// Ready cursor cannot retire during this step: redrive waits until the receipt is deposited.
 unsafe fn run_one_pending_add_device_child_step(
     handler: *mut ExecNtHandler,
-) -> Result<Option<(RootAddDeviceOwner, bool)>, ()> {
+) -> Option<(RootAddDeviceOwner, bool)> {
     let selected = {
         let table = &(*handler).pending_driver_starts;
         table.occupied_slots().find_map(|slot| {
@@ -14455,16 +14537,15 @@ unsafe fn run_one_pending_add_device_child_step(
     };
     if let Some((slot, reservation, needs_child)) = selected {
         let owner = RootAddDeviceOwner::DriverStart(reservation);
-        if !needs_child { return Ok(Some((owner, false))) }
+        if !needs_child { return Some((owner, false)) }
         let step = drive_one_nested_file_child_step();
         let ran_child = step.ran_child();
         let pending = (*handler).pending_driver_starts.get_mut(slot)
             .filter(|pending| pending.reservation == reservation)
             .expect("selected AddDevice batch cannot retire before its child receipt is deposited");
+        // A quarantined receipt stays in the batch, whose parent the turn then fails (#420).
         return match pending.batch.record_add_device_child_step(step) {
-            Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Recorded) =>
-                Ok(Some((owner, ran_child))),
-            Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Quarantined) => Err(()),
+            Ok(_) => Some((owner, ran_child)),
             Err(_) => unreachable!("exact AddDevice batch refused its selected child receipt"),
         };
     }
@@ -14479,9 +14560,9 @@ unsafe fn run_one_pending_add_device_child_step(
                 batch.needs_add_device_child_step()))
         })
     };
-    let Some((slot, reservation, needs_child)) = selected else { return Ok(None) };
+    let (slot, reservation, needs_child) = selected?;
     let owner = RootAddDeviceOwner::PnpRebalance(reservation);
-    if !needs_child { return Ok(Some((owner, false))) }
+    if !needs_child { return Some((owner, false)) }
     let step = drive_one_nested_file_child_step();
     let ran_child = step.ran_child();
     let pending = (*handler).pending_pnp_operations.get_mut(slot)
@@ -14491,9 +14572,7 @@ unsafe fn run_one_pending_add_device_child_step(
         unreachable!("exact rebalance AddDevice changed operation kind");
     };
     match batch.record_add_device_child_step(step) {
-        Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Recorded) =>
-            Ok(Some((owner, ran_child))),
-        Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Quarantined) => Err(()),
+        Ok(_) => Some((owner, ran_child)),
         Err(_) => unreachable!("exact rebalance AddDevice refused its selected child receipt"),
     }
 }
@@ -14877,7 +14956,9 @@ unsafe fn pending_driver_start_redrive_selected(
                 continue;
             };
             if selected.is_some()
-                && pending.batch.wait_stage() == hosted_pnp_start::HostedPnpWaitStage::AddDevice
+                && matches!(pending.batch.wait_stage(),
+                    hosted_pnp_start::HostedPnpWaitStage::AddDevice
+                    | hosted_pnp_start::HostedPnpWaitStage::AddDeviceFailed)
             {
                 // This exact AddDevice has already entered native code. A predecessor may
                 // affect later START policy, but cannot revoke its physical Reply owner.

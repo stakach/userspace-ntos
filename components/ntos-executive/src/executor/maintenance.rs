@@ -291,15 +291,7 @@ pub(super) unsafe fn maintain(
         }
         let selected = {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
-            match run_one_pending_add_device_child_step(nt_handler as *mut _) {
-                Ok(selected) => selected,
-                Err(()) => {
-                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    lp.exit.stop_ssn = 0;
-                    lp.exit.record(b"add-device-child-step");
-                    return ControlFlow::Break(Turn::Exit);
-                }
-            }
+            run_one_pending_add_device_child_step(nt_handler as *mut _)
         };
         let Some((reservation, ran_child)) = selected else {
             if let Some(turn) = lp.ingress.root_add_device_turn.take() {
@@ -313,28 +305,16 @@ pub(super) unsafe fn maintain(
                     lp.exit.record(b"add-device-owner-changed");
                     return ControlFlow::Break(Turn::Exit);
                 }
-                if turn.retained_ingress(owner).ok().flatten().is_some_and(|ticket|
-                    !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_parked_ingress_is_exact(ticket))
-                {
-                    lp.ingress.root_add_device_turn = Some(turn);
-                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    lp.exit.stop_ssn = 0;
-                    lp.exit.record(b"add-device-ingress-changed");
-                    return ControlFlow::Break(Turn::Exit);
-                }
-                let retained = match turn.settle(owner) {
-                    Ok(retained) => retained,
-                    Err(turn) => {
-                        lp.ingress.root_add_device_turn = Some(turn);
+                lp.ingress.root_add_device_turn = Some(turn);
+                match release_root_add_device_turn(&mut lp.ingress.root_add_device_turn, owner) {
+                    Ok(retained) => root_event_consumed |= retained,
+                    Err(reason) => {
                         lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         lp.exit.stop_ssn = 0;
-                        lp.exit.record(b"add-device-settle");
+                        lp.exit.record(reason);
                         return ControlFlow::Break(Turn::Exit);
                     }
-                };
-                ROOT_ADD_DEVICE_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
-                ROOT_ADD_DEVICE_EXCLUSIVE.store(false, Ordering::Release);
-                root_event_consumed |= retained.is_some();
+                }
                 break;
             }
             // Ordinary redrives may reach Ready, but only this flat root phase may
@@ -450,41 +430,40 @@ pub(super) unsafe fn maintain(
         trace_connect_add_device_boundary(6,
             crate::driver_launch::hosted_connect_root_probe_origin_bits());
         if !still_parked {
-            if lp.ingress.root_add_device_turn.as_ref().and_then(|turn|
-                turn.retained_ingress(reservation).ok().flatten())
-                .is_some_and(|ticket|
-                    !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_parked_ingress_is_exact(ticket))
+            if let Err(reason) =
+                release_root_add_device_turn(&mut lp.ingress.root_add_device_turn, reservation)
             {
                 lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 lp.exit.stop_ssn = 0;
-                lp.exit.record(b"add-device-ingress-changed");
+                lp.exit.record(reason);
                 return ControlFlow::Break(Turn::Exit);
             }
-            let turn = lp.ingress.root_add_device_turn.take().expect("exact AddDevice turn");
-            let retained = match turn.settle(reservation) {
-                Ok(retained) => retained,
-                Err(turn) => {
-                    lp.ingress.root_add_device_turn = Some(turn);
-                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    lp.exit.stop_ssn = 0;
-                    lp.exit.record(b"add-device-settle");
-                    return ControlFlow::Break(Turn::Exit);
-                }
-            };
-            ROOT_ADD_DEVICE_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
-            ROOT_ADD_DEVICE_EXCLUSIVE.store(false, Ordering::Release);
             break;
         }
         if !awaiting_connect_child && !ran_child
             && !root_add_device_retry_without_new_child(&nt_handler, reservation)
             && !root_add_device_needs_child_step(&nt_handler, reservation)
         {
-            // The exact parent has an indeterminate or quarantined outcome. Its Reply
-            // and banks remain held, and no unrelated provider can enter after this.
-            lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-            lp.exit.stop_ssn = 0;
-            lp.exit.record(b"add-device-parent-retained");
-            return ControlFlow::Break(Turn::Exit);
+            // The exact parent has an indeterminate or quarantined outcome. NT fails that
+            // devnode and keeps enumerating (#420): its Reply, banks and its driver's rows stay
+            // fenced in the batch, and the released turn lets the rest of boot proceed.
+            match fail_parked_root_add_device(
+                &mut nt_handler, &mut lp.ingress.root_add_device_turn, reservation,
+            ) {
+                Ok(true) => break,
+                Ok(false) => {
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
+                    lp.exit.record(b"add-device-parent-retained");
+                    return ControlFlow::Break(Turn::Exit);
+                }
+                Err(reason) => {
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
+                    lp.exit.record(reason);
+                    return ControlFlow::Break(Turn::Exit);
+                }
+            }
         }
         if ran_child && !awaiting_connect_child { continue }
         let turn = lp.ingress.root_add_device_turn.as_mut().expect("parked AddDevice turn");

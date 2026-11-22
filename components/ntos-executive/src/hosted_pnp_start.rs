@@ -184,6 +184,8 @@ pub(crate) enum OwnedHostedPnpStartProgress {
 pub(crate) enum HostedPnpWaitStage {
     BootstrapPredecessor,
     AddDevice,
+    /// The devnode's AddDevice is uncertain and failed (#420); its parent stays fenced.
+    AddDeviceFailed,
     Relations,
     FilterAdmission,
     FilterCompletion,
@@ -197,6 +199,7 @@ impl HostedPnpWaitStage {
         match self {
             Self::BootstrapPredecessor => b"bootstrap-predecessor",
             Self::AddDevice => b"add-device",
+            Self::AddDeviceFailed => b"add-device-failed",
             Self::Relations => b"relations",
             Self::FilterAdmission => b"filter-admission",
             Self::FilterCompletion => b"filter-completion",
@@ -215,6 +218,9 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     pending_device_id: u64,
     pending_add_device: Option<PendingHostedAddDevice>,
     pending_upper_filter: Option<PendingHostedUpperFilter>,
+    /// An AddDevice whose effect is uncertain. Its devnode has failed; the parked parent, its
+    /// Reply, banks and resource plan stay here for the life of the batch row (#420).
+    fenced_add_device: Option<FencedHostedAddDevice>,
     pending_filter_admission: Option<PendingHostedFilterAdmission>,
     pending_filter: Option<PendingHostedPnpFilter>,
     pending_grant_admission: Option<PendingHostedGrantAdmission>,
@@ -281,6 +287,12 @@ struct PendingHostedUpperFilter {
     quarantined_child_step: Option<crate::service_sec_image::NestedChildStep>,
 }
 
+/// Held, never released or resumed: the parent's AddDevice may still be running.
+enum FencedHostedAddDevice {
+    Function(#[allow(dead_code)] PendingHostedAddDevice),
+    UpperFilter(#[allow(dead_code)] PendingHostedUpperFilter),
+}
+
 pub(crate) enum AddDeviceStepDeposit {
     Recorded,
     Quarantined,
@@ -331,6 +343,7 @@ impl OwnedHostedPnpStartBatch {
             pending_device_id: 0,
             pending_add_device: None,
             pending_upper_filter: None,
+            fenced_add_device: None,
             pending_filter_admission: None,
             pending_filter: None,
             pending_grant_admission: None,
@@ -355,7 +368,9 @@ impl OwnedHostedPnpStartBatch {
     }
 
     pub(crate) fn wait_stage(&self) -> HostedPnpWaitStage {
-        if self.pending_relations.is_some() {
+        if self.fenced_add_device.is_some() {
+            HostedPnpWaitStage::AddDeviceFailed
+        } else if self.pending_relations.is_some() {
             HostedPnpWaitStage::Relations
         } else if self.pending_add_device.is_some() || self.pending_upper_filter.is_some() {
             HostedPnpWaitStage::AddDevice
@@ -558,6 +573,37 @@ impl OwnedHostedPnpStartBatch {
                     && pending.devnode_index == self.coordinator.next_devnode()
                     && pending.continuation.retry_without_new_child()
             })
+    }
+
+    /// The parked AddDevice has neither a child to run nor a retry: its effect is uncertain.
+    /// Fail its devnode as NT fails an AddDevice (`CM_PROB_FAILED_ADD`), and fence the parent
+    /// with its Reply, banks and resource plan in this batch; nothing is released, resumed or
+    /// replayed, and no later devnode of this driver enters. Returns the failed devnode.
+    pub(crate) fn fail_uncertain_add_device(&mut self) -> Option<&str> {
+        if self.fenced_add_device.is_some()
+            || self.needs_add_device_child_step()
+            || self.retry_add_device_without_new_child()
+        {
+            return None;
+        }
+        let failure = nt_driver_start::UNCERTAIN_ADD_DEVICE;
+        let devnode_index = self.pending_add_device.as_ref().map(|pending| pending.devnode_index)
+            .or_else(|| self.pending_upper_filter.as_ref().map(|pending| pending.devnode_index))?;
+        if devnode_index != self.coordinator.next_devnode()
+            || self.coordinator.fail_entered_add_device(failure.status).is_err()
+        {
+            return None;
+        }
+        self.fenced_add_device = Some(match self.pending_upper_filter.take() {
+            Some(pending) => FencedHostedAddDevice::UpperFilter(pending),
+            None => FencedHostedAddDevice::Function(
+                self.pending_add_device.take().expect("inspected AddDevice owner")),
+        });
+        let status = nt_status::NtStatus(failure.status as i32);
+        record_start_indeterminate(&mut self.report, status, false);
+        let instance_id = &self.spec.devnodes[devnode_index].instance_id;
+        print_add_device_failure(self.options.trace, &self.spec.service_name, instance_id, status);
+        Some(instance_id)
     }
 
     /// Read-only census for the retained root AddDevice turn. Bit 0 is a present native
@@ -907,6 +953,12 @@ impl OwnedHostedPnpStartBatch {
         flat_root_add_device_permit: bool) -> OwnedHostedPnpStartProgress {
         let _active_drive = ActiveHostedStartBatchDrive::enter();
         let mut flat_root_add_device_permit = flat_root_add_device_permit;
+        if self.fenced_add_device.is_some() {
+            return OwnedHostedPnpStartProgress::OwnershipLost(HostedPnpStartBatchFailure {
+                status: nt_status::NtStatus(nt_driver_start::UNCERTAIN_ADD_DEVICE.status as i32),
+                teardown_blocked: true,
+            });
+        }
         loop {
             if let Some(pending) = self.pending_add_device.as_ref() {
                 // Only the selected flat root turn may consume this physical parent. An
@@ -1432,6 +1484,11 @@ impl OwnedHostedPnpRebalance {
     ) -> Result<AddDeviceStepDeposit, crate::service_sec_image::NestedChildStep> {
         if !self.add_device_wait_stage() { return Err(step) }
         self.restart.record_add_device_child_step(step)
+    }
+
+    pub(crate) fn fail_uncertain_add_device(&mut self) -> Option<&str> {
+        if !self.add_device_wait_stage() { return None }
+        self.restart.fail_uncertain_add_device()
     }
 
     fn fail_terminal(&mut self, failure: HostedPnpStartBatchFailure) {
