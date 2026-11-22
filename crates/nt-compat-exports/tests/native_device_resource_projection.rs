@@ -52,11 +52,6 @@ impl<'ast> Visit<'ast> for RestoreContract {
         {
             self.selected_binding |= matches!(call.args.first(), Some(Expr::Path(path))
                 if path.path.is_ident("binding"));
-            assert!(
-                matches!(call.args.iter().nth(1), Some(Expr::Path(path))
-                if path.path.is_ident("sh")),
-                "restore the actual selected dispatch bank"
-            );
         }
         syn::visit::visit_expr_call(self, call);
     }

@@ -113,6 +113,21 @@ pub const fn hosted_lane_irql_bank(lane: HostedInstanceLane, primary_shared: u64
     }
 }
 
+/// The bank a lane's dispatch projects its device resources into: the lane's own, and for a
+/// worker never the primary's (a projection there would overwrite the parked primary's device).
+pub const fn hosted_resource_projection_bank(
+    lane: HostedInstanceLane,
+    primary_shared: u64,
+    channel_shared: u64,
+) -> Option<u64> {
+    match lane {
+        HostedInstanceLane::Primary if channel_shared == primary_shared => Some(primary_shared),
+        HostedInstanceLane::Worker if channel_shared != primary_shared && channel_shared != 0 =>
+            Some(channel_shared),
+        _ => None,
+    }
+}
+
 /// A thread may take an interrupt's lock only once it has raised to that interrupt's
 /// SynchronizeIrql, which is at least DISPATCH_LEVEL.
 pub const fn interrupt_lock_irql_matches(synchronize_irql: u8, lane_irql: u8) -> bool {

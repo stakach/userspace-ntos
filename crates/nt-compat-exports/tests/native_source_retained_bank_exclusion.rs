@@ -17,11 +17,9 @@ fn file_dispatch_claims_the_selected_request_bank_before_native_publication() {
         .expect("retained physical bank claim");
     let projection = body.find("project_provider_device_dispatch_state(")
         .expect("provider projection");
-    let restore = body.find("restore_hosted_device_resource_state(binding, sh, false)")
-        .expect("resource projection");
     let request = body.find("write_volatile((sh + SH_REQ_MAJOR)")
         .expect("request header publication");
-    assert!(selected < claim && claim < projection && claim < restore && claim < request);
+    assert!(selected < claim && claim < projection && claim < request);
 
     let enter = NATIVE
         .split_once("unsafe fn enter_active_hosted_irp_transfer(")

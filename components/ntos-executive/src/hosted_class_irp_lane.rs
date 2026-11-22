@@ -15,7 +15,8 @@ use core::sync::atomic::AtomicUsize;
 const LABEL: u64 = 0x7bd;
 pub(super) const FSD_DISPATCH_DYNAMIC_DELETE: u64 = u64::MAX - 0x7bd;
 const BANK_OFFSET: u64 = FSD_WORKER_KPCR_OFFSET + 0x1000;
-const ARG_OFFSET: u64 = BANK_OFFSET + 0x1000;
+/// A full SH-layout bank, so a worker's dispatch can hold its device's resource projection.
+const ARG_OFFSET: u64 = BANK_OFFSET + FSD_SHARED_FRAMES * 0x1000;
 const REQUEST_OFFSET: u64 = 0x800;
 const JUMP_OFFSET: u64 = align_up_u64(
     REQUEST_OFFSET + core::mem::size_of::<IrpDispatchRequest>() as u64, 16,
@@ -24,7 +25,59 @@ const SCRATCH_BANK_OFFSET: u64 = 0xff0;
 const ORDINAL_BIT: u64 = 1 << 63;
 const _: () = assert!(REQUEST_OFFSET + core::mem::size_of::<IrpDispatchRequest>() as u64 <= JUMP_OFFSET);
 const _: () = assert!(JUMP_OFFSET + 3 * 8 <= SCRATCH_BANK_OFFSET);
-const _: () = assert!(BANK_OFFSET + 0x1000 <= FSD_WORKER_STRIDE);
+const _: () = assert!(BANK_OFFSET + FSD_SHARED_FRAMES * 0x1000 <= FSD_WORKER_STRIDE);
+/// The lane's private overlay inside its SH-layout bank (the request copy and jump buffer; the
+/// bank marker lives in the scratch page) must never overlap a field the device resource
+/// projection writes (#427).
+const fn outside_lane_private(offset: u64, len: u64) -> bool {
+    offset + len <= REQUEST_OFFSET || offset >= JUMP_OFFSET + 3 * 8
+}
+const _: () = assert!(outside_lane_private(SH_DMA_ADAPTER_BLOB, 8), "SH_DMA_ADAPTER_BLOB");
+const _: () = assert!(outside_lane_private(SH_DMA_ADAPTER_ID, 8), "SH_DMA_ADAPTER_ID");
+const _: () = assert!(outside_lane_private(SH_DMA_COMMON_LEN, 8), "SH_DMA_COMMON_LEN");
+const _: () = assert!(outside_lane_private(SH_DMA_COMMON_LOGICAL, 8), "SH_DMA_COMMON_LOGICAL");
+const _: () = assert!(outside_lane_private(SH_DMA_COMMON_VA, 8), "SH_DMA_COMMON_VA");
+const _: () = assert!(outside_lane_private(SH_DPC_DELIVERIES, 8), "SH_DPC_DELIVERIES");
+const _: () = assert!(outside_lane_private(SH_DPC_QUEUE_DROPS, 8), "SH_DPC_QUEUE_DROPS");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_ADDRESS, 8), "SH_RESOURCE_ADDRESS");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_BUS_NUMBER, 8), "SH_RESOURCE_BUS_NUMBER");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERFACE_TYPE, 8), "SH_RESOURCE_INTERFACE_TYPE");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERRUPT_AFFINITY, 8), "SH_RESOURCE_INTERRUPT_AFFINITY");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERRUPT_CONTEXT, 8), "SH_RESOURCE_INTERRUPT_CONTEXT");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR, 8), "SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERRUPT_DELIVERIES, 8), "SH_RESOURCE_INTERRUPT_DELIVERIES");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERRUPT_ID, 8), "SH_RESOURCE_INTERRUPT_ID");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERRUPT_ISR_CLAIMED, 8), "SH_RESOURCE_INTERRUPT_ISR_CLAIMED");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERRUPT_LINE, 8), "SH_RESOURCE_INTERRUPT_LINE");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERRUPT_OBJECT, 8), "SH_RESOURCE_INTERRUPT_OBJECT");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERRUPT_POLICY, 8), "SH_RESOURCE_INTERRUPT_POLICY");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERRUPT_ROUTINE, 8), "SH_RESOURCE_INTERRUPT_ROUTINE");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_INTERRUPT_VECTOR, 8), "SH_RESOURCE_INTERRUPT_VECTOR");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_IN16_CALLS, 8), "SH_RESOURCE_IO_PORT_IN16_CALLS");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_IN16_DENIED, 8), "SH_RESOURCE_IO_PORT_IN16_DENIED");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_IN16_FAILURES, 8), "SH_RESOURCE_IO_PORT_IN16_FAILURES");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_LAST_IN16_PORT, 8), "SH_RESOURCE_IO_PORT_LAST_IN16_PORT");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_LAST_IN16_STATUS, 8), "SH_RESOURCE_IO_PORT_LAST_IN16_STATUS");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_LAST_IN16_VALUE, 8), "SH_RESOURCE_IO_PORT_LAST_IN16_VALUE");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_LAST_OUT16_PORT, 8), "SH_RESOURCE_IO_PORT_LAST_OUT16_PORT");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS, 8), "SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE, 8), "SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_OUT16_CALLS, 8), "SH_RESOURCE_IO_PORT_OUT16_CALLS");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_OUT16_DENIED, 8), "SH_RESOURCE_IO_PORT_OUT16_DENIED");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_OUT16_FAILURES, 8), "SH_RESOURCE_IO_PORT_OUT16_FAILURES");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_IO_PORT_OUT32_FAULTS, 8), "SH_RESOURCE_IO_PORT_OUT32_FAULTS");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_MMIO_MAPPED_LEN, 8), "SH_RESOURCE_MMIO_MAPPED_LEN");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_MMIO_MAPPED_PHYS, 8), "SH_RESOURCE_MMIO_MAPPED_PHYS");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_PCI_CLASS_REV, 8), "SH_RESOURCE_PCI_CLASS_REV");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_PCI_IRQ, 8), "SH_RESOURCE_PCI_IRQ");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_PCI_VENDOR_DEVICE, 8), "SH_RESOURCE_PCI_VENDOR_DEVICE");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_PDO_OBJECT, 8), "SH_RESOURCE_PDO_OBJECT");
+const _: () = assert!(outside_lane_private(SH_VIDEO_MEMORY_CALLER_VA, 8), "SH_VIDEO_MEMORY_CALLER_VA");
+const _: () = assert!(outside_lane_private(SH_VIDEO_MEMORY_LEN, 8), "SH_VIDEO_MEMORY_LEN");
+const _: () = assert!(outside_lane_private(SH_VIDEO_MEMORY_PHYS, 8), "SH_VIDEO_MEMORY_PHYS");
+const _: () = assert!(outside_lane_private(SH_HOSTED_CURRENT_IRQL, 8), "SH_HOSTED_CURRENT_IRQL");
+const _: () = assert!(outside_lane_private(SH_RESOURCE_ADDRESS_RECORDS,
+    SH_RESOURCE_ADDRESS_RECORD_CAPACITY * SH_RESOURCE_ADDRESS_RECORD_SIZE));
 const _: () = assert!(ARG_OFFSET + FSD_ARG_FRAMES * 0x1000 <= FSD_WORKER_STRIDE);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -255,7 +308,7 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<Startup, u32> 
     (&mut *core::ptr::addr_of_mut!(LANES))[index].handle = handle;
     let spawn = spawn_hosted_driver_worker_thread_with_shared_bank(
         instance_index, inst, handle, slot, entry as *const () as u64, shared,
-        Some(HostedWorkerSharedBankSpec { offset: BANK_OFFSET, frames: 1,
+        Some(HostedWorkerSharedBankSpec { offset: BANK_OFFSET, frames: FSD_SHARED_FRAMES,
             arg_offset: Some(ARG_OFFSET) }),
     ).ok_or(STATUS_INSUFFICIENT_RESOURCES as u32)?;
     let bank = spawn.shared_bank.ok_or(STATUS_INVALID_HANDLE as u32)?;

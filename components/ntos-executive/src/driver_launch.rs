@@ -8742,7 +8742,7 @@ impl HostedBusIdentity {
 }
 
 unsafe fn hosted_resource_identity_active() -> bool {
-    read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PDO_OBJECT) as *const u64) != 0
+    read_volatile((hosted_component_resource_shared_va() + SH_RESOURCE_PDO_OBJECT) as *const u64) != 0
         || shared_address_resource_count(FSD_SHARED_VADDR).is_some_and(|count| count != 0)
         || read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32) != 0
         || read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64) != 0
@@ -20224,7 +20224,7 @@ unsafe fn component_read_video_access_range(ptr: u64) -> VideoAccessRangeX64 {
 
 unsafe fn hosted_memory_range_granted(start: u64, len: u64) -> bool {
     find_shared_address_resource_by_range(
-        hosted_component_shared_va(),
+        hosted_component_resource_shared_va(),
         SH_RESOURCE_ADDRESS_KIND_MEMORY,
         start,
         len,
@@ -20234,7 +20234,7 @@ unsafe fn hosted_memory_range_granted(start: u64, len: u64) -> bool {
 }
 
 unsafe fn hosted_video_memory_64k_units() -> Option<u16> {
-    let bytes = read_volatile((hosted_component_shared_va() + SH_VIDEO_MEMORY_LEN) as *const u64);
+    let bytes = read_volatile((hosted_component_resource_shared_va() + SH_VIDEO_MEMORY_LEN) as *const u64);
     let units = bytes / VIDEO_MEMORY_64K_UNIT;
     if units == 0 {
         None
@@ -20245,7 +20245,7 @@ unsafe fn hosted_video_memory_64k_units() -> Option<u16> {
 
 unsafe fn hosted_io_range_granted(start: u64, len: u64) -> bool {
     find_shared_address_resource_by_range(
-        hosted_component_shared_va(),
+        hosted_component_resource_shared_va(),
         SH_RESOURCE_ADDRESS_KIND_PORT,
         start,
         len,
@@ -20255,11 +20255,11 @@ unsafe fn hosted_io_range_granted(start: u64, len: u64) -> bool {
 }
 
 unsafe fn hosted_mmio_va_range_granted(start: u64, len: u64) -> bool {
-    find_shared_address_resource_by_va(hosted_component_shared_va(), start, len).is_some()
+    find_shared_address_resource_by_va(hosted_component_resource_shared_va(), start, len).is_some()
 }
 
 unsafe fn bump_shared_io_counter(offset: u64) -> u64 {
-    let ptr = (hosted_component_shared_va() + offset) as *mut u64;
+    let ptr = (hosted_component_resource_shared_va() + offset) as *mut u64;
     let next = read_volatile(ptr).saturating_add(1);
     write_volatile(ptr, next);
     next
@@ -20270,7 +20270,7 @@ unsafe fn hosted_port_cap_for_component_io(port: u64, width: u64) -> Option<u64>
         return None;
     }
     let resource = find_shared_address_resource_by_range(
-        hosted_component_shared_va(),
+        hosted_component_resource_shared_va(),
         SH_RESOURCE_ADDRESS_KIND_PORT,
         port,
         width,
@@ -20283,28 +20283,28 @@ extern "win64" fn s_read_port_ushort(port: u64) -> u16 {
     unsafe {
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_CALLS);
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
             port,
         );
         let Some(cap) = hosted_port_cap_for_component_io(port, 2) else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_DENIED);
             write_volatile(
-                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
                 u64::MAX,
             );
             write_volatile(
-                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
                 0,
             );
             return 0;
         };
         let (value, status) = crate::io_in16_r(cap, port as u16);
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
             status,
         );
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
             value as u64,
         );
         if status != 0 {
@@ -20319,24 +20319,24 @@ extern "win64" fn s_write_port_ushort(port: u64, value: u16) {
     unsafe {
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_CALLS);
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
             port,
         );
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
             value as u64,
         );
         let Some(cap) = hosted_port_cap_for_component_io(port, 2) else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_DENIED);
             write_volatile(
-                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
                 u64::MAX,
             );
             return;
         };
         let status = crate::io_out16(cap, port as u16, value);
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
             status,
         );
         if status != 0 {
@@ -20349,28 +20349,28 @@ extern "win64" fn s_read_port_ulong(port: u64) -> u32 {
     unsafe {
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_CALLS);
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
             port,
         );
         let Some(cap) = hosted_port_cap_for_component_io(port, 4) else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_DENIED);
             write_volatile(
-                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
                 u64::MAX,
             );
             write_volatile(
-                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
                 0,
             );
             return 0;
         };
         let (value, status) = crate::io_in32_r(cap, port as u16);
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
             status,
         );
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
             value as u64,
         );
         if status == 0 {
@@ -20386,24 +20386,24 @@ extern "win64" fn s_write_port_ulong(port: u64, value: u32) {
     unsafe {
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_CALLS);
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
             port,
         );
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
             value as u64,
         );
         let Some(cap) = hosted_port_cap_for_component_io(port, 4) else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_DENIED);
             write_volatile(
-                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
                 u64::MAX,
             );
             return;
         };
         let status = crate::io_out32(cap, port as u16, value);
         write_volatile(
-            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+            (hosted_component_resource_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
             status,
         );
         if status == 0 {
@@ -20481,13 +20481,13 @@ unsafe fn hosted_videoprt_pci_identity_matches(vendor_id: u64, device_id: u64) -
     if vendor_id == 0 && device_id == 0 {
         return true;
     }
-    if read_volatile((hosted_component_shared_va() + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
+    if read_volatile((hosted_component_resource_shared_va() + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
         != HOSTED_INTERFACE_TYPE_PCIBUS
     {
         return false;
     }
     let vendor_device =
-        read_volatile((hosted_component_shared_va() + SH_RESOURCE_PCI_VENDOR_DEVICE) as *const u32);
+        read_volatile((hosted_component_resource_shared_va() + SH_RESOURCE_PCI_VENDOR_DEVICE) as *const u32);
     let granted_vendor = (vendor_device & 0xFFFF) as u16;
     let granted_device = (vendor_device >> 16) as u16;
     if vendor_id != 0 && read_unaligned(vendor_id as *const u16) != granted_vendor {
@@ -20580,7 +20580,7 @@ extern "win64" fn s_video_port_verify_access_ranges(
             if !hosted_resource_identity_active() {
                 return VP_ERROR_DEV_NOT_EXIST;
             }
-            let pdo = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PDO_OBJECT) as *const u64);
+            let pdo = read_volatile((hosted_component_resource_shared_va() + SH_RESOURCE_PDO_OBJECT) as *const u64);
             return if pdo != 0 && hosted_device_claim_port_range(pdo, 0, 0) == STATUS_SUCCESS {
                 VP_NO_ERROR
             } else {
@@ -20617,7 +20617,7 @@ extern "win64" fn s_video_port_verify_access_ranges(
             idx += 1;
         }
         if let Some(range) = supplemental {
-            let pdo = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PDO_OBJECT) as *const u64);
+            let pdo = read_volatile((hosted_component_resource_shared_va() + SH_RESOURCE_PDO_OBJECT) as *const u64);
             if pdo == 0
                 || hosted_device_claim_port_range(pdo, range.range_start, range.range_length as u64)
                     != STATUS_SUCCESS
@@ -63964,8 +63964,10 @@ pub(crate) unsafe fn hosted_io_port_fault_grant(
     shared_va: u64,
     port: u16,
 ) -> Option<HostedIoPortFaultGrant> {
+    // A dispatch worker's bank holds its own device projection (#427).
     let (instance, inst) = instance_by_shared_va(shared_va)
-        .or_else(|| hosted_irq_instance_by_shared_va(shared_va))?;
+        .or_else(|| hosted_irq_instance_by_shared_va(shared_va))
+        .or_else(|| hosted_class_irp_lane::instance_for_shared(shared_va))?;
     let pdo_object = read_volatile((shared_va + SH_RESOURCE_PDO_OBJECT) as *const u64);
     let current = hosted_device_bindings()?.iter().copied().find(|binding| {
         binding.used && binding.instance == instance && binding.pdo_object == pdo_object
@@ -76320,15 +76322,20 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
         project_provider_device_dispatch_state(binding, dependent_inst.exec_shared_va, d, sh)
         .ok()?;
     } else if let Some(binding) = dispatch_binding {
-        if class_selection.is_some() {
-            let state = hosted_device_resource_state_by_device_id(binding.device_id);
-            if state.is_none_or(|state| state.driver_id != binding.driver_id
-                || state.instance != binding.instance) {
-                return Some(HostedIrpTransportResult::NotDispatched {
-                    status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-                });
-            }
-        } else if let Err(status) = restore_hosted_device_resource_state(binding, sh, false) {
+        // Every lane's dispatch projects its device's resources into that lane's own bank
+        // (#427): a worker's never reaches the parked primary's.
+        let lane = if class_selection.is_some() {
+            nt_hosted_runtime::HostedInstanceLane::Worker
+        } else {
+            nt_hosted_runtime::HostedInstanceLane::Primary
+        };
+        let Some(bank) = nt_hosted_runtime::hosted_resource_projection_bank(lane, d.exec_shared_va, sh)
+        else {
+            return Some(HostedIrpTransportResult::NotDispatched {
+                status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            });
+        };
+        if let Err(status) = restore_hosted_device_resource_state(binding, bank, false) {
             return Some(HostedIrpTransportResult::NotDispatched { status });
         }
     }

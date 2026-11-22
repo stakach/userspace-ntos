@@ -115,7 +115,8 @@ pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderW
     HostedWorkerBankLayout, classify_hosted_provider_export_completion,
     hosted_provider_export_worker_phase, HostedProviderExportPumpEnd,
     HostedProviderExportWorkerPhase,
-    hosted_instance_lane, hosted_lane_irql_bank, interrupt_lock_irql_matches,
+    hosted_instance_lane, hosted_lane_irql_bank, hosted_resource_projection_bank,
+    interrupt_lock_irql_matches,
     select_hosted_cr8_bank, select_hosted_provider_export_worker, HostedInstanceLane, hosted_provider_export_needs_worker,
     hosted_provider_worker_admissible};
 pub use gop_bar_projection::{GopBarProjection, GopLegacyVgaPortAuthority,

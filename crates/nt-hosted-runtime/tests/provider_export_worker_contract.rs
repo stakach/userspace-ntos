@@ -164,3 +164,21 @@ fn an_interrupt_lock_checks_the_calling_lanes_own_irql() {
     assert!(!interrupt_lock_irql_matches(SYNCHRONIZE_IRQL, 0));
     assert!(!interrupt_lock_irql_matches(1, 1));
 }
+
+/// #427 audit gaps 1-3, 6, 7: an ordinary IRP admitted on a dispatch worker never got its
+/// device's resource projection, so MmMapIoSpace returned NULL, port I/O faults were refused,
+/// DPC resources were lost and CLAIM_PORT_RANGE compared against an empty PDO. Each lane's
+/// dispatch projects the device resources into that lane's own bank, never into the parked
+/// primary's.
+#[test]
+fn a_dispatch_projects_device_resources_into_its_own_lane_bank() {
+    use nt_hosted_runtime::{hosted_instance_lane, hosted_resource_projection_bank};
+    const PRIMARY_BANK: u64 = 0x1000;
+    const WORKER_BANK: u64 = 0x9000;
+    let worker = hosted_instance_lane(false, false, true).unwrap();
+    assert_eq!(hosted_resource_projection_bank(worker, PRIMARY_BANK, WORKER_BANK), Some(WORKER_BANK));
+    let primary = hosted_instance_lane(true, false, false).unwrap();
+    assert_eq!(hosted_resource_projection_bank(primary, PRIMARY_BANK, PRIMARY_BANK), Some(PRIMARY_BANK));
+    // A worker's projection can never target the primary bank.
+    assert_eq!(hosted_resource_projection_bank(worker, PRIMARY_BANK, PRIMARY_BANK), None);
+}
