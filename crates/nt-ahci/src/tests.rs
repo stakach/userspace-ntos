@@ -227,7 +227,7 @@ fn busy_task_file_times_out_before_command_publication() {
 
 #[test]
 fn invalid_dma_or_timeout_is_rejected_without_hardware_changes() {
-    for (dma, timeout) in [(1, 30), (u64::MAX & !0x3ff, 30), (0x4000, 0)] {
+    for (dma, timeout) in [(1, 30), (!0x3ff, 30), (0x4000, 0)] {
         let mut port = Port::new();
         assert_eq!(
             execute(&mut port, dma, Command::Identify, timeout),

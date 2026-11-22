@@ -16,8 +16,8 @@ use std::process::ExitCode;
 use nt_pe_loader::PeFile;
 use nt_syscall_abi::{NT_SYSCALLS, ZW_ALIASES};
 
-mod native_stub;
 mod export_compare;
+mod native_stub;
 mod wine_spec;
 
 // IMAGE_FILE_CHARACTERISTICS.IMAGE_FILE_DLL

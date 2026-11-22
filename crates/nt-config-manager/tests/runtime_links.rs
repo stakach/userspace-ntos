@@ -14,8 +14,14 @@ fn registry_with_link() -> (Registry, u64, u64) {
     let generation = registry.generation(parent).unwrap();
     let descriptor = nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR;
     let link = registry
-        .create_secured_link_checked(r"\Registry\Machine\HARDWARE\DEVICEMAP\Link", &descriptor,
-            true, parent, generation, None)
+        .create_secured_link_checked(
+            r"\Registry\Machine\HARDWARE\DEVICEMAP\Link",
+            &descriptor,
+            true,
+            parent,
+            generation,
+            None,
+        )
         .unwrap();
     (registry, parent, link)
 }
@@ -28,13 +34,23 @@ fn a_runtime_link_is_created_once_and_holds_only_its_target() {
     let generation = registry.generation(parent).unwrap();
     let descriptor = nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR;
     assert_eq!(
-        registry.create_secured_link_checked(r"\Registry\Machine\HARDWARE\DEVICEMAP\Link",
-            &descriptor, true, parent, generation, None),
+        registry.create_secured_link_checked(
+            r"\Registry\Machine\HARDWARE\DEVICEMAP\Link",
+            &descriptor,
+            true,
+            parent,
+            generation,
+            None
+        ),
         Err(0xC000_0035),
         "an existing key collides"
     );
     assert_eq!(
-        registry.create_secured_key(r"\Registry\Machine\HARDWARE\DEVICEMAP\Link\Child", &descriptor, true),
+        registry.create_secured_key(
+            r"\Registry\Machine\HARDWARE\DEVICEMAP\Link\Child",
+            &descriptor,
+            true
+        ),
         Err(0xC000_0022),
         "a link key has no children"
     );
@@ -49,16 +65,34 @@ fn a_runtime_walk_reparses_through_a_link() {
     let (mut registry, parent, link) = registry_with_link();
     let root = registry.open_key(r"\Registry").unwrap();
     let path = r"Machine\HARDWARE\DEVICEMAP\Link";
-    assert_eq!(registry.walk_following_links(root, path, false),
-        Err(nt_config_manager::symbolic_link::SymbolicLinkError::NoTarget));
-    assert!(registry.set_value(link, "SymbolicLinkValue", RegistryValueType::Link, link_data(TARGET)));
-    assert_eq!(registry.walk_following_links(root, path, false),
-        Ok(RegistryLinkWalk::Reparse(TARGET.into())));
-    assert_eq!(registry.walk_following_links(parent, r"Link\Child", false),
-        Ok(RegistryLinkWalk::Reparse(format!(r"{TARGET}\Child"))));
-    assert_eq!(registry.walk_following_links(root, path, true), Ok(RegistryLinkWalk::Found(link)));
-    assert_eq!(registry.walk_following_links(root, r"Machine\Missing", false),
-        Ok(RegistryLinkWalk::NotFound { last: true }));
-    assert_eq!(registry.walk_following_links(root, r"Machine\Missing\Child", false),
-        Ok(RegistryLinkWalk::NotFound { last: false }));
+    assert_eq!(
+        registry.walk_following_links(root, path, false),
+        Err(nt_config_manager::symbolic_link::SymbolicLinkError::NoTarget)
+    );
+    assert!(registry.set_value(
+        link,
+        "SymbolicLinkValue",
+        RegistryValueType::Link,
+        link_data(TARGET)
+    ));
+    assert_eq!(
+        registry.walk_following_links(root, path, false),
+        Ok(RegistryLinkWalk::Reparse(TARGET.into()))
+    );
+    assert_eq!(
+        registry.walk_following_links(parent, r"Link\Child", false),
+        Ok(RegistryLinkWalk::Reparse(format!(r"{TARGET}\Child")))
+    );
+    assert_eq!(
+        registry.walk_following_links(root, path, true),
+        Ok(RegistryLinkWalk::Found(link))
+    );
+    assert_eq!(
+        registry.walk_following_links(root, r"Machine\Missing", false),
+        Ok(RegistryLinkWalk::NotFound { last: true })
+    );
+    assert_eq!(
+        registry.walk_following_links(root, r"Machine\Missing\Child", false),
+        Ok(RegistryLinkWalk::NotFound { last: false })
+    );
 }

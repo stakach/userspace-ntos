@@ -10,7 +10,10 @@ pub enum NativeRoutePublication<R> {
 
 impl<R: Copy + Eq> NativeRoutePublication<R> {
     pub const fn published(self) -> Option<R> {
-        match self { Self::Published { route } => Some(route), _ => None }
+        match self {
+            Self::Published { route } => Some(route),
+            _ => None,
+        }
     }
 
     pub const fn retained_recheck_route(self) -> Option<R> {
@@ -21,7 +24,10 @@ impl<R: Copy + Eq> NativeRoutePublication<R> {
     }
 
     pub fn publish_initial(self, route: R) -> Result<Self, Self> {
-        match self { Self::Absent => Ok(Self::Initial { route }), _ => Err(self) }
+        match self {
+            Self::Absent => Ok(Self::Initial { route }),
+            _ => Err(self),
+        }
     }
 
     pub fn complete_initial(self, route: R) -> Result<Self, Self> {
@@ -33,21 +39,27 @@ impl<R: Copy + Eq> NativeRoutePublication<R> {
 
     pub fn begin_refresh(self, route: R) -> Result<Self, Self> {
         match self {
-            Self::Published { route: current } if current == route => Ok(Self::Refreshing { route }),
+            Self::Published { route: current } if current == route => {
+                Ok(Self::Refreshing { route })
+            }
             _ => Err(self),
         }
     }
 
     pub fn abort_refresh(self, route: R) -> Option<Self> {
         match self {
-            Self::Refreshing { route: current } if current == route => Some(Self::Published { route }),
+            Self::Refreshing { route: current } if current == route => {
+                Some(Self::Published { route })
+            }
             _ => None,
         }
     }
 
     pub fn commit_refresh(self, previous: R, next: R) -> Option<Self> {
         match self {
-            Self::Refreshing { route } if route == previous => Some(Self::Published { route: next }),
+            Self::Refreshing { route } if route == previous => {
+                Some(Self::Published { route: next })
+            }
             _ => None,
         }
     }
@@ -71,7 +83,10 @@ mod tests {
 
     #[test]
     fn retained_relation_claim_stays_bound_to_exact_owner_and_request() {
-        let claimed = RelationWalClaim { owner: 41u64, request: 7u64 };
+        let claimed = RelationWalClaim {
+            owner: 41u64,
+            request: 7u64,
+        };
         assert!(claimed.matches(41, 7));
         assert!(!claimed.matches(42, 7));
         assert!(!claimed.matches(41, 8));
@@ -101,7 +116,10 @@ mod tests {
         assert!(refreshing.complete_initial(41).is_err());
         assert_eq!(refreshing.abort_refresh(42), None);
         assert_eq!(refreshing.abort_refresh(41), Some(published));
-        assert_eq!(refreshing.commit_refresh(41, 42), Some(Publication::Published { route: 42 }));
+        assert_eq!(
+            refreshing.commit_refresh(41, 42),
+            Some(Publication::Published { route: 42 })
+        );
         assert_eq!(refreshing.commit_refresh(42, 43), None);
     }
 }

@@ -130,8 +130,11 @@ impl MdlPageLockLedger {
         range: PageRange,
         operation: LockOperation,
     ) -> Result<PageLockTicket, PageLockError> {
-        if process.generation == 0 || mdl.generation == 0
-            || mdl.key.domain_id == 0 || mdl.key.domain_cookie == 0 || mdl.key.component_va == 0
+        if process.generation == 0
+            || mdl.generation == 0
+            || mdl.key.domain_id == 0
+            || mdl.key.domain_cookie == 0
+            || mdl.key.component_va == 0
         {
             return Err(PageLockError::InvalidOwner);
         }
@@ -159,7 +162,10 @@ impl MdlPageLockLedger {
     }
 
     pub fn get(&self, ticket: PageLockTicket) -> Option<PageLockRecord> {
-        self.records.iter().find(|record| record.ticket == ticket).copied()
+        self.records
+            .iter()
+            .find(|record| record.ticket == ticket)
+            .copied()
     }
 
     /// Call only after every page has been validated and pinned for this exact process.
@@ -251,8 +257,12 @@ mod tests {
         let (process, first) = owners(0x1000);
         let (_, second) = owners(0x2000);
         let range = PageRange::for_bytes(0x1fff, 2).unwrap();
-        let a = ledger.prepare(process, first, range, LockOperation::Read).unwrap();
-        let b = ledger.prepare(process, second, range, LockOperation::Write).unwrap();
+        let a = ledger
+            .prepare(process, first, range, LockOperation::Read)
+            .unwrap();
+        let b = ledger
+            .prepare(process, second, range, LockOperation::Write)
+            .unwrap();
         ledger.commit_pinned(a).unwrap();
         ledger.commit_pinned(b).unwrap();
         assert_eq!(ledger.page_owner_count(process, 0x1000), 2);
@@ -270,12 +280,20 @@ mod tests {
         let mut ledger = MdlPageLockLedger::new();
         let (process, mdl) = owners(0x1000);
         let range = PageRange::for_bytes(0x2123, 100).unwrap();
-        let ticket = ledger.prepare(process, mdl, range, LockOperation::Modify).unwrap();
+        let ticket = ledger
+            .prepare(process, mdl, range, LockOperation::Modify)
+            .unwrap();
         assert_eq!(ledger.page_owner_count(process, 0x2000), 1);
-        assert_eq!(ledger.prepare(process, mdl, range, LockOperation::Read), Err(PageLockError::AlreadyOwned));
+        assert_eq!(
+            ledger.prepare(process, mdl, range, LockOperation::Read),
+            Err(PageLockError::AlreadyOwned)
+        );
         assert_eq!(ledger.begin_release(ticket), Err(PageLockError::WrongState));
         ledger.commit_pinned(ticket).unwrap();
-        assert_eq!(ledger.abort_unpinned(ticket), Err(PageLockError::WrongState));
+        assert_eq!(
+            ledger.abort_unpinned(ticket),
+            Err(PageLockError::WrongState)
+        );
         ledger.begin_release(ticket).unwrap();
         assert_eq!(ledger.begin_release(ticket), Err(PageLockError::WrongState));
         assert_eq!(ledger.page_owner_count(process, 0x2000), 1);
@@ -291,14 +309,25 @@ mod tests {
         assert!(PageRange::for_bytes(0, 0).is_none());
         assert!(PageRange::for_bytes(u64::MAX, 1).is_none());
         let range = PageRange::for_bytes(0x2fff, 2).unwrap();
-        let ticket = ledger.prepare(process, mdl, range, LockOperation::Read).unwrap();
+        let ticket = ledger
+            .prepare(process, mdl, range, LockOperation::Read)
+            .unwrap();
         assert_eq!(range.first_page(), 0x2000);
         assert_eq!(range.end_exclusive(), 0x4000);
-        assert_eq!(ledger.page_owner_count(ProcessOwner::new(1, 3).unwrap(), 0x2000), 0);
+        assert_eq!(
+            ledger.page_owner_count(ProcessOwner::new(1, 3).unwrap(), 0x2000),
+            0
+        );
         assert_eq!(ledger.page_owner_count(process, 0x2001), 0);
         let reused = MdlOwner::new(mdl.key, mdl.generation + 1).unwrap();
-        assert_eq!(ledger.prepare(process, reused, range, LockOperation::Read), Err(PageLockError::AlreadyOwned));
+        assert_eq!(
+            ledger.prepare(process, reused, range, LockOperation::Read),
+            Err(PageLockError::AlreadyOwned)
+        );
         ledger.abort_unpinned(ticket).unwrap();
-        assert_eq!(ledger.abort_unpinned(ticket), Err(PageLockError::UnknownTicket));
+        assert_eq!(
+            ledger.abort_unpinned(ticket),
+            Err(PageLockError::UnknownTicket)
+        );
     }
 }

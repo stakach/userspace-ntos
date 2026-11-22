@@ -4,14 +4,13 @@ use crate::{Bar, PciDevice, PCI_HEADER_TYPE_DEVICE};
 use nt_cm_resources::{
     validate_cm_resource_list_extent, validate_io_resource_requirements_list_extent,
     CM_RESOURCE_INTERRUPT_LATCHED, CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
-    CM_RESOURCE_INTERRUPT_MESSAGE, CM_RESOURCE_INTERRUPT_MESSAGE_TOKEN,
-    CM_RESOURCE_MEMORY_BAR, CM_RESOURCE_MEMORY_PREFETCHABLE,
-    CM_RESOURCE_PORT_16_BIT_DECODE, CM_RESOURCE_PORT_BAR, CM_RESOURCE_PORT_IO,
-    CM_RESOURCE_PORT_POSITIVE_DECODE, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, CM_RESOURCE_SHARE_SHARED,
-    CM_RESOURCE_TYPE_DEVICE_PRIVATE, CM_RESOURCE_TYPE_INTERRUPT, CM_RESOURCE_TYPE_MEMORY,
-    CM_RESOURCE_TYPE_PORT, INTERFACE_TYPE_PCI_BUS, IO_RESOURCE_ALTERNATIVE,
-    IO_RESOURCE_DESCRIPTOR_SIZE, IO_RESOURCE_PREFERRED, IO_RESOURCE_REQUIRED,
-    IO_RESOURCE_REQUIREMENTS_HEADER_SIZE, PARTIAL_DESCRIPTOR_SIZE,
+    CM_RESOURCE_INTERRUPT_MESSAGE, CM_RESOURCE_INTERRUPT_MESSAGE_TOKEN, CM_RESOURCE_MEMORY_BAR,
+    CM_RESOURCE_MEMORY_PREFETCHABLE, CM_RESOURCE_PORT_16_BIT_DECODE, CM_RESOURCE_PORT_BAR,
+    CM_RESOURCE_PORT_IO, CM_RESOURCE_PORT_POSITIVE_DECODE, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+    CM_RESOURCE_SHARE_SHARED, CM_RESOURCE_TYPE_DEVICE_PRIVATE, CM_RESOURCE_TYPE_INTERRUPT,
+    CM_RESOURCE_TYPE_MEMORY, CM_RESOURCE_TYPE_PORT, INTERFACE_TYPE_PCI_BUS,
+    IO_RESOURCE_ALTERNATIVE, IO_RESOURCE_DESCRIPTOR_SIZE, IO_RESOURCE_PREFERRED,
+    IO_RESOURCE_REQUIRED, IO_RESOURCE_REQUIREMENTS_HEADER_SIZE, PARTIAL_DESCRIPTOR_SIZE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,8 +364,8 @@ pub fn validate_pci_bus_reported_resources(
         // The native PCI PDO may offer an MSI token before its legacy INTx
         // alternative. This is only a proposal; it never authorizes a routed
         // interrupt until the platform grant is selected independently.
-        let message_alternative = native_requirements
-            && declared_count.checked_sub(descriptor_index) == Some(2);
+        let message_alternative =
+            native_requirements && declared_count.checked_sub(descriptor_index) == Some(2);
         if message_alternative {
             let offset = IO_RESOURCE_REQUIREMENTS_HEADER_SIZE
                 + descriptor_index * IO_RESOURCE_DESCRIPTOR_SIZE;
@@ -380,7 +379,8 @@ pub fn validate_pci_bus_reported_resources(
                 || u32_at(requirements, offset + 8)? != CM_RESOURCE_INTERRUPT_MESSAGE_TOKEN
                 || u32_at(requirements, offset + 12)? != CM_RESOURCE_INTERRUPT_MESSAGE_TOKEN
                 || requirements[offset + 16..offset + IO_RESOURCE_DESCRIPTOR_SIZE]
-                    .iter().any(|byte| *byte != 0)
+                    .iter()
+                    .any(|byte| *byte != 0)
             {
                 return Err(PciBusResourceError::ResourceMismatch);
             }
@@ -388,7 +388,12 @@ pub fn validate_pci_bus_reported_resources(
         }
         let offset =
             IO_RESOURCE_REQUIREMENTS_HEADER_SIZE + descriptor_index * IO_RESOURCE_DESCRIPTOR_SIZE;
-        if requirements[offset] != if message_alternative { IO_RESOURCE_ALTERNATIVE } else { IO_RESOURCE_REQUIRED }
+        if requirements[offset]
+            != if message_alternative {
+                IO_RESOURCE_ALTERNATIVE
+            } else {
+                IO_RESOURCE_REQUIRED
+            }
             || requirements[offset + 1] != CM_RESOURCE_TYPE_INTERRUPT
             || requirements[offset + 2] != CM_RESOURCE_SHARE_SHARED
             || requirements[offset + 3] != 0
@@ -452,7 +457,10 @@ mod tests {
         function.bars.clear();
         function.irq_pin = 0;
         function.irq_line = 255;
-        assert_eq!(validate_pci_bus_reported_resources(&function, &[], &[]), Ok(()));
+        assert_eq!(
+            validate_pci_bus_reported_resources(&function, &[], &[]),
+            Ok(())
+        );
 
         function.irq_pin = 1;
         assert!(validate_pci_bus_reported_resources(&function, &[], &[]).is_err());
@@ -534,7 +542,9 @@ mod tests {
         let mut lists = captured.lines().filter(|line| !line.starts_with('#'));
         let decode = |hex: &str| -> alloc::vec::Vec<u8> {
             hex.as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
                 .collect()
         };
@@ -611,25 +621,51 @@ mod tests {
         let captured = include_str!("../tests/fixtures/libernt_pci_ahci_resources.txt");
         let mut lists = captured.lines().filter(|line| !line.starts_with('#'));
         let decode = |hex: &str| -> alloc::vec::Vec<u8> {
-            hex.as_bytes().chunks_exact(2)
+            hex.as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
                 .collect()
         };
         let raw = decode(lists.next().unwrap());
         let requirements = decode(lists.next().unwrap());
         let device = PciDevice {
-            bus: 0, dev: 2, func: 0,
-            vendor: 0x8086, device: 0x2922, class: 0x010601,
-            header_type: PCI_HEADER_TYPE_DEVICE, bridge: None,
-            irq_line: 22, irq_pin: 1,
+            bus: 0,
+            dev: 2,
+            func: 0,
+            vendor: 0x8086,
+            device: 0x2922,
+            class: 0x010601,
+            header_type: PCI_HEADER_TYPE_DEVICE,
+            bridge: None,
+            irq_line: 22,
+            irq_pin: 1,
             bars: alloc::vec![
-                Bar { index: 4, is_io: true, is_64bit: false, prefetchable: false,
-                    base: 0x60a0, size: 0x20, maximum_address: 0xffff },
-                Bar { index: 5, is_io: false, is_64bit: false, prefetchable: false,
-                    base: 0x8106_1000, size: 0x1000, maximum_address: u32::MAX as u64 },
+                Bar {
+                    index: 4,
+                    is_io: true,
+                    is_64bit: false,
+                    prefetchable: false,
+                    base: 0x60a0,
+                    size: 0x20,
+                    maximum_address: 0xffff
+                },
+                Bar {
+                    index: 5,
+                    is_io: false,
+                    is_64bit: false,
+                    prefetchable: false,
+                    base: 0x8106_1000,
+                    size: 0x1000,
+                    maximum_address: u32::MAX as u64
+                },
             ],
         };
-        assert_eq!(validate_pci_bus_reported_resources(&device, &raw, &requirements), Ok(()));
+        assert_eq!(
+            validate_pci_bus_reported_resources(&device, &raw, &requirements),
+            Ok(())
+        );
         let mut invalid_message = requirements.clone();
         let message = IO_RESOURCE_REQUIREMENTS_HEADER_SIZE + 8 * IO_RESOURCE_DESCRIPTOR_SIZE;
         invalid_message[message + 8] ^= 1;

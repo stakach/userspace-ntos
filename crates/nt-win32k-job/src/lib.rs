@@ -307,7 +307,9 @@ impl JobUiPolicyStore {
     /// The job's private table behind an opaque handle from
     /// [`Self::private_atom_table_for_process`], if this store owns that handle.
     pub fn atom_table_for_handle(&mut self, handle: u64) -> Option<&mut OwnedAtomTable> {
-        self.jobs.iter_mut().filter_map(|job| job.atoms.as_deref_mut())
+        self.jobs
+            .iter_mut()
+            .filter_map(|job| job.atoms.as_deref_mut())
             .find(|table| *table as *const OwnedAtomTable as u64 == handle)
     }
 

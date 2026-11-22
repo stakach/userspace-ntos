@@ -54,8 +54,14 @@ fn replacement_generation_cannot_receive_old_provider_events() {
     };
     let fresh = registry.register_device(replacement).unwrap();
     assert_ne!(old, fresh);
-    assert_eq!(registry.plan_device_event(old, GUID, 0), Err(STATUS_INVALID_HANDLE));
-    assert_eq!(registry.plan_device_event(fresh, GUID, 0), Err(STATUS_WMI_GUID_NOT_FOUND));
+    assert_eq!(
+        registry.plan_device_event(old, GUID, 0),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        registry.plan_device_event(fresh, GUID, 0),
+        Err(STATUS_WMI_GUID_NOT_FOUND)
+    );
     assert_eq!(
         registry.publish_device_guids(DEVICE, &[(GUID, WMIGUID_NOTIFICATION)]),
         Err(STATUS_INVALID_HANDLE)

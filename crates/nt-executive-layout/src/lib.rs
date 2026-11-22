@@ -90,8 +90,11 @@ pub mod root {
     pub const WIN32K_SESSION_VIEWS: Region =
         Region::new("win32k session views", 0x0000_0100_4a00_0000, 96 * MIB);
     /// Root views of hosted driver images and their private windows.
-    pub const DRIVER_HOST_VIEWS: Region =
-        Region::spanning("driver host views", 0x0000_0100_5000_0000, 0x0000_0101_5000_0000);
+    pub const DRIVER_HOST_VIEWS: Region = Region::spanning(
+        "driver host views",
+        0x0000_0100_5000_0000,
+        0x0000_0101_5000_0000,
+    );
     /// Root aliases of the hosted KUSER page, the debug filter page and exception-image
     /// snapshots.
     pub const DIAGNOSTIC_ALIASES: Region =
@@ -100,8 +103,11 @@ pub mod root {
     pub const DRIVER_WORKER_ALIASES: Region =
         Region::new("driver worker aliases", 0x0000_0102_0000_0000, 4 * GIB);
     /// Root views of contiguous RAM leased to hosted drivers.
-    pub const CONTIGUOUS_RAM_APERTURE: Region =
-        Region::new("contiguous RAM aperture", DRIVER_WORKER_ALIASES.end(), 512 * MIB);
+    pub const CONTIGUOUS_RAM_APERTURE: Region = Region::new(
+        "contiguous RAM aperture",
+        DRIVER_WORKER_ALIASES.end(),
+        512 * MIB,
+    );
     /// Mirrors of hosted worker lanes outside the legacy slots.
     pub const WORKER_MIRRORS: Region =
         Region::new("worker lane mirrors", 0x0000_0104_0000_0000, 4 * GIB);
@@ -135,8 +141,11 @@ pub mod root {
     pub const DEVICE_MAPPINGS: Region =
         Region::new("device mappings", 0x0000_4000_0000_0000, 4 * GIB);
     /// Process and thread object bodies, in a PML4 branch of their own.
-    pub const PS_OBJECTS: Region =
-        Region::new("process and thread objects", 0x0000_4080_0000_0000, 512 * GIB);
+    pub const PS_OBJECTS: Region = Region::new(
+        "process and thread objects",
+        0x0000_4080_0000_0000,
+        512 * GIB,
+    );
 
     /// Every band of the root VSpace, in ascending order.
     pub const REGIONS: &[Region] = &[
@@ -163,13 +172,14 @@ pub mod root {
     ];
 
     const _: () = assert!(is_ascending(REGIONS));
-    const _: () = assert!(HEAP.base % TABLE_SPAN == 0 && HEAP.len % TABLE_SPAN == 0);
+    const _: () =
+        assert!(HEAP.base.is_multiple_of(TABLE_SPAN) && HEAP.len.is_multiple_of(TABLE_SPAN));
     // The heap's page tables are built at boot into the page directory the image already has;
     // the root does not build another directory before its heap exists.
     const _: () = assert!(HEAP.base / GIB == FIXED_LOW.base / GIB);
     const _: () = assert!((HEAP.end() - 1) / GIB == FIXED_LOW.base / GIB);
-    const _: () = assert!(STATIC_SCRATCH.base % TABLE_SPAN == 0);
-    const _: () = assert!(DYNAMIC_RUNTIME.base % TABLE_SPAN == 0);
+    const _: () = assert!(STATIC_SCRATCH.base.is_multiple_of(TABLE_SPAN));
+    const _: () = assert!(DYNAMIC_RUNTIME.base.is_multiple_of(TABLE_SPAN));
     const _: () = assert!(HOSTED_PROCESS_LIMIT > STATIC_PROCESS_COUNT);
     // Every lane of every process has a mirror, whichever lanes keep legacy addresses.
     const _: () = assert!(
@@ -186,8 +196,11 @@ pub mod component {
     pub const RESOURCE_WINDOWS: Region =
         Region::spanning("device resource windows", 0x0000_0100_1600_0000, HEAP_BASE);
     /// The most a component heap may occupy.
-    pub const HEAP: Region =
-        Region::new("component heap", HEAP_BASE, COMPONENT_HEAP_MAX_FRAMES * PAGE);
+    pub const HEAP: Region = Region::new(
+        "component heap",
+        HEAP_BASE,
+        COMPONENT_HEAP_MAX_FRAMES * PAGE,
+    );
     /// Provider views of section objects.
     pub const SECTION_VIEWS: Region =
         Region::spanning("provider section views", HEAP.end(), 0x0000_0100_3000_0000);
@@ -196,6 +209,6 @@ pub mod component {
     pub const REGIONS: &[Region] = &[RESOURCE_WINDOWS, HEAP, SECTION_VIEWS];
 
     const _: () = assert!(is_ascending(REGIONS));
-    const _: () = assert!(RESOURCE_WINDOWS.base % TABLE_SPAN == 0);
-    const _: () = assert!(SECTION_VIEWS.base % TABLE_SPAN == 0);
+    const _: () = assert!(RESOURCE_WINDOWS.base.is_multiple_of(TABLE_SPAN));
+    const _: () = assert!(SECTION_VIEWS.base.is_multiple_of(TABLE_SPAN));
 }

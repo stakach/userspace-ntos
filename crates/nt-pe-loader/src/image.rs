@@ -69,8 +69,13 @@ impl MappedImage {
                 continue;
             }
             let off = r.rva as usize;
-            let end = off.checked_add(r.kind.width()).ok_or(PeError::PatchOutOfBounds)?;
-            let target = self.bytes.get_mut(off..end).ok_or(PeError::PatchOutOfBounds)?;
+            let end = off
+                .checked_add(r.kind.width())
+                .ok_or(PeError::PatchOutOfBounds)?;
+            let target = self
+                .bytes
+                .get_mut(off..end)
+                .ok_or(PeError::PatchOutOfBounds)?;
             r.kind.apply(target, delta);
         }
         Ok(())

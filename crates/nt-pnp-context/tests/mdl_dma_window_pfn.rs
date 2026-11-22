@@ -11,7 +11,10 @@ use nt_pnp_context::{
     ContextRegistry,
 };
 
-const DOMAIN: MappingDomain = MappingDomain { id: 0x1_0000_000c, cookie: 0x1_0000_000c };
+const DOMAIN: MappingDomain = MappingDomain {
+    id: 0x1_0000_000c,
+    cookie: 0x1_0000_000c,
+};
 const PML4: u64 = 0x4_2000;
 /// The SRB DataBuffer from boot 44461724169.
 const SRB_DATA: u64 = 0x100_1750_0000;
@@ -39,7 +42,9 @@ fn window() -> ResourceMappingTable {
             rights: 3,
             attributes: 0,
         };
-        let Admission::New(receipt) = table.prepare(key, owner).unwrap() else { panic!() };
+        let Admission::New(receipt) = table.prepare(key, owner).unwrap() else {
+            panic!()
+        };
         table.attach_cap(receipt, 0xa00 + index as u64).unwrap();
         let (_, effect) = table.begin_map(receipt).unwrap();
         table.acknowledge_map(effect).unwrap();
@@ -54,13 +59,18 @@ fn owned_run(page: u64) -> Option<u64> {
 
 fn populated(translate: impl Fn(u64) -> Option<u64>) -> (Result<u64, PfnError>, Vec<u64>) {
     let mut pfns = vec![0; 4];
-    let result = populate(SRB_DATA, 0, 0x4000, 4, translate, |index, pfn| pfns[index as usize] = pfn);
+    let result = populate(SRB_DATA, 0, 0x4000, 4, translate, |index, pfn| {
+        pfns[index as usize] = pfn
+    });
     (result, pfns)
 }
 
 #[test]
 fn owned_runs_alone_refuse_the_dma_window_buffer_as_in_boot_44461724169() {
-    assert_eq!(populated(owned_run), (Err(PfnError::Untranslated { page: SRB_DATA }), vec![0; 4]));
+    assert_eq!(
+        populated(owned_run),
+        (Err(PfnError::Untranslated { page: SRB_DATA }), vec![0; 4])
+    );
 }
 
 #[test]
@@ -68,15 +78,27 @@ fn an_mdl_over_a_projected_srb_buffer_records_the_window_frames() {
     let table = window();
     let translate =
         |page| owned_run(page).or_else(|| table.mapped_physical_page(DOMAIN, PML4, page));
-    let expected = FRAMES.iter().map(|frame| frame / 0x1000).collect::<Vec<_>>();
+    let expected = FRAMES
+        .iter()
+        .map(|frame| frame / 0x1000)
+        .collect::<Vec<_>>();
     assert_eq!(populated(translate), (Ok(4), expected));
 }
 
 #[test]
 fn another_domain_generation_or_vspace_has_no_window_translation() {
     let table = window();
-    let stale = MappingDomain { cookie: DOMAIN.cookie + 1, ..DOMAIN };
+    let stale = MappingDomain {
+        cookie: DOMAIN.cookie + 1,
+        ..DOMAIN
+    };
     assert_eq!(table.mapped_physical_page(stale, PML4, SRB_DATA), None);
-    assert_eq!(table.mapped_physical_page(DOMAIN, PML4 + 0x1000, SRB_DATA), None);
-    assert_eq!(table.mapped_physical_page(DOMAIN, PML4, SRB_DATA + 0x4000), None);
+    assert_eq!(
+        table.mapped_physical_page(DOMAIN, PML4 + 0x1000, SRB_DATA),
+        None
+    );
+    assert_eq!(
+        table.mapped_physical_page(DOMAIN, PML4, SRB_DATA + 0x4000),
+        None
+    );
 }

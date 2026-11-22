@@ -137,6 +137,94 @@ impl ImagePageFillPlan {
     }
 }
 
+pub(crate) fn plan(
+    pe: &PeLayout,
+    page_rva: u32,
+    file_size: u64,
+) -> Result<ImagePageFillPlan, PeError> {
+    let image_size = u64::from(pe.size_of_image());
+    let page_start = u64::from(page_rva);
+    if !(page_rva as usize).is_multiple_of(IMAGE_PAGE_SIZE)
+        || page_start >= image_size
+        || image_size == 0
+    {
+        return Err(PeError::BadRva(page_rva));
+    }
+    let page_end = page_start + IMAGE_PAGE_SIZE as u64;
+    let table_end = pe
+        .headers()
+        .section_table_offset()
+        .checked_add(pe.sections().len() * 40)
+        .ok_or(PeError::SectionOutOfBounds)?;
+    if table_end as u64 > u64::from(pe.headers().size_of_headers)
+        || u64::from(pe.headers().size_of_headers) > image_size
+    {
+        return Err(PeError::SectionOutOfBounds);
+    }
+    if table_end as u64 > file_size {
+        return Err(PeError::Truncated);
+    }
+
+    let mut result = ImagePageFillPlan {
+        page_rva,
+        protection: pe.image_protection_at(page_rva),
+        spans: [ImagePageFileSpan::default(); MAX_SPANS],
+        span_count: 0,
+    };
+    let headers_end = u64::from(pe.headers().size_of_headers)
+        .min(image_size)
+        .min(file_size);
+    let header_end = page_end.min(headers_end);
+    if header_end > page_start {
+        result.push(page_start, page_start, header_end - page_start)?;
+    }
+
+    let header_end_rounded = u64::from(pe.headers().size_of_headers)
+        .saturating_add((IMAGE_PAGE_SIZE - 1) as u64)
+        & !((IMAGE_PAGE_SIZE - 1) as u64);
+    let header_page = page_start < header_end_rounded;
+    let mut section_page = false;
+    for section in pe.sections() {
+        let start = u64::from(section.virtual_address);
+        let virtual_end = start
+            .checked_add(u64::from(
+                section.virtual_size.max(section.size_of_raw_data),
+            ))
+            .filter(|end| *end <= image_size)
+            .ok_or(PeError::SectionOutOfBounds)?;
+        if virtual_end > start && start % IMAGE_PAGE_SIZE as u64 != 0 {
+            return Err(PeError::UnsupportedImageAlignment(section.virtual_address));
+        }
+        let mapped_end = virtual_end.saturating_add((IMAGE_PAGE_SIZE - 1) as u64)
+            & !((IMAGE_PAGE_SIZE - 1) as u64);
+        if page_start >= start && page_start < mapped_end {
+            if header_page || section_page {
+                return Err(PeError::AmbiguousImagePage(page_rva));
+            }
+            section_page = true;
+        }
+        if virtual_end == start || section.is_uninitialized() || section.size_of_raw_data == 0 {
+            continue;
+        }
+        let raw_start = u64::from(section.pointer_to_raw_data);
+        let raw_end = raw_start
+            .checked_add(u64::from(section.size_of_raw_data))
+            .filter(|end| *end <= file_size)
+            .ok_or(PeError::SectionOutOfBounds)?;
+        let image_raw_end = start + u64::from(section.size_of_raw_data);
+        let copy_start = page_start.max(start);
+        let copy_end = page_end.min(image_raw_end);
+        if copy_start < copy_end {
+            let file_offset = raw_start + (copy_start - start);
+            if file_offset + (copy_end - copy_start) > raw_end {
+                return Err(PeError::SectionOutOfBounds);
+            }
+            result.push(file_offset, copy_start, copy_end - copy_start)?;
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,7 +311,10 @@ mod tests {
     fn pe_page_waits_for_each_acknowledged_span_before_publication() {
         let mut page = ImagePageFillCapture::new(two_spans());
         let first = page.next_span().expect("first PE file span");
-        assert_eq!((first.file_offset, first.page_offset, first.length), (0x400, 0, 4));
+        assert_eq!(
+            (first.file_offset, first.page_offset, first.length),
+            (0x400, 0, 4)
+        );
         // A pending IRP may have copied bytes into a private buffer, but the caller only
         // presents them here after the provider's strict terminal ACK succeeds.
         assert_eq!(page.next_span(), Some(first));
@@ -231,13 +322,19 @@ mod tests {
         assert!(page.accept_acknowledged_span(first, b"abcd"));
 
         let second = page.next_span().expect("second PE file span");
-        assert_eq!((second.file_offset, second.page_offset, second.length), (0x900, 16, 8));
+        assert_eq!(
+            (second.file_offset, second.page_offset, second.length),
+            (0x900, 16, 8)
+        );
         assert!(page.completed_page().is_none());
         assert!(page.accept_acknowledged_span(second, b"12345678"));
         let filled = page.completed_page().expect("every span completed");
         assert_eq!(&filled[..4], b"abcd");
         assert_eq!(&filled[16..24], b"12345678");
-        assert!(filled[4..16].iter().chain(filled[24..].iter()).all(|byte| *byte == 0));
+        assert!(filled[4..16]
+            .iter()
+            .chain(filled[24..].iter())
+            .all(|byte| *byte == 0));
     }
 
     #[test]
@@ -261,89 +358,4 @@ mod tests {
         assert_eq!(page.next_span(), None);
         assert!(page.completed_page().unwrap().iter().all(|byte| *byte == 0));
     }
-}
-
-pub(crate) fn plan(
-    pe: &PeLayout,
-    page_rva: u32,
-    file_size: u64,
-) -> Result<ImagePageFillPlan, PeError> {
-    let image_size = u64::from(pe.size_of_image());
-    let page_start = u64::from(page_rva);
-    if page_rva as usize % IMAGE_PAGE_SIZE != 0 || page_start >= image_size || image_size == 0 {
-        return Err(PeError::BadRva(page_rva));
-    }
-    let page_end = page_start + IMAGE_PAGE_SIZE as u64;
-    let table_end = pe
-        .headers()
-        .section_table_offset()
-        .checked_add(pe.sections().len() * 40)
-        .ok_or(PeError::SectionOutOfBounds)?;
-    if table_end as u64 > u64::from(pe.headers().size_of_headers)
-        || u64::from(pe.headers().size_of_headers) > image_size
-    {
-        return Err(PeError::SectionOutOfBounds);
-    }
-    if table_end as u64 > file_size {
-        return Err(PeError::Truncated);
-    }
-
-    let mut result = ImagePageFillPlan {
-        page_rva,
-        protection: pe.image_protection_at(page_rva),
-        spans: [ImagePageFileSpan::default(); MAX_SPANS],
-        span_count: 0,
-    };
-    let headers_end = u64::from(pe.headers().size_of_headers)
-        .min(image_size)
-        .min(file_size);
-    let header_end = page_end.min(headers_end);
-    if header_end > page_start {
-        result.push(page_start, page_start, header_end - page_start)?;
-    }
-
-    let header_end_rounded = u64::from(pe.headers().size_of_headers)
-        .saturating_add((IMAGE_PAGE_SIZE - 1) as u64)
-        & !((IMAGE_PAGE_SIZE - 1) as u64);
-    let header_page = page_start < header_end_rounded;
-    let mut section_page = false;
-    for section in pe.sections() {
-        let start = u64::from(section.virtual_address);
-        let virtual_end = start
-            .checked_add(u64::from(
-                section.virtual_size.max(section.size_of_raw_data),
-            ))
-            .filter(|end| *end <= image_size)
-            .ok_or(PeError::SectionOutOfBounds)?;
-        if virtual_end > start && start % IMAGE_PAGE_SIZE as u64 != 0 {
-            return Err(PeError::UnsupportedImageAlignment(section.virtual_address));
-        }
-        let mapped_end = virtual_end.saturating_add((IMAGE_PAGE_SIZE - 1) as u64)
-            & !((IMAGE_PAGE_SIZE - 1) as u64);
-        if page_start >= start && page_start < mapped_end {
-            if header_page || section_page {
-                return Err(PeError::AmbiguousImagePage(page_rva));
-            }
-            section_page = true;
-        }
-        if virtual_end == start || section.is_uninitialized() || section.size_of_raw_data == 0 {
-            continue;
-        }
-        let raw_start = u64::from(section.pointer_to_raw_data);
-        let raw_end = raw_start
-            .checked_add(u64::from(section.size_of_raw_data))
-            .filter(|end| *end <= file_size)
-            .ok_or(PeError::SectionOutOfBounds)?;
-        let image_raw_end = start + u64::from(section.size_of_raw_data);
-        let copy_start = page_start.max(start);
-        let copy_end = page_end.min(image_raw_end);
-        if copy_start < copy_end {
-            let file_offset = raw_start + (copy_start - start);
-            if file_offset + (copy_end - copy_start) > raw_end {
-                return Err(PeError::SectionOutOfBounds);
-            }
-            result.push(file_offset, copy_start, copy_end - copy_start)?;
-        }
-    }
-    Ok(result)
 }

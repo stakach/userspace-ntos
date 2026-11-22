@@ -89,8 +89,7 @@ pub fn eval_output_overflow_retry_len(
     probe: &[u8],
     maximum: usize,
 ) -> Result<usize, AcpiEvalError> {
-    if information != ACPI_EVAL_OUTPUT_PROBE_LEN as u64
-        || probe.len() != ACPI_EVAL_OUTPUT_PROBE_LEN
+    if information != ACPI_EVAL_OUTPUT_PROBE_LEN as u64 || probe.len() != ACPI_EVAL_OUTPUT_PROBE_LEN
     {
         return Err(AcpiEvalError::InvalidRequiredLength);
     }
@@ -226,9 +225,18 @@ mod tests {
         // (20) on STATUS_BUFFER_OVERFLOW so buffered completion cannot overcopy.
         let probe = output_header(84, 4);
         assert_eq!(eval_output_overflow_retry_len(20, &probe, 4096), Ok(84));
-        assert_eq!(eval_output_overflow_retry_len(84, &probe, 4096), Err(AcpiEvalError::InvalidRequiredLength));
-        assert_eq!(eval_output_overflow_retry_len(19, &probe, 4096), Err(AcpiEvalError::InvalidRequiredLength));
-        assert_eq!(eval_output_overflow_retry_len(20, &output_header(20, 1), 4096), Err(AcpiEvalError::InvalidRequiredLength));
+        assert_eq!(
+            eval_output_overflow_retry_len(84, &probe, 4096),
+            Err(AcpiEvalError::InvalidRequiredLength)
+        );
+        assert_eq!(
+            eval_output_overflow_retry_len(19, &probe, 4096),
+            Err(AcpiEvalError::InvalidRequiredLength)
+        );
+        assert_eq!(
+            eval_output_overflow_retry_len(20, &output_header(20, 1), 4096),
+            Err(AcpiEvalError::InvalidRequiredLength)
+        );
     }
 
     #[test]
@@ -239,9 +247,15 @@ mod tests {
         bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
         bytes[14..16].copy_from_slice(&8u16.to_le_bytes());
         bytes[16..24].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
-        assert_eq!(parse_extended_integer_evaluation(&bytes), Ok(0x1234_5678_9abc_def0));
+        assert_eq!(
+            parse_extended_integer_evaluation(&bytes),
+            Ok(0x1234_5678_9abc_def0)
+        );
         bytes[14..16].copy_from_slice(&4u16.to_le_bytes());
-        assert_eq!(parse_extended_integer_evaluation(&bytes), Err(AcpiEvalError::InvalidIntegerResult));
+        assert_eq!(
+            parse_extended_integer_evaluation(&bytes),
+            Err(AcpiEvalError::InvalidIntegerResult)
+        );
     }
 
     #[test]

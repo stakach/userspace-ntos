@@ -88,8 +88,7 @@ fn timestamp_and_total_overflow_use_wrapping_arithmetic() {
 
 #[test]
 fn const_initialization_starts_all_categories_empty() {
-    const CENSUS: CommandCensus = CommandCensus::new();
-    let census = CENSUS;
+    let census = const { CommandCensus::new() };
     for operation in [IoOperation::Read, IoOperation::Write, IoOperation::Barrier] {
         assert_eq!(census.snapshot(operation), IoSnapshot::default());
     }
@@ -153,7 +152,9 @@ fn fat_one_sector_callsites_reconcile_with_the_existing_one_sector_bucket() {
     census.record(DirectReadSource::Snapshot, 1);
     assert_eq!(census.fat_one_sector_total(), 4);
     assert_eq!(
-        census.snapshot(DirectReadSource::Fat, DirectReadBucket::One).commands,
+        census
+            .snapshot(DirectReadSource::Fat, DirectReadBucket::One)
+            .commands,
         census.fat_one_sector_total()
     );
     for kind in [
@@ -177,7 +178,10 @@ fn directory_callsites_reconcile_with_the_existing_directory_bucket() {
     ] {
         census.record_fat(site, 1);
         assert_eq!(census.fat_directory_calls(site), 1);
-        assert_eq!(census.fat_directory_total(), census.fat_one_sector_calls(FatOneSectorCallsite::Directory));
+        assert_eq!(
+            census.fat_directory_total(),
+            census.fat_one_sector_calls(FatOneSectorCallsite::Directory)
+        );
     }
     census.record_fat(FatOneSectorCallsite::PathDirectory, 2);
     assert_eq!(census.fat_directory_total(), 4);

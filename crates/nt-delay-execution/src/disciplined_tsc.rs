@@ -69,16 +69,24 @@ pub enum TscObservation {
     Measuring,
     /// The projection now starts at this sample. `offset_100ns` is how far the previous
     /// projection was from it.
-    Anchored { offset_100ns: u64 },
+    Anchored {
+        offset_100ns: u64,
+    },
     /// While disciplined, the reference disagrees with the projection for the first time. One
     /// reading cannot say which clock is wrong: a 64-bit reference read torn across a carry is
     /// 2^32 ticks off. Nothing changed. The caller must not return this reading; it takes another
     /// bracketed sample, which settles the disagreement, and returns that one.
-    Suspect { offset_100ns: u64, allowed_100ns: u64 },
+    Suspect {
+        offset_100ns: u64,
+        allowed_100ns: u64,
+    },
     /// The counter and the reference disagree by more than the rate tolerance allows on two
     /// consecutive samples, or the reference went backwards while measuring. The fast path is
     /// withdrawn until the counter is re-measured.
-    Excursion { offset_100ns: u64, allowed_100ns: u64 },
+    Excursion {
+        offset_100ns: u64,
+        allowed_100ns: u64,
+    },
     Failed(TscClockError),
 }
 
@@ -147,24 +155,44 @@ impl DisciplinedTsc {
         })
     }
 
-    pub const fn phase(&self) -> TscPhase { self.phase }
+    pub const fn phase(&self) -> TscPhase {
+        self.phase
+    }
     /// The current rate estimate: the seed until the first window is measured.
-    pub const fn frequency_hz(&self) -> u64 { self.frequency_hz }
-    pub const fn seed_frequency_hz(&self) -> u64 { self.seed_frequency_hz }
+    pub const fn frequency_hz(&self) -> u64 {
+        self.frequency_hz
+    }
+    pub const fn seed_frequency_hz(&self) -> u64 {
+        self.seed_frequency_hz
+    }
     /// Reference samples the projection was moved to while disciplined.
-    pub const fn anchors(&self) -> u64 { self.anchors }
+    pub const fn anchors(&self) -> u64 {
+        self.anchors
+    }
     /// Every excursion since admission, forgiven or not.
-    pub const fn excursions(&self) -> u64 { self.excursions }
-    pub const fn uncertain_samples(&self) -> u64 { self.uncertain_samples }
+    pub const fn excursions(&self) -> u64 {
+        self.excursions
+    }
+    pub const fn uncertain_samples(&self) -> u64 {
+        self.uncertain_samples
+    }
     /// Reference samples set aside because they disagreed with the projection once.
-    pub const fn suspect_samples(&self) -> u64 { self.suspects }
+    pub const fn suspect_samples(&self) -> u64 {
+        self.suspects
+    }
     /// How far the last measured window was from the estimate it replaced.
-    pub const fn last_rate_error_ppm(&self) -> u64 { self.last_rate_error_ppm }
+    pub const fn last_rate_error_ppm(&self) -> u64 {
+        self.last_rate_error_ppm
+    }
     /// The largest such difference, not counting the first window's distance from the seed.
-    pub const fn max_rate_error_ppm(&self) -> u64 { self.max_rate_error_ppm }
+    pub const fn max_rate_error_ppm(&self) -> u64 {
+        self.max_rate_error_ppm
+    }
     /// The furthest a projection has been from a reference sample it was checked against, or
     /// the reference behind its own earlier reading.
-    pub const fn max_offset_100ns(&self) -> u64 { self.max_offset_100ns }
+    pub const fn max_offset_100ns(&self) -> u64 {
+        self.max_offset_100ns
+    }
 
     /// One fast reading, or a request for a reference sample. Never changes the discipline.
     pub fn read(&self, tsc: u64, ordinal: u64) -> TscRead {
@@ -189,7 +217,10 @@ impl DisciplinedTsc {
         let Some(bracket) = sample.tsc_after.checked_sub(sample.tsc_before) else {
             return self.fail(TscClockError::CounterRegressed);
         };
-        if self.anchor.is_some_and(|anchor| sample.tsc_before < anchor.tsc) {
+        if self
+            .anchor
+            .is_some_and(|anchor| sample.tsc_before < anchor.tsc)
+        {
             return self.fail(TscClockError::CounterRegressed);
         }
         // The seed sizes every bracket. The estimate is wrong after a window that spanned a
@@ -266,7 +297,10 @@ impl DisciplinedTsc {
         }
         self.suspect = true;
         self.suspects += 1;
-        TscObservation::Suspect { offset_100ns, allowed_100ns }
+        TscObservation::Suspect {
+            offset_100ns,
+            allowed_100ns,
+        }
     }
 
     /// Withdraw the fast path and measure the counter again from this sample.
@@ -282,7 +316,10 @@ impl DisciplinedTsc {
         self.anchor = Some(mark);
         self.window = Some(mark);
         self.clean_windows = 0;
-        TscObservation::Excursion { offset_100ns, allowed_100ns }
+        TscObservation::Excursion {
+            offset_100ns,
+            allowed_100ns,
+        }
     }
 
     fn fail(&mut self, error: TscClockError) -> TscObservation {
@@ -308,8 +345,8 @@ impl DisciplinedTsc {
             self.clean_windows = 0;
             return true;
         };
-        let error_ppm = u128::from(measured.abs_diff(self.frequency_hz)) * PPM
-            / u128::from(self.frequency_hz);
+        let error_ppm =
+            u128::from(measured.abs_diff(self.frequency_hz)) * PPM / u128::from(self.frequency_hz);
         let placement_ppm = (u128::from(start.uncertainty_100ns + mark.uncertainty_100ns) * PPM)
             .div_ceil(u128::from(span));
         self.clean_windows = if error_ppm <= u128::from(RATE_TOLERANCE_PPM) + placement_ppm {
@@ -344,12 +381,19 @@ pub struct Published {
 pub struct MonotonicTime(AtomicU64);
 
 impl MonotonicTime {
-    pub const fn new() -> Self { Self(AtomicU64::new(0)) }
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
 
     pub fn publish(&self, reading_100ns: u64) -> Published {
         let latest = self.0.fetch_max(reading_100ns, Ordering::AcqRel);
-        Published { time_100ns: latest.max(reading_100ns), held: latest > reading_100ns }
+        Published {
+            time_100ns: latest.max(reading_100ns),
+            held: latest > reading_100ns,
+        }
     }
 
-    pub fn latest(&self) -> u64 { self.0.load(Ordering::Acquire) }
+    pub fn latest(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
 }

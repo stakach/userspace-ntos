@@ -20,11 +20,25 @@ const IMPORTS: [&str; 12] = [
 ];
 
 const FILE_IMPORTS: &[&str] = &[
-    "NtCreateFile", "NtOpenFile", "NtReadFile", "NtWriteFile", "NtQueryInformationFile",
-    "NtSetInformationFile", "NtDuplicateObject",
-    "NtAllocateVirtualMemory", "NtProtectVirtualMemory", "NtFreeVirtualMemory",
-    "NtCreateEvent", "NtWaitForSingleObject", "NtClose", "NtDisplayString", "NtTerminateProcess",
-    "NtTerminateThread", "RtlCreateUserThread", "NtOpenKey", "NtQueryKey",
+    "NtCreateFile",
+    "NtOpenFile",
+    "NtReadFile",
+    "NtWriteFile",
+    "NtQueryInformationFile",
+    "NtSetInformationFile",
+    "NtDuplicateObject",
+    "NtAllocateVirtualMemory",
+    "NtProtectVirtualMemory",
+    "NtFreeVirtualMemory",
+    "NtCreateEvent",
+    "NtWaitForSingleObject",
+    "NtClose",
+    "NtDisplayString",
+    "NtTerminateProcess",
+    "NtTerminateThread",
+    "RtlCreateUserThread",
+    "NtOpenKey",
+    "NtQueryKey",
     "NtQueryInformationProcess",
 ];
 
@@ -136,9 +150,7 @@ fn verify(exe_path: &Path, dll_path: &Path, expected_imports: &[&str]) -> Result
         seen == expected_imports.iter().copied().collect(),
         &format!("fixture import set differs from its exact declared APIs: {seen:?}"),
     )?;
-    println!(
-        "PASS static artifact: AMD64 native PE, exact ntdll imports bound by nt-pe-loader"
-    );
+    println!("PASS static artifact: AMD64 native PE, exact ntdll imports bound by nt-pe-loader");
     println!("nonpreferred mapping: fixture={exe_base:#x} ntdll={dll_base:#x}");
     println!("fixture SHA256 {:x}", Sha256::digest(&exe_bytes));
     println!("ntdll SHA256 {:x}", Sha256::digest(&dll_bytes));
@@ -148,9 +160,11 @@ fn verify(exe_path: &Path, dll_path: &Path, expected_imports: &[&str]) -> Result
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let expected_imports: &[&str] = if args.len() == 2 { &IMPORTS }
-        else if args.len() == 3 && args[2] == "file-acceptance" { FILE_IMPORTS }
-        else {
+    let expected_imports: &[&str] = if args.len() == 2 {
+        &IMPORTS
+    } else if args.len() == 3 && args[2] == "file-acceptance" {
+        FILE_IMPORTS
+    } else {
         eprintln!("usage: nt-native-test-verify <fixture.exe> <our-ntdll.dll> [file-acceptance]");
         return ExitCode::FAILURE;
     };

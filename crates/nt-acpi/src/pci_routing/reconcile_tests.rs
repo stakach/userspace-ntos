@@ -1,8 +1,9 @@
 use alloc::vec::Vec;
 
 use super::{
-    parse_small_irq, reconcile_reported_interrupt, InterruptResource, InterruptSource, LegacyIrqOverride,
-    ReportedInterruptError, ReportedInterruptResource, ResolvedInterruptResource,
+    parse_small_irq, reconcile_reported_interrupt, InterruptResource, InterruptSource,
+    LegacyIrqOverride, ReportedInterruptError, ReportedInterruptResource,
+    ResolvedInterruptResource,
 };
 
 #[test]

@@ -65,8 +65,7 @@ pub const IRP_MN_SURPRISE_REMOVAL: u8 = 0x17;
 
 /// In-memory GUID bytes, matching `GUID_BUS_INTERFACE_STANDARD` in wdmguid.h.
 pub const GUID_BUS_INTERFACE_STANDARD: [u8; 16] = [
-    0x80, 0x82, 0x6b, 0x49, 0x25, 0x6f, 0xd0, 0x11, 0xbe, 0xaf, 0x08, 0x00, 0x2b, 0xe2,
-    0x09, 0x2f,
+    0x80, 0x82, 0x6b, 0x49, 0x25, 0x6f, 0xd0, 0x11, 0xbe, 0xaf, 0x08, 0x00, 0x2b, 0xe2, 0x09, 0x2f,
 ];
 pub const BUS_INTERFACE_STANDARD_X64_SIZE: u16 = 64;
 pub const BUS_INTERFACE_QUERY_REQUEST_BYTES: usize = 20;
@@ -430,18 +429,32 @@ mod tests {
     #[test]
     fn bus_interface_query_wire_is_pointer_free_and_strict() {
         let request = BusInterfaceQueryRequest::standard();
-        assert_eq!(BusInterfaceQueryRequest::decode(&request.encode()), Ok(request));
+        assert_eq!(
+            BusInterfaceQueryRequest::decode(&request.encode()),
+            Ok(request)
+        );
         let mut too_old = request;
         too_old.version = 0;
-        assert_eq!(too_old.validate(), Err(BusInterfaceQueryError::UnsupportedVersion));
+        assert_eq!(
+            too_old.validate(),
+            Err(BusInterfaceQueryError::UnsupportedVersion)
+        );
         let mut too_small = request;
         too_small.size = BUS_INTERFACE_STANDARD_X64_SIZE - 1;
-        assert_eq!(too_small.validate(), Err(BusInterfaceQueryError::BufferTooSmall));
+        assert_eq!(
+            too_small.validate(),
+            Err(BusInterfaceQueryError::BufferTooSmall)
+        );
         let mut other = request;
         other.interface_type[0] ^= 1;
-        assert_eq!(other.validate(), Err(BusInterfaceQueryError::UnsupportedGuid));
-        assert_eq!(BusInterfaceQueryRequest::decode(&request.encode()[..19]),
-            Err(BusInterfaceQueryError::InvalidLength));
+        assert_eq!(
+            other.validate(),
+            Err(BusInterfaceQueryError::UnsupportedGuid)
+        );
+        assert_eq!(
+            BusInterfaceQueryRequest::decode(&request.encode()[..19]),
+            Err(BusInterfaceQueryError::InvalidLength)
+        );
         let reply = BusInterfaceQueryReply {
             size: BUS_INTERFACE_STANDARD_X64_SIZE,
             version: 1,
@@ -451,7 +464,9 @@ mod tests {
         assert_eq!(BusInterfaceQueryReply::decode(&reply.encode()), Ok(reply));
         let mut invalid = reply.encode();
         invalid[4] = 1;
-        assert_eq!(BusInterfaceQueryReply::decode(&invalid),
-            Err(BusInterfaceQueryError::InvalidLength));
+        assert_eq!(
+            BusInterfaceQueryReply::decode(&invalid),
+            Err(BusInterfaceQueryError::InvalidLength)
+        );
     }
 }

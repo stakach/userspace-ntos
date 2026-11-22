@@ -839,9 +839,10 @@ fn parse_reconciliation(
         });
     }
     if rows.len() != 372 || sha256_hex(names.as_bytes()) != EXPECTED_BASELINE_GAP_SHA256 {
-        return Err(format!(
+        return Err(
             "tracked Wine reconciliation does not cover the exact 372-name baseline gap"
-        ));
+                .to_string(),
+        );
     }
     if sha256_hex(classification.as_bytes()) != EXPECTED_CLASSIFICATION_SHA256 {
         return Err("tracked Wine reconciliation classification changed".to_string());

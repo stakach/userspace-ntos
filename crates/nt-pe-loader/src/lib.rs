@@ -26,8 +26,8 @@ mod relocation_snapshot;
 mod relocs;
 mod rva;
 mod snapshot_capacity;
-pub mod system_image_request;
 pub mod system_image_load_plan;
+pub mod system_image_request;
 pub mod system_module;
 
 pub use exports::ExportedSymbol;
@@ -37,12 +37,10 @@ pub use headers::{
 };
 pub use image::MappedImage;
 pub use image_header_capture::{
-    capture_image_layout, ImageHeaderCaptureError, ImageHeaderRead,
-    IncrementalImageLayoutCapture,
+    capture_image_layout, ImageHeaderCaptureError, ImageHeaderRead, IncrementalImageLayoutCapture,
 };
 pub use image_page_fill::{
-    ImagePageFileSpan, ImagePageFillCapture, ImagePageFillPlan, ImagePageReadError,
-    IMAGE_PAGE_SIZE,
+    ImagePageFileSpan, ImagePageFillCapture, ImagePageFillPlan, ImagePageReadError, IMAGE_PAGE_SIZE,
 };
 pub use imports::{ImportRef, ImportedDll};
 pub use layout::PeLayout;
@@ -417,10 +415,11 @@ impl<'a> PeFile<'a> {
     /// Read `len` raw file bytes at `rva` (via the section table), without materialising a full
     /// mapped image — enough to inspect an export's code (e.g. a syscall stub).
     pub fn bytes_at_rva(&self, rva: u32, len: usize) -> Option<&'a [u8]> {
-        let offset = usize::try_from(
-            self.layout
-                .file_span_at_rva(rva, len, self.bytes.len() as u64)?,
-        )
+        let offset = usize::try_from(self.layout.file_span_at_rva(
+            rva,
+            len,
+            self.bytes.len() as u64,
+        )?)
         .ok()?;
         self.bytes.get(offset..offset.checked_add(len)?)
     }

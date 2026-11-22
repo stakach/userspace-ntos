@@ -11,7 +11,7 @@ pub use add_device_selection::{
     AwaitingBusPdo,
 };
 pub use nt_component_suspension::{
-    RootChildTurn as AddDeviceRootTurn, RootChildArrival as RootArrival,
+    RootChildArrival as RootArrival, RootChildTurn as AddDeviceRootTurn,
     RootChildTurnAction as RootTurnAction, RootChildTurnError as RootTurnError,
 };
 
@@ -557,9 +557,7 @@ impl<T> PendingOperationTable<T> {
     /// Read only the owner published under this exact slot generation.
     pub fn get_exact(&self, reservation: PendingOperationReservation) -> Option<&T> {
         match self.slots.get(reservation.slot) {
-            Some(Slot::Occupied { generation, value })
-                if *generation == reservation.generation =>
-            {
+            Some(Slot::Occupied { generation, value }) if *generation == reservation.generation => {
                 Some(value)
             }
             _ => None,

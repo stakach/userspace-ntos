@@ -56,6 +56,9 @@ impl SystemImageLoadPlan {
         })
     }
 
+    /// `None` while a read or map is outstanding; the plan resumes once it completes, so this
+    /// is not an `Iterator`.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<LoadAction> {
         loop {
             let frame = self.frames.last_mut()?;

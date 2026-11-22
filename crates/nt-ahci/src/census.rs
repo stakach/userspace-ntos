@@ -194,8 +194,10 @@ impl FatOneSectorCallsite {
     const fn index(self) -> usize {
         match self {
             Self::FatLink => 0,
-            Self::Directory | Self::PathDirectory | Self::CheckedDirectory
-                | Self::ShortDirectory => 1,
+            Self::Directory
+            | Self::PathDirectory
+            | Self::CheckedDirectory
+            | Self::ShortDirectory => 1,
             Self::FilePayload => 2,
             Self::Other => 3,
         }
@@ -326,7 +328,10 @@ impl DirectReadCensus {
                 self.fat_directory[index].fetch_add(1, Ordering::Relaxed);
             }
         }
-        let counters = self.counters(DirectReadSource::Fat, DirectReadBucket::for_sectors(sectors));
+        let counters = self.counters(
+            DirectReadSource::Fat,
+            DirectReadBucket::for_sectors(sectors),
+        );
         counters.commands.fetch_add(1, Ordering::Relaxed);
         counters.sectors.fetch_add(sectors, Ordering::Relaxed);
     }
@@ -336,16 +341,24 @@ impl DirectReadCensus {
     }
 
     pub fn fat_directory_calls(&self, callsite: FatOneSectorCallsite) -> u64 {
-        callsite.directory_index().map_or(0, |index| self.fat_directory[index].load(Ordering::Relaxed))
+        callsite
+            .directory_index()
+            .map_or(0, |index| self.fat_directory[index].load(Ordering::Relaxed))
     }
 
     pub fn fat_directory_total(&self) -> u64 {
-        self.fat_directory.iter().map(|count| count.load(Ordering::Relaxed)).sum()
+        self.fat_directory
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Exact after the native-start Ready drain; concurrent snapshots are advisory only.
     pub fn fat_one_sector_total(&self) -> u64 {
-        self.fat_one_sector.iter().map(|count| count.load(Ordering::Relaxed)).sum()
+        self.fat_one_sector
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
     }
 
     pub fn snapshot(

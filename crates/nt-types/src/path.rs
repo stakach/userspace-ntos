@@ -248,8 +248,8 @@ impl NtPath {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
     use super::*;
+    use alloc::vec;
 
     fn p(s: &str) -> Result<NtPath, NtStatus> {
         NtPath::parse_str(s)

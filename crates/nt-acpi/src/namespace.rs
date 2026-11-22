@@ -43,7 +43,9 @@ impl AcpiNamespacePath {
         if path == "\\" {
             return Ok(Self(String::from("\\")));
         }
-        let relative = path.strip_prefix('\\').ok_or(AcpiNamespaceError::InvalidPath)?;
+        let relative = path
+            .strip_prefix('\\')
+            .ok_or(AcpiNamespaceError::InvalidPath)?;
         validate_relative_path_segments(relative.as_bytes(), true)
             .map_err(|_| AcpiNamespaceError::InvalidPath)?;
         let segments = relative.split('.').count();
@@ -193,8 +195,10 @@ pub fn namespace_children_probe_retry_len(
     current: usize,
     maximum: usize,
 ) -> Result<usize, AcpiNamespaceError> {
-    if header.len() != current || current < ENUM_OUTPUT_HEADER_LEN
-        || maximum < ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN || current > maximum
+    if header.len() != current
+        || current < ENUM_OUTPUT_HEADER_LEN
+        || maximum < ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN
+        || current > maximum
     {
         return Err(AcpiNamespaceError::InvalidRequiredLength);
     }
@@ -592,13 +596,25 @@ mod tests {
         // before writing a header. Its subsequent overflow reports Information=20,
         // with required bytes in NumberOfChildren at header offset 4.
         let input = immediate_namespace_children_input();
-        assert_eq!(namespace_children_probe_retry_len(0xc000_0023, 0, &input[..8], 8, 4096), Ok(20));
+        assert_eq!(
+            namespace_children_probe_retry_len(0xc000_0023, 0, &input[..8], 8, 4096),
+            Ok(20)
+        );
         let mut output = [0u8; 20];
         output[..4].copy_from_slice(&ENUM_OUTPUT_SIGNATURE.to_le_bytes());
         output[4..8].copy_from_slice(&1234u32.to_le_bytes());
-        assert_eq!(namespace_children_probe_retry_len(0x8000_0005, 20, &output, 20, 4096), Ok(1234));
-        assert_eq!(namespace_children_probe_retry_len(0x8000_0005, 0, &output, 20, 4096), Err(AcpiNamespaceError::InvalidOutput));
-        assert_eq!(namespace_children_probe_retry_len(0xc000_0023, 0, &output, 20, 4096), Err(AcpiNamespaceError::InvalidRequiredLength));
+        assert_eq!(
+            namespace_children_probe_retry_len(0x8000_0005, 20, &output, 20, 4096),
+            Ok(1234)
+        );
+        assert_eq!(
+            namespace_children_probe_retry_len(0x8000_0005, 0, &output, 20, 4096),
+            Err(AcpiNamespaceError::InvalidOutput)
+        );
+        assert_eq!(
+            namespace_children_probe_retry_len(0xc000_0023, 0, &output, 20, 4096),
+            Err(AcpiNamespaceError::InvalidRequiredLength)
+        );
     }
 
     #[test]

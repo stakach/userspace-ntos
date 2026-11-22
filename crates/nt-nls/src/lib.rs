@@ -250,7 +250,9 @@ pub fn custom_cp_to_unicode_into(
 /// the RTL sizing pass. Malformed tables and overflowing output sizes fail.
 pub fn multibyte_to_unicode_size(bytes: &[u8], lead_byte_info: Option<&[u16]>) -> Option<u32> {
     if let Some(leads) = lead_byte_info {
-        if leads.len() < 256 { return None; }
+        if leads.len() < 256 {
+            return None;
+        }
     }
     let mut source = 0usize;
     let mut units = 0usize;
@@ -264,7 +266,9 @@ pub fn multibyte_to_unicode_size(bytes: &[u8], lead_byte_info: Option<&[u16]>) -
         }
         units += 1;
     }
-    units.checked_mul(2).and_then(|size| u32::try_from(size).ok())
+    units
+        .checked_mul(2)
+        .and_then(|size| u32::try_from(size).ok())
 }
 
 /// Progress of one bounded Unicode-to-DBCS conversion.
@@ -287,13 +291,24 @@ pub fn unicode_to_multibyte_dbcs_mapped_into<F>(
 where
     F: Fn(u16) -> u16,
 {
-    if unicode_to_dbcs.len() < 0x1_0000 { return None; }
-    let mut progress = DbcsConversion { bytes_written: 0, units_consumed: 0 };
+    if unicode_to_dbcs.len() < 0x1_0000 {
+        return None;
+    }
+    let mut progress = DbcsConversion {
+        bytes_written: 0,
+        units_consumed: 0,
+    };
     for &source in unicode {
         let unit = map(source);
-        let encoded = if unit < 0x80 { unit } else { unicode_to_dbcs[unit as usize] };
+        let encoded = if unit < 0x80 {
+            unit
+        } else {
+            unicode_to_dbcs[unit as usize]
+        };
         let width = if encoded >> 8 != 0 { 2 } else { 1 };
-        if output.len() - progress.bytes_written < width { break; }
+        if output.len() - progress.bytes_written < width {
+            break;
+        }
         if width == 2 {
             output[progress.bytes_written] = (encoded >> 8) as u8;
             progress.bytes_written += 1;
@@ -324,11 +339,17 @@ pub fn unicode_to_multibyte_dbcs_size<F>(
 where
     F: Fn(u16) -> u16,
 {
-    if unicode_to_dbcs.len() < 0x1_0000 { return None; }
+    if unicode_to_dbcs.len() < 0x1_0000 {
+        return None;
+    }
     let mut count = 0u32;
     for &source in unicode {
         let unit = map(source);
-        let encoded = if unit < 0x80 { unit } else { unicode_to_dbcs[unit as usize] };
+        let encoded = if unit < 0x80 {
+            unit
+        } else {
+            unicode_to_dbcs[unit as usize]
+        };
         count = count.checked_add(if encoded >> 8 != 0 { 2 } else { 1 })?;
     }
     Some(count)
@@ -503,8 +524,8 @@ mod tests {
     #[test]
     fn sbcs_narrowing_is_bounded_and_failure_is_atomic() {
         let mut table = vec![b'?'; 0x10000];
-        for byte in 0..=255 {
-            table[byte] = byte as u8;
+        for (byte, slot) in table.iter_mut().enumerate().take(256) {
+            *slot = byte as u8;
         }
         table[0x20ac] = 0x80;
         let mut output = [0xcc; 3];

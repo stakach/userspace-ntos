@@ -21,7 +21,9 @@ pub fn first_due<S>(
         .peekable();
     eligible.peek()?;
     let now = clock();
-    eligible.find(|(deadline, _)| *deadline <= now).map(|(_, source)| (source, now))
+    eligible
+        .find(|(deadline, _)| *deadline <= now)
+        .map(|(_, source)| (source, now))
 }
 
 #[cfg(test)]
@@ -38,17 +40,37 @@ mod tests {
     #[test]
     fn absent_retained_retry_owners_do_not_read_the_clock() {
         let mut reads = 0;
-        assert_eq!(first_due::<u8>([], || { reads += 1; 100 }), None);
-        assert_eq!(first_due([(None, 4), (None, 9)], || { reads += 1; 100 }), None);
+        assert_eq!(
+            first_due::<u8>([], || {
+                reads += 1;
+                100
+            }),
+            None
+        );
+        assert_eq!(
+            first_due([(None, 4), (None, 9)], || {
+                reads += 1;
+                100
+            }),
+            None
+        );
         assert_eq!(reads, 0, "no eligible owner may cause an HPET read");
     }
 
     #[test]
     fn retained_retry_uses_one_fresh_clock_and_first_due_owner() {
-        let candidates = [(None, 0), (Some(150), 1), (Some(100), 7),
-            (Some(100), 3), (Some(200), 9)];
+        let candidates = [
+            (None, 0),
+            (Some(150), 1),
+            (Some(100), 7),
+            (Some(100), 3),
+            (Some(200), 9),
+        ];
         let mut reads = 0;
-        let mut now = || { reads += 1; 100 };
+        let mut now = || {
+            reads += 1;
+            100
+        };
         assert_eq!(first_due(candidates, &mut now), Some((7, 100)));
         assert_eq!(reads, 1);
         assert_eq!(first_due(candidates, || 99), None);
@@ -88,10 +110,17 @@ mod tests {
     fn section_retry_owner_ties_keep_existing_candidate_order() {
         // The four section retry owners will have separate census IDs. Equal deadlines
         // must retain their current order rather than choosing by numeric source ID.
-        let candidates = [(Some(100), 28), (Some(100), 21),
-            (Some(100), 27), (Some(100), 26)];
+        let candidates = [
+            (Some(100), 28),
+            (Some(100), 21),
+            (Some(100), 27),
+            (Some(100), 26),
+        ];
         assert_eq!(earliest_deadline(candidates), Some((100, 28)));
-        assert_eq!(earliest_deadline(candidates.into_iter().skip(1)), Some((100, 21)));
+        assert_eq!(
+            earliest_deadline(candidates.into_iter().skip(1)),
+            Some((100, 21))
+        );
     }
 
     #[test]

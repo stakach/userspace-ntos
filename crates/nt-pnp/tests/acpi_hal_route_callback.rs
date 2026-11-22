@@ -1,9 +1,15 @@
 use nt_pnp::acpi_hal_route_callback::{PciRouteCallback, PciRouteCallbackLedger};
 
 fn callback(cookie: u64) -> PciRouteCallback {
-    PciRouteCallback { domain_id: 7, domain_cookie: cookie, vspace: 13,
-        image_base: 0x1000_0000, image_len: 0x8000, image_generation: 17,
-        callback: 0x1000_1234 }
+    PciRouteCallback {
+        domain_id: 7,
+        domain_cookie: cookie,
+        vspace: 13,
+        image_base: 0x1000_0000,
+        image_len: 0x8000,
+        image_generation: 17,
+        callback: 0x1000_1234,
+    }
 }
 
 #[test]

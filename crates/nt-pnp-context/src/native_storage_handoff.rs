@@ -49,11 +49,12 @@ pub fn validate_native_relation_refresh(
         || candidate.relation.provider_domain != published.relation.provider_domain
         || candidate.relation.provider_cookie != published.relation.provider_cookie
         || candidate.pdo != published.pdo
-        || dma.state(published.controller, published.dma_root)
-            != Ok(ControllerState::NativeActive)
+        || dma.state(published.controller, published.dma_root) != Ok(ControllerState::NativeActive)
         || dma.native_route(published.controller, published.dma_root)
             != Ok(Some(published.pdo.device))
-    { return Err(Error::WrongOwner); }
+    {
+        return Err(Error::WrongOwner);
+    }
     Ok(())
 }
 
@@ -155,7 +156,9 @@ impl NativeStorageAdmissions {
         }) {
             return Err(Error::ControllerClaimed);
         }
-        self.candidates.try_reserve(1).map_err(|_| Error::InsufficientResources)?;
+        self.candidates
+            .try_reserve(1)
+            .map_err(|_| Error::InsufficientResources)?;
         self.candidates.push(key);
         Ok(())
     }
@@ -491,21 +494,36 @@ mod tests {
     fn refresh_reaffirms_exact_native_disk_without_replaying_proof() {
         let (mut dma, key, _) = fixture();
         native_start(&mut dma, key);
-        assert_eq!(dma.can_activate_native(key.controller, key.dma_root, key.pdo.device), Ok(()));
-        dma.activate_native(key.controller, key.dma_root, key.pdo.device).unwrap();
+        assert_eq!(
+            dma.can_activate_native(key.controller, key.dma_root, key.pdo.device),
+            Ok(())
+        );
+        dma.activate_native(key.controller, key.dma_root, key.pdo.device)
+            .unwrap();
         let mut next = key;
         next.relation.generation += 1;
         assert_eq!(validate_native_relation_refresh(&dma, key, next), Ok(()));
         next.pdo.raw_pointer += 8;
-        assert_eq!(validate_native_relation_refresh(&dma, key, next), Err(Error::WrongOwner));
+        assert_eq!(
+            validate_native_relation_refresh(&dma, key, next),
+            Err(Error::WrongOwner)
+        );
         next.pdo = key.pdo;
         next.relation.provider_cookie += 1;
-        assert_eq!(validate_native_relation_refresh(&dma, key, next), Err(Error::WrongOwner));
+        assert_eq!(
+            validate_native_relation_refresh(&dma, key, next),
+            Err(Error::WrongOwner)
+        );
         next.relation = key.relation;
         next.relation.generation -= 1;
-        assert_eq!(validate_native_relation_refresh(&dma, key, next), Err(Error::WrongOwner));
-        assert_eq!(dma.can_activate_native(key.controller, key.dma_root, key.pdo.device),
-            Err(crate::pci_dma_handoff::Error::WrongPhase));
+        assert_eq!(
+            validate_native_relation_refresh(&dma, key, next),
+            Err(Error::WrongOwner)
+        );
+        assert_eq!(
+            dma.can_activate_native(key.controller, key.dma_root, key.pdo.device),
+            Err(crate::pci_dma_handoff::Error::WrongPhase)
+        );
     }
 
     #[test]
@@ -549,7 +567,9 @@ mod tests {
         handoff
             .complete_sector(volume, &expected.volume_sector)
             .unwrap();
-        let commit = handoff.enter_mount_commit(&mut admissions, &dma, key).unwrap();
+        let commit = handoff
+            .enter_mount_commit(&mut admissions, &dma, key)
+            .unwrap();
         assert_eq!(
             handoff.mark_relation_published(&dma, key),
             Err(Error::WrongPhase)
@@ -567,23 +587,37 @@ mod tests {
         let mut other = key;
         other.pdo.device += 1;
         other.pdo.raw_pointer += 0x100;
-        let mut candidate = NativeStorageHandoff::new(&mut admissions, &dma, other, expected.clone()).unwrap();
+        let mut candidate =
+            NativeStorageHandoff::new(&mut admissions, &dma, other, expected.clone()).unwrap();
         let capacity = candidate.enter_srb(&dma, other).unwrap();
-        assert_eq!(candidate.complete_capacity(capacity, 512, expected.sector_count - 1),
-            Err(Error::GeometryMismatch));
-        let mut matching = NativeStorageHandoff::new(&mut admissions, &dma, key, expected.clone()).unwrap();
+        assert_eq!(
+            candidate.complete_capacity(capacity, 512, expected.sector_count - 1),
+            Err(Error::GeometryMismatch)
+        );
+        let mut matching =
+            NativeStorageHandoff::new(&mut admissions, &dma, key, expected.clone()).unwrap();
         let capacity = matching.enter_srb(&dma, key).unwrap();
-        matching.complete_capacity(capacity, 512, expected.sector_count).unwrap();
+        matching
+            .complete_capacity(capacity, 512, expected.sector_count)
+            .unwrap();
         let first = matching.enter_srb(&dma, key).unwrap();
-        matching.complete_sector(first, &expected.sector_zero).unwrap();
+        matching
+            .complete_sector(first, &expected.sector_zero)
+            .unwrap();
         let second = matching.enter_srb(&dma, key).unwrap();
-        matching.complete_sector(second, &expected.volume_sector).unwrap();
-        matching.enter_mount_commit(&mut admissions, &dma, key).unwrap();
+        matching
+            .complete_sector(second, &expected.volume_sector)
+            .unwrap();
+        matching
+            .enter_mount_commit(&mut admissions, &dma, key)
+            .unwrap();
         let mut third = key;
         third.pdo.device += 2;
         third.pdo.raw_pointer += 0x200;
-        assert!(matches!(NativeStorageHandoff::new(&mut admissions, &dma, third, expected),
-            Err(Error::ControllerClaimed)));
+        assert!(matches!(
+            NativeStorageHandoff::new(&mut admissions, &dma, third, expected),
+            Err(Error::ControllerClaimed)
+        ));
     }
 
     #[test]
@@ -636,8 +670,10 @@ mod tests {
             handoff.enter_srb(&dma, key).unwrap().step,
             ProofStep::SectorZero
         );
-        assert!(matches!(NativeStorageHandoff::new(&mut admissions, &dma, key, expected.clone()),
-            Err(Error::ControllerClaimed)));
+        assert!(matches!(
+            NativeStorageHandoff::new(&mut admissions, &dma, key, expected.clone()),
+            Err(Error::ControllerClaimed)
+        ));
         let (mut dma, key, expected) = fixture();
         native_start(&mut dma, key);
         let mut admissions = NativeStorageAdmissions::new();
@@ -653,7 +689,9 @@ mod tests {
         second
             .complete_sector(volume, &expected.volume_sector)
             .unwrap();
-        let commit = second.enter_mount_commit(&mut admissions, &dma, key).unwrap();
+        let commit = second
+            .enter_mount_commit(&mut admissions, &dma, key)
+            .unwrap();
         second.lose_mount_commit(commit).unwrap();
         assert_eq!(second.phase(), HandoffPhase::Uncertain);
         let mut wrong = commit;

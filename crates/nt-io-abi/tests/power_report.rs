@@ -4,14 +4,22 @@ use nt_io_abi::power_report::{PowerReportReply, PowerReportRequest};
 fn acknowledged_previous_state_includes_unspecified_and_is_not_requested_state() {
     for (power_type, maximum) in [(0, 6), (1, 4)] {
         for previous in 0..=maximum {
-            assert_eq!(PowerReportReply::decode(4, 0, previous, [0; 2], power_type)
-                .unwrap().into_result(), Ok(previous as u32));
+            assert_eq!(
+                PowerReportReply::decode(4, 0, previous, [0; 2], power_type)
+                    .unwrap()
+                    .into_result(),
+                Ok(previous as u32)
+            );
         }
     }
     let request = PowerReportRequest::decode(0x1000, 1, 4).unwrap();
     assert_eq!(request.state, 4);
-    assert_eq!(PowerReportReply::decode(4, 0, 1, [0; 2], request.power_type)
-        .unwrap().into_result(), Ok(1));
+    assert_eq!(
+        PowerReportReply::decode(4, 0, 1, [0; 2], request.power_type)
+            .unwrap()
+            .into_result(),
+        Ok(1)
+    );
 }
 
 #[test]
@@ -36,8 +44,12 @@ fn request_scalar_types_and_state_sentinels_are_checked() {
 #[test]
 fn rejection_never_fabricates_an_unspecified_success() {
     for status in [0xc000_000du64, 0xc000_0022, 0xc000_00a3] {
-        assert_eq!(PowerReportReply::decode(4, status, 0, [0; 2], 1)
-            .unwrap().into_result(), Err(status as u32 as i32));
+        assert_eq!(
+            PowerReportReply::decode(4, status, 0, [0; 2], 1)
+                .unwrap()
+                .into_result(),
+            Err(status as u32 as i32)
+        );
         assert!(PowerReportReply::decode(4, status, 1, [0; 2], 1).is_err());
     }
 }

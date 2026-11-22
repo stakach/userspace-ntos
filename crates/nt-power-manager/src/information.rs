@@ -76,7 +76,10 @@ pub struct SystemBatteryState {
 
 impl SystemBatteryState {
     /// The state NT reports while no battery is present: on AC power, everything else zero.
-    pub const NO_BATTERY: Self = Self { ac_on_line: true, battery_present: false };
+    pub const NO_BATTERY: Self = Self {
+        ac_on_line: true,
+        battery_present: false,
+    };
 
     pub fn encode(self) -> [u8; SYSTEM_BATTERY_STATE_SIZE] {
         let mut output = [0u8; SYSTEM_BATTERY_STATE_SIZE];
@@ -132,18 +135,36 @@ mod tests {
             plan_power_information(5, false, 0x40),
             Ok(PowerInformationQuery::SystemBatteryState)
         );
-        assert_eq!(plan_power_information(4, false, 0x4b), Err(STATUS_BUFFER_TOO_SMALL));
-        assert_eq!(plan_power_information(5, false, 0x1f), Err(STATUS_BUFFER_TOO_SMALL));
+        assert_eq!(
+            plan_power_information(4, false, 0x4b),
+            Err(STATUS_BUFFER_TOO_SMALL)
+        );
+        assert_eq!(
+            plan_power_information(5, false, 0x1f),
+            Err(STATUS_BUFFER_TOO_SMALL)
+        );
         // The input check precedes the length check.
-        assert_eq!(plan_power_information(5, true, 0), Err(STATUS_INVALID_PARAMETER));
-        assert_eq!(plan_power_information(4, true, 0x4c), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(
+            plan_power_information(5, true, 0),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            plan_power_information(4, true, 0x4c),
+            Err(STATUS_INVALID_PARAMETER)
+        );
     }
 
     #[test]
     fn other_levels_are_not_implemented_whatever_their_buffers() {
         for level in [0, 1, 2, 3, 6, 11, 12, 16, 83, u32::MAX] {
-            assert_eq!(plan_power_information(level, false, 0x1000), Err(STATUS_NOT_IMPLEMENTED));
-            assert_eq!(plan_power_information(level, true, 0), Err(STATUS_NOT_IMPLEMENTED));
+            assert_eq!(
+                plan_power_information(level, false, 0x1000),
+                Err(STATUS_NOT_IMPLEMENTED)
+            );
+            assert_eq!(
+                plan_power_information(level, true, 0),
+                Err(STATUS_NOT_IMPLEMENTED)
+            );
         }
     }
 
@@ -172,7 +193,10 @@ mod tests {
 
     #[test]
     fn batteries_present_occupies_its_native_offset() {
-        let capabilities = SystemPowerCapabilities { system_batteries_present: true }.encode();
+        let capabilities = SystemPowerCapabilities {
+            system_batteries_present: true,
+        }
+        .encode();
         assert_eq!(capabilities[0x1e], 1);
         assert_eq!(capabilities.iter().filter(|byte| **byte != 0).count(), 1);
     }

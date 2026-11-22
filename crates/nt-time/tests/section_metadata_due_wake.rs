@@ -21,8 +21,11 @@ fn overdue_retained_work_wakes_once_until_outer_redrive_or_new_publication() {
     assert_eq!(wake.next_deadline(true), Some(250));
     assert!(!wake.wake_due(249, true));
     wake.publish(170);
-    assert_eq!(wake.next_deadline(true), Some(170),
-        "new work outranks an existing later retry");
+    assert_eq!(
+        wake.next_deadline(true),
+        Some(170),
+        "new work outranks an existing later retry"
+    );
     assert_eq!(wake.next_deadline(false), None);
 }
 
@@ -35,8 +38,10 @@ fn nested_publication_survives_outer_retry_scheduling() {
     // A nested provider callback publishes another retained request before the outer owner
     // finishes its attempted redrive.
     wake.publish(120);
-    assert!(!outer.retry_at(200),
-        "the old attempt cannot overwrite newer earlier demand");
+    assert!(
+        !outer.retry_at(200),
+        "the old attempt cannot overwrite newer earlier demand"
+    );
     assert_eq!(wake.next_deadline(true), Some(120));
     assert!(wake.wake_due(120, true));
 

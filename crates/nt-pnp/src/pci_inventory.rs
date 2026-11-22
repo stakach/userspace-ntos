@@ -131,19 +131,10 @@ pub struct CommittedPciInventoryUpdate {
 }
 
 /// Accepted PCI topology and resource snapshot. Only [`PciInventory::commit`] mutates it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PciInventory {
     generation: u64,
     devices: Vec<PciDevice>,
-}
-
-impl Default for PciInventory {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            devices: Vec::new(),
-        }
-    }
 }
 
 impl PciInventory {
@@ -503,15 +494,15 @@ mod tests {
         assert_eq!(inventory.devices(), &[removed.clone(), sibling.clone()]);
 
         let removal = inventory.prepare_rescan(vec![sibling.clone()]).unwrap();
-        assert_eq!(removal.departures(), &[removed.clone()]);
+        assert_eq!(removal.departures(), core::slice::from_ref(&removed));
         assert!(removal.arrivals().is_empty());
         inventory.commit(removal).unwrap();
-        assert_eq!(inventory.devices(), &[sibling.clone()]);
+        assert_eq!(inventory.devices(), core::slice::from_ref(&sibling));
 
         let arrival = inventory
             .prepare_rescan(vec![sibling.clone(), removed.clone()])
             .unwrap();
-        assert_eq!(arrival.arrivals(), &[removed.clone()]);
+        assert_eq!(arrival.arrivals(), core::slice::from_ref(&removed));
         assert!(arrival.departures().is_empty());
         inventory.commit(arrival).unwrap();
         assert_eq!(inventory.devices(), &[removed, sibling]);

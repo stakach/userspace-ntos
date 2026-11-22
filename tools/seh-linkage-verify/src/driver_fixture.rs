@@ -137,7 +137,14 @@ fn verify(path: &str, object_path: &str, fault_variant: Option<&str>) -> Result<
         })
         .collect::<Result<_, _>>()?;
     names.sort_unstable();
-    if names != ["DbgPrint", "ExRaiseStatus", "RtlUnwindEx", "__C_specific_handler"] {
+    if names
+        != [
+            "DbgPrint",
+            "ExRaiseStatus",
+            "RtlUnwindEx",
+            "__C_specific_handler",
+        ]
+    {
         return Err(format!("unexpected ntoskrnl imports: {names:?}"));
     }
 
@@ -243,20 +250,20 @@ fn verify(path: &str, object_path: &str, fault_variant: Option<&str>) -> Result<
             "missing compiler-emitted C exception/finally scopes: except={except_scopes} finally={finally_scopes}"
         ));
     }
-    if fault_variant.is_some() {
-        if except_scopes < 2 {
-            return Err(format!(
-                "fault variant needs an additional compiler-emitted exception scope: {except_scopes}"
-            ));
-        }
+    if fault_variant.is_some() && except_scopes < 2 {
+        return Err(format!(
+            "fault variant needs an additional compiler-emitted exception scope: {except_scopes}"
+        ));
     }
     if fault_variant == Some("--fault-ud2") {
-        let admitted_ud2 = pe.sections().iter().filter(|section| section.is_executable()).any(
-            |section| {
+        let admitted_ud2 = pe
+            .sections()
+            .iter()
+            .filter(|section| section.is_executable())
+            .any(|section| {
                 let start = section.virtual_address as usize;
-                let end = start.saturating_add(
-                    section.virtual_size.max(section.size_of_raw_data) as usize,
-                );
+                let end = start
+                    .saturating_add(section.virtual_size.max(section.size_of_raw_data) as usize);
                 mapped.bytes.get(start..end).is_some_and(|code| {
                     code.windows(2).enumerate().any(|(offset, instruction)| {
                         instruction == [0x0f, 0x0b]
@@ -266,19 +273,20 @@ fn verify(path: &str, object_path: &str, fault_variant: Option<&str>) -> Result<
                             })
                     })
                 })
-            },
-        );
+            });
         if !admitted_ud2 {
             return Err("fault variant needs a UD2 covered by an x64 runtime function".into());
         }
     }
     if let Some(target_rva) = protection_target {
-        let admitted_store = pe.sections().iter().filter(|section| section.is_executable()).any(
-            |section| {
+        let admitted_store = pe
+            .sections()
+            .iter()
+            .filter(|section| section.is_executable())
+            .any(|section| {
                 let start = section.virtual_address as usize;
-                let end = start.saturating_add(
-                    section.virtual_size.max(section.size_of_raw_data) as usize,
-                );
+                let end = start
+                    .saturating_add(section.virtual_size.max(section.size_of_raw_data) as usize);
                 mapped.bytes.get(start..end).is_some_and(|code| {
                     code.windows(10).enumerate().any(|(offset, instruction)| {
                         if instruction[0..2] != [0xc7, 0x05]
@@ -287,7 +295,9 @@ fn verify(path: &str, object_path: &str, fault_variant: Option<&str>) -> Result<
                             return false;
                         }
                         let displacement = i32::from_le_bytes(
-                            instruction[2..6].try_into().expect("four-byte displacement"),
+                            instruction[2..6]
+                                .try_into()
+                                .expect("four-byte displacement"),
                         );
                         let instruction_rva = (start + offset) as u64;
                         let resolved = instruction_rva as i64 + 10 + i64::from(displacement);
@@ -298,10 +308,11 @@ fn verify(path: &str, object_path: &str, fault_variant: Option<&str>) -> Result<
                             })
                     })
                 })
-            },
-        );
+            });
         if !admitted_store {
-            return Err("fault variant lacks an unwind-covered store into the read-only target".into());
+            return Err(
+                "fault variant lacks an unwind-covered store into the read-only target".into(),
+            );
         }
     }
     println!(
@@ -321,8 +332,10 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let variant = args.next();
-    if !matches!(variant.as_deref(), None | Some("--fault-ud2") | Some("--fault-protection"))
-        || args.next().is_some()
+    if !matches!(
+        variant.as_deref(),
+        None | Some("--fault-ud2") | Some("--fault-protection")
+    ) || args.next().is_some()
     {
         eprintln!("usage: seh-driver-fixture-verify <driver_seh.sys> <driver_seh.obj> [--fault-ud2|--fault-protection]");
         return ExitCode::FAILURE;

@@ -2,7 +2,7 @@
 
 use nt_pe_loader::{plan_mapped_relocations, Headers, PeError, RelocKind};
 
-const BASE: u64 = 0x1800_0000_0;
+const BASE: u64 = 0x0001_8000_0000;
 const MAPPED: u64 = BASE + 0x20_0000;
 
 fn headers(directory_size: u32) -> Headers {

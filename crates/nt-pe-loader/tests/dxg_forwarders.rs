@@ -7,8 +7,10 @@ use nt_pe_loader::{
 #[test]
 #[ignore = "requires locally staged ReactOS dxg.sys, dxgthk.sys, and win32k.sys"]
 fn staged_dxg_import_graph_resolves_against_canonical_core_exports() {
-    let root = concat!(env!("CARGO_MANIFEST_DIR"),
-        "/../../rust-micro/.tmp/simpleboot-esp/reactos/system32/");
+    let root = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../rust-micro/.tmp/simpleboot-esp/reactos/system32/"
+    );
     let dxg_bytes = std::fs::read(format!("{root}drivers/dxg.sys")).unwrap();
     let mut images = Vec::new();
     for (name, path, base) in [
@@ -30,17 +32,37 @@ fn staged_dxg_import_graph_resolves_against_canonical_core_exports() {
                 ImportRef::ByOrdinal { ordinal, .. } => Symbol::Ordinal(ordinal),
             };
             resolve_with_core(&images, &dll.name, &symbol, |role, symbol| {
-                let module = match role { CoreRole::Kernel => "ntoskrnl.exe", CoreRole::Hal => "hal.dll" };
-                let Symbol::Name(name) = symbol else { panic!("unexpected core ordinal") };
-                assert!(registry.resolve(module, name).loads(), "missing canonical {module}!{name}");
+                let module = match role {
+                    CoreRole::Kernel => "ntoskrnl.exe",
+                    CoreRole::Hal => "hal.dll",
+                };
+                let Symbol::Name(name) = symbol else {
+                    panic!("unexpected core ordinal")
+                };
+                assert!(
+                    registry.resolve(module, name).loads(),
+                    "missing canonical {module}!{name}"
+                );
                 core.push(name.clone());
                 Some(0x200000)
-            }).unwrap();
+            })
+            .unwrap();
             count += 1;
         }
     }
     assert_eq!(count, 15, "fixture import contract changed");
     core.sort();
-    assert_eq!(core, ["DbgPrint", "ExFreePoolWithTag", "IoGetCurrentProcess",
-        "PsGetCurrentProcessId", "PsGetCurrentThreadProcessId", "memcpy", "memmove", "memset"]);
+    assert_eq!(
+        core,
+        [
+            "DbgPrint",
+            "ExFreePoolWithTag",
+            "IoGetCurrentProcess",
+            "PsGetCurrentProcessId",
+            "PsGetCurrentThreadProcessId",
+            "memcpy",
+            "memmove",
+            "memset"
+        ]
+    );
 }

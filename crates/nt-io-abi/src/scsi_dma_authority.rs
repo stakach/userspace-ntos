@@ -1,7 +1,7 @@
 //! Root-owned, provider-read-only authority for one coherent SCSI data slice.
 
-use bytemuck::{Pod, Zeroable};
 use crate::{major, IrpDispatchRequest, IRP_DISPATCH_SCSI_SRB};
+use bytemuck::{Pod, Zeroable};
 
 pub const SCSI_DMA_AUTHORITY_SLOTS: usize = 16;
 pub const SCSI_DMA_AUTHORITY_ALIASES: usize = 8;
@@ -48,10 +48,15 @@ pub fn select_scsi_coherent_controller(
     authority: ScsiControllerAuthority,
     candidates: &[ScsiControllerCandidate],
 ) -> Option<ScsiControllerCandidate> {
-    if authority.child_pdo == 0 || authority.relation_generation == 0
-        || authority.parent_pdo == 0 || authority.parent_generation == 0
-        || authority.provider_domain_id == 0 || authority.provider_cookie == 0
-    { return None; }
+    if authority.child_pdo == 0
+        || authority.relation_generation == 0
+        || authority.parent_pdo == 0
+        || authority.parent_generation == 0
+        || authority.provider_domain_id == 0
+        || authority.provider_cookie == 0
+    {
+        return None;
+    }
     let mut selected = None;
     for candidate in candidates {
         if !candidate.live
@@ -64,14 +69,28 @@ pub fn select_scsi_coherent_controller(
             || candidate.provider_cookie != authority.provider_cookie
             || candidate.window_lease_id == 0
             || candidate.window_generation != authority.parent_generation
-            || candidate.grant_va == 0 || candidate.broker_va == 0
+            || candidate.grant_va == 0
+            || candidate.broker_va == 0
             || candidate.grant_logical == 0
             || candidate.grant_length == 0
-            || candidate.grant_va.checked_add(candidate.grant_length).is_none()
-            || candidate.broker_va.checked_add(candidate.grant_length).is_none()
-            || candidate.grant_logical.checked_add(candidate.grant_length).is_none()
-        { continue; }
-        if selected.replace(*candidate).is_some() { return None; }
+            || candidate
+                .grant_va
+                .checked_add(candidate.grant_length)
+                .is_none()
+            || candidate
+                .broker_va
+                .checked_add(candidate.grant_length)
+                .is_none()
+            || candidate
+                .grant_logical
+                .checked_add(candidate.grant_length)
+                .is_none()
+        {
+            continue;
+        }
+        if selected.replace(*candidate).is_some() {
+            return None;
+        }
     }
     selected
 }
@@ -119,8 +138,10 @@ pub struct ScsiCoherentProjection {
     pub logical: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<ScsiCoherentAuthority>()
-    * SCSI_DMA_AUTHORITY_SLOTS == SCSI_DMA_AUTHORITY_BYTES);
+const _: () = assert!(
+    core::mem::size_of::<ScsiCoherentAuthority>() * SCSI_DMA_AUTHORITY_SLOTS
+        == SCSI_DMA_AUTHORITY_BYTES
+);
 
 fn subrange_offset(base: u64, span: u64, address: u64, length: u64) -> Option<u64> {
     base.checked_add(span)?;
@@ -157,21 +178,31 @@ pub fn validate_scsi_coherent_authority(
         || authority.alias_count == 0
         || authority.alias_count > SCSI_DMA_AUTHORITY_ALIASES as u64
         || authority.alias_count != projections.len() as u64
-    { return None; }
+    {
+        return None;
+    }
     let offset = subrange_offset(
-        authority.window_va, authority.window_length,
-        authority.provider_va, authority.length,
+        authority.window_va,
+        authority.window_length,
+        authority.provider_va,
+        authority.length,
     )?;
-    authority.window_logical.checked_add(authority.window_length)?;
+    authority
+        .window_logical
+        .checked_add(authority.window_length)?;
     if authority.window_logical.checked_add(offset) != Some(authority.logical) {
         return None;
     }
     let aliases = &authority.aliases[..authority.alias_count as usize];
     for (index, alias) in aliases.iter().enumerate() {
-        if alias.adapter_id == 0 || alias.alias_id == 0
-            || aliases[..index].iter().any(|earlier| earlier.adapter_id == alias.adapter_id
-                || earlier.alias_id == alias.alias_id)
-        { return None; }
+        if alias.adapter_id == 0
+            || alias.alias_id == 0
+            || aliases[..index].iter().any(|earlier| {
+                earlier.adapter_id == alias.adapter_id || earlier.alias_id == alias.alias_id
+            })
+        {
+            return None;
+        }
         let mut matches = 0usize;
         for projection in projections {
             if projection.adapter_id == alias.adapter_id && projection.alias_id == alias.alias_id {
@@ -181,11 +212,15 @@ pub fn validate_scsi_coherent_authority(
                     || projection.provider_va != authority.provider_va
                     || projection.length != authority.length
                     || projection.logical != authority.logical
-                { return None; }
+                {
+                    return None;
+                }
                 matches += 1;
             }
         }
-        if matches != 1 { return None; }
+        if matches != 1 {
+            return None;
+        }
     }
     Some((authority.provider_va, authority.length))
 }
@@ -194,27 +229,53 @@ pub fn validate_scsi_coherent_authority(
 mod tests {
     use super::*;
 
-    fn valid() -> (IrpDispatchRequest, ScsiCoherentAuthority, [ScsiCoherentProjection; 1]) {
+    fn valid() -> (
+        IrpDispatchRequest,
+        ScsiCoherentAuthority,
+        [ScsiCoherentProjection; 1],
+    ) {
         let request = IrpDispatchRequest {
             major: major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
             _reserved0: IRP_DISPATCH_SCSI_SRB,
-            irp_id: 7, device_id: 8, target_domain_id: 9,
-            target_domain_cookie: 10, scsi_relation_generation: 11,
+            irp_id: 7,
+            device_id: 8,
+            target_domain_id: 9,
+            target_domain_cookie: 10,
+            scsi_relation_generation: 11,
             ..Default::default()
         };
         let mut authority = ScsiCoherentAuthority {
-            irp_id: 7, pdo: 8, provider_domain_id: 9, provider_cookie: 10,
-            provider_pdo: 12, relation_generation: 11,
-            window_lease_id: 13, window_generation: 14, reservation_id: 15,
-            provider_va: 0x1100, length: 3, logical: 0x2100,
-            window_va: 0x1000, window_length: 0x1000, window_logical: 0x2000,
-            alias_count: 1, ..Default::default()
+            irp_id: 7,
+            pdo: 8,
+            provider_domain_id: 9,
+            provider_cookie: 10,
+            provider_pdo: 12,
+            relation_generation: 11,
+            window_lease_id: 13,
+            window_generation: 14,
+            reservation_id: 15,
+            provider_va: 0x1100,
+            length: 3,
+            logical: 0x2100,
+            window_va: 0x1000,
+            window_length: 0x1000,
+            window_logical: 0x2000,
+            alias_count: 1,
+            ..Default::default()
         };
-        authority.aliases[0] = ScsiCoherentAlias { adapter_id: 16, alias_id: 17 };
+        authority.aliases[0] = ScsiCoherentAlias {
+            adapter_id: 16,
+            alias_id: 17,
+        };
         let projection = ScsiCoherentProjection {
-            kind: SCSI_COHERENT_RECORD_KIND, irp_id: 7, reservation_id: 15,
-            adapter_id: 16, alias_id: 17,
-            provider_va: 0x1100, length: 3, logical: 0x2100,
+            kind: SCSI_COHERENT_RECORD_KIND,
+            irp_id: 7,
+            reservation_id: 15,
+            adapter_id: 16,
+            alias_id: 17,
+            provider_va: 0x1100,
+            length: 3,
+            logical: 0x2100,
         };
         (request, authority, [projection])
     }
@@ -222,43 +283,102 @@ mod tests {
     #[test]
     fn exact_authority_accepts_and_every_changed_projection_field_rejects() {
         let (request, authority, projection) = valid();
-        assert_eq!(validate_scsi_coherent_authority(&request, 12, &authority, &projection), Some((0x1100, 3)));
+        assert_eq!(
+            validate_scsi_coherent_authority(&request, 12, &authority, &projection),
+            Some((0x1100, 3))
+        );
         for changed in [
-            ScsiCoherentProjection { provider_va: 0x1200, ..projection[0] },
-            ScsiCoherentProjection { logical: 0x2200, ..projection[0] },
-            ScsiCoherentProjection { length: 4, ..projection[0] },
-            ScsiCoherentProjection { reservation_id: 16, ..projection[0] },
-            ScsiCoherentProjection { alias_id: 18, ..projection[0] },
-            ScsiCoherentProjection { adapter_id: 18, ..projection[0] },
-            ScsiCoherentProjection { irp_id: 8, ..projection[0] },
+            ScsiCoherentProjection {
+                provider_va: 0x1200,
+                ..projection[0]
+            },
+            ScsiCoherentProjection {
+                logical: 0x2200,
+                ..projection[0]
+            },
+            ScsiCoherentProjection {
+                length: 4,
+                ..projection[0]
+            },
+            ScsiCoherentProjection {
+                reservation_id: 16,
+                ..projection[0]
+            },
+            ScsiCoherentProjection {
+                alias_id: 18,
+                ..projection[0]
+            },
+            ScsiCoherentProjection {
+                adapter_id: 18,
+                ..projection[0]
+            },
+            ScsiCoherentProjection {
+                irp_id: 8,
+                ..projection[0]
+            },
         ] {
-            assert_eq!(validate_scsi_coherent_authority(&request, 12, &authority, &[changed]), None);
+            assert_eq!(
+                validate_scsi_coherent_authority(&request, 12, &authority, &[changed]),
+                None
+            );
         }
-        assert_eq!(validate_scsi_coherent_authority(&request, 12, &authority, &[]), None);
-        assert_eq!(validate_scsi_coherent_authority(&request, 12, &authority, &[projection[0], projection[0]]), None);
+        assert_eq!(
+            validate_scsi_coherent_authority(&request, 12, &authority, &[]),
+            None
+        );
+        assert_eq!(
+            validate_scsi_coherent_authority(
+                &request,
+                12,
+                &authority,
+                &[projection[0], projection[0]]
+            ),
+            None
+        );
     }
 
     #[test]
     fn stale_window_and_out_of_grant_reject() {
         let (request, mut authority, projection) = valid();
         authority.window_generation = 0;
-        assert_eq!(validate_scsi_coherent_authority(&request, 12, &authority, &projection), None);
+        assert_eq!(
+            validate_scsi_coherent_authority(&request, 12, &authority, &projection),
+            None
+        );
         authority.window_generation = 14;
         authority.window_length = 0x100;
-        assert_eq!(validate_scsi_coherent_authority(&request, 12, &authority, &projection), None);
+        assert_eq!(
+            validate_scsi_coherent_authority(&request, 12, &authority, &projection),
+            None
+        );
         authority.window_length = 0x1000;
         authority.window_va = u64::MAX - 1;
-        assert_eq!(validate_scsi_coherent_authority(&request, 12, &authority, &projection), None);
+        assert_eq!(
+            validate_scsi_coherent_authority(&request, 12, &authority, &projection),
+            None
+        );
     }
 
     #[test]
     fn alias_count_and_duplicate_adapter_cannot_be_truncated() {
         let (request, mut authority, projection) = valid();
         authority.alias_count = (SCSI_DMA_AUTHORITY_ALIASES + 1) as u64;
-        assert_eq!(validate_scsi_coherent_authority(&request, 12, &authority, &projection), None);
+        assert_eq!(
+            validate_scsi_coherent_authority(&request, 12, &authority, &projection),
+            None
+        );
         authority.alias_count = 2;
-        authority.aliases[1] = ScsiCoherentAlias { adapter_id: 16, alias_id: 18 };
-        let second = ScsiCoherentProjection { alias_id: 18, ..projection[0] };
-        assert_eq!(validate_scsi_coherent_authority(&request, 12, &authority, &[projection[0], second]), None);
+        authority.aliases[1] = ScsiCoherentAlias {
+            adapter_id: 16,
+            alias_id: 18,
+        };
+        let second = ScsiCoherentProjection {
+            alias_id: 18,
+            ..projection[0]
+        };
+        assert_eq!(
+            validate_scsi_coherent_authority(&request, 12, &authority, &[projection[0], second]),
+            None
+        );
     }
 }

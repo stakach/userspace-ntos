@@ -25,11 +25,14 @@ pub enum SymbolicLinkError {
 }
 
 /// CmpGetSymbolicLink's checks on a `SymbolicLinkValue` of type `value_type` holding `bytes`.
-pub fn parse_symbolic_link_value(value_type: u32, bytes: &[u8]) -> Result<String, SymbolicLinkError> {
+pub fn parse_symbolic_link_value(
+    value_type: u32,
+    bytes: &[u8],
+) -> Result<String, SymbolicLinkError> {
     if value_type != RegistryValueType::Link as u32 {
         return Err(SymbolicLinkError::NoTarget);
     }
-    if bytes.is_empty() || bytes.len() % 2 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
         return Err(SymbolicLinkError::InvalidTarget);
     }
     if bytes.len() > u16::MAX as usize {
@@ -40,7 +43,11 @@ pub fn parse_symbolic_link_value(value_type: u32, bytes: &[u8]) -> Result<String
         .try_reserve_exact(bytes.len())
         .map_err(|_| SymbolicLinkError::Capacity)?;
     for character in char::decode_utf16(
-        bytes.chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])),
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|unit| u16::from_le_bytes([unit[0], unit[1]])),
     ) {
         match character {
             Ok('\0') | Err(_) => return Err(SymbolicLinkError::InvalidTarget),
@@ -67,4 +74,3 @@ pub fn reparse_with_rest<'a>(
     }
     Ok(target)
 }
-

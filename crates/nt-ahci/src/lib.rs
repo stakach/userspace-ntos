@@ -3,11 +3,11 @@
 
 mod census;
 mod transfer;
-pub use transfer::{transfer, Transfer, TransferOutcome};
 pub use census::{
     CommandCensus, CommandWindow, CommandWindowSnapshot, DirectReadBucket, DirectReadCensus,
     DirectReadSnapshot, DirectReadSource, FatOneSectorCallsite, IoOperation, IoSnapshot,
 };
+pub use transfer::{transfer, Transfer, TransferOutcome};
 
 #[cfg(test)]
 mod tests;

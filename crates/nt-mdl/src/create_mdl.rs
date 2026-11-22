@@ -16,6 +16,8 @@ pub fn mdl_size_for_range(base: u64, length: u64) -> Option<usize> {
         let offset = base & (PAGE_BYTES - 1);
         offset.checked_add(length - 1)? / PAGE_BYTES + 1
     };
-    let bytes = pages.checked_mul(PFN_BYTES)?.checked_add(MDL_HEADER_BYTES)?;
+    let bytes = pages
+        .checked_mul(PFN_BYTES)?
+        .checked_add(MDL_HEADER_BYTES)?;
     (bytes <= i16::MAX as u64).then_some(bytes as usize)
 }

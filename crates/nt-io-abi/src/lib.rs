@@ -9,29 +9,27 @@
 
 #![no_std]
 
-pub mod device_pointer;
 pub mod device_mutation;
-pub mod power_report;
-pub mod power_dispatch;
+pub mod device_pointer;
 pub mod ioctl;
 pub mod major;
 pub mod opcodes;
+pub mod power_dispatch;
+pub mod power_report;
 pub mod projection;
 pub mod scsi_dma_authority;
 pub mod wire;
 
-pub use device_pointer::{
-    DevicePointerOperation, DevicePointerReply, MalformedDevicePointerReply,
-};
+pub use device_pointer::{DevicePointerOperation, DevicePointerReply, MalformedDevicePointerReply};
 
 pub use projection::{
     DeviceObjectProjection, DriverObjectProjection, FileObjectProjection, IoStackLocationProjection,
 };
 pub use scsi_dma_authority::{
-    select_scsi_coherent_controller, validate_scsi_coherent_authority,
-    ScsiCoherentAlias, ScsiCoherentAuthority, ScsiCoherentProjection,
-    ScsiControllerAuthority, ScsiControllerCandidate, SCSI_DMA_AUTHORITY_ALIASES,
-    SCSI_DMA_AUTHORITY_BYTES, SCSI_DMA_AUTHORITY_SLOTS, SCSI_COHERENT_RECORD_KIND,
+    select_scsi_coherent_controller, validate_scsi_coherent_authority, ScsiCoherentAlias,
+    ScsiCoherentAuthority, ScsiCoherentProjection, ScsiControllerAuthority,
+    ScsiControllerCandidate, SCSI_COHERENT_RECORD_KIND, SCSI_DMA_AUTHORITY_ALIASES,
+    SCSI_DMA_AUTHORITY_BYTES, SCSI_DMA_AUTHORITY_SLOTS,
 };
 pub use wire::{
     IoCancelRequest, IoDeviceControlRequest, IoFileRequest, IoOpenRequest, IoReadWriteRequest,
@@ -52,7 +50,10 @@ pub const IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY: u16 = 3;
 
 pub const fn valid_buffered_output_capacity_dispatch(request: &IrpDispatchRequest) -> bool {
     request._reserved0 == IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY
-        && matches!(request.major, major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL)
+        && matches!(
+            request.major,
+            major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+        )
         && request.file_id == 0
         && request.scsi_relation_generation == 0
         && ioctl::method(request.ioctl_code) == ioctl::METHOD_BUFFERED
@@ -70,7 +71,12 @@ mod buffered_capture_tests {
         let mut request = IrpDispatchRequest {
             _reserved0: IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY,
             major: major::IRP_MJ_DEVICE_CONTROL,
-            ioctl_code: ioctl::ctl_code(0x22, 0x800, ioctl::METHOD_BUFFERED, ioctl::FILE_ANY_ACCESS),
+            ioctl_code: ioctl::ctl_code(
+                0x22,
+                0x800,
+                ioctl::METHOD_BUFFERED,
+                ioctl::FILE_ANY_ACCESS,
+            ),
             input_len: 12,
             output_len: 8,
             buffer_len: 12,
@@ -643,7 +649,10 @@ mod tests {
 
     #[test]
     fn request_wide_irp_flags_append_without_moving_existing_fields() {
-        assert_eq!(core::mem::offset_of!(IrpDispatchRequest, scsi_relation_generation), 272);
+        assert_eq!(
+            core::mem::offset_of!(IrpDispatchRequest, scsi_relation_generation),
+            272
+        );
         assert_eq!(core::mem::offset_of!(IrpDispatchRequest, irp_flags), 280);
         let request = IrpDispatchRequest {
             major: major::IRP_MJ_READ,
@@ -652,7 +661,10 @@ mod tests {
         };
         let bytes = bytemuck::bytes_of(&request);
         assert_eq!(&bytes[280..284], &0x43u32.to_le_bytes());
-        assert_eq!(bytemuck::pod_read_unaligned::<IrpDispatchRequest>(bytes), request);
+        assert_eq!(
+            bytemuck::pod_read_unaligned::<IrpDispatchRequest>(bytes),
+            request
+        );
         assert!(bytemuck::try_pod_read_unaligned::<IrpDispatchRequest>(&bytes[..280]).is_err());
     }
 

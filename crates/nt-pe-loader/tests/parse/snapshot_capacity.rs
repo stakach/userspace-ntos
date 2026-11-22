@@ -8,7 +8,11 @@ fn complete_chunked_snapshot_reserves_exact_eof_before_first_read() {
         let mut bytes = Vec::new();
         reserve_file_snapshot_capacity(&mut bytes, file_size).unwrap();
         assert!(bytes.is_empty(), "reservation is not captured image data");
-        assert_eq!(bytes.capacity(), file_size, "no geometric retained capacity slack");
+        assert_eq!(
+            bytes.capacity(),
+            file_size,
+            "no geometric retained capacity slack"
+        );
         let storage = bytes.as_ptr();
         let mut offset = 0;
         while offset < file_size {
@@ -16,11 +20,22 @@ fn complete_chunked_snapshot_reserves_exact_eof_before_first_read() {
             let length = 4096.min(file_size - offset);
             bytes.extend((offset..offset + length).map(|index| index as u8));
             offset += length;
-            assert_eq!(bytes.as_ptr(), storage, "accepted chunks never relocate storage");
+            assert_eq!(
+                bytes.as_ptr(),
+                storage,
+                "accepted chunks never relocate storage"
+            );
             assert_eq!(bytes.capacity(), file_size);
         }
-        assert_eq!(bytes.len(), file_size, "retain complete bytes, not only PE headers");
-        assert!(bytes.iter().enumerate().all(|(index, byte)| *byte == index as u8));
+        assert_eq!(
+            bytes.len(),
+            file_size,
+            "retain complete bytes, not only PE headers"
+        );
+        assert!(bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| *byte == index as u8));
     }
 }
 
@@ -41,8 +56,10 @@ fn impossible_reservation_leaves_captured_owner_unchanged() {
     let mut bytes = vec![0x31, 0x72, 0xa5];
     let storage = bytes.as_ptr();
     let capacity = bytes.capacity();
-    assert_eq!(reserve_file_snapshot_capacity(&mut bytes, usize::MAX),
-        Err(PeError::InsufficientResources));
+    assert_eq!(
+        reserve_file_snapshot_capacity(&mut bytes, usize::MAX),
+        Err(PeError::InsufficientResources)
+    );
     assert_eq!(bytes.as_ptr(), storage);
     assert_eq!(bytes.capacity(), capacity);
     assert_eq!(bytes, [0x31, 0x72, 0xa5]);
@@ -53,7 +70,10 @@ fn admitted_eof_cannot_exclude_already_captured_bytes() {
     let mut bytes = vec![0x31, 0x72, 0xa5];
     let storage = bytes.as_ptr();
     let capacity = bytes.capacity();
-    assert_eq!(reserve_file_snapshot_capacity(&mut bytes, 2), Err(PeError::BadImageSize));
+    assert_eq!(
+        reserve_file_snapshot_capacity(&mut bytes, 2),
+        Err(PeError::BadImageSize)
+    );
     assert_eq!(bytes.as_ptr(), storage);
     assert_eq!(bytes.capacity(), capacity);
     assert_eq!(bytes, [0x31, 0x72, 0xa5]);

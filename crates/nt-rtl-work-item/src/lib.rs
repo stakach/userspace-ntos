@@ -1367,7 +1367,10 @@ mod tests {
         assert_eq!(counters.requests(CounterLane::Normal), 1);
         // The same request's exact success reply transfers the original packet once.
         let queued = match retained
-            .resolve(QueuePostObservation::Completed(STATUS_SUCCESS), &mut counters)
+            .resolve(
+                QueuePostObservation::Completed(STATUS_SUCCESS),
+                &mut counters,
+            )
             .unwrap()
         {
             SubmissionResolution::Queued(queued) => queued,
@@ -1389,7 +1392,10 @@ mod tests {
             other => panic!("unexpected resolution: {other:?}"),
         };
         let failed = retained
-            .resolve(QueuePostObservation::Completed(STATUS_UNSUCCESSFUL), &mut counters)
+            .resolve(
+                QueuePostObservation::Completed(STATUS_UNSUCCESSFUL),
+                &mut counters,
+            )
             .unwrap();
         assert_eq!(
             failed,
@@ -1806,13 +1812,20 @@ mod tests {
     fn starting_worker_cannot_retire_before_creator_finishes_handshake() {
         let mut fleet = WorkerFleet::new();
         let counters = PoolCounters::new();
-        let worker = reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        let worker =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
 
-        assert_eq!(fleet.request_stop(worker.id, &counters), Ok(StopDecision::Busy));
+        assert_eq!(
+            fleet.request_stop(worker.id, &counters),
+            Ok(StopDecision::Busy)
+        );
         assert_eq!(fleet.state(worker.id), Ok(WorkerState::Starting));
 
         finish_worker(&mut fleet, worker);
-        assert_eq!(fleet.request_stop(worker.id, &counters), Ok(StopDecision::KeepMinimum));
+        assert_eq!(
+            fleet.request_stop(worker.id, &counters),
+            Ok(StopDecision::KeepMinimum)
+        );
     }
 
     #[test]

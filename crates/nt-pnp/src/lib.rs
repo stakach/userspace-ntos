@@ -26,17 +26,17 @@
 
 extern crate alloc;
 
-mod acpi_pci_routing_discovery;
-mod acpi_pci_scope_catalog;
 pub mod acpi_hal_pci_root;
 pub mod acpi_hal_route_callback;
+mod acpi_pci_routing_discovery;
+mod acpi_pci_scope_catalog;
+mod pci_bus_reported_resources;
 mod pci_interrupt_routes;
 mod pci_inventory;
-mod pci_bus_reported_resources;
 mod platform_bus_reported_resources;
 pub use platform_bus_reported_resources::{
-    admit_bus_reported_platform_resources, BusReportedPlatformResources,
-    BusReportedPlatformResourceError,
+    admit_bus_reported_platform_resources, BusReportedPlatformResourceError,
+    BusReportedPlatformResources,
 };
 
 pub use pci_bus_reported_resources::{validate_pci_bus_reported_resources, PciBusResourceError};
@@ -857,9 +857,7 @@ fn pci_instance_location(instance_id: &str) -> Option<(u8, u8, u8)> {
     if !starts_with_pci_prefix(instance_id) {
         return None;
     }
-    let instance = instance_id
-        .rsplit(|ch| ch == '\\' || ch == '/' || ch == '#')
-        .next()?;
+    let instance = instance_id.rsplit(['\\', '/', '#']).next()?;
     let mut bus_token = None;
     let mut request_token = None;
     for token in instance.split('&') {
@@ -1146,6 +1144,7 @@ pub struct PlatformResourceProfile {
 /// NT platform providers describe their resources on `PNPBus`, while firmware interrupt handlers
 /// conventionally query the HAL through `Internal, bus 0`. That alias is valid only for a PnP-bus
 /// assignment; PCI and other buses retain exact interface/bus matching.
+#[allow(clippy::too_many_arguments)] // Scalar HAL query contract used by ntos-executive.
 pub fn hal_interrupt_query_matches_assignment(
     assigned_interface_type: u32,
     assigned_bus_number: u32,
@@ -1808,6 +1807,16 @@ where
             .any(|id| id_matches_profile(id.as_ref(), profile))
 }
 
+/// The executive-arranged interrupt offered to a root-bus devnode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootBusInterrupt {
+    /// System vector; the profile must name the same vector.
+    pub vector: u32,
+    pub latched: bool,
+    /// Translated processor affinity.
+    pub affinity: u64,
+}
+
 /// Assign resources to a root-bus devnode when its instance path or registry IDs match a known
 /// broker-backed profile. This is the root-bus counterpart to PCI BAR assignment: the returned
 /// abstract resource list still has to be minted by the executive before `START_DEVICE`.
@@ -1816,15 +1825,18 @@ pub fn assign_root_bus_resources<H, C>(
     hardware_ids: &[H],
     compatible_ids: &[C],
     profile: &RootBusResourceProfile,
-    int_vector: u32,
-    int_latched: bool,
-    int_affinity: u64,
+    interrupt: RootBusInterrupt,
     dma_len: u64,
 ) -> Option<ResourceAssignment>
 where
     H: AsRef<str>,
     C: AsRef<str>,
 {
+    let RootBusInterrupt {
+        vector: int_vector,
+        latched: int_latched,
+        affinity: int_affinity,
+    } = interrupt;
     if !devnode_matches_root_bus_profile(instance_id, hardware_ids, compatible_ids, profile)
         || profile.mmio_phys == 0
         || profile.mmio_len == 0
@@ -1986,18 +1998,24 @@ mod tests {
         })
     }
 
+    /// `(dev, func, off) -> dword` entries.
+    type ConfigRegs = vec::Vec<((u8, u8, u8), u32)>;
+
     /// A mock PCI config space: a map of `(dev, func, off) -> dword`, with the size-probe protocol
     /// implemented (an all-ones write to a BAR latches the size mask; reading back returns it; any
     /// other write restores the stored value). Enough to drive the enumerator end-to-end.
     struct MockConfig {
         /// (dev, func, off) -> stored dword.
-        regs: RefCell<vec::Vec<((u8, u8, u8), u32)>>,
+        regs: RefCell<ConfigRegs>,
         /// (dev, func, bar_off) -> size mask returned after an all-ones write.
-        bar_masks: vec::Vec<((u8, u8, u8), u32)>,
+        bar_masks: ConfigRegs,
     }
 
+    /// `(bus, dev, func, off) -> dword` entries.
+    type TopologyRegs = vec::Vec<((u8, u8, u8, u8), u32)>;
+
     struct MockTopology {
-        regs: RefCell<vec::Vec<((u8, u8, u8, u8), u32)>>,
+        regs: RefCell<TopologyRegs>,
     }
 
     impl MockTopology {
@@ -2031,7 +2049,7 @@ mod tests {
         fn write(&self, bus: u8, dev: u8, func: u8, off: u8, value: u32) {
             if value == 0xffff_ffff
                 && (PCI_CFG_BAR0..PCI_CFG_BAR0 + (PCI_NUM_BARS as u8) * 4).contains(&off)
-                && (off - PCI_CFG_BAR0) % 4 == 0
+                && (off - PCI_CFG_BAR0).is_multiple_of(4)
             {
                 self.set(bus, dev, func, off, 0);
             } else {
@@ -2075,7 +2093,7 @@ mod tests {
                     return;
                 }
                 if (PCI_CFG_BAR0..PCI_CFG_BAR0 + (PCI_NUM_BARS as u8) * 4).contains(&off)
-                    && (off - PCI_CFG_BAR0) % 4 == 0
+                    && (off - PCI_CFG_BAR0).is_multiple_of(4)
                 {
                     self.set(dev, func, off, 0);
                     return;
@@ -2428,7 +2446,9 @@ mod tests {
             assert_eq!(bytes.len(), 60);
             assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 2);
             assert!(!bytes[20..]
-                .chunks_exact(20)
+                .as_chunks::<20>()
+                .0
+                .iter()
                 .any(|descriptor| descriptor[0] == nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT));
         }
     }
@@ -2636,10 +2656,25 @@ mod tests {
 
     #[test]
     fn accepted_libernt_pdo_location_selects_repeated_ahci_function() {
-        let first = PciDevice { bus: 0, dev: 2, func: 0, vendor: 0x8086, device: 0x2922,
-            class: 0x010601, header_type: 0, bridge: None, irq_line: 22, irq_pin: 1,
-            bars: vec![] };
-        let second = PciDevice { bus: 0, dev: 31, func: 2, ..first.clone() };
+        let first = PciDevice {
+            bus: 0,
+            dev: 2,
+            func: 0,
+            vendor: 0x8086,
+            device: 0x2922,
+            class: 0x010601,
+            header_type: 0,
+            bridge: None,
+            irq_line: 22,
+            irq_pin: 1,
+            bars: vec![],
+        };
+        let second = PciDevice {
+            bus: 0,
+            dev: 31,
+            func: 2,
+            ..first.clone()
+        };
         let devices = [first, second];
         let instance = r"PCI\VEN_8086&DEV_2922&SUBSYS_11001AF4&REV_02\5F";
         let hardware_ids = [r"PCI\VEN_8086&DEV_2922"];
@@ -2649,11 +2684,21 @@ mod tests {
             Some((31, 2)),
         );
         assert!(find_pci_device_for_accepted_pdo(
-            &devices, instance, &hardware_ids, 0, (30 << 16) | 2,
-        ).is_none());
+            &devices,
+            instance,
+            &hardware_ids,
+            0,
+            (30 << 16) | 2,
+        )
+        .is_none());
         assert!(find_pci_device_for_accepted_pdo(
-            &devices, r"PCI\VEN_1234&DEV_1111\5F", &hardware_ids, 0, (31 << 16) | 2,
-        ).is_none());
+            &devices,
+            r"PCI\VEN_1234&DEV_1111\5F",
+            &hardware_ids,
+            0,
+            (31 << 16) | 2,
+        )
+        .is_none());
     }
 
     #[test]
@@ -3079,9 +3124,11 @@ mod tests {
             &[r"ROOT\USERSPACE_NTOS_DMA"],
             &empty,
             &ROOT_DMA_TEST_RESOURCE_PROFILE,
-            5,
-            false,
-            1,
+            RootBusInterrupt {
+                vector: 5,
+                latched: false,
+                affinity: 1,
+            },
             0x1000,
         )
         .expect("root-bus DMA resources");
@@ -3302,9 +3349,11 @@ mod tests {
             &[r"PCI\VEN_8086&DEV_100E"],
             &empty,
             &ROOT_DMA_TEST_RESOURCE_PROFILE,
-            5,
-            false,
-            1,
+            RootBusInterrupt {
+                vector: 5,
+                latched: false,
+                affinity: 1,
+            },
             0x1000,
         )
         .is_none());

@@ -27,20 +27,27 @@ impl RetryWakeAttempt<'_> {
 struct RetryWakeWriter<'a>(&'a AtomicBool);
 
 impl Drop for RetryWakeWriter<'_> {
-    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl CoalescedRetryWake {
     pub const fn new() -> Self {
         Self {
-            deadline: AtomicU64::new(0), notified: AtomicBool::new(false),
-            publication: AtomicU64::new(0), writer: AtomicBool::new(false),
+            deadline: AtomicU64::new(0),
+            notified: AtomicBool::new(false),
+            publication: AtomicU64::new(0),
+            writer: AtomicBool::new(false),
         }
     }
 
     fn writer(&self) -> RetryWakeWriter<'_> {
-        while self.writer.compare_exchange(false, true, Ordering::Acquire,
-            Ordering::Relaxed).is_err() {
+        while self
+            .writer
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             core::hint::spin_loop();
         }
         RetryWakeWriter(&self.writer)
@@ -68,30 +75,28 @@ impl CoalescedRetryWake {
 
     /// Defer the clock read until the caller has found a retained owner. The due decision
     /// still uses a fresh sample and the latest deadline under the same writer lock.
-    pub fn due_for_outer_with_clock(
-        &self,
-        has_work: bool,
-        clock: impl FnOnce() -> u64,
-    ) -> bool {
-        if !has_work { return false; }
+    pub fn due_for_outer_with_clock(&self, has_work: bool, clock: impl FnOnce() -> u64) -> bool {
+        if !has_work {
+            return false;
+        }
         self.due_for_outer(clock(), true)
     }
 
     /// The timer may announce due work once; it never claims or drops the retained owner.
     pub fn wake_due(&self, now: u64, has_work: bool) -> bool {
         let _writer = self.writer();
-        has_work && now >= self.deadline.load(Ordering::Acquire)
+        has_work
+            && now >= self.deadline.load(Ordering::Acquire)
             && !self.notified.swap(true, Ordering::AcqRel)
     }
 
     /// The outer owner can act on a delivered wake even after timer rearming is suppressed.
     pub fn begin_redrive(&self, now: u64, has_work: bool) -> Option<RetryWakeAttempt<'_>> {
         let _writer = self.writer();
-        (has_work && now >= self.deadline.load(Ordering::Acquire))
-            .then(|| RetryWakeAttempt {
-                owner: self,
-                publication: self.publication.load(Ordering::Acquire),
-            })
+        (has_work && now >= self.deadline.load(Ordering::Acquire)).then(|| RetryWakeAttempt {
+            owner: self,
+            publication: self.publication.load(Ordering::Acquire),
+        })
     }
 
     /// Preserve the same time sample for the due decision and the next retry deadline.
@@ -100,16 +105,21 @@ impl CoalescedRetryWake {
         has_work: bool,
         clock: impl FnOnce() -> u64,
     ) -> Option<(RetryWakeAttempt<'_>, u64)> {
-        if !has_work { return None; }
+        if !has_work {
+            return None;
+        }
         let now = clock();
-        self.begin_redrive(now, has_work).map(|attempt| (attempt, now))
+        self.begin_redrive(now, has_work)
+            .map(|attempt| (attempt, now))
     }
 
     /// An attempted redrive may schedule a later retry only if no nested callback published
     /// newer work. Both mutations are serialized; a newer earlier deadline remains authoritative.
     fn retry_after(&self, publication: u64, deadline: u64) -> bool {
         let _writer = self.writer();
-        if self.publication.load(Ordering::Acquire) != publication { return false; }
+        if self.publication.load(Ordering::Acquire) != publication {
+            return false;
+        }
         self.deadline.store(deadline, Ordering::Release);
         self.publication.fetch_add(1, Ordering::Release);
         self.notified.store(false, Ordering::Release);
@@ -118,9 +128,10 @@ impl CoalescedRetryWake {
 }
 
 impl Default for CoalescedRetryWake {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
-
 
 /// Diagnostic cohort only; epochs never authorize a timer, sector claim or native effect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,20 +162,31 @@ pub struct WakeLatencySnapshot {
 impl WakeLatencySnapshot {
     /// Approximate percentile boundary; MAX denotes the open >=50 ms bucket.
     pub fn percentile_bound(bins: &[u64; 6], count: u64, percent: u8) -> Option<u64> {
-        if count == 0 || !(1..=100).contains(&percent) { return None; }
-        let rank = ((u128::from(count) * u128::from(percent) + 99) / 100) as u64;
+        if count == 0 || !(1..=100).contains(&percent) {
+            return None;
+        }
+        let rank = (u128::from(count) * u128::from(percent)).div_ceil(100) as u64;
         let mut seen = 0u64;
         for (i, n) in bins.iter().enumerate() {
             seen = seen.saturating_add(*n);
-            if seen >= rank { return Some([10_000, 50_000, 100_000, 200_000, 500_000, u64::MAX][i]); }
+            if seen >= rank {
+                return Some([10_000, 50_000, 100_000, 200_000, 500_000, u64::MAX][i]);
+            }
         }
         None
     }
 }
 
 struct WakeLatencyState {
-    epoch: u64, active: bool, follow_on: bool, first: u64, deadline: u64,
-    due: Option<u64>, service: Option<u64>, nested: u64, totals: WakeLatencySnapshot,
+    epoch: u64,
+    active: bool,
+    follow_on: bool,
+    first: u64,
+    deadline: u64,
+    due: Option<u64>,
+    service: Option<u64>,
+    nested: u64,
+    totals: WakeLatencySnapshot,
 }
 
 /// Short independent lock, never held across a callback or physical operation.
@@ -175,77 +197,156 @@ pub struct RetainedWakeLatency {
 // The writer lock serializes every UnsafeCell access.
 unsafe impl Sync for RetainedWakeLatency {}
 
+impl Default for RetainedWakeLatency {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RetainedWakeLatency {
     pub const fn new() -> Self {
-        Self { writer: AtomicBool::new(false), state: core::cell::UnsafeCell::new(WakeLatencyState {
-            epoch: 0, active: false, follow_on: false, first: 0, deadline: 0,
-            due: None, service: None, nested: 0,
-            totals: WakeLatencySnapshot { samples: 0, empty_epochs: 0,
-                coalesced_publications: 0, unknown_epochs: 0, follow_on_samples: 0,
-                published_total_100ns: 0, follow_on_total_100ns: 0,
-                due_total_100ns: 0, due_samples: 0, service_total_100ns: 0,
-                service_samples: 0, published_buckets: [0; 6], follow_on_buckets: [0; 6] },
-        }) }
+        Self {
+            writer: AtomicBool::new(false),
+            state: core::cell::UnsafeCell::new(WakeLatencyState {
+                epoch: 0,
+                active: false,
+                follow_on: false,
+                first: 0,
+                deadline: 0,
+                due: None,
+                service: None,
+                nested: 0,
+                totals: WakeLatencySnapshot {
+                    samples: 0,
+                    empty_epochs: 0,
+                    coalesced_publications: 0,
+                    unknown_epochs: 0,
+                    follow_on_samples: 0,
+                    published_total_100ns: 0,
+                    follow_on_total_100ns: 0,
+                    due_total_100ns: 0,
+                    due_samples: 0,
+                    service_total_100ns: 0,
+                    service_samples: 0,
+                    published_buckets: [0; 6],
+                    follow_on_buckets: [0; 6],
+                },
+            }),
+        }
     }
     fn edit<T>(&self, f: impl FnOnce(&mut WakeLatencyState) -> T) -> T {
-        while self.writer.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while self
+            .writer
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             core::hint::spin_loop();
         }
         let _guard = RetryWakeWriter(&self.writer);
         f(unsafe { &mut *self.state.get() })
     }
-    pub fn publish(&self, now: u64, deadline: u64) -> u64 { self.start(now, deadline, false) }
-    pub fn follow_on(&self, now: u64, deadline: u64) -> u64 { self.start(now, deadline, true) }
+    pub fn publish(&self, now: u64, deadline: u64) -> u64 {
+        self.start(now, deadline, false)
+    }
+    pub fn follow_on(&self, now: u64, deadline: u64) -> u64 {
+        self.start(now, deadline, true)
+    }
     fn start(&self, now: u64, deadline: u64, follow_on: bool) -> u64 {
         self.edit(|s| {
             if s.active {
-                s.deadline = deadline; s.due = None; s.nested = s.nested.saturating_add(1);
+                s.deadline = deadline;
+                s.due = None;
+                s.nested = s.nested.saturating_add(1);
                 s.totals.coalesced_publications = s.totals.coalesced_publications.saturating_add(1);
                 return s.epoch;
             }
             let Some(epoch) = s.epoch.checked_add(1) else {
-                s.totals.unknown_epochs = s.totals.unknown_epochs.saturating_add(1); return 0;
+                s.totals.unknown_epochs = s.totals.unknown_epochs.saturating_add(1);
+                return 0;
             };
-            s.epoch = epoch; s.active = true; s.follow_on = follow_on;
-            s.first = now; s.deadline = deadline; s.due = None; s.service = None; s.nested = 0;
+            s.epoch = epoch;
+            s.active = true;
+            s.follow_on = follow_on;
+            s.first = now;
+            s.deadline = deadline;
+            s.due = None;
+            s.service = None;
+            s.nested = 0;
             epoch
         })
     }
-    pub fn current_epoch(&self) -> Option<u64> { self.edit(|s| s.active.then_some(s.epoch)) }
-    pub fn due(&self, epoch: u64, now: u64) -> bool { self.edit(|s| {
-        if !s.active || epoch == 0 || s.epoch != epoch || now < s.deadline { return false; }
-        if s.due.is_none() { s.due = Some(now); } true
-    }) }
-    pub fn service(&self, epoch: u64, now: u64) -> bool { self.edit(|s| {
-        if !s.active || epoch == 0 || s.epoch != epoch { return false; }
-        if s.service.is_none() { s.service = Some(now); } true
-    }) }
-    pub fn reschedule(&self, epoch: u64, deadline: u64) -> bool { self.edit(|s| {
-        if !s.active || epoch == 0 || s.epoch != epoch { return false; }
-        s.deadline = deadline; s.due = None; true
-    }) }
-    pub fn empty(&self, epoch: u64) -> bool { self.edit(|s| {
-        if !s.active || epoch == 0 || s.epoch != epoch { return false; }
-        s.active = false; s.totals.empty_epochs = s.totals.empty_epochs.saturating_add(1); true
-    }) }
+    pub fn current_epoch(&self) -> Option<u64> {
+        self.edit(|s| s.active.then_some(s.epoch))
+    }
+    pub fn due(&self, epoch: u64, now: u64) -> bool {
+        self.edit(|s| {
+            if !s.active || epoch == 0 || s.epoch != epoch || now < s.deadline {
+                return false;
+            }
+            if s.due.is_none() {
+                s.due = Some(now);
+            }
+            true
+        })
+    }
+    pub fn service(&self, epoch: u64, now: u64) -> bool {
+        self.edit(|s| {
+            if !s.active || epoch == 0 || s.epoch != epoch {
+                return false;
+            }
+            if s.service.is_none() {
+                s.service = Some(now);
+            }
+            true
+        })
+    }
+    pub fn reschedule(&self, epoch: u64, deadline: u64) -> bool {
+        self.edit(|s| {
+            if !s.active || epoch == 0 || s.epoch != epoch {
+                return false;
+            }
+            s.deadline = deadline;
+            s.due = None;
+            true
+        })
+    }
+    pub fn empty(&self, epoch: u64) -> bool {
+        self.edit(|s| {
+            if !s.active || epoch == 0 || s.epoch != epoch {
+                return false;
+            }
+            s.active = false;
+            s.totals.empty_epochs = s.totals.empty_epochs.saturating_add(1);
+            true
+        })
+    }
     pub fn claim_sector(&self, epoch: u64, now: u64) -> Option<WakeLatencySample> {
         self.edit(|s| {
-            if !s.active || epoch == 0 || s.epoch != epoch { return None; }
+            if !s.active || epoch == 0 || s.epoch != epoch {
+                return None;
+            }
             s.active = false;
             let Some(elapsed) = now.checked_sub(s.first) else {
-                s.totals.unknown_epochs = s.totals.unknown_epochs.saturating_add(1); return None;
+                s.totals.unknown_epochs = s.totals.unknown_epochs.saturating_add(1);
+                return None;
             };
             let due = s.due.and_then(|t| now.checked_sub(t));
             s.totals.samples = s.totals.samples.saturating_add(1);
             let bucket = [10_000, 50_000, 100_000, 200_000, 500_000]
-                .iter().position(|bound| elapsed < *bound).unwrap_or(5);
+                .iter()
+                .position(|bound| elapsed < *bound)
+                .unwrap_or(5);
             if s.follow_on {
                 s.totals.follow_on_samples = s.totals.follow_on_samples.saturating_add(1);
-                s.totals.follow_on_total_100ns = s.totals.follow_on_total_100ns.saturating_add(elapsed);
-                s.totals.follow_on_buckets[bucket] = s.totals.follow_on_buckets[bucket].saturating_add(1);
+                s.totals.follow_on_total_100ns =
+                    s.totals.follow_on_total_100ns.saturating_add(elapsed);
+                s.totals.follow_on_buckets[bucket] =
+                    s.totals.follow_on_buckets[bucket].saturating_add(1);
             } else {
-                s.totals.published_total_100ns = s.totals.published_total_100ns.saturating_add(elapsed);
-                s.totals.published_buckets[bucket] = s.totals.published_buckets[bucket].saturating_add(1);
+                s.totals.published_total_100ns =
+                    s.totals.published_total_100ns.saturating_add(elapsed);
+                s.totals.published_buckets[bucket] =
+                    s.totals.published_buckets[bucket].saturating_add(1);
             }
             if let Some(delay) = due {
                 s.totals.due_samples = s.totals.due_samples.saturating_add(1);
@@ -256,12 +357,17 @@ impl RetainedWakeLatency {
                 s.totals.service_samples = s.totals.service_samples.saturating_add(1);
                 s.totals.service_total_100ns = s.totals.service_total_100ns.saturating_add(delay);
             }
-            Some(WakeLatencySample { publish_to_claim_100ns: elapsed,
-                due_to_claim_100ns: due, service_to_claim_100ns: service,
-                coalesced_publications: s.nested })
+            Some(WakeLatencySample {
+                publish_to_claim_100ns: elapsed,
+                due_to_claim_100ns: due,
+                service_to_claim_100ns: service,
+                coalesced_publications: s.nested,
+            })
         })
     }
-    pub fn snapshot(&self) -> WakeLatencySnapshot { self.edit(|s| s.totals) }
+    pub fn snapshot(&self) -> WakeLatencySnapshot {
+        self.edit(|s| s.totals)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -428,7 +534,10 @@ mod tests {
 
         let wake = CoalescedRetryWake::new();
         let reads = Cell::new(0);
-        let clock = || { reads.set(reads.get() + 1); 100 };
+        let clock = || {
+            reads.set(reads.get() + 1);
+            100
+        };
         assert!(wake.begin_redrive_with_clock(false, clock).is_none());
         assert_eq!(reads.get(), 0);
 
@@ -442,7 +551,12 @@ mod tests {
 
         // A producer can publish while the clock callback runs. The due decision must observe
         // the later authoritative deadline rather than claim the older work.
-        assert!(wake.begin_redrive_with_clock(true, || { wake.publish(300); 200 }).is_none());
+        assert!(wake
+            .begin_redrive_with_clock(true, || {
+                wake.publish(300);
+                200
+            })
+            .is_none());
         assert_eq!(wake.next_deadline(true), Some(300));
     }
 
@@ -505,10 +619,14 @@ mod tests {
         }
         let snapshot = observation.snapshot();
         assert_eq!(snapshot.samples, 100);
-        assert_eq!(WakeLatencySnapshot::percentile_bound(
-            &snapshot.published_buckets, 100, 50), Some(50_000));
-        assert_eq!(WakeLatencySnapshot::percentile_bound(
-            &snapshot.published_buckets, 100, 95), Some(u64::MAX));
+        assert_eq!(
+            WakeLatencySnapshot::percentile_bound(&snapshot.published_buckets, 100, 50),
+            Some(50_000)
+        );
+        assert_eq!(
+            WakeLatencySnapshot::percentile_bound(&snapshot.published_buckets, 100, 95),
+            Some(u64::MAX)
+        );
     }
 
     #[test]

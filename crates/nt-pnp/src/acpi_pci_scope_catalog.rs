@@ -380,15 +380,13 @@ impl AcpiPciScopeCatalog {
             || sources
                 .iter()
                 .any(|source| source.relation_owner != relation_owner)
-            || link_candidates
-                .iter()
-                .any(|candidate| {
-                    candidate.relation_owner != relation_owner
-                        || !candidate.endpoint.is_valid()
-                        || candidate.endpoint.hosted_domain_id != relation_owner.hosted_domain_id
-                        || candidate.endpoint.hosted_domain_cookie
-                            != relation_owner.hosted_domain_cookie
-                })
+            || link_candidates.iter().any(|candidate| {
+                candidate.relation_owner != relation_owner
+                    || !candidate.endpoint.is_valid()
+                    || candidate.endpoint.hosted_domain_id != relation_owner.hosted_domain_id
+                    || candidate.endpoint.hosted_domain_cookie
+                        != relation_owner.hosted_domain_cookie
+            })
             || (sources.is_empty() && !link_candidates.is_empty())
         {
             return Err(AcpiPciScopeError::InvalidProviderEndpoint);
@@ -746,16 +744,13 @@ fn canonicalize_catalog(sources: &mut [AcpiPciScopeSource]) -> Result<(), AcpiPc
 fn canonicalize_link_candidates(
     candidates: &mut [AcpiPciLinkCandidateFact],
 ) -> Result<(), AcpiPciScopeError> {
-    if candidates
-        .iter()
-        .any(|candidate| {
-            !candidate.relation_owner.is_valid()
-                || !candidate.endpoint.is_valid()
-                || candidate.endpoint.hosted_domain_id != candidate.relation_owner.hosted_domain_id
-                || candidate.endpoint.hosted_domain_cookie
-                    != candidate.relation_owner.hosted_domain_cookie
-        })
-    {
+    if candidates.iter().any(|candidate| {
+        !candidate.relation_owner.is_valid()
+            || !candidate.endpoint.is_valid()
+            || candidate.endpoint.hosted_domain_id != candidate.relation_owner.hosted_domain_id
+            || candidate.endpoint.hosted_domain_cookie
+                != candidate.relation_owner.hosted_domain_cookie
+    }) {
         return Err(AcpiPciScopeError::InvalidProviderEndpoint);
     }
     candidates.sort_unstable_by(|left, right| {
@@ -1153,7 +1148,10 @@ mod tests {
         assert!(changed.changed());
         catalog.commit(changed).unwrap();
         assert_eq!(catalog.generation(), 2);
-        assert_eq!(catalog.link_candidates(), &[replacement.clone()]);
+        assert_eq!(
+            catalog.link_candidates(),
+            core::slice::from_ref(&replacement)
+        );
 
         let duplicate = [replacement.clone(), replacement];
         assert_eq!(
@@ -1455,10 +1453,7 @@ mod tests {
         // LiberNT METHOD_EX rejects a sibling link on the PCI-root PDO with
         // STATUS_OBJECT_PATH_INVALID; use the link PDO from BusRelations.
         assert_eq!(links.link_queries()[0].endpoint, provider(45));
-        assert_eq!(
-            links.link_queries()[0].object_path,
-            path("\\_SB_.LNKA")
-        );
+        assert_eq!(links.link_queries()[0].object_path, path("\\_SB_.LNKA"));
         assert_eq!(
             links.link_queries()[0].method_path,
             path("\\_SB_.LNKA._CRS")

@@ -22,7 +22,12 @@ struct Machine {
 
 impl Machine {
     fn new() -> Self {
-        Self { real_ns: 0, tsc: 20_405_468_090, tsc_hz: TRUE_HZ, cycle_remainder: 0 }
+        Self {
+            real_ns: 0,
+            tsc: 20_405_468_090,
+            tsc_hz: TRUE_HZ,
+            cycle_remainder: 0,
+        }
     }
 
     fn advance(&mut self, ns: u64) {
@@ -32,11 +37,16 @@ impl Machine {
         self.cycle_remainder %= u128::from(NS_PER_SECOND);
     }
 
-    fn reference_100ns(&self) -> u64 { 2_040_546_809 + self.real_ns / 100 }
+    fn reference_100ns(&self) -> u64 {
+        2_040_546_809 + self.real_ns / 100
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Source { Fast, Reference }
+enum Source {
+    Fast,
+    Reference,
+}
 
 /// The adapter's whole flow: one read, at most one bracketed reference sample, one publication.
 struct Clock {
@@ -56,7 +66,10 @@ struct Clock {
     last_observation: Option<TscObservation>,
 }
 
-struct Reading { time: u64, source: Source }
+struct Reading {
+    time: u64,
+    source: Source,
+}
 
 impl Clock {
     fn seeded(seed_hz: u64) -> Self {
@@ -79,21 +92,29 @@ impl Clock {
 
     /// One bracketed reference read, as the adapter takes it.
     fn reference_sample(&mut self, tsc_before: u64) -> ReferenceSample {
-        self.machine.advance(core::mem::take(&mut self.stall_next_reference_ns));
+        self.machine
+            .advance(core::mem::take(&mut self.stall_next_reference_ns));
         let position = self.latch_position.unwrap_or_else(|| {
             // Anywhere in the read, both ends included.
-            self.latch_sequence = self.latch_sequence
+            self.latch_sequence = self
+                .latch_sequence
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
             (self.latch_sequence >> 33) % 1025
         });
         let latch_ns = self.reference_read_ns * position / 1024;
         self.machine.advance(latch_ns);
-        let reference_100ns = self.machine.reference_100ns()
+        let reference_100ns = self
+            .machine
+            .reference_100ns()
             .wrapping_add(core::mem::take(&mut self.glitch_next_reference_100ns));
         self.machine.advance(self.reference_read_ns - latch_ns);
         self.reference_reads += 1;
-        ReferenceSample { tsc_before, reference_100ns, tsc_after: self.machine.tsc }
+        ReferenceSample {
+            tsc_before,
+            reference_100ns,
+            tsc_after: self.machine.tsc,
+        }
     }
 
     fn now(&mut self) -> Reading {
@@ -115,7 +136,10 @@ impl Clock {
         };
         let published = self.published.publish(reading);
         self.held += u64::from(published.held);
-        Reading { time: published.time_100ns, source }
+        Reading {
+            time: published.time_100ns,
+            source,
+        }
     }
 
     /// One reading checked against the simulated truth: never earlier than a reading already
@@ -124,11 +148,17 @@ impl Clock {
         let before = self.machine.reference_100ns();
         let reading = self.now();
         let after = self.machine.reference_100ns();
-        assert!(reading.time >= self.latest, "time stepped back: {} -> {}", self.latest, reading.time);
+        assert!(
+            reading.time >= self.latest,
+            "time stepped back: {} -> {}",
+            self.latest,
+            reading.time
+        );
         assert!(
             reading.time + bound_100ns >= before && reading.time <= after + bound_100ns,
             "{:?} reading {} is not within {bound_100ns} of the reference [{before}, {after}]",
-            reading.source, reading.time,
+            reading.source,
+            reading.time,
         );
         self.latest = reading.time;
         reading
@@ -146,7 +176,10 @@ impl Clock {
     fn run_until_disciplined(&mut self, step_ns: u64) -> u64 {
         let start = self.machine.real_ns;
         while self.tsc.phase() != TscPhase::Disciplined {
-            assert!(self.machine.real_ns - start < 10 * NS_PER_SECOND, "never admitted");
+            assert!(
+                self.machine.real_ns - start < 10 * NS_PER_SECOND,
+                "never admitted"
+            );
             self.run(step_ns, step_ns, PLACEMENT_BOUND_100NS);
         }
         self.machine.real_ns - start
@@ -156,7 +189,10 @@ impl Clock {
     fn run_while_disciplined(&mut self, step_ns: u64, bound_100ns: u64) -> u64 {
         let start = self.machine.real_ns;
         while self.tsc.phase() == TscPhase::Disciplined {
-            assert!(self.machine.real_ns - start < 10 * NS_PER_SECOND, "never withdrawn");
+            assert!(
+                self.machine.real_ns - start < 10 * NS_PER_SECOND,
+                "never withdrawn"
+            );
             self.run(step_ns, step_ns, bound_100ns);
         }
         self.machine.real_ns - start
@@ -173,16 +209,27 @@ fn ppm_apart(a: u64, b: u64) -> u64 {
     (u128::from(a.abs_diff(b)) * 1_000_000 / u128::from(b)) as u64
 }
 
-fn window_ns() -> u64 { RATE_WINDOW_100NS * 100 }
+fn window_ns() -> u64 {
+    RATE_WINDOW_100NS * 100
+}
 
 #[test]
 fn admission_requires_invariant_capability_and_a_seed_frequency() {
-    assert_eq!(DisciplinedTsc::admit(false, TRUE_HZ), Err(TscClockError::NotInvariant));
-    assert_eq!(DisciplinedTsc::admit(true, 0), Err(TscClockError::Uncalibrated));
+    assert_eq!(
+        DisciplinedTsc::admit(false, TRUE_HZ),
+        Err(TscClockError::NotInvariant)
+    );
+    assert_eq!(
+        DisciplinedTsc::admit(true, 0),
+        Err(TscClockError::Uncalibrated)
+    );
     let tsc = DisciplinedTsc::admit(true, TRUE_HZ).unwrap();
     assert_eq!(tsc.phase(), TscPhase::Measuring);
-    assert_eq!(tsc.read(1_000, 0), TscRead::NeedsReference,
-        "an unmeasured counter never serves a reading");
+    assert_eq!(
+        tsc.read(1_000, 0),
+        TscRead::NeedsReference,
+        "an unmeasured counter never serves a reading"
+    );
 }
 
 #[test]
@@ -192,13 +239,19 @@ fn the_fast_path_is_served_only_after_consecutive_clean_rate_windows() {
     let admitted_after = {
         let start = clock.machine.real_ns;
         while clock.tsc.phase() != TscPhase::Disciplined {
-            assert!(clock.machine.real_ns - start < 10 * NS_PER_SECOND, "never admitted");
+            assert!(
+                clock.machine.real_ns - start < 10 * NS_PER_SECOND,
+                "never admitted"
+            );
             clock.machine.advance(50_000);
             fast += u64::from(clock.now().source == Source::Fast);
         }
         clock.machine.real_ns - start
     };
-    assert_eq!(fast, 0, "every reading before admission is a reference reading");
+    assert_eq!(
+        fast, 0,
+        "every reading before admission is a reference reading"
+    );
     let windows = u64::from(CLEAN_WINDOWS_TO_ADMIT);
     assert!(admitted_after >= windows * window_ns());
     assert!(admitted_after < (windows + 1) * window_ns());
@@ -222,12 +275,22 @@ fn a_hundred_ppm_seed_error_stays_on_the_fast_path_with_bounded_error() {
     assert_eq!(clock.tsc.phase(), TscPhase::Disciplined);
     assert_eq!(clock.tsc.excursions(), 0);
     assert_eq!(clock.tsc.seed_frequency_hz(), seed);
-    assert!(ppm_apart(clock.tsc.frequency_hz(), TRUE_HZ) <= 20,
-        "the rate is measured against the reference: {}", clock.tsc.frequency_hz());
-    assert!(clock.tsc.max_rate_error_ppm() <= 20, "{}", clock.tsc.max_rate_error_ppm());
+    assert!(
+        ppm_apart(clock.tsc.frequency_hz(), TRUE_HZ) <= 20,
+        "the rate is measured against the reference: {}",
+        clock.tsc.frequency_hz()
+    );
+    assert!(
+        clock.tsc.max_rate_error_ppm() <= 20,
+        "{}",
+        clock.tsc.max_rate_error_ppm()
+    );
     let reference_reads = clock.reference_reads - reference_reads;
     let reads = clock.ordinal - reads;
-    assert!(reference_reads * 100 < reads, "{reference_reads} reference reads in {reads}");
+    assert!(
+        reference_reads * 100 < reads,
+        "{reference_reads} reference reads in {reads}"
+    );
     assert_eq!(clock.tsc.anchors(), reference_reads);
 }
 
@@ -236,8 +299,15 @@ fn a_seed_far_outside_the_tolerance_is_replaced_by_the_measured_rate() {
     // 1.6%: the largest error the first KVM boot with an invariant TSC could have had.
     let mut clock = Clock::seeded(TRUE_HZ + TRUE_HZ / 1_000 * 16);
     let admitted_after = clock.run_until_disciplined(50_000);
-    assert!(admitted_after >= 3 * window_ns(), "the seed's window is not a clean window");
-    assert_eq!(clock.tsc.excursions(), 0, "a wrong seed is not a counter fault");
+    assert!(
+        admitted_after >= 3 * window_ns(),
+        "the seed's window is not a clean window"
+    );
+    assert_eq!(
+        clock.tsc.excursions(),
+        0,
+        "a wrong seed is not a counter fault"
+    );
     assert!(ppm_apart(clock.tsc.frequency_hz(), TRUE_HZ) <= 20);
     clock.run(10 * NS_PER_SECOND, 50_000, PLACEMENT_BOUND_100NS);
     assert_eq!(clock.tsc.phase(), TscPhase::Disciplined);
@@ -253,8 +323,10 @@ fn reference_reads_per_second_are_bounded_while_disciplined() {
             clock.run(NS_PER_SECOND, step_ns, PLACEMENT_BOUND_100NS);
             let reference_reads = clock.reference_reads - before;
             let bound = per_interval + reads_per_second / CHECK_READS + 2;
-            assert!(reference_reads <= bound,
-                "{reference_reads} reference reads in a second of {reads_per_second} reads");
+            assert!(
+                reference_reads <= bound,
+                "{reference_reads} reference reads in a second of {reads_per_second} reads"
+            );
         }
     }
     assert_eq!(clock.tsc.phase(), TscPhase::Disciplined);
@@ -275,15 +347,21 @@ fn time_never_steps_back_when_the_fast_clock_was_ahead_at_a_reanchor() {
         clock.machine.advance(1_000);
         since_read_ns += 1_000;
         let a_microsecond_later = clock.machine.tsc + clock.machine.tsc_hz / 1_000_000;
-        let check_is_near = [(clock.machine.tsc, 0), (a_microsecond_later, 1)].iter().any(
-            |&(tsc, reads)| clock.tsc.read(tsc, clock.ordinal + reads) == TscRead::NeedsReference);
+        let check_is_near = [(clock.machine.tsc, 0), (a_microsecond_later, 1)]
+            .iter()
+            .any(|&(tsc, reads)| {
+                clock.tsc.read(tsc, clock.ordinal + reads) == TscRead::NeedsReference
+            });
         if since_read_ns >= 50_000 || check_is_near {
             clock.checked_now(ahead_bound);
             since_read_ns = 0;
         }
     }
     assert!(clock.tsc.anchors() > anchors + 10);
-    assert!(clock.held > 0, "an anchor behind a returned reading holds that reading");
+    assert!(
+        clock.held > 0,
+        "an anchor behind a returned reading holds that reading"
+    );
     clock.reference_read_ns = REFERENCE_READ_NS;
     assert_eq!(clock.tsc.phase(), TscPhase::Disciplined);
     assert_eq!(clock.tsc.excursions(), 0);
@@ -316,16 +394,25 @@ fn a_delayed_reference_read_is_uncertain_and_not_a_rate_error() {
     assert_eq!(stalled.source, Source::Reference);
     assert_eq!(clock.last_observation, Some(TscObservation::Uncertain));
     let after_latch_100ns = (REFERENCE_READ_NS - REFERENCE_READ_NS / 4) / 100;
-    assert_eq!(stalled.time, clock.machine.reference_100ns() - after_latch_100ns,
-        "the delayed reading is still a real reference reading");
+    assert_eq!(
+        stalled.time,
+        clock.machine.reference_100ns() - after_latch_100ns,
+        "the delayed reading is still a real reference reading"
+    );
     assert_eq!(clock.tsc.phase(), TscPhase::Disciplined);
-    assert_eq!((clock.tsc.excursions(), clock.tsc.uncertain_samples()), (0, 1));
+    assert_eq!(
+        (clock.tsc.excursions(), clock.tsc.uncertain_samples()),
+        (0, 1)
+    );
     assert_eq!(clock.tsc.anchors(), anchors);
 
     // The unplaced sample is not an anchor, so the next read checks again.
     clock.machine.advance(50_000);
     assert_eq!(clock.now().source, Source::Reference);
-    assert!(matches!(clock.last_observation, Some(TscObservation::Anchored { .. })));
+    assert!(matches!(
+        clock.last_observation,
+        Some(TscObservation::Anchored { .. })
+    ));
     clock.run(NS_PER_SECOND, 50_000, PLACEMENT_BOUND_100NS);
     assert_eq!(clock.tsc.excursions(), 0);
 }
@@ -337,21 +424,33 @@ fn a_counter_jump_is_refused_before_publication_and_recovers_after_clean_windows
     clock.machine.tsc += TRUE_HZ / 20; // 50 ms of cycles appear at once
     let reading = clock.now();
     assert_eq!(reading.source, Source::Reference);
-    assert!(matches!(clock.last_observation, Some(TscObservation::Excursion { .. })));
-    assert!(reading.time <= clock.machine.reference_100ns(), "the jump was never published");
+    assert!(matches!(
+        clock.last_observation,
+        Some(TscObservation::Excursion { .. })
+    ));
+    assert!(
+        reading.time <= clock.machine.reference_100ns(),
+        "the jump was never published"
+    );
     assert_eq!(clock.tsc.phase(), TscPhase::Measuring);
     assert_eq!(clock.tsc.excursions(), 1);
 
     let reference_reads = clock.reference_reads;
     let reads = clock.ordinal;
     let recovered_after = clock.run_until_disciplined(50_000);
-    assert_eq!(clock.reference_reads - reference_reads, clock.ordinal - reads,
-        "the reference serves every reading until the counter is re-admitted");
+    assert_eq!(
+        clock.reference_reads - reference_reads,
+        clock.ordinal - reads,
+        "the reference serves every reading until the counter is re-admitted"
+    );
     let windows = u64::from(CLEAN_WINDOWS_TO_ADMIT);
     assert!(recovered_after >= windows * window_ns());
     assert!(recovered_after < (windows + 1) * window_ns());
     clock.run(5 * NS_PER_SECOND, 50_000, PLACEMENT_BOUND_100NS);
-    assert_eq!((clock.tsc.phase(), clock.tsc.excursions()), (TscPhase::Disciplined, 1));
+    assert_eq!(
+        (clock.tsc.phase(), clock.tsc.excursions()),
+        (TscPhase::Disciplined, 1)
+    );
 }
 
 #[test]
@@ -373,7 +472,11 @@ fn a_jump_inside_the_check_interval_is_caught_at_the_next_check_without_a_step_b
     assert!(clock.published.latest() > clock.machine.reference_100ns());
     // The reference then serves; the reading already returned is held until it catches up.
     let held = clock.held;
-    clock.run(NS_PER_SECOND / 100, 50_000, jump_100ns + PLACEMENT_BOUND_100NS);
+    clock.run(
+        NS_PER_SECOND / 100,
+        50_000,
+        jump_100ns + PLACEMENT_BOUND_100NS,
+    );
     assert!(clock.held > held);
     clock.run(NS_PER_SECOND / 100, 50_000, 0);
 }
@@ -385,15 +488,20 @@ fn a_rate_beyond_the_tolerance_falls_back_and_is_readmitted_at_the_measured_rate
     clock.machine.tsc_hz = TRUE_HZ + TRUE_HZ / 1_000_000 * wrong_ppm;
     let wrong_bound = PLACEMENT_BOUND_100NS + CHECK_INTERVAL_100NS * wrong_ppm / 1_000_000 + 1;
     let withdrawn_after = clock.run_while_disciplined(50_000, wrong_bound);
-    assert!(withdrawn_after <= 2 * CHECK_INTERVAL_100NS * 100,
-        "a wrong rate is withdrawn at the first check that can see it");
+    assert!(
+        withdrawn_after <= 2 * CHECK_INTERVAL_100NS * 100,
+        "a wrong rate is withdrawn at the first check that can see it"
+    );
     assert_eq!(clock.tsc.excursions(), 1);
 
     clock.run_until_disciplined(50_000);
     assert!(ppm_apart(clock.tsc.frequency_hz(), clock.machine.tsc_hz) <= 20);
     assert!(clock.tsc.max_rate_error_ppm() >= wrong_ppm - 20);
     clock.run(5 * NS_PER_SECOND, 50_000, PLACEMENT_BOUND_100NS);
-    assert_eq!((clock.tsc.phase(), clock.tsc.excursions()), (TscPhase::Disciplined, 1));
+    assert_eq!(
+        (clock.tsc.phase(), clock.tsc.excursions()),
+        (TscPhase::Disciplined, 1)
+    );
 }
 
 #[test]
@@ -402,7 +510,10 @@ fn a_stalled_counter_is_checked_within_the_read_budget() {
     clock.machine.tsc_hz = 0;
     let reads = clock.ordinal;
     while clock.tsc.phase() == TscPhase::Disciplined {
-        assert!(clock.ordinal - reads <= CHECK_READS, "a stalled counter was never checked");
+        assert!(
+            clock.ordinal - reads <= CHECK_READS,
+            "a stalled counter was never checked"
+        );
         clock.machine.advance(50_000);
         // Held readings fall behind by the whole stall, but never step back.
         clock.checked_now(CHECK_READS * 500);
@@ -427,10 +538,16 @@ fn excursions_without_a_sustained_clean_run_fail_the_counter_for_the_boot() {
         }
     }
     assert_eq!(clock.tsc.phase(), TscPhase::Failed(TscClockError::Unstable));
-    assert_eq!(clock.last_observation, Some(TscObservation::Failed(TscClockError::Unstable)));
+    assert_eq!(
+        clock.last_observation,
+        Some(TscObservation::Failed(TscClockError::Unstable))
+    );
     clock.run(5 * NS_PER_SECOND, 2_000_000, 0);
     assert_eq!(clock.tsc.phase(), TscPhase::Failed(TscClockError::Unstable));
-    assert_eq!(clock.tsc.read(clock.machine.tsc, clock.ordinal), TscRead::NeedsReference);
+    assert_eq!(
+        clock.tsc.read(clock.machine.tsc, clock.ordinal),
+        TscRead::NeedsReference
+    );
 }
 
 #[test]
@@ -441,8 +558,11 @@ fn a_sustained_clean_run_forgives_earlier_excursions() {
         clock.machine.tsc += TRUE_HZ / 20;
         clock.now();
         clock.run_until_disciplined(2_000_000);
-        clock.run(u64::from(FORGIVENESS_WINDOWS + 1) * window_ns(), 2_000_000,
-            PLACEMENT_BOUND_100NS);
+        clock.run(
+            u64::from(FORGIVENESS_WINDOWS + 1) * window_ns(),
+            2_000_000,
+            PLACEMENT_BOUND_100NS,
+        );
     }
     assert_eq!(clock.tsc.phase(), TscPhase::Disciplined);
     assert_eq!(clock.tsc.excursions(), u64::from(2 * MAX_EXCURSIONS));
@@ -453,23 +573,38 @@ fn a_counter_that_goes_backwards_fails_for_the_boot() {
     let clock = Clock::disciplined();
     let tsc = clock.machine.tsc;
     let reference = clock.machine.reference_100ns();
-    let sample = |tsc_before, reference_100ns, tsc_after| {
-        ReferenceSample { tsc_before, reference_100ns, tsc_after }
+    let sample = |tsc_before, reference_100ns, tsc_after| ReferenceSample {
+        tsc_before,
+        reference_100ns,
+        tsc_after,
     };
 
     let mut inside_bracket = clock.tsc;
-    assert_eq!(inside_bracket.observe(sample(tsc + 10, reference + 1, tsc + 9), clock.ordinal),
-        TscObservation::Failed(TscClockError::CounterRegressed));
-    assert_eq!(inside_bracket.phase(), TscPhase::Failed(TscClockError::CounterRegressed));
+    assert_eq!(
+        inside_bracket.observe(sample(tsc + 10, reference + 1, tsc + 9), clock.ordinal),
+        TscObservation::Failed(TscClockError::CounterRegressed)
+    );
+    assert_eq!(
+        inside_bracket.phase(),
+        TscPhase::Failed(TscClockError::CounterRegressed)
+    );
 
     let mut behind_anchor = clock.tsc;
     let before = tsc - TRUE_HZ;
-    assert_eq!(behind_anchor.observe(sample(before, reference + 1, before + 10), clock.ordinal),
-        TscObservation::Failed(TscClockError::CounterRegressed));
+    assert_eq!(
+        behind_anchor.observe(sample(before, reference + 1, before + 10), clock.ordinal),
+        TscObservation::Failed(TscClockError::CounterRegressed)
+    );
 
-    assert_eq!(behind_anchor.observe(sample(tsc + 10, reference + 2, tsc + 20), clock.ordinal),
-        TscObservation::Failed(TscClockError::CounterRegressed), "a failure is final");
-    assert_eq!(behind_anchor.read(tsc + 30, clock.ordinal + 1), TscRead::NeedsReference);
+    assert_eq!(
+        behind_anchor.observe(sample(tsc + 10, reference + 2, tsc + 20), clock.ordinal),
+        TscObservation::Failed(TscClockError::CounterRegressed),
+        "a failure is final"
+    );
+    assert_eq!(
+        behind_anchor.read(tsc + 30, clock.ordinal + 1),
+        TscRead::NeedsReference
+    );
 }
 
 #[test]
@@ -482,13 +617,28 @@ fn a_torn_reference_read_is_set_aside_and_never_anchored_or_published() {
     clock.glitch_next_reference_100ns = 429_496_729;
     let reading = clock.checked_now(PLACEMENT_BOUND_100NS);
     assert_eq!(reading.source, Source::Reference);
-    assert!(matches!(clock.last_observation, Some(TscObservation::Anchored { .. })),
-        "{:?}", clock.last_observation);
+    assert!(
+        matches!(
+            clock.last_observation,
+            Some(TscObservation::Anchored { .. })
+        ),
+        "{:?}",
+        clock.last_observation
+    );
     assert_eq!(clock.tsc.suspect_samples(), 1);
-    assert_eq!(clock.tsc.anchors(), anchors + 1, "only the confirming sample is an anchor");
-    assert!(clock.published.latest() <= clock.machine.reference_100ns(),
-        "the torn reading was never published");
-    assert_eq!((clock.tsc.phase(), clock.tsc.excursions()), (TscPhase::Disciplined, 0));
+    assert_eq!(
+        clock.tsc.anchors(),
+        anchors + 1,
+        "only the confirming sample is an anchor"
+    );
+    assert!(
+        clock.published.latest() <= clock.machine.reference_100ns(),
+        "the torn reading was never published"
+    );
+    assert_eq!(
+        (clock.tsc.phase(), clock.tsc.excursions()),
+        (TscPhase::Disciplined, 0)
+    );
     clock.run(NS_PER_SECOND, 50_000, PLACEMENT_BOUND_100NS);
     assert_eq!(clock.tsc.excursions(), 0);
 }
@@ -501,7 +651,10 @@ fn a_torn_reference_read_behind_the_anchor_is_also_set_aside() {
     clock.glitch_next_reference_100ns = 0u64.wrapping_sub(clock.machine.reference_100ns() / 2);
     clock.checked_now(PLACEMENT_BOUND_100NS);
     assert_eq!(clock.tsc.suspect_samples(), 1);
-    assert_eq!((clock.tsc.phase(), clock.tsc.excursions()), (TscPhase::Disciplined, 0));
+    assert_eq!(
+        (clock.tsc.phase(), clock.tsc.excursions()),
+        (TscPhase::Disciplined, 0)
+    );
 }
 
 #[test]
@@ -512,7 +665,10 @@ fn a_disagreement_that_a_second_sample_confirms_is_an_excursion() {
     clock.machine.tsc += TRUE_HZ / 20;
     clock.now();
     assert_eq!(clock.tsc.suspect_samples(), 1);
-    assert!(matches!(clock.last_observation, Some(TscObservation::Excursion { .. })));
+    assert!(matches!(
+        clock.last_observation,
+        Some(TscObservation::Excursion { .. })
+    ));
     assert_eq!(clock.tsc.phase(), TscPhase::Measuring);
 }
 
@@ -526,12 +682,17 @@ fn a_counter_that_stalls_while_being_measured_is_readmitted_once_it_counts_again
     clock.machine.tsc_hz = TRUE_HZ;
     let uncertain = clock.tsc.uncertain_samples();
     clock.run(NS_PER_SECOND / 10, 50_000, 0);
-    assert!(clock.tsc.frequency_hz() < TRUE_HZ / 20,
-        "the scenario must measure a window that spans the end of the stall");
+    assert!(
+        clock.tsc.frequency_hz() < TRUE_HZ / 20,
+        "the scenario must measure a window that spans the end of the stall"
+    );
 
     clock.run(4 * NS_PER_SECOND, 50_000, PLACEMENT_BOUND_100NS);
-    assert_eq!(clock.tsc.uncertain_samples(), uncertain,
-        "a wrong rate estimate must not make honest reference reads look delayed");
+    assert_eq!(
+        clock.tsc.uncertain_samples(),
+        uncertain,
+        "a wrong rate estimate must not make honest reference reads look delayed"
+    );
     assert_eq!(clock.tsc.phase(), TscPhase::Disciplined);
     assert!(ppm_apart(clock.tsc.frequency_hz(), TRUE_HZ) <= 20);
 }
@@ -548,7 +709,10 @@ fn a_reference_latch_anywhere_in_its_read_is_never_a_rate_error() {
         clock.run(3 * NS_PER_SECOND, step_ns, bound);
     }
     assert!(clock.tsc.anchors() > 5_000, "{}", clock.tsc.anchors());
-    assert_eq!((clock.tsc.phase(), clock.tsc.excursions()), (TscPhase::Disciplined, 0));
+    assert_eq!(
+        (clock.tsc.phase(), clock.tsc.excursions()),
+        (TscPhase::Disciplined, 0)
+    );
 }
 
 #[test]
@@ -560,7 +724,10 @@ fn the_first_read_after_a_long_idle_is_a_reference_reading_and_not_an_excursion(
     clock.machine.advance(60 * NS_PER_SECOND);
     let reading = clock.checked_now(0);
     assert_eq!(reading.source, Source::Reference);
-    assert!(matches!(clock.last_observation, Some(TscObservation::Anchored { .. })));
+    assert!(matches!(
+        clock.last_observation,
+        Some(TscObservation::Anchored { .. })
+    ));
     assert_eq!(clock.tsc.excursions(), 0);
     clock.run(NS_PER_SECOND, 50_000, PLACEMENT_BOUND_100NS + 31);
 }
@@ -571,7 +738,10 @@ fn a_bracket_is_uncertain_exactly_past_the_bound() {
     clock.machine.advance(CHECK_INTERVAL_100NS * 100 + 1_000);
     clock.stall_next_reference_ns = MAX_BRACKET_100NS * 100 - REFERENCE_READ_NS;
     clock.now();
-    assert!(matches!(clock.last_observation, Some(TscObservation::Anchored { .. })));
+    assert!(matches!(
+        clock.last_observation,
+        Some(TscObservation::Anchored { .. })
+    ));
     clock.machine.advance(CHECK_INTERVAL_100NS * 100 + 1_000);
     clock.stall_next_reference_ns = MAX_BRACKET_100NS * 100 - REFERENCE_READ_NS + 100;
     clock.now();

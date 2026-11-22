@@ -259,6 +259,10 @@ pub mod timer {
                 .count()
         }
 
+        pub fn is_empty(&self) -> bool {
+            self.slots.iter().all(|slot| slot.phase == TimerPhase::Free)
+        }
+
         pub fn callbacks_in_flight(&self, key: TimerKey) -> Option<u32> {
             self.slot(key).map(|slot| slot.callbacks_in_flight)
         }
@@ -648,6 +652,10 @@ pub mod registered_wait {
 
         pub const fn len(&self) -> usize {
             self.len
+        }
+
+        pub const fn is_empty(&self) -> bool {
+            self.len == 0
         }
 
         pub const fn handle_count(&self) -> usize {

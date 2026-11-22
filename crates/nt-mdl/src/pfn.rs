@@ -29,7 +29,7 @@ pub fn span_pages(address: u64, length: u32) -> Option<u64> {
         return None;
     }
     address.checked_add(u64::from(length) - 1)?;
-    Some(((address & (PAGE - 1)) + u64::from(length) + PAGE - 1) / PAGE)
+    Some(((address & (PAGE - 1)) + u64::from(length)).div_ceil(PAGE))
 }
 
 /// PFN slots described by a declared `MDL.Size`.
@@ -60,7 +60,8 @@ pub fn populate(
     }
     let page = |index: u64| start_va + index * PAGE;
     for index in 0..pages {
-        let physical = translate(page(index)).ok_or(PfnError::Untranslated { page: page(index) })?;
+        let physical =
+            translate(page(index)).ok_or(PfnError::Untranslated { page: page(index) })?;
         if physical & (PAGE - 1) != 0 {
             return Err(PfnError::Unaligned { page: page(index) });
         }

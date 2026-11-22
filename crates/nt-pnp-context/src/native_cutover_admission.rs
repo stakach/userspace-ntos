@@ -49,13 +49,17 @@ pub struct DeferredVideoOwner<I> {
 }
 
 impl<I: Copy + Eq> DeferredVideoOwner<I> {
-    pub const fn new(identity: I) -> Self { Self { identity } }
+    pub const fn new(identity: I) -> Self {
+        Self { identity }
+    }
 
     pub fn matches_current(self, current: Option<I>) -> bool {
         current == Some(self.identity)
     }
 
-    pub const fn identity(self) -> I { self.identity }
+    pub const fn identity(self) -> I {
+        self.identity
+    }
 }
 
 #[cfg(test)]

@@ -8,9 +8,9 @@
 
 #![no_std]
 
-pub mod mutation_begin;
-pub mod key_value_information;
 pub mod key_value_copy;
+pub mod key_value_information;
+pub mod mutation_begin;
 
 /// The Configuration Manager's SURT opcode range.
 pub const CM_OPCODE_MIN: u16 = 0x2100;
@@ -1176,10 +1176,16 @@ mod tests {
         assert_eq!(core::mem::size_of::<CmHiveMutationCommitRequest>(), 48);
         assert_eq!(core::mem::size_of::<CmHiveMutationCommitReply>(), 56);
         let request = CmHiveMutationCommitRequest {
-            abi_size: 48, abi_version: CM_ABI_VERSION,
-            operation: hive_mutation_commit_operation::COMMIT, mount: hive_mount::SYSTEM,
-            mutation_token: 0x1122_3344_5566_7788, expected_generation: 3,
-            semantic_journal_len: 17, reserved: 0, receipt_bank: 0, receipt_generation: 0,
+            abi_size: 48,
+            abi_version: CM_ABI_VERSION,
+            operation: hive_mutation_commit_operation::COMMIT,
+            mount: hive_mount::SYSTEM,
+            mutation_token: 0x1122_3344_5566_7788,
+            expected_generation: 3,
+            semantic_journal_len: 17,
+            reserved: 0,
+            receipt_bank: 0,
+            receipt_generation: 0,
         };
         let mut bytes = [0; 48];
         bytes[..2].copy_from_slice(&48u16.to_le_bytes());
@@ -1190,19 +1196,31 @@ mod tests {
         bytes[16..24].copy_from_slice(&3u64.to_le_bytes());
         bytes[24..28].copy_from_slice(&17u32.to_le_bytes());
         assert_eq!(request.as_bytes(), bytes);
-        assert_eq!(CmHiveMutationCommitRequest::from_bytes(&bytes), Some(request));
+        assert_eq!(
+            CmHiveMutationCommitRequest::from_bytes(&bytes),
+            Some(request)
+        );
         assert!(CmHiveMutationCommitRequest::from_bytes(&bytes[..47]).is_none());
         let reply = CmHiveMutationCommitReply {
-            abi_size: 56, abi_version: CM_ABI_VERSION,
+            abi_size: 56,
+            abi_version: CM_ABI_VERSION,
             disposition: hive_mutation_commit_disposition::RETAINED,
-            mutation_token: request.mutation_token, expected_generation: 3, next_generation: 4,
-            semantic_journal_len: 17, has_pending_device_action: 1,
-            receipt_bank: 29, receipt_generation: 5, reserved: 0,
+            mutation_token: request.mutation_token,
+            expected_generation: 3,
+            next_generation: 4,
+            semantic_journal_len: 17,
+            has_pending_device_action: 1,
+            receipt_bank: 29,
+            receipt_generation: 5,
+            reserved: 0,
         };
         assert_eq!(&reply.as_bytes()[24..32], &4u64.to_le_bytes());
         assert_eq!(&reply.as_bytes()[40..48], &29u64.to_le_bytes());
         assert_eq!(&reply.as_bytes()[48..56], &5u64.to_le_bytes());
-        assert_eq!(CmHiveMutationCommitReply::from_bytes(reply.as_bytes()), Some(reply));
+        assert_eq!(
+            CmHiveMutationCommitReply::from_bytes(reply.as_bytes()),
+            Some(reply)
+        );
     }
 
     #[test]
@@ -1288,7 +1306,10 @@ mod tests {
         assert_eq!(core::mem::size_of::<CmHiveKeyCloseRequest>(), 40);
         assert_eq!(core::mem::size_of::<CmHiveKeyCloseReply>(), 40);
         assert_eq!(core::mem::size_of::<CmHiveKeyOpenRequest>(), 64);
-        assert_eq!(core::mem::size_of::<CmHiveKeyOpenReply>(), CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES);
+        assert_eq!(
+            core::mem::size_of::<CmHiveKeyOpenReply>(),
+            CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES
+        );
         assert_eq!(core::mem::size_of::<CmLeasedHiveKeyRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmLeasedHiveRecordRequest>(), 48);
         assert_eq!(core::mem::size_of::<CmHiveCheckpointRequest>(), 32);
@@ -1333,10 +1354,7 @@ mod tests {
             path_offset: 16,
             path_len_bytes: 0x1122_3344,
         };
-        assert_eq!(
-            CmHivePathRequest::from_bytes(path.as_bytes()),
-            Some(path)
-        );
+        assert_eq!(CmHivePathRequest::from_bytes(path.as_bytes()), Some(path));
 
         let leased_query = CmLeasedHiveKeyRequest {
             abi_size: 32,
@@ -1407,8 +1425,14 @@ mod tests {
         assert_eq!(core::mem::size_of::<CmHiveExportHeader>(), 24);
         assert_eq!(CM_HIVE_EXPORT_HEADER_BYTES, 24);
         assert_eq!(core::mem::size_of::<CmHiveMutationRequest>(), 48);
-        assert_eq!(CM_HIVE_MUTATION_CHUNK_BYTES + core::mem::size_of::<CmHiveMutationRequest>(), 4096);
-        assert_eq!(core::mem::offset_of!(CmHiveMutationRequest, expected_mount), 40);
+        assert_eq!(
+            CM_HIVE_MUTATION_CHUNK_BYTES + core::mem::size_of::<CmHiveMutationRequest>(),
+            4096
+        );
+        assert_eq!(
+            core::mem::offset_of!(CmHiveMutationRequest, expected_mount),
+            40
+        );
         assert_eq!(core::mem::size_of::<CmHiveMutationRecord>(), 24);
         assert_eq!(CM_HIVE_MUTATION_RECORD_HEADER_BYTES, 24);
 
@@ -1458,9 +1482,18 @@ mod tests {
             chunk_capacity: CM_RETAINED_SNAPSHOT_CHUNK_BYTES as u32,
             ..CmRetainedSnapshotRequest::default()
         };
-        assert_eq!(CmRetainedSnapshotRequest::from_bytes(request.as_bytes()), Some(request));
-        let response = CmRetainedSnapshotReply { abi_size: 64, server_nonce: request.server_nonce,
-            ..CmRetainedSnapshotReply::default() };
-        assert_eq!(CmRetainedSnapshotReply::from_bytes(response.as_bytes()), Some(response));
+        assert_eq!(
+            CmRetainedSnapshotRequest::from_bytes(request.as_bytes()),
+            Some(request)
+        );
+        let response = CmRetainedSnapshotReply {
+            abi_size: 64,
+            server_nonce: request.server_nonce,
+            ..CmRetainedSnapshotReply::default()
+        };
+        assert_eq!(
+            CmRetainedSnapshotReply::from_bytes(response.as_bytes()),
+            Some(response)
+        );
     }
 }

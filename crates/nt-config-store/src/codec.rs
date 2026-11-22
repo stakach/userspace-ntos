@@ -62,8 +62,8 @@ impl Crc32c {
 
     pub fn update(&mut self, data: &[u8]) {
         let mut crc = self.crc;
-        let mut blocks = data.chunks_exact(8);
-        for block in &mut blocks {
+        let (blocks, remainder) = data.as_chunks::<8>();
+        for block in blocks {
             // Rows advance each byte's contribution through the rest of the block.
             let word = crc ^ u32::from_le_bytes([block[0], block[1], block[2], block[3]]);
             crc = CRC32C_SLICING_TABLES[6][(word & 0xff) as usize]
@@ -75,7 +75,7 @@ impl Crc32c {
                 ^ CRC32C_SLICING_TABLES[0][block[6] as usize]
                 ^ CRC32C_TABLE[block[7] as usize];
         }
-        for &byte in blocks.remainder() {
+        for &byte in remainder {
             let index = ((crc ^ u32::from(byte)) & 0xff) as usize;
             crc = (crc >> 8) ^ CRC32C_TABLE[index];
         }
@@ -84,6 +84,12 @@ impl Crc32c {
 
     pub fn finish(self) -> u32 {
         !self.crc
+    }
+}
+
+impl Default for Crc32c {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -237,7 +243,9 @@ impl<'a> Reader<'a> {
         let n = self.u32()? as usize;
         let bytes = self.take(n)?;
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         Some(

@@ -124,7 +124,7 @@ impl Aml<'_> {
         while at < end {
             match self.byte(at, end)? {
                 0 => at = self.pkg_length(at + 1, end)?.1,
-                1 => at = at + 3,
+                1 => at += 3,
                 2 => {
                     at = if self.byte(at + 1, end)? == 0x11 {
                         self.pkg(at + 2, end)?.1
@@ -132,7 +132,7 @@ impl Aml<'_> {
                         self.name(at + 1, end, scope)?.1
                     };
                 }
-                3 => at = at + 4,
+                3 => at += 4,
                 _ => {
                     let (name, next) = self.name(at, end, scope)?;
                     if next != at + 4 {
@@ -255,7 +255,7 @@ impl Aml<'_> {
                     .iter()
                     .position(|b| *b == 0)
                     .ok_or(StaticIoResourceError::MalformedAml)?),
-            0x11 | 0x12 | 0x13 => Ok(self.pkg(at + 1, end)?.1),
+            0x11..=0x13 => Ok(self.pkg(at + 1, end)?.1),
             _ => Ok(self.name(at, end, &Scope::default())?.1),
         }
     }
@@ -486,7 +486,7 @@ impl Aml<'_> {
                     self.declare(name)?;
                     at = next;
                 }
-                0xa0 | 0xa1 | 0xa2 => at = self.pkg(at + 1, end)?.1,
+                0xa0..=0xa2 => at = self.pkg(at + 1, end)?.1,
                 0x5b if matches!(self.byte(at + 1, end)?, 0x81 | 0x86 | 0x87) => {
                     let opcode = self.byte(at + 1, end)?;
                     let (body, next) = self.pkg(at + 2, end)?;
@@ -504,7 +504,7 @@ impl Aml<'_> {
                     self.field_list(fields + 1, next, scope)?;
                     at = next;
                 }
-                0x5b if matches!(self.byte(at + 1, end)?, 0x83 | 0x84 | 0x85) => {
+                0x5b if matches!(self.byte(at + 1, end)?, 0x83..=0x85) => {
                     let opcode = self.byte(at + 1, end)?;
                     let (body, next) = self.pkg(at + 2, end)?;
                     let (name, terms) = self.name(body, next, scope)?;

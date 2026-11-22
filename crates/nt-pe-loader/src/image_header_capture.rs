@@ -14,9 +14,12 @@ pub struct ImageHeaderRead {
 
 enum CaptureStage {
     Initial,
-    Nt { nt_offset: usize, window_offset: u64 },
+    Nt {
+        nt_offset: usize,
+        window_offset: u64,
+    },
     Table {
-        headers: Headers,
+        headers: alloc::boxed::Box<Headers>,
         table: usize,
         window_offset: u64,
     },
@@ -43,11 +46,12 @@ impl IncrementalImageLayoutCapture {
     pub fn next_window(&self) -> Option<ImageHeaderRead> {
         let (offset, capacity) = match &self.stage {
             CaptureStage::Initial => (0, PAGE_SIZE),
-            CaptureStage::Nt { window_offset, .. }
-            | CaptureStage::Table { window_offset, .. } => (*window_offset, HEADER_WINDOW),
+            CaptureStage::Nt { window_offset, .. } | CaptureStage::Table { window_offset, .. } => {
+                (*window_offset, HEADER_WINDOW)
+            }
             CaptureStage::Complete => return None,
         };
-        let available = self.file_size.checked_sub(offset).unwrap_or(0);
+        let available = self.file_size.saturating_sub(offset);
         Some(ImageHeaderRead {
             offset,
             length: available.min(capacity as u64) as usize,
@@ -110,7 +114,7 @@ impl IncrementalImageLayoutCapture {
                     return Ok(Some(layout));
                 }
                 self.stage = CaptureStage::Table {
-                    headers,
+                    headers: alloc::boxed::Box::new(headers),
                     table,
                     window_offset: (table as u64) & !((PAGE_SIZE - 1) as u64),
                 };
@@ -123,7 +127,7 @@ impl IncrementalImageLayoutCapture {
             } => {
                 let layout = PeLayout::from_section_window(
                     bytes,
-                    headers.clone(),
+                    headers.as_ref().clone(),
                     (*table as u64 - *window_offset) as usize,
                 )?;
                 self.stage = CaptureStage::Complete;

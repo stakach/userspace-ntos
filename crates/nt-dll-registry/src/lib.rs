@@ -128,7 +128,7 @@ pub enum ReserveError {
 impl Registry {
     /// Pack activated images into `[arena_start, arena_end)` at Windows' 64 KiB granularity.
     pub fn new(arena_start: u64, arena_end: u64) -> Self {
-        assert!(arena_start % ALLOCATION_GRANULARITY == 0);
+        assert!(arena_start.is_multiple_of(ALLOCATION_GRANULARITY));
         assert!(arena_start < arena_end);
         Self {
             dlls: Vec::new(),
@@ -262,7 +262,7 @@ impl Registry {
     }
 
     pub fn arena_page_table_count(&self) -> usize {
-        ((self.arena_end - self.arena_start + PAGE_TABLE_SPAN - 1) / PAGE_TABLE_SPAN) as usize
+        (self.arena_end - self.arena_start).div_ceil(PAGE_TABLE_SPAN) as usize
     }
 
     /// Half-open page-table-index range covering active DLL `i`, relative to the arena start.
@@ -276,7 +276,7 @@ impl Registry {
             return None;
         }
         let first = ((d.base - self.arena_start) / PAGE_TABLE_SPAN) as usize;
-        let last = ((end - self.arena_start + PAGE_TABLE_SPAN - 1) / PAGE_TABLE_SPAN) as usize;
+        let last = (end - self.arena_start).div_ceil(PAGE_TABLE_SPAN) as usize;
         Some(first..last)
     }
 
@@ -961,8 +961,8 @@ mod tests {
     fn measured_reactos_images_fit_compactly() {
         // Measured from the staged ReactOS System32: 449 DLLs consume 0x6f70000 bytes after
         // 64 KiB alignment; shell32.dll is largest at SizeOfImage 0x899000.
-        const ALIGNED_TOTAL: u64 = 0x6f70_000;
-        assert!(ARENA_END - ARENA_START > ALIGNED_TOTAL);
+        const ALIGNED_TOTAL: u64 = 0x06f7_0000;
+        const _: () = assert!(ARENA_END - ARENA_START > ALIGNED_TOTAL);
         let mut r = Registry::new(ARENA_START, ARENA_END);
         let shell = r.register(b"shell32", 0x899000, 0x1000);
         assert_eq!(r.base(shell), ARENA_START);

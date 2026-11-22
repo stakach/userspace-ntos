@@ -127,7 +127,10 @@ pub struct PortAdmission {
 impl Default for PortAdmission {
     fn default() -> Self {
         // Legacy LPC callers have always accepted both forms of traffic.
-        Self { allow_lpc_requests: true, allow_impersonation: true }
+        Self {
+            allow_lpc_requests: true,
+            allow_impersonation: true,
+        }
     }
 }
 
@@ -271,6 +274,13 @@ pub struct QueuedMessage {
 struct StoredMessage {
     message: QueuedMessage,
     pool_charge: u32,
+}
+
+/// The broker pool account a stored message is charged to, and the charge it replaces there.
+#[derive(Copy, Clone)]
+struct MessageCharge {
+    account: usize,
+    replaced: u32,
 }
 
 /// Identity stamped into a synchronous request by the trusted API adapter. The connection id is
@@ -520,7 +530,8 @@ impl PortCore {
     /// A completed client endpoint can be observed by another API adapter
     /// without repeating the original connect effect.
     pub fn completed_client_handle(&self, id: u64) -> Option<u64> {
-        self.conn(id).filter(|c| c.state == ConnState::Connected && c.client_open)
+        self.conn(id)
+            .filter(|c| c.state == ConnState::Connected && c.client_open)
             .map(|c| c.client_handle)
     }
 
@@ -555,7 +566,8 @@ impl PortCore {
     /// A closed and replaced port has a different handle even if its name matches.
     pub fn named_listen_port_handle(&self, name: &[u16]) -> Option<u64> {
         let folded = fold_name(name);
-        self.ports.iter()
+        self.ports
+            .iter()
             .find(|port| port.user_open && port.named && port.name == folded)
             .map(|port| port.handle)
     }
@@ -688,7 +700,13 @@ impl PortCore {
         admission: PortAdmission,
     ) -> Result<u64, NtStatus> {
         self.create_port_with_owner_and_limits_policy(
-            name, api, ClientId::default(), limits, admission, false)
+            name,
+            api,
+            ClientId::default(),
+            limits,
+            admission,
+            false,
+        )
     }
 
     /// Create a port while preserving both its kernel-supplied owner and native limits.
@@ -700,7 +718,13 @@ impl PortCore {
         limits: PortLimits,
     ) -> Result<u64, NtStatus> {
         self.create_port_with_owner_and_limits_policy(
-            name, api, owner, limits, PortAdmission::default(), false)
+            name,
+            api,
+            owner,
+            limits,
+            PortAdmission::default(),
+            false,
+        )
     }
 
     /// Create a port with a unique name, preserving the caller's owner identity.
@@ -714,7 +738,13 @@ impl PortCore {
         limits: PortLimits,
     ) -> Result<u64, NtStatus> {
         self.create_port_with_owner_and_limits_policy(
-            name, api, owner, limits, PortAdmission::default(), true)
+            name,
+            api,
+            owner,
+            limits,
+            PortAdmission::default(),
+            true,
+        )
     }
 
     /// Create a checked native ALPC port with its captured admission policy.
@@ -726,8 +756,7 @@ impl PortCore {
         limits: PortLimits,
         admission: PortAdmission,
     ) -> Result<u64, NtStatus> {
-        self.create_port_with_owner_and_limits_policy(
-            name, api, owner, limits, admission, true)
+        self.create_port_with_owner_and_limits_policy(name, api, owner, limits, admission, true)
     }
 
     fn create_port_with_owner_and_limits_policy(
@@ -832,12 +861,20 @@ impl PortCore {
         client_id: ClientId,
         security: ConnectionSecurity,
     ) -> Result<ConnectOutcome, NtStatus> {
-        self.connect_with_client_id_and_security_limit(name, client_api, subsystem_type,
-            conn_info, client_id, security, None)
+        self.connect_with_client_id_and_security_limit(
+            name,
+            client_api,
+            subsystem_type,
+            conn_info,
+            client_id,
+            security,
+            None,
+        )
     }
 
     /// Connect with captured client QoS and an optional client message ceiling.
     /// The effective connection limit is the tighter of the two endpoint limits.
+    #[allow(clippy::too_many_arguments)] // Public connect contract used by nt-alpc.
     pub fn connect_with_client_id_and_security_limit(
         &mut self,
         name: &[u16],
@@ -857,7 +894,8 @@ impl PortCore {
             .iter()
             .position(|p| p.user_open && p.named && p.name == name)
             .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
-        if client_api == PortApi::Lpc && self.ports[port_idx].api == PortApi::Alpc
+        if client_api == PortApi::Lpc
+            && self.ports[port_idx].api == PortApi::Alpc
             && !self.ports[port_idx].admission.allow_lpc_requests
         {
             return Err(NtStatus::ACCESS_DENIED);
@@ -979,9 +1017,15 @@ impl PortCore {
     /// Inspect the next connection request without changing its delivery state.
     /// A native receiver uses this to check its output capacity before dequeue.
     pub fn peek_pending_connection(&self, port_handle: u64) -> Option<(u64, usize)> {
-        let port = self.ports.iter().find(|port| port.user_open && port.handle == port_handle)?;
+        let port = self
+            .ports
+            .iter()
+            .find(|port| port.user_open && port.handle == port_handle)?;
         let connection_id = *port.pending.first()?;
-        let connection = self.connections.iter().find(|connection| connection.id == connection_id)?;
+        let connection = self
+            .connections
+            .iter()
+            .find(|connection| connection.id == connection_id)?;
         Some((connection_id, connection.conn_info.len()))
     }
 
@@ -990,20 +1034,33 @@ impl PortCore {
         &self,
         port_handle: u64,
     ) -> Option<(u64, usize)> {
-        let port = self.parent_port_index_for_server_handle(port_handle)
+        let port = self
+            .parent_port_index_for_server_handle(port_handle)
             .and_then(|index| self.ports.get(index))
-            .or_else(|| self.ports.iter().find(|port| port.user_open && port.handle == port_handle))?;
+            .or_else(|| {
+                self.ports
+                    .iter()
+                    .find(|port| port.user_open && port.handle == port_handle)
+            })?;
         let connection_id = *port.pending.first()?;
-        let connection = self.connections.iter().find(|connection| connection.id == connection_id)?;
+        let connection = self
+            .connections
+            .iter()
+            .find(|connection| connection.id == connection_id)?;
         Some((connection_id, connection.conn_info.len()))
     }
 
     /// The parent listen handle owns the connection receipt even when a
     /// reply-and-wait delivered the request through a server comm handle.
     pub fn connection_listen_handle_for_server_reply(&self, handle: u64) -> Option<u64> {
-        let port = self.parent_port_index_for_server_handle(handle)
+        let port = self
+            .parent_port_index_for_server_handle(handle)
             .and_then(|index| self.ports.get(index))
-            .or_else(|| self.ports.iter().find(|port| port.user_open && port.handle == handle))?;
+            .or_else(|| {
+                self.ports
+                    .iter()
+                    .find(|port| port.user_open && port.handle == handle)
+            })?;
         port.user_open.then_some(port.handle)
     }
 
@@ -1397,10 +1454,16 @@ impl PortCore {
                 connection_id: connection.id,
                 client: connection.client_id,
             };
-            let port_context = from_client.then_some(connection.port_context).unwrap_or(0);
+            let port_context = if from_client {
+                connection.port_context
+            } else {
+                0
+            };
             let stored = self.allocate_stored_message(
-                account,
-                0,
+                MessageCharge {
+                    account,
+                    replaced: 0,
+                },
                 bytes,
                 attrs,
                 provenance,
@@ -1455,8 +1518,10 @@ impl PortCore {
         };
         let port_context = conn.port_context;
         let stored = self.allocate_stored_message(
-            account,
-            0,
+            MessageCharge {
+                account,
+                replaced: 0,
+            },
             bytes,
             attrs,
             provenance,
@@ -1485,14 +1550,17 @@ impl PortCore {
             .iter()
             .position(|endpoint| endpoint.handle == endpoint_handle)
         {
-            if let Some(connection_id) = self.kernel_endpoints[endpoint_index]
-                .accepted_alpc_connection
+            if let Some(connection_id) =
+                self.kernel_endpoints[endpoint_index].accepted_alpc_connection
             {
-                if !self.connections.iter().any(|connection| connection.id == connection_id
-                    && connection.state == ConnState::Connected && connection.server_open
-                    && connection.client_live()
-                    && connection.port_object_id == self.kernel_endpoints[endpoint_index].port_object_id)
-                {
+                if !self.connections.iter().any(|connection| {
+                    connection.id == connection_id
+                        && connection.state == ConnState::Connected
+                        && connection.server_open
+                        && connection.client_live()
+                        && connection.port_object_id
+                            == self.kernel_endpoints[endpoint_index].port_object_id
+                }) {
                     return Err(NtStatus::PORT_DISCONNECTED);
                 }
             }
@@ -1505,8 +1573,10 @@ impl PortCore {
                 return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
             }
             let stored = self.allocate_stored_message(
-                port.pool_account,
-                0,
+                MessageCharge {
+                    account: port.pool_account,
+                    replaced: 0,
+                },
                 bytes,
                 attrs,
                 MessageProvenance {
@@ -1549,8 +1619,10 @@ impl PortCore {
             return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
         }
         let stored = self.allocate_stored_message(
-            connection.pool_account,
-            0,
+            MessageCharge {
+                account: connection.pool_account,
+                replaced: 0,
+            },
             bytes,
             attrs,
             MessageProvenance {
@@ -1599,8 +1671,10 @@ impl PortCore {
                 .try_reserve(1)
                 .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
             let stored = self.allocate_stored_message(
-                account,
-                0,
+                MessageCharge {
+                    account,
+                    replaced: 0,
+                },
                 bytes,
                 attrs,
                 MessageProvenance {
@@ -1641,8 +1715,10 @@ impl PortCore {
             .try_reserve(1)
             .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
         let stored = self.allocate_stored_message(
-            account,
-            0,
+            MessageCharge {
+                account,
+                replaced: 0,
+            },
             bytes,
             attrs,
             MessageProvenance {
@@ -1934,8 +2010,10 @@ impl PortCore {
                     client: identity.client,
                 };
                 let stored = self.allocate_stored_message(
-                    account,
-                    old_charge,
+                    MessageCharge {
+                        account,
+                        replaced: old_charge,
+                    },
                     bytes,
                     attrs,
                     provenance,
@@ -1971,7 +2049,8 @@ impl PortCore {
                             .any(|request| request.identity == identity)
                 })
                 .ok_or(NtStatus::REPLY_MESSAGE_MISMATCH)?;
-            if self.kernel_endpoints[endpoint_index].accepted_alpc_connection
+            if self.kernel_endpoints[endpoint_index]
+                .accepted_alpc_connection
                 .is_some_and(|accepted| accepted != connection.id)
             {
                 return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
@@ -1991,8 +2070,10 @@ impl PortCore {
             let accepted_alpc_connection =
                 (connection.server_api == PortApi::Alpc).then_some(connection.id);
             let stored = self.allocate_stored_message(
-                account,
-                old_charge,
+                MessageCharge {
+                    account,
+                    replaced: old_charge,
+                },
                 bytes,
                 attrs,
                 MessageProvenance {
@@ -2009,7 +2090,8 @@ impl PortCore {
                 .client_inbox
                 .push(stored);
             if let Some(connection_id) = accepted_alpc_connection {
-                self.kernel_endpoints[endpoint_index].accepted_alpc_connection = Some(connection_id);
+                self.kernel_endpoints[endpoint_index].accepted_alpc_connection =
+                    Some(connection_id);
             }
             return Ok(());
         }
@@ -2039,8 +2121,10 @@ impl PortCore {
                 .pool_charge;
             let account = port.pool_account;
             let stored = self.allocate_stored_message(
-                account,
-                old_charge,
+                MessageCharge {
+                    account,
+                    replaced: old_charge,
+                },
                 bytes,
                 attrs,
                 MessageProvenance {
@@ -2088,8 +2172,10 @@ impl PortCore {
             client: identity.client,
         };
         let stored = self.allocate_stored_message(
-            account,
-            old_charge,
+            MessageCharge {
+                account,
+                replaced: old_charge,
+            },
             bytes,
             attrs,
             provenance,
@@ -2176,38 +2262,68 @@ impl PortCore {
     /// Inspect the next queued message length without consuming it. The search
     /// order matches `receive_message` so native copyout can reject short buffers.
     pub fn peek_receive_message_len(&self, handle: u64) -> Option<usize> {
-        if let Some(connection) = self.connections.iter().find(|connection|
-            handle != 0 && connection.client_open && connection.client_handle == handle)
-        {
-            return connection.client_inbox.first().map(|stored| stored.message.bytes.len());
+        if let Some(connection) = self.connections.iter().find(|connection| {
+            handle != 0 && connection.client_open && connection.client_handle == handle
+        }) {
+            return connection
+                .client_inbox
+                .first()
+                .map(|stored| stored.message.bytes.len());
         }
-        if let Some(connection) = self.connections.iter().find(|connection|
-            handle != 0 && connection.server_open && connection.server_handle == handle
-                && connection.server_api == PortApi::Alpc)
-        {
-            return connection.server_inbox.first().map(|stored| stored.message.bytes.len())
-                .or_else(|| self.kernel_endpoints.iter()
-                    .find(|endpoint| endpoint.accepted_alpc_connection == Some(connection.id)
-                        && !endpoint.server_inbox.is_empty())
+        if let Some(connection) = self.connections.iter().find(|connection| {
+            handle != 0
+                && connection.server_open
+                && connection.server_handle == handle
+                && connection.server_api == PortApi::Alpc
+        }) {
+            return connection
+                .server_inbox
+                .first()
+                .map(|stored| stored.message.bytes.len())
+                .or_else(|| {
+                    self.kernel_endpoints
+                        .iter()
+                        .find(|endpoint| {
+                            endpoint.accepted_alpc_connection == Some(connection.id)
+                                && !endpoint.server_inbox.is_empty()
+                        })
+                        .and_then(|endpoint| endpoint.server_inbox.first())
+                        .map(|stored| stored.message.bytes.len())
+                });
+        }
+        let port = self
+            .ports
+            .iter()
+            .find(|port| port.user_open && port.handle == handle)
+            .or_else(|| {
+                self.connection_port_index_for_server_handle(handle)
+                    .and_then(|index| self.ports.get(index))
+            })?;
+        port.datagrams
+            .first()
+            .map(|stored| stored.message.bytes.len())
+            .or_else(|| {
+                self.kernel_endpoints
+                    .iter()
+                    .find(|endpoint| {
+                        endpoint.port_object_id == port.object_id
+                            && endpoint.accepted_alpc_connection.is_none()
+                            && !endpoint.server_inbox.is_empty()
+                    })
                     .and_then(|endpoint| endpoint.server_inbox.first())
-                    .map(|stored| stored.message.bytes.len()));
-        }
-        let port = self.ports.iter().find(|port| port.user_open && port.handle == handle)
-            .or_else(|| self.connection_port_index_for_server_handle(handle)
-                .and_then(|index| self.ports.get(index)))?;
-        port.datagrams.first().map(|stored| stored.message.bytes.len())
-            .or_else(|| self.kernel_endpoints.iter()
-                .find(|endpoint| endpoint.port_object_id == port.object_id
-                    && endpoint.accepted_alpc_connection.is_none()
-                    && !endpoint.server_inbox.is_empty())
-                .and_then(|endpoint| endpoint.server_inbox.first())
-                .map(|stored| stored.message.bytes.len()))
-            .or_else(|| self.connections.iter()
-                .find(|connection| connection.server_open
-                    && connection.port_object_id == port.object_id
-                    && !connection.server_inbox.is_empty())
-                .and_then(|connection| connection.server_inbox.first())
-                .map(|stored| stored.message.bytes.len()))
+                    .map(|stored| stored.message.bytes.len())
+            })
+            .or_else(|| {
+                self.connections
+                    .iter()
+                    .find(|connection| {
+                        connection.server_open
+                            && connection.port_object_id == port.object_id
+                            && !connection.server_inbox.is_empty()
+                    })
+                    .and_then(|connection| connection.server_inbox.first())
+                    .map(|stored| stored.message.bytes.len())
+            })
     }
 
     /// Receive the next `PORT_MESSAGE` for the endpoint identified by `handle`.
@@ -2345,9 +2461,7 @@ impl PortCore {
 
     fn parent_port_index_for_server_handle(&self, handle: u64) -> Option<usize> {
         let connection = self.connections.iter().find(|connection| {
-            handle != 0
-                && connection.server_open
-                && connection.server_handle == handle
+            handle != 0 && connection.server_open && connection.server_handle == handle
         })?;
         self.ports
             .iter()
@@ -2416,14 +2530,17 @@ impl PortCore {
 
     fn allocate_stored_message(
         &mut self,
-        account_index: usize,
-        replaced_charge: u32,
+        charge: MessageCharge,
         bytes: &[u8],
         attrs: MessageAttrs,
         provenance: MessageProvenance,
         port_context: u64,
         request_identity: Option<MessageIdentity>,
     ) -> Result<StoredMessage, NtStatus> {
+        let MessageCharge {
+            account: account_index,
+            replaced: replaced_charge,
+        } = charge;
         let pool_charge = queued_message_pool_charge(bytes.len(), &attrs)?;
         self.replace_pool_charge(account_index, replaced_charge, pool_charge)?;
 
@@ -2738,16 +2855,28 @@ mod tests {
     #[test]
     fn checked_create_refuses_existing_folded_name_without_transferring_ownership() {
         let mut core = PortCore::new();
-        let first_owner = ClientId { process: 7, thread: 11 };
-        let other_owner = ClientId { process: 8, thread: 12 };
+        let first_owner = ClientId {
+            process: 7,
+            thread: 11,
+        };
+        let other_owner = ClientId {
+            process: 8,
+            thread: 12,
+        };
         let first = core
             .create_port_with_owner_and_limits_checked(
-                &utf16("\\SmApiPort"), PortApi::Alpc, first_owner, PortLimits::default(),
+                &utf16("\\SmApiPort"),
+                PortApi::Alpc,
+                first_owner,
+                PortLimits::default(),
             )
             .unwrap();
         assert_eq!(
             core.create_port_with_owner_and_limits_checked(
-                &utf16("\\smapiport"), PortApi::Alpc, other_owner, PortLimits::default(),
+                &utf16("\\smapiport"),
+                PortApi::Alpc,
+                other_owner,
+                PortLimits::default(),
             ),
             Err(NtStatus::OBJECT_NAME_COLLISION),
         );
@@ -3462,42 +3591,76 @@ mod tests {
         core.set_accept_policy(AcceptPolicy::Manual);
         let name = utf16("\\Windows\\ApiPortAlpcOwners");
         let listen = core.create_port(&name, PortApi::Alpc);
-        let first_client = ClientId { process: 76, thread: 80 };
-        let other_client = ClientId { process: 77, thread: 81 };
+        let first_client = ClientId {
+            process: 76,
+            thread: 80,
+        };
+        let other_client = ClientId {
+            process: 77,
+            thread: 81,
+        };
         let mut servers = Vec::new();
         for client in [first_client, other_client] {
             let ConnectOutcome::Pending { connection_id } = core
                 .connect_with_client_id(&name, PortApi::Alpc, 0, &[], client)
                 .unwrap()
-            else { panic!("manual ALPC connection must pend") };
+            else {
+                panic!("manual ALPC connection must pend")
+            };
             core.receive(listen).unwrap();
             servers.push(core.accept(connection_id, true, 0).unwrap());
             core.complete(connection_id).unwrap();
         }
         let kernel = core.retain_connection_port(listen).unwrap();
-        let first = MessageIdentity { client: first_client, message_id: 2 };
+        let first = MessageIdentity {
+            client: first_client,
+            message_id: 2,
+        };
         core.send_kernel_request_message(kernel, b"first", MessageAttrs::default(), first)
             .unwrap();
-        assert_eq!(core.receive_message(listen).unwrap().unwrap().bytes, b"first");
-        assert_eq!(core.send_reply_message(servers[1], b"wrong", MessageAttrs::default(), first),
-            Err(NtStatus::REPLY_MESSAGE_MISMATCH));
+        assert_eq!(
+            core.receive_message(listen).unwrap().unwrap().bytes,
+            b"first"
+        );
+        assert_eq!(
+            core.send_reply_message(servers[1], b"wrong", MessageAttrs::default(), first),
+            Err(NtStatus::REPLY_MESSAGE_MISMATCH)
+        );
         core.send_reply_message(servers[0], b"first-reply", MessageAttrs::default(), first)
             .unwrap();
-        assert_eq!(core.receive_reply_message(kernel, first).unwrap().unwrap().bytes,
-            b"first-reply");
+        assert_eq!(
+            core.receive_reply_message(kernel, first)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"first-reply"
+        );
 
-        let second = MessageIdentity { client: first_client, message_id: 3 };
+        let second = MessageIdentity {
+            client: first_client,
+            message_id: 3,
+        };
         core.send_kernel_request_message(kernel, b"second", MessageAttrs::default(), second)
             .unwrap();
         assert!(core.receive_message(servers[1]).unwrap().is_none());
         assert!(core.receive_message(listen).unwrap().is_none());
-        assert_eq!(core.receive_message(servers[0]).unwrap().unwrap().bytes, b"second");
-        assert_eq!(core.send_reply_message(servers[1], b"wrong", MessageAttrs::default(), second),
-            Err(NtStatus::REPLY_MESSAGE_MISMATCH));
+        assert_eq!(
+            core.receive_message(servers[0]).unwrap().unwrap().bytes,
+            b"second"
+        );
+        assert_eq!(
+            core.send_reply_message(servers[1], b"wrong", MessageAttrs::default(), second),
+            Err(NtStatus::REPLY_MESSAGE_MISMATCH)
+        );
         core.send_reply_message(servers[0], b"second-reply", MessageAttrs::default(), second)
             .unwrap();
-        assert_eq!(core.receive_reply_message(kernel, second).unwrap().unwrap().bytes,
-            b"second-reply");
+        assert_eq!(
+            core.receive_reply_message(kernel, second)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"second-reply"
+        );
     }
 
     #[test]
@@ -3506,26 +3669,43 @@ mod tests {
         core.set_accept_policy(AcceptPolicy::Manual);
         let name = utf16("\\Windows\\ApiPortAlpcClosed");
         let listen = core.create_port(&name, PortApi::Alpc);
-        let client = ClientId { process: 76, thread: 80 };
+        let client = ClientId {
+            process: 76,
+            thread: 80,
+        };
         let ConnectOutcome::Pending { connection_id } = core
             .connect_with_client_id(&name, PortApi::Alpc, 0, &[], client)
             .unwrap()
-        else { panic!("manual ALPC connection must pend") };
+        else {
+            panic!("manual ALPC connection must pend")
+        };
         core.receive(listen).unwrap();
         let server = core.accept(connection_id, true, 0).unwrap();
         core.complete(connection_id).unwrap();
         let kernel = core.retain_connection_port(listen).unwrap();
-        let first = MessageIdentity { client, message_id: 2 };
+        let first = MessageIdentity {
+            client,
+            message_id: 2,
+        };
         core.send_kernel_request_message(kernel, b"first", MessageAttrs::default(), first)
             .unwrap();
-        assert_eq!(core.receive_message(listen).unwrap().unwrap().bytes, b"first");
-        core.send_reply_message(server, b"reply", MessageAttrs::default(), first).unwrap();
+        assert_eq!(
+            core.receive_message(listen).unwrap().unwrap().bytes,
+            b"first"
+        );
+        core.send_reply_message(server, b"reply", MessageAttrs::default(), first)
+            .unwrap();
         assert!(core.receive_reply_message(kernel, first).unwrap().is_some());
 
         core.close_port(server);
-        let later = MessageIdentity { client, message_id: 3 };
-        assert_eq!(core.send_kernel_request_message(kernel, b"later", MessageAttrs::default(), later),
-            Err(NtStatus::PORT_DISCONNECTED));
+        let later = MessageIdentity {
+            client,
+            message_id: 3,
+        };
+        assert_eq!(
+            core.send_kernel_request_message(kernel, b"later", MessageAttrs::default(), later),
+            Err(NtStatus::PORT_DISCONNECTED)
+        );
         assert!(core.receive_message(listen).unwrap().is_none());
     }
 

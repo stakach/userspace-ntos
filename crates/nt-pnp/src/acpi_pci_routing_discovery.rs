@@ -349,8 +349,7 @@ impl PreparedAcpiPciRoutingTables {
                     link_queries
                         .iter()
                         .position(|query: &AcpiPciInterruptLinkMethodQuery| {
-                            query.endpoint == endpoint
-                                && query.object_path == *object_path
+                            query.endpoint == endpoint && query.object_path == *object_path
                         }) {
                     index
                 } else {

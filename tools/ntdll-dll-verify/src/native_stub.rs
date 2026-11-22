@@ -20,7 +20,7 @@ const UNWIND_BYTES: [u8; 18] = [
 /// Require one exact, non-overlapping RUNTIME_FUNCTION and the matching prologue description.
 /// The caller obtains the exception directory through the PE parser, not a section-name guess.
 pub(super) fn unwind_matches(pdata: &[u8], image: &[u8], export_rva: u32) -> bool {
-    if pdata.is_empty() || pdata.len() % 12 != 0 {
+    if pdata.is_empty() || !pdata.len().is_multiple_of(12) {
         return false;
     }
     let Some(expected_end) = export_rva.checked_add(BODY_BYTES as u32) else {
@@ -28,7 +28,7 @@ pub(super) fn unwind_matches(pdata: &[u8], image: &[u8], export_rva: u32) -> boo
     };
     let mut previous_end = 0;
     let mut found = false;
-    for row in pdata.chunks_exact(12) {
+    for row in pdata.as_chunks::<12>().0 {
         let begin = u32::from_le_bytes(row[..4].try_into().unwrap());
         let end = u32::from_le_bytes(row[4..8].try_into().unwrap());
         let unwind = u32::from_le_bytes(row[8..12].try_into().unwrap());

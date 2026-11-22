@@ -86,9 +86,21 @@ fn owned_layout_resolves_only_file_backed_rva_spans_within_the_file() {
     let raw = u64::from(section.pointer_to_raw_data);
     let raw_size = section.size_of_raw_data as usize;
 
-    assert_eq!(layout.file_span_at_rva(0x1000, raw_size, bytes.len() as u64), Some(raw));
-    assert_eq!(layout.file_span_at_rva(0x1000, raw_size + 1, bytes.len() as u64), None);
+    assert_eq!(
+        layout.file_span_at_rva(0x1000, raw_size, bytes.len() as u64),
+        Some(raw)
+    );
+    assert_eq!(
+        layout.file_span_at_rva(0x1000, raw_size + 1, bytes.len() as u64),
+        None
+    );
     assert_eq!(layout.file_span_at_rva(0x1000, 1, raw), None);
-    assert_eq!(layout.file_span_at_rva(0x1000, 1, bytes.len() as u64), Some(raw));
-    assert_eq!(layout.file_span_at_rva(u32::MAX, 2, bytes.len() as u64), None);
+    assert_eq!(
+        layout.file_span_at_rva(0x1000, 1, bytes.len() as u64),
+        Some(raw)
+    );
+    assert_eq!(
+        layout.file_span_at_rva(u32::MAX, 2, bytes.len() as u64),
+        None
+    );
 }

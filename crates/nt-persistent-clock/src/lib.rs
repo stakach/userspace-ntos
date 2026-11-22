@@ -64,6 +64,7 @@ pub enum ClockError {
     TimeOutOfRange,
 }
 
+#[allow(clippy::result_unit_err)] // Transport-failure contract implemented by ntos-executive.
 pub trait PortIo {
     fn read8(&mut self, capability: u64, port: u16) -> Result<u8, ()>;
     fn write8(&mut self, capability: u64, port: u16, value: u8) -> Result<(), ()>;
@@ -472,7 +473,7 @@ fn encode(value: u8, binary: bool) -> u8 {
     if binary {
         value
     } else {
-        (value / 10) << 4 | value % 10
+        ((value / 10) << 4) | (value % 10)
     }
 }
 
@@ -574,9 +575,7 @@ mod tests {
     fn registry_requires_explicit_replacement_after_active_removal() {
         let mut registry = ClockProviderRegistry::new();
         let first = registry.register(provider(Some(0x32))).unwrap();
-        let mut duplicate = match provider(Some(0x32)) {
-            ProviderDescriptor::PcCmos(value) => value,
-        };
+        let ProviderDescriptor::PcCmos(mut duplicate) = provider(Some(0x32));
         duplicate.year_hint = 2030;
         assert_eq!(
             registry.register(ProviderDescriptor::PcCmos(duplicate)),

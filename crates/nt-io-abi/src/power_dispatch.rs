@@ -1,9 +1,12 @@
 //! Pointer-free POWER dispatch scalars on the driver-peer wire.
 
 use crate::major;
-use nt_power_types::{IRP_MN_QUERY_POWER, IRP_MN_SET_POWER, IRP_MN_WAIT_WAKE,
-    POWER_STATE_TYPE_DEVICE, POWER_STATE_TYPE_SYSTEM};
+use nt_power_types::{
+    IRP_MN_QUERY_POWER, IRP_MN_SET_POWER, IRP_MN_WAIT_WAKE, POWER_STATE_TYPE_DEVICE,
+    POWER_STATE_TYPE_SYSTEM,
+};
 
+#[allow(clippy::too_many_arguments)] // Mirrors the wire scalars; called by nt-io-manager and ntos-executive.
 pub const fn valid_power_dispatch(
     major: u8,
     minor: u8,
@@ -21,10 +24,12 @@ pub const fn valid_power_dispatch(
         return false;
     }
     match minor {
-        IRP_MN_WAIT_WAKE => state_type == POWER_STATE_TYPE_SYSTEM
-            && system_context == 0 && shutdown_type == 0,
-        IRP_MN_SET_POWER | IRP_MN_QUERY_POWER =>
-            state_type == POWER_STATE_TYPE_DEVICE || state_type == POWER_STATE_TYPE_SYSTEM,
+        IRP_MN_WAIT_WAKE => {
+            state_type == POWER_STATE_TYPE_SYSTEM && system_context == 0 && shutdown_type == 0
+        }
+        IRP_MN_SET_POWER | IRP_MN_QUERY_POWER => {
+            state_type == POWER_STATE_TYPE_DEVICE || state_type == POWER_STATE_TYPE_SYSTEM
+        }
         _ => false,
     }
 }
@@ -35,17 +40,105 @@ mod tests {
 
     #[test]
     fn validates_type_without_substituting_provider_state() {
-        assert!(valid_power_dispatch(major::IRP_MJ_POWER, IRP_MN_SET_POWER, 1, 0, 0, 0, 0, 0));
-        assert!(valid_power_dispatch(major::IRP_MJ_POWER, IRP_MN_SET_POWER,
-            POWER_STATE_TYPE_SYSTEM, 1, 0x1234, 5, 0, 0));
-        assert!(valid_power_dispatch(major::IRP_MJ_POWER, IRP_MN_QUERY_POWER,
-            POWER_STATE_TYPE_SYSTEM, 6, 0, 0, 0, 0));
-        assert!(valid_power_dispatch(major::IRP_MJ_POWER, IRP_MN_WAIT_WAKE, 0, u32::MAX, 0, 0, 0, 0));
-        assert!(!valid_power_dispatch(major::IRP_MJ_POWER, IRP_MN_SET_POWER, 2, 1, 0, 0, 0, 0));
-        assert!(!valid_power_dispatch(major::IRP_MJ_POWER, IRP_MN_WAIT_WAKE, 1, 1, 0, 0, 0, 0));
-        assert!(!valid_power_dispatch(major::IRP_MJ_POWER, IRP_MN_WAIT_WAKE, 0, 1, 1, 0, 0, 0));
-        assert!(!valid_power_dispatch(major::IRP_MJ_POWER, IRP_MN_SET_POWER, 1, 1, 0, 0, 1, 0));
-        assert!(!valid_power_dispatch(major::IRP_MJ_PNP, 0, 1, 1, 0, 0, 0, 0));
-        assert!(!valid_power_dispatch(major::IRP_MJ_PNP, 0, 0, 0, 1, 0, 0, 0));
+        assert!(valid_power_dispatch(
+            major::IRP_MJ_POWER,
+            IRP_MN_SET_POWER,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0
+        ));
+        assert!(valid_power_dispatch(
+            major::IRP_MJ_POWER,
+            IRP_MN_SET_POWER,
+            POWER_STATE_TYPE_SYSTEM,
+            1,
+            0x1234,
+            5,
+            0,
+            0
+        ));
+        assert!(valid_power_dispatch(
+            major::IRP_MJ_POWER,
+            IRP_MN_QUERY_POWER,
+            POWER_STATE_TYPE_SYSTEM,
+            6,
+            0,
+            0,
+            0,
+            0
+        ));
+        assert!(valid_power_dispatch(
+            major::IRP_MJ_POWER,
+            IRP_MN_WAIT_WAKE,
+            0,
+            u32::MAX,
+            0,
+            0,
+            0,
+            0
+        ));
+        assert!(!valid_power_dispatch(
+            major::IRP_MJ_POWER,
+            IRP_MN_SET_POWER,
+            2,
+            1,
+            0,
+            0,
+            0,
+            0
+        ));
+        assert!(!valid_power_dispatch(
+            major::IRP_MJ_POWER,
+            IRP_MN_WAIT_WAKE,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0
+        ));
+        assert!(!valid_power_dispatch(
+            major::IRP_MJ_POWER,
+            IRP_MN_WAIT_WAKE,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0
+        ));
+        assert!(!valid_power_dispatch(
+            major::IRP_MJ_POWER,
+            IRP_MN_SET_POWER,
+            1,
+            1,
+            0,
+            0,
+            1,
+            0
+        ));
+        assert!(!valid_power_dispatch(
+            major::IRP_MJ_PNP,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0
+        ));
+        assert!(!valid_power_dispatch(
+            major::IRP_MJ_PNP,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0
+        ));
     }
 }

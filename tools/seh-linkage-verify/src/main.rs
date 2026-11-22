@@ -355,9 +355,15 @@ fn verify_access_violation_entry(
         .checked_add(u64::from(export.rva))
         .ok_or("access-violation entry VA overflow")?;
     let function = match image.lookup_exception_function(pc) {
-        Ok(ExceptionFunction::Function { image_base, function })
-            if image_base == mapped.load_base && function.begin == export.rva => function,
-        other => return Err(format!("access-violation entry lacks exact runtime function: {other:?}")),
+        Ok(ExceptionFunction::Function {
+            image_base,
+            function,
+        }) if image_base == mapped.load_base && function.begin == export.rva => function,
+        other => {
+            return Err(format!(
+                "access-violation entry lacks exact runtime function: {other:?}"
+            ))
+        }
     };
     let header: [u8; 4] = mapped
         .bytes
@@ -395,7 +401,10 @@ fn verify_access_violation_entry(
     {
         return Err("access-violation entry code or unwind metadata invalid".into());
     }
-    println!("{} RVA=0x{:x} unwind=0x{:x}", export.name, export.rva, function.unwind_info);
+    println!(
+        "{} RVA=0x{:x} unwind=0x{:x}",
+        export.name, export.rva, function.unwind_info
+    );
     Ok(())
 }
 
@@ -478,9 +487,15 @@ fn verify_legacy_unwind_entry(
         .checked_add(u64::from(export.rva))
         .ok_or("legacy unwind entry VA overflow")?;
     let function = match image.lookup_exception_function(pc) {
-        Ok(ExceptionFunction::Function { image_base, function })
-            if image_base == mapped.load_base && function.begin == export.rva => function,
-        other => return Err(format!("legacy unwind lacks exact runtime function: {other:?}")),
+        Ok(ExceptionFunction::Function {
+            image_base,
+            function,
+        }) if image_base == mapped.load_base && function.begin == export.rva => function,
+        other => {
+            return Err(format!(
+                "legacy unwind lacks exact runtime function: {other:?}"
+            ))
+        }
     };
     let code = mapped
         .bytes
@@ -498,14 +513,19 @@ fn verify_legacy_unwind_entry(
         .and_then(|bytes| bytes.try_into().ok())
         .map(i32::from_le_bytes)
         .ok_or("legacy unwind call displacement missing")?;
-    let call_end = export.rva.checked_add(31).ok_or("legacy unwind call overflow")?;
+    let call_end = export
+        .rva
+        .checked_add(31)
+        .ok_or("legacy unwind call overflow")?;
     if header.version != 1
         || header.flags != 0
         || header.is_chained()
         || header.size_of_prolog != 7
         || header.frame_register != 0
         || header.count_of_codes != 2
-        || mapped.bytes.get(function.unwind_info as usize + 4..function.unwind_info as usize + 8)
+        || mapped
+            .bytes
+            .get(function.unwind_info as usize + 4..function.unwind_info as usize + 8)
             != Some(LEGACY_UNWIND_CODES.as_slice())
         || code.len() != 33
         || code.get(..26) != Some(LEGACY_UNWIND_PREFIX.as_slice())
@@ -528,7 +548,10 @@ fn verify_legacy_unwind_entry(
     {
         return Err("legacy unwind wrapper or metadata invalid".into());
     }
-    println!("{} RVA=0x{:x} unwind=0x{:x}", export.name, export.rva, function.unwind_info);
+    println!(
+        "{} RVA=0x{:x} unwind=0x{:x}",
+        export.name, export.rva, function.unwind_info
+    );
     Ok(())
 }
 
@@ -566,7 +589,11 @@ fn verify_fault_entry(
             image_base,
             function,
         }) if image_base == mapped.load_base && function.begin == export.rva => function,
-        other => return Err(format!("fault entry lacks exact runtime function: {other:?}")),
+        other => {
+            return Err(format!(
+                "fault entry lacks exact runtime function: {other:?}"
+            ))
+        }
     };
     let header: [u8; 4] = mapped
         .bytes
@@ -779,9 +806,10 @@ fn verify_foreign_call16(
         || header.frame_offset != 0
         || function.end - function.begin != FOREIGN_CALL16_FUNCTION_LEN
         || code.get(..FOREIGN_CALL16_PROLOGUE.len()) != Some(FOREIGN_CALL16_PROLOGUE.as_slice())
-        || mapped.bytes.get(
-            function.unwind_info as usize + 4..function.unwind_info as usize + 8,
-        ) != Some(FOREIGN_CALL16_UNWIND_CODES.as_slice())
+        || mapped
+            .bytes
+            .get(function.unwind_info as usize + 4..function.unwind_info as usize + 8)
+            != Some(FOREIGN_CALL16_UNWIND_CODES.as_slice())
         || digest.as_slice() != FOREIGN_CALL16_CODE_SHA256
         || !pe.sections().iter().any(|section| {
             section.name_str() == ".text"
@@ -1013,6 +1041,25 @@ fn verify(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn main() -> ExitCode {
+    let mut args = env::args().skip(1);
+    let Some(path) = args.next() else {
+        eprintln!("usage: seh-linkage-verify <nt-seh-linkage.dll>");
+        return ExitCode::FAILURE;
+    };
+    if args.next().is_some() {
+        eprintln!("expected exactly one image path");
+        return ExitCode::FAILURE;
+    }
+    match verify(&path) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("SEH linkage verification failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,25 +1238,6 @@ mod tests {
             bytes[offset] ^= 1;
             assert!(!resume_layout_is_exact(&bytes, 0x112a, 0x11de, 0x211c));
             bytes[offset] ^= 1;
-        }
-    }
-}
-
-fn main() -> ExitCode {
-    let mut args = env::args().skip(1);
-    let Some(path) = args.next() else {
-        eprintln!("usage: seh-linkage-verify <nt-seh-linkage.dll>");
-        return ExitCode::FAILURE;
-    };
-    if args.next().is_some() {
-        eprintln!("expected exactly one image path");
-        return ExitCode::FAILURE;
-    }
-    match verify(&path) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("SEH linkage verification failed: {error}");
-            ExitCode::FAILURE
         }
     }
 }

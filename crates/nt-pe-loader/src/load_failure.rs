@@ -11,6 +11,27 @@ pub enum LoadFailure {
     DeviceNotReady,
 }
 
+impl LoadFailure {
+    pub const fn ntstatus(self) -> i32 {
+        (match self {
+            Self::FileMissing => 0xc000_0135u32,
+            Self::InvalidImage => 0xc000_007b,
+            Self::MissingExport => 0xc000_007a,
+            Self::InsufficientResources => 0xc000_009a,
+            Self::NativeFailure => 0xc000_0001,
+            Self::DeviceNotReady => 0xc000_00a3,
+        }) as i32
+    }
+    /// seL4 error 10 is NotEnoughMemory; other acknowledged native failures are not file absence.
+    pub const fn from_native_error(error: u64) -> Self {
+        if error == 10 {
+            Self::InsufficientResources
+        } else {
+            Self::NativeFailure
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,26 +54,5 @@ mod tests {
             LoadFailure::from_native_error(4),
             LoadFailure::NativeFailure
         );
-    }
-}
-
-impl LoadFailure {
-    pub const fn ntstatus(self) -> i32 {
-        (match self {
-            Self::FileMissing => 0xc000_0135u32,
-            Self::InvalidImage => 0xc000_007b,
-            Self::MissingExport => 0xc000_007a,
-            Self::InsufficientResources => 0xc000_009a,
-            Self::NativeFailure => 0xc000_0001,
-            Self::DeviceNotReady => 0xc000_00a3,
-        }) as i32
-    }
-    /// seL4 error 10 is NotEnoughMemory; other acknowledged native failures are not file absence.
-    pub const fn from_native_error(error: u64) -> Self {
-        if error == 10 {
-            Self::InsufficientResources
-        } else {
-            Self::NativeFailure
-        }
     }
 }

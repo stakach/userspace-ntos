@@ -7,8 +7,8 @@
 
 extern crate alloc;
 
-pub mod reginfo;
 pub mod event;
+pub mod reginfo;
 pub mod reply;
 
 use alloc::vec::Vec;
@@ -151,7 +151,8 @@ impl WmiRegistry {
             if identity.generation < entry.identity.generation
                 || (identity.generation == entry.identity.generation && !entry.live)
                 || (identity.generation > entry.identity.generation && entry.live)
-                || entry.pending_reginfo.is_some() && identity.generation != entry.identity.generation
+                || entry.pending_reginfo.is_some()
+                    && identity.generation != entry.identity.generation
             {
                 return Err(STATUS_INVALID_HANDLE);
             }
@@ -198,11 +199,13 @@ impl WmiRegistry {
     /// Resolve a pending ticket without requiring the device to remain live.
     /// The native broker still authenticates the caller's domain separately.
     pub fn pending_reginfo_identity(&self, id: u64) -> Option<WmiDeviceIdentity> {
-        if id == 0 { return None; }
+        if id == 0 {
+            return None;
+        }
         self.device_providers.iter().find_map(|entry| {
-            entry.pending_reginfo.and_then(|pending| {
-                (pending.ticket.id == id).then_some(pending.ticket.identity)
-            })
+            entry
+                .pending_reginfo
+                .and_then(|pending| (pending.ticket.id == id).then_some(pending.ticket.identity))
         })
     }
 
@@ -210,9 +213,13 @@ impl WmiRegistry {
     /// A dispatched ticket stays pending across uncertain effects; retrying
     /// registration while it is pending would replay the driver callback.
     pub fn begin_reginfo(&mut self, identity: WmiDeviceIdentity) -> Result<RegInfoTicket, u32> {
-        let entry = self.device_providers.iter().position(|entry| {
-            entry.live && entry.identity == identity && entry.pending_reginfo.is_none()
-        }).ok_or(STATUS_INVALID_HANDLE)?;
+        let entry = self
+            .device_providers
+            .iter()
+            .position(|entry| {
+                entry.live && entry.identity == identity && entry.pending_reginfo.is_none()
+            })
+            .ok_or(STATUS_INVALID_HANDLE)?;
         let id = self.next_reginfo_ticket_id;
         self.next_reginfo_ticket_id = id.checked_add(1).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let ticket = RegInfoTicket { id, identity };
@@ -263,12 +270,17 @@ impl WmiRegistry {
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let total = entry.reginfo_bytes.len().checked_add(chunk.len())
+        let total = entry
+            .reginfo_bytes
+            .len()
+            .checked_add(chunk.len())
             .ok_or(STATUS_INVALID_PARAMETER)?;
         if total > u32::MAX as usize {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        entry.reginfo_bytes.try_reserve(chunk.len())
+        entry
+            .reginfo_bytes
+            .try_reserve(chunk.len())
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         entry.reginfo_bytes.extend_from_slice(chunk);
         Ok(())
@@ -315,7 +327,9 @@ impl WmiRegistry {
             _ => STATUS_INVALID_PARAMETER,
         })?;
         let mut guids = Vec::new();
-        guids.try_reserve(registrations.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        guids
+            .try_reserve(registrations.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         for registration in registrations {
             if registration.flags & 0x0001_0000 == 0 {
                 guids.push((registration.guid, WMIGUID_NOTIFICATION));
@@ -325,10 +339,13 @@ impl WmiRegistry {
     }
 
     fn reginfo_entry_mut(&mut self, ticket: RegInfoTicket) -> Result<&mut DeviceProvider, u32> {
-        self.device_providers.iter_mut().find(|entry| {
-            entry.identity == ticket.identity
-                && entry.pending_reginfo.map(|pending| pending.ticket) == Some(ticket)
-        }).ok_or(STATUS_INVALID_HANDLE)
+        self.device_providers
+            .iter_mut()
+            .find(|entry| {
+                entry.identity == ticket.identity
+                    && entry.pending_reginfo.map(|pending| pending.ticket) == Some(ticket)
+            })
+            .ok_or(STATUS_INVALID_HANDLE)
     }
 
     /// Publish the GUIDs returned by an authenticated device's REGINFO IRP.
@@ -349,7 +366,8 @@ impl WmiRegistry {
             .try_reserve(guids.len())
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         for &(guid, access) in guids {
-            if access == 0 || access & !VALID_ACCESS != 0
+            if access == 0
+                || access & !VALID_ACCESS != 0
                 || replacement.iter().any(|(existing, _)| *existing == guid)
             {
                 return Err(STATUS_INVALID_PARAMETER);
@@ -363,7 +381,9 @@ impl WmiRegistry {
     /// Deregistration withdraws advertised GUIDs while retaining the device's
     /// stable provider ID until its physical pointer is retired.
     pub fn deregister_device_guids(&mut self, identity: WmiDeviceIdentity) -> Result<(), u32> {
-        let entry = self.device_providers.iter_mut()
+        let entry = self
+            .device_providers
+            .iter_mut()
             .find(|entry| entry.live && entry.identity == identity)
             .ok_or(STATUS_INVALID_HANDLE)?;
         if entry.pending_reginfo.is_some() {

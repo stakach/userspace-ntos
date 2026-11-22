@@ -261,9 +261,15 @@ mod tests {
         let mut by_ordinal: BTreeMap<u16, BTreeSet<String>> = BTreeMap::new();
         for (name, ordinal) in entries {
             by_name.insert(name.to_string(), *ordinal);
-            by_ordinal.entry(*ordinal).or_default().insert(name.to_string());
+            by_ordinal
+                .entry(*ordinal)
+                .or_default()
+                .insert(name.to_string());
         }
-        Exports { by_name, by_ordinal }
+        Exports {
+            by_name,
+            by_ordinal,
+        }
     }
 
     #[test]

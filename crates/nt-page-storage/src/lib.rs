@@ -20,6 +20,12 @@ pub struct PageSequence<T> {
     len: usize,
 }
 
+impl<T> Default for PageSequence<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> PageSequence<T> {
     pub const fn new() -> Self {
         Self {
@@ -30,11 +36,9 @@ impl<T> PageSequence<T> {
     }
 
     pub const fn leaf_capacity() -> usize {
-        let size = core::mem::size_of::<T>();
-        if size == 0 {
-            0
-        } else {
-            PAGE_BYTES / size
+        match PAGE_BYTES.checked_div(core::mem::size_of::<T>()) {
+            Some(capacity) => capacity,
+            None => 0,
         }
     }
 
@@ -86,6 +90,7 @@ impl<T> PageSequence<T> {
     }
 
     /// Metadata-only growth may remain on refusal; no element or logical length is published.
+    #[allow(clippy::result_unit_err)] // A refusal has one cause; callers map it to their status.
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), ()> {
         let end = self.len.checked_add(additional).ok_or(())?;
         if Self::leaf_capacity() == 0 || Self::fanout() < 2 {
@@ -165,6 +170,7 @@ impl<T> PageSequence<T> {
     }
 
     /// Reserve every new slot before generating or publishing any new element.
+    #[allow(clippy::result_unit_err)] // A refusal has one cause; callers map it to their status.
     pub fn try_resize_with(
         &mut self,
         new_len: usize,
@@ -327,6 +333,7 @@ impl<T> ExactSizeIterator for IterMut<'_, T> {}
 
 impl<T: Clone> PageSequence<T> {
     /// Clone logical elements into separately reserved page-bounded backing storage.
+    #[allow(clippy::result_unit_err)] // A refusal has one cause; callers map it to their status.
     pub fn try_clone(&self) -> Result<Self, ()> {
         let mut cloned = Self::new();
         if self.len != 0 {

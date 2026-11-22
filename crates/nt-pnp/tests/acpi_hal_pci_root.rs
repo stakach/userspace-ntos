@@ -15,8 +15,16 @@ fn root(segment: u32, bus: u32, start: u32, end: u32) -> [u8; 152] {
 
 #[test]
 fn validates_pinned_root_layout_and_exact_owner() {
-    let owner = PciRootOwner { domain_id: 7, domain_cookie: 11, vspace: 13 };
-    let other = PciRootOwner { domain_id: 7, domain_cookie: 12, vspace: 13 };
+    let owner = PciRootOwner {
+        domain_id: 7,
+        domain_cookie: 11,
+        vspace: 13,
+    };
+    let other = PciRootOwner {
+        domain_id: 7,
+        domain_cookie: 12,
+        vspace: 13,
+    };
     let parsed = PciRootDescriptor::decode(&root(0, 2, 2, 4)).unwrap();
     let mut ledger = PciRootLedger::new();
     ledger.publish(owner, parsed).unwrap();

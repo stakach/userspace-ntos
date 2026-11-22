@@ -259,17 +259,27 @@ impl<W> GenerationTable<WaitEffectOwner<W>> {
     }
 
     fn next_waiting_after(&self, generation: u64) -> Option<(usize, u64, &W)> {
-        self.slots.iter().enumerate().filter_map(|(slot, entry)| match entry {
-            Slot::Occupied { generation: current, value }
-                if *current > generation && value.phase == WaitEffectPhase::Waiting =>
-                    Some((slot, *current, &value.wait)),
-            _ => None,
-        }).min_by_key(|(_, current, _)| *current)
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, entry)| match entry {
+                Slot::Occupied {
+                    generation: current,
+                    value,
+                } if *current > generation && value.phase == WaitEffectPhase::Waiting => {
+                    Some((slot, *current, &value.wait))
+                }
+                _ => None,
+            })
+            .min_by_key(|(_, current, _)| *current)
     }
 
-    fn begin_effect(&mut self, slot: usize, phase: WaitEffectPhase, status: Option<u32>)
-        -> Result<WaitEffectTicket, TableError>
-    {
+    fn begin_effect(
+        &mut self,
+        slot: usize,
+        phase: WaitEffectPhase,
+        status: Option<u32>,
+    ) -> Result<WaitEffectTicket, TableError> {
         let Some(Slot::Occupied { generation, value }) = self.slots.get_mut(slot) else {
             return Err(TableError::InvalidRequest);
         };
@@ -278,12 +288,18 @@ impl<W> GenerationTable<WaitEffectOwner<W>> {
         }
         value.phase = phase;
         value.status = status;
-        Ok(WaitEffectTicket { slot, generation: *generation })
+        Ok(WaitEffectTicket {
+            slot,
+            generation: *generation,
+        })
     }
 
-    fn finish_effect(&mut self, ticket: WaitEffectTicket, phase: WaitEffectPhase,
-        acknowledged: bool) -> Option<W>
-    {
+    fn finish_effect(
+        &mut self,
+        ticket: WaitEffectTicket,
+        phase: WaitEffectPhase,
+        acknowledged: bool,
+    ) -> Option<W> {
         let Some(Slot::Occupied { generation, value }) = self.slots.get_mut(ticket.slot) else {
             return None;
         };
@@ -294,7 +310,9 @@ impl<W> GenerationTable<WaitEffectOwner<W>> {
             value.phase = match phase {
                 WaitEffectPhase::ReplyEntered => WaitEffectPhase::ReplyIndeterminate,
                 WaitEffectPhase::CancelEntered => WaitEffectPhase::CancelIndeterminate,
-                WaitEffectPhase::ReconcileStopEntered => WaitEffectPhase::ReconcileStopIndeterminate,
+                WaitEffectPhase::ReconcileStopEntered => {
+                    WaitEffectPhase::ReconcileStopIndeterminate
+                }
                 _ => return None,
             };
             return None;
@@ -313,7 +331,10 @@ impl<W> GenerationTable<WaitEffectOwner<W>> {
             return Err(TableError::InvalidRequest);
         }
         value.phase = WaitEffectPhase::ReconcileStopEntered;
-        Ok(WaitEffectTicket { slot, generation: *generation })
+        Ok(WaitEffectTicket {
+            slot,
+            generation: *generation,
+        })
     }
 
     fn take_waiting(&mut self, slot: usize) -> Option<W> {
@@ -372,9 +393,14 @@ impl<C> ReceiveWaitTable<C> {
         if !value.request.is_valid() {
             return Err(TableError::InvalidRequest);
         }
-        self.inner.publish(reservation, WaitEffectOwner {
-            wait: value, phase: WaitEffectPhase::Waiting, status: None,
-        })
+        self.inner.publish(
+            reservation,
+            WaitEffectOwner {
+                wait: value,
+                phase: WaitEffectPhase::Waiting,
+                status: None,
+            },
+        )
     }
 
     pub fn get(&self, slot: usize) -> Option<&PendingReceive<C>> {
@@ -388,7 +414,8 @@ impl<C> ReceiveWaitTable<C> {
     /// Return the next occupied slot in reservation order. This keeps receive polling FIFO even
     /// after a low-numbered slot has been freed and reused by a newer waiter.
     pub fn next_occupied_after(&self, generation: u64) -> Option<(usize, u64, &PendingReceive<C>)> {
-        self.inner.next_occupied_after(generation)
+        self.inner
+            .next_occupied_after(generation)
             .map(|(slot, generation, owner)| (slot, generation, &owner.wait))
     }
 
@@ -396,34 +423,49 @@ impl<C> ReceiveWaitTable<C> {
         self.inner.next_waiting_after(generation)
     }
 
-    pub fn begin_reply(&mut self, slot: usize, status: u32) -> Result<WaitEffectTicket, TableError> {
-        self.inner.begin_effect(slot, WaitEffectPhase::ReplyEntered, Some(status))
+    pub fn begin_reply(
+        &mut self,
+        slot: usize,
+        status: u32,
+    ) -> Result<WaitEffectTicket, TableError> {
+        self.inner
+            .begin_effect(slot, WaitEffectPhase::ReplyEntered, Some(status))
     }
 
-    pub fn finish_reply(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
-        -> Option<PendingReceive<C>>
-    {
-        self.inner.finish_effect(ticket, WaitEffectPhase::ReplyEntered, acknowledged)
+    pub fn finish_reply(
+        &mut self,
+        ticket: WaitEffectTicket,
+        acknowledged: bool,
+    ) -> Option<PendingReceive<C>> {
+        self.inner
+            .finish_effect(ticket, WaitEffectPhase::ReplyEntered, acknowledged)
     }
 
     pub fn begin_cancel(&mut self, slot: usize) -> Result<WaitEffectTicket, TableError> {
-        self.inner.begin_effect(slot, WaitEffectPhase::CancelEntered, None)
+        self.inner
+            .begin_effect(slot, WaitEffectPhase::CancelEntered, None)
     }
 
-    pub fn finish_cancel(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
-        -> Option<PendingReceive<C>>
-    {
-        self.inner.finish_effect(ticket, WaitEffectPhase::CancelEntered, acknowledged)
+    pub fn finish_cancel(
+        &mut self,
+        ticket: WaitEffectTicket,
+        acknowledged: bool,
+    ) -> Option<PendingReceive<C>> {
+        self.inner
+            .finish_effect(ticket, WaitEffectPhase::CancelEntered, acknowledged)
     }
 
     pub fn begin_reconcile_stop(&mut self, slot: usize) -> Result<WaitEffectTicket, TableError> {
         self.inner.begin_reconcile_stop(slot)
     }
 
-    pub fn finish_reconcile_stop(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
-        -> Option<PendingReceive<C>>
-    {
-        self.inner.finish_effect(ticket, WaitEffectPhase::ReconcileStopEntered, acknowledged)
+    pub fn finish_reconcile_stop(
+        &mut self,
+        ticket: WaitEffectTicket,
+        acknowledged: bool,
+    ) -> Option<PendingReceive<C>> {
+        self.inner
+            .finish_effect(ticket, WaitEffectPhase::ReconcileStopEntered, acknowledged)
     }
 
     pub fn take(&mut self, slot: usize) -> Option<PendingReceive<C>> {
@@ -682,9 +724,14 @@ impl<C> RequestWaitTable<C> {
         }) {
             return Err(TableError::InvalidRequest);
         }
-        self.inner.publish(reservation, WaitEffectOwner {
-            wait: value, phase: WaitEffectPhase::Waiting, status: None,
-        })
+        self.inner.publish(
+            reservation,
+            WaitEffectOwner {
+                wait: value,
+                phase: WaitEffectPhase::Waiting,
+                status: None,
+            },
+        )
     }
 
     pub fn get(&self, slot: usize) -> Option<&PendingRequestWait<C>> {
@@ -699,42 +746,61 @@ impl<C> RequestWaitTable<C> {
         &self,
         generation: u64,
     ) -> Option<(usize, u64, &PendingRequestWait<C>)> {
-        self.inner.next_occupied_after(generation)
+        self.inner
+            .next_occupied_after(generation)
             .map(|(slot, generation, owner)| (slot, generation, &owner.wait))
     }
 
-    pub fn next_waiting_after(&self, generation: u64) -> Option<(usize, u64, &PendingRequestWait<C>)> {
+    pub fn next_waiting_after(
+        &self,
+        generation: u64,
+    ) -> Option<(usize, u64, &PendingRequestWait<C>)> {
         self.inner.next_waiting_after(generation)
     }
 
-    pub fn begin_reply(&mut self, slot: usize, status: u32) -> Result<WaitEffectTicket, TableError> {
-        self.inner.begin_effect(slot, WaitEffectPhase::ReplyEntered, Some(status))
+    pub fn begin_reply(
+        &mut self,
+        slot: usize,
+        status: u32,
+    ) -> Result<WaitEffectTicket, TableError> {
+        self.inner
+            .begin_effect(slot, WaitEffectPhase::ReplyEntered, Some(status))
     }
 
-    pub fn finish_reply(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
-        -> Option<PendingRequestWait<C>>
-    {
-        self.inner.finish_effect(ticket, WaitEffectPhase::ReplyEntered, acknowledged)
+    pub fn finish_reply(
+        &mut self,
+        ticket: WaitEffectTicket,
+        acknowledged: bool,
+    ) -> Option<PendingRequestWait<C>> {
+        self.inner
+            .finish_effect(ticket, WaitEffectPhase::ReplyEntered, acknowledged)
     }
 
     pub fn begin_cancel(&mut self, slot: usize) -> Result<WaitEffectTicket, TableError> {
-        self.inner.begin_effect(slot, WaitEffectPhase::CancelEntered, None)
+        self.inner
+            .begin_effect(slot, WaitEffectPhase::CancelEntered, None)
     }
 
-    pub fn finish_cancel(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
-        -> Option<PendingRequestWait<C>>
-    {
-        self.inner.finish_effect(ticket, WaitEffectPhase::CancelEntered, acknowledged)
+    pub fn finish_cancel(
+        &mut self,
+        ticket: WaitEffectTicket,
+        acknowledged: bool,
+    ) -> Option<PendingRequestWait<C>> {
+        self.inner
+            .finish_effect(ticket, WaitEffectPhase::CancelEntered, acknowledged)
     }
 
     pub fn begin_reconcile_stop(&mut self, slot: usize) -> Result<WaitEffectTicket, TableError> {
         self.inner.begin_reconcile_stop(slot)
     }
 
-    pub fn finish_reconcile_stop(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
-        -> Option<PendingRequestWait<C>>
-    {
-        self.inner.finish_effect(ticket, WaitEffectPhase::ReconcileStopEntered, acknowledged)
+    pub fn finish_reconcile_stop(
+        &mut self,
+        ticket: WaitEffectTicket,
+        acknowledged: bool,
+    ) -> Option<PendingRequestWait<C>> {
+        self.inner
+            .finish_effect(ticket, WaitEffectPhase::ReconcileStopEntered, acknowledged)
     }
 
     pub fn take(&mut self, slot: usize) -> Option<PendingRequestWait<C>> {
@@ -1201,20 +1267,35 @@ mod tests {
         let mut table = BrokerRequestWaitTable::with_initial_reserve(1);
         table.reset().unwrap();
         let unpublished = table.reserve().unwrap();
-        assert_eq!(table.release_unpublished(unpublished), ReservationRelease::NoEffect);
+        assert_eq!(
+            table.release_unpublished(unpublished),
+            ReservationRelease::NoEffect
+        );
         // A second release of the same reservation proves nothing.
-        assert_eq!(table.release_unpublished(unpublished), ReservationRelease::Indeterminate);
+        assert_eq!(
+            table.release_unpublished(unpublished),
+            ReservationRelease::Indeterminate
+        );
 
         let published = table.reserve().unwrap();
         table.publish(published, broker_request(9, 3)).unwrap();
-        assert_eq!(table.release_unpublished(published), ReservationRelease::Indeterminate);
+        assert_eq!(
+            table.release_unpublished(published),
+            ReservationRelease::Indeterminate
+        );
         // The published request is untouched: an indeterminate release consumed nothing.
         assert_eq!(table.get(published.slot).unwrap().identity.message_id, 9);
 
         let reused = table.reserve().unwrap();
         assert_ne!(reused, unpublished);
-        assert_eq!(table.release_unpublished(unpublished), ReservationRelease::Indeterminate);
-        assert_eq!(table.release_unpublished(reused), ReservationRelease::NoEffect);
+        assert_eq!(
+            table.release_unpublished(unpublished),
+            ReservationRelease::Indeterminate
+        );
+        assert_eq!(
+            table.release_unpublished(reused),
+            ReservationRelease::NoEffect
+        );
     }
 
     #[test]
@@ -1361,7 +1442,10 @@ mod tests {
         let ticket = table.begin_reply(1, 0).unwrap();
         assert_eq!(table.finish_reply(ticket, true).unwrap().continuation, 2);
         assert!(!table.is_empty());
-        assert_eq!(table.begin_cancel(0).err(), Some(TableError::InvalidRequest));
+        assert_eq!(
+            table.begin_cancel(0).err(),
+            Some(TableError::InvalidRequest)
+        );
     }
 
     #[test]
@@ -1387,10 +1471,19 @@ mod tests {
         table.publish(reservation, receive(7, 1)).unwrap();
         let reply = table.begin_reply(0, 0).unwrap();
         assert!(table.finish_reply(reply, false).is_none());
-        assert_eq!(table.begin_cancel(0).err(), Some(TableError::InvalidRequest));
+        assert_eq!(
+            table.begin_cancel(0).err(),
+            Some(TableError::InvalidRequest)
+        );
         let stop = table.begin_reconcile_stop(0).unwrap();
         assert!(table.begin_reconcile_stop(0).is_err());
-        assert_eq!(table.finish_reconcile_stop(stop, true).unwrap().continuation, 1);
+        assert_eq!(
+            table
+                .finish_reconcile_stop(stop, true)
+                .unwrap()
+                .continuation,
+            1
+        );
         assert!(table.is_empty());
     }
 
@@ -1415,7 +1508,14 @@ mod tests {
         let first = table.reserve().unwrap();
         table.publish(first, request_wait(7, 1)).unwrap();
         let ticket = table.begin_cancel(0).unwrap();
-        assert_eq!(table.finish_cancel(ticket, true).unwrap().request.message_id, 7);
+        assert_eq!(
+            table
+                .finish_cancel(ticket, true)
+                .unwrap()
+                .request
+                .message_id,
+            7
+        );
         assert!(table.is_empty());
         let next = table.reserve().unwrap();
         table.publish(next, request_wait(8, 2)).unwrap();

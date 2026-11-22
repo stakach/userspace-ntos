@@ -663,38 +663,61 @@ fn io_requirement_matches_candidate(
                 && candidate.share == bytes[descriptor + 2])
         }
         (CM_RESOURCE_TYPE_BUS_NUMBER, CmResourceDescriptor::BusNumber(candidate)) => {
-            let length = read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?;
-            let minimum = read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?;
-            let maximum = read_u32(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
+            let length =
+                read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?;
+            let minimum =
+                read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum =
+                read_u32(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
             let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
-            let end = candidate.start.checked_add(candidate.length.saturating_sub(1));
-            Ok(length != 0 && candidate.length == length && candidate.start >= minimum
-                && end.is_some_and(|end| end <= maximum) && candidate.flags == flags
+            let end = candidate
+                .start
+                .checked_add(candidate.length.saturating_sub(1));
+            Ok(length != 0
+                && candidate.length == length
+                && candidate.start >= minimum
+                && end.is_some_and(|end| end <= maximum)
+                && candidate.flags == flags
                 && candidate.share == bytes[descriptor + 2])
         }
         (CM_RESOURCE_TYPE_MEMORY_LARGE, CmResourceDescriptor::MemoryLarge(candidate)) => {
             let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
             let shift = memory_large_shift(flags)
                 .ok_or(IoResourceAssignmentError::UnsupportedDescriptor)?;
-            let length = u64::from(read_u32(bytes, descriptor + 8)
-                .map_err(IoResourceAssignmentError::Malformed)?) << shift;
-            let scaled_alignment = u64::from(read_u32(bytes, descriptor + 12)
-                .map_err(IoResourceAssignmentError::Malformed)?);
-            let alignment = if scaled_alignment == 0 { 1 } else { scaled_alignment << shift };
-            let minimum = read_u64(bytes, descriptor + 16)
-                .map_err(IoResourceAssignmentError::Malformed)?;
-            let maximum = read_u64(bytes, descriptor + 24)
-                .map_err(IoResourceAssignmentError::Malformed)?;
-            Ok(length != 0 && candidate.length == length && candidate.start >= minimum
+            let length = u64::from(
+                read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?,
+            ) << shift;
+            let scaled_alignment = u64::from(
+                read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?,
+            );
+            let alignment = if scaled_alignment == 0 {
+                1
+            } else {
+                scaled_alignment << shift
+            };
+            let minimum =
+                read_u64(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum =
+                read_u64(bytes, descriptor + 24).map_err(IoResourceAssignmentError::Malformed)?;
+            Ok(length != 0
+                && candidate.length == length
+                && candidate.start >= minimum
                 && candidate.start % alignment == 0
-                && candidate.start.checked_add(length - 1)
+                && candidate
+                    .start
+                    .checked_add(length - 1)
                     .is_some_and(|end| end <= maximum)
-                && candidate.flags == flags && candidate.share == bytes[descriptor + 2])
+                && candidate.flags == flags
+                && candidate.share == bytes[descriptor + 2])
         }
-        (CM_RESOURCE_TYPE_MEMORY | CM_RESOURCE_TYPE_PORT | CM_RESOURCE_TYPE_INTERRUPT
-            | CM_RESOURCE_TYPE_BUS_NUMBER | CM_RESOURCE_TYPE_MEMORY_LARGE, _) => {
-            Ok(false)
-        }
+        (
+            CM_RESOURCE_TYPE_MEMORY
+            | CM_RESOURCE_TYPE_PORT
+            | CM_RESOURCE_TYPE_INTERRUPT
+            | CM_RESOURCE_TYPE_BUS_NUMBER
+            | CM_RESOURCE_TYPE_MEMORY_LARGE,
+            _,
+        ) => Ok(false),
         _ => Err(IoResourceAssignmentError::UnsupportedDescriptor),
     }
 }
@@ -732,8 +755,9 @@ fn io_address_requirement_matches(
         && maximum >= minimum
         && candidate_length == length
         && candidate_start >= minimum
-        && candidate_start % alignment as u64 == 0
-        && (candidate_flags == flags || port_window_metadata
+        && candidate_start.is_multiple_of(alignment as u64)
+        && (candidate_flags == flags
+            || port_window_metadata
             || (candidate_flags & marker != 0 && candidate_flags & !marker == flags))
         && candidate_share == bytes[descriptor + 2]
         && end.is_some_and(|end| end <= maximum))
@@ -786,13 +810,19 @@ fn validate_io_requirement_descriptor(
             }
         }
         CM_RESOURCE_TYPE_BUS_NUMBER => {
-            let length = read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?;
-            let minimum = read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?;
-            let maximum = read_u32(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
-            if length == 0 || minimum > maximum
+            let length =
+                read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?;
+            let minimum =
+                read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum =
+                read_u32(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
+            if length == 0
+                || minimum > maximum
                 || u64::from(maximum) - u64::from(minimum) + 1 < u64::from(length)
-                || read_u32(bytes, descriptor + 20).map_err(IoResourceAssignmentError::Malformed)? != 0
-                || read_u64(bytes, descriptor + 24).map_err(IoResourceAssignmentError::Malformed)? != 0
+                || read_u32(bytes, descriptor + 20).map_err(IoResourceAssignmentError::Malformed)?
+                    != 0
+                || read_u64(bytes, descriptor + 24).map_err(IoResourceAssignmentError::Malformed)?
+                    != 0
             {
                 return Err(IoResourceAssignmentError::UnsupportedDescriptor);
             }
@@ -801,17 +831,27 @@ fn validate_io_requirement_descriptor(
             let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
             let shift = memory_large_shift(flags)
                 .ok_or(IoResourceAssignmentError::UnsupportedDescriptor)?;
-            let length = u64::from(read_u32(bytes, descriptor + 8)
-                .map_err(IoResourceAssignmentError::Malformed)?) << shift;
-            let scaled_alignment = u64::from(read_u32(bytes, descriptor + 12)
-                .map_err(IoResourceAssignmentError::Malformed)?);
-            let alignment = if scaled_alignment == 0 { 1 } else { scaled_alignment << shift };
-            let minimum = read_u64(bytes, descriptor + 16)
-                .map_err(IoResourceAssignmentError::Malformed)?;
-            let maximum = read_u64(bytes, descriptor + 24)
-                .map_err(IoResourceAssignmentError::Malformed)?;
-            if length == 0 || maximum < minimum || alignment == 0
-                || maximum.checked_sub(minimum).and_then(|span| span.checked_add(1))
+            let length = u64::from(
+                read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?,
+            ) << shift;
+            let scaled_alignment = u64::from(
+                read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?,
+            );
+            let alignment = if scaled_alignment == 0 {
+                1
+            } else {
+                scaled_alignment << shift
+            };
+            let minimum =
+                read_u64(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum =
+                read_u64(bytes, descriptor + 24).map_err(IoResourceAssignmentError::Malformed)?;
+            if length == 0
+                || maximum < minimum
+                || alignment == 0
+                || maximum
+                    .checked_sub(minimum)
+                    .and_then(|span| span.checked_add(1))
                     .is_none_or(|span| span < length)
             {
                 return Err(IoResourceAssignmentError::UnsupportedDescriptor);
@@ -1100,14 +1140,13 @@ pub fn build_cm_resource_list(
             CmResourceDescriptor::BusNumber(bus) => {
                 bus.length != 0 && bus.start.checked_add(bus.length - 1).is_some()
             }
-            CmResourceDescriptor::MemoryLarge(memory) => {
-                memory_large_shift(memory.flags).is_some_and(|shift| {
+            CmResourceDescriptor::MemoryLarge(memory) => memory_large_shift(memory.flags)
+                .is_some_and(|shift| {
                     memory.length != 0
                         && memory.length & ((1u64 << shift) - 1) == 0
                         && memory.length >> shift <= u64::from(u32::MAX)
                         && memory.start.checked_add(memory.length - 1).is_some()
-                })
-            }
+                }),
         };
         if !valid {
             return Err(CmResourceListError::InvalidDescriptor);

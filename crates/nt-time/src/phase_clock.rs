@@ -34,9 +34,18 @@ mod tests {
     fn consumers_of_one_phase_share_one_reading() {
         let mut reads = 0;
         let mut clock = PhaseClock::new();
-        let first = clock.now(|| { reads += 1; 100 });
-        let second = clock.now(|| { reads += 1; 200 });
-        let third = clock.now(|| { reads += 1; 300 });
+        let first = clock.now(|| {
+            reads += 1;
+            100
+        });
+        let second = clock.now(|| {
+            reads += 1;
+            200
+        });
+        let third = clock.now(|| {
+            reads += 1;
+            300
+        });
         assert_eq!((first, second, third), (100, 100, 100));
         assert_eq!(reads, 1, "back-to-back bookkeeping may cost one clock read");
     }
@@ -53,11 +62,29 @@ mod tests {
     fn ending_a_phase_forces_a_fresh_reading() {
         let mut reads = 0;
         let mut clock = PhaseClock::new();
-        assert_eq!(clock.now(|| { reads += 1; 100 }), 100);
+        assert_eq!(
+            clock.now(|| {
+                reads += 1;
+                100
+            }),
+            100
+        );
         clock.end_phase();
-        assert_eq!(clock.now(|| { reads += 1; 250 }), 250,
-            "a reading taken before a blocking operation must not describe what follows it");
-        assert_eq!(clock.now(|| { reads += 1; 900 }), 250);
+        assert_eq!(
+            clock.now(|| {
+                reads += 1;
+                250
+            }),
+            250,
+            "a reading taken before a blocking operation must not describe what follows it"
+        );
+        assert_eq!(
+            clock.now(|| {
+                reads += 1;
+                900
+            }),
+            250
+        );
         assert_eq!(reads, 2);
     }
 }

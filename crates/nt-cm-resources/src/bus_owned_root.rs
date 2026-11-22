@@ -4,11 +4,10 @@ use super::{
     select_complete_io_resource_assignment, validate_cm_resource_list_extent,
     validate_io_resource_requirements_list_extent, BusNumberDescriptor, CmResourceDescriptor,
     InterruptDescriptor, IoResourceAssignmentError, MemoryDescriptor, MemoryLargeDescriptor,
-    NativeResourceListError,
-    PortDescriptor, CM_RESOURCE_TYPE_BUS_NUMBER, CM_RESOURCE_TYPE_DEVICE_PRIVATE,
-    CM_RESOURCE_TYPE_INTERRUPT, CM_RESOURCE_TYPE_MEMORY, CM_RESOURCE_TYPE_MEMORY_LARGE,
-    CM_RESOURCE_TYPE_PORT,
-    IO_RESOURCE_REQUIREMENTS_FIXED_SIZE, PARTIAL_DESCRIPTOR_SIZE,
+    NativeResourceListError, PortDescriptor, CM_RESOURCE_TYPE_BUS_NUMBER,
+    CM_RESOURCE_TYPE_DEVICE_PRIVATE, CM_RESOURCE_TYPE_INTERRUPT, CM_RESOURCE_TYPE_MEMORY,
+    CM_RESOURCE_TYPE_MEMORY_LARGE, CM_RESOURCE_TYPE_PORT, IO_RESOURCE_REQUIREMENTS_FIXED_SIZE,
+    PARTIAL_DESCRIPTOR_SIZE,
 };
 
 /// Failure to adopt a bus PDO's current assignment. The caller must not invent a replacement.
@@ -39,9 +38,11 @@ pub fn admit_bus_owned_root_resources(
     requirements: &[u8],
     published_bus_number: u32,
 ) -> Result<Vec<u8>, BusOwnedRootResourceError> {
-    if validate_cm_resource_list_extent(raw).map_err(BusOwnedRootResourceError::Malformed)? != raw.len()
+    if validate_cm_resource_list_extent(raw).map_err(BusOwnedRootResourceError::Malformed)?
+        != raw.len()
         || validate_io_resource_requirements_list_extent(requirements)
-            .map_err(BusOwnedRootResourceError::Malformed)? != requirements.len()
+            .map_err(BusOwnedRootResourceError::Malformed)?
+            != requirements.len()
         || u32_at(raw, 0)? != 1
         || u32_at(raw, 8)? != published_bus_number
         || u32_at(requirements, 4)? != u32_at(raw, 4)?
@@ -53,11 +54,13 @@ pub fn admit_bus_owned_root_resources(
     }
     let count = u32_at(raw, 16)? as usize;
     let mut translated = Vec::new();
-    translated.try_reserve_exact(raw.len())
+    translated
+        .try_reserve_exact(raw.len())
         .map_err(|_| BusOwnedRootResourceError::OutOfMemory)?;
     translated.extend_from_slice(raw);
     let mut candidates = Vec::new();
-    candidates.try_reserve_exact(count)
+    candidates
+        .try_reserve_exact(count)
         .map_err(|_| BusOwnedRootResourceError::OutOfMemory)?;
     let mut bus_count = 0usize;
     let mut previous_address = None;
@@ -70,14 +73,19 @@ pub fn admit_bus_owned_root_resources(
             CM_RESOURCE_TYPE_BUS_NUMBER => {
                 let start = u32_at(raw, offset + 4)?;
                 let length = u32_at(raw, offset + 8)?;
-                if length == 0 || !start.checked_add(length)
-                    .is_some_and(|end| (start..end).contains(&published_bus_number))
+                if length == 0
+                    || !start
+                        .checked_add(length)
+                        .is_some_and(|end| (start..end).contains(&published_bus_number))
                 {
                     return Err(BusOwnedRootResourceError::UnsupportedDescriptor);
                 }
                 bus_count += 1;
                 candidates.push(CmResourceDescriptor::BusNumber(BusNumberDescriptor {
-                    start, length, flags, share,
+                    start,
+                    length,
+                    flags,
+                    share,
                 }));
                 previous_address = None;
             }
@@ -89,11 +97,17 @@ pub fn admit_bus_owned_root_resources(
                 }
                 if resource_type == CM_RESOURCE_TYPE_MEMORY {
                     candidates.push(CmResourceDescriptor::Memory(MemoryDescriptor {
-                        start, length, flags, share,
+                        start,
+                        length,
+                        flags,
+                        share,
                     }));
                 } else {
                     candidates.push(CmResourceDescriptor::Port(PortDescriptor {
-                        start, length, flags, share,
+                        start,
+                        length,
+                        flags,
+                        share,
                     }));
                 }
                 previous_address = Some((offset, resource_type, u64::from(length)));
@@ -107,7 +121,10 @@ pub fn admit_bus_owned_root_resources(
                     return Err(BusOwnedRootResourceError::UnsupportedDescriptor);
                 }
                 candidates.push(CmResourceDescriptor::MemoryLarge(MemoryLargeDescriptor {
-                    start, length, flags, share,
+                    start,
+                    length,
+                    flags,
+                    share,
                 }));
                 previous_address = Some((offset, resource_type, length));
             }
@@ -115,7 +132,9 @@ pub fn admit_bus_owned_root_resources(
                 candidates.push(CmResourceDescriptor::Interrupt(InterruptDescriptor {
                     level: u32_at(raw, offset + 4)?,
                     vector: u32_at(raw, offset + 8)?,
-                    affinity: u64_at(raw, offset + 12)?, flags, share,
+                    affinity: u64_at(raw, offset + 12)?,
+                    flags,
+                    share,
                 }));
                 previous_address = None;
             }
@@ -156,7 +175,9 @@ pub fn admit_bus_owned_root_resources(
         Ok(Some(_)) => Ok(translated),
         Ok(None) => Err(BusOwnedRootResourceError::UnsatisfiedRequirements),
         Err(IoResourceAssignmentError::OutOfMemory) => Err(BusOwnedRootResourceError::OutOfMemory),
-        Err(IoResourceAssignmentError::Malformed(error)) => Err(BusOwnedRootResourceError::Malformed(error)),
+        Err(IoResourceAssignmentError::Malformed(error)) => {
+            Err(BusOwnedRootResourceError::Malformed(error))
+        }
         Err(_) => Err(BusOwnedRootResourceError::UnsupportedDescriptor),
     }
 }
@@ -218,7 +239,10 @@ mod tests {
     fn root_assignment_preserves_provider_raw_and_translates_parent_window() {
         let (raw, req) = provider_pair();
         let translated = admit_bus_owned_root_resources(&raw, &req, 0).unwrap();
-        assert_eq!(u64::from_le_bytes(translated[44..52].try_into().unwrap()), 0x3000);
+        assert_eq!(
+            u64::from_le_bytes(translated[44..52].try_into().unwrap()),
+            0x3000
+        );
         assert_eq!(u64::from_le_bytes(raw[44..52].try_into().unwrap()), 0x2000);
         assert_eq!(&translated[60..], &raw[60..]);
     }
@@ -247,7 +271,10 @@ mod tests {
         let fixture = include_str!("libernt_pci_root_resources.hex");
         let mut lines = fixture.lines();
         let decode = |hex: &str| -> Vec<u8> {
-            hex.as_bytes().chunks_exact(2)
+            hex.as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
                 .collect()
         };

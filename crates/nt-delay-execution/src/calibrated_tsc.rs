@@ -39,21 +39,31 @@ impl CalibratedTscEpoch {
         if frequency_hz == 0 {
             return Err(TscClockError::Uncalibrated);
         }
-        Ok(Self { frequency_hz, epoch_tsc, epoch_time_100ns })
+        Ok(Self {
+            frequency_hz,
+            epoch_tsc,
+            epoch_time_100ns,
+        })
     }
 
-    pub const fn frequency_hz(self) -> u64 { self.frequency_hz }
-    pub const fn epoch_tsc(self) -> u64 { self.epoch_tsc }
-    pub const fn epoch_time_100ns(self) -> u64 { self.epoch_time_100ns }
+    pub const fn frequency_hz(self) -> u64 {
+        self.frequency_hz
+    }
+    pub const fn epoch_tsc(self) -> u64 {
+        self.epoch_tsc
+    }
+    pub const fn epoch_time_100ns(self) -> u64 {
+        self.epoch_time_100ns
+    }
 
     /// Round fractional cycles down, as a clock read cannot report a future time.
     /// Both multiplication and epoch addition are checked; overflow never saturates into
     /// a plausible-looking timestamp.
     pub fn time_100ns(self, tsc_now: u64) -> Result<u64, TscClockError> {
-        let cycles = tsc_now.checked_sub(self.epoch_tsc)
+        let cycles = tsc_now
+            .checked_sub(self.epoch_tsc)
             .ok_or(TscClockError::CounterRegressed)?;
-        let elapsed = (u128::from(cycles) * HUNDRED_NS_PER_SECOND)
-            / u128::from(self.frequency_hz);
+        let elapsed = (u128::from(cycles) * HUNDRED_NS_PER_SECOND) / u128::from(self.frequency_hz);
         let total = u128::from(self.epoch_time_100ns) + elapsed;
         u64::try_from(total).map_err(|_| TscClockError::TimeOverflow)
     }

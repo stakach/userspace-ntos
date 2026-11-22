@@ -20,7 +20,7 @@ impl HpetReadOnlyAlias {
             || frame_base == 0
             || hpet != grant
             || hpet.length != HPET_REGISTER_BLOCK_LEN
-            || hpet.start % ACPI_PAGE_SIZE != 0
+            || !hpet.start.is_multiple_of(ACPI_PAGE_SIZE)
             || hpet.start.checked_add(hpet.length).is_none()
         {
             return None;
@@ -30,21 +30,27 @@ impl HpetReadOnlyAlias {
             .then_some(Self { frame_base, pages })
     }
 
-    pub const fn frame_base(self) -> u64 { self.frame_base }
-    pub const fn pages(self) -> u64 { self.pages }
+    pub const fn frame_base(self) -> u64 {
+        self.frame_base
+    }
+    pub const fn pages(self) -> u64 {
+        self.pages
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const HPET: PhysicalRange = PhysicalRange { start: 0xfed0_0000, length: 1024 };
+    const HPET: PhysicalRange = PhysicalRange {
+        start: 0xfed0_0000,
+        length: 1024,
+    };
 
     #[test]
     fn exact_read_only_firmware_frame_is_projectable() {
-        let alias = HpetReadOnlyAlias::for_firmware_range(
-            HPET, HPET, 500, 1, false,
-        ).expect("retained read-only HPET frame");
+        let alias = HpetReadOnlyAlias::for_firmware_range(HPET, HPET, 500, 1, false)
+            .expect("retained read-only HPET frame");
         assert_eq!(alias.frame_base(), 500);
         assert_eq!(alias.pages(), 1);
     }
@@ -57,13 +63,29 @@ mod tests {
         assert!(HpetReadOnlyAlias::for_firmware_range(HPET, HPET, 500, 2, false).is_none());
         assert!(HpetReadOnlyAlias::for_firmware_range(HPET, HPET, u64::MAX, 1, false).is_none());
         assert!(HpetReadOnlyAlias::for_firmware_range(
-            HPET, PhysicalRange { start: HPET.start + ACPI_PAGE_SIZE, length: HPET.length },
-            500, 1, false,
-        ).is_none());
+            HPET,
+            PhysicalRange {
+                start: HPET.start + ACPI_PAGE_SIZE,
+                length: HPET.length
+            },
+            500,
+            1,
+            false,
+        )
+        .is_none());
         assert!(HpetReadOnlyAlias::for_firmware_range(
-            PhysicalRange { start: HPET.start + 1, length: HPET.length },
-            PhysicalRange { start: HPET.start + 1, length: HPET.length },
-            500, 1, false,
-        ).is_none());
+            PhysicalRange {
+                start: HPET.start + 1,
+                length: HPET.length
+            },
+            PhysicalRange {
+                start: HPET.start + 1,
+                length: HPET.length
+            },
+            500,
+            1,
+            false,
+        )
+        .is_none());
     }
 }

@@ -22,10 +22,10 @@ pub use aml_static_resources::{
 };
 pub use eval::{
     eval_method_input, eval_method_input_ex, eval_output_overflow_retry_len,
-    eval_output_required_len,
-    parse_extended_integer_evaluation, parse_integer_evaluation, AcpiEvalError,
-    ACPI_EVAL_EXTENDED_INTEGER_LEN, ACPI_EVAL_INPUT_BUFFER_EX_LEN, ACPI_EVAL_INPUT_BUFFER_LEN,
-    ACPI_EVAL_OUTPUT_PROBE_LEN, IOCTL_ACPI_EVAL_METHOD, IOCTL_ACPI_EVAL_METHOD_EX,
+    eval_output_required_len, parse_extended_integer_evaluation, parse_integer_evaluation,
+    AcpiEvalError, ACPI_EVAL_EXTENDED_INTEGER_LEN, ACPI_EVAL_INPUT_BUFFER_EX_LEN,
+    ACPI_EVAL_INPUT_BUFFER_LEN, ACPI_EVAL_OUTPUT_PROBE_LEN, IOCTL_ACPI_EVAL_METHOD,
+    IOCTL_ACPI_EVAL_METHOD_EX,
 };
 pub use hpet_projection::HpetReadOnlyAlias;
 pub use madt::{
@@ -35,21 +35,18 @@ pub use madt::{
 };
 pub use namespace::{
     immediate_namespace_children_input, multilevel_namespace_filter_input,
-    namespace_children_absent,
-    namespace_children_probe_retry_len,
-    namespace_children_required_len,
+    namespace_children_absent, namespace_children_probe_retry_len, namespace_children_required_len,
     parse_namespace_children, parse_namespace_matches, resolve_namespace_reference,
     AcpiNamespaceChild, AcpiNamespaceChildren, AcpiNamespaceError, AcpiNamespaceMatches,
     AcpiNamespacePath, ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN, ACPI_ENUM_CHILDREN_INPUT_LEN,
-    ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN,
-    IOCTL_ACPI_ENUM_CHILDREN,
+    ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN, IOCTL_ACPI_ENUM_CHILDREN,
 };
 pub use pci_routing::{
-    parse_interrupt_resource_template, parse_pci_routing_table, resolve_legacy_irq,
-    reconcile_reported_interrupt, resolve_interrupt_resource, resolve_pci_routing_table,
-    InterruptResource, InterruptSource, LegacyIrqOverride, PciInterruptLink, PciRouteSource,
-    PciRoutingEntry, PciRoutingError, PciRoutingTable, ReportedInterruptError,
-    ReportedInterruptResource, ResolvedInterruptResource, ResolvedPciRoute,
+    parse_interrupt_resource_template, parse_pci_routing_table, reconcile_reported_interrupt,
+    resolve_interrupt_resource, resolve_legacy_irq, resolve_pci_routing_table, InterruptResource,
+    InterruptSource, LegacyIrqOverride, PciInterruptLink, PciRouteSource, PciRoutingEntry,
+    PciRoutingError, PciRoutingTable, ReportedInterruptError, ReportedInterruptResource,
+    ResolvedInterruptResource, ResolvedPciRoute,
 };
 
 pub const SDT_HEADER_LEN: usize = 36;
@@ -137,7 +134,7 @@ impl AcpiRootTable {
             _ => return Err(AcpiError::InvalidSignature),
         };
         let payload_len = header.length as usize - SDT_HEADER_LEN;
-        if payload_len % entry_width != 0 {
+        if !payload_len.is_multiple_of(entry_width) {
             return Err(AcpiError::InvalidRootEntryWidth);
         }
         let count = payload_len / entry_width;
@@ -461,8 +458,12 @@ fn append_unambiguous_static_io(
     fresh: Vec<StaticIoResource>,
 ) -> bool {
     for (index, candidate) in fresh.iter().enumerate() {
-        if retained.iter().any(|prior| static_io_overlaps(prior, candidate))
-            || fresh[..index].iter().any(|prior| static_io_overlaps(prior, candidate))
+        if retained
+            .iter()
+            .any(|prior| static_io_overlaps(prior, candidate))
+            || fresh[..index]
+                .iter()
+                .any(|prior| static_io_overlaps(prior, candidate))
         {
             retained.clear();
             return false;
@@ -1407,8 +1408,12 @@ mod tests {
             (DSDT, dsdt),
         ]);
         let resources = discover_platform_resources(
-            &mut memory, ROOT, xsdt.len() as u32, DiscoveryLimits::default(),
-        ).unwrap();
+            &mut memory,
+            ROOT,
+            xsdt.len() as u32,
+            DiscoveryLimits::default(),
+        )
+        .unwrap();
         assert!(resources.static_io.iter().any(|resource| {
             resource.hardware_id == "PNP0A06"
                 && resource.namespace_path == "\\_SB_.PCI0.PRES"

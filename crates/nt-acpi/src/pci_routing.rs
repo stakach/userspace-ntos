@@ -215,7 +215,11 @@ pub fn resolve_legacy_irq(
         .filter(|irq| *irq < 16)
         .ok_or(PciRoutingError::InvalidRoutingEntry)?;
     let route = overrides.iter().find(|route| route.irq == irq);
-    if route.and_then(|route| route.level_sensitive).unwrap_or(false) != level_sensitive {
+    if route
+        .and_then(|route| route.level_sensitive)
+        .unwrap_or(false)
+        != level_sensitive
+    {
         return Err(PciRoutingError::ConflictingLegacyIrqOverride);
     }
     Ok((
@@ -272,15 +276,18 @@ mod legacy_irq_tests {
     #[test]
     fn child_crs_legacy_irq4_keeps_level_low_shared_authority_without_madt_override() {
         // Small IRQ descriptor: mask IRQ4, level triggered, active low, shared.
-        let resources = parse_interrupt_resource_template(&crs(&[0x23, 0x10, 0, 0x18, 0x79, 0]))
-            .unwrap();
-        assert_eq!(resources, [InterruptResource {
-            descriptor_index: 0,
-            interrupt: InterruptSource::LegacyIrq(4),
-            level_sensitive: true,
-            active_low: true,
-            shared: true,
-        }]);
+        let resources =
+            parse_interrupt_resource_template(&crs(&[0x23, 0x10, 0, 0x18, 0x79, 0])).unwrap();
+        assert_eq!(
+            resources,
+            [InterruptResource {
+                descriptor_index: 0,
+                interrupt: InterruptSource::LegacyIrq(4),
+                level_sensitive: true,
+                active_low: true,
+                shared: true,
+            }]
+        );
         assert_eq!(
             resolve_interrupt_resource(resources[0], &[]),
             Ok(ResolvedInterruptResource {
@@ -299,7 +306,10 @@ mod legacy_irq_tests {
             0x89, 0x06, 0, 0x09, 0x01, 4, 0, 0, 0, 0x79, 0,
         ]))
         .unwrap();
-        assert_eq!(resources[0].interrupt, InterruptSource::GlobalSystemInterrupt(4));
+        assert_eq!(
+            resources[0].interrupt,
+            InterruptSource::GlobalSystemInterrupt(4)
+        );
         assert_eq!(
             resolve_interrupt_resource(resources[0], &[]),
             Ok(ResolvedInterruptResource {
@@ -313,15 +323,18 @@ mod legacy_irq_tests {
 
     #[test]
     fn child_crs_legacy_irq_rejects_conflicting_madt_override() {
-        let resource = parse_interrupt_resource_template(&crs(&[0x23, 0x10, 0, 0x18, 0x79, 0]))
-            .unwrap()[0];
+        let resource =
+            parse_interrupt_resource_template(&crs(&[0x23, 0x10, 0, 0x18, 0x79, 0])).unwrap()[0];
         assert_eq!(
-            resolve_interrupt_resource(resource, &[LegacyIrqOverride {
-                irq: 4,
-                gsi: 20,
-                level_sensitive: Some(true),
-                active_low: Some(true),
-            }]),
+            resolve_interrupt_resource(
+                resource,
+                &[LegacyIrqOverride {
+                    irq: 4,
+                    gsi: 20,
+                    level_sensitive: Some(true),
+                    active_low: Some(true),
+                }]
+            ),
             Ok(ResolvedInterruptResource {
                 gsi: 20,
                 level_sensitive: true,
@@ -330,12 +343,15 @@ mod legacy_irq_tests {
             })
         );
         assert_eq!(
-            resolve_interrupt_resource(resource, &[LegacyIrqOverride {
-                irq: 4,
-                gsi: 20,
-                level_sensitive: Some(false),
-                active_low: Some(false),
-            }]),
+            resolve_interrupt_resource(
+                resource,
+                &[LegacyIrqOverride {
+                    irq: 4,
+                    gsi: 20,
+                    level_sensitive: Some(false),
+                    active_low: Some(false),
+                }]
+            ),
             Err(PciRoutingError::ConflictingLegacyIrqOverride)
         );
     }

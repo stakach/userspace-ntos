@@ -49,9 +49,7 @@ pub fn decode_request(bytes: &[u8], max_message: usize) -> Result<RequestReply, 
     if total_len > max_message {
         return Err(RequestError::MessageTooLong);
     }
-    let message = bytes
-        .get(..total_len)
-        .ok_or(RequestError::InvalidMessage)?;
+    let message = bytes.get(..total_len).ok_or(RequestError::InvalidMessage)?;
     let api_number = u32::from_le_bytes(
         message
             .get(API_OFFSET..API_OFFSET + 4)
@@ -109,57 +107,97 @@ mod tests {
     #[test]
     fn decodes_all_three_commands_at_their_native_offsets() {
         let audit = request(RM_AUDIT_SET_COMMAND, &[]);
-        assert_eq!(decode_request(&audit[..44], 64), Ok(RequestReply {
-            api_number: 1, result_status: 0, luid: None,
-        }));
+        assert_eq!(
+            decode_request(&audit[..44], 64),
+            Ok(RequestReply {
+                api_number: 1,
+                result_status: 0,
+                luid: None,
+            })
+        );
         let luid = 0x1122_3344_5566_7788u64;
         for api in [RM_CREATE_LOGON_SESSION, RM_DELETE_LOGON_SESSION] {
             let message = request(api, &luid.to_le_bytes());
-            assert_eq!(decode_request(&message[..52], 64), Ok(RequestReply {
-                api_number: api, result_status: 0, luid: Some(luid),
-            }));
+            assert_eq!(
+                decode_request(&message[..52], 64),
+                Ok(RequestReply {
+                    api_number: api,
+                    result_status: 0,
+                    luid: Some(luid),
+                })
+            );
         }
     }
 
     #[test]
     fn missing_luid_and_unknown_api_receive_invalid_parameter() {
         let short_luid = request(RM_CREATE_LOGON_SESSION, &[1, 2, 3, 4]);
-        assert_eq!(decode_request(&short_luid[..48], 64).unwrap().result_status,
-                   STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            decode_request(&short_luid[..48], 64).unwrap().result_status,
+            STATUS_INVALID_PARAMETER
+        );
         let unknown = request(99, &[]);
-        assert_eq!(decode_request(&unknown[..44], 64).unwrap().result_status,
-                   STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            decode_request(&unknown[..44], 64).unwrap().result_status,
+            STATUS_INVALID_PARAMETER
+        );
     }
 
     #[test]
     fn rejects_invalid_lpc_lengths_and_incomplete_captures() {
         let message = request(RM_AUDIT_SET_COMMAND, &[]);
-        assert_eq!(decode_request(&message[..3], 64), Err(RequestError::InvalidMessage));
-        assert_eq!(decode_request(&message[..43], 64), Err(RequestError::InvalidMessage));
-        assert_eq!(decode_request(&message[..44], 43), Err(RequestError::MessageTooLong));
+        assert_eq!(
+            decode_request(&message[..3], 64),
+            Err(RequestError::InvalidMessage)
+        );
+        assert_eq!(
+            decode_request(&message[..43], 64),
+            Err(RequestError::InvalidMessage)
+        );
+        assert_eq!(
+            decode_request(&message[..44], 43),
+            Err(RequestError::MessageTooLong)
+        );
         let mut short_total = message;
         short_total[2..4].copy_from_slice(&43u16.to_le_bytes());
         short_total[0..2].copy_from_slice(&3u16.to_le_bytes());
-        assert_eq!(decode_request(&short_total, 64), Err(RequestError::InvalidMessage));
+        assert_eq!(
+            decode_request(&short_total, 64),
+            Err(RequestError::InvalidMessage)
+        );
         let mut short_header = message;
         short_header[2..4].copy_from_slice(&39u16.to_le_bytes());
-        assert_eq!(decode_request(&short_header, 64), Err(RequestError::InvalidMessage));
+        assert_eq!(
+            decode_request(&short_header, 64),
+            Err(RequestError::InvalidMessage)
+        );
         let mut data_overflow = message;
         data_overflow[0..2].copy_from_slice(&5u16.to_le_bytes());
-        assert_eq!(decode_request(&data_overflow, 64), Err(RequestError::InvalidMessage));
+        assert_eq!(
+            decode_request(&data_overflow, 64),
+            Err(RequestError::InvalidMessage)
+        );
     }
 
     #[test]
     fn reply_patches_only_type_and_result() {
         let mut reply = [0xa5u8; REPLY_FIELDS_END];
-        let result = RequestReply { api_number: 99, result_status: STATUS_INVALID_PARAMETER,
-                                    luid: None };
+        let result = RequestReply {
+            api_number: 99,
+            result_status: STATUS_INVALID_PARAMETER,
+            luid: None,
+        };
         write_reply_fields(&mut reply, result).unwrap();
         assert_eq!(&reply[4..6], &msg_type::LPC_REPLY.to_le_bytes());
-        assert_eq!(&reply[RESULT_OFFSET..REPLY_FIELDS_END],
-                   &STATUS_INVALID_PARAMETER.to_le_bytes());
+        assert_eq!(
+            &reply[RESULT_OFFSET..REPLY_FIELDS_END],
+            &STATUS_INVALID_PARAMETER.to_le_bytes()
+        );
         assert!(reply[..4].iter().all(|byte| *byte == 0xa5));
         assert!(reply[6..RESULT_OFFSET].iter().all(|byte| *byte == 0xa5));
-        assert_eq!(write_reply_fields(&mut reply[..47], result), Err(RequestError::InvalidMessage));
+        assert_eq!(
+            write_reply_fields(&mut reply[..47], result),
+            Err(RequestError::InvalidMessage)
+        );
     }
 }

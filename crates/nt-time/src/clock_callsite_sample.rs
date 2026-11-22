@@ -75,7 +75,10 @@ impl<const SLOTS: usize> ClockCallsiteSampler<SLOTS> {
             let existing = slot.location.load(Ordering::Acquire);
             if existing.is_null() {
                 match slot.location.compare_exchange(
-                    ptr::null_mut(), wanted, Ordering::AcqRel, Ordering::Acquire,
+                    ptr::null_mut(),
+                    wanted,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 ) {
                     Ok(_) => {
                         slot.samples.fetch_add(1, Ordering::Relaxed);
@@ -130,7 +133,9 @@ impl<const SLOTS: usize> ClockCallsiteSampler<SLOTS> {
 }
 
 impl<const SLOTS: usize> Default for ClockCallsiteSampler<SLOTS> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn same_location(pointer: *mut Location<'static>, location: &'static Location<'static>) -> bool {
@@ -158,26 +163,44 @@ mod tests {
     #[test]
     fn samples_exact_static_callers_and_sorts_top_counts() {
         let counter = ClockCallsiteSampler::<4>::new();
-        for _ in 0..4096 { wrapped_clock(&counter); }
-        for _ in 0..2048 { wrapped_clock(&counter); }
+        for _ in 0..4096 {
+            wrapped_clock(&counter);
+        }
+        for _ in 0..2048 {
+            wrapped_clock(&counter);
+        }
         let snapshot = counter.snapshot::<3>();
-        assert_eq!((snapshot.calls, snapshot.sampled, snapshot.overflow), (6144, 6, 0));
+        assert_eq!(
+            (snapshot.calls, snapshot.sampled, snapshot.overflow),
+            (6144, 6, 0)
+        );
         assert_eq!(snapshot.top[0].unwrap().samples, 4);
         assert_eq!(snapshot.top[1].unwrap().samples, 2);
         assert_eq!(snapshot.top[2].map(|sample| sample.samples), None);
-        assert!(snapshot.top[0].unwrap().location.file().ends_with("clock_callsite_sample.rs"));
-        assert_ne!(snapshot.top[0].unwrap().location.line(),
-            snapshot.top[1].unwrap().location.line());
+        assert!(snapshot.top[0]
+            .unwrap()
+            .location
+            .file()
+            .ends_with("clock_callsite_sample.rs"));
+        assert_ne!(
+            snapshot.top[0].unwrap().location.line(),
+            snapshot.top[1].unwrap().location.line()
+        );
     }
 
     #[test]
     fn full_table_counts_overflow_without_relabeling_an_existing_caller() {
         let counter = ClockCallsiteSampler::<1>::new();
         wrapped_clock(&counter);
-        for _ in 0..1023 { wrapped_clock(&counter); }
+        for _ in 0..1023 {
+            wrapped_clock(&counter);
+        }
         wrapped_clock(&counter);
         let snapshot = counter.snapshot::<2>();
-        assert_eq!((snapshot.calls, snapshot.sampled, snapshot.overflow), (1025, 2, 1));
+        assert_eq!(
+            (snapshot.calls, snapshot.sampled, snapshot.overflow),
+            (1025, 2, 1)
+        );
         assert_eq!(snapshot.top[0].unwrap().samples, 1);
         assert!(snapshot.top[1].is_none());
     }
@@ -189,7 +212,9 @@ mod tests {
             for _ in 0..4 {
                 let counter = Arc::clone(&counter);
                 scope.spawn(move || {
-                    for _ in 0..4096 { wrapped_clock(&counter); }
+                    for _ in 0..4096 {
+                        wrapped_clock(&counter);
+                    }
                 });
             }
         });
@@ -197,6 +222,14 @@ mod tests {
         assert_eq!(snapshot.calls, 16_384);
         assert_eq!(snapshot.sampled, 16);
         assert_eq!(snapshot.overflow, 0);
-        assert_eq!(snapshot.top.iter().flatten().map(|sample| sample.samples).sum::<u64>(), 16);
+        assert_eq!(
+            snapshot
+                .top
+                .iter()
+                .flatten()
+                .map(|sample| sample.samples)
+                .sum::<u64>(),
+            16
+        );
     }
 }

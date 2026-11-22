@@ -3,14 +3,14 @@
 mod wake_deadline;
 pub use wake_deadline::{earliest_deadline, first_due};
 mod clock_callsite_sample;
-pub use clock_callsite_sample::{
-    ClockCallsiteSample, ClockCallsiteSampler, ClockCallsiteSnapshot,
-};
+pub use clock_callsite_sample::{ClockCallsiteSample, ClockCallsiteSampler, ClockCallsiteSnapshot};
 mod delivery_gate;
 pub use delivery_gate::{DeferredTimerProgress, TimerDeliveryGate, TimerDeliveryGuard};
 mod deferred_work;
-pub use deferred_work::{CoalescedRetryWake, DeferredWorkWake, RetainedWakeLatency,
-    RetryWakeAttempt, WakeLatencySample, WakeLatencySnapshot};
+pub use deferred_work::{
+    CoalescedRetryWake, DeferredWorkWake, RetainedWakeLatency, RetryWakeAttempt, WakeLatencySample,
+    WakeLatencySnapshot,
+};
 mod rearm_request;
 pub use rearm_request::{DeferredRearm, RearmRequest};
 mod phase_clock;
@@ -239,17 +239,16 @@ fn civil_from_days(days: i64) -> (i32, u8, u8) {
 ///
 /// Relative deadlines remain tied to monotonic time. Absolute deadlines remain
 /// tied to system time and are projected again whenever the system clock moves.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Deadline {
+    #[default]
     Infinite,
-    Relative { monotonic_100ns: u64 },
-    Absolute { system_time_100ns: u64 },
-}
-
-impl Default for Deadline {
-    fn default() -> Self {
-        Self::Infinite
-    }
+    Relative {
+        monotonic_100ns: u64,
+    },
+    Absolute {
+        system_time_100ns: u64,
+    },
 }
 
 impl Deadline {

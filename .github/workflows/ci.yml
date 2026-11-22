@@ -53,6 +53,12 @@ jobs:
       - name: Executive layout static rule
         run: scripts/check_executive_layout_statics.sh
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Scoped formatting and clippy gate
+        run: |
+          python3 -m unittest scripts/tests/test_ci_scoped_lints.py
+          python3 scripts/ci_scoped_lints.py 2>&1 | tee scoped-lints.log
       - name: Workspace unit, integration and doc specs
         run: cargo test --workspace --locked --no-fail-fast 2>&1 | tee crate-specs.log
       - name: Microkernel userspace ABI specs
@@ -87,4 +93,5 @@ jobs:
             mup-log-specs.log
             mup-source-lifetime-specs.log
             kvm-runner-specs.log
+            scoped-lints.log
           if-no-files-found: warn

@@ -72,7 +72,7 @@ pub fn hundred_ns_to_ticks_ceil(value: u64, period_fs: u64) -> u64 {
         return 0;
     }
     let numerator = value as u128 * 100_000_000u128;
-    ((numerator + period_fs as u128 - 1) / period_fs as u128).min(u64::MAX as u128) as u64
+    numerator.div_ceil(period_fs as u128).min(u64::MAX as u128) as u64
 }
 
 pub fn timer_arm_target_ticks(
@@ -189,6 +189,10 @@ impl Queue {
 
     pub fn len(&self) -> usize {
         self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(|slot| slot.is_none())
     }
 
     pub fn records(&self) -> usize {

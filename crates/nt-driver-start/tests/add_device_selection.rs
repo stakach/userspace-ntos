@@ -51,10 +51,7 @@ fn table_order_decides_between_ready_rows() {
 
 #[test]
 fn no_unentered_devnode_is_idle() {
-    assert_eq!(
-        select_add_device_row::<u8>([]),
-        AddDeviceSelection::Idle
-    );
+    assert_eq!(select_add_device_row::<u8>([]), AddDeviceSelection::Idle);
     assert_eq!(
         select_add_device_row([(1u8, NotReady), (2, NotReady)]),
         AddDeviceSelection::Idle
@@ -79,7 +76,10 @@ fn bus_child(reported: bool) -> AddDeviceReadiness {
 
 #[test]
 fn a_devnode_that_needs_no_bus_pdo_is_ready() {
-    assert_eq!(AddDeviceReadiness::for_unentered_devnode(false, false), Ready);
+    assert_eq!(
+        AddDeviceReadiness::for_unentered_devnode(false, false),
+        Ready
+    );
 }
 
 #[test]

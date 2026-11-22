@@ -18,7 +18,10 @@ impl FullValueLayout {
         u32::try_from(data.len()).ok()?;
         u32::try_from(data_offset).ok()?;
         u32::try_from(required_length).ok()?;
-        Some(Self { data_offset, required_length })
+        Some(Self {
+            data_offset,
+            required_length,
+        })
     }
 
     pub fn encode_ascii(self, name: &[u8], value_type: u32, data: &[u8], out: &mut [u8]) -> bool {
@@ -51,7 +54,10 @@ mod tests {
         let mut bytes = [0u8; 80];
         assert!(layout.encode_ascii(name, 1, data, &mut bytes));
         assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 48);
-        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), data.len() as u32);
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            data.len() as u32
+        );
         assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 26);
         assert_eq!(&bytes[20..24], &[b'P', 0, b'r', 0]);
         assert_eq!(&bytes[48..48 + data.len()], data);

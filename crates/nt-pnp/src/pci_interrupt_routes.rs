@@ -138,7 +138,7 @@ impl PreparedPciInterruptRouteRevocation {
 
 /// Accepted provider route set. A topology generation change makes the entire set unusable until
 /// the bus transaction publishes a replacement.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PciInterruptRouteOwner {
     generation: u64,
     accepted: bool,
@@ -146,19 +146,6 @@ pub struct PciInterruptRouteOwner {
     provider_scope_generation: Option<u64>,
     segment: Option<u16>,
     routes: Vec<PciInterruptRoute>,
-}
-
-impl Default for PciInterruptRouteOwner {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            accepted: false,
-            inventory_generation: None,
-            provider_scope_generation: None,
-            segment: None,
-            routes: Vec::new(),
-        }
-    }
 }
 
 impl PciInterruptRouteOwner {
@@ -357,7 +344,13 @@ impl PciInterruptRouteOwner {
         if device.irq_pin == 0 {
             return Ok(None);
         }
-        self.resolve_pin(inventory, provider_scope_generation, segment, location, device.irq_pin)
+        self.resolve_pin(
+            inventory,
+            provider_scope_generation,
+            segment,
+            location,
+            device.irq_pin,
+        )
     }
 
     /// Resolve a caller-supplied PCI INTx pin (1 = INTA through 4 = INTD).
@@ -618,36 +611,74 @@ mod tests {
         let location = PciLocation::new(0, 3, 0);
         let inventory = PciInventory::try_from_initial(vec![device(0, 3, 0, 1)]).unwrap();
         let mut owner = PciInterruptRouteOwner::default();
-        let prepared = owner.prepare_replace(
-            PROVIDER_RELATION_GENERATION,
-            0,
-            &inventory,
-            vec![
-                route(0, 3, PciRouteFunction::Any, 0, 17),
-                route(0, 3, PciRouteFunction::Any, 1, 33),
-            ],
-        ).unwrap();
-        owner.commit(prepared, &inventory, PROVIDER_RELATION_GENERATION).unwrap();
+        let prepared = owner
+            .prepare_replace(
+                PROVIDER_RELATION_GENERATION,
+                0,
+                &inventory,
+                vec![
+                    route(0, 3, PciRouteFunction::Any, 0, 17),
+                    route(0, 3, PciRouteFunction::Any, 1, 33),
+                ],
+            )
+            .unwrap();
+        owner
+            .commit(prepared, &inventory, PROVIDER_RELATION_GENERATION)
+            .unwrap();
 
-        assert_eq!(owner.resolve(&inventory, PROVIDER_RELATION_GENERATION, 0, location)
-            .unwrap().unwrap().route().gsi, 17);
-        let swizzled = owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 2)
-            .unwrap().unwrap();
+        assert_eq!(
+            owner
+                .resolve(&inventory, PROVIDER_RELATION_GENERATION, 0, location)
+                .unwrap()
+                .unwrap()
+                .route()
+                .gsi,
+            17
+        );
+        let swizzled = owner
+            .resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 2)
+            .unwrap()
+            .unwrap();
         assert_eq!(swizzled.route().gsi, 33);
-        assert_eq!(owner.validate(&inventory, PROVIDER_RELATION_GENERATION, swizzled)
-            .unwrap().gsi, 33);
-        assert_eq!(owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 3)
-            .unwrap(), None);
-        assert_eq!(owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 0),
-            Err(PciInterruptRouteError::InvalidQueryPin(0)));
-        assert_eq!(owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 5),
-            Err(PciInterruptRouteError::InvalidQueryPin(5)));
-        assert_eq!(owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0,
-            PciLocation::new(0, 4, 0), 1).unwrap(), None);
+        assert_eq!(
+            owner
+                .validate(&inventory, PROVIDER_RELATION_GENERATION, swizzled)
+                .unwrap()
+                .gsi,
+            33
+        );
+        assert_eq!(
+            owner
+                .resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 3)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 0),
+            Err(PciInterruptRouteError::InvalidQueryPin(0))
+        );
+        assert_eq!(
+            owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 5),
+            Err(PciInterruptRouteError::InvalidQueryPin(5))
+        );
+        assert_eq!(
+            owner
+                .resolve_pin(
+                    &inventory,
+                    PROVIDER_RELATION_GENERATION,
+                    0,
+                    PciLocation::new(0, 4, 0),
+                    1
+                )
+                .unwrap(),
+            None
+        );
 
         owner.invalidate().unwrap();
-        assert_eq!(owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 2),
-            Err(PciInterruptRouteError::Invalidated));
+        assert_eq!(
+            owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 2),
+            Err(PciInterruptRouteError::Invalidated)
+        );
     }
 
     #[test]

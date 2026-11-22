@@ -572,8 +572,12 @@ pub fn split_enum_instance_path(path: &str) -> (&str, &str) {
 /// Children of physical buses retain their instance IDs across boots, but receive fresh PDOs
 /// from the bus driver; an old registry entry does not authorize inventing one.
 pub fn is_root_enumerated_instance(path: &str) -> bool {
-    let Some((enumerator, rest)) = path.split_once('\\') else { return false; };
-    let Some((device, instance)) = rest.rsplit_once('\\') else { return false; };
+    let Some((enumerator, rest)) = path.split_once('\\') else {
+        return false;
+    };
+    let Some((device, instance)) = rest.rsplit_once('\\') else {
+        return false;
+    };
     enumerator.eq_ignore_ascii_case("ROOT") && !device.is_empty() && !instance.is_empty()
 }
 

@@ -104,7 +104,10 @@ impl<R> Default for ChangeNotifier<R> {
 
 impl<R> ChangeNotifier<R> {
     pub const fn new() -> Self {
-        Self { blocks: Vec::new(), next_post: 1 }
+        Self {
+            blocks: Vec::new(),
+            next_post: 1,
+        }
     }
 
     /// No notify session exists: no change can complete or be remembered by anything.
@@ -177,7 +180,11 @@ impl<R> ChangeNotifier<R> {
             }
             return Err(ArmError::InsufficientResources(request));
         }
-        block.posts.push(Post { id, thread, request });
+        block.posts.push(Post {
+            id,
+            thread,
+            request,
+        });
         Ok(Armed::Pending(id))
     }
 
@@ -285,7 +292,10 @@ impl<R> ChangeNotifier<R> {
             block.pending = false;
             let body = block.body;
             completions.extend(
-                block.posts.drain(..).map(|post| complete(body, post, STATUS_NOTIFY_ENUM_DIR)),
+                block
+                    .posts
+                    .drain(..)
+                    .map(|post| complete(body, post, STATUS_NOTIFY_ENUM_DIR)),
             );
         }
     }
@@ -302,7 +312,10 @@ impl<R> ChangeNotifier<R> {
                 let block = self.blocks.remove(index);
                 let body = block.body;
                 completions.extend(
-                    block.posts.into_iter().map(|post| complete(body, post, STATUS_NOTIFY_CLEANUP)),
+                    block
+                        .posts
+                        .into_iter()
+                        .map(|post| complete(body, post, STATUS_NOTIFY_CLEANUP)),
                 );
             } else {
                 index += 1;
@@ -312,7 +325,13 @@ impl<R> ChangeNotifier<R> {
 }
 
 fn complete<R>(body: KeyBody, post: Post<R>, status: u32) -> Completion<R> {
-    Completion { post: post.id, body, thread: post.thread, status, request: post.request }
+    Completion {
+        post: post.id,
+        body,
+        thread: post.thread,
+        status,
+        request: post.request,
+    }
 }
 
 /// Lower-case components, each preceded by `\`; the namespace root is the empty string.

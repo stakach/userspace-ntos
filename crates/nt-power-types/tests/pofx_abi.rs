@@ -7,7 +7,10 @@ use nt_power_types::pofx::{PoFxComponentIdleState, PoFxComponentV2, PoFxDeviceV3
 fn released_dxgkrnl_registration_layout_matches_wdk_x64() {
     assert_eq!(size_of::<PoFxDeviceV3>(), 160);
     assert_eq!(offset_of!(PoFxDeviceV3, version), 0);
-    assert_eq!(offset_of!(PoFxDeviceV3, component_active_condition_callback), 16);
+    assert_eq!(
+        offset_of!(PoFxDeviceV3, component_active_condition_callback),
+        16
+    );
     assert_eq!(offset_of!(PoFxDeviceV3, device_context), 88);
     assert_eq!(offset_of!(PoFxDeviceV3, component_count), 96);
     assert_eq!(offset_of!(PoFxDeviceV3, components), 104);

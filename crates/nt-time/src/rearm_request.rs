@@ -8,6 +8,12 @@ pub struct DeferredRearm {
     completed: u64,
 }
 
+impl Default for DeferredRearm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeferredRearm {
     pub const fn new() -> Self {
         Self {

@@ -19,9 +19,15 @@ const PX_CI: u32 = 0x38;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transfer<'a> {
-    Read { lba: u64, sectors: u32 },
+    Read {
+        lba: u64,
+        sectors: u32,
+    },
     /// Whole sectors staged into the DMA window only after the slot is known to be free.
-    Write { lba: u64, data: &'a [u8] },
+    Write {
+        lba: u64,
+        data: &'a [u8],
+    },
 }
 
 impl Transfer<'_> {
@@ -33,9 +39,7 @@ impl Transfer<'_> {
     fn bytes(&self) -> Option<usize> {
         match *self {
             Self::Read { sectors, .. } => (sectors as usize).checked_mul(SECTOR_BYTES),
-            Self::Write { data, .. } => {
-                (data.len() % SECTOR_BYTES == 0).then_some(data.len())
-            }
+            Self::Write { data, .. } => (data.len() % SECTOR_BYTES == 0).then_some(data.len()),
         }
     }
 }
@@ -111,13 +115,16 @@ pub fn transfer(
     request: Transfer<'_>,
     budget_ticks: u64,
 ) -> TransferOutcome {
-    let Some(bytes) = request.bytes().filter(|bytes| {
-        *bytes != 0 && *bytes <= window_bytes && *bytes <= MAX_PRDT_BYTES
-    }) else {
+    let Some(bytes) = request
+        .bytes()
+        .filter(|bytes| *bytes != 0 && *bytes <= window_bytes && *bytes <= MAX_PRDT_BYTES)
+    else {
         return TransferOutcome::Refused(Error::InvalidDma);
     };
     if dma_paddr & 0x3ff != 0
-        || dma_paddr.checked_add((DATA_OFFSET + window_bytes) as u64).is_none()
+        || dma_paddr
+            .checked_add((DATA_OFFSET + window_bytes) as u64)
+            .is_none()
         || request.lba() >> 48 != 0
         || budget_ticks == 0
     {
@@ -177,10 +184,16 @@ pub fn transfer(
             }
             let task_file = io.read_port(PX_TFD) & 0xff;
             if task_file & TASK_FILE_FAILURE != 0 {
-                return TransferOutcome::Failed { error: Error::Device, task_file };
+                return TransferOutcome::Failed {
+                    error: Error::Device,
+                    task_file,
+                };
             }
             if io.read_dma_u32(4) as usize != bytes {
-                return TransferOutcome::Failed { error: Error::ShortTransfer, task_file };
+                return TransferOutcome::Failed {
+                    error: Error::ShortTransfer,
+                    task_file,
+                };
             }
             return TransferOutcome::Completed;
         }

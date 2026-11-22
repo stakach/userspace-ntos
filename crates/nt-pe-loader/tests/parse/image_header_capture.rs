@@ -126,7 +126,10 @@ fn incremental_capture_rejects_short_window_without_advancing() {
     let mut capture = IncrementalImageLayoutCapture::new(source.extent);
     let first = capture.next_window().unwrap();
     assert_eq!((first.offset, first.length), (0, 4096));
-    assert!(matches!(capture.complete_window(&[0; 8]), Err(PeError::Truncated)));
+    assert!(matches!(
+        capture.complete_window(&[0; 8]),
+        Err(PeError::Truncated)
+    ));
     assert_eq!(capture.next_window(), Some(first));
     let mut bytes = vec![0; first.length];
     source.read(first.offset, &mut bytes);

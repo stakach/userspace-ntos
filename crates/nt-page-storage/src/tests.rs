@@ -154,7 +154,10 @@ fn mutable_iteration_retains_disjoint_references_across_three_tree_levels() {
         **slot = Some([index as u64; 24]);
     }
     for pair in retained.windows(2) {
-        assert_ne!(core::ptr::from_ref(&*pair[0]), core::ptr::from_ref(&*pair[1]));
+        assert_ne!(
+            core::ptr::from_ref(&*pair[0]),
+            core::ptr::from_ref(&*pair[1])
+        );
     }
     drop(retained);
     for (index, slot) in values.iter().enumerate() {

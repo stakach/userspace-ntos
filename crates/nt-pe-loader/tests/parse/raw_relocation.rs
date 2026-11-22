@@ -19,8 +19,18 @@ fn fixture() -> Vec<u8> {
         0,
         0x4000,
         &[
-            Sec { name: *b".data\0\0\0", va: 0x2000, chars: 0xc000_0040, data },
-            Sec { name: *b".reloc\0\0", va: 0x3000, chars: 0x4200_0040, data: reloc },
+            Sec {
+                name: *b".data\0\0\0",
+                va: 0x2000,
+                chars: 0xc000_0040,
+                data,
+            },
+            Sec {
+                name: *b".reloc\0\0",
+                va: 0x3000,
+                chars: 0x4200_0040,
+                data: reloc,
+            },
         ],
         &[(5, 0x3000, 12)],
     )
@@ -29,7 +39,10 @@ fn fixture() -> Vec<u8> {
 fn reject_unchanged(mut bytes: Vec<u8>) {
     let before = bytes.clone();
     assert!(relocate_file_snapshot(&mut bytes, LOAD_BASE).is_err());
-    assert_eq!(bytes, before, "a malformed relocation plan cannot partially patch its snapshot");
+    assert_eq!(
+        bytes, before,
+        "a malformed relocation plan cannot partially patch its snapshot"
+    );
 }
 
 #[test]
@@ -37,8 +50,14 @@ fn valid_dir64_and_absolute_transform_only_the_independent_snapshot() {
     let source = fixture();
     let mut snapshot = source.clone();
     relocate_file_snapshot(&mut snapshot, LOAD_BASE).unwrap();
-    assert_eq!(u64::from_le_bytes(snapshot[DATA_RAW..DATA_RAW + 8].try_into().unwrap()), LOAD_BASE + 0x1234);
-    assert_eq!(u64::from_le_bytes(snapshot[OPT_OFF + 24..OPT_OFF + 32].try_into().unwrap()), LOAD_BASE);
+    assert_eq!(
+        u64::from_le_bytes(snapshot[DATA_RAW..DATA_RAW + 8].try_into().unwrap()),
+        LOAD_BASE + 0x1234
+    );
+    assert_eq!(
+        u64::from_le_bytes(snapshot[OPT_OFF + 24..OPT_OFF + 32].try_into().unwrap()),
+        LOAD_BASE
+    );
     let mut expected = source.clone();
     put_u64(&mut expected, DATA_RAW, LOAD_BASE + 0x1234);
     put_u64(&mut expected, OPT_OFF + 24, LOAD_BASE);
@@ -131,7 +150,8 @@ fn nt_high_low_highlow_fixups_use_their_actual_widths_and_wrapping_delta() {
         put_u16(&mut bytes, RELOC_RAW + 8, kind << 12 | offset);
         let target = BASE + 0x20_1234;
         let mut expected = bytes.clone();
-        expected[start..start + width].copy_from_slice(&before.wrapping_add(addend).to_le_bytes()[..width]);
+        expected[start..start + width]
+            .copy_from_slice(&before.wrapping_add(addend).to_le_bytes()[..width]);
         put_u64(&mut expected, OPT_OFF + 24, target);
         relocate_file_snapshot(&mut bytes, target).unwrap();
         assert_eq!(bytes, expected);
@@ -139,7 +159,10 @@ fn nt_high_low_highlow_fixups_use_their_actual_widths_and_wrapping_delta() {
     let mut bytes = fixture();
     put_u64(&mut bytes, DATA_RAW, BASE + 0x1234);
     relocate_file_snapshot(&mut bytes, BASE - 0x1000).unwrap();
-    assert_eq!(u64::from_le_bytes(bytes[DATA_RAW..DATA_RAW + 8].try_into().unwrap()), BASE + 0x234);
+    assert_eq!(
+        u64::from_le_bytes(bytes[DATA_RAW..DATA_RAW + 8].try_into().unwrap()),
+        BASE + 0x234
+    );
 }
 
 #[test]

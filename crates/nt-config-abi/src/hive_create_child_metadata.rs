@@ -13,7 +13,7 @@ pub fn header(class_len: u32, descriptor_len: u32) -> [u8; HEADER_BYTES] {
 pub fn split(data: &[u8], class_present: bool) -> Option<(&[u8], &[u8])> {
     let class_len = u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as usize;
     let descriptor_len = u32::from_le_bytes(data.get(4..8)?.try_into().ok()?) as usize;
-    if class_len % 2 != 0 || (!class_present && class_len != 0) || descriptor_len == 0 {
+    if !class_len.is_multiple_of(2) || (!class_present && class_len != 0) || descriptor_len == 0 {
         return None;
     }
     let class_end = HEADER_BYTES.checked_add(class_len)?;

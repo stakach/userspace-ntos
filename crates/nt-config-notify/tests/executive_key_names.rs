@@ -39,7 +39,8 @@ fn registry() -> MutableHiveSet {
 
 /// The key a handle opened by `path` names, as the executive resolves an open.
 fn opened(set: &MutableHiveSet, path: &str) -> ResolvedHiveKey {
-    set.resolve_key(path).unwrap_or_else(|| panic!("{path} resolves"))
+    set.resolve_key(path)
+        .unwrap_or_else(|| panic!("{path} resolves"))
 }
 
 /// `registry_target_path` of a mutable-hive handle (`mutable_key_path`).
@@ -48,13 +49,21 @@ fn handle_name(set: &MutableHiveSet, key: ResolvedHiveKey) -> String {
 }
 
 fn arm(notifier: &mut ChangeNotifier<u32>, handle: u64, name: &str, filter: u32, tree: bool) {
-    let body = KeyBody { process: WATCHER, handle };
-    let armed = notifier.arm(body, name, filter, tree, THREAD, handle as u32).unwrap();
+    let body = KeyBody {
+        process: WATCHER,
+        handle,
+    };
+    let armed = notifier
+        .arm(body, name, filter, tree, THREAD, handle as u32)
+        .unwrap();
     assert!(matches!(armed, Armed::Pending(_)), "{name}: armed pending");
 }
 
 fn completed(completions: &[Completion<u32>]) -> Vec<(u32, u32)> {
-    completions.iter().map(|done| (done.request, done.status)).collect()
+    completions
+        .iter()
+        .map(|done| (done.request, done.status))
+        .collect()
 }
 
 #[test]
@@ -62,12 +71,23 @@ fn ctfmon_run_watch_on_hkcu_completes_when_a_value_of_that_key_changes() {
     let set = registry();
     let mut notifier = ChangeNotifier::new();
     // HKCU (no per-user hive loaded) is `\Registry\User\.Default`; ctfmon opens `Run` below it.
-    let run = opened(&set, r"\Registry\User\.DEFAULT\Software\Microsoft\Windows\CurrentVersion\Run");
-    arm(&mut notifier, 0x40, &handle_name(&set, run),
-        REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME, false);
+    let run = opened(
+        &set,
+        r"\Registry\User\.DEFAULT\Software\Microsoft\Windows\CurrentVersion\Run",
+    );
+    arm(
+        &mut notifier,
+        0x40,
+        &handle_name(&set, run),
+        REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME,
+        false,
+    );
 
     // RegDeleteValue(Run, "internat.exe") through another handle: `journal_delete_mutable_value`.
-    let writer = opened(&set, r"\REGISTRY\USER\.default\software\microsoft\windows\currentversion\run");
+    let writer = opened(
+        &set,
+        r"\REGISTRY\USER\.default\software\microsoft\windows\currentversion\run",
+    );
     let done = notifier.report_key_changed(&handle_name(&set, writer), REG_NOTIFY_CHANGE_LAST_SET);
     assert_eq!(completed(&done), [(0x40, STATUS_NOTIFY_ENUM_DIR)]);
 }
@@ -76,8 +96,17 @@ fn ctfmon_run_watch_on_hkcu_completes_when_a_value_of_that_key_changes() {
 fn mmdevapi_driver_watch_completes_on_a_value_set() {
     let set = registry();
     let mut notifier = ChangeNotifier::new();
-    let drivers = opened(&set, r"\Registry\User\.Default\Software\Wine\Drivers\winealsa.drv");
-    arm(&mut notifier, 0x44, &handle_name(&set, drivers), REG_NOTIFY_CHANGE_LAST_SET, false);
+    let drivers = opened(
+        &set,
+        r"\Registry\User\.Default\Software\Wine\Drivers\winealsa.drv",
+    );
+    arm(
+        &mut notifier,
+        0x44,
+        &handle_name(&set, drivers),
+        REG_NOTIFY_CHANGE_LAST_SET,
+        false,
+    );
     let done = notifier.report_key_changed(&handle_name(&set, drivers), REG_NOTIFY_CHANGE_LAST_SET);
     assert_eq!(completed(&done), [(0x44, STATUS_NOTIFY_ENUM_DIR)]);
 }
@@ -87,8 +116,13 @@ fn tree_watch_on_a_software_key_completes_when_a_subkey_is_created_below_it() {
     let mut set = registry();
     let mut notifier = ChangeNotifier::new();
     let tip = opened(&set, r"\Registry\Machine\SOFTWARE\Microsoft\CTF\TIP");
-    arm(&mut notifier, 0x48, &handle_name(&set, tip),
-        REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME, true);
+    arm(
+        &mut notifier,
+        0x48,
+        &handle_name(&set, tip),
+        REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME,
+        true,
+    );
 
     // NtCreateKey: `journal_create_secured_mutable_subkey` reports the child it created.
     let child = set
@@ -102,7 +136,13 @@ fn tree_watch_on_a_software_key_completes_when_a_subkey_is_created_below_it() {
 fn hklm_tree_watch_sees_a_change_inside_the_mounted_software_hive() {
     let set = registry();
     let mut notifier = ChangeNotifier::new();
-    arm(&mut notifier, 0x4C, MACHINE_ROOT, REG_NOTIFY_CHANGE_LAST_SET, true);
+    arm(
+        &mut notifier,
+        0x4C,
+        MACHINE_ROOT,
+        REG_NOTIFY_CHANGE_LAST_SET,
+        true,
+    );
     let speech = opened(&set, r"\Registry\Machine\Software\Microsoft\Speech");
     let done = notifier.report_key_changed(&handle_name(&set, speech), REG_NOTIFY_CHANGE_LAST_SET);
     assert_eq!(completed(&done), [(0x4C, STATUS_NOTIFY_ENUM_DIR)]);
@@ -114,9 +154,21 @@ fn a_base_hive_handle_and_a_mutable_handle_name_the_same_key() {
     let mut notifier = ChangeNotifier::new();
     // A read-only REGF handle: `registry_target_path` joins the mount path and the cell's
     // hive-relative path (original case, no leading separator) and canonicalizes the result.
-    let base = set.canonical_name(&format!(r"{SOFTWARE_MOUNT}\{}", r"Microsoft\Windows\CurrentVersion\Run"));
-    arm(&mut notifier, 0x50, &base, REG_NOTIFY_CHANGE_LAST_SET, false);
-    let run = opened(&set, r"\Registry\Machine\SOFTWARE\Microsoft\Windows\CurrentVersion\Run");
+    let base = set.canonical_name(&format!(
+        r"{SOFTWARE_MOUNT}\{}",
+        r"Microsoft\Windows\CurrentVersion\Run"
+    ));
+    arm(
+        &mut notifier,
+        0x50,
+        &base,
+        REG_NOTIFY_CHANGE_LAST_SET,
+        false,
+    );
+    let run = opened(
+        &set,
+        r"\Registry\Machine\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+    );
     assert_eq!(base, handle_name(&set, run));
     let done = notifier.report_key_changed(&handle_name(&set, run), REG_NOTIFY_CHANGE_LAST_SET);
     assert_eq!(completed(&done), [(0x50, STATUS_NOTIFY_ENUM_DIR)]);
@@ -128,8 +180,20 @@ fn hkcu_and_hklm_keys_with_the_same_relative_path_are_different_keys() {
     let mut notifier = ChangeNotifier::new();
     let user = opened(&set, r"\Registry\User\.Default\Software\Microsoft\Speech");
     let machine = opened(&set, r"\Registry\Machine\SOFTWARE\Microsoft\Speech");
-    arm(&mut notifier, 0x54, &handle_name(&set, user), REG_NOTIFY_CHANGE_LAST_SET, true);
-    arm(&mut notifier, 0x58, &handle_name(&set, machine), REG_NOTIFY_CHANGE_LAST_SET, true);
+    arm(
+        &mut notifier,
+        0x54,
+        &handle_name(&set, user),
+        REG_NOTIFY_CHANGE_LAST_SET,
+        true,
+    );
+    arm(
+        &mut notifier,
+        0x58,
+        &handle_name(&set, machine),
+        REG_NOTIFY_CHANGE_LAST_SET,
+        true,
+    );
     let done = notifier.report_key_changed(&handle_name(&set, machine), REG_NOTIFY_CHANGE_LAST_SET);
     assert_eq!(completed(&done), [(0x58, STATUS_NOTIFY_ENUM_DIR)]);
     assert_eq!(notifier.posted_requests(), 1);

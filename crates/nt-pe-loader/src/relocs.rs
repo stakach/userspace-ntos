@@ -124,7 +124,7 @@ pub(crate) fn parse_relocation_directory(directory: &[u8]) -> Result<Vec<Relocat
         }
         let page_va = u32_at(directory, pos)?;
         let block_size = u32_at(directory, pos + 4)? as usize;
-        if block_size < 8 || block_size % 2 != 0 || block_size > total - pos {
+        if block_size < 8 || !block_size.is_multiple_of(2) || block_size > total - pos {
             return Err(PeError::RelocationInvalid);
         }
         let entries = (block_size - 8) / 2;

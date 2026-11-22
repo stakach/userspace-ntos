@@ -342,8 +342,7 @@ pub fn kernel_sync_reply_length(
         .and_then(|header| header.try_into().ok())
         .ok_or(KernelSyncError::InvalidReply)?;
     let length = port_message_total_length(header).ok_or(KernelSyncError::InvalidReply)?;
-    if message.len() != length
-        || message.get(4..6) != Some(&msg_type::LPC_REPLY.to_le_bytes()[..])
+    if message.len() != length || message.get(4..6) != Some(&msg_type::LPC_REPLY.to_le_bytes()[..])
     {
         return Err(KernelSyncError::InvalidReply);
     }
@@ -807,12 +806,27 @@ mod tests {
     fn kernel_sync_send_wait_receive_validates_request_and_reply_capacity() {
         let mut request = [0u8; PORT_MESSAGE_HEADER_LEN];
         request[2..4].copy_from_slice(&(PORT_MESSAGE_HEADER_LEN as u16).to_le_bytes());
-        assert_eq!(kernel_sync_send_length(0x20000, &request, 0x178, false), Ok(request.len()));
-        assert_eq!(kernel_sync_send_length(0, &request, 0x178, false), Err(KernelSyncError::UnsupportedFlags));
-        assert_eq!(kernel_sync_send_length(0x20000, &request, 8, false), Err(KernelSyncError::BufferTooSmall));
-        assert_eq!(kernel_sync_send_length(0x20000, &request, 0x178, true), Err(KernelSyncError::UnsupportedTimeout));
+        assert_eq!(
+            kernel_sync_send_length(0x20000, &request, 0x178, false),
+            Ok(request.len())
+        );
+        assert_eq!(
+            kernel_sync_send_length(0, &request, 0x178, false),
+            Err(KernelSyncError::UnsupportedFlags)
+        );
+        assert_eq!(
+            kernel_sync_send_length(0x20000, &request, 8, false),
+            Err(KernelSyncError::BufferTooSmall)
+        );
+        assert_eq!(
+            kernel_sync_send_length(0x20000, &request, 0x178, true),
+            Err(KernelSyncError::UnsupportedTimeout)
+        );
         request[2..4].copy_from_slice(&0x201u16.to_le_bytes());
-        assert_eq!(kernel_sync_send_length(0x20000, &request, 0x178, false), Err(KernelSyncError::InvalidMessage));
+        assert_eq!(
+            kernel_sync_send_length(0x20000, &request, 0x178, false),
+            Err(KernelSyncError::InvalidMessage)
+        );
 
         let mut reply = [0u8; PORT_MESSAGE_HEADER_LEN + 8];
         let reply_len = reply.len() as u16;
@@ -820,9 +834,15 @@ mod tests {
         reply[2..4].copy_from_slice(&reply_len.to_le_bytes());
         reply[4..6].copy_from_slice(&msg_type::LPC_REPLY.to_le_bytes());
         assert_eq!(kernel_sync_reply_length(&reply, 0x178), Ok(reply.len()));
-        assert_eq!(kernel_sync_reply_length(&reply, PORT_MESSAGE_HEADER_LEN), Err(KernelSyncError::BufferTooSmall));
+        assert_eq!(
+            kernel_sync_reply_length(&reply, PORT_MESSAGE_HEADER_LEN),
+            Err(KernelSyncError::BufferTooSmall)
+        );
         reply[4..6].copy_from_slice(&msg_type::LPC_DATAGRAM.to_le_bytes());
-        assert_eq!(kernel_sync_reply_length(&reply, 0x178), Err(KernelSyncError::InvalidReply));
+        assert_eq!(
+            kernel_sync_reply_length(&reply, 0x178),
+            Err(KernelSyncError::InvalidReply)
+        );
     }
 
     #[test]

@@ -57,8 +57,8 @@ pub fn relation_requires_native_disk_proof(
     accepted_pdo == Some(relation_pdo)
         || observed_pci_location.is_some_and(|(bus, address)| {
             bus == u32::from(controller.bus)
-                && address == ((u32::from(controller.device) << 16)
-                    | u32::from(controller.function))
+                && address
+                    == ((u32::from(controller.device) << 16) | u32::from(controller.function))
         })
 }
 
@@ -476,12 +476,9 @@ impl PciDmaHandoff {
         {
             return Err(Error::UncertainDma);
         }
-        if !row
-            .windows
-            .iter()
-            .any(|window| window.phase == WindowPhase::Mapped
-                && expected_window.is_none_or(|id| window.id == id))
-        {
+        if !row.windows.iter().any(|window| {
+            window.phase == WindowPhase::Mapped && expected_window.is_none_or(|id| window.id == id)
+        }) {
             return Err(Error::NoNativeWindow);
         }
         row.state = ControllerState::NativeStarting;
@@ -495,7 +492,9 @@ impl PciDmaHandoff {
         root: u64,
         route: u64,
     ) -> Result<(), Error> {
-        if route == 0 { return Err(Error::InvalidController); }
+        if route == 0 {
+            return Err(Error::InvalidController);
+        }
         let row = self.record(key, root)?;
         if row.state != ControllerState::NativeStarting || row.native_route.is_some() {
             return Err(Error::WrongPhase);
@@ -557,11 +556,36 @@ mod tests {
     #[test]
     fn boot_controller_relation_requires_proof_before_dma_ready_or_properties_arrive() {
         let pdo = 91;
-        assert!(relation_requires_native_disk_proof(AHCI, pdo, Some(pdo), None));
-        assert!(relation_requires_native_disk_proof(AHCI, pdo, Some(pdo), Some((0, 2 << 16))));
-        assert!(relation_requires_native_disk_proof(AHCI, pdo, None, Some((0, 2 << 16))));
-        assert!(!relation_requires_native_disk_proof(AHCI, 92, Some(pdo), None));
-        assert!(!relation_requires_native_disk_proof(AHCI, 92, None, Some((0, 3 << 16))));
+        assert!(relation_requires_native_disk_proof(
+            AHCI,
+            pdo,
+            Some(pdo),
+            None
+        ));
+        assert!(relation_requires_native_disk_proof(
+            AHCI,
+            pdo,
+            Some(pdo),
+            Some((0, 2 << 16))
+        ));
+        assert!(relation_requires_native_disk_proof(
+            AHCI,
+            pdo,
+            None,
+            Some((0, 2 << 16))
+        ));
+        assert!(!relation_requires_native_disk_proof(
+            AHCI,
+            92,
+            Some(pdo),
+            None
+        ));
+        assert!(!relation_requires_native_disk_proof(
+            AHCI,
+            92,
+            None,
+            Some((0, 3 << 16))
+        ));
     }
 
     #[test]
@@ -591,7 +615,10 @@ mod tests {
     fn five_page_boot_window_reserves_exactly_its_iova_range() {
         let mut ledger = PciDmaHandoff::new();
         ledger.register(AHCI, 41, 0x1000, 5).unwrap();
-        assert_eq!(ledger.reserve_window(AHCI, 41, 0x5000, 1), Err(Error::Overlap));
+        assert_eq!(
+            ledger.reserve_window(AHCI, 41, 0x5000, 1),
+            Err(Error::Overlap)
+        );
         assert!(ledger.reserve_window(AHCI, 41, 0x6000, 1).is_ok());
     }
 
@@ -660,7 +687,10 @@ mod tests {
         let mut ledger = ledger();
         let ticket = ledger.enter_boot_io(AHCI, 41).unwrap();
         assert_eq!(ledger.outstanding_boot_io_count(AHCI, 41), Ok(1));
-        assert_eq!(ledger.outstanding_boot_io_count(NEXT_GENERATION, 41), Err(Error::WrongController));
+        assert_eq!(
+            ledger.outstanding_boot_io_count(NEXT_GENERATION, 41),
+            Err(Error::WrongController)
+        );
         let native = ledger.reserve_window(AHCI, 41, 0x2000, 1).unwrap();
         ledger.begin_map(AHCI, 41, native).unwrap();
         ledger.confirm_map(AHCI, 41, native).unwrap();
@@ -695,13 +725,25 @@ mod tests {
         let other = ledger.reserve_window(AHCI, 41, 0x3000, 1).unwrap();
         ledger.begin_drain(AHCI, 41).unwrap();
         assert_eq!(ledger.enter_boot_io(AHCI, 41), Err(Error::WrongPhase));
-        assert_eq!(ledger.begin_native_start_exact(AHCI, 41, native), Err(Error::BootIoOutstanding));
+        assert_eq!(
+            ledger.begin_native_start_exact(AHCI, 41, native),
+            Err(Error::BootIoOutstanding)
+        );
         ledger.complete_boot_io(AHCI, 41, command).unwrap();
-        assert_eq!(ledger.begin_native_start_exact(AHCI, 41, native), Err(Error::NoNativeWindow));
+        assert_eq!(
+            ledger.begin_native_start_exact(AHCI, 41, native),
+            Err(Error::NoNativeWindow)
+        );
         ledger.begin_map(AHCI, 41, native).unwrap();
-        assert_eq!(ledger.begin_native_start_exact(AHCI, 41, native), Err(Error::NoNativeWindow));
+        assert_eq!(
+            ledger.begin_native_start_exact(AHCI, 41, native),
+            Err(Error::NoNativeWindow)
+        );
         ledger.confirm_map(AHCI, 41, native).unwrap();
-        assert_eq!(ledger.begin_native_start_exact(AHCI, 41, other), Err(Error::NoNativeWindow));
+        assert_eq!(
+            ledger.begin_native_start_exact(AHCI, 41, other),
+            Err(Error::NoNativeWindow)
+        );
         ledger.begin_native_start_exact(AHCI, 41, native).unwrap();
         assert_eq!(ledger.state(AHCI, 41), Ok(ControllerState::NativeStarting));
         assert_eq!(ledger.enter_boot_io(AHCI, 41), Err(Error::WrongPhase));
@@ -767,7 +809,7 @@ mod tests {
             Err(Error::InvalidWindow)
         );
         assert_eq!(
-            ledger.reserve_window(AHCI, 41, u64::MAX & !0xfff, 2),
+            ledger.reserve_window(AHCI, 41, !0xfff, 2),
             Err(Error::InvalidWindow)
         );
         assert_eq!(

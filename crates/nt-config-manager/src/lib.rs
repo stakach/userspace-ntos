@@ -15,28 +15,28 @@
 
 extern crate alloc;
 
+mod filter_policy;
+#[cfg(test)]
+mod kernel_device_interface_tests;
+mod key_open_options;
 mod property;
 mod registry;
 mod registry_security;
-mod filter_policy;
-mod key_open_options;
 pub mod symbolic_link;
-#[cfg(test)]
-mod kernel_device_interface_tests;
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+pub use filter_policy::{DeviceFilterPolicy, DeviceFilterPolicyError};
+pub use key_open_options::{validate_key_open_options, KeyOpenOptions};
 pub use property::{
     device_property, devprop_type, DevPropKey, DevicePropertySource, PropertyBag, PropertyValue,
 };
 pub use registry::{
-    encode_multi_sz, encode_sz, Registry, RegistryKeyId, RegistryLinkWalk, RegistryTransaction, RegistryValue,
-    RegistryValueType,
+    encode_multi_sz, encode_sz, Registry, RegistryKeyId, RegistryLinkWalk, RegistryTransaction,
+    RegistryValue, RegistryValueType,
 };
-pub use filter_policy::{DeviceFilterPolicy, DeviceFilterPolicyError};
-pub use key_open_options::{validate_key_open_options, KeyOpenOptions};
 pub use registry_security::{inherit_generated_key_security, validate_generated_key_security};
 
 /// The NT root-bus pseudo-devnode exposed through user-mode PnP relations.
@@ -360,8 +360,7 @@ impl DeviceActionJournal {
         let maximum_event_count = actions.len();
         let maximum_event_count_u64 = u64::try_from(maximum_event_count)
             .map_err(|_| DeviceActionJournalError::InsufficientResources)?;
-        self
-            .next_sequence
+        self.next_sequence
             .checked_add(maximum_event_count_u64)
             .ok_or(DeviceActionJournalError::InsufficientResources)?;
 
@@ -2162,11 +2161,11 @@ impl ConfigManager {
 }
 
 fn valid_utf16_sz(data: &[u8]) -> bool {
-    data.len() >= 2 && data.len() % 2 == 0 && data[data.len() - 2..] == [0, 0]
+    data.len() >= 2 && data.len().is_multiple_of(2) && data[data.len() - 2..] == [0, 0]
 }
 
 fn valid_utf16_multi_sz(data: &[u8]) -> bool {
-    data.len() >= 4 && data.len() % 2 == 0 && data[data.len() - 4..] == [0, 0, 0, 0]
+    data.len() >= 4 && data.len().is_multiple_of(2) && data[data.len() - 4..] == [0, 0, 0, 0]
 }
 
 fn valid_registry_property_data(value: &RegistryValue) -> bool {
@@ -2443,9 +2442,15 @@ mod tests {
             assert!(hosted_boot_legacy_device_group(start, Some("Base")));
             assert!(hosted_boot_legacy_device_group(start, Some("base")));
         }
-        assert!(!hosted_boot_legacy_device_group(SERVICE_DEMAND_START, Some("Base")));
+        assert!(!hosted_boot_legacy_device_group(
+            SERVICE_DEMAND_START,
+            Some("Base")
+        ));
         assert!(!hosted_boot_legacy_device_group(SERVICE_SYSTEM_START, None));
-        assert!(!hosted_boot_legacy_device_group(SERVICE_SYSTEM_START, Some("Boot Bus Extender")));
+        assert!(!hosted_boot_legacy_device_group(
+            SERVICE_SYSTEM_START,
+            Some("Boot Bus Extender")
+        ));
     }
 
     #[test]
@@ -2470,7 +2475,10 @@ mod tests {
             registry.create_key(path);
         }
         assert!(registry.open_key(parent).is_some());
-        assert!(registry.open_key(child).is_none(), "the display driver owns Video creation");
+        assert!(
+            registry.open_key(child).is_none(),
+            "the display driver owns Video creation"
+        );
         registry.create_key(child);
         assert!(registry.open_key(child).is_some());
     }
@@ -3591,11 +3599,13 @@ mod tests {
         assert!(cm.is_boot_system_legacy_driver(&service));
 
         // IopInitializeSystemDrivers loads system-start Base services too (ConDrv, Null, Beep).
-        cm.registry_mut().set_dword(key, "Start", SERVICE_SYSTEM_START);
+        cm.registry_mut()
+            .set_dword(key, "Start", SERVICE_SYSTEM_START);
         let service = cm.service_metadata("EntropyProvider").unwrap();
         assert!(cm.is_boot_system_legacy_driver(&service));
 
-        cm.registry_mut().set_dword(key, "Start", SERVICE_DEMAND_START);
+        cm.registry_mut()
+            .set_dword(key, "Start", SERVICE_DEMAND_START);
         let service = cm.service_metadata("EntropyProvider").unwrap();
         assert!(!cm.is_boot_system_legacy_driver(&service));
     }
@@ -4395,8 +4405,12 @@ mod tests {
             .pnp_interface_links_by_guid_bytes(&guid_bytes, PNP_ROOT_DEVICE_INSTANCE, true)
             .expect("root interface query");
         assert_eq!(all_links.len(), 2);
-        assert!(all_links.iter().any(|link| link.contains("ROOT#IFACE#0000")));
-        assert!(all_links.iter().any(|link| link.contains("ROOT#IFACE#0001")));
+        assert!(all_links
+            .iter()
+            .any(|link| link.contains("ROOT#IFACE#0000")));
+        assert!(all_links
+            .iter()
+            .any(|link| link.contains("ROOT#IFACE#0001")));
         assert_eq!(
             cm.pnp_interface_links_by_guid_bytes(&guid_bytes, r"ROOT\IFACE\0001", true)
                 .unwrap(),
@@ -4622,7 +4636,13 @@ mod tests {
     #[test]
     fn device_action_journal_reconciles_bus_presence_against_seeded_enum() {
         let mut cm = ConfigManager::new();
-        cm.register_devnode(r"ROOT\EXISTING\0000", None, Some(r"\Device\Existing"), &[], &[]);
+        cm.register_devnode(
+            r"ROOT\EXISTING\0000",
+            None,
+            Some(r"\Device\Existing"),
+            &[],
+            &[],
+        );
         let mut journal = DeviceActionJournal::new();
         journal.seed(1, &cm.devnode_publications()).unwrap();
 
@@ -4637,20 +4657,33 @@ mod tests {
                 instance_id: String::from(r"ROOT\NEW\0000"),
             },
         ];
-        assert_eq!(journal.publish_actions(2, &cm.devnode_publications(), &intents), Ok(1));
+        assert_eq!(
+            journal.publish_actions(2, &cm.devnode_publications(), &intents),
+            Ok(1)
+        );
         let arrival = journal.peek().unwrap();
         assert_eq!(arrival.kind, DeviceActionKind::Arrival);
         assert_eq!(arrival.sequence, 1);
         assert_eq!(arrival.publication.instance_id, r"ROOT\NEW\0000");
         journal.acknowledge(1).unwrap();
 
-        let existing = cm.registry().open_key(&devnode_path(r"ROOT\EXISTING\0000")).unwrap();
-        cm.registry_mut().set_string(existing, "PdoName", r"\Device\Updated");
-        assert_eq!(journal.publish_actions(3, &cm.devnode_publications(), &intents[..1]), Ok(1));
+        let existing = cm
+            .registry()
+            .open_key(&devnode_path(r"ROOT\EXISTING\0000"))
+            .unwrap();
+        cm.registry_mut()
+            .set_string(existing, "PdoName", r"\Device\Updated");
+        assert_eq!(
+            journal.publish_actions(3, &cm.devnode_publications(), &intents[..1]),
+            Ok(1)
+        );
         let change = journal.peek().unwrap();
         assert_eq!(change.kind, DeviceActionKind::Change);
         assert_eq!(change.sequence, 2);
-        assert_eq!(change.publication.pdo_name.as_deref(), Some(r"\Device\Updated"));
+        assert_eq!(
+            change.publication.pdo_name.as_deref(),
+            Some(r"\Device\Updated")
+        );
         assert_eq!(
             journal.publish_actions(4, &cm.devnode_publications(), &intents[..1]),
             Err(DeviceActionJournalError::PendingInstance)

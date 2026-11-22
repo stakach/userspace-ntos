@@ -390,3 +390,9 @@ impl ResourceMappingTable {
         Ok(())
     }
 }
+
+impl Default for ResourceMappingTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}

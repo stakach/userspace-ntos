@@ -20,7 +20,10 @@ fn assert_disjoint(space: &str, regions: &[Region]) {
             regions[second].end(),
         );
     }
-    assert!(is_ascending(regions), "{space}: table is not in ascending order");
+    assert!(
+        is_ascending(regions),
+        "{space}: table is not in ascending order"
+    );
 }
 
 #[test]
@@ -44,7 +47,10 @@ fn an_overlap_of_one_page_is_reported() {
     let reaching = Region::new("reaching", low.end() - PAGE, 0x20_0000);
     assert_eq!(first_overlap(&[low, touching, reaching]), Some((0, 2)));
     assert!(!is_ascending(&[low, reaching]));
-    assert!(!is_ascending(&[touching, low]), "descending order is not accepted");
+    assert!(
+        !is_ascending(&[touching, low]),
+        "descending order is not accepted"
+    );
 }
 
 /// The addresses themselves. Moving a band is a decision; it is made here as well as in the
@@ -55,15 +61,43 @@ fn every_root_band_is_where_the_plan_says() {
         (&root::FIXED_LOW, 0x0100_0000_0000, 0x0100_1500_0000),
         (&root::FILE_POOL, 0x0100_1500_0000, 0x0100_1800_0000),
         (&root::HEAP, 0x0100_1e00_0000, 0x0100_2e00_0000),
-        (&root::PROVIDER_LARGE_POOL, 0x0100_4000_0000, 0x0100_4400_0000),
-        (&root::PROVIDER_BULK_ARENA, 0x0100_4400_0000, 0x0100_4800_0000),
+        (
+            &root::PROVIDER_LARGE_POOL,
+            0x0100_4000_0000,
+            0x0100_4400_0000,
+        ),
+        (
+            &root::PROVIDER_BULK_ARENA,
+            0x0100_4400_0000,
+            0x0100_4800_0000,
+        ),
         (&root::PE_SCRATCH, 0x0100_4800_0000, 0x0100_4820_0000),
-        (&root::WIN32K_STACK_ALIASES, 0x0100_4820_0000, 0x0100_48a0_0000),
-        (&root::WIN32K_SESSION_VIEWS, 0x0100_4a00_0000, 0x0100_5000_0000),
+        (
+            &root::WIN32K_STACK_ALIASES,
+            0x0100_4820_0000,
+            0x0100_48a0_0000,
+        ),
+        (
+            &root::WIN32K_SESSION_VIEWS,
+            0x0100_4a00_0000,
+            0x0100_5000_0000,
+        ),
         (&root::DRIVER_HOST_VIEWS, 0x0100_5000_0000, 0x0101_5000_0000),
-        (&root::DIAGNOSTIC_ALIASES, 0x0101_5000_0000, 0x0101_5200_0000),
-        (&root::DRIVER_WORKER_ALIASES, 0x0102_0000_0000, 0x0103_0000_0000),
-        (&root::CONTIGUOUS_RAM_APERTURE, 0x0103_0000_0000, 0x0103_2000_0000),
+        (
+            &root::DIAGNOSTIC_ALIASES,
+            0x0101_5000_0000,
+            0x0101_5200_0000,
+        ),
+        (
+            &root::DRIVER_WORKER_ALIASES,
+            0x0102_0000_0000,
+            0x0103_0000_0000,
+        ),
+        (
+            &root::CONTIGUOUS_RAM_APERTURE,
+            0x0103_0000_0000,
+            0x0103_2000_0000,
+        ),
         (&root::WORKER_MIRRORS, 0x0104_0000_0000, 0x0105_0000_0000),
         (&root::STATIC_SCRATCH, 0x0105_0000_0000, 0x0105_1c00_0000),
         (&root::SHELL_MIRRORS, 0x0105_1c00_0000, 0x0105_1c40_0000),
@@ -73,24 +107,50 @@ fn every_root_band_is_where_the_plan_says() {
         (&root::DEVICE_MAPPINGS, 0x4000_0000_0000, 0x4001_0000_0000),
         (&root::PS_OBJECTS, 0x4080_0000_0000, 0x4100_0000_0000),
     ];
-    assert_eq!(plan.len(), root::REGIONS.len(), "a band is missing from the plan");
+    assert_eq!(
+        plan.len(),
+        root::REGIONS.len(),
+        "a band is missing from the plan"
+    );
     for ((region, base, end), listed) in plan.iter().zip(root::REGIONS) {
-        assert_eq!(*region, listed, "{} is out of order in the table", region.name);
-        assert_eq!((region.base, region.end()), (*base, *end), "{}", region.name);
+        assert_eq!(
+            *region, listed,
+            "{} is out of order in the table",
+            region.name
+        );
+        assert_eq!(
+            (region.base, region.end()),
+            (*base, *end),
+            "{}",
+            region.name
+        );
     }
 }
 
 #[test]
 fn every_component_band_is_where_the_plan_says() {
     let plan: &[(&Region, u64, u64)] = &[
-        (&component::RESOURCE_WINDOWS, 0x0100_1600_0000, 0x0100_1e00_0000),
+        (
+            &component::RESOURCE_WINDOWS,
+            0x0100_1600_0000,
+            0x0100_1e00_0000,
+        ),
         (&component::HEAP, 0x0100_1e00_0000, 0x0100_2380_0000),
-        (&component::SECTION_VIEWS, 0x0100_2380_0000, 0x0100_3000_0000),
+        (
+            &component::SECTION_VIEWS,
+            0x0100_2380_0000,
+            0x0100_3000_0000,
+        ),
     ];
     assert_eq!(plan.len(), component::REGIONS.len());
     for ((region, base, end), listed) in plan.iter().zip(component::REGIONS) {
         assert_eq!(*region, listed);
-        assert_eq!((region.base, region.end()), (*base, *end), "{}", region.name);
+        assert_eq!(
+            (region.base, region.end()),
+            (*base, *end),
+            "{}",
+            region.name
+        );
     }
 }
 
@@ -127,7 +187,7 @@ fn every_static_process_has_a_whole_scratch_window() {
 fn every_dynamic_process_has_a_whole_runtime_window() {
     let dynamic = (HOSTED_PROCESS_LIMIT - STATIC_PROCESS_COUNT) as u64;
     assert_eq!(root::DYNAMIC_RUNTIME.len, dynamic * DYNAMIC_RUNTIME_STRIDE);
-    assert!(DYNAMIC_RUNTIME_STRIDE >= DEMAND_SCRATCH_WINDOW + 4 * 0x10_0000);
+    const _: () = assert!(DYNAMIC_RUNTIME_STRIDE >= DEMAND_SCRATCH_WINDOW + 4 * 0x10_0000);
     assert_eq!(root::DYNAMIC_RUNTIME.base % TABLE_SPAN, 0);
     assert_eq!(DYNAMIC_RUNTIME_STRIDE % TABLE_SPAN, 0);
     // Raising the process limit to the badge limit keeps the band below its neighbour.
@@ -145,16 +205,19 @@ fn every_lane_of_every_process_has_a_mirror() {
     assert_eq!(root::WORKER_MIRRORS.base % WORKER_MIRROR_STRIDE, 0);
     assert_eq!((HOSTED_PROCESS_LIMIT, WORKER_LANES_PER_PROCESS), (32, 32));
     // Lane sets are 64-bit masks.
-    assert!(WORKER_LANES_PER_PROCESS <= 64);
+    const _: () = assert!(WORKER_LANES_PER_PROCESS <= 64);
 }
 
 /// A dynamic process is named on its fault endpoint by a badge, and the badges run out.
 #[test]
 fn every_process_slot_has_a_badge() {
     assert_eq!(STATIC_PROCESS_COUNT, nt_exe_image::DYNAMIC_PROCESS_FIRST_PI);
-    assert!(HOSTED_PROCESS_LIMIT <= nt_exe_image::DYNAMIC_PROCESS_PI_LIMIT);
+    const _: () = assert!(HOSTED_PROCESS_LIMIT <= nt_exe_image::DYNAMIC_PROCESS_PI_LIMIT);
     for pi in STATIC_PROCESS_COUNT..HOSTED_PROCESS_LIMIT {
-        assert!(nt_exe_image::dynamic_top_badge_for_pi(pi).is_some(), "pi {pi} has no badge");
+        assert!(
+            nt_exe_image::dynamic_top_badge_for_pi(pi).is_some(),
+            "pi {pi} has no badge"
+        );
     }
 }
 
@@ -171,7 +234,7 @@ fn the_root_heap_stays_under_the_image_page_directory() {
 #[test]
 fn the_private_memory_limit_separates_the_two_groups() {
     assert!(root::HEAP.end() <= PRIVATE_VM_LIMIT);
-    assert!(root::STATIC_SCRATCH.base >= PRIVATE_VM_LIMIT);
+    const _: () = assert!(root::STATIC_SCRATCH.base >= PRIVATE_VM_LIMIT);
     assert_eq!(root::PROVIDER_LARGE_POOL.base, PRIVATE_VM_LIMIT);
     assert!(component::SECTION_VIEWS.end() <= PRIVATE_VM_LIMIT);
 }

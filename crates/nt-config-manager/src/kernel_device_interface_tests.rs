@@ -18,11 +18,19 @@ fn kernel_interface_query_filters_exact_devnode_class_and_enabled_state() {
     let mut cm = ConfigManager::new();
     let first = cm.register_devnode(r"ROOT\DISPLAY\0000", Some("DisplaySvc"), None, &[], &[]);
     let second = cm.register_devnode(r"ROOT\DISPLAY\0001", Some("DisplaySvc"), None, &[], &[]);
-    let first_interface = cm.register_interface(first, DISPLAY_GUID, "", true).unwrap();
-    let second_interface = cm.register_interface(second, DISPLAY_GUID, "Port1", false).unwrap();
+    let first_interface = cm
+        .register_interface(first, DISPLAY_GUID, "", true)
+        .unwrap();
+    let second_interface = cm
+        .register_interface(second, DISPLAY_GUID, "Port1", false)
+        .unwrap();
     cm.register_interface(first, OTHER_GUID, "", true).unwrap();
     let first_path = cm.interface(first_interface).unwrap().symbolic_link.clone();
-    let second_path = cm.interface(second_interface).unwrap().symbolic_link.clone();
+    let second_path = cm
+        .interface(second_interface)
+        .unwrap()
+        .symbolic_link
+        .clone();
 
     assert_eq!(
         cm.kernel_device_interface_multi_sz(&DISPLAY_GUID.to_ascii_lowercase(), None, false),

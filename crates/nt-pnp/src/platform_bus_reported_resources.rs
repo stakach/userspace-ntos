@@ -2,13 +2,11 @@ use alloc::vec::Vec;
 
 use nt_cm_resources::{
     CmResourceDescriptor, InterruptDescriptor, PortDescriptor, CM_RESOURCE_INTERRUPT_LATCHED,
-    CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE, CM_RESOURCE_PORT_IO,
-    CM_RESOURCE_PORT_16_BIT_DECODE, CM_RESOURCE_PORT_POSITIVE_DECODE,
-    CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, CM_RESOURCE_SHARE_DRIVER_EXCLUSIVE,
-    CM_RESOURCE_SHARE_SHARED, CM_RESOURCE_TYPE_INTERRUPT, CM_RESOURCE_TYPE_PORT,
-    INTERFACE_TYPE_INTERNAL,
-    IO_RESOURCE_DESCRIPTOR_SIZE, IO_RESOURCE_LIST_HEADER_SIZE,
-    IO_RESOURCE_REQUIREMENTS_FIXED_SIZE, PARTIAL_DESCRIPTOR_SIZE,
+    CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE, CM_RESOURCE_PORT_16_BIT_DECODE, CM_RESOURCE_PORT_IO,
+    CM_RESOURCE_PORT_POSITIVE_DECODE, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+    CM_RESOURCE_SHARE_DRIVER_EXCLUSIVE, CM_RESOURCE_SHARE_SHARED, CM_RESOURCE_TYPE_INTERRUPT,
+    CM_RESOURCE_TYPE_PORT, INTERFACE_TYPE_INTERNAL, IO_RESOURCE_DESCRIPTOR_SIZE,
+    IO_RESOURCE_LIST_HEADER_SIZE, IO_RESOURCE_REQUIREMENTS_FIXED_SIZE, PARTIAL_DESCRIPTOR_SIZE,
 };
 
 use crate::{PlatformInterruptResource, PlatformPortResource};
@@ -53,9 +51,13 @@ pub fn admit_bus_reported_platform_resources<'a>(
     let slot_number = field_u32(resource_requirements, 12)?;
 
     let mut ports = Vec::new();
-    ports.try_reserve_exact(descriptor_count.saturating_sub(1)).map_err(|_| invalid)?;
+    ports
+        .try_reserve_exact(descriptor_count.saturating_sub(1))
+        .map_err(|_| invalid)?;
     let mut candidates = Vec::new();
-    candidates.try_reserve_exact(descriptor_count).map_err(|_| invalid)?;
+    candidates
+        .try_reserve_exact(descriptor_count)
+        .map_err(|_| invalid)?;
     let mut raw_interrupt = None;
     for index in 0..descriptor_count {
         let offset = 20usize
@@ -74,7 +76,10 @@ pub fn admit_bus_reported_platform_resources<'a>(
                     flags,
                     share,
                 };
-                let end = port.start.checked_add(u64::from(port.length)).ok_or(invalid)?;
+                let end = port
+                    .start
+                    .checked_add(u64::from(port.length))
+                    .ok_or(invalid)?;
                 if port.length == 0
                     || end == 0
                     || end - 1 > u16::MAX as u64
@@ -84,11 +89,15 @@ pub fn admit_bus_reported_platform_resources<'a>(
                             | CM_RESOURCE_PORT_16_BIT_DECODE
                             | CM_RESOURCE_PORT_POSITIVE_DECODE)
                         != 0
-                    || !matches!(port.share, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE | CM_RESOURCE_SHARE_DRIVER_EXCLUSIVE)
+                    || !matches!(
+                        port.share,
+                        CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE | CM_RESOURCE_SHARE_DRIVER_EXCLUSIVE
+                    )
                     || !authorized_ports.iter().any(|window| {
                         window.start <= port.start
                             && window.length != 0
-                            && window.start
+                            && window
+                                .start
                                 .checked_add(u64::from(window.length))
                                 .is_some_and(|window_end| {
                                     end <= window_end && window_end <= u16::MAX as u64 + 1
@@ -121,9 +130,13 @@ pub fn admit_bus_reported_platform_resources<'a>(
                         } else {
                             CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
                         }
-                    || (interrupt.share == CM_RESOURCE_SHARE_SHARED)
-                        != authorized_interrupt.shared
-                    || !matches!(interrupt.share, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE | CM_RESOURCE_SHARE_DRIVER_EXCLUSIVE | CM_RESOURCE_SHARE_SHARED)
+                    || (interrupt.share == CM_RESOURCE_SHARE_SHARED) != authorized_interrupt.shared
+                    || !matches!(
+                        interrupt.share,
+                        CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
+                            | CM_RESOURCE_SHARE_DRIVER_EXCLUSIVE
+                            | CM_RESOURCE_SHARE_SHARED
+                    )
                 {
                     return Err(invalid);
                 }
@@ -179,8 +192,8 @@ fn normalized_interrupt_requirements(
     raw_interrupt: InterruptDescriptor,
 ) -> Result<Vec<u8>, BusReportedPlatformResourceError> {
     let invalid = BusReportedPlatformResourceError::Invalid;
-    if nt_cm_resources::validate_io_resource_requirements_list_extent(bytes)
-        .map_err(|_| invalid)? != bytes.len()
+    if nt_cm_resources::validate_io_resource_requirements_list_extent(bytes).map_err(|_| invalid)?
+        != bytes.len()
     {
         return Err(invalid);
     }
@@ -191,10 +204,16 @@ fn normalized_interrupt_requirements(
     let mut list_offset = IO_RESOURCE_REQUIREMENTS_FIXED_SIZE;
     for _ in 0..alternatives {
         let count = field_u32(bytes, list_offset + 4)? as usize;
-        let descriptors = list_offset.checked_add(IO_RESOURCE_LIST_HEADER_SIZE).ok_or(invalid)?;
+        let descriptors = list_offset
+            .checked_add(IO_RESOURCE_LIST_HEADER_SIZE)
+            .ok_or(invalid)?;
         for index in 0..count {
             let descriptor = descriptors
-                .checked_add(index.checked_mul(IO_RESOURCE_DESCRIPTOR_SIZE).ok_or(invalid)?)
+                .checked_add(
+                    index
+                        .checked_mul(IO_RESOURCE_DESCRIPTOR_SIZE)
+                        .ok_or(invalid)?,
+                )
                 .ok_or(invalid)?;
             if interface_type == INTERFACE_TYPE_INTERNAL
                 && bus_number == 0
@@ -212,23 +231,39 @@ fn normalized_interrupt_requirements(
             }
         }
         list_offset = descriptors
-            .checked_add(count.checked_mul(IO_RESOURCE_DESCRIPTOR_SIZE).ok_or(invalid)?)
+            .checked_add(
+                count
+                    .checked_mul(IO_RESOURCE_DESCRIPTOR_SIZE)
+                    .ok_or(invalid)?,
+            )
             .ok_or(invalid)?;
     }
     Ok(copy)
 }
 
 fn field_u16(bytes: &[u8], offset: usize) -> Result<u16, BusReportedPlatformResourceError> {
-    let field = bytes.get(offset..offset + 2).ok_or(BusReportedPlatformResourceError::Invalid)?;
-    Ok(u16::from_le_bytes(field.try_into().expect("two-byte field")))
+    let field = bytes
+        .get(offset..offset + 2)
+        .ok_or(BusReportedPlatformResourceError::Invalid)?;
+    Ok(u16::from_le_bytes(
+        field.try_into().expect("two-byte field"),
+    ))
 }
 
 fn field_u32(bytes: &[u8], offset: usize) -> Result<u32, BusReportedPlatformResourceError> {
-    let field = bytes.get(offset..offset + 4).ok_or(BusReportedPlatformResourceError::Invalid)?;
-    Ok(u32::from_le_bytes(field.try_into().expect("four-byte field")))
+    let field = bytes
+        .get(offset..offset + 4)
+        .ok_or(BusReportedPlatformResourceError::Invalid)?;
+    Ok(u32::from_le_bytes(
+        field.try_into().expect("four-byte field"),
+    ))
 }
 
 fn field_u64(bytes: &[u8], offset: usize) -> Result<u64, BusReportedPlatformResourceError> {
-    let field = bytes.get(offset..offset + 8).ok_or(BusReportedPlatformResourceError::Invalid)?;
-    Ok(u64::from_le_bytes(field.try_into().expect("eight-byte field")))
+    let field = bytes
+        .get(offset..offset + 8)
+        .ok_or(BusReportedPlatformResourceError::Invalid)?;
+    Ok(u64::from_le_bytes(
+        field.try_into().expect("eight-byte field"),
+    ))
 }

@@ -211,12 +211,13 @@ impl<'a> RegfHive<'a> {
         self.data.get(body_start..cell_end)
     }
 
-    /// A cell body given a *file* offset already past the size word is not needed — everything is
-    /// keyed by hbin-relative cell offset via `cell_body`.
+    // A cell body given a *file* offset already past the size word is not needed — everything is
+    // keyed by hbin-relative cell offset via `cell_body`.
 
     /// Exact NK object kind; a key named `Current` is not necessarily a registry link.
     pub fn key_kind(&self, nk: KeyRef) -> Result<nt_hive_core::KeyKind, RegfHiveImportError> {
-        let body = self.allocated_cell_body(nk)
+        let body = self
+            .allocated_cell_body(nk)
             .filter(|body| body.get(..2) == Some(&b"nk"[..]))
             .ok_or(RegfHiveImportError::InvalidKey)?;
         let flags = u16le(body, 2).ok_or(RegfHiveImportError::InvalidKey)?;
@@ -242,7 +243,7 @@ impl<'a> RegfHive<'a> {
             }
         } else {
             // UTF-16LE.
-            for pair in raw.chunks_exact(2) {
+            for pair in raw.as_chunks::<2>().0 {
                 let w = u16::from_le_bytes([pair[0], pair[1]]);
                 if let Some(c) = char::from_u32(w as u32) {
                     for lc in c.to_lowercase() {
@@ -269,7 +270,7 @@ impl<'a> RegfHive<'a> {
                 s.push(c as char);
             }
         } else {
-            for pair in raw.chunks_exact(2) {
+            for pair in raw.as_chunks::<2>().0 {
                 let w = u16::from_le_bytes([pair[0], pair[1]]);
                 s.push(char::from_u32(w as u32)?);
             }
@@ -303,7 +304,7 @@ impl<'a> RegfHive<'a> {
         if class_len == 0 {
             return Ok(None);
         }
-        if class_cell == HCELL_NIL || class_len % 2 != 0 {
+        if class_cell == HCELL_NIL || !class_len.is_multiple_of(2) {
             return Err(RegfHiveImportError::InvalidClass);
         }
         let raw = self
@@ -316,7 +317,9 @@ impl<'a> RegfHive<'a> {
             .try_reserve_exact(unit_count.saturating_mul(3))
             .map_err(|_| RegfHiveImportError::OutOfMemory)?;
         let units = raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
         for character in core::char::decode_utf16(units) {
             class_name.push(character.map_err(|_| RegfHiveImportError::InvalidClass)?);
@@ -782,7 +785,7 @@ impl<'a> RegfHive<'a> {
                 s.push(c as char); // COMP_NAME: Latin-1
             }
         } else {
-            for pair in raw.chunks_exact(2) {
+            for pair in raw.as_chunks::<2>().0 {
                 if let Some(c) = char::from_u32(u16::from_le_bytes([pair[0], pair[1]]) as u32) {
                     s.push(c);
                 }
@@ -975,7 +978,7 @@ fn count_regf_key_cells(
     depth: usize,
     visited: &mut Vec<KeyRef>,
 ) -> Result<RegfHiveCellCounts, RegfHiveImportError> {
-    if depth > CONFIG_IMPORT_MAX_DEPTH || visited.iter().any(|key| *key == source_key) {
+    if depth > CONFIG_IMPORT_MAX_DEPTH || visited.contains(&source_key) {
         return Err(RegfHiveImportError::DepthLimitOrCycle);
     }
     let body = source
@@ -1007,7 +1010,7 @@ fn import_regf_key_into_hive(
     depth: usize,
     visited: &mut Vec<KeyRef>,
 ) -> Result<(), RegfHiveImportError> {
-    if depth > CONFIG_IMPORT_MAX_DEPTH || visited.iter().any(|key| *key == source_key) {
+    if depth > CONFIG_IMPORT_MAX_DEPTH || visited.contains(&source_key) {
         return Err(RegfHiveImportError::DepthLimitOrCycle);
     }
     visited
@@ -1166,18 +1169,15 @@ fn compose_boot_system_hive_inner(
     };
     let base_sequence = base.sequence;
     let replayed_sequence = if let Some(suffix) = wal_suffix {
-        let snapshot_log = persisted_log
-            .get(..suffix.snapshot_log_len)
-            .ok_or(BootSystemHiveComposeError::PersistedLog(
-                nt_hive_core::HiveLogReplayError::Truncated,
-            ))?;
-        let wal_log = persisted_log
-            .get(suffix.snapshot_log_len..)
-            .ok_or(BootSystemHiveComposeError::PersistedLog(
-                nt_hive_core::HiveLogReplayError::Truncated,
-            ))?;
-        let snapshot_sequence = nt_hive_core::try_replay_log(&mut base, snapshot_log, base_sequence)
-            .map_err(BootSystemHiveComposeError::PersistedLog)?;
+        let snapshot_log = persisted_log.get(..suffix.snapshot_log_len).ok_or(
+            BootSystemHiveComposeError::PersistedLog(nt_hive_core::HiveLogReplayError::Truncated),
+        )?;
+        let wal_log = persisted_log.get(suffix.snapshot_log_len..).ok_or(
+            BootSystemHiveComposeError::PersistedLog(nt_hive_core::HiveLogReplayError::Truncated),
+        )?;
+        let snapshot_sequence =
+            nt_hive_core::try_replay_log(&mut base, snapshot_log, base_sequence)
+                .map_err(BootSystemHiveComposeError::PersistedLog)?;
         if suffix.first_sequence <= snapshot_sequence {
             return Err(BootSystemHiveComposeError::PersistedLog(
                 nt_hive_core::HiveLogReplayError::NonAdvancingSequence,
@@ -1362,15 +1362,33 @@ mod tests {
         let child_body = HBIN_BASE + 0xa0 + 4;
         write_u16(&mut bytes, child_body + 2, 0x20 | 0x10);
         let source = RegfHive::new(&bytes).unwrap();
-        assert_eq!(source.key_kind(source.root()), Ok(nt_hive_core::KeyKind::Ordinary));
-        assert_eq!(source.key_kind(0xa0), Ok(nt_hive_core::KeyKind::SymbolicLink));
+        assert_eq!(
+            source.key_kind(source.root()),
+            Ok(nt_hive_core::KeyKind::Ordinary)
+        );
+        assert_eq!(
+            source.key_kind(0xa0),
+            Ok(nt_hive_core::KeyKind::SymbolicLink)
+        );
         let (hive, _) = try_import_regf_into_hive(&source, HiveKind::System).unwrap();
         let child = hive.open_key("Child").unwrap();
-        assert_eq!(hive.key_kind(child), Some(nt_hive_core::KeyKind::SymbolicLink));
+        assert_eq!(
+            hive.key_kind(child),
+            Some(nt_hive_core::KeyKind::SymbolicLink)
+        );
         let restored = nt_hive_core::decode_image(&nt_hive_core::encode_image(&hive)).unwrap();
-        assert_eq!(restored.key_kind(restored.open_key("Child").unwrap()), Some(nt_hive_core::KeyKind::SymbolicLink));
-        let subtree = nt_hive_core::decode_image(&nt_hive_core::try_encode_subtree_image(&hive, child).unwrap()).unwrap();
-        assert_eq!(subtree.key_kind(subtree.root()), Some(nt_hive_core::KeyKind::SymbolicLink));
+        assert_eq!(
+            restored.key_kind(restored.open_key("Child").unwrap()),
+            Some(nt_hive_core::KeyKind::SymbolicLink)
+        );
+        let subtree = nt_hive_core::decode_image(
+            &nt_hive_core::try_encode_subtree_image(&hive, child).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            subtree.key_kind(subtree.root()),
+            Some(nt_hive_core::KeyKind::SymbolicLink)
+        );
     }
 
     fn metadata_test_hive() -> (Vec<u8>, Vec<u8>) {
@@ -2386,8 +2404,7 @@ mod tests {
     fn secured_services_test_hive() -> (Vec<u8>, Vec<u8>) {
         const SECURITY: u32 = 0x1280;
         const KEYS: &[u32] = &[
-            0x20, 0x100, 0x180, 0x240, 0x300, 0x880, 0x900, 0xb00, 0xb80, 0xc00,
-            0xc80, 0x1100,
+            0x20, 0x100, 0x180, 0x240, 0x300, 0x880, 0x900, 0xb00, 0xb80, 0xc00, 0xc80, 0x1100,
         ];
         let mut data = services_test_hive();
         let descriptor = system_fixture_security();
@@ -2481,9 +2498,12 @@ mod tests {
             composed.hive.key_security_descriptor(services),
             Some(parent_security.as_slice())
         );
-        let generated = composed.hive
-            .open_key(r"ControlSet002\Services\GeneratedDriver").unwrap();
-        let inherited = nt_config_manager::inherit_generated_key_security(&parent_security).unwrap();
+        let generated = composed
+            .hive
+            .open_key(r"ControlSet002\Services\GeneratedDriver")
+            .unwrap();
+        let inherited =
+            nt_config_manager::inherit_generated_key_security(&parent_security).unwrap();
         assert_eq!(
             composed.hive.key_security_descriptor(generated),
             Some(inherited.as_slice())
@@ -2521,19 +2541,33 @@ mod tests {
         let generated = generated_overlay_image();
         assert!(matches!(
             compose_boot_system_hive_with_wal_suffix(
-                Some(&installed), None, &record[..record.len() - 1], &generated, proof,
+                Some(&installed),
+                None,
+                &record[..record.len() - 1],
+                &generated,
+                proof,
             ),
             Err(BootSystemHiveComposeError::PersistedLog(
                 nt_hive_core::HiveLogReplayError::Truncated
             ))
         ));
         let composed = compose_boot_system_hive_with_wal_suffix(
-            Some(&installed), None, &record, &generated, proof,
+            Some(&installed),
+            None,
+            &record,
+            &generated,
+            proof,
         )
         .expect("complete committed WAL mutation");
         assert_eq!(composed.replayed_sequence, 1);
-        assert_eq!(composed.hive.sequence, 1, "the imported CM must append after the recovered WAL");
-        let key = composed.hive.open_key(r"ControlSet001\Services\Npfs").unwrap();
+        assert_eq!(
+            composed.hive.sequence, 1,
+            "the imported CM must append after the recovered WAL"
+        );
+        let key = composed
+            .hive
+            .open_key(r"ControlSet001\Services\Npfs")
+            .unwrap();
         assert_eq!(composed.hive.query_dword(key, "Recovered"), Some(7));
 
         // A checkpoint of the composed image is the next boot's primary. Its sequence must
@@ -2562,12 +2596,21 @@ mod tests {
         .expect("next boot must compose the advancing WAL suffix");
         assert_eq!(rebooted.replayed_sequence, 2);
         assert_eq!(rebooted.hive.sequence, 2);
-        let key = rebooted.hive.open_key(r"ControlSet001\Services\Npfs").unwrap();
+        let key = rebooted
+            .hive
+            .open_key(r"ControlSet001\Services\Npfs")
+            .unwrap();
         assert_eq!(rebooted.hive.query_dword(key, "AfterReboot"), Some(8));
         assert!(matches!(
             compose_boot_system_hive_with_wal_suffix(
-                Some(&installed), None, &record, &generated,
-                BootSystemWalSuffix { first_sequence: 0, ..proof },
+                Some(&installed),
+                None,
+                &record,
+                &generated,
+                BootSystemWalSuffix {
+                    first_sequence: 0,
+                    ..proof
+                },
             ),
             Err(BootSystemHiveComposeError::PersistedLog(
                 nt_hive_core::HiveLogReplayError::NonAdvancingSequence
@@ -2584,7 +2627,10 @@ mod tests {
         );
         assert!(matches!(
             compose_boot_system_hive_with_wal_suffix(
-                Some(&installed), None, &skipped, &generated,
+                Some(&installed),
+                None,
+                &skipped,
+                &generated,
                 BootSystemWalSuffix {
                     first_sequence: 2,
                     last_sequence: 2,
@@ -2643,9 +2689,12 @@ mod tests {
             composed.hive.key_security_descriptor(services),
             Some(parent_security.as_slice())
         );
-        let generated = composed.hive
-            .open_key(r"ControlSet001\Services\GeneratedDriver").unwrap();
-        let inherited = nt_config_manager::inherit_generated_key_security(&parent_security).unwrap();
+        let generated = composed
+            .hive
+            .open_key(r"ControlSet001\Services\GeneratedDriver")
+            .unwrap();
+        let inherited =
+            nt_config_manager::inherit_generated_key_security(&parent_security).unwrap();
         assert_eq!(
             composed.hive.key_security_descriptor(generated),
             Some(inherited.as_slice())

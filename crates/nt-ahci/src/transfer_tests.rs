@@ -50,7 +50,10 @@ impl Hba {
     fn complete(&mut self) {
         let bytes = self.moved.unwrap_or(self.requested_bytes());
         if self.dma[0x502] == 0x25 {
-            for (index, byte) in self.dma[DATA_OFFSET..DATA_OFFSET + bytes].iter_mut().enumerate() {
+            for (index, byte) in self.dma[DATA_OFFSET..DATA_OFFSET + bytes]
+                .iter_mut()
+                .enumerate()
+            {
                 *byte = index as u8;
             }
         }
@@ -107,7 +110,16 @@ impl PortIo for Hba {
 }
 
 fn read(hba: &mut Hba, sectors: u32) -> TransferOutcome {
-    transfer(hba, DMA, WINDOW, Transfer::Read { lba: 0x12_3456_789a, sectors }, BUDGET)
+    transfer(
+        hba,
+        DMA,
+        WINDOW,
+        Transfer::Read {
+            lba: 0x12_3456_789a,
+            sectors,
+        },
+        BUDGET,
+    )
 }
 
 #[test]
@@ -115,10 +127,14 @@ fn completed_read_programs_one_exact_prdt_and_releases_the_slot() {
     let mut hba = Hba::new();
     assert_eq!(read(&mut hba, 4), TransferOutcome::Completed);
     assert_eq!(&hba.dma[..4], &[5, 0, 1, 0]);
-    assert_eq!(&hba.dma[0x500..0x50e], &[
-        0x27, 0x80, 0x25, 0, 0x9a, 0x78, 0x56, 0x40, 0x34, 0x12, 0, 0, 4, 0,
-    ]);
-    assert_eq!(u64::from_le_bytes(hba.dma[0x580..0x588].try_into().unwrap()), DMA + 0x800);
+    assert_eq!(
+        &hba.dma[0x500..0x50e],
+        &[0x27, 0x80, 0x25, 0, 0x9a, 0x78, 0x56, 0x40, 0x34, 0x12, 0, 0, 4, 0,]
+    );
+    assert_eq!(
+        u64::from_le_bytes(hba.dma[0x580..0x588].try_into().unwrap()),
+        DMA + 0x800
+    );
     assert_eq!(hba.requested_bytes(), 2048);
     assert!(TransferOutcome::Completed.hba_released());
 }
@@ -130,7 +146,7 @@ fn legal_multi_sector_read_owns_the_former_fat_cache_bytes() {
     let mut hba = Hba::new();
     assert_eq!(read(&mut hba, 3), TransferOutcome::Completed);
     assert!(hba.dma[0xa00..0xc08].iter().any(|byte| *byte != 0xcc));
-    assert!(DATA_OFFSET + 3 * 512 > 0xa00 + 8);
+    const _: () = assert!(DATA_OFFSET + 3 * 512 > 0xa00 + 8);
 }
 
 #[test]
@@ -138,7 +154,10 @@ fn write_staging_covers_the_window_and_is_written_only_to_a_free_slot() {
     let data = [0x5a; 4 * 512];
     let mut hba = Hba::new();
     hba.regs[14] = 1; // A previous command still owns slot zero.
-    let request = Transfer::Write { lba: 9, data: &data };
+    let request = Transfer::Write {
+        lba: 9,
+        data: &data,
+    };
     assert_eq!(
         transfer(&mut hba, DMA, WINDOW, request, BUDGET),
         TransferOutcome::Refused(Error::Busy)
@@ -146,8 +165,13 @@ fn write_staging_covers_the_window_and_is_written_only_to_a_free_slot() {
     assert_eq!(hba.dma_writes, 0);
     assert!(hba.dma[DATA_OFFSET..].iter().all(|byte| *byte == 0xcc));
     hba.regs[14] = 0;
-    assert_eq!(transfer(&mut hba, DMA, WINDOW, request, BUDGET), TransferOutcome::Completed);
-    assert!(hba.dma[DATA_OFFSET..DATA_OFFSET + data.len()].iter().all(|byte| *byte == 0x5a));
+    assert_eq!(
+        transfer(&mut hba, DMA, WINDOW, request, BUDGET),
+        TransferOutcome::Completed
+    );
+    assert!(hba.dma[DATA_OFFSET..DATA_OFFSET + data.len()]
+        .iter()
+        .all(|byte| *byte == 0x5a));
     assert_eq!(hba.dma[0x502], 0x35);
     assert_eq!(hba.dma[0] & (1 << 6), 1 << 6);
 }
@@ -158,7 +182,13 @@ fn completed_ata_error_is_a_released_failure_not_data() {
         let mut hba = Hba::new();
         hba.issue_tfd = task_file;
         let outcome = read(&mut hba, 2);
-        assert_eq!(outcome, TransferOutcome::Failed { error: Error::Device, task_file });
+        assert_eq!(
+            outcome,
+            TransferOutcome::Failed {
+                error: Error::Device,
+                task_file
+            }
+        );
         assert!(!outcome.is_completed());
         assert!(outcome.hba_released());
         assert_eq!(outcome.diagnostic(), task_file);
@@ -174,7 +204,13 @@ fn cache_shaped_partial_dma_is_rejected_by_byte_count() {
     let mut hba = Hba::new();
     hba.moved = Some(520); // One sector plus a cache-header-sized tail.
     let outcome = read(&mut hba, 3);
-    assert_eq!(outcome, TransferOutcome::Failed { error: Error::ShortTransfer, task_file: 0x50 });
+    assert_eq!(
+        outcome,
+        TransferOutcome::Failed {
+            error: Error::ShortTransfer,
+            task_file: 0x50
+        }
+    );
     assert!(!outcome.is_completed());
 }
 
@@ -199,11 +235,18 @@ fn fatal_status_with_ci_still_set_retains_the_slot() {
 fn latched_fatal_on_a_running_port_refuses_reissue_without_clearing_it() {
     let mut hba = Hba::new();
     hba.issue_is = 1 << 30;
-    assert_eq!(read(&mut hba, 1), TransferOutcome::Outstanding(Error::Device));
+    assert_eq!(
+        read(&mut hba, 1),
+        TransferOutcome::Outstanding(Error::Device)
+    );
     hba.issue_is = 0;
     let writes = hba.dma_writes;
     assert_eq!(read(&mut hba, 1), TransferOutcome::Refused(Error::Device));
-    assert_eq!(hba.regs[4], 1 << 30, "the fatal record is retained for recovery");
+    assert_eq!(
+        hba.regs[4],
+        1 << 30,
+        "the fatal record is retained for recovery"
+    );
     assert_eq!((hba.dma_writes, hba.issues), (writes, 1));
 }
 
@@ -211,7 +254,10 @@ fn latched_fatal_on_a_running_port_refuses_reissue_without_clearing_it() {
 fn completion_delayed_past_timeout_is_outstanding_until_the_hba_releases_it() {
     let mut hba = Hba::new();
     hba.completion = Completion::After(BUDGET as u32 * 2);
-    assert_eq!(read(&mut hba, 2), TransferOutcome::Outstanding(Error::Timeout));
+    assert_eq!(
+        read(&mut hba, 2),
+        TransferOutcome::Outstanding(Error::Timeout)
+    );
     let writes = hba.dma_writes;
     // Each refused attempt observes PxCI; the late completion eventually lands.
     let mut refused = 0;
@@ -229,8 +275,14 @@ fn invalid_requests_change_no_hardware_state() {
     let odd = [0u8; 513];
     for request in [
         Transfer::Read { lba: 0, sectors: 0 },
-        Transfer::Read { lba: 0, sectors: (WINDOW / 512) as u32 + 1 },
-        Transfer::Read { lba: 1 << 48, sectors: 1 },
+        Transfer::Read {
+            lba: 0,
+            sectors: (WINDOW / 512) as u32 + 1,
+        },
+        Transfer::Read {
+            lba: 1 << 48,
+            sectors: 1,
+        },
         Transfer::Write { lba: 0, data: &odd },
         Transfer::Write { lba: 0, data: &[] },
     ] {
@@ -243,7 +295,13 @@ fn invalid_requests_change_no_hardware_state() {
     }
     let mut hba = Hba::new();
     assert_eq!(
-        transfer(&mut hba, DMA + 0x200, WINDOW, Transfer::Read { lba: 0, sectors: 1 }, BUDGET),
+        transfer(
+            &mut hba,
+            DMA + 0x200,
+            WINDOW,
+            Transfer::Read { lba: 0, sectors: 1 },
+            BUDGET
+        ),
         TransferOutcome::Refused(Error::InvalidDma)
     );
 }

@@ -22,9 +22,9 @@
 
 extern crate alloc;
 
-pub mod page_lock;
-pub mod create_mdl;
 pub mod contiguous;
+pub mod create_mdl;
+pub mod page_lock;
 pub mod pfn;
 
 use alloc::vec::Vec;
@@ -73,10 +73,18 @@ pub fn partial_mdl_range(
         return None;
     }
     source_address.checked_add(u64::from(source_length) - 1)?;
-    let address = if requested_address == 0 { source_address } else { requested_address };
+    let address = if requested_address == 0 {
+        source_address
+    } else {
+        requested_address
+    };
     let offset = address.checked_sub(source_address)?;
     let remaining = u64::from(source_length).checked_sub(offset)?;
-    let length = if requested_length == 0 { remaining } else { u64::from(requested_length) };
+    let length = if requested_length == 0 {
+        remaining
+    } else {
+        u64::from(requested_length)
+    };
     if length == 0 || length > remaining || address.checked_add(length - 1).is_none() {
         return None;
     }
@@ -246,9 +254,7 @@ impl MdlRegistry {
                 && source.generation == binding.generation
                 && source.locked
                 && source.virtual_address != 0
-                && source
-                    .virtual_address
-                    .checked_add(binding.offset)
+                && source.virtual_address.checked_add(binding.offset)
                     == Some(record.virtual_address)
                 && binding
                     .offset
@@ -259,9 +265,9 @@ impl MdlRegistry {
 
     fn active_partial_dependents(&self, source_id: u64, generation: u32) -> Result<(), MdlError> {
         for target in self.mdls.iter().filter(|record| {
-            record.partial_source.is_some_and(|binding| {
-                binding.id == source_id && binding.generation == generation
-            })
+            record
+                .partial_source
+                .is_some_and(|binding| binding.id == source_id && binding.generation == generation)
         }) {
             if self.has_read_lease(target.id) {
                 return Err(MdlError::ActiveReadLeases);
@@ -275,9 +281,10 @@ impl MdlRegistry {
 
     fn invalidate_partial_dependents(&mut self, source_id: u64, generation: u32) {
         for target in &mut self.mdls {
-            if target.partial_source.is_some_and(|binding| {
-                binding.id == source_id && binding.generation == generation
-            }) {
+            if target
+                .partial_source
+                .is_some_and(|binding| binding.id == source_id && binding.generation == generation)
+            {
                 target.partial_source = None;
             }
         }
@@ -376,11 +383,16 @@ impl MdlRegistry {
         }
         let generation = self.find(id).ok_or(MdlError::StaleId)?.generation;
         self.active_partial_dependents(id, generation)?;
-        if self.find(id).is_some_and(|record| record.active_mappings != 0) {
+        if self
+            .find(id)
+            .is_some_and(|record| record.active_mappings != 0)
+        {
             return Err(MdlError::ActiveMappings);
         }
         let required = mdl_allocation_size(virtual_address, length).ok_or(MdlError::OutOfRange)?;
-        if self.find(id).and_then(|record| record.allocated_bytes)
+        if self
+            .find(id)
+            .and_then(|record| record.allocated_bytes)
             .is_none_or(|allocated| required > allocated)
         {
             return Err(MdlError::OutOfRange);
@@ -413,15 +425,19 @@ impl MdlRegistry {
             return Err(MdlError::InvalidKey);
         }
         let source_record = self.find_key(source).ok_or(MdlError::StaleId)?;
-        if !source_record.locked || source_record.virtual_address == 0
+        if !source_record.locked
+            || source_record.virtual_address == 0
             || source_record.partial_source.is_some()
         {
             return Err(MdlError::StaleId);
         }
-        let offset = address.checked_sub(source_record.virtual_address)
+        let offset = address
+            .checked_sub(source_record.virtual_address)
             .ok_or(MdlError::OutOfRange)?;
-        if length == 0 || offset.checked_add(u64::from(length))
-            .is_none_or(|end| end > u64::from(source_record.byte_count))
+        if length == 0
+            || offset
+                .checked_add(u64::from(length))
+                .is_none_or(|end| end > u64::from(source_record.byte_count))
         {
             return Err(MdlError::OutOfRange);
         }
@@ -436,7 +452,10 @@ impl MdlRegistry {
             return Err(MdlError::OutOfRange);
         }
         let required = mdl_allocation_size(address, length).ok_or(MdlError::OutOfRange)?;
-        if target_record.allocated_bytes.is_none_or(|allocated| required > allocated) {
+        if target_record
+            .allocated_bytes
+            .is_none_or(|allocated| required > allocated)
+        {
             return Err(MdlError::OutOfRange);
         }
         if self.has_read_lease(target_record.id) {
@@ -460,7 +479,10 @@ impl MdlRegistry {
         }
         let generation = self.find(id).ok_or(MdlError::StaleId)?.generation;
         self.active_partial_dependents(id, generation)?;
-        if self.find(id).is_some_and(|record| record.active_mappings != 0) {
+        if self
+            .find(id)
+            .is_some_and(|record| record.active_mappings != 0)
+        {
             return Err(MdlError::ActiveMappings);
         }
         self.invalidate_partial_dependents(id, generation);
@@ -525,9 +547,8 @@ impl MdlRegistry {
     }
 
     pub fn is_locked(&self, id: u64) -> bool {
-        self.find(id).is_some_and(|record| {
-            record.locked || self.partial_source_matches(record)
-        })
+        self.find(id)
+            .is_some_and(|record| record.locked || self.partial_source_matches(record))
     }
 
     pub fn virtual_address(&self, id: u64) -> Option<u64> {
@@ -622,7 +643,9 @@ impl MdlRegistry {
 
     /// Record a DMA mapping against the MDL (bumps `active_mappings`).
     pub fn add_mapping(&mut self, id: u64) -> Result<(), MdlError> {
-        if self.find(id).is_some_and(|record| record.partial_source.is_some())
+        if self
+            .find(id)
+            .is_some_and(|record| record.partial_source.is_some())
             && !self.is_locked(id)
         {
             return Err(MdlError::StaleId);
@@ -688,7 +711,11 @@ mod tests {
             address,
             address,
         ));
-        assert!(source_mdl_has_retained_mapping(MDL_PAGES_LOCKED, 0, address));
+        assert!(source_mdl_has_retained_mapping(
+            MDL_PAGES_LOCKED,
+            0,
+            address
+        ));
         assert!(!source_mdl_has_retained_mapping(
             MDL_SOURCE_IS_NONPAGED_POOL,
             0,
@@ -700,7 +727,10 @@ mod tests {
     #[test]
     fn partial_mdl_range_uses_source_remainder_and_rejects_escape() {
         assert_eq!(partial_mdl_range(0x2000, 8192, 0, 0), Some((0x2000, 8192)));
-        assert_eq!(partial_mdl_range(0x2000, 8192, 0x3000, 0), Some((0x3000, 4096)));
+        assert_eq!(
+            partial_mdl_range(0x2000, 8192, 0x3000, 0),
+            Some((0x3000, 4096))
+        );
         assert_eq!(partial_mdl_range(0x2000, 8192, 0x3000, 4097), None);
         assert_eq!(partial_mdl_range(0x2000, 8192, 0x1fff, 1), None);
         assert_eq!(partial_mdl_range(0, 8192, 0, 1), None);
@@ -787,7 +817,10 @@ mod tests {
         let key = MdlKey::new(2, 4, 0x20_0300).unwrap();
         let id = registry.register(key, 0, 2 * 1024 * 1024).unwrap();
         assert_eq!(registry.virtual_address(id), Some(0));
-        assert_eq!(registry.build_for_nonpaged_key(key), Err(MdlError::OutOfRange));
+        assert_eq!(
+            registry.build_for_nonpaged_key(key),
+            Err(MdlError::OutOfRange)
+        );
         assert!(!registry.is_locked(id));
         assert_eq!(registry.validate_slice(id, 0, 1), Err(MdlError::StaleId));
         assert_eq!(registry.add_mapping(id), Err(MdlError::OutOfRange));
@@ -816,7 +849,9 @@ mod tests {
             Err(MdlError::StaleId)
         );
         registry.build_for_nonpaged_key(source).unwrap();
-        registry.bind_partial_key(source, target, 0x40_1000, 4096).unwrap();
+        registry
+            .bind_partial_key(source, target, 0x40_1000, 4096)
+            .unwrap();
         assert_eq!(registry.virtual_address(target_id), Some(0x40_1000));
         assert_eq!(registry.byte_count(target_id), Some(4096));
         assert_eq!(registry.allocated_bytes_for_key(target), shell_bytes);
@@ -869,7 +904,9 @@ mod tests {
         registry.register(source, 0x40_0000, 4096).unwrap();
         registry.build_for_nonpaged_key(source).unwrap();
         let target_id = registry.register(target, 0, 4096).unwrap();
-        registry.bind_partial_key(source, target, 0x40_0000, 4096).unwrap();
+        registry
+            .bind_partial_key(source, target, 0x40_0000, 4096)
+            .unwrap();
 
         let lease = registry.acquire_read_lease(target, 0, 4096).unwrap();
         assert_eq!(registry.free_key(source), Err(MdlError::ActiveReadLeases));
@@ -885,7 +922,10 @@ mod tests {
         assert!(!registry.is_locked(target_id));
         assert!(!registry.is_partial_key(target));
         assert!(!registry.is_partial_target_of(source, target));
-        assert_eq!(registry.acquire_read_lease(target, 0, 1), Err(MdlError::StaleId));
+        assert_eq!(
+            registry.acquire_read_lease(target, 0, 1),
+            Err(MdlError::StaleId)
+        );
     }
 
     #[test]

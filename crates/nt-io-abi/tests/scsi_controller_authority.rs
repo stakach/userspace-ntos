@@ -37,10 +37,22 @@ fn controller() -> ScsiControllerCandidate {
 fn accepted_child_selects_only_its_exact_live_controller_and_window() {
     let exact = controller();
     let candidates = [
-        ScsiControllerCandidate { child_pdo: 0x1201, ..exact },
-        ScsiControllerCandidate { parent_pdo: 0x2301, ..exact },
-        ScsiControllerCandidate { provider_cookie: 0x46, ..exact },
-        ScsiControllerCandidate { window_lease_id: 0, ..exact },
+        ScsiControllerCandidate {
+            child_pdo: 0x1201,
+            ..exact
+        },
+        ScsiControllerCandidate {
+            parent_pdo: 0x2301,
+            ..exact
+        },
+        ScsiControllerCandidate {
+            provider_cookie: 0x46,
+            ..exact
+        },
+        ScsiControllerCandidate {
+            window_lease_id: 0,
+            ..exact
+        },
         exact,
     ];
     assert_eq!(
@@ -54,26 +66,74 @@ fn stale_or_ambiguous_parent_authority_never_selects_a_dma_window() {
     let relation = accepted_relation();
     let exact = controller();
     for stale in [
-        ScsiControllerAuthority { child_pdo: 0x1201, ..relation },
-        ScsiControllerAuthority { relation_generation: 8, ..relation },
-        ScsiControllerAuthority { parent_pdo: 0x2301, ..relation },
-        ScsiControllerAuthority { parent_generation: 12, ..relation },
-        ScsiControllerAuthority { provider_domain_id: 4, ..relation },
-        ScsiControllerAuthority { provider_cookie: 0x46, ..relation },
+        ScsiControllerAuthority {
+            child_pdo: 0x1201,
+            ..relation
+        },
+        ScsiControllerAuthority {
+            relation_generation: 8,
+            ..relation
+        },
+        ScsiControllerAuthority {
+            parent_pdo: 0x2301,
+            ..relation
+        },
+        ScsiControllerAuthority {
+            parent_generation: 12,
+            ..relation
+        },
+        ScsiControllerAuthority {
+            provider_domain_id: 4,
+            ..relation
+        },
+        ScsiControllerAuthority {
+            provider_cookie: 0x46,
+            ..relation
+        },
     ] {
         assert_eq!(select_scsi_coherent_controller(stale, &[exact]), None);
     }
     for unavailable in [
-        ScsiControllerCandidate { live: false, ..exact },
-        ScsiControllerCandidate { controller_device_id: 0, ..exact },
-        ScsiControllerCandidate { window_lease_id: 0, ..exact },
-        ScsiControllerCandidate { window_generation: 12, ..exact },
-        ScsiControllerCandidate { grant_va: 0, ..exact },
-        ScsiControllerCandidate { broker_va: 0, ..exact },
-        ScsiControllerCandidate { grant_length: 0, ..exact },
-        ScsiControllerCandidate { grant_logical: u64::MAX, ..exact },
+        ScsiControllerCandidate {
+            live: false,
+            ..exact
+        },
+        ScsiControllerCandidate {
+            controller_device_id: 0,
+            ..exact
+        },
+        ScsiControllerCandidate {
+            window_lease_id: 0,
+            ..exact
+        },
+        ScsiControllerCandidate {
+            window_generation: 12,
+            ..exact
+        },
+        ScsiControllerCandidate {
+            grant_va: 0,
+            ..exact
+        },
+        ScsiControllerCandidate {
+            broker_va: 0,
+            ..exact
+        },
+        ScsiControllerCandidate {
+            grant_length: 0,
+            ..exact
+        },
+        ScsiControllerCandidate {
+            grant_logical: u64::MAX,
+            ..exact
+        },
     ] {
-        assert_eq!(select_scsi_coherent_controller(relation, &[unavailable]), None);
+        assert_eq!(
+            select_scsi_coherent_controller(relation, &[unavailable]),
+            None
+        );
     }
-    assert_eq!(select_scsi_coherent_controller(relation, &[exact, exact]), None);
+    assert_eq!(
+        select_scsi_coherent_controller(relation, &[exact, exact]),
+        None
+    );
 }

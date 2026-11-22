@@ -351,7 +351,7 @@ mod tests {
     fn pe_importing_builds_a_walkable_import_table() {
         let b = pe_importing("ntoskrnl.exe", &["IoCreateDevice", "IoDeleteDevice"]);
         // Import directory (index 1) points at the descriptor in .rdata.
-        let imp_rva = rd_u32(&b, OPT_OFF + 112 + 1 * 8);
+        let imp_rva = rd_u32(&b, OPT_OFF + 112 + 8);
         assert_ne!(imp_rva, 0, "import data directory RVA set");
         let to_off = rva_to_off(&b);
         let desc = to_off(imp_rva).unwrap();

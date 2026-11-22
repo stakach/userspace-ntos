@@ -1,14 +1,16 @@
-use nt_pnp::{
-    admit_bus_reported_platform_resources, PlatformInterruptResource, PlatformPortResource,
-};
 use nt_cm_resources::{
     build_io_resource_requirements_lists, io_resource_requirements_lists_size,
     IoAddressRequirement, IoInterruptRequirement, IoResourceAlternative, IoResourceRequirement,
 };
+use nt_pnp::{
+    admit_bus_reported_platform_resources, PlatformInterruptResource, PlatformPortResource,
+};
 
 fn hex_bytes(hex: &str) -> Vec<u8> {
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let digit = |byte: u8| (byte as char).to_digit(16).unwrap() as u8;
             (digit(pair[0]) << 4) | digit(pair[1])
@@ -55,22 +57,49 @@ fn irq(line: u32, vector: u32) -> PlatformInterruptResource {
 fn keyboard_keeps_exact_bus_bytes_and_requires_both_physical_ports() {
     let (raw, requirements) = keyboard_reports();
     let ports = [
-        PlatformPortResource { start: 0x60, length: 1 },
-        PlatformPortResource { start: 0x64, length: 1 },
+        PlatformPortResource {
+            start: 0x60,
+            length: 1,
+        },
+        PlatformPortResource {
+            start: 0x64,
+            length: 1,
+        },
     ];
     let admitted = admit_bus_reported_platform_resources(&raw, &requirements, &ports, irq(1, 33))
         .expect("both physical ports and the IRQ admit the accepted PDO");
     assert_eq!(admitted.raw_resources, raw);
     assert_eq!(admitted.resource_requirements, requirements);
-    assert_eq!(admitted.ports.iter().map(|port| port.start).collect::<Vec<_>>(), [0x60, 0x64]);
+    assert_eq!(
+        admitted
+            .ports
+            .iter()
+            .map(|port| port.start)
+            .collect::<Vec<_>>(),
+        [0x60, 0x64]
+    );
     assert_eq!(admitted.raw_interrupt.vector, 1);
     assert_eq!(admitted.translated_interrupt.vector, 33);
 
-    let root_port_control = [PlatformPortResource { start: 0, length: 0x1_0000 }];
-    assert!(admit_bus_reported_platform_resources(&raw, &requirements, &root_port_control, irq(1, 33)).is_ok());
+    let root_port_control = [PlatformPortResource {
+        start: 0,
+        length: 0x1_0000,
+    }];
+    assert!(admit_bus_reported_platform_resources(
+        &raw,
+        &requirements,
+        &root_port_control,
+        irq(1, 33)
+    )
+    .is_ok());
 
-    assert!(admit_bus_reported_platform_resources(&raw, &requirements, &ports[..1], irq(1, 33)).is_err());
-    assert!(admit_bus_reported_platform_resources(&raw, &requirements, &ports, irq(12, 33)).is_err());
+    assert!(
+        admit_bus_reported_platform_resources(&raw, &requirements, &ports[..1], irq(1, 33))
+            .is_err()
+    );
+    assert!(
+        admit_bus_reported_platform_resources(&raw, &requirements, &ports, irq(12, 33)).is_err()
+    );
 }
 
 #[test]
@@ -79,16 +108,23 @@ fn keyboard_accepts_live_reactos_pool_residue_without_changing_bus_bytes() {
     // Accepted PNP0303 PDO query captured during the native Q35 boot. ReactOS leaves the
     // interrupt policy tail uninitialized; here it contains UTF-16 pool residue.
     let requirements = hex_bytes("880000000000000000000000000000000000000000000000b025830e01000000010001000300000000010200110000000100000001000000600000000000000060000000000000000001020011000000010000000100000064000000000000006400000000000000010201000100630001000000010000002d005f0041004d004400360034005f00");
-    let root_port_control = [PlatformPortResource { start: 0, length: 0x1_0000 }];
-    let admitted = admit_bus_reported_platform_resources(
-        &raw,
-        &requirements,
-        &root_port_control,
-        irq(1, 33),
-    ).expect("accepted keyboard PDO's physical assignment is complete");
+    let root_port_control = [PlatformPortResource {
+        start: 0,
+        length: 0x1_0000,
+    }];
+    let admitted =
+        admit_bus_reported_platform_resources(&raw, &requirements, &root_port_control, irq(1, 33))
+            .expect("accepted keyboard PDO's physical assignment is complete");
     assert_eq!(admitted.raw_resources, raw);
     assert_eq!(admitted.resource_requirements, requirements);
-    assert_eq!(admitted.ports.iter().map(|port| port.start).collect::<Vec<_>>(), [0x60, 0x64]);
+    assert_eq!(
+        admitted
+            .ports
+            .iter()
+            .map(|port| port.start)
+            .collect::<Vec<_>>(),
+        [0x60, 0x64]
+    );
 }
 
 #[test]
@@ -103,22 +139,42 @@ fn mouse_accepts_an_interrupt_only_and_rejects_changed_bus_evidence() {
 
     let mut changed_requirements = requirements.clone();
     changed_requirements[52] = 11;
-    assert!(admit_bus_reported_platform_resources(&raw, &changed_requirements, &[], irq(12, 44)).is_err());
+    assert!(
+        admit_bus_reported_platform_resources(&raw, &changed_requirements, &[], irq(12, 44))
+            .is_err()
+    );
     let mut unsupported_policy = requirements.clone();
     unsupported_policy[56..64].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
-    assert!(admit_bus_reported_platform_resources(&raw, &unsupported_policy, &[], irq(12, 44)).is_err());
+    assert!(
+        admit_bus_reported_platform_resources(&raw, &unsupported_policy, &[], irq(12, 44)).is_err()
+    );
     let mut non_acpi_raw = raw.clone();
     let mut non_acpi_requirements = requirements.clone();
     non_acpi_raw[4] = 5;
     non_acpi_requirements[4] = 5;
-    assert!(admit_bus_reported_platform_resources(&non_acpi_raw, &non_acpi_requirements, &[], irq(12, 44)).is_err());
-    assert!(admit_bus_reported_platform_resources(&raw[..raw.len() - 1], &requirements, &[], irq(12, 44)).is_err());
+    assert!(admit_bus_reported_platform_resources(
+        &non_acpi_raw,
+        &non_acpi_requirements,
+        &[],
+        irq(12, 44)
+    )
+    .is_err());
+    assert!(admit_bus_reported_platform_resources(
+        &raw[..raw.len() - 1],
+        &requirements,
+        &[],
+        irq(12, 44)
+    )
+    .is_err());
 }
 
 #[test]
 fn libernt_serial_exact_bus_bytes_admit_before_irq_electrical_resolution() {
     let (raw, requirements) = libernt_serial_reports();
-    let root_ports = [PlatformPortResource { start: 0, length: 0x1_0000 }];
+    let root_ports = [PlatformPortResource {
+        start: 0,
+        length: 0x1_0000,
+    }];
     let interrupt = PlatformInterruptResource {
         level: 4,
         vector: 4,
@@ -126,16 +182,19 @@ fn libernt_serial_exact_bus_bytes_admit_before_irq_electrical_resolution() {
         latched: false,
         shared: true,
     };
-    let admitted = admit_bus_reported_platform_resources(
-        &raw, &requirements, &root_ports, interrupt,
-    ).expect("exact accepted serial CM reports satisfy bus resource admission");
+    let admitted =
+        admit_bus_reported_platform_resources(&raw, &requirements, &root_ports, interrupt)
+            .expect("exact accepted serial CM reports satisfy bus resource admission");
     assert_eq!(admitted.raw_resources, raw);
     assert_eq!(admitted.resource_requirements, requirements);
     assert_eq!(admitted.ports.len(), 1);
     assert_eq!(admitted.ports[0].start, 0x3f8);
     assert_eq!(admitted.ports[0].length, 8);
     assert_eq!(admitted.raw_interrupt.level, 4);
-    assert_eq!(admitted.raw_interrupt.flags, nt_cm_resources::CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE);
+    assert_eq!(
+        admitted.raw_interrupt.flags,
+        nt_cm_resources::CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+    );
 }
 
 #[test]
@@ -151,24 +210,39 @@ fn a_later_complete_requirement_alternative_is_not_hidden_by_irq_only_choice() {
         priority_policy: 0,
         targeted_processors: 0,
     });
-    let port = |start| IoResourceRequirement::Port(IoAddressRequirement {
-        option: 0,
-        share: 2,
-        flags: 17,
-        length: 1,
-        alignment: 1,
-        minimum: start,
-        maximum: start,
-    });
+    let port = |start| {
+        IoResourceRequirement::Port(IoAddressRequirement {
+            option: 0,
+            share: 2,
+            flags: 17,
+            length: 1,
+            alignment: 1,
+            minimum: start,
+            maximum: start,
+        })
+    };
     let irq_only = [interrupt];
     let complete = [port(0x60), port(0x64), interrupt];
     let alternatives = [
-        IoResourceAlternative { descriptors: &irq_only },
-        IoResourceAlternative { descriptors: &complete },
+        IoResourceAlternative {
+            descriptors: &irq_only,
+        },
+        IoResourceAlternative {
+            descriptors: &complete,
+        },
     ];
     let mut requirements = vec![0; io_resource_requirements_lists_size(&alternatives).unwrap()];
     build_io_resource_requirements_lists(&mut requirements, 0, 0, 0, &alternatives).unwrap();
 
-    let root_port_control = [PlatformPortResource { start: 0, length: 0x1_0000 }];
-    assert!(admit_bus_reported_platform_resources(&raw, &requirements, &root_port_control, irq(1, 33)).is_ok());
+    let root_port_control = [PlatformPortResource {
+        start: 0,
+        length: 0x1_0000,
+    }];
+    assert!(admit_bus_reported_platform_resources(
+        &raw,
+        &requirements,
+        &root_port_control,
+        irq(1, 33)
+    )
+    .is_ok());
 }

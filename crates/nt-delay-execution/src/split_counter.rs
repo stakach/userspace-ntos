@@ -44,17 +44,26 @@ mod tests {
     #[test]
     fn a_read_straddling_a_low_word_carry_is_never_torn() {
         for start in (0xffff_fff0u64..=0x1_0000_0002).chain(0x6_ffff_fffc..=0x7_0000_0001) {
-            let counter = Counter { value: Cell::new(start), step: 1 };
+            let counter = Counter {
+                value: Cell::new(start),
+                step: 1,
+            };
             let value = read_split_counter(|| counter.read(32), || counter.read(0));
             let end = counter.value.get();
-            assert!(start <= value && value < end, "{start:#x}: {value:#x} not in [{start:#x}, {end:#x})");
+            assert!(
+                start <= value && value < end,
+                "{start:#x}: {value:#x} not in [{start:#x}, {end:#x})"
+            );
         }
     }
 
     #[test]
     fn the_naive_low_then_high_order_is_torn_at_a_carry() {
         // What one 64-bit load split as low-then-high observes across the carry.
-        let counter = Counter { value: Cell::new(0xffff_ffff), step: 1 };
+        let counter = Counter {
+            value: Cell::new(0xffff_ffff),
+            step: 1,
+        };
         let low = counter.read(0);
         let high = counter.read(32);
         let torn = (u64::from(high) << 32) | u64::from(low);
@@ -65,8 +74,14 @@ mod tests {
     fn a_stable_high_word_needs_no_retry() {
         let reads = Cell::new(0);
         let value = read_split_counter(
-            || { reads.set(reads.get() + 1); 7 },
-            || { reads.set(reads.get() + 1); 9 },
+            || {
+                reads.set(reads.get() + 1);
+                7
+            },
+            || {
+                reads.set(reads.get() + 1);
+                9
+            },
         );
         assert_eq!((value, reads.get()), ((7 << 32) | 9, 3));
     }

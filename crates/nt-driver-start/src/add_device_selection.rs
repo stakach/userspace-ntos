@@ -62,7 +62,12 @@ pub fn select_add_device_row<O: Copy>(
             AddDeviceReadiness::NotReady => {}
             AddDeviceReadiness::AwaitingBusPdo => match awaiting.as_mut() {
                 Some(awaiting) => awaiting.rows += 1,
-                None => awaiting = Some(AwaitingBusPdo { first: owner, rows: 1 }),
+                None => {
+                    awaiting = Some(AwaitingBusPdo {
+                        first: owner,
+                        rows: 1,
+                    })
+                }
             },
             AddDeviceReadiness::Ready => {
                 return AddDeviceSelection::Selected {
@@ -72,7 +77,10 @@ pub fn select_add_device_row<O: Copy>(
             }
         }
     }
-    awaiting.map_or(AddDeviceSelection::Idle, AddDeviceSelection::AwaitingBusRelations)
+    awaiting.map_or(
+        AddDeviceSelection::Idle,
+        AddDeviceSelection::AwaitingBusRelations,
+    )
 }
 
 /// Bounds the boot-log evidence for selections that involve a row awaiting its bus PDO.

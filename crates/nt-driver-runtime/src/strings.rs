@@ -32,7 +32,9 @@ pub fn read_unicode_string(arena: &Arena, addr: GuestAddr) -> Option<String> {
     let n = us.code_units();
     let bytes = arena.slice(us.buffer, n * 2)?;
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     Some(String::from_utf16_lossy(&units))

@@ -20,12 +20,22 @@ fn terminal_packet_streams_in_order_before_guid_publication() {
     let mut registry = WmiRegistry::new();
     let provider = registry.register_device(DEVICE).unwrap();
     let ticket = registry.begin_reginfo(DEVICE).unwrap();
-    assert_eq!(registry.pending_reginfo_identity(ticket.raw()), Some(DEVICE));
+    assert_eq!(
+        registry.pending_reginfo_identity(ticket.raw()),
+        Some(DEVICE)
+    );
     registry.mark_reginfo_dispatched(ticket).unwrap();
     let bytes = packet();
-    registry.stage_reginfo_chunk(ticket, 0, &bytes[..17]).unwrap();
-    assert_eq!(registry.stage_reginfo_chunk(ticket, 0, &bytes[..17]), Err(STATUS_INVALID_PARAMETER));
-    registry.stage_reginfo_chunk(ticket, 17, &bytes[17..]).unwrap();
+    registry
+        .stage_reginfo_chunk(ticket, 0, &bytes[..17])
+        .unwrap();
+    assert_eq!(
+        registry.stage_reginfo_chunk(ticket, 0, &bytes[..17]),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    registry
+        .stage_reginfo_chunk(ticket, 17, &bytes[17..])
+        .unwrap();
     assert!(registry.plan_device_event(provider, GUID, 0).is_err());
     registry.complete_streamed_reginfo(ticket, 0).unwrap();
     assert_eq!(registry.pending_reginfo_identity(ticket.raw()), None);
@@ -39,7 +49,10 @@ fn failed_terminal_releases_stream_without_publishing() {
     let ticket = registry.begin_reginfo(DEVICE).unwrap();
     registry.mark_reginfo_dispatched(ticket).unwrap();
     registry.stage_reginfo_chunk(ticket, 0, &packet()).unwrap();
-    assert_eq!(registry.complete_streamed_reginfo(ticket, STATUS_INVALID_PARAMETER), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(
+        registry.complete_streamed_reginfo(ticket, STATUS_INVALID_PARAMETER),
+        Err(STATUS_INVALID_PARAMETER)
+    );
     assert!(registry.plan_device_event(provider, GUID, 0).is_err());
     let next = registry.begin_reginfo(DEVICE).unwrap();
     registry.mark_reginfo_dispatched(next).unwrap();

@@ -216,7 +216,9 @@ fn read_path(buf: &[u8], offset: u32, len_bytes: u32) -> Result<NtPath, NtStatus
         return Err(NtStatus::INVALID_PARAMETER);
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     NtPath::parse(&units)

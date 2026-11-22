@@ -19,11 +19,11 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_object_abi::{
     opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateFileHandleRequest,
-    ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObDeleteSymbolicLinkExactRequest,
-    ObDereferenceObjectRequest, ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo,
-    ObReferenceFileHandleRequest,
-    ObReferenceHandleRequest, ObReply, ObDirectoryHandleRequest, ObQueryDirectoryRequest,
-    ObCreateSessionNamespaceRequest, ObRetireSessionNamespaceRequest,
+    ObCreateIoObjectRequest, ObCreateSessionNamespaceRequest, ObCreateSymbolicLinkRequest,
+    ObDeleteSymbolicLinkExactRequest, ObDereferenceObjectRequest, ObDirectoryHandleRequest,
+    ObLookupPathRequest, ObOpenObjectRequest, ObQueryDirectoryRequest, ObQueryObjectInfo,
+    ObReferenceFileHandleRequest, ObReferenceHandleRequest, ObReply,
+    ObRetireSessionNamespaceRequest,
 };
 use nt_object_manager::{ClientKind, ComponentId, ObjectBody, ObjectManager, ObjectRef};
 use nt_status::NtStatus;
@@ -120,8 +120,12 @@ impl Server {
             opcode::OB_OP_CREATE_DIRECTORY => self.op_create_directory(in_buf),
             opcode::OB_OP_CREATE_DIRECTORY_HANDLE => self.op_directory_handle(client, in_buf, true),
             opcode::OB_OP_OPEN_DIRECTORY_HANDLE => self.op_directory_handle(client, in_buf, false),
-            opcode::OB_OP_CREATE_SESSION_NAMESPACE => self.op_create_session_namespace(client, in_buf, out_buf),
-            opcode::OB_OP_RETIRE_SESSION_NAMESPACE_EXACT => self.op_retire_session_namespace(client, in_buf),
+            opcode::OB_OP_CREATE_SESSION_NAMESPACE => {
+                self.op_create_session_namespace(client, in_buf, out_buf)
+            }
+            opcode::OB_OP_RETIRE_SESSION_NAMESPACE_EXACT => {
+                self.op_retire_session_namespace(client, in_buf)
+            }
             opcode::OB_OP_QUERY_DIRECTORY => self.op_query_directory(client, in_buf, out_buf),
             opcode::OB_OP_CREATE_SYMBOLIC_LINK => self.op_create_symlink(in_buf),
             opcode::OB_OP_QUERY_SYMBOLIC_LINK => self.op_query_symlink(in_buf, out_buf),
@@ -172,17 +176,23 @@ impl Server {
         Ok(ok())
     }
 
-    fn directory_mutation_object(&self, client: ClientId, buf: &[u8])
-        -> Result<ObjectRef, NtStatus>
-    {
+    fn directory_mutation_object(
+        &self,
+        client: ClientId,
+        buf: &[u8],
+    ) -> Result<ObjectRef, NtStatus> {
         let req: ObCloseHandleRequest = read_req(buf)?;
         check_size::<ObCloseHandleRequest>(req.abi_size)?;
         if req._reserved != 0 || req._reserved2 != 0 {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         let directory_type = self.om.directory_type().ok_or(NtStatus::INVALID_HANDLE)?;
-        self.om.reference_by_handle(client, HandleValue(req.handle),
-            Some(directory_type), AccessMask::DELETE)
+        self.om.reference_by_handle(
+            client,
+            HandleValue(req.handle),
+            Some(directory_type),
+            AccessMask::DELETE,
+        )
     }
 
     fn op_reference_handle(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
@@ -260,8 +270,11 @@ impl Server {
         }
         let leaf = path.leaf().ok_or(NtStatus::INVALID_PARAMETER)?.clone();
         let parent_path = path.parent().ok_or(NtStatus::INVALID_PARAMETER)?;
-        let parent = self.om.lookup_path(&parent_path, CaseSensitivity::CaseInsensitive)?;
-        self.om.remove_named_object(&parent, &leaf, case_of(req.flags))?;
+        let parent = self
+            .om
+            .lookup_path(&parent_path, CaseSensitivity::CaseInsensitive)?;
+        self.om
+            .remove_named_object(&parent, &leaf, case_of(req.flags))?;
         Ok(ok())
     }
 
@@ -307,12 +320,15 @@ impl Server {
         ))
     }
 
-    fn op_directory_handle(&mut self, client: ClientId, buf: &[u8], create: bool)
-        -> Result<ObReply, NtStatus>
-    {
+    fn op_directory_handle(
+        &mut self,
+        client: ClientId,
+        buf: &[u8],
+        create: bool,
+    ) -> Result<ObReply, NtStatus> {
         let req: ObDirectoryHandleRequest = read_req(buf)?;
         check_size::<ObDirectoryHandleRequest>(req.abi_size)?;
-        if req.name_offset < req.abi_size as u32 || req.name_offset % 2 != 0 {
+        if req.name_offset < req.abi_size as u32 || !req.name_offset.is_multiple_of(2) {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         let name = read_unicode(buf, req.name_offset, req.name_len_bytes)?;
@@ -320,13 +336,19 @@ impl Server {
         let attributes = ObjAttrFlags::from_bits_retain(req.obj_attributes as u32);
         let desired = AccessMask::from_bits_retain(req.desired_access);
         if create {
-            let result = self.om.create_directory_handle(client, root, &name, desired, attributes)?;
-            let status = if result.created { NtStatus::SUCCESS } else {
+            let result = self
+                .om
+                .create_directory_handle(client, root, &name, desired, attributes)?;
+            let status = if result.created {
+                NtStatus::SUCCESS
+            } else {
                 nt_object_manager::directory::OBJECT_NAME_EXISTS
             };
             Ok(reply(status, 0, result.handle.0, u64::from(result.created)))
         } else {
-            let handle = self.om.open_directory_handle(client, root, &name, desired, attributes)?;
+            let handle = self
+                .om
+                .open_directory_handle(client, root, &name, desired, attributes)?;
             Ok(reply(NtStatus::SUCCESS, 0, handle.0, 0))
         }
     }
@@ -342,8 +364,12 @@ impl Server {
         }
         let req: ObCreateSessionNamespaceRequest = read_req(buf)?;
         check_size::<ObCreateSessionNamespaceRequest>(req.abi_size)?;
-        if req.reserved != 0 { return Err(NtStatus::INVALID_PARAMETER); }
-        let dst = out_buf.get_mut(..8).ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        if req.reserved != 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let dst = out_buf
+            .get_mut(..8)
+            .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
         let (session, windows, bno) = self.om.create_session_namespace(req.session_id)?;
         dst.copy_from_slice(&bno.0.to_le_bytes());
         Ok(reply(NtStatus::SUCCESS, 8, session.0, windows.0))
@@ -359,29 +385,51 @@ impl Server {
         }
         let req: ObRetireSessionNamespaceRequest = read_req(buf)?;
         check_size::<ObRetireSessionNamespaceRequest>(req.abi_size)?;
-        if req.reserved != 0 || req.session_object_id == 0 || req.windows_object_id == 0
-            || req.base_named_objects_id == 0 {
+        if req.reserved != 0
+            || req.session_object_id == 0
+            || req.windows_object_id == 0
+            || req.base_named_objects_id == 0
+        {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         self.om.retire_session_namespace_exact(
-            req.session_id, ObjectId(req.session_object_id), ObjectId(req.windows_object_id),
+            req.session_id,
+            ObjectId(req.session_object_id),
+            ObjectId(req.windows_object_id),
             ObjectId(req.base_named_objects_id),
         )?;
         Ok(ok())
     }
 
-    fn op_query_directory(&mut self, client: ClientId, buf: &[u8], out: &mut [u8])
-        -> Result<ObReply, NtStatus>
-    {
+    fn op_query_directory(
+        &mut self,
+        client: ClientId,
+        buf: &[u8],
+        out: &mut [u8],
+    ) -> Result<ObReply, NtStatus> {
         let req: ObQueryDirectoryRequest = read_req(buf)?;
         check_size::<ObQueryDirectoryRequest>(req.abi_size)?;
         if req.reserved != 0 || req.restart_scan > 1 || req.return_single_entry > 1 {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        let output = out.get_mut(..req.buffer_length as usize).ok_or(NtStatus::INVALID_PARAMETER)?;
-        let result = self.om.query_directory(client, HandleValue(req.handle), req.context,
-            req.restart_scan != 0, req.return_single_entry != 0, req.output_base, output)?;
-        Ok(reply(result.status, result.written, u64::from(result.context), u64::from(result.return_length)))
+        let output = out
+            .get_mut(..req.buffer_length as usize)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let result = self.om.query_directory(
+            client,
+            HandleValue(req.handle),
+            req.context,
+            req.restart_scan != 0,
+            req.return_single_entry != 0,
+            req.output_base,
+            output,
+        )?;
+        Ok(reply(
+            result.status,
+            result.written,
+            u64::from(result.context),
+            u64::from(result.return_length),
+        ))
     }
 
     fn op_create_directory(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
@@ -477,22 +525,25 @@ impl Server {
         let target = read_unicode(buf, req.target_offset, req.target_len_bytes)?;
         let (parent, leaf) = self.split_parent(&link_path)?;
         let permanent = permanent_of(req.obj_attributes);
-        let link = match self
-            .om
-            .create_symbolic_link_target(&parent, &leaf, target.clone(), permanent)
-        {
-            Ok(link) => link,
-            Err(NtStatus::OBJECT_NAME_COLLISION)
-                if u32::from(req.obj_attributes) & ObjAttrFlags::OPEN_IF.bits() != 0 =>
+        let link =
+            match self
+                .om
+                .create_symbolic_link_target(&parent, &leaf, target.clone(), permanent)
             {
-                let existing = self.om.lookup_link(&link_path, case_of(req.obj_attributes))?;
-                if self.om.query_symbolic_link(&existing)? != target {
-                    return Err(NtStatus::OBJECT_NAME_COLLISION);
+                Ok(link) => link,
+                Err(NtStatus::OBJECT_NAME_COLLISION)
+                    if u32::from(req.obj_attributes) & ObjAttrFlags::OPEN_IF.bits() != 0 =>
+                {
+                    let existing = self
+                        .om
+                        .lookup_link(&link_path, case_of(req.obj_attributes))?;
+                    if self.om.query_symbolic_link(&existing)? != target {
+                        return Err(NtStatus::OBJECT_NAME_COLLISION);
+                    }
+                    return Ok(reply(NtStatus::OBJECT_NAME_EXISTS, 0, existing.id().0, 0));
                 }
-                return Ok(reply(NtStatus::OBJECT_NAME_EXISTS, 0, existing.id().0, 0));
-            }
-            Err(status) => return Err(status),
-        };
+                Err(status) => return Err(status),
+            };
         Ok(reply(NtStatus::SUCCESS, 0, link.id().0, 0))
     }
 
@@ -584,7 +635,9 @@ fn read_unicode(buf: &[u8], offset: u32, len_bytes: u32) -> Result<UnicodeString
         return Err(NtStatus::INVALID_PARAMETER);
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     Ok(UnicodeString::from_units(&units))

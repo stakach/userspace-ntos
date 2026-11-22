@@ -25,8 +25,11 @@ fn reused_queue_slot_keeps_each_captured_wait_owner_and_park_time() {
     let deadline = due_time(-10, 100, 1_000);
     let mut first = waiter(deadline, 11);
     first.observation = Some(WaitDiagnostic {
-        process_id: 7, process_generation: 3, thread_generation: 5,
-        process_index: 2, parked_at_100ns: 90,
+        process_id: 7,
+        process_generation: 3,
+        thread_generation: 5,
+        process_index: 2,
+        parked_at_100ns: 90,
     });
     queue.insert(first).unwrap();
     let retired = queue.pop_due(now(110, 1_010)).unwrap();
@@ -34,8 +37,11 @@ fn reused_queue_slot_keeps_each_captured_wait_owner_and_park_time() {
 
     let mut replacement = waiter(due_time(-20, 200, 1_100), 11);
     replacement.observation = Some(WaitDiagnostic {
-        process_id: 7, process_generation: 4, thread_generation: 6,
-        process_index: 2, parked_at_100ns: 200,
+        process_id: 7,
+        process_generation: 4,
+        thread_generation: 6,
+        process_index: 2,
+        parked_at_100ns: 200,
     });
     queue.insert(replacement).unwrap();
     assert_eq!(queue.records(), 1, "the vacant slot is reused");

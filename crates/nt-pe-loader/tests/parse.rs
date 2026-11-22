@@ -561,12 +561,12 @@ fn imports_are_listed() {
         }
         other => panic!("expected ByName, got {other:?}"),
     }
-    assert_eq!(pe.page_has_loader_writable_state(iat).unwrap(), true);
+    assert!(pe.page_has_loader_writable_state(iat).unwrap());
     assert_eq!(
         pe.loader_writable_page_state(iat).unwrap(),
         LoaderWritablePageState::Iat
     );
-    assert_eq!(pe.page_has_loader_writable_state(0x1000).unwrap(), false);
+    assert!(!pe.page_has_loader_writable_state(0x1000).unwrap());
 }
 
 #[test]
@@ -586,13 +586,13 @@ fn iat_directory_marks_loader_writable_state_without_import_walk() {
         &[(12, iat, 0x10)], // IMAGE_DIRECTORY_ENTRY_IAT
     );
     let pe = PeFile::parse(&pe_bytes).unwrap();
-    assert_eq!(pe.page_has_loader_writable_state(iat).unwrap(), true);
+    assert!(pe.page_has_loader_writable_state(iat).unwrap());
     assert_eq!(
         pe.loader_writable_page_state(iat).unwrap(),
         LoaderWritablePageState::Iat
     );
-    assert_eq!(pe.page_has_loader_writable_state(iat + 8).unwrap(), true);
-    assert_eq!(pe.page_has_loader_writable_state(0x1000).unwrap(), false);
+    assert!(pe.page_has_loader_writable_state(iat + 8).unwrap());
+    assert!(!pe.page_has_loader_writable_state(0x1000).unwrap());
 }
 
 #[test]
@@ -629,12 +629,12 @@ fn relocations_are_applied_on_rebase() {
     let pe_bytes = build_pe(BASE, 0x1000, 0x4000, &sections, &[(5, reloc_va, 12)]);
     let pe = PeFile::parse(&pe_bytes).unwrap();
     assert_eq!(pe.relocations().unwrap().len(), 2); // DIR64 + ABSOLUTE
-    assert_eq!(pe.page_has_loader_writable_state(data_va).unwrap(), true);
+    assert!(pe.page_has_loader_writable_state(data_va).unwrap());
     assert_eq!(
         pe.loader_writable_page_state(data_va).unwrap(),
         LoaderWritablePageState::Relocation
     );
-    assert_eq!(pe.page_has_loader_writable_state(reloc_va).unwrap(), false);
+    assert!(!pe.page_has_loader_writable_state(reloc_va).unwrap());
 
     let new_base = 0x2_0000_0000u64;
     let img = pe.map(new_base).unwrap();
@@ -675,12 +675,12 @@ fn unsupported_relocation_kind_marks_only_its_page_loader_writable() {
         pe.relocations().unwrap_err(),
         PeError::UnsupportedRelocation(6)
     );
-    assert_eq!(pe.page_has_loader_writable_state(data_va).unwrap(), true);
+    assert!(pe.page_has_loader_writable_state(data_va).unwrap());
     assert_eq!(
         pe.loader_writable_page_state(data_va).unwrap(),
         LoaderWritablePageState::Relocation
     );
-    assert_eq!(pe.page_has_loader_writable_state(reloc_va).unwrap(), false);
+    assert!(!pe.page_has_loader_writable_state(reloc_va).unwrap());
 }
 
 #[test]
@@ -705,7 +705,7 @@ fn security_cookie_from_load_config() {
     );
     let pe = PeFile::parse(&pe_bytes).unwrap();
     assert_eq!(pe.security_cookie_rva(), Some(0x3000));
-    assert_eq!(pe.page_has_loader_writable_state(0x3000).unwrap(), true);
+    assert!(pe.page_has_loader_writable_state(0x3000).unwrap());
     assert_eq!(
         pe.loader_writable_page_state(0x3000).unwrap(),
         LoaderWritablePageState::SecurityCookie
@@ -744,15 +744,12 @@ fn tls_index_page_is_loader_writable_state() {
     );
     let pe = PeFile::parse(&pe_bytes).unwrap();
     assert_eq!(pe.tls_index_rva().unwrap(), Some(tls_index_rva));
-    assert_eq!(
-        pe.page_has_loader_writable_state(tls_index_rva).unwrap(),
-        true
-    );
+    assert!(pe.page_has_loader_writable_state(tls_index_rva).unwrap());
     assert_eq!(
         pe.loader_writable_page_state(tls_index_rva).unwrap(),
         LoaderWritablePageState::TlsIndex
     );
-    assert_eq!(pe.page_has_loader_writable_state(0x1000).unwrap(), false);
+    assert!(!pe.page_has_loader_writable_state(0x1000).unwrap());
 }
 
 #[test]
@@ -795,11 +792,9 @@ fn relocated_tls_index_page_is_loader_writable_at_runtime_base() {
             .pe_error(),
         PeError::PatchOutOfBounds
     );
-    assert_eq!(
-        pe.page_has_loader_writable_state_at_base(tls_index_rva, runtime_base)
-            .unwrap(),
-        true
-    );
+    assert!(pe
+        .page_has_loader_writable_state_at_base(tls_index_rva, runtime_base)
+        .unwrap());
 }
 
 #[test]
@@ -828,7 +823,7 @@ fn protection_from_section_characteristics() {
     assert_eq!(pe.protection_at(0x2000), Protection::ReadWrite); // .data
     assert_eq!(pe.protection_at(0x3000), Protection::ReadOnly); // .rdata
     assert_eq!(pe.protection_at(0), Protection::ReadOnly); // headers
-    assert_eq!(pe.page_has_loader_writable_state(0x2000).unwrap(), false);
+    assert!(!pe.page_has_loader_writable_state(0x2000).unwrap());
 }
 
 #[test]
