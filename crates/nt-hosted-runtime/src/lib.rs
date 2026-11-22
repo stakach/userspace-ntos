@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod hosted_irq_arena;
 mod hosted_irq_bank;
+mod nested_port_caps;
 mod hosted_irq_cr8_source;
 mod hosted_irq_call_stack;
 mod badge_census;
@@ -159,6 +160,7 @@ pub use hosted_irq_arena::{
     HOSTED_IRQ_ARENA_RESULT_CAP, HOSTED_IRQ_ARENA_VERSION,
 };
 pub use hosted_irq_bank::HostedIrqPrivateBankLayout;
+pub use nested_port_caps::{port_caps_after_nested_dispatch, NestedPortCapRestore};
 pub use hosted_irq_cr8_source::{HostedIrqCr8Source, select_hosted_irq_cr8_source};
 pub use hosted_irq_call_stack::{
     validate_hosted_irq_call_pop, validate_hosted_irq_call_push, HostedIrqCallFrame,

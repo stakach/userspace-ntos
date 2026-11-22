@@ -60696,7 +60696,48 @@ unsafe fn hosted_irq_private_shared_va(connection: HostedIrqConnection) -> Optio
     }).map(|lane| lane.exec_shared_va)
 }
 
+/// The IRQ lane installs its own device's I/O-port capabilities in the instance CNode. An
+/// ordinary dispatch of another device that it interrupted gets its own back afterwards, from
+/// its current canonical state; a binding revoked meanwhile gets none (#430).
 unsafe fn dispatch_hosted_irq_connection(
+    connection: HostedIrqConnection,
+) -> Result<HostedIrqConnectionDispatchOutcome, nt_status::NtStatus> {
+    let instance = connection.binding.instance;
+    let outer = current_hosted_device_dispatch_binding(instance);
+    let outcome = dispatch_hosted_irq_connection_on_lane(connection);
+    restore_outer_port_caps_after_irq(instance, outer, connection.binding.device_id);
+    outcome
+}
+
+unsafe fn restore_outer_port_caps_after_irq(
+    instance: usize,
+    outer: Option<HostedDeviceBinding>,
+    irq_device: u64,
+) {
+    use nt_hosted_runtime::NestedPortCapRestore;
+    let published = outer.is_some_and(|binding| {
+        current_hosted_device_dispatch_binding(instance) == Some(binding)
+    });
+    let state = outer.and_then(|binding| hosted_device_resource_state_by_device_id(binding.device_id)
+        .filter(|state| state.driver_id == binding.driver_id && state.instance == binding.instance));
+    let action = nt_hosted_runtime::port_caps_after_nested_dispatch(
+        outer.map(|binding| binding.device_id), irq_device, published && state.is_some(),
+    );
+    let Some(binding) = outer else { return };
+    let Some((_, inst)) = instance_by_driver_id(binding.driver_id) else { return };
+    match (action, state) {
+        (NestedPortCapRestore::Keep, _) => {}
+        (NestedPortCapRestore::Restore, Some(state)) => {
+            // A failed copy leaves the slots empty, never holding the IRQ device's ports.
+            let _ = copy_hosted_io_port_caps_to_instance(inst, state);
+        }
+        (NestedPortCapRestore::Restore, None) | (NestedPortCapRestore::Clear, _) => {
+            clear_hosted_io_port_caps(inst);
+        }
+    }
+}
+
+unsafe fn dispatch_hosted_irq_connection_on_lane(
     connection: HostedIrqConnection,
 ) -> Result<HostedIrqConnectionDispatchOutcome, nt_status::NtStatus> {
     if !hosted_irq_connection_active(connection) && !connection.rundown.has_delivery_lease() {
@@ -63648,6 +63689,17 @@ unsafe fn claim_hosted_supplemental_port_range(
     Ok(())
 }
 
+unsafe fn clear_hosted_io_port_caps(inst: DriverInstance) {
+    if inst.cnode == 0 {
+        return;
+    }
+    let mut slot = 0;
+    while slot < crate::CT_IO_PORT_CAPACITY {
+        let _ = crate::cnode_delete_in_cnode_r(inst.cnode, crate::CT_IO_PORT_BASE + slot);
+        slot += 1;
+    }
+}
+
 unsafe fn copy_hosted_io_port_caps_to_instance(
     inst: DriverInstance,
     state: HostedDeviceResourceState,
@@ -63655,11 +63707,7 @@ unsafe fn copy_hosted_io_port_caps_to_instance(
     if inst.cnode == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let mut slot = 0;
-    while slot < crate::CT_IO_PORT_CAPACITY {
-        let _ = crate::cnode_delete_in_cnode_r(inst.cnode, crate::CT_IO_PORT_BASE + slot);
-        slot += 1;
-    }
+    clear_hosted_io_port_caps(inst);
     for resource in hosted_state_address_resources(&state) {
         if resource.kind != SH_RESOURCE_ADDRESS_KIND_PORT {
             continue;
@@ -63674,11 +63722,7 @@ unsafe fn copy_hosted_io_port_caps_to_instance(
         }
         let copy = crate::cnode_copy_at_r(inst.cnode, component_slot, cap);
         if copy != 0 {
-            slot = 0;
-            while slot < crate::CT_IO_PORT_CAPACITY {
-                let _ = crate::cnode_delete_in_cnode_r(inst.cnode, crate::CT_IO_PORT_BASE + slot);
-                slot += 1;
-            }
+            clear_hosted_io_port_caps(inst);
             print_str(b"[driver-launch] IOPort cap restore failed label=");
             print_u64(copy);
             print_str(b" device_id=");
