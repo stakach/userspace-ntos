@@ -309,6 +309,9 @@ fn finish_invoke_result(
         trace_port_connect_execute(1, projection.irp_id, projection.device_id);
     }
     match result {
+        // No lane could admit it yet (#427): not entered, and not a failure of the request.
+        HostedIrpTransportResult::NotDispatched { status: nt_status::NtStatus::DEVICE_BUSY } =>
+            conclude(invocation, capture, ExternalFileIrpOutcome::NotAdmitted),
         HostedIrpTransportResult::NotDispatched { status } =>
             conclude(invocation, capture, ExternalFileIrpOutcome::NotEntered { status }),
         HostedIrpTransportResult::Returned { status: nt_status::NtStatus::PENDING, .. } =>

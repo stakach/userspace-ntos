@@ -11,6 +11,7 @@ use nt_types::{AccessMask, HandleValue, NtPath, UnicodeString};
 mod device_object_target_tests;
 mod exact_device_control_tests;
 mod internal_block_io_tests;
+mod not_admitted_tests;
 mod open_case_tests;
 mod operations_tests;
 mod pump_suspension_tests;

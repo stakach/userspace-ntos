@@ -134,6 +134,19 @@ struct Row {
     phase_pump_ticks: u64,
     phase_bank_ticks: u64,
     phase_major: u8,
+    /// A syscall caller's ordinary IRP that no lane admitted waits in `QueuedDispatch` rather
+    /// than failing with a synthetic STATUS_DEVICE_BUSY (#427).
+    queue_not_admitted: bool,
+    /// [`LANE_EPOCH`] when it was last refused; it is retried only after a lane has freed.
+    admission_epoch: u64,
+}
+
+/// Advanced whenever a hosted dispatch lane may have become free (#427).
+static LANE_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// A hosted lane may now admit a queued IRP.
+pub(super) fn lane_freed() {
+    LANE_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
 static mut ROWS: Vec<Row> = Vec::new();
@@ -525,6 +538,7 @@ fn remove(id: u64) -> Result<Row, nt_status::NtStatus> {
         if let Some((instance, _)) = instance_by_driver_id(driver.raw()) {
             unsafe { hosted_class_irp_lane::release_irp(instance, irp.raw()) };
         }
+        lane_freed();
     }
     Ok(retired)
 }
@@ -573,6 +587,8 @@ fn reserve(
         phase_pump_ticks: 0,
         phase_bank_ticks: 0,
         phase_major: 0,
+        queue_not_admitted: false,
+        admission_epoch: 0,
     });
     Ok(id)
 }
@@ -1692,6 +1708,7 @@ pub(super) fn dispatch_mutable_method_neither_suspend_aware(
         caller, request, input, &[],
         ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice,
         None,
+        Admission::Refuse,
         |invocation, caller, capture| {
             match hosted_file_dispatch::invoke_suspend_aware(invocation, caller, capture) {
                 hosted_file_dispatch::InvokeResult::Returned(returned) => Ok(returned),
@@ -1747,7 +1764,7 @@ pub(super) fn dispatch(
     policy: ExternalFileIrpDispatchPolicy,
 ) -> Result<PlainDispatch, nt_status::NtStatus> {
     let result = dispatch_with_port_connect(
-        caller, request, input, initial_output, policy, None, invoke_retaining,
+        caller, request, input, initial_output, policy, None, Admission::Refuse, invoke_retaining,
     );
     match result {
         Ok(result) => Ok(PlainDispatch::Ready(result)),
@@ -1849,8 +1866,37 @@ pub(super) fn dispatch_deferring(
     initial_output: &[u8],
     policy: ExternalFileIrpDispatchPolicy,
 ) -> Result<DispatchResult, nt_status::NtStatus> {
+    dispatch_deferring_with(caller, request, input, initial_output, policy, Admission::Refuse)
+}
+
+/// [`dispatch_deferring`] for a syscall caller, whose STATUS_PENDING is published before any
+/// provider runs again: an IRP no lane admits waits in this row (#427), never failing busy.
+pub(super) fn dispatch_deferring_queued(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    request: ExternalFileIrpRequest,
+    input: &[u8],
+    initial_output: &[u8],
+    policy: ExternalFileIrpDispatchPolicy,
+) -> Result<DispatchResult, nt_status::NtStatus> {
+    // A scoped SCSI proof authorizes only its own frame; such an IRP is never queued.
+    let admission = if unsafe { pending_scsi_proof_slot() }.is_some() {
+        Admission::Refuse
+    } else {
+        Admission::Queue
+    };
+    dispatch_deferring_with(caller, request, input, initial_output, policy, admission)
+}
+
+fn dispatch_deferring_with(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    request: ExternalFileIrpRequest,
+    input: &[u8],
+    initial_output: &[u8],
+    policy: ExternalFileIrpDispatchPolicy,
+    admission: Admission,
+) -> Result<DispatchResult, nt_status::NtStatus> {
     match dispatch_with_port_connect(
-        caller, request, input, initial_output, policy, None, invoke_retaining,
+        caller, request, input, initial_output, policy, None, admission, invoke_retaining,
     ) {
         Ok(result) => Ok(result),
         Err(DispatchFailure::Status(status)) => Err(status),
@@ -2036,6 +2082,7 @@ pub(super) fn dispatch_port_connect(
         caller, request, input, &[],
         ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice,
         Some(device),
+        Admission::Refuse,
         |invocation, caller, capture| {
             match hosted_file_dispatch::invoke_suspend_aware(invocation, caller, capture) {
                 hosted_file_dispatch::InvokeResult::Returned(returned) => Ok(returned),
@@ -2135,6 +2182,73 @@ fn trace_file_return_probe_status(
     print_str(b"\n");
 }
 
+/// What a dispatch does when no hosted lane can admit its IRP yet (#427).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Return STATUS_DEVICE_BUSY to a caller that re-prepares the request itself.
+    Refuse,
+    /// Keep the prepared IRP queued in its row and redrive it when a lane frees.
+    Queue,
+}
+
+/// An older not-admitted IRP for the same driver is still queued.
+fn queued_ahead(id: u64) -> bool {
+    let driver = row(id).primary_driver;
+    rows().iter().any(|other| other.id < id && other.queue_not_admitted
+        && other.flight == Flight::QueuedDispatch && other.primary_driver == driver)
+}
+
+/// Retain a not-admitted preparation; nothing was entered, so it may be begun again.
+fn queue_unadmitted(id: u64, prepared: PreparedExternalFileIrp) {
+    let row = row(id);
+    row.payload = Some(Payload::Prepared(prepared));
+    row.flight = Flight::QueuedDispatch;
+    row.blocked_status = None;
+    row.admission_epoch = LANE_EPOCH.load(Ordering::Acquire);
+}
+
+fn queued_admissions() -> Vec<nt_hosted_runtime::QueuedIrp> {
+    rows().iter()
+        .filter(|row| row.queue_not_admitted && row.flight == Flight::QueuedDispatch)
+        .map(|row| nt_hosted_runtime::QueuedIrp {
+            id: row.id,
+            driver: row.primary_driver.map_or(0, |driver| driver.raw()),
+            refused_at: row.admission_epoch,
+            cancel_queued: queued_cancel(row),
+        })
+        .collect()
+}
+
+/// Queued not-admitted rows a lane change or a queued cancel may now move.
+pub(super) fn queued_admission_due() -> bool {
+    if !rows().iter().any(|row| row.queue_not_admitted && row.flight == Flight::QueuedDispatch) {
+        return false;
+    }
+    let _transient = crate::allocator::enter_transient();
+    !nt_hosted_runtime::queued_admission_candidates(
+        &queued_admissions(), LANE_EPOCH.load(Ordering::Acquire)).is_empty()
+}
+
+fn queued_cancel(row: &Row) -> bool {
+    row.irp_id.is_some_and(|irp| io_manager_mut()
+        .detached_file_irp_intent(ClientId(IO_MANAGER_COMPONENT_ID), irp)
+        .is_ok_and(|intent| intent.cancel == ExternalFileIrpCancelPhase::Queued))
+}
+
+/// Begin queued not-admitted IRPs again, oldest first per driver (see
+/// `nt_hosted_runtime::queued_admission_candidates`); a queued cancel or abandon completes its
+/// IRP without provider entry. Must run where entering a provider cannot disturb a caller's
+/// Reply or received message: the root's global-work pass, after the queuing syscall parked its
+/// Reply.
+pub(super) fn redrive_queued_dispatches() -> usize {
+    let _durable = crate::allocator::enter_durable();
+    let candidates = nt_hosted_runtime::queued_admission_candidates(
+        &queued_admissions(), LANE_EPOCH.load(Ordering::Acquire));
+    candidates.into_iter()
+        .filter(|id| matches!(redrive_queued(*id), QueuedReadRedriveOutcome::Progressed))
+        .count()
+}
+
 fn dispatch_with_port_connect<Yield>(
     caller: nt_process::native_handle::NativeHandleCaller,
     request: ExternalFileIrpRequest,
@@ -2142,6 +2256,7 @@ fn dispatch_with_port_connect<Yield>(
     initial_output: &[u8],
     policy: ExternalFileIrpDispatchPolicy,
     port_connect_device: Option<nt_io_manager::DeviceId>,
+    admission: Admission,
     invoke: impl FnOnce(
         ExternalFileIrpInvocation,
         nt_process::native_handle::NativeHandleCaller,
@@ -2180,6 +2295,15 @@ fn dispatch_with_port_connect<Yield>(
     if let Err(status) = capture_route(id, &prepared) {
         discard(id, prepared)?;
         return Err(DispatchFailure::Status(status));
+    }
+    row(id).queue_not_admitted = admission == Admission::Queue
+        && port_connect_device.is_none()
+        && policy == ExternalFileIrpDispatchPolicy::File;
+    if row(id).queue_not_admitted && queued_ahead(id) {
+        // An older IRP for this driver still waits for a lane; never overtake it.
+        let irp_id = prepared.irp_id();
+        queue_unadmitted(id, prepared);
+        return Ok(DispatchResult::Outstanding { irp_id });
     }
     // This exact retained stack is the last Executive-side point before a disk provider may
     // enter. A possible installed-media mutation permanently disables metadata read-through.
@@ -2250,6 +2374,23 @@ fn settle_returned_dispatch(
         }
     };
     match result {
+        ExternalFileIrpResult::NotAdmitted { prepared } => {
+            trace_file_return_probe(73, irp_id);
+            if take_deferred(id) {
+                // A resumed pump had entered its provider; a no-admission return contradicts that.
+                block(id, Payload::Prepared(prepared), nt_status::NtStatus::DEVICE_BUSY);
+                return Ok(DispatchResult::Outstanding { irp_id });
+            }
+            if row(id).queue_not_admitted {
+                queue_unadmitted(id, prepared);
+                return Ok(DispatchResult::Outstanding { irp_id });
+            }
+            // This caller re-prepares a busy refusal itself.
+            if discard(id, prepared).is_err() {
+                return Ok(DispatchResult::Outstanding { irp_id });
+            }
+            Err(nt_status::NtStatus::DEVICE_BUSY)
+        }
         ExternalFileIrpResult::NotEntered { status, prepared } => {
             trace_file_return_probe(73, irp_id);
             if take_deferred(id) {
@@ -2481,9 +2622,17 @@ pub(super) enum QueuedReadRedriveOutcome {
 }
 
 pub(super) fn redrive_queued_read(irp_id: IrpId) -> QueuedReadRedriveOutcome {
-    let _durable = crate::allocator::enter_durable();
     let Some(id) = find(irp_id) else { return QueuedReadRedriveOutcome::NoWork };
+    redrive_queued(id)
+}
+
+/// Enter the exact queued IRP at most once: a queued READ after its parent Reply was restored,
+/// or a not-admitted ordinary IRP after its caller's Reply was parked. A rejected or uncertain
+/// effect remains in this row; only a manager-validated no-admission requeues it.
+fn redrive_queued(id: u64) -> QueuedReadRedriveOutcome {
+    let _durable = crate::allocator::enter_durable();
     if row(id).flight != Flight::QueuedDispatch { return QueuedReadRedriveOutcome::NoWork }
+    let Some(irp_id) = row(id).irp_id else { return QueuedReadRedriveOutcome::NoWork };
     // A queued caller may be cancelled or abandoned before this explicit redrive. The manager
     // owns that intent; never infer a new provider call merely from a live native route.
     let intent = match io_manager_mut()
@@ -2514,52 +2663,46 @@ pub(super) fn redrive_queued_read(irp_id: IrpId) -> QueuedReadRedriveOutcome {
             return QueuedReadRedriveOutcome::Retained(nt_status::NtStatus::INVALID_PARAMETER);
         }
     };
-    let mut phase = FileRpcPhaseGuard::new(major::IRP_MJ_READ);
+    let major = prepared.projection().major;
+    let mut phase = FileRpcPhaseGuard::new(major);
+    // The same last point before a disk provider may enter as a first dispatch's.
+    unsafe { mounted_native_block::before_external_scsi_effect(&prepared, &row(id).stack) };
     let invocation = match io_manager_mut().begin_prepared_external_file_irp(prepared) {
         Ok(invocation) => invocation,
         Err(rejection) => {
             let (status, prepared) = rejection.into_parts();
             // A queued cancellation is a proven no-entry terminal; a failed physical or
             // manager route remains retained if its exact cause cannot be terminalized.
-            if status == nt_status::NtStatus::CANCELLED {
-                match io_manager_mut().complete_prepared_external_file_irp_without_entry(
-                    prepared,
-                    nt_io_manager::detached_file_irp::ExternalFileIrpPreEntryFailure::Cancelled,
-                ) {
-                    Ok(retained) => {
-                        keep(id, Payload::Retained(retained));
-                        return QueuedReadRedriveOutcome::Progressed;
-                    }
-                    Err(rejection) => {
-                        let (error, prepared) = rejection.into_parts();
-                        block(id, Payload::Prepared(prepared), error);
-                        return QueuedReadRedriveOutcome::Retained(error);
-                    }
-                }
-            }
-            // A manager route refusal is terminal only when the manager validates its own
-            // route fault against this exact preparation. Other refusals remain retained.
-            let failure = nt_io_manager::detached_file_irp::ExternalFileIrpPreEntryFailure::ManagerRouteUnavailable;
-            match io_manager_mut().complete_prepared_external_file_irp_without_entry(prepared, failure) {
+            let failure = if status == nt_status::NtStatus::CANCELLED {
+                nt_io_manager::detached_file_irp::ExternalFileIrpPreEntryFailure::Cancelled
+            } else {
+                // A manager route refusal is terminal only when the manager validates its own
+                // route fault against this exact preparation. Other refusals remain retained.
+                nt_io_manager::detached_file_irp::ExternalFileIrpPreEntryFailure::ManagerRouteUnavailable
+            };
+            return match io_manager_mut().complete_prepared_external_file_irp_without_entry(
+                prepared, failure,
+            ) {
                 Ok(retained) => {
                     keep(id, Payload::Retained(retained));
-                    return QueuedReadRedriveOutcome::Progressed;
+                    crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING
+                        .store(true, Ordering::Release);
+                    QueuedReadRedriveOutcome::Progressed
                 }
                 Err(rejection) => {
-                    let (_, prepared) = rejection.into_parts();
-                    block(id, Payload::Prepared(prepared), status);
-                    return QueuedReadRedriveOutcome::Retained(status);
+                    let (error, prepared) = rejection.into_parts();
+                    let error = if status == nt_status::NtStatus::CANCELLED { error } else { status };
+                    block(id, Payload::Prepared(prepared), error);
+                    QueuedReadRedriveOutcome::Retained(error)
                 }
-            }
+            };
         }
     };
     // The manager has transferred the owner to Dispatched; even an uncertain transport
     // result may never send this invocation again.
     row(id).flight = Flight::Dispatch;
-    row(id).phase_major = major::IRP_MJ_READ;
-    phase.identity = Some(nt_hosted_runtime::HostedFileRpcIdentity {
-        irp_id: irp_id.raw(), major: major::IRP_MJ_READ,
-    });
+    row(id).phase_major = major;
+    phase.identity = Some(nt_hosted_runtime::HostedFileRpcIdentity { irp_id: irp_id.raw(), major });
     let returned = if !live_route(id) {
         // begin_prepared_external_file_irp transferred the exact manager owner, but the
         // captured native authority/generation is no longer live. No provider has entered.
@@ -2569,13 +2712,13 @@ pub(super) fn redrive_queued_read(irp_id: IrpId) -> QueuedReadRedriveOutcome {
     } else {
         phase.invoked = crate::disk_census_ticks();
         match hosted_file_dispatch::invoke_retaining(
-            invocation, row(id).caller, ExternalFileIrpDispatchPolicy::File.output_capture(),
+            invocation, row(id).caller, row(id).output_capture,
         ) {
             hosted_file_dispatch::InvokeResult::Returned(returned) => returned,
-            // The READ's caller is already parked on its pending owner (#420).
+            // The caller is already parked on its pending owner (#420).
             hosted_file_dispatch::InvokeResult::ChildWorkYield {
                 invocation, key, continuation,
-            // A READ is never bound to a scoped SCSI proof.
+            // A queued IRP is never bound to a scoped SCSI proof.
             } => return match defer_pump(irp_id, invocation, key, continuation, None) {
                 Ok(()) => QueuedReadRedriveOutcome::Progressed,
                 Err(status) => QueuedReadRedriveOutcome::Retained(status),
@@ -2615,6 +2758,11 @@ pub(super) fn redrive_queued_read(irp_id: IrpId) -> QueuedReadRedriveOutcome {
             // An invalid success-shaped refusal has no terminal authority; retain it.
             block(id, Payload::Prepared(prepared), status);
             QueuedReadRedriveOutcome::Retained(status)
+        }
+        ExternalFileIrpResult::NotAdmitted { prepared } => {
+            // Still no free lane: nothing was entered, so it waits for the next lane change.
+            queue_unadmitted(id, prepared);
+            QueuedReadRedriveOutcome::Retained(nt_status::NtStatus::DEVICE_BUSY)
         }
         ExternalFileIrpResult::Returned(terminal) => match publish_terminal(id, irp_id, terminal) {
             Ok(()) => QueuedReadRedriveOutcome::Progressed,

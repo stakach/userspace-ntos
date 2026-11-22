@@ -52525,7 +52525,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
             }
         });
     }
-    let result = hosted_file_owners::dispatch_deferring(
+    let result = hosted_file_owners::dispatch_deferring_queued(
         caller,
         nt_io_manager::detached_file_irp::ExternalFileIrpRequest {
             client: ClientId(IO_MANAGER_COMPONENT_ID),
@@ -76178,6 +76178,12 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
     yielded: Option<(&mut Option<FileIrpPumpContinuation>, FilePumpMode)>,
 ) -> Option<HostedIrpTransportResult> {
+    // Whatever this dispatch did, a lane may be free once it returns (#427).
+    struct LaneFreedOnReturn;
+    impl Drop for LaneFreedOnReturn {
+        fn drop(&mut self) { hosted_file_owners::lane_freed(); }
+    }
+    let _lane_freed = LaneFreedOnReturn;
     if yielded.is_some() && caller.is_none() {
         return Some(HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus::INVALID_PARAMETER,
@@ -77326,6 +77332,21 @@ pub(crate) fn reconcile_retained_hosted_file_read_exact(
 ) -> Result<(), (u32, hosted_file_owners::RetainedQueuedReadSelector)> {
     hosted_file_owners::reconcile_retained_queued_read(selector)
         .map_err(|(status, selector)| (status.raw() as u32, selector))
+}
+
+/// A hosted dispatch lane may have become free (#427).
+pub(crate) fn hosted_lane_freed() {
+    hosted_file_owners::lane_freed();
+}
+
+/// Queued not-admitted ordinary IRPs a freed lane or a queued cancel may now move (#427).
+pub(crate) fn queued_hosted_admission_due() -> bool {
+    hosted_file_owners::queued_admission_due()
+}
+
+/// Begin queued not-admitted ordinary IRPs again; see `hosted_file_owners`.
+pub(crate) fn redrive_queued_hosted_dispatches() -> usize {
+    hosted_file_owners::redrive_queued_dispatches()
 }
 
 pub(crate) fn redrive_queued_hosted_file_read_exact(

@@ -4717,6 +4717,22 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
     unsafe { crate::pending_file_apc::redrive(nt_handler) };
     unsafe { crate::current_apc::redrive(nt_handler) };
     end(Step::WaitApcRedrive, t, ());
+    // Ordinary IRPs no lane admitted wait in their File rows (#427). Their callers' Replies are
+    // parked by now, so a freed lane may enter the next one; a queued cancel completes without
+    // entry. Its terminal is delivered by the File I/O pass below.
+    if !root_queued_callback_exclusive_pending()
+        && !unsafe { driver_launch::unsettled_queued_callback() }
+        && driver_launch::queued_hosted_admission_due()
+    {
+        let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+        // An admitted IRP's return frees its lane for the next queued one; settle that here,
+        // before the root can block, until no queued IRP can move (bounded per pass).
+        for _ in 0..64 {
+            if driver_launch::redrive_queued_hosted_dispatches() == 0 { break; }
+            FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+            if !driver_launch::queued_hosted_admission_due() { break; }
+        }
+    }
     if FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel) {
         let t = begin();
         let mut progressed = 0u64;
@@ -13946,7 +13962,10 @@ fn trace_running_lane_gate(
 pub(crate) unsafe fn drain_root_restores() {
     trace_root_restore_drain(
         crate::spawn_hosts::shared_ingress::owner::runtime::nested::drain_root_restore_queue());
-    let _ = crate::driver_launch::drive_kept_pumps();
+    // A kept dispatch that finished or yielded may have freed its lane (#427).
+    if crate::driver_launch::drive_kept_pumps() != 0 {
+        crate::driver_launch::hosted_lane_freed();
+    }
 }
 
 /// Whether a root-level owner may block in the root progress loop here (#420): the live

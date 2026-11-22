@@ -247,6 +247,9 @@ pub enum ExternalFileIrpOutcome {
     NotEntered {
         status: NtStatus,
     },
+    /// The executor proves no hosted lane could admit the IRP yet, so nothing was entered. This
+    /// is not a failure: the IRP returns to its owner, which keeps it queued and begins it again.
+    NotAdmitted,
     Returned {
         status: NtStatus,
         information: u64,
@@ -270,6 +273,10 @@ pub enum ExternalFileIrpPreEntryFailure {
 pub enum ExternalFileIrpResult {
     NotEntered {
         status: NtStatus,
+        prepared: PreparedExternalFileIrp,
+    },
+    /// No lane admitted it; `prepared` may be begun again and never mints a no-entry failure.
+    NotAdmitted {
         prepared: PreparedExternalFileIrp,
     },
     Returned(ExternalFileIrpTerminal),
@@ -923,10 +930,17 @@ impl<P: ObjectManagerPort> IoManager<P> {
             let record = self.irp(prepared.irp_id()).ok_or(NtStatus::INVALID_HANDLE)?;
             if !status.is_error()
                 || record.state != IrpState::Initialized
-                || prepared.0.projection.major != major::IRP_MJ_READ
                 || self.file_irp_projection(prepared.irp_id())? != prepared.0.projection
             {
                 return Err(NtStatus::INVALID_PARAMETER);
+            }
+            if crate::is_create_major(prepared.0.projection.major) {
+                let file = self
+                    .file(prepared.0.projection.file_id.ok_or(NtStatus::INVALID_PARAMETER)?)
+                    .ok_or(NtStatus::INVALID_HANDLE)?;
+                if file.state != FileState::Allocated || file.related_file.is_some() {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
             }
             Ok(())
         })();
@@ -940,6 +954,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
             });
         }
         let id = prepared.irp_id();
+        if crate::is_create_major(prepared.0.projection.major) {
+            // The CREATE never reached a provider: its File fails closed, as a failed CREATE's.
+            let file = self.file_mut(prepared.0.projection.file_id.unwrap()).unwrap();
+            file.related_file = prepared.0.related;
+            file.complete_create(status, None);
+        }
         let record = self.irp_mut(id).expect("validated detached IRP");
         record.status = status;
         record.information = 0;
@@ -1031,7 +1051,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
             {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
-            if let ExternalFileIrpOutcome::NotEntered { .. } = returned.outcome {
+            if let ExternalFileIrpOutcome::NotEntered { .. } | ExternalFileIrpOutcome::NotAdmitted =
+                returned.outcome
+            {
                 if crate::is_create_major(record.origin_major)
                     && !record
                         .file_id
@@ -1070,16 +1092,18 @@ impl<P: ObjectManagerPort> IoManager<P> {
             }));
         }
         Ok(match outcome {
-            ExternalFileIrpOutcome::NotEntered { status } => {
+            ExternalFileIrpOutcome::NotEntered { .. } | ExternalFileIrpOutcome::NotAdmitted => {
                 self.irp_mut(id).unwrap().state = IrpState::Initialized;
                 if crate::is_create_major(owner.projection.major) {
                     self.file_mut(owner.projection.file_id.unwrap())
                         .unwrap()
                         .state = FileState::Allocated;
                 }
-                ExternalFileIrpResult::NotEntered {
-                    status,
-                    prepared: PreparedExternalFileIrp(owner),
+                let prepared = PreparedExternalFileIrp(owner);
+                match outcome {
+                    ExternalFileIrpOutcome::NotEntered { status } =>
+                        ExternalFileIrpResult::NotEntered { status, prepared },
+                    _ => ExternalFileIrpResult::NotAdmitted { prepared },
                 }
             }
             ExternalFileIrpOutcome::Pending => {

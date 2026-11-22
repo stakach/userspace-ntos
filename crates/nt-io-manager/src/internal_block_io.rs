@@ -470,6 +470,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let InternalBlockReturn { owner, contract } = returned;
         self.finish_external_file_irp(owner)
             .map(|result| match result {
+                // Block I/O owners re-prepare a busy refusal themselves.
+                ExternalFileIrpResult::NotAdmitted { prepared } => InternalBlockResult::NotEntered {
+                    status: NtStatus::DEVICE_BUSY,
+                    prepared: PreparedInternalBlockIrp { owner: prepared, contract },
+                },
                 ExternalFileIrpResult::NotEntered { status, prepared } => {
                     InternalBlockResult::NotEntered {
                         status,
