@@ -7734,7 +7734,7 @@ extern "win64" fn s_ex_free_pool(p: u64) {
     if p == 0 {
         return;
     }
-    if unsafe { hosted_driver_contiguous_memory::owns_allocation(p) } {
+    if hosted_driver_contiguous_memory::in_aperture(p) {
         unsafe { crate::provider_bugcheck::report(0xc4, [0x434f_4e54, p, 3, 0]); }
     }
     let status = unsafe { hosted_source_retirement::retire(3, p) };

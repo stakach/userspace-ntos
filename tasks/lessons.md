@@ -133,6 +133,12 @@
   returns a no-effects refusal. Tag shared lock words with their holder so a refusal names it.
 - Executive image `.data`/`.bss` statics are physically shared by every hosted VSpace; a
   "component-private" static lock is one word across all drivers.
+- A DPC-reachable export (ExFreePool, IoCompleteRequest, ...) must never wait on a component
+  lock that a PASSIVE lane holds across a root Call. Root drives the DPC to completion before it
+  answers that Call, so the IRQ lane yield-spins forever (boot 44963863150: `s_ex_free_pool` ->
+  `owns_allocation` -> `component_device_reply_lock`, held by IoGetDeviceProperty). For a stall
+  with a busy CPU0, read RCX (user RIP) and RDX (syscall number, -11 = yield) at `syscall_entry`
+  samples and disassemble that site in the evidence `rootserver.elf`.
 
 ## Build / verification
 - **build.sh silently leaves a STALE rootserver.elf if `cargo build` fails** (documented in

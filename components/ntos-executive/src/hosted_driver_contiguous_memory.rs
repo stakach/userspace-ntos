@@ -87,10 +87,13 @@ pub(super) extern "win64" fn mm_free_contiguous_memory_specify_cache(
     if address != 0 { unsafe { free(address, Some(length), Some(cache)) }; }
 }
 
-/// Generic ExFreePool cannot recycle the separately owned physical RAM aperture.
-pub(super) unsafe fn owns_allocation(address: u64) -> bool {
-    let _guard = component_device_reply_lock();
-    (&*core::ptr::addr_of!(ALLOCATIONS)).iter().any(|row| row.address == address)
+/// Generic ExFreePool cannot recycle the separately owned physical RAM aperture, and no pool
+/// allocation lies inside it. The fixed range needs no ledger: ExFreePool runs on a DPC at
+/// DISPATCH_LEVEL, and a PASSIVE lane holds the device-reply lock across root Calls that root
+/// cannot answer until the DPC returns.
+pub(super) fn in_aperture(address: u64) -> bool {
+    (hosted_contiguous_ram_broker::APERTURE_BASE..hosted_contiguous_ram_broker::APERTURE_END)
+        .contains(&address)
 }
 
 /// Ask the executive to translate only a live physical run owned by this exact hosted domain.
