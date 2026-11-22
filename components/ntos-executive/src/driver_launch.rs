@@ -77331,6 +77331,12 @@ pub(crate) fn hosted_admission_counts() -> nt_component_suspension::AdmissionCou
     }
 }
 
+/// Advanced whenever a hosted lane becomes admissible again (#427): a request refused
+/// admission before this changes could only be refused again.
+pub(crate) fn hosted_admission_epoch() -> u64 {
+    hosted_file_owners::admission_epoch()
+}
+
 /// How far a hosted File IRP's dispatch has got for its caller (#427).
 pub(crate) fn hosted_dispatch_progress(irp_id: u64) -> Option<nt_hosted_runtime::DispatchProgress> {
     hosted_file_owners::dispatch_progress(IrpId(irp_id))

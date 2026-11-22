@@ -207,6 +207,9 @@ pub(super) unsafe fn maintain(
         }
     }
     'queued_callback_settlement: loop {
+        // Every receive below arms the turn's retry shot unless this pass finds its child
+        // awaiting a lane going idle (#420).
+        set_root_add_device_awaiting_lane(false);
         // A callback reached by the preceding AddDevice child owns a nested physical
         // Reply. Settle it before running another AddDevice child or resuming the batch.
         // Passive work may enter a provider and retain a physical callback Reply. Only
@@ -293,7 +296,8 @@ pub(super) unsafe fn maintain(
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             run_one_pending_add_device_child_step(nt_handler as *mut _)
         };
-        let Some((reservation, ran_child)) = selected else {
+        let Some(ParkedAddDeviceStep { owner: reservation, ran_child, awaiting_lane_idle }) =
+            selected else {
             if let Some(turn) = lp.ingress.root_add_device_turn.take() {
                 let owner = turn.owner();
                 if !root_add_device_owner_exact_present(&nt_handler, owner)
@@ -466,6 +470,9 @@ pub(super) unsafe fn maintain(
             }
         }
         if ran_child && !awaiting_connect_child { continue }
+        // A child no lane admitted reruns once a lane goes idle, which only a root event can
+        // cause: wait for it with no retry shot. A CONNECT child keeps its retry shot.
+        set_root_add_device_awaiting_lane(awaiting_lane_idle && !awaiting_connect_child);
         let turn = lp.ingress.root_add_device_turn.as_mut().expect("parked AddDevice turn");
         if !root_event_consumed && badge_has_delay_timer(lp.msg.badge)
             || !root_event_consumed && hosted_irq_lines_from_badge(lp.msg.badge) != 0

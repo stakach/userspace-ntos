@@ -13761,6 +13761,13 @@ type RootQueuedCallbackTurn = nt_component_suspension::RootChildTurn<
 /// `u64::MAX` denotes no armed retry; the PIT remains one-shot and idle without retained work.
 static ROOT_ADD_DEVICE_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 static ROOT_ADD_DEVICE_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
+/// The parked AddDevice's child awaits a lane going idle (#420): its turn arms no retry shot.
+static ROOT_ADD_DEVICE_AWAITING_LANE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the parked turn's next receive waits for a lane to go idle rather than a retry shot.
+pub(crate) fn set_root_add_device_awaiting_lane(awaiting: bool) {
+    ROOT_ADD_DEVICE_AWAITING_LANE.store(awaiting, Ordering::Release);
+}
 
 /// A root-owned callback is physically retained while its selected local child is absent.
 /// The retry is only a wake request; neither the timer nor another Call may replace that owner.
@@ -13858,6 +13865,7 @@ unsafe fn release_root_add_device_turn(
         }
     };
     ROOT_ADD_DEVICE_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
+    ROOT_ADD_DEVICE_AWAITING_LANE.store(false, Ordering::Release);
     ROOT_ADD_DEVICE_EXCLUSIVE.store(false, Ordering::Release);
     Ok(retained.is_some())
 }
@@ -13913,6 +13921,12 @@ unsafe fn prepare_parked_add_device_receive(
         if turn.observe_arrival(owner, nt_driver_start::RootArrival::Timer { now }).is_err() {
             return false;
         }
+    }
+    if !nt_driver_start::arm_add_device_retry_shot(ROOT_ADD_DEVICE_AWAITING_LANE.load(Ordering::Acquire)) {
+        // The refused child reruns when a lane goes idle; a retry shot could only poll the
+        // busy lane (#420). A shot already programmed wakes the root once, harmlessly.
+        ROOT_ADD_DEVICE_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
+        return true;
     }
     let now = monotonic_time_100ns();
     let deadline = match turn.retry_deadline(owner) {
@@ -14521,31 +14535,85 @@ unsafe fn redrive_flat_root_add_device_selected(
     }
 }
 
+/// The root's pass over the selected parked AddDevice.
+#[derive(Clone, Copy)]
+struct ParkedAddDeviceStep {
+    owner: RootAddDeviceOwner,
+    ran_child: bool,
+    /// Its child was refused admission at the current lane-idle epoch (#420): nothing ran,
+    /// and nothing reruns it before a lane goes idle.
+    awaiting_lane_idle: bool,
+}
+
+/// What one child step of a parked AddDevice did, judged by the admission it got.
+enum AddDeviceChildRun {
+    /// Deposit this receipt in the batch.
+    Deposit(NestedChildStep),
+    /// No lane admitted the child, so nothing entered (#427). The parent stays parked
+    /// unchanged, with no receipt to deposit, until a lane goes idle.
+    Refused,
+}
+
+/// Bounded native evidence for a parked AddDevice's child waiting on a lane (#420).
+fn trace_add_device_child_wait(stage: &[u8], epoch: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 64 { return; }
+    print_str(b"[add-device-child-wait] stage=");
+    print_str(stage);
+    print_str(b" epoch=");
+    print_u64(epoch);
+    print_str(b"\n");
+}
+
+unsafe fn run_add_device_child(epoch: u64) -> AddDeviceChildRun {
+    let before = crate::driver_launch::hosted_admission_counts();
+    let step = drive_one_nested_file_child_step();
+    // A Waiting pass reports NoReady (#427); only its refusal tells it from "nothing ready".
+    if !step.ran_child() && crate::driver_launch::hosted_admission_counts().refusals != before.refusals {
+        trace_add_device_child_wait(b"refused", epoch);
+        return AddDeviceChildRun::Refused;
+    }
+    AddDeviceChildRun::Deposit(step)
+}
+
 /// Run at most one certified nested File step for an exact retained AddDevice batch. Its
 /// Ready cursor cannot retire during this step: redrive waits until the receipt is deposited.
+/// A child refused admission reruns only once the lane-idle epoch moves (#420).
 unsafe fn run_one_pending_add_device_child_step(
     handler: *mut ExecNtHandler,
-) -> Option<(RootAddDeviceOwner, bool)> {
+) -> Option<ParkedAddDeviceStep> {
+    use nt_driver_start::AddDeviceChildAction;
+    let epoch = crate::driver_launch::hosted_admission_epoch();
     let selected = {
         let table = &(*handler).pending_driver_starts;
         table.occupied_slots().find_map(|slot| {
             let pending = table.get(slot)?;
             (pending.batch.wait_stage() == hosted_pnp_start::HostedPnpWaitStage::AddDevice)
                 .then_some((slot, pending.reservation,
-                    pending.batch.needs_add_device_child_step()))
+                    pending.batch.needs_add_device_child_step(),
+                    pending.batch.add_device_child_action(epoch)))
         })
     };
-    if let Some((slot, reservation, needs_child)) = selected {
+    if let Some((slot, reservation, needs_child, action)) = selected {
         let owner = RootAddDeviceOwner::DriverStart(reservation);
-        if !needs_child { return Some((owner, false)) }
-        let step = drive_one_nested_file_child_step();
-        let ran_child = step.ran_child();
+        if !needs_child {
+            return Some(ParkedAddDeviceStep { owner, ran_child: false, awaiting_lane_idle: false });
+        }
+        if action == AddDeviceChildAction::AwaitLaneIdle {
+            return Some(ParkedAddDeviceStep { owner, ran_child: false, awaiting_lane_idle: true });
+        }
+        let run = run_add_device_child(epoch);
         let pending = (*handler).pending_driver_starts.get_mut(slot)
             .filter(|pending| pending.reservation == reservation)
             .expect("selected AddDevice batch cannot retire before its child receipt is deposited");
+        let AddDeviceChildRun::Deposit(step) = run else {
+            pending.batch.observe_add_device_child_refused(epoch);
+            return Some(ParkedAddDeviceStep { owner, ran_child: false, awaiting_lane_idle: true });
+        };
+        let ran_child = step.ran_child();
         // A quarantined receipt stays in the batch, whose parent the turn then fails (#420).
         return match pending.batch.record_add_device_child_step(step) {
-            Ok(_) => Some((owner, ran_child)),
+            Ok(_) => Some(ParkedAddDeviceStep { owner, ran_child, awaiting_lane_idle: false }),
             Err(_) => unreachable!("exact AddDevice batch refused its selected child receipt"),
         };
     }
@@ -14557,22 +14625,31 @@ unsafe fn run_one_pending_add_device_child_step(
                 return None;
             };
             batch.add_device_wait_stage().then_some((slot, pending.reservation,
-                batch.needs_add_device_child_step()))
+                batch.needs_add_device_child_step(), batch.add_device_child_action(epoch)))
         })
     };
-    let (slot, reservation, needs_child) = selected?;
+    let (slot, reservation, needs_child, action) = selected?;
     let owner = RootAddDeviceOwner::PnpRebalance(reservation);
-    if !needs_child { return Some((owner, false)) }
-    let step = drive_one_nested_file_child_step();
-    let ran_child = step.ran_child();
+    if !needs_child {
+        return Some(ParkedAddDeviceStep { owner, ran_child: false, awaiting_lane_idle: false });
+    }
+    if action == AddDeviceChildAction::AwaitLaneIdle {
+        return Some(ParkedAddDeviceStep { owner, ran_child: false, awaiting_lane_idle: true });
+    }
+    let run = run_add_device_child(epoch);
     let pending = (*handler).pending_pnp_operations.get_mut(slot)
         .filter(|pending| pending.reservation == reservation)
         .expect("selected rebalance AddDevice cannot retire before its child receipt is deposited");
     let OwnedPendingPnpOperation::Rebalance(batch) = &mut pending.operation else {
         unreachable!("exact rebalance AddDevice changed operation kind");
     };
+    let AddDeviceChildRun::Deposit(step) = run else {
+        batch.observe_add_device_child_refused(epoch);
+        return Some(ParkedAddDeviceStep { owner, ran_child: false, awaiting_lane_idle: true });
+    };
+    let ran_child = step.ran_child();
     match batch.record_add_device_child_step(step) {
-        Ok(_) => Some((owner, ran_child)),
+        Ok(_) => Some(ParkedAddDeviceStep { owner, ran_child, awaiting_lane_idle: false }),
         Err(_) => unreachable!("exact rebalance AddDevice refused its selected child receipt"),
     }
 }

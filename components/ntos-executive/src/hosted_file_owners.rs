@@ -159,7 +159,7 @@ pub(super) fn lane_freed() {
 }
 
 /// Changes whenever any hosted lane becomes admissible or a worker claim ends (#427).
-fn admission_epoch() -> u64 {
+pub(super) fn admission_epoch() -> u64 {
     LANE_EPOCH.load(Ordering::Acquire)
         .wrapping_add(unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::lane_idle_epoch() })
 }

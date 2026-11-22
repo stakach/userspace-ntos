@@ -272,6 +272,7 @@ struct PendingHostedAddDevice {
     child_step_recorded: bool,
     blocked: bool,
     quarantined_child_step: Option<crate::service_sec_image::NestedChildStep>,
+    child_wait: nt_driver_start::AddDeviceChildWait,
 }
 
 /// The function FDO has returned, but its ordered class filter still owns an entered
@@ -285,6 +286,7 @@ struct PendingHostedUpperFilter {
     child_step_recorded: bool,
     blocked: bool,
     quarantined_child_step: Option<crate::service_sec_image::NestedChildStep>,
+    child_wait: nt_driver_start::AddDeviceChildWait,
 }
 
 /// Held, never released or resumed: the parent's AddDevice may still be running.
@@ -575,6 +577,24 @@ impl OwnedHostedPnpStartBatch {
             })
     }
 
+    /// What the root does for the parked AddDevice's ready child at lane-idle `epoch` (#420).
+    pub(crate) fn add_device_child_action(&self, epoch: u64) -> nt_driver_start::AddDeviceChildAction {
+        self.pending_upper_filter.as_ref().map(|pending| pending.child_wait)
+            .or_else(|| self.pending_add_device.as_ref().map(|pending| pending.child_wait))
+            .map_or(nt_driver_start::AddDeviceChildAction::RunChild, |wait| wait.action(epoch))
+    }
+
+    /// The parked AddDevice's child step sampled `epoch` and no lane admitted it. Nothing
+    /// entered, so the parent stays parked unchanged and the child reruns once a lane goes idle.
+    pub(crate) fn observe_add_device_child_refused(&mut self, epoch: u64) {
+        let wait = match (self.pending_upper_filter.as_mut(), self.pending_add_device.as_mut()) {
+            (Some(pending), _) => &mut pending.child_wait,
+            (None, Some(pending)) => &mut pending.child_wait,
+            (None, None) => return,
+        };
+        wait.observe(true, epoch);
+    }
+
     /// The parked AddDevice has neither a child to run nor a retry: its effect is uncertain.
     /// Fail its devnode as NT fails an AddDevice (`CM_PROB_FAILED_ADD`), and fence the parent
     /// with its Reply, banks and resource plan in this batch; nothing is released, resumed or
@@ -777,6 +797,7 @@ impl OwnedHostedPnpStartBatch {
                     devnode_index, resource_plan, continuation,
                     child_step_recorded: false, blocked,
                     quarantined_child_step: None,
+                    child_wait: nt_driver_start::AddDeviceChildWait::new(),
                 });
                 return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
             }
@@ -789,6 +810,7 @@ impl OwnedHostedPnpStartBatch {
                     devnode_index, device_id, resource_plan, continuation,
                     child_step_recorded: false, blocked,
                     quarantined_child_step: None,
+                    child_wait: nt_driver_start::AddDeviceChildWait::new(),
                 });
                 return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
             }
@@ -1489,6 +1511,14 @@ impl OwnedHostedPnpRebalance {
     pub(crate) fn fail_uncertain_add_device(&mut self) -> Option<&str> {
         if !self.add_device_wait_stage() { return None }
         self.restart.fail_uncertain_add_device()
+    }
+
+    pub(crate) fn add_device_child_action(&self, epoch: u64) -> nt_driver_start::AddDeviceChildAction {
+        self.restart.add_device_child_action(epoch)
+    }
+
+    pub(crate) fn observe_add_device_child_refused(&mut self, epoch: u64) {
+        if self.add_device_wait_stage() { self.restart.observe_add_device_child_refused(epoch) }
     }
 
     fn fail_terminal(&mut self, failure: HostedPnpStartBatchFailure) {
