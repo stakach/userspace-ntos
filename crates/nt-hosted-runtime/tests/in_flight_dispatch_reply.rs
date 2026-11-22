@@ -93,3 +93,21 @@ mod release_is_event_driven {
         assert_eq!(callers.take_ready(), [(cmd, 0x51)]);
     }
 }
+
+mod record_removal {
+    use nt_hosted_runtime::{in_flight_caller_reply, DispatchProgress, InFlightCallers, InFlightReply};
+
+    /// A held caller whose IRP's File record retires (with no later settle) is readied by that
+    /// removal and released through ordinary completion delivery, never left in the table.
+    #[test]
+    fn a_retired_record_releases_its_held_caller() {
+        let mut callers = InFlightCallers::new();
+        callers.hold(7u64, 0x51);
+        callers.dispatch_returned(0x51); // the record's removal
+        let ready = callers.take_ready();
+        assert_eq!(ready, [(7, 0x51)]);
+        // With no record left, its progress reads as Completed: delivery owns the reply.
+        assert_eq!(in_flight_caller_reply(false, DispatchProgress::Completed), InFlightReply::Completion);
+        assert_eq!(callers.held(), 0);
+    }
+}

@@ -546,6 +546,8 @@ fn remove(id: u64) -> Result<Row, nt_status::NtStatus> {
             unsafe { hosted_class_irp_lane::release_irp(instance, irp.raw()) };
         }
         lane_freed();
+        // A caller held on this IRP is released by ordinary completion delivery (#427).
+        crate::service_sec_image::hosted_file_dispatch_returned(irp.raw());
     }
     Ok(retired)
 }
