@@ -36,9 +36,21 @@ RECORDED_READY_COMMA_OCR = ("CAWindows\\svstem32\\emd.exe\n"
 OLD_APPLAUNCH_OCR = ("C:\\Windows\\system32\\cmd.exe\n"
                      "APPLAUNCH_NO_DISK\nAPPLAUNCH_DONE\n"
                      "Command\nPrompt\n")
+RECORDED_SPILLOVER_OCR = (Path(__file__).with_name("fixtures") /
+                          "ready_prompt_45248027167.txt").read_text()
 
 
 class VisualProofTests(unittest.TestCase):
+    def test_recorded_ready_prompt_ignores_separate_punctuation_spillover(self):
+        # Original full step-6 PPM SHA-256 from mainline run 45248027167:
+        # 2cb84c651432283ecf1e3e4bcae3209a2326a5ddb285712b6ff8d54df7e835dc.
+        # PSM 11 joins an unrelated desktop glyph into the prompt's OCR line.
+        self.assertTrue(contains_ready_prompt(RECORDED_SPILLOVER_OCR))
+        self.assertFalse(contains_ready_prompt(OLD_APPLAUNCH_OCR))
+        self.assertFalse(contains_ready_prompt("Command Prompt\nabc C:\\Users\\User>,\n"))
+        self.assertFalse(contains_ready_prompt("Command Prompt\n(;} C:\\Users\\User>,ver\n"))
+        self.assertFalse(contains_ready_prompt("Command Prompt\n!!!! C:\\Users\\User>,\n"))
+
     def test_recorded_ready_prompt_ocr_comma_caret_is_not_a_typed_command(self):
         self.assertTrue(contains_ready_prompt(RECORDED_READY_COMMA_OCR))
         self.assertFalse(contains_ready_prompt("Command Prompt\nC:\\Users\\User>,ver\n"))
