@@ -104,6 +104,9 @@ impl Ticket {
         cnode: u64,
         state: Option<HostedDeviceResourceState>,
     ) -> Result<Self, nt_status::NtStatus> {
+        // A provider runs in its own physical domain while projecting a dependent device's
+        // resource bank under an admitted dependency lease. Keep both domains: a later uncertain
+        // native effect fences the bank's canonical caps and the provider's physical CNode.
         if cnode == 0 {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }

@@ -88,6 +88,7 @@ mod nt_status {
 fn hosted_io_port_cap_effect_pending(_: HostedDeviceBinding, _: u64) -> bool { false }
 static mut CNODES: [[u64; 32]; 8] = [[0; 32]; 8];
 static mut PHYSICAL_GENERATION: [u64; 8] = [0, 1, 1, 1, 1, 1, 1, 1];
+static mut PHYSICAL_DOMAIN: [u64; 8] = [0, 1, 1, 1, 1, 1, 1, 1];
 static mut FAIL_TARGET_CNODE: u64 = 2;
 static mut DELETE_CALLS: u64 = 0;
 static mut COPY_CALLS: u64 = 0;
@@ -134,7 +135,7 @@ fn instance_by_driver_id(driver_id: u64) -> Option<(usize, DriverInstance)> {
 unsafe fn hosted_port_projection_owner(cnode: u64) -> Option<hosted_port_projection::PhysicalOwner> {
     (cnode < 8 && PHYSICAL_GENERATION[cnode as usize] != 0).then(||
         hosted_port_projection::PhysicalOwner::Primary {
-            instance: cnode as usize, domain_id: 1,
+            instance: cnode as usize, domain_id: PHYSICAL_DOMAIN[cnode as usize],
             cookie: PHYSICAL_GENERATION[cnode as usize], tcb: cnode,
         })
 }
@@ -152,6 +153,7 @@ fn sibling_binding() -> HostedDeviceBinding {
 unsafe fn reset() {
     CNODES = [[0; 32]; 8];
     PHYSICAL_GENERATION = [0, 1, 1, 1, 1, 1, 1, 1];
+    PHYSICAL_DOMAIN = [0, 1, 1, 1, 1, 1, 1, 1];
     FAIL_TARGET_CNODE = 2;
     DELETE_CALLS = 0;
     COPY_CALLS = 0;
@@ -252,6 +254,28 @@ fn acknowledged_retirement_releases_a_physical_cnode_for_new_generation() {
         CNODES[7] = [0; 32];
         restore_hosted_device_resource_state(binding(), 200, 7, false).unwrap();
         assert_eq!(CNODES[7][CT_IO_PORT_BASE as usize], 0xA);
+    }
+}
+#[test]
+fn provider_projection_retains_both_dependent_bank_and_physical_owner_domains() {
+    unsafe {
+        reset();
+        PHYSICAL_DOMAIN[1] = 2;
+        FAIL_TARGET_CNODE = 1;
+        FAIL_COPY_AFTER_EFFECT = true;
+        assert!(restore_hosted_device_resource_state(binding(), 100, 1, false).is_err());
+        assert_eq!(CNODES[1][CT_IO_PORT_BASE as usize], 0xA,
+            "an admitted provider may receive a dependent domain's canonical port cap");
+        assert!(hosted_port_projection::quarantines_domain(
+            HostedDomainIdentity { domain_id: DomainId(1), cookie: 11 }),
+            "uncertain projection must fence the dependent's canonical cap lifetime");
+        assert!(hosted_port_projection::quarantines_domain(
+            HostedDomainIdentity { domain_id: DomainId(2), cookie: 1 }),
+            "uncertain projection must fence the provider's physical owner lifetime");
+        let calls = (DELETE_CALLS, COPY_CALLS);
+        assert!(restore_hosted_device_resource_state(binding(), 100, 1, false).is_err());
+        assert_eq!((DELETE_CALLS, COPY_CALLS), calls,
+            "a cross-domain provider's uncertain native effect cannot replay");
     }
 }
 "#;
