@@ -24,14 +24,25 @@ fn method<'a>(file: &'a syn::File, name: &str) -> &'a syn::ImplItemFn {
 }
 
 #[test]
-fn process_creation_selects_canonical_section_before_legacy_image_bookkeeping() {
+fn process_creation_requires_a_canonical_retained_section() {
     let file = syn::parse_file(include_str!("../../../../components/ntos-executive/src/exec_handler.rs")).unwrap();
     let mut calls = Calls::default();
     calls.visit_block(&method(&file, "nt_create_process_service").block);
-    let canonical = calls.0.iter().position(|name| name == "reserve_native_image_process")
-        .expect("native Section handles must select the exact retained image source");
-    let legacy = calls.0.iter().position(|name| name == "index_for_section").unwrap();
-    assert!(canonical < legacy, "legacy pseudo-Section state cannot select a canonical image");
+    assert!(calls.0.iter().any(|name| name == "reserve_native_image_process"),
+        "native Section handles must select the exact retained image source");
+    for forbidden in ["index_for_section", "reserve_spawn_owned_registered"] {
+        assert!(!calls.0.iter().any(|name| name == forbidden),
+            "numeric ImageTable state cannot authorize a process via {forbidden}");
+    }
+}
+
+#[test]
+fn executable_section_creation_never_mints_a_pseudo_section() {
+    let source = include_str!("../../../../components/ntos-executive/src/exec_handler.rs");
+    assert!(source.contains("submit_local_image_section("),
+        "a mounted executable File must use the retained native Section path");
+    assert!(!source.contains("exe_images).create_section("),
+        "an observed image File must not create a numeric pseudo Section");
 }
 
 #[test]

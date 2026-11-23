@@ -31,10 +31,14 @@ fn exact_registered_file_survives_file_close_in_retained_section_and_process() {
     let observation = catalog.observation_for_backing(exact).unwrap();
     assert_eq!(observation.target(), target);
     let mut files = ImageTable::<2>::new();
-    let slot = files.open_with_target(8, b"services.exe", 0x40, META, Some(target)).unwrap();
-    files.create_section(8, 0x40, 0x44).unwrap();
+    files.open_with_target(8, b"services.exe", 0x40, META, Some(target)).unwrap();
+    let request = files.reserve_spawn_from_native_section(
+        &catalog, target, 8, 0x44, META, 0x1f_ffff, 0x1000,
+    ).unwrap();
+    files.publish(request, 0x48).unwrap();
     files.close(8, 0x40);
-    assert_eq!(files.get(slot).unwrap().target, Some(target));
+    assert_eq!(files.target_for_handle(8, 0x44).unwrap().0, target);
+    assert_eq!(files.get(request.slot).unwrap().target, Some(target));
     let child_pi = catalog.admit_dynamic_executable_observed(b"services.exe",
         HostedProcessRole::Application, b"\\SystemRoot\\System32\\services.exe",
         b"services.exe", HostedImageRoot::System32, Some(observation), 64).unwrap();

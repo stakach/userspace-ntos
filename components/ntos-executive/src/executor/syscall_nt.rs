@@ -126,7 +126,6 @@ pub(super) unsafe fn syscall_nt_route(
     nt_handler.system_time_change = None;
     nt_handler.out_writes_n = 0;
     nt_handler.exe_spawn_request = None;
-    nt_handler.exe_spawn_new_process = false;
     nt_handler.thread_spawn_request = None;
     nt_handler.wait_park_event = -1;
     nt_handler.wait_park_event_identity = 0;
@@ -1203,12 +1202,9 @@ pub(super) unsafe fn syscall_nt_route(
         sc.park_dbgk_reporter = true;
     }
     redrive_global_post_syscall_work(&mut nt_handler);
-    // The hosted-exe lane reserved a spawn after validating the owner-local file ->
-    // section -> process transition in `exe_images`. The remaining per-image policy is
-    // the address-space descriptor; handle publication and ProcessManager wiring are
-    // common for csrss/winlogon and later Win32 children.
+    // The hosted-exe lane reserved a spawn from a retained native image Section.
+    // Its exact source and process owner remain pinned through physical publication.
     if let Some(request) = nt_handler.exe_spawn_request {
-        let new_process = nt_handler.exe_spawn_new_process;
         match hosted_spawn_uncertainty::prepare(&mut nt_handler, request) {
             Ok(prepared) => match publish_reserved_hosted_exe(request,
                 &*exe_image_catalog, hosted_loaded_images_ptr, ntdll, fault_ep,
@@ -1220,8 +1216,8 @@ pub(super) unsafe fn syscall_nt_route(
                 }
                 Err(HostedExeSpawnError::Unentered(status)) => {
                     hosted_spawn_uncertainty::release_unentered(&mut nt_handler, prepared);
-                    assert!(nt_handler.abort_unentered_hosted_exe(
-                        request, new_process),
+                    assert!(nt_handler.abort_unentered_native_image_process(
+                        request),
                         "unentered hosted spawn lost its exact reservation");
                     sc.result = u64::from(status);
                 }
@@ -1235,8 +1231,8 @@ pub(super) unsafe fn syscall_nt_route(
                 }
             },
             Err(status) => {
-                assert!(nt_handler.abort_unentered_hosted_exe(
-                    request, new_process),
+                assert!(nt_handler.abort_unentered_native_image_process(
+                    request),
                     "preflighted hosted spawn lost its exact reservation");
                 sc.result = u64::from(status);
             }

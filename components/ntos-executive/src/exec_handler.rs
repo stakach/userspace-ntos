@@ -4345,7 +4345,6 @@ impl ExecNtHandler {
         write_field!(out_writes_n, 0);
         write_field!(loop_ctx, None);
         write_field!(exe_spawn_request, None);
-        write_field!(exe_spawn_new_process, false);
         write_field!(thread_spawn_request, None);
         write_field!(remote_thread_request, None);
         write_field!(wait_park_event, -1);
@@ -33139,10 +33138,9 @@ impl ExecNtHandler {
         match self.reserve_native_image_process(parent, create, nt_ulong_arg(args[1]), args[0], previous_mode) {
             Ok(Some(request)) => {
                 self.exe_spawn_request = Some(request);
-                self.exe_spawn_new_process = true;
                 return 0;
             }
-            Ok(None) => {}
+            Ok(None) => return nt_process::STATUS_INVALID_HANDLE,
             Err(status) => {
                 if status == STATUS_NOT_SUPPORTED
                     && PROCESS_ROUTE_ERROR_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -33151,93 +33149,7 @@ impl ExecNtHandler {
                 return status;
             },
         }
-        let ctx = self.loop_ctx.unwrap();
-        let sect = create.section_handle;
-        let slot_info = {
-            let table = &*ctx.exe_images;
-            table.index_for_section(self.pi, sect).and_then(|index| {
-                table.get(index).map(|slot| {
-                    let mut leaf = [0u8; nt_exe_image::MAX_EXE_LEAF];
-                    let leaf_len = slot.leaf().len();
-                    leaf[..leaf_len].copy_from_slice(slot.leaf());
-                    (index, leaf, leaf_len, slot.target)
-                })
-            })
-        };
-        let Some((slot_index, leaf, leaf_len, target)) = slot_info else {
-            self.stop = true;
-            return nt_process::STATUS_INVALID_HANDLE;
-        };
-        let leaf = &leaf[..leaf_len];
-        if self.current_process_is_winlogon() || self.current_process_is_shell_bootstrap() {
-            print_str(if self.current_process_is_winlogon() {
-                b"[wl-createproc] pi=2 sect=0x" as &[u8]
-            } else {
-                b"[userinit-createproc] pi=5 sect=0x" as &[u8]
-            });
-            print_hex(sect as u32);
-            print_str(b" exe-slot=");
-            print_u64(slot_index as u64 + 1);
-            print_str(b"\n");
-        }
-        let catalog = &*ctx.exe_image_catalog;
-        let image = if let Some(target) = target {
-            let Some(image) = catalog.get_by_pi(target.pi) else {
-                self.stop = true;
-                return nt_fs::STATUS_OBJECT_NAME_NOT_FOUND;
-            };
-            if !image.leaf.eq_ignore_ascii_case(leaf)
-                || nt_exe_image::SpawnTarget::from_image(image) != target
-            {
-                self.stop = true;
-                return 0xC000_000D;
-            }
-            image
-        } else {
-            let Some(image) = catalog.get_by_leaf(leaf) else {
-                self.stop = true;
-                return nt_fs::STATUS_OBJECT_NAME_NOT_FOUND;
-            };
-            image
-        };
-        let new_process = self.pm_pid_for_pi(image.pi).is_none();
-        if let Err(status) =
-            self.allocate_hosted_process_slot(parent, image, create)
-        {
-            return status;
-        }
-        match image.role {
-            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap => {
-                USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
-            }
-            nt_exe_image::HostedProcessRole::InteractiveShell => {
-                EXPLORER_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-        let table = &mut *ctx.exe_images;
-        match table.reserve_spawn_owned_registered(
-            catalog,
-            self.pi,
-            sect,
-            nt_ulong_arg(args[1]),
-            args[0],
-        ) {
-            Ok(request) => {
-                self.exe_spawn_request = Some(request);
-                self.exe_spawn_new_process = new_process;
-                0
-            }
-            Err(_) => {
-                if new_process {
-                    if !self.abort_unentered_hosted_child(
-                        nt_exe_image::SpawnTarget::from_image(image)) {
-                        panic!("unreserved hosted child lost exact PM ownership");
-                    }
-                }
-                0xC000_000D
-            },
-        }
+
     }
 
     #[inline(never)]
@@ -41996,26 +41908,6 @@ impl ExecNtHandler {
                         );
                         (b, reg.name(i))
                     })
-                } else if let Some(index) = (&*ctx.exe_images).index_for_section(self.pi, sect) {
-                    (&*ctx.exe_images).get(index).map(|slot| {
-                        let metadata = slot.metadata;
-                        let mut info = nt_dll_registry::image_info(
-                            PE_LOAD_BASE,
-                            metadata.entry_rva,
-                            metadata.image_size as u32,
-                            false,
-                        );
-                        info[0x20..0x24]
-                            .copy_from_slice(&(metadata.subsystem as u32).to_le_bytes());
-                        info[0x24..0x26].copy_from_slice(&metadata.subsystem_minor.to_le_bytes());
-                        info[0x26..0x28].copy_from_slice(&metadata.subsystem_major.to_le_bytes());
-                        basic_info[8..12].copy_from_slice(
-                            &(SECTION_ATTR_SEC_IMAGE | SECTION_ATTR_SEC_FILE).to_le_bytes(),
-                        );
-                        basic_info[16..24]
-                            .copy_from_slice(&(metadata.image_size as u64).to_le_bytes());
-                        (info, slot.leaf())
-                    })
                 } else {
                     None
                 };
@@ -42264,43 +42156,16 @@ impl ExecNtHandler {
                             }
                         }
                     }
-                    let exe_known = (&*ctx.exe_images)
-                        .index_for_file(self.pi, sec_file)
-                        .is_some();
-                    if exe_known || registry_slot.is_some() {
+                    if let Some(i) = registry_slot {
                         let h = self.mint_handle();
-                        if exe_known {
-                            if let Ok(index) =
-                                (&mut *ctx.exe_images).create_section(self.pi, sec_file, h)
-                            {
-                                let leaf = (&*ctx.exe_images).get(index).unwrap().leaf();
-                                if leaf == b"services.exe" {
-                                    SERVICES_CREATE_STARTED.store(1, Ordering::Relaxed);
-                                } else if leaf == b"lsass.exe" {
-                                    LSASS_CREATE_STARTED.store(1, Ordering::Relaxed);
-                                } else if leaf == b"userinit.exe" {
-                                    USERINIT_IMAGE_SECTIONS.fetch_add(1, Ordering::Relaxed);
-                                } else if leaf == b"explorer.exe" {
-                                    EXPLORER_IMAGE_SECTIONS.fetch_add(1, Ordering::Relaxed);
-                                }
-                                print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
-                                print_str(leaf);
-                                print_str(b" -> handle 0x");
-                                print_hex((h >> 32) as u32);
-                                print_hex(h as u32);
-                                print_str(b"\n");
-                            }
-                        }
                         // A registry DLL (csrsrv/basesrv/winsrv): record its section handle by file handle.
-                        if let Some(i) = registry_slot {
-                            reg.set_section_handle(self.pi, i, h);
-                            if !self.current_process_is_winlogon() {
-                                print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
-                                print_str(reg.name(i));
-                                print_str(b" -> handle 0x");
-                                print_hex(h as u32);
-                                print_str(b"\n");
-                            }
+                        reg.set_section_handle(self.pi, i, h);
+                        if !self.current_process_is_winlogon() {
+                            print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
+                            print_str(reg.name(i));
+                            print_str(b" -> handle 0x");
+                            print_hex(h as u32);
+                            print_str(b"\n");
                         }
                         if !self.user_memory_write(
                             SyscallUserMemory::CurrentProcess,

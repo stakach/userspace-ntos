@@ -24361,12 +24361,9 @@ struct ExecNtHandler {
     /// Raw refs to the loop's per-iteration state for group-C handlers (see [`ExecLoopCtx`]). Set
     /// by the Tier-1 dispatch arm before each `dispatch`; `None` outside the loop.
     loop_ctx: Option<ExecLoopCtx>,
-    /// Hosted executable spawn reservation produced by the executable image state table. The loop
-    /// consumes it after dispatch, builds the seL4 mechanism, then publishes or rolls back the
-    /// reservation. This covers csrss/winlogon and later Win32 children.
+    /// Spawn reservation produced from a retained native image Section. The loop builds the seL4
+    /// mechanism, then publishes or rolls back that exact process-image owner.
     exe_spawn_request: Option<nt_exe_image::SpawnRequest>,
-    /// Whether this syscall allocated the child's PM slot before the physical spawn.
-    exe_spawn_new_process: bool,
     /// Local hosted-thread mechanism request produced by NtCreateThread policy and consumed by the
     /// loop after dispatch. The handler owns NT policy (ETHREAD, TEB, handles, ClientId copyout);
     /// the loop owns seL4 TCB construction because it holds the target VSpace + fault endpoint.
@@ -27593,12 +27590,6 @@ static CSRSS_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_SPAWNED: AtomicU64 = AtomicU64::new(0);
 /// How many pages winlogon's ntdll loader demand-faulted (slot 2), for the spec-check report.
 static WINLOGON_FAULTS: AtomicU64 = AtomicU64::new(0);
-/// Set when winlogon's kernel32 CreateProcessInternalW creates the services.exe SEC_IMAGE section —
-/// i.e. the Win32 process-create for services.exe has begun. Used to gate OFF the broad empty-name
-/// NtOpenKey → machine-root fallback (which the keyboard-layout path needed, but which makes
-/// BasepIsProcessAllowed's AppCertDlls open spuriously succeed → RtlQueryRegistryValues fails
-/// c0000002 → "Process not allowed to launch"). The keyboard path runs long before services create.
-static SERVICES_CREATE_STARTED: AtomicU64 = AtomicU64::new(0);
 /// SERVICE 8 — count of REAL named events services (pi 3) registered in \BaseNamedObjects via
 /// NtCreateEvent (SCM_START_EVENT / SC_AutoStartComplete / LSA_RPC_SERVER_ACTIVE / …). Drives the
 /// `exec_services_named_events` milestone spec: the SCM's CreateEventW now resolves real event
@@ -27612,9 +27603,7 @@ pub(crate) static SERVICES_QUERY_DIR_OBJECT: AtomicU64 = AtomicU64::new(0);
 static SERVICES_SPAWNED: AtomicU64 = AtomicU64::new(0);
 /// How many pages services.exe's ntdll loader demand-faulted (slot 3), for the spec-check report.
 static SERVICES_FAULTS: AtomicU64 = AtomicU64::new(0);
-/// SERVICE 10 — lsass.exe (5th hosted process, badge 8, pi 4). CREATE_STARTED set at its
-/// NtCreateSection; SPAWNED set at NtCreateProcessEx; FAULTS = its loader demand-fault count.
-static LSASS_CREATE_STARTED: AtomicU64 = AtomicU64::new(0);
+/// LSASS process publication and loader demand-fault diagnostics.
 static LSASS_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static USERINIT_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_SPAWNED: AtomicU64 = AtomicU64::new(0);

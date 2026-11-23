@@ -27,7 +27,7 @@ const CATALOG_ROLE_CALLS: &[&str] = &[
 const BASELINE: &[(&str, usize)] = &[
     ("diag/post_loop.rs", 1),
     ("exec_file_create.rs", 1),
-    ("exec_handler.rs", 21),
+    ("exec_handler.rs", 19),
     ("executor/admission.rs", 1),
     ("executor/exceptions.rs", 4),
     ("executor/syscall.rs", 2),

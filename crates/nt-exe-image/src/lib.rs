@@ -53,7 +53,6 @@ pub struct ImageMetadata {
 pub enum ImageState {
     Empty,
     Opened,
-    Sectioned,
     SpawnReserved,
     Published,
 }
@@ -1133,15 +1132,6 @@ impl<const N: usize> ImageTable<N> {
         })
     }
 
-    pub fn index_for_section(&self, owner_pi: usize, section_handle: u64) -> Option<usize> {
-        (section_handle != 0).then_some(())?;
-        self.slots.iter().position(|slot| {
-            slot.state != ImageState::Empty
-                && slot.owner_pi == owner_pi
-                && slot.section_handle == section_handle
-        })
-    }
-
     pub fn target_for_handle(
         &self,
         owner_pi: usize,
@@ -1158,54 +1148,6 @@ impl<const N: usize> ImageTable<N> {
                     && (slot.file_handle == handle || slot.section_handle == handle)
             })
             .and_then(|slot| slot.target.map(|target| (target, slot.state)))
-    }
-
-    pub fn create_section(
-        &mut self,
-        owner_pi: usize,
-        file_handle: u64,
-        section_handle: u64,
-    ) -> Result<usize, ImageError> {
-        if section_handle == 0 {
-            return Err(ImageError::InvalidHandle);
-        }
-        let index = self
-            .index_for_file(owner_pi, file_handle)
-            .ok_or(ImageError::NotFound)?;
-        if self.slots[index].state == ImageState::Sectioned
-            && self.slots[index].section_handle == section_handle
-        {
-            return Ok(index);
-        }
-        if self.index_for_section(owner_pi, section_handle).is_some() {
-            return Err(ImageError::HandleCollision);
-        }
-        let slot = &mut self.slots[index];
-        match slot.state {
-            ImageState::Opened => {
-                slot.section_handle = section_handle;
-                slot.state = ImageState::Sectioned;
-                Ok(index)
-            }
-            ImageState::Sectioned if slot.section_handle == section_handle => Ok(index),
-            _ => Err(ImageError::InvalidState),
-        }
-    }
-
-    pub fn reserve_spawn(
-        &mut self,
-        owner_pi: usize,
-        section_handle: u64,
-        desired_access: u32,
-        process_handle_out: u64,
-    ) -> Result<SpawnRequest, ImageError> {
-        self.reserve_spawn_with_target(
-            owner_pi,
-            section_handle,
-            desired_access,
-            process_handle_out,
-            None,
-        )
     }
 
     /// Attach an already authenticated native image Section to an exact registered process.
@@ -1240,123 +1182,6 @@ impl<const N: usize> ImageTable<N> {
         slot.state = ImageState::SpawnReserved;
         self.slots[index] = slot;
         Ok(self.slots[index].spawn_request(index).unwrap())
-    }
-
-    pub fn reserve_spawn_registered<'a, const M: usize>(
-        &mut self,
-        catalog: &HostedImageCatalog<'a, M>,
-        owner_pi: usize,
-        section_handle: u64,
-        desired_access: u32,
-        process_handle_out: u64,
-    ) -> Result<SpawnRequest, ImageError> {
-        let index = self
-            .index_for_section(owner_pi, section_handle)
-            .ok_or(ImageError::NotFound)?;
-        let target = if let Some(target) = self.slots[index].target {
-            let image = catalog
-                .get_by_pi(target.pi)
-                .ok_or(ImageError::InvalidPath)?;
-            if !image.leaf.eq_ignore_ascii_case(self.slots[index].leaf())
-                || SpawnTarget::from_image(image) != target
-            {
-                return Err(ImageError::InvalidPath);
-            }
-            target
-        } else {
-            let image = catalog
-                .get_by_leaf(self.slots[index].leaf())
-                .ok_or(ImageError::InvalidPath)?;
-            SpawnTarget::from_image(image)
-        };
-        self.reserve_spawn_with_target(
-            owner_pi,
-            section_handle,
-            desired_access,
-            process_handle_out,
-            Some(target),
-        )
-    }
-
-    pub fn reserve_spawn_owned_registered<const M: usize>(
-        &mut self,
-        catalog: &OwnedHostedImageCatalog<M>,
-        owner_pi: usize,
-        section_handle: u64,
-        desired_access: u32,
-        process_handle_out: u64,
-    ) -> Result<SpawnRequest, ImageError> {
-        let index = self
-            .index_for_section(owner_pi, section_handle)
-            .ok_or(ImageError::NotFound)?;
-        let target = if let Some(target) = self.slots[index].target {
-            let image = catalog
-                .get_by_pi(target.pi)
-                .ok_or(ImageError::InvalidPath)?;
-            if !image.leaf.eq_ignore_ascii_case(self.slots[index].leaf())
-                || SpawnTarget::from_image(image) != target
-            {
-                return Err(ImageError::InvalidPath);
-            }
-            target
-        } else {
-            let image = catalog
-                .get_by_leaf(self.slots[index].leaf())
-                .ok_or(ImageError::InvalidPath)?;
-            SpawnTarget::from_image(image)
-        };
-        self.reserve_spawn_with_target(
-            owner_pi,
-            section_handle,
-            desired_access,
-            process_handle_out,
-            Some(target),
-        )
-    }
-
-    fn reserve_spawn_with_target(
-        &mut self,
-        owner_pi: usize,
-        section_handle: u64,
-        desired_access: u32,
-        process_handle_out: u64,
-        target: Option<SpawnTarget>,
-    ) -> Result<SpawnRequest, ImageError> {
-        if process_handle_out == 0 {
-            return Err(ImageError::InvalidHandle);
-        }
-        let index = self
-            .index_for_section(owner_pi, section_handle)
-            .ok_or(ImageError::NotFound)?;
-        let slot = &mut self.slots[index];
-        match slot.state {
-            ImageState::Sectioned => {
-                slot.desired_access = desired_access;
-                slot.process_handle_out = process_handle_out;
-                slot.target = target;
-                slot.state = ImageState::SpawnReserved;
-            }
-            ImageState::SpawnReserved
-                if slot.desired_access == desired_access
-                    && slot.process_handle_out == process_handle_out
-                    && slot.target == target => {}
-            _ => return Err(ImageError::InvalidState),
-        }
-        Ok(slot.spawn_request(index).unwrap())
-    }
-
-    pub fn rollback_spawn(&mut self, request: SpawnRequest) -> Result<(), ImageError> {
-        let slot = self
-            .slots
-            .get_mut(request.slot)
-            .ok_or(ImageError::NotFound)?;
-        if slot.spawn_request_with_target(request.slot, request.target) != Some(request) {
-            return Err(ImageError::InvalidState);
-        }
-        slot.desired_access = 0;
-        slot.process_handle_out = 0;
-        slot.state = ImageState::Sectioned;
-        Ok(())
     }
 
     /// Remove only a fresh canonical-Section reservation; never close a real Section handle.
@@ -2264,94 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_reservation_can_bind_to_dynamic_catalog_target() {
-        let mut catalog = HostedImageCatalog::<1>::new();
-        catalog
-            .register(catalog_image(
-                5,
-                USERINIT_TOP_BADGE,
-                b"userinit.exe",
-                b"\\SystemRoot\\System32\\userinit.exe",
-                HostedProcessRole::InteractiveShellBootstrap,
-                HostedImageRoot::System32,
-                b"userinit",
-            ))
-            .unwrap();
-        let mut table = ImageTable::<1>::new();
-        let slot = table.open(2, b"userinit.exe", 0x40, META).unwrap();
-        table.create_section(2, 0x40, 0x44).unwrap();
-
-        let request = table
-            .reserve_spawn_registered(&catalog, 2, 0x44, 0x1fffff, 0x1000)
-            .unwrap();
-
-        assert_eq!(request.slot, slot);
-        assert_eq!(
-            request.target,
-            Some(SpawnTarget {
-                pi: 5,
-                top_badge: USERINIT_TOP_BADGE,
-                generation: 1,
-                role: HostedProcessRole::InteractiveShellBootstrap,
-            })
-        );
-        assert_eq!(
-            table.reserve_spawn_registered(&catalog, 2, 0x44, 0x1fffff, 0x1000),
-            Ok(request)
-        );
-        table.publish(request, 0x48).unwrap();
-        assert_eq!(table.get(slot).unwrap().state, ImageState::Published);
-    }
-
-    #[test]
-    fn spawn_reservation_rejects_unregistered_images() {
-        let catalog = HostedImageCatalog::<1>::new();
-        let mut table = ImageTable::<1>::new();
-        table.open(2, b"calc.exe", 0x40, META).unwrap();
-        table.create_section(2, 0x40, 0x44).unwrap();
-
-        assert_eq!(
-            table.reserve_spawn_registered(&catalog, 2, 0x44, 0x1fffff, 0x1000),
-            Err(ImageError::InvalidPath)
-        );
-        assert_eq!(table.get(0).unwrap().state, ImageState::Sectioned);
-    }
-
-    #[test]
-    fn spawn_reservation_can_bind_to_owned_catalog_target() {
-        let mut catalog = OwnedHostedImageCatalog::<1>::new();
-        catalog
-            .register(owned_catalog_image(
-                6,
-                EXPLORER_TOP_BADGE,
-                b"explorer.exe",
-                b"\\SystemRoot\\explorer.exe",
-                HostedProcessRole::InteractiveShell,
-                HostedImageRoot::SystemRoot,
-                b"explorer",
-            ))
-            .unwrap();
-        let mut table = ImageTable::<1>::new();
-        table.open(5, b"explorer.exe", 0x40, META).unwrap();
-        table.create_section(5, 0x40, 0x44).unwrap();
-
-        let request = table
-            .reserve_spawn_owned_registered(&catalog, 5, 0x44, 0x1fffff, 0x1000)
-            .unwrap();
-
-        assert_eq!(
-            request.target,
-            Some(SpawnTarget {
-                pi: 6,
-                top_badge: EXPLORER_TOP_BADGE,
-                generation: 1,
-                role: HostedProcessRole::InteractiveShell,
-            })
-        );
-    }
-
-    #[test]
-    fn spawn_reservation_uses_exact_open_target_for_duplicate_leaf() {
+    fn file_observation_uses_exact_open_target_for_duplicate_leaf() {
         let mut catalog = OwnedHostedImageCatalog::<2>::new();
         let first = catalog
             .admit_dynamic_executable(
@@ -2380,13 +2118,9 @@ mod tests {
         table
             .open_with_target(3, b"svchost.exe", 0x40, META, Some(target))
             .unwrap();
-        table.create_section(3, 0x40, 0x44).unwrap();
-        let request = table
-            .reserve_spawn_owned_registered(&catalog, 3, 0x44, 0x1fffff, 0x1000)
-            .unwrap();
 
         assert_eq!(first, DYNAMIC_PROCESS_FIRST_PI);
-        assert_eq!(request.target, Some(target));
+        assert_eq!(table.target_for_handle(3, 0x40), Some((target, ImageState::Opened)));
         assert_eq!(catalog.get_by_leaf(b"svchost.exe").unwrap().pi, first);
     }
 
@@ -2539,14 +2273,20 @@ mod tests {
     }
 
     #[test]
-    fn ordered_lifecycle_is_idempotent_and_publish_is_transactional() {
-        let mut table = ImageTable::<2>::new();
-        let slot = table.open(2, b"userinit.exe", 0x40, META).unwrap();
-        assert_eq!(table.create_section(2, 0x40, 0x44), Ok(slot));
-        assert_eq!(table.create_section(2, 0x40, 0x44), Ok(slot));
-        let request = table.reserve_spawn(2, 0x44, 0x1fffff, 0x1000).unwrap();
+    fn native_section_publish_is_transactional() {
+        let mut catalog = OwnedHostedImageCatalog::<1>::new();
+        let pi = catalog.admit_dynamic_executable(
+            b"userinit.exe", HostedProcessRole::Application,
+            b"\\SystemRoot\\System32\\userinit.exe", b"userinit.exe",
+            HostedImageRoot::System32, 16,
+        ).unwrap();
+        let target = SpawnTarget::from_image(catalog.get_by_pi(pi).unwrap());
+        let mut table = ImageTable::<1>::new();
+        let request = table.reserve_spawn_from_native_section(
+            &catalog, target, 2, 0x44, META, 0x1fffff, 0x1000,
+        ).unwrap();
         assert_eq!(request.leaf(), b"userinit.exe");
-        assert_eq!(table.reserve_spawn(2, 0x44, 0x1fffff, 0x1000), Ok(request));
+        let slot = request.slot;
         assert_eq!(table.get(slot).unwrap().state, ImageState::SpawnReserved);
         assert_eq!(table.publish(request, 0), Err(ImageError::InvalidHandle));
         assert_eq!(table.get(slot).unwrap().state, ImageState::SpawnReserved);
@@ -2556,54 +2296,38 @@ mod tests {
     }
 
     #[test]
-    fn failed_spawn_can_roll_back_without_losing_the_section() {
+    fn close_releases_file_observation_and_allows_handle_reuse() {
         let mut table = ImageTable::<1>::new();
         let slot = table.open(2, b"userinit.exe", 0x40, META).unwrap();
-        table.create_section(2, 0x40, 0x44).unwrap();
-        let request = table.reserve_spawn(2, 0x44, 1, 0x1000).unwrap();
-        table.rollback_spawn(request).unwrap();
-        assert_eq!(table.get(slot).unwrap().state, ImageState::Sectioned);
-        assert_eq!(table.index_for_section(2, 0x44), Some(slot));
-    }
-
-    #[test]
-    fn close_removes_stale_handle_bindings_and_releases_unpublished_slots() {
-        let mut table = ImageTable::<1>::new();
-        let slot = table.open(2, b"userinit.exe", 0x40, META).unwrap();
-        table.create_section(2, 0x40, 0x44).unwrap();
-        assert_eq!(table.close(2, 0x40), CloseOutcome::Retained(slot));
+        assert_eq!(table.close(2, 0x40), CloseOutcome::Released(slot));
         assert_eq!(table.index_for_file(2, 0x40), None);
-        assert_eq!(table.close(2, 0x44), CloseOutcome::Released(slot));
         assert_eq!(table.active_len(), 0);
         assert_eq!(table.open(2, b"explorer.exe", 0x40, META), Ok(slot));
     }
 
     #[test]
     fn published_spawn_retirement_rejects_stale_same_leaf_generation() {
-        let old = SpawnTarget {
-            pi: DYNAMIC_PROCESS_FIRST_PI,
-            top_badge: DYNAMIC_TOP_BADGE_BASE,
-            generation: 2,
-            role: HostedProcessRole::NonInteractiveService,
-        };
-        let replacement = SpawnTarget {
-            generation: 3,
-            ..old
-        };
+        let mut catalog = OwnedHostedImageCatalog::<1>::new();
         let mut table = ImageTable::<2>::new();
-        for (file, section, process_out, process, target) in [
-            (0x40, 0x44, 0x1000, 0x48, old),
-            (0x50, 0x54, 0x2000, 0x58, replacement),
-        ] {
-            table
-                .open_with_target(3, b"rundll32.exe", file, META, Some(target))
-                .unwrap();
-            table.create_section(3, file, section).unwrap();
-            let request = table
-                .reserve_spawn_with_target(3, section, 0x1f_ffff, process_out, Some(target))
-                .unwrap();
+        let publish = |catalog: &mut OwnedHostedImageCatalog<1>,
+                       table: &mut ImageTable<2>, section, process_out, process| {
+            let pi = catalog.admit_dynamic_executable(
+                b"rundll32.exe", HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\rundll32.exe", b"rundll32.exe",
+                HostedImageRoot::System32, 16,
+            ).unwrap();
+            let target = SpawnTarget::from_image(catalog.get_by_pi(pi).unwrap());
+            let request = table.reserve_spawn_from_native_section(
+                catalog, target, 3, section, META, 0x1f_ffff, process_out,
+            ).unwrap();
             table.publish(request, process).unwrap();
-        }
+            target
+        };
+        let old = publish(&mut catalog, &mut table, 0x44, 0x1000, 0x48);
+        catalog.retire_dynamic_target(old).unwrap();
+        let replacement = publish(&mut catalog, &mut table, 0x54, 0x2000, 0x58);
+        assert_eq!(old.pi, replacement.pi);
+        assert_ne!(old.generation, replacement.generation);
 
         assert_eq!(table.published_target_count(old), 1);
         assert_eq!(table.published_target_count(replacement), 1);

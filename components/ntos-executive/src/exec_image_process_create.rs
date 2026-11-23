@@ -249,47 +249,6 @@ impl ExecNtHandler {
         true
     }
 
-    /// Retire an immediate-route reservation only when the physical child spawn did not enter.
-    /// Static catalog images keep their Section/loaded image; only a child PM slot created by
-    /// this syscall is rolled back. Dynamic Section-backed children use their exact owner path.
-    pub(crate) unsafe fn abort_unentered_hosted_exe(
-        &mut self,
-        request: nt_exe_image::SpawnRequest,
-        new_process: bool,
-    ) -> bool {
-        let Some(target) = request.target else { return false; };
-        if self.process_image_owners.iter().any(|owner| owner.target == target) {
-            return self.abort_unentered_native_image_process(request);
-        }
-        let Some(ctx) = self.loop_ctx else { return false; };
-        let exact_pid = if new_process {
-            let Some(mechanism) = self.process_mechanisms.get(target.pi) else { return false; };
-            if mechanism.pi != target.pi || mechanism.generation != target.generation
-                || mechanism.top_badge != target.top_badge
-                || self.pm.process(mechanism.pid).is_none()
-            { return false; }
-            Some(mechanism.pid)
-        } else { None };
-        if (&mut *ctx.exe_images).rollback_spawn(request).is_err() { return false; }
-        if let Some(pid) = exact_pid {
-            self.rollback_hosted_process_creation(target.pi, pid);
-        }
-        true
-    }
-
-    pub(crate) unsafe fn abort_unentered_hosted_child(
-        &mut self,
-        target: nt_exe_image::SpawnTarget,
-    ) -> bool {
-        let Some(mechanism) = self.process_mechanisms.get(target.pi) else { return false; };
-        if mechanism.pi != target.pi || mechanism.generation != target.generation
-            || mechanism.top_badge != target.top_badge
-            || self.pm.process(mechanism.pid).is_none()
-        { return false; }
-        self.rollback_hosted_process_creation(target.pi, mechanism.pid);
-        true
-    }
-
     pub(super) fn release_native_process_image(&mut self, pi: usize, pid: nt_process::ProcessId, generation: u64) {
         let Some(index) = self.process_image_owners.iter().position(|row|
             row.target.pi == pi && row.target.generation == generation && row.pid == Some(pid))
