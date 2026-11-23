@@ -45,6 +45,20 @@ impl<'ast> Visit<'ast> for Calls {
     }
 }
 
+#[test]
+fn mounted_image_header_reads_use_the_retained_paging_continuation() {
+    let mut calls = Calls::default();
+    calls.visit_arm(&phase("HeaderDispatch"));
+    for required in ["immutable_file_extent", "next_window", "build_and_dispatch_paging_to_device"] {
+        assert!(calls.0.iter().any(|call| call == required),
+            "routed image header capture must retain its exact File and dispatch {required}");
+    }
+    for forbidden in ["capture_image_layout", "read_retained"] {
+        assert!(!calls.0.iter().any(|call| call == forbidden),
+            "mounted image headers must not use the physical Boot route to synchronously {forbidden}");
+    }
+}
+
 #[derive(Default)]
 struct Extent { eof: bool, captured: bool, equality: bool }
 impl<'ast> Visit<'ast> for Extent {
@@ -93,20 +107,6 @@ fn routed_image_publishes_only_after_exact_eof_or_immutable_extent() {
     assert!(file_size.0, "the exact full-capture comparison must use metadata EOF");
     struct Publication { exact: bool, guarded: bool, count: usize }
     impl<'ast> Visit<'ast> for Publication {
-        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
-            let previous = self.exact;
-            if let Some((_, guard)) = &arm.guard {
-                let mut extent = Extent::default();
-                extent.visit_expr(guard);
-                let mut calls = Calls::default();
-                calls.visit_expr(&arm.body);
-                self.exact |= extent.eof && extent.equality
-                    && calls.0.iter().any(|name| name == "capture_image_layout")
-                    && calls.0.iter().any(|name| name == "read_retained");
-            }
-            self.visit_expr(&arm.body);
-            self.exact = previous;
-        }
         fn visit_expr_if(&mut self, branch: &'ast syn::ExprIf) {
             let mut extent = Extent::default();
             extent.visit_expr(&branch.cond);
@@ -128,11 +128,13 @@ fn routed_image_publishes_only_after_exact_eof_or_immutable_extent() {
     let mut publication = Publication { exact: false, guarded: true, count: 0 };
     publication.visit_arm(&phase("HeaderDispatch"));
     assert!(publication.count != 0 && publication.guarded,
-        "publication requires exact canonical EOF or an identity-bound immutable extent with a retained layout read");
+        "full-snapshot publication requires exact canonical EOF; sparse publication waits for layout completion");
     let mut calls = Calls::default();
     calls.visit_arm(&phase("HeaderDispatch"));
     assert!(calls.0.iter().any(|name| name == "immutable_file_extent"),
         "the layout-only path needs an attested immutable File extent");
+    assert!(calls.0.iter().any(|name| name == "new"),
+        "immutable extent starts the resumable sparse layout capture");
     calls.0.iter().position(|name| name == "reserve_file_snapshot_capacity")
         .expect("fallible capture storage admission remains required");
 }
