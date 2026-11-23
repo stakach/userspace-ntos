@@ -6800,6 +6800,9 @@ pub(crate) struct DriverObjectSpec {
     /// bump allocator over `WIN32K_POOL_VADDR`). `component_main` builds the DRIVER_OBJECT / ext /
     /// RegistryPath from THIS pool — win32k's DriverEntry + `SH_POOL_USED` readback need its own pool.
     pub pool: unsafe fn(u64) -> u64,
+    /// Root-owned prepublication claim, before any foreign DriverEntry code can run.
+    /// A failed claim prevents both support and primary image execution.
+    pub pre_driver_entry: Option<unsafe fn(u64, u64) -> i32>,
     /// Admitted PE boundary used for DriverEntry and support-image calls in this component.
     pub foreign_call2_va: u64,
     /// Optional shared-frame offset containing a support image `DriverEntry` RVA relative to
@@ -6997,7 +7000,13 @@ pub(crate) unsafe fn component_main(
     } else {
         core::ptr::read_volatile((shared_va + spec.support_entry_rva_off) as *const u64)
     };
-    let mut status = component_run_support_entries(shared_va, code_va, spec, support_entry_rva);
+    let mut status = match spec.pre_driver_entry {
+        Some(claim) => claim(shared_va, drv),
+        None => 0,
+    };
+    if status == 0 {
+        status = component_run_support_entries(shared_va, code_va, spec, support_entry_rva);
+    }
 
     let mut primary_ran = false;
     if status == 0 {
