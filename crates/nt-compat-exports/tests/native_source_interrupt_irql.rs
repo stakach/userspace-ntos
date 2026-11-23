@@ -22,6 +22,14 @@ fn hosted_interrupt_policy_uses_translated_level_independently_of_vector() {
     let hal = &hal[..hal.find("\n}\n").unwrap()];
     assert!(hal.contains("SH_RESOURCE_INTERRUPT_POLICY"));
     assert!(!hal.contains("granted_vector.min(0xF)"));
-    let acpi = &main[main.find("fn grant_hosted_acpi_child").unwrap_or(0)..];
-    assert!(acpi.contains("translated_interrupt_level"));
+    let acpi = main
+        .split_once("unsafe fn grant_hosted_acpi_child_devnode_resources(")
+        .unwrap()
+        .1
+        .split_once("\n}\n")
+        .unwrap()
+        .0;
+    let (preflight, grant) = acpi.split_once("claim_acpi_child_interrupt(").unwrap();
+    assert!(preflight.contains("let interrupt_irql = u8::try_from(interrupt.level)"));
+    assert!(grant.contains("assignment.route.vector,\n        interrupt_irql,"));
 }
