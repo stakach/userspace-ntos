@@ -139,11 +139,20 @@ fn stream_reginfo_bytes(device_object: u64, ticket: u64, bytes: &[u8]) -> Result
     while offset < bytes.len() {
         let count = (bytes.len() - offset).min((FSD_ARG_BYTES - ARG_CHUNK_BYTES) as usize);
         let _guard = unsafe { component_device_reply_lock() };
+        let worker_arg = hosted_provider_export_lane::current_component_arg()
+            .or_else(hosted_class_irp_lane::current_component_arg);
+        let arg = match worker_arg {
+            Some(arg) => arg,
+            None if current_hosted_worker_scratch_va().is_some() => {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            None => FSD_ARG_VADDR,
+        };
         unsafe {
-            write_volatile((FSD_ARG_VADDR + ARG_CHUNK_LENGTH) as *mut u32, count as u32);
+            write_volatile((arg + ARG_CHUNK_LENGTH) as *mut u32, count as u32);
             core::ptr::copy_nonoverlapping(
                 bytes[offset..offset + count].as_ptr(),
-                (FSD_ARG_VADDR + ARG_CHUNK_BYTES) as *mut u8,
+                (arg + ARG_CHUNK_BYTES) as *mut u8,
                 count,
             );
         }
@@ -291,18 +300,38 @@ fn service_reginfo_terminal(
     let ticket = RegInfoTicket::for_authenticated_device(ticket_id, identity);
     let result = match op {
         OP_REGINFO_CHUNK => {
-            if inst.exec_arg_va == 0 {
+            use crate::spawn_hosts::shared_ingress::owner::runtime::{self, PhysicalSourceKind};
+            let Some(route) = (unsafe { runtime::channel_route(ch).ok().flatten() }) else {
+                return (STATUS_ACCESS_DENIED, 0);
+            };
+            let Ok(source) = (unsafe { runtime::physical_source(route) }) else {
+                return (STATUS_ACCESS_DENIED, 0);
+            };
+            let arg = match source.kind {
+                PhysicalSourceKind::DispatchWorker { .. } => {
+                    let worker_arg = unsafe {
+                        hosted_provider_export_lane::executive_arg_for_shared(ch.shared_va)
+                            .or_else(|| hosted_class_irp_lane::executive_arg_for_shared(ch.shared_va))
+                    };
+                    let Some(arg) = worker_arg else {
+                        return (STATUS_ACCESS_DENIED, 0);
+                    };
+                    arg
+                }
+                _ => inst.exec_arg_va,
+            };
+            if arg == 0 {
                 return (STATUS_INVALID_HANDLE, 0);
             }
             let length = unsafe {
-                read_volatile((inst.exec_arg_va + ARG_CHUNK_LENGTH) as *const u32)
+                read_volatile((arg + ARG_CHUNK_LENGTH) as *const u32)
             } as u64;
             if length == 0 || length > FSD_ARG_BYTES - ARG_CHUNK_BYTES {
                 return (STATUS_INVALID_PARAMETER, 0);
             }
             let bytes = unsafe {
                 core::slice::from_raw_parts(
-                    (inst.exec_arg_va + ARG_CHUNK_BYTES) as *const u8,
+                    (arg + ARG_CHUNK_BYTES) as *const u8,
                     length as usize,
                 )
             };
