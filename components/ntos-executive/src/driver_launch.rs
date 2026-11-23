@@ -60432,6 +60432,7 @@ unsafe fn hosted_irq_connection_line_live(connection: HostedIrqConnection) -> bo
 unsafe fn install_hosted_irq_connection(
     binding: HostedDeviceBinding,
     tokens: nt_resource_manager::InterruptTokens,
+    request_state: HostedDeviceResourceState,
 ) -> Result<(), nt_status::NtStatus> {
     if clear_hosted_irq_orphan_lines() != 0 {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
@@ -60491,10 +60492,8 @@ unsafe fn install_hosted_irq_connection(
     if route.tokens != tokens {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let state = hosted_device_resource_state_by_device_id(binding.device_id)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let authority =
-        retain_hosted_irq_connection_authority(binding, state, route).map_err(|rejection| {
+        retain_hosted_irq_connection_authority(binding, request_state, route).map_err(|rejection| {
             trace_hosted_interrupt_broker_rejection(
                 rejection.name(),
                 Some(binding),
@@ -63671,7 +63670,38 @@ unsafe fn read_hosted_device_resource_state_from_shared(
 }
 
 unsafe fn refresh_hosted_device_resource_state(binding: HostedDeviceBinding, sh: u64) {
-    let state = read_hosted_device_resource_state_from_shared(binding, sh);
+    let mut state = read_hosted_device_resource_state_from_shared(binding, sh);
+    // A lane bank carries a pending CONNECT request and can outlive the dispatch that wrote it.
+    // Only the exact installed root connection may become device-owned interrupt evidence.
+    let connection = hosted_irq_connections().and_then(|connections| {
+        connections.iter().find(|connection| {
+            connection.binding == binding && hosted_irq_connection_active(**connection)
+        })
+    });
+    if let Some(connection) = connection {
+        let tokens = connection.route.tokens;
+        if state.evidence.interrupt_object != connection.interrupt_object
+            || state.evidence.interrupt_id != tokens.interrupt_id
+            || state.evidence.interrupt_routine != tokens.service_routine_token
+            || state.evidence.interrupt_context != tokens.service_context_token
+        {
+            state.evidence.interrupt_delivered_vector = 0;
+            state.evidence.interrupt_isr_claimed = 0;
+            state.evidence.interrupt_deliveries = 0;
+        }
+        state.evidence.interrupt_object = connection.interrupt_object;
+        state.evidence.interrupt_routine = tokens.service_routine_token;
+        state.evidence.interrupt_context = tokens.service_context_token;
+        state.evidence.interrupt_id = tokens.interrupt_id;
+    } else {
+        state.evidence.interrupt_object = 0;
+        state.evidence.interrupt_routine = 0;
+        state.evidence.interrupt_context = 0;
+        state.evidence.interrupt_id = 0;
+        state.evidence.interrupt_delivered_vector = 0;
+        state.evidence.interrupt_isr_claimed = 0;
+        state.evidence.interrupt_deliveries = 0;
+    }
     let states = hosted_device_resource_states_mut();
     if let Some(index) = states.iter().position(|slot| {
         slot.device_id != 0
@@ -68867,6 +68897,14 @@ pub(crate) fn service_hosted_driver_interrupt(
                     status: status.raw(), interrupt_id: 0, grant_generation: 0,
                 };
             }
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64, 0);
+            refresh_hosted_device_resource_state(binding, sh);
             if let Err(status) = hosted_device_allocations::mark_interrupt_projection_canonical_retired(
                 inst, binding, interrupt_object, identity,
             ) {
@@ -68874,8 +68912,6 @@ pub(crate) fn service_hosted_driver_interrupt(
                     status: status.raw(), interrupt_id: 0, grant_generation: 0,
                 };
             }
-            write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
-            refresh_hosted_device_resource_state(binding, sh);
             HostedDriverInterruptServiceResult::Reply {
                 status: STATUS_SUCCESS,
                 interrupt_id: 0,
@@ -73587,11 +73623,13 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
             )?;
             *effect_started = true;
             retire_hosted_irq_connection(binding, existing)?;
+            // Keep the replacement request bytes in this lane; the canonical snapshot now
+            // sees no active connection even if ledger retirement later refuses.
+            refresh_hosted_device_resource_state(binding, sh);
             hosted_device_allocations::mark_interrupt_projection_canonical_retired(
                 projection_inst, binding, retiring.interrupt_object, old_identity,
             )?;
             write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
-            refresh_hosted_device_resource_state(binding, sh);
         }
     }
     let existing = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
@@ -73631,7 +73669,9 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
             projection_inst, binding, interrupt_object,
         )?;
         *effect_started = true;
-        install_hosted_irq_connection(binding, tokens)?;
+        install_hosted_irq_connection(
+            binding, tokens, read_hosted_device_resource_state_from_shared(binding, sh),
+        )?;
         return hosted_device_allocations::bind_interrupt_projection(
             projection_inst, binding, interrupt_object, existing, grant_generation,
         );
@@ -73660,8 +73700,12 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, connected);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64, 0);
+    let request_state = read_hosted_device_resource_state_from_shared(binding, sh);
     refresh_hosted_device_resource_state(binding, sh);
-    if let Err(status) = install_hosted_irq_connection(binding, connected_tokens) {
+    if let Err(status) = install_hosted_irq_connection(binding, connected_tokens, request_state) {
         if hosted_irq_connections().is_some_and(|connections| {
             connections
                 .iter()
@@ -73687,6 +73731,7 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
         refresh_hosted_device_resource_state(binding, sh);
         return Err(status);
     }
+    refresh_hosted_device_resource_state(binding, sh);
     hosted_device_allocations::bind_interrupt_projection(
         projection_inst, binding, interrupt_object, connected, connected_tokens.grant_generation,
     )?;
