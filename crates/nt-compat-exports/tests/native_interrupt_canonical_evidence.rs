@@ -10,7 +10,7 @@ fn interrupt_evidence_follows_exact_root_connection_across_lane_reuse() {
         .find("unsafe fn refresh_hosted_device_resource_state(")
         .expect("native device state refresh");
     let end = source[start..]
-        .find("\nunsafe fn issue_hosted_io_port_cap(")
+        .find("\nunsafe fn hosted_io_port_cap_effects_mut(")
         .expect("native refresh boundary");
     let fixture = format!("{SUPPORT}\n{}\n{CASES}", &source[start..start + end]);
     let directory = std::env::temp_dir().join(format!(

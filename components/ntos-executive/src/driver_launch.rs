@@ -19662,7 +19662,7 @@ extern "win64" fn s_hal_acpi_query_interrupt_model(interrupt_model_out: u64) -> 
 }
 
 unsafe fn hosted_pci_device_function() -> (u32, u32, u32) {
-    let address = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_ADDRESS) as *const u32);
+    let address = read_volatile((hosted_component_resource_shared_va() + SH_RESOURCE_ADDRESS) as *const u32);
     let dev = (address >> 16) & 0x1F;
     let func = address & 0x7;
     (address, dev, func)
@@ -20518,7 +20518,8 @@ extern "win64" fn s_video_port_get_access_ranges(
         if !hosted_videoprt_pci_identity_matches(vendor_id, device_id) {
             return VP_ERROR_DEV_NOT_EXIST;
         }
-        let Some(count) = shared_address_resource_count(FSD_SHARED_VADDR) else {
+        let sh = hosted_component_resource_shared_va();
+        let Some(count) = shared_address_resource_count(sh) else {
             return VP_ERROR_DEV_NOT_EXIST;
         };
         if count == 0 {
@@ -20529,7 +20530,7 @@ extern "win64" fn s_video_port_get_access_ranges(
         }
         let mut index = 0u64;
         while index < count {
-            let Some(resource) = read_shared_address_resource(FSD_SHARED_VADDR, index) else {
+            let Some(resource) = read_shared_address_resource(sh, index) else {
                 return VP_ERROR_INVALID_PARAMETER;
             };
             if resource.len > u32::MAX as u64 {
@@ -20553,7 +20554,7 @@ extern "win64" fn s_video_port_get_access_ranges(
             index += 1;
         }
         if slot != 0
-            && read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
+            && read_volatile((sh + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
                 == HOSTED_INTERFACE_TYPE_PCIBUS
         {
             let (_address, dev, func) = hosted_pci_device_function();
@@ -20600,7 +20601,7 @@ extern "win64" fn s_video_port_verify_access_ranges(
                     || range.range_length == 0
                     || supplemental.is_some()
                     || first_shared_address_resource(
-                        FSD_SHARED_VADDR,
+                        hosted_component_resource_shared_va(),
                         SH_RESOURCE_ADDRESS_KIND_PORT,
                     )
                     .is_some()
@@ -33330,6 +33331,9 @@ unsafe fn project_provider_resource_state(
     });
     if state.driver_id != binding.driver_id || state.instance != binding.instance {
         return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    if hosted_io_port_cap_effect_pending(binding, provider_cnode) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
     }
     copy_hosted_io_port_caps_to_cnode(provider_cnode, state).map_err(|status| status.raw())?;
     write_hosted_resource_state_projection(provider_shared, state, false);
@@ -53730,6 +53734,29 @@ struct HostedDeviceResourceState {
     evidence: HostedHardwareEvidence,
 }
 
+/// A native port-cap effect stays owned even when its reply does not prove whether a cap moved.
+/// Ready caps belong to HostedDeviceResourceState; this table owns only in-flight effects.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HostedIoPortNativeStep {
+    Pending,
+    Acknowledged,
+    Uncertain,
+}
+
+#[derive(Clone, Copy)]
+struct HostedIoPortCapEffect {
+    binding: HostedDeviceBinding,
+    cnode: u64,
+    component_slot: u64,
+    root_cap: u64,
+    start: u64,
+    length: u64,
+    claim_resource_id: Option<u64>,
+    root_revoke: HostedIoPortNativeStep,
+    root_retire: HostedIoPortNativeStep,
+    claim_released: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostedIrqConnection {
     binding: HostedDeviceBinding,
@@ -54157,6 +54184,7 @@ static mut HOSTED_DMA_QUARANTINED_OWNERS: Vec<DmaOwner> = Vec::new();
 static HOSTED_DMA_ADAPTER_LEASE_NEXT: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
+static mut HOSTED_IO_PORT_CAP_EFFECTS: Option<Vec<HostedIoPortCapEffect>> = None;
 static mut HOSTED_IRQ_CONNECTIONS: Option<Vec<HostedIrqConnection>> = None;
 static mut HOSTED_IRQ_ACTUAL_LOCKS: Option<InterruptActualLockTable> = None;
 static mut HOSTED_INTERRUPT_LOCK_HOLDERS: Option<Vec<HostedInterruptLockHolder>> = None;
@@ -61614,6 +61642,7 @@ unsafe fn clear_hosted_resource_projection(
     }
     preflight_hosted_dma_adapter_leases(binding)?;
     revoke_hosted_dma_adapter_leases(binding)?;
+    reconcile_hosted_io_port_cap_effects(binding)?;
     let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
     let resource_state = hosted_device_resource_state_by_device_id(binding.device_id);
     if let Some(state) = resource_state {
@@ -62826,6 +62855,9 @@ pub(crate) fn service_hosted_device(
                 Ok(resolved) => resolved,
                 Err(status) => return (status.raw(), 0, 0, 0),
             };
+        let Some(cnode) = physical_cnode_for_pump_channel(ch, active_reply_cap) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
         let Some(binding) = hosted_device_binding_by_pdo_object(pdo_object) else {
             return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         };
@@ -62843,7 +62875,7 @@ pub(crate) fn service_hosted_device(
             return (STATUS_ACCESS_DENIED, 0, 0, 0);
         }
         let status = unsafe {
-            claim_hosted_supplemental_port_range(binding, inst, ch.shared_va, arg2, arg3)
+            claim_hosted_supplemental_port_range(binding, cnode, ch.shared_va, arg2, arg3)
         };
         return (
             status
@@ -63737,11 +63769,169 @@ unsafe fn refresh_hosted_device_resource_state(binding: HostedDeviceBinding, sh:
     }
 }
 
+unsafe fn hosted_io_port_cap_effects_mut() -> &'static mut Vec<HostedIoPortCapEffect> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_IO_PORT_CAP_EFFECTS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+fn hosted_io_port_cap_same_owner(a: HostedDeviceBinding, b: HostedDeviceBinding) -> bool {
+    a.driver_id == b.driver_id
+        && a.device_id == b.device_id
+        && a.pdo_device_id == b.pdo_device_id
+        && a.instance == b.instance
+        && a.projection_instance == b.projection_instance
+        && a.projection_domain == b.projection_domain
+        && a.device_object == b.device_object
+        && a.pdo_object == b.pdo_object
+        && a.registry_identity_id == b.registry_identity_id
+}
+
+unsafe fn hosted_io_port_cap_effect_pending(binding: HostedDeviceBinding, cnode: u64) -> bool {
+    (*core::ptr::addr_of!(HOSTED_IO_PORT_CAP_EFFECTS))
+        .as_ref()
+        .is_some_and(|effects| effects.iter().any(|effect| {
+            hosted_io_port_cap_same_owner(effect.binding, binding) || effect.cnode == cnode
+        }))
+}
+
+unsafe fn retain_hosted_io_port_cap_effect(
+    effect: HostedIoPortCapEffect,
+) -> Result<(), nt_status::NtStatus> {
+    if effect.cnode == 0
+        || effect.root_cap == 0
+        || effect.length == 0
+        || effect.component_slot < crate::CT_IO_PORT_BASE
+        || effect.component_slot >= crate::CT_IO_PORT_BASE + crate::CT_IO_PORT_CAPACITY
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let effects = hosted_io_port_cap_effects_mut();
+    let end = effect.start.checked_add(effect.length)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    if effects.iter().any(|existing| {
+        let existing_end = existing.start.saturating_add(existing.length);
+        hosted_io_port_cap_same_owner(existing.binding, effect.binding)
+            || (existing.cnode == effect.cnode
+                && existing.component_slot == effect.component_slot)
+            || (effect.start < existing_end && existing.start < end)
+    }) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    effects.try_reserve(1).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    effects.push(effect);
+    Ok(())
+}
+
+unsafe fn hosted_io_port_cap_effect_mut(
+    binding: HostedDeviceBinding,
+    root_cap: u64,
+) -> Option<&'static mut HostedIoPortCapEffect> {
+    hosted_io_port_cap_effects_mut().iter_mut().find(|effect| {
+        hosted_io_port_cap_same_owner(effect.binding, binding) && effect.root_cap == root_cap
+    })
+}
+
+unsafe fn settle_hosted_io_port_cap_effect(binding: HostedDeviceBinding, root_cap: u64) {
+    hosted_io_port_cap_effects_mut().retain(|effect| {
+        !hosted_io_port_cap_same_owner(effect.binding, binding) || effect.root_cap != root_cap
+    });
+}
+
+/// Reconcile only after exact device quiescence. Root revoke removes every derived child cap;
+/// an uncertain native result quarantines the root slot and claim without replaying the effect.
+unsafe fn reconcile_hosted_io_port_cap_effects(
+    binding: HostedDeviceBinding,
+) -> Result<(), nt_status::NtStatus> {
+    loop {
+        let Some(effect) = (*core::ptr::addr_of!(HOSTED_IO_PORT_CAP_EFFECTS))
+            .as_ref()
+            .and_then(|effects| effects.iter().find(|effect| {
+                hosted_io_port_cap_same_owner(effect.binding, binding)
+            }))
+            .copied()
+        else {
+            return Ok(());
+        };
+        match effect.root_revoke {
+            HostedIoPortNativeStep::Pending => {
+                let result = crate::cnode_revoke_r(effect.root_cap);
+                hosted_io_port_cap_effect_mut(binding, effect.root_cap).unwrap().root_revoke =
+                    if result == 0 {
+                        HostedIoPortNativeStep::Acknowledged
+                    } else {
+                        HostedIoPortNativeStep::Uncertain
+                    };
+                if result != 0 {
+                    return Err(nt_status::NtStatus::UNSUCCESSFUL);
+                }
+            }
+            HostedIoPortNativeStep::Acknowledged => {}
+            HostedIoPortNativeStep::Uncertain => return Err(nt_status::NtStatus::UNSUCCESSFUL),
+        }
+        match effect.root_retire {
+            HostedIoPortNativeStep::Pending => {
+                let result = crate::cnode_delete_recycle_r(effect.root_cap);
+                hosted_io_port_cap_effect_mut(binding, effect.root_cap).unwrap().root_retire =
+                    if result == 0 {
+                        HostedIoPortNativeStep::Acknowledged
+                    } else {
+                        HostedIoPortNativeStep::Uncertain
+                    };
+                if result != 0 {
+                    return Err(nt_status::NtStatus::UNSUCCESSFUL);
+                }
+            }
+            HostedIoPortNativeStep::Acknowledged => {}
+            HostedIoPortNativeStep::Uncertain => return Err(nt_status::NtStatus::UNSUCCESSFUL),
+        }
+        if let Some(resource_id) = effect.claim_resource_id {
+            if !effect.claim_released {
+                hosted_resource_manager_mut()
+                    .release_port(hosted_resource_owner(binding), resource_id)
+                    .map_err(hosted_hal_status)?;
+                hosted_io_port_cap_effect_mut(binding, effect.root_cap).unwrap().claim_released = true;
+            }
+        }
+        if let Some(state) = hosted_device_resource_states_mut().iter_mut().find(|state| {
+            state.device_id == binding.device_id
+                && state.projection_domain == binding.projection_domain
+        }) {
+            let mut count = state.address_resource_count as usize;
+            if count > state.address_resources.len() {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            let mut index = 0usize;
+            while index < count {
+                let resource = state.address_resources[index];
+                if resource.kind != SH_RESOURCE_ADDRESS_KIND_PORT
+                    || resource.broker_va_or_root_cap != effect.root_cap
+                {
+                    index += 1;
+                    continue;
+                }
+                state.address_resources.copy_within(index + 1..count, index);
+                count -= 1;
+                state.address_resources[count] = SharedAddressResource::default();
+                state.address_resource_count = count as u8;
+                if effect.claim_resource_id.is_some() {
+                    state.io_port_supplemental = false;
+                }
+            }
+        }
+        settle_hosted_io_port_cap_effect(binding, effect.root_cap);
+    }
+}
+
 unsafe fn issue_hosted_io_port_cap(
-    inst: DriverInstance,
+    binding: HostedDeviceBinding,
+    cnode: u64,
     component_slot: u64,
     io_port_base: u64,
     io_port_len: u64,
+    claim_resource_id: Option<u64>,
 ) -> Result<u64, nt_status::NtStatus> {
     let io_port_last = io_port_base
         .checked_add(
@@ -63752,22 +63942,41 @@ unsafe fn issue_hosted_io_port_cap(
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     if io_port_base > u16::MAX as u64
         || io_port_last > u16::MAX as u64
-        || inst.cnode == 0
+        || cnode == 0
         || component_slot < crate::CT_IO_PORT_BASE
         || component_slot >= crate::CT_IO_PORT_BASE + crate::CT_IO_PORT_CAPACITY
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
+    if hosted_io_port_cap_effect_pending(binding, cnode) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     let cap = try_alloc_slot().ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    if let Err(status) = retain_hosted_io_port_cap_effect(HostedIoPortCapEffect {
+        binding,
+        cnode,
+        component_slot,
+        root_cap: cap,
+        start: io_port_base,
+        length: io_port_len,
+        claim_resource_id,
+        root_revoke: HostedIoPortNativeStep::Pending,
+        root_retire: HostedIoPortNativeStep::Pending,
+        claim_released: false,
+    }) {
+        // No native effect began, so this reserved root slot is certainly empty.
+        recycle_deleted_root_slot(cap);
+        return Err(status);
+    }
     let issue = crate::issue_ioport_cap(cap, io_port_base as u16, io_port_last as u16);
     if issue != 0 {
-        recycle_deleted_root_slot(cap);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let _ = crate::cnode_delete_in_cnode_r(inst.cnode, component_slot);
-    let copy = crate::cnode_copy_at_r(inst.cnode, component_slot, cap);
+    if crate::cnode_delete_in_cnode_r(cnode, component_slot) != 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let copy = crate::cnode_copy_at_r(cnode, component_slot, cap);
     if copy != 0 {
-        let _ = cnode_delete_recycle_r(cap);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     Ok(cap)
@@ -63775,7 +63984,7 @@ unsafe fn issue_hosted_io_port_cap(
 
 unsafe fn claim_hosted_supplemental_port_range(
     binding: HostedDeviceBinding,
-    inst: DriverInstance,
+    cnode: u64,
     sh: u64,
     start: u64,
     length: u64,
@@ -63785,8 +63994,12 @@ unsafe fn claim_hosted_supplemental_port_range(
     if state.driver_id != binding.driver_id
         || state.instance != binding.instance
         || state.pdo_object != binding.pdo_object
+        || state.projection_domain != binding.projection_domain
     {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    if hosted_io_port_cap_effect_pending(binding, cnode) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     let resource_id = hosted_supplemental_io_port_resource_id(binding.device_id)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
@@ -63802,16 +64015,45 @@ unsafe fn claim_hosted_supplemental_port_range(
             return Ok(());
         };
         let resource = state.address_resources[index];
-        let _ = crate::cnode_delete_in_cnode_r(inst.cnode, resource.component_cap);
-        retire_hosted_io_port_cap(resource.broker_va_or_root_cap)?;
+        let cap = resource.broker_va_or_root_cap;
+        retain_hosted_io_port_cap_effect(HostedIoPortCapEffect {
+            binding,
+            cnode,
+            component_slot: resource.component_cap,
+            root_cap: cap,
+            start: resource.translated_start,
+            length: resource.len,
+            claim_resource_id: Some(resource_id),
+            root_revoke: HostedIoPortNativeStep::Pending,
+            root_retire: HostedIoPortNativeStep::Pending,
+            claim_released: false,
+        })?;
+        if crate::cnode_delete_in_cnode_r(cnode, resource.component_cap) != 0 {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if crate::cnode_revoke_r(cap) != 0 {
+            hosted_io_port_cap_effect_mut(binding, cap).unwrap().root_revoke =
+                HostedIoPortNativeStep::Uncertain;
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+        hosted_io_port_cap_effect_mut(binding, cap).unwrap().root_revoke =
+            HostedIoPortNativeStep::Acknowledged;
+        if crate::cnode_delete_recycle_r(cap) != 0 {
+            hosted_io_port_cap_effect_mut(binding, cap).unwrap().root_retire =
+                HostedIoPortNativeStep::Uncertain;
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+        hosted_io_port_cap_effect_mut(binding, cap).unwrap().root_retire =
+            HostedIoPortNativeStep::Acknowledged;
+        state.address_resources.copy_within(index + 1..state.address_resource_count as usize, index);
+        state.address_resources[state.address_resource_count as usize - 1] = SharedAddressResource::default();
+        state.address_resource_count -= 1;
+        state.io_port_supplemental = false;
+        copy_hosted_io_port_caps_to_cnode(cnode, state)?;
         hosted_resource_manager_mut()
             .release_port(owner, resource_id)
             .map_err(hosted_hal_status)?;
-        let count = state.address_resource_count as usize;
-        state.address_resources.copy_within(index + 1..count, index);
-        state.address_resources[count - 1] = SharedAddressResource::default();
-        state.address_resource_count -= 1;
-        state.io_port_supplemental = false;
+        hosted_io_port_cap_effect_mut(binding, cap).unwrap().claim_released = true;
         if let Some(first) =
             hosted_state_first_address_resource(&state, SH_RESOURCE_ADDRESS_KIND_PORT)
         {
@@ -63825,12 +64067,15 @@ unsafe fn claim_hosted_supplemental_port_range(
         }
         if let Some(current) = hosted_device_resource_states_mut()
             .iter_mut()
-            .find(|current| current.device_id == binding.device_id)
+            .find(|current| {
+                current.device_id == binding.device_id
+                    && current.projection_domain == binding.projection_domain
+            })
         {
             *current = state;
         }
-        copy_hosted_io_port_caps_to_instance(inst, state)?;
         write_hosted_resource_state_projection(sh, state, false);
+        settle_hosted_io_port_cap_effect(binding, cap);
         return Ok(());
     }
 
@@ -63867,10 +64112,14 @@ unsafe fn claim_hosted_supplemental_port_range(
         let _ = hosted_resource_manager_mut().release_port(owner, resource_id);
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
-    let cap = match issue_hosted_io_port_cap(inst, component_slot, start, length) {
+    let cap = match issue_hosted_io_port_cap(
+        binding, cnode, component_slot, start, length, Some(resource_id),
+    ) {
         Ok(cap) => cap,
         Err(status) => {
-            let _ = hosted_resource_manager_mut().release_port(owner, resource_id);
+            if !hosted_io_port_cap_effect_pending(binding, cnode) {
+                let _ = hosted_resource_manager_mut().release_port(owner, resource_id);
+            }
             return Err(status);
         }
     };
@@ -63895,11 +64144,15 @@ unsafe fn claim_hosted_supplemental_port_range(
     }
     if let Some(current) = hosted_device_resource_states_mut()
         .iter_mut()
-        .find(|current| current.device_id == binding.device_id)
+        .find(|current| {
+            current.device_id == binding.device_id
+                && current.projection_domain == binding.projection_domain
+        })
     {
         *current = state;
     }
     write_hosted_resource_state_projection(sh, state, false);
+    settle_hosted_io_port_cap_effect(binding, cap);
     Ok(())
 }
 
@@ -64186,6 +64439,9 @@ unsafe fn restore_hosted_device_resource_state(
     if state.driver_id != binding.driver_id || state.instance != binding.instance {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    if hosted_io_port_cap_effect_pending(binding, cnode) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     let _ = instance_by_driver_id(binding.driver_id)
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     copy_hosted_io_port_caps_to_cnode(cnode, state)?;
@@ -64203,6 +64459,9 @@ unsafe fn project_provider_device_dispatch_state(
         .unwrap_or_else(|| read_hosted_device_resource_state_from_shared(binding, dependent_sh));
     if state.driver_id != binding.driver_id || state.instance != binding.instance {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if hosted_io_port_cap_effect_pending(binding, provider_inst.cnode) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     copy_hosted_io_port_caps_to_instance(provider_inst, state)?;
     write_hosted_resource_state_projection(provider_sh, state, false);
@@ -66875,6 +67134,30 @@ fn instance_for_pump_channel(
         return None;
     }
     Some((instance, inst))
+}
+
+/// Select the cap table installed on this exact retained physical source, not the instance's
+/// primary CNode. A route, badge, or numeric slot by itself does not authorize a port claim.
+fn physical_cnode_for_pump_channel(
+    ch: &crate::spawn_hosts::PumpChannel,
+    active_reply_cap: u64,
+) -> Option<u64> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime::{self, PhysicalDomain};
+    let route = unsafe { runtime::channel_route(ch).ok()?? };
+    let source = unsafe { runtime::physical_source(route).ok()? };
+    if source.tcb != ch.tcb
+        || source.pml4 != ch.pml4
+        || source.domain != PhysicalDomain::Hosted(ch.physical_domain?)
+        || unsafe { runtime::current_reply(route).ok()? } != active_reply_cap
+        || !unsafe { hosted_ingress_sources::verify(source) }
+    {
+        return None;
+    }
+    let enrollment = hosted_ingress_sources::enrollment(source)?;
+    (enrollment.route == Some(route)
+        && enrollment.phase == hosted_ingress_sources::EnrollmentPhase::Published
+        && enrollment.cnode != 0)
+        .then_some(enrollment.cnode)
 }
 
 /// A fatal autonomous service ends the actual thread, never its unrelated parked pump parent.
@@ -72612,6 +72895,14 @@ unsafe fn rollback_staged_hosted_resource_grant(
     issued_port_caps: &mut Vec<u64>,
 ) {
     let _ = instance_index;
+    if hosted_io_port_cap_effect_pending(binding, inst.cnode) {
+        // A native issue/copy may have taken effect. Keep the staged owner and mappings until
+        // exact quiesced reconciliation; rollback cannot safely recycle this authority.
+        print_str(b"[driver-launch] staged port-cap effect retained device_id=");
+        print_u64(binding.device_id);
+        print_str(b"\n");
+        return;
+    }
     issued_port_caps.clear();
     if let Err(status) = clear_hosted_resource_projection(binding, inst.exec_shared_va) {
         print_str(b"[driver-launch] staged resource rollback retained status=0x");
@@ -72990,10 +73281,12 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     for (port_index, grant) in ports.iter().enumerate() {
         let component_slot = crate::CT_IO_PORT_BASE + port_index as u64;
         let cap = match issue_hosted_io_port_cap(
-            inst,
+            binding,
+            inst.cnode,
             component_slot,
             grant.translated_start,
             grant.length as u64,
+            None,
         ) {
             Ok(cap) => cap,
             Err(status) => {
@@ -73030,6 +73323,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             );
             return Err(status);
         }
+        settle_hosted_io_port_cap_effect(binding, cap);
     }
     resources.sort_unstable_by_key(|resource| (resource.kind, resource.resource_index));
 
