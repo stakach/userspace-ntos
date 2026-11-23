@@ -138,3 +138,32 @@ fn dynamic_file_observation_uses_pe_subsystem_after_live_creator_admission() {
         "the PE-derived role must reach the catalog admission"
     );
 }
+
+#[test]
+fn event_role_checks_require_live_owner_and_preserve_main_badge_scope() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/service_sec_image.rs"),
+    )
+    .expect("executive source");
+    let body = |start: &str, end: &str| {
+        source.split(start).nth(1).expect("role helper")
+            .split(end).next().expect("role helper boundary")
+            .chars().filter(|c| !c.is_whitespace()).collect::<String>()
+    };
+    let pi = body("fn hosted_pi_has_role(", "fn hosted_main_badge_has_role(");
+    assert!(pi.contains("live_execution_role(pi)==Some(role)"),
+        "catalog role cannot authorize an event for a pending or retired process");
+
+    let main = body("fn hosted_main_badge_has_role(", "fn hosted_owner_has_role(");
+    assert!(main.contains("admit_hosted_thread_ingress(badge)"),
+        "main badge check must authenticate the event ingress");
+    assert!(main.contains("hosted_process_top_badge(runtime.pi)==Some(badge)"),
+        "a worker badge must not pass the main badge check");
+
+    let owner = body("fn hosted_owner_has_role(", "fn live_hosted_pi_for_role(");
+    assert!(owner.contains("admit_hosted_thread_ingress(badge)"),
+        "worker owner check must authenticate the event ingress");
+    assert!(owner.contains("hosted_pi_has_role(nt_handler,runtime.pi,role)"),
+        "worker role authority must come from its exact admitted owner");
+}
