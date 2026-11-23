@@ -57,18 +57,33 @@ use nt_user_host::process_create_callout::InitialReplyRetryPhase as RetryPhase;
 
 static mut INITIAL_CREATE_RETRIES: alloc::vec::Vec<InitialCreateRetry> = alloc::vec::Vec::new();
 
-unsafe fn park_foreign_retry_no_effect(caller: Binding, target: Binding) -> Result<(), u32> {
-    let origin = nt_user_host::process_create_callout::InitialThreadReplyOrigin::new(caller, target)
+unsafe fn prepare_foreign_retry_slot(caller: Binding, target: Binding) -> Result<(), u32> {
+    nt_user_host::process_create_callout::InitialThreadReplyOrigin::new(caller, target)
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
     let rows = &mut *core::ptr::addr_of_mut!(INITIAL_CREATE_RETRIES);
     if rows.iter().any(|row| row.origin().source() == caller || row.origin().target() == target) {
         return Err(nt_process::STATUS_DEVICE_BUSY);
     }
     rows.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    if crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    Ok(())
+}
+
+unsafe fn park_foreign_retry(
+    caller: Binding, target: Binding, cancellation: Option<u32>,
+) -> Result<(), u32> {
+    prepare_foreign_retry_slot(caller, target)?;
+    let origin = nt_user_host::process_create_callout::InitialThreadReplyOrigin::new(caller, target)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let rows = &mut *core::ptr::addr_of_mut!(INITIAL_CREATE_RETRIES);
     let reply_cap = crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    if reply_cap == 0 { return Err(STATUS_INSUFFICIENT_RESOURCES); }
     // Record the exact process generations and Reply before rotating the root selector.
-    rows.push(InitialCreateRetry::new(origin, reply_cap)
+    rows.push(match cancellation {
+        Some(status) => InitialCreateRetry::new_cancelling(origin, reply_cap, status),
+        None => InitialCreateRetry::new(origin, reply_cap),
+    }
         .expect("captured root Reply is valid"));
     if crate::service_sec_image::steal_main_reply() != Some(reply_cap) {
         // steal_main_reply returns None only when the selector was not rotated. Its commit
@@ -78,6 +93,25 @@ unsafe fn park_foreign_retry_no_effect(caller: Binding, target: Binding) -> Resu
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     Ok(())
+}
+
+unsafe fn park_foreign_retry_no_effect(caller: Binding, target: Binding) -> Result<(), u32> {
+    park_foreign_retry(caller, target, None)
+}
+
+unsafe fn park_foreign_retry_cancelling(
+    caller: Binding, target: Binding, status: u32,
+    prepared_park: crate::root_reply_park::RootReplyPark,
+) {
+    let origin = nt_user_host::process_create_callout::InitialThreadReplyOrigin::new(caller, target)
+        .expect("preflighted initial source and target remain exact");
+    let reply_cap = crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let rows = &mut *core::ptr::addr_of_mut!(INITIAL_CREATE_RETRIES);
+    rows.push(InitialCreateRetry::new_cancelling(origin, reply_cap, status)
+        .expect("preflighted original Reply is valid"));
+    // Capture has no native effect and runs in the same serialized root pass as preflight.
+    // The exact Reply and cancellation row are retained before the selector rotates.
+    prepared_park.commit();
 }
 
 /// The service loop consumes this marker before its ordinary STATUS_PENDING provider handoff.
@@ -295,20 +329,60 @@ unsafe fn reserve_foreign_initial_thread_lineage(
     Ok(Some(PendingInitialThreadRole { token, target, process: child.process }))
 }
 
-/// Capture the dormant target's exact provider identity before initial-thread ownership closes
-/// ordinary executable lookup. The callout may then use only this already authenticated target.
+/// The retained initial owner is the only pre-commit source of a special Win32k process role.
+/// A foreign child without a role reservation may still need ordinary GUI process creation, but
+/// it cannot inherit a catalog role through that callout.
+unsafe fn precommit_initial_win32k_role(
+    handler: &ExecNtHandler,
+    binding: Binding,
+) -> Result<Option<nt_exe_image::HostedProcessRole>, u32> {
+    let image = handler.hosted_process_image(binding.pi)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let target = nt_exe_image::SpawnTarget::from_image(image);
+    if handler.capture_process_identity(binding.pi) != Some(binding.process)
+        || binding.process.generation != nt_types::ProcessGeneration::Hosted(target.generation)
+    {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let owner = runtime(handler, binding).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let slot = owner.initial_creation.try_borrow()
+        .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+    let initial = slot.as_ref().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let lifetime = initial.plan.lifetime();
+    if lifetime.process_id() != binding.process.pid
+        || u64::from(lifetime.thread_id()) != binding.tid
+    {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    match (initial.origin, initial.role_reservation) {
+        (InitialCreationOrigin::Configured, None) => Ok(Some(target.role)),
+        (InitialCreationOrigin::Foreign(_), None) => Ok(None),
+        (InitialCreationOrigin::Foreign(_), Some(reservation))
+            if reservation.target == target && reservation.process == binding.process =>
+        {
+            handler.execution_roles.reserved_role(
+                reservation.token, reservation.target, reservation.process,
+            ).map(Some).ok_or(nt_process::STATUS_INVALID_HANDLE)
+        }
+        _ => Err(nt_process::STATUS_INVALID_HANDLE),
+    }
+}
+
+/// Capture the dormant target's exact provider identity from its retained initial owner. The
+/// catalog describes GUI eligibility; only the owner above supplies a privileged process role.
 unsafe fn capture_initial_win32k_client(
     handler: &ExecNtHandler,
     binding: Binding,
 ) -> Result<Option<crate::win32k_glue::Win32kClientContext>, u32> {
-    let role = handler.hosted_process_role(binding.pi)
-        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-    if !role.uses_win32_client_gdi() { return Ok(None); }
-    if crate::win32k_subsystem::registered_win32k_callouts().is_none() {
-        return Err(0xC000_00A3);
-    }
     if handler.capture_process_identity(binding.pi) != Some(binding.process) {
         return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let image = handler.hosted_process_image(binding.pi)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let role = precommit_initial_win32k_role(handler, binding)?;
+    if !role.unwrap_or(image.role).uses_win32_client_gdi() { return Ok(None); }
+    if crate::win32k_subsystem::registered_win32k_callouts().is_none() {
+        return Err(0xC000_00A3);
     }
     let mut client = crate::win32k_lifecycle_client(binding.tid, handler, role)
         .ok_or(nt_process::STATUS_DEVICE_BUSY)?;
@@ -327,28 +401,35 @@ unsafe fn capture_initial_win32k_client(
 /// The initial TCB is deliberately closed to ordinary hosted ingress while its one-shot
 /// creation plan is retained. Only its exact in-flight Ps process-create callout may still use
 /// its logical caller authority to service native provider faults and waits.
-pub(crate) unsafe fn validate_process_create_provider_caller(
+unsafe fn process_create_provider_binding(
     handler: &ExecNtHandler,
     caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
-) -> bool {
+) -> Option<Binding> {
     use nt_user_host::process_create_callout::ProcessCreateCalloutPhase;
     let Some(target) = (&*handler.thread_runtime.table).entries.iter()
         .filter_map(|slot| slot.owner())
         .find(|owner| owner.binding().tid == u64::from(caller.thread().thread_id()))
-    else { return false; };
+    else { return None; };
     let binding = target.binding();
     if caller.validate(
         Some(binding), handler.pm.thread_lifetime(caller.thread().thread_id()),
     ).is_err()
         || handler.capture_process_identity(binding.pi) != Some(binding.process)
         || !target.initial_creation.try_borrow().is_ok_and(|slot| slot.is_some())
-    { return false; }
+    { return None; }
     target.process_create_callout.try_borrow().is_ok_and(|slot| {
         slot.as_ref().is_some_and(|owner| matches!(
             owner.phase(),
             ProcessCreateCalloutPhase::Invoking | ProcessCreateCalloutPhase::Suspended,
         ))
-    })
+    }).then_some(binding)
+}
+
+pub(crate) unsafe fn validate_process_create_provider_caller(
+    handler: &ExecNtHandler,
+    caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+) -> bool {
+    process_create_provider_binding(handler, caller).is_some()
 }
 
 /// The initial process-create provider callback runs before its execution role is committed.
@@ -358,30 +439,11 @@ pub(crate) unsafe fn process_create_provider_role(
     handler: &ExecNtHandler,
     caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
 ) -> Option<nt_exe_image::HostedProcessRole> {
-    if !validate_process_create_provider_caller(handler, caller)
-        || handler.pm.is_process_signaled(caller.process().pid)
-    {
+    let binding = process_create_provider_binding(handler, caller)?;
+    if handler.pm.is_process_signaled(caller.process().pid) {
         return None;
     }
-    let image = handler.hosted_process_image(caller.pi())?;
-    let target = nt_exe_image::SpawnTarget::from_image(image);
-    if caller.process().generation != nt_types::ProcessGeneration::Hosted(target.generation) {
-        return None;
-    }
-    let owner = (&*handler.thread_runtime.table).entries.iter()
-        .filter_map(|slot| slot.owner())
-        .find(|owner| owner.binding().tid == u64::from(caller.thread().thread_id()))?;
-    let slot = owner.initial_creation.try_borrow().ok()?;
-    let initial = slot.as_ref()?;
-    match (initial.origin, initial.role_reservation) {
-        (InitialCreationOrigin::Configured, None) => Some(target.role),
-        (InitialCreationOrigin::Foreign(_), Some(reservation))
-            if reservation.target == target && reservation.process == caller.process() =>
-                handler.execution_roles.reserved_role(
-                    reservation.token, reservation.target, reservation.process,
-                ),
-        _ => None,
-    }
+    precommit_initial_win32k_role(handler, binding).ok().flatten()
 }
 
 /// Complete the genuine win32k process-create callback while the initial TCB is still dormant.
@@ -744,8 +806,8 @@ impl ExecNtHandler {
         let Some(tid) = self.pm.main_thread(process.pid) else {
             return nt_process::STATUS_INVALID_HANDLE;
         };
-        // Capture executable authority before publishing the retained creation owner, which
-        // deliberately closes ordinary dispatch and retirement until creation is committed.
+        // Capture the exact dormant runtime before retaining the one-shot creation owner.
+        // Once retained, ordinary ingress closes; the pre-commit callout uses this binding.
         let Some(binding) = self
             .thread_runtime
             .executable_by_tid(u64::from(tid))
@@ -775,14 +837,6 @@ impl ExecNtHandler {
             Ok(None) => return nt_process::STATUS_INVALID_PARAMETER,
             Err(status) => return status,
         };
-        let client = match capture_initial_win32k_client(self, binding) {
-            Ok(client) => client,
-            Err(status) => {
-                self.pm.cancel_initial_thread_creation(&plan)
-                    .expect("unentered initial creation retains its canonical reservation");
-                return status;
-            }
-        };
         {
             let runtime = runtime(self, binding).expect("configured initial runtime retained");
             let mut slot = runtime.initial_creation.borrow_mut();
@@ -799,6 +853,10 @@ impl ExecNtHandler {
                 origin: InitialCreationOrigin::Configured,
             });
         }
+        let client = match capture_initial_win32k_client(self, binding) {
+            Ok(client) => client,
+            Err(status) => return cancel_creation(self, binding, status),
+        };
         self.continue_configured_initial_thread(binding, client)
     }
 
@@ -898,20 +956,22 @@ impl ExecNtHandler {
                 return nt_process::STATUS_DEVICE_BUSY;
             }
         };
-        let client = match capture_initial_win32k_client(self, binding) {
-            Ok(client) => client,
-            Err(status) => {
-                self.pm.cancel_initial_thread_creation(&plan)
-                    .expect("unentered initial creation retains its canonical reservation");
-                return status;
-            }
-        };
         let origin = ForeignInitialCreation {
             caller,
             handle_out: args[0],
             client_id_out: args[NT_CREATE_THREAD_CLIENT_ID_ARG],
             desired_access: nt_ulong_arg(args[1]),
             create_suspended: nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]),
+        };
+        if let Err(status) = prepare_foreign_retry_slot(caller, binding) {
+            self.pm.cancel_initial_thread_creation(&plan)
+                .expect("unentered initial creation retains its exact canonical reservation");
+            return status;
+        }
+        let Some(prepared_reply_park) = crate::root_reply_park::RootReplyPark::prepare() else {
+            self.pm.cancel_initial_thread_creation(&plan)
+                .expect("unentered initial creation retains its exact canonical reservation");
+            return STATUS_INSUFFICIENT_RESOURCES;
         };
         let role_reservation = match reserve_foreign_initial_thread_lineage(self, caller, binding) {
             Ok(reservation) => reservation,
@@ -937,6 +997,13 @@ impl ExecNtHandler {
                 origin: InitialCreationOrigin::Foreign(origin),
             });
         }
+        let client = match capture_initial_win32k_client(self, binding) {
+            Ok(client) => client,
+            Err(status) => {
+                park_foreign_retry_cancelling(caller, binding, status, prepared_reply_park);
+                return nt_user_callback::STATUS_PENDING as u32;
+            }
+        };
         match create_win32_process_before_loader(self, binding, client) {
             Ok(ProcessCalloutProgress::Ready) => {}
             Ok(ProcessCalloutProgress::Suspended) => return nt_user_callback::STATUS_PENDING as u32,

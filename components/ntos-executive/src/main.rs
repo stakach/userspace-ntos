@@ -19144,7 +19144,7 @@ fn hosted_process_has_one_mechanism_left(
 fn win32k_lifecycle_client(
     tid: u64,
     handler: &ExecNtHandler,
-    process_role: nt_exe_image::HostedProcessRole,
+    process_role: Option<nt_exe_image::HostedProcessRole>,
 ) -> Option<win32k_glue::Win32kClientContext> {
     let pi = handler.hosted_thread_pi_for_tid(tid)?;
     let pid = handler.pm_pid_for_pi(pi)?;
@@ -19183,7 +19183,7 @@ fn win32k_lifecycle_client(
             .thread_kernel_object(tid as nt_process::ThreadId)
             .unwrap_or(0),
         role: handler.hosted_thread_role(tid),
-        process_role: Some(process_role),
+        process_role,
         top_badge: handler.hosted_process_top_badge(pi).unwrap_or(0),
         teb,
         peb_mirror: 0,
@@ -19215,7 +19215,7 @@ unsafe fn release_hosted_thread_win32_context(
             && process.generation == nt_types::ProcessGeneration::Hosted(target.generation))
         .and_then(|(target, process)| handler.execution_roles.role(target, process));
     let Some(client) = process_role.and_then(|process_role|
-        win32k_lifecycle_client(tid, handler, process_role)) else {
+        win32k_lifecycle_client(tid, handler, Some(process_role))) else {
         return thread_win32.is_none()
             && process_win32.is_none()
             && (!final_mechanism

@@ -49,6 +49,11 @@ fn registered_file_alias_cannot_override_the_actual_creator_policy() {
     assert_eq!(roles.role(child, child_process), None);
     let token = roles.reserve_foreign_initial_thread_lineage(&catalog,
         lineage(caller_process, child_process, child, source.file(), None)).unwrap();
+    assert_eq!(roles.reserved_role(token, child, child_process),
+        Some(HostedProcessRole::Application),
+        "an unauthorized creator has only the ordinary pending role before Win32k process-create");
+    assert_eq!(roles.reserved_role(token, child, process(120, 3)), None,
+        "a replacement process generation cannot borrow the pending role");
     roles.commit_foreign_initial_thread(&catalog, token, child, child_process).unwrap();
     assert_eq!(roles.role(child, child_process), Some(HostedProcessRole::Application));
 }

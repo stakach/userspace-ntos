@@ -63,6 +63,15 @@ impl<R: Copy + Eq> InitialReplyRetry<R> {
         })
     }
 
+    /// A failed no-effect cleanup owns the original Reply before its next cancellation attempt.
+    pub fn new_cancelling(
+        origin: InitialThreadReplyOrigin<R>, reply_cap: u64, status: u32,
+    ) -> Option<Self> {
+        let mut row = Self::new(origin, reply_cap)?;
+        row.phase = InitialReplyRetryPhase::Cancelling(status);
+        Some(row)
+    }
+
     pub const fn origin(&self) -> InitialThreadReplyOrigin<R> { self.origin }
     pub const fn reply_cap(&self) -> u64 { self.reply_cap }
     pub const fn phase(&self) -> InitialReplyRetryPhase { self.phase }
@@ -319,6 +328,22 @@ mod tests {
         assert!(finishing.take_root_transfer(origin.source()));
         assert!(finishing.transition(InitialReplyRetryPhase::Finishing));
         assert!(finishing.can_redrive_while(origin.source(), origin.target(), true));
+    }
+
+    #[test]
+    fn failed_no_effect_cleanup_retains_exact_reply_until_owner_retires() {
+        let origin = reply_origin();
+        let status = 0xc000_0008;
+        let mut retry = InitialReplyRetry::new_cancelling(origin, 41, status).unwrap();
+        assert_eq!(retry.phase(), InitialReplyRetryPhase::Cancelling(status));
+        assert!(!retry.can_redrive(origin.source(), origin.target()));
+        assert!(retry.take_root_transfer(origin.source()));
+        assert!(retry.can_redrive_while(origin.source(), origin.target(), true));
+        assert!(retry.transition(InitialReplyRetryPhase::Cancelling(status)),
+            "failed cleanup keeps the exact Reply and reservation pending");
+        assert_eq!(retry.reply_cap(), 41);
+        assert!(retry.transition(InitialReplyRetryPhase::Replying(status)),
+            "terminal reply is allowed only after the caller proves owner retirement");
     }
 
     #[test]

@@ -15,9 +15,7 @@ const CATALOG_ROLE_CALLS: &[&str] = &[
 ];
 
 /// Today's sites, per executive source file (counted call sites, definitions excluded).
-const BASELINE: &[(&str, usize)] = &[
-    ("initial_thread_creation.rs", 1),
-];
+const BASELINE: &[(&str, usize)] = &[];
 
 fn executive_sources(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
     for entry in fs::read_dir(dir).expect("executive source directory") {
@@ -216,7 +214,7 @@ fn win32k_lifecycle_client_keeps_the_exact_committed_role_after_process_exit() {
         .split("unsafe fn terminate_hosted_thread_mechanism(").next().unwrap();
     assert!(retirement.contains("handler.execution_roles.role("),
         "a signaled process retains an exact committed role until execution retirement");
-    assert!(retirement.contains("win32k_lifecycle_client(tid, handler, process_role)"),
+    assert!(retirement.contains("win32k_lifecycle_client(tid, handler, Some(process_role))"),
         "retirement must pass its exact retained role into the client constructor");
     assert!(!retirement.contains("handler.hosted_process_role(pi)"),
         "provider retirement cannot inherit a replacement catalog role");
@@ -234,8 +232,40 @@ fn initial_win32k_client_does_not_require_a_committed_role() {
         .split("pub(crate) unsafe fn validate_process_create_provider_caller(").next().unwrap();
     assert!(capture.contains("handler.capture_process_identity(binding.pi) != Some(binding.process)"),
         "the pre-commit observation must be tied to the exact reserved process");
+    assert!(!capture.contains("handler.hosted_process_role(binding.pi)"),
+        "catalog role cannot authorize the pre-commit Win32k client");
+    assert!(capture.contains("precommit_initial_win32k_role(handler, binding)"),
+        "the client role must come from its retained exact initial owner");
+    assert!(capture.contains("role.unwrap_or(image.role).uses_win32_client_gdi()"),
+        "a foreign GUI process without a role reservation still needs ordinary Win32k creation");
     assert!(capture.contains("win32k_lifecycle_client(binding.tid, handler, role)"),
         "initial process-create must pass its validated pre-commit role explicitly");
+    let role = source.split("unsafe fn precommit_initial_win32k_role(").nth(1)
+        .expect("focused pre-commit role selector")
+        .split("unsafe fn capture_initial_win32k_client(").next().unwrap();
+    assert!(role.contains("InitialCreationOrigin::Configured")
+        && role.contains("InitialCreationOrigin::Foreign")
+        && role.contains("execution_roles.reserved_role("),
+        "configured authority and foreign exact reservation must be handled separately");
+    let foreign = source.split("pub(super) unsafe fn create_foreign_thread(").nth(1)
+        .expect("foreign initial thread")
+        .split("unsafe fn finish_foreign_initial_thread(").next().unwrap();
+    let reserve = foreign.find("reserve_foreign_initial_thread_lineage(self, caller, binding)")
+        .expect("reserve exact foreign lineage");
+    let preflight = foreign.find("prepare_foreign_retry_slot(caller, binding)")
+        .expect("preflight retained Reply capacity before owner publication");
+    let reply_park = foreign.find("RootReplyPark::prepare()")
+        .expect("preflight root Reply selector before owner publication");
+    let publish = foreign.find("*slot = Some(PendingInitialThreadCreation {")
+        .expect("publish the retained initial owner");
+    let client = foreign.find("capture_initial_win32k_client(self, binding)")
+        .expect("capture the pre-commit Win32k client");
+    assert!(preflight < reply_park && reply_park < reserve && reserve < publish && publish < client,
+        "the foreign role and owner must be retained before any role-bearing Win32k client");
+    assert!(foreign[client..].contains("park_foreign_retry_cancelling(")
+        && foreign[client..].contains("caller, binding, status, prepared_reply_park")
+        && foreign[client..].contains("return nt_user_callback::STATUS_PENDING as u32"),
+        "capture failure must retain the foreign source Reply while cancellation is retried");
     let constructor = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../components/ntos-executive/src/main.rs"),
@@ -246,6 +276,8 @@ fn initial_win32k_client_does_not_require_a_committed_role() {
         .split("unsafe fn release_hosted_thread_win32_context(").next().unwrap();
     assert!(!constructor.contains("handler.execution_roles.role("),
         "the shared constructor also serves a pre-commit initial process-create callout");
+    assert!(constructor.contains("process_role,") && !constructor.contains("process_role: Some(process_role)"),
+        "an unreserved foreign client must reach Win32k without a privileged role");
 }
 
 #[test]
@@ -412,11 +444,15 @@ fn precommit_gdi_projection_keeps_its_exact_process_create_role() {
     let proof = initial.split("pub(crate) unsafe fn process_create_provider_role(")
         .nth(1).expect("pre-commit role proof")
         .split("unsafe fn create_win32_process_before_loader(").next().unwrap();
-    assert!(proof.contains("validate_process_create_provider_caller(handler, caller)")
-        && proof.contains("reservation.target")
-        && proof.contains("reservation.process")
-        && proof.contains("execution_roles.reserved_role(")
-        && proof.contains("is_process_signaled"),
+    let selector = initial.split("unsafe fn precommit_initial_win32k_role(")
+        .nth(1).expect("shared pre-commit role selector")
+        .split("unsafe fn capture_initial_win32k_client(").next().unwrap();
+    assert!(proof.contains("process_create_provider_binding(handler, caller)?")
+        && proof.contains("precommit_initial_win32k_role(handler, binding)")
+        && proof.contains("is_process_signaled")
+        && selector.contains("reservation.target == target")
+        && selector.contains("reservation.process == binding.process")
+        && selector.contains("execution_roles.reserved_role("),
         "pre-commit GDI attribution needs the retained exact callout and role reservation");
     assert!(!proof.contains("image.observation_role()"),
         "a historical catalog observation cannot replace the pending execution-role reservation");
