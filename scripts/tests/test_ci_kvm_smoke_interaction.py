@@ -11,6 +11,7 @@ from scripts.ci_kvm_interaction import (
     parse_script, pointer_batches, relative_deltas, screenshot_name, text_chords,
 )
 from scripts.ci_kvm_smoke import DESKTOP_EPOCH_SEALED_RECORD, SerialPanicDetector
+from scripts.ci_kvm_cursor import CursorProof
 from scripts.ci_kvm_visual_proof import VisualProof
 
 DOCUMENT = {
@@ -56,7 +57,7 @@ class ParseScriptTests(unittest.TestCase):
                          ["baseline", "start-menu", "start-menu-closed",
                           "desktop-clear", "command-prompt", "ver"])
         self.assertEqual(script.steps[3].actions, (("click", (800, 600)),))
-        self.assertEqual(script.steps[4].actions, (("double_click", (37, 470)),))
+        self.assertEqual(script.steps[4].actions, (("verified_double_click", (37, 470)),))
         self.assertEqual(script.steps[5].actions, (("type", "ver\n"),))
 
     def test_document_parses_to_ordered_steps(self):
@@ -255,6 +256,63 @@ class InteractionRunnerTests(unittest.TestCase):
         entries = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertEqual(entries[-1]["image_sha256"], "recorded-image-sha")
         self.assertEqual(entries[-1]["event"], "checkpoint")
+
+    def test_verified_click_corrects_recorded_boot2_drift_before_press(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "baseline", "actions": [], "wait_seconds": 0},
+                                   {"name": "command-prompt", "actions": [
+                                       {"verified_double_click": [37, 470]}],
+                                    "wait_seconds": 0}]})
+        positions = iter(((37, 446), (37, 470)))
+        def probe(_before, after, _target):
+            return CursorProof(next(positions), after, "recorded-image-sha")
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock, cursor_probe=probe)
+        runner.arm(0)
+        runner.advance(0)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 0)
+        self.assertEqual(len(self.performed), 3)  # aim, correction, then click
+        self.assertEqual(rel_sum(self.performed[1]), (0, 24))
+        self.assertEqual([events[0]["data"]["down"]
+                          for events, _pause in self.performed[2]],
+                         [True, False, True, False])
+        self.assertEqual([receipt["position"] for receipt in runner.cursor_receipts],
+                         [[37, 446], [37, 470]])
+
+    def test_unmeasured_cursor_halts_without_click(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "baseline", "actions": [], "wait_seconds": 0},
+                                   {"name": "command-prompt", "actions": [
+                                       {"verified_double_click": [37, 470]}],
+                                    "wait_seconds": 0}]})
+        runner = InteractionRunner(
+            script, self.performed.append, self.captured.append, self.log, self.clock,
+            cursor_probe=lambda _before, after, _target: CursorProof(None, after, "sha"))
+        runner.arm(0)
+        runner.advance(0)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(len(self.performed), 1)  # aim only; no button packet
+
+    def test_bounded_correction_never_clicks_when_cursor_stays_off_target(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "baseline", "actions": [], "wait_seconds": 0},
+                                   {"name": "command-prompt", "actions": [
+                                       {"verified_double_click": [37, 470]}],
+                                    "wait_seconds": 0}]})
+        runner = InteractionRunner(
+            script, self.performed.append, self.captured.append, self.log, self.clock,
+            cursor_probe=lambda _before, after, _target: CursorProof((37, 446), after, "sha"))
+        runner.arm(0)
+        runner.advance(0)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(len(runner.cursor_receipts), 3)
+        self.assertEqual(len(self.performed), 3)  # initial aim and two corrections, no click
 
     def test_seal_detector_finds_the_desktop_record(self):
         path = Path(self.directory.name) / "serial.log"
