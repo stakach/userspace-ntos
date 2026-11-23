@@ -31,7 +31,7 @@ The workflow is a desktop gate ([scripts/ci_kvm_verdict.py](scripts/ci_kvm_verdi
 - The scripted interaction completes every step with no input errors.
 - The serial log has no executive panic, provider bugcheck, service-loop exit or kernel halt.
 
-Each boot writes `native-kvm-verdict.json`. The workflow defaults to a 1,200-second ceiling per boot. The progress watchdog can stop a stationary guest sooner. After the desktop seals and startup work goes idle, the runner drives scripted guest input; the `interact` input is on by default, and clearing it fails the gate. The runner pins the PS/2 cursor at the bottom-left corner, aims with small relative moves, sends keys over QMP, and uploads `native-kvm-interact-NN-<step>.ppm` plus `native-kvm-interact.jsonl`. Edit the steps in [scripts/kvm_interaction_steps.json](scripts/kvm_interaction_steps.json).
+Each boot writes `native-kvm-verdict.json`. The workflow defaults to a 1,200-second ceiling per boot. The progress watchdog can stop a stationary guest sooner. After the desktop seals and a 10-second settle period, the runner drives scripted guest input; the `interact` input is on by default, and clearing it fails the gate. The runner pins the PS/2 cursor at the bottom-left corner, aims with small relative moves, sends keys over QMP, and uploads `native-kvm-interact-NN-<step>.ppm` plus `native-kvm-interact.jsonl`. Edit the steps in [scripts/kvm_interaction_steps.json](scripts/kvm_interaction_steps.json).
 
 A failed run still publishes its disk for continuation in two cases: it went idle after setup completed and a user logged on, or it ran its whole bound without a fault.
 
