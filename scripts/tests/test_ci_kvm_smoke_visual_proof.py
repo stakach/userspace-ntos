@@ -38,9 +38,25 @@ OLD_APPLAUNCH_OCR = ("C:\\Windows\\system32\\cmd.exe\n"
                      "Command\nPrompt\n")
 RECORDED_SPILLOVER_OCR = (Path(__file__).with_name("fixtures") /
                           "ready_prompt_45248027167.txt").read_text()
+RECORDED_BOOT2_VER_OCR = (Path(__file__).with_name("fixtures") /
+                          "ver_boot2_45256201173.txt").read_text()
 
 
 class VisualProofTests(unittest.TestCase):
+    def test_recorded_boot2_ver_ignores_separate_punctuation_spillover(self):
+        # Original boot-2 step-7 PPM SHA-256 from mainline run 45256201173:
+        # 5d81ceacaabece252cef893f1435a9cf28f1a3ecb39a04767caef4611abf29a2.
+        # Both the command and version are visible; PSM 11 joined an unrelated glyph.
+        self.assertTrue(contains_ver_result(RECORDED_BOOT2_VER_OCR))
+        self.assertFalse(contains_ver_result(RECORDED_BOOT2_VER_OCR.replace(
+            "C:\\Users\\User>ver", "C:\\Users\\User>dir")))
+        self.assertFalse(contains_ver_result(RECORDED_BOOT2_VER_OCR.replace(
+            "Microsoft Windows [Version 10.0.26100.1]", "Version unavailable")))
+        self.assertFalse(contains_ver_result("Command Prompt\nabc C:\\Users\\User>ver\n"
+                                             "Microsoft Windows [Version 10.0.26100.1]\n"))
+        self.assertFalse(contains_ver_result("Command Prompt\n!!!! C:\\Users\\User>ver\n"
+                                             "Microsoft Windows [Version 10.0.26100.1]\n"))
+
     def test_recorded_ready_prompt_ignores_separate_punctuation_spillover(self):
         # Original full step-6 PPM SHA-256 from mainline run 45248027167:
         # 2cb84c651432283ecf1e3e4bcae3209a2326a5ddb285712b6ff8d54df7e835dc.
