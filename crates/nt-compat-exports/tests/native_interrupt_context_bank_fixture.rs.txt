@@ -1,0 +1,46 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostedDeviceBinding {
+    driver_id: u64,
+    device_id: u64,
+    instance: usize,
+    projection_instance: usize,
+    projection_domain: u64,
+    device_object: u64,
+    pdo_object: u64,
+    used: bool,
+}
+const BINDING_A: HostedDeviceBinding = HostedDeviceBinding {
+    driver_id: 5, device_id: 10, instance: 2, projection_instance: 2,
+    projection_domain: 7, device_object: 100, pdo_object: 200, used: true,
+};
+const BINDING_B: HostedDeviceBinding = HostedDeviceBinding {
+    driver_id: 5, device_id: 11, instance: 2, projection_instance: 2,
+    projection_domain: 7, device_object: 101, pdo_object: 201, used: true,
+};
+#[derive(Clone, Copy)]
+struct HostedDeviceDispatchContext {
+    instance: usize,
+    binding: HostedDeviceBinding,
+    projection_shared_va: Option<u64>,
+}
+struct Contexts(Vec<HostedDeviceDispatchContext>);
+impl Contexts {
+    fn find_active(&self, matches: impl Fn(&HostedDeviceDispatchContext) -> bool)
+        -> Option<&HostedDeviceDispatchContext>
+    {
+        self.0.iter().rev().find(|context| matches(context))
+    }
+}
+static mut HOSTED_DEVICE_DISPATCH_CONTEXTS: Option<Contexts> = None;
+#[derive(Clone, Copy)]
+struct DriverInstance { ready: bool, domain: u64 }
+fn instance_by_driver_id(driver_id: u64) -> Option<(usize, DriverInstance)> {
+    (driver_id == 5).then_some((2, DriverInstance { ready: true, domain: 7 }))
+}
+fn instance(index: usize) -> Option<DriverInstance> {
+    (index == 2).then_some(DriverInstance { ready: true, domain: 7 })
+}
+fn hosted_device_binding_by_device_id(id: u64) -> Option<HostedDeviceBinding> {
+    match id { 10 => Some(BINDING_A), 11 => Some(BINDING_B), _ => None }
+}
+fn instance_domain_identity(inst: DriverInstance) -> Option<u64> { Some(inst.domain) }

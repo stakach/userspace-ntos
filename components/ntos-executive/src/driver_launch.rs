@@ -34254,6 +34254,25 @@ where
         }
     }
 
+    // Own the exact worker bank before projecting resources into it. A kept export retains this
+    // context with its continuation until the provider really returns.
+    let _device_dispatch_context = if let Some(binding) = dependent_binding {
+        let admitted = HostedDeviceDispatchContextGuard::enter(dependent_index, binding)
+            .and_then(|mut guard| {
+                guard.bind_projection_shared(provider_shared)?;
+                Ok(guard)
+            });
+        match admitted {
+            Ok(guard) => Some(guard),
+            Err(status) => {
+                abort_provider_export_marshal_before_dispatch(&marshal_state);
+                return ProviderExportService::Replied(
+                    hosted_provider_export_failure(status.raw()));
+            }
+        }
+    } else {
+        None
+    };
     if let Some(binding) = dependent_binding {
         if let Err(status) = project_provider_resource_state(
             binding,
@@ -34299,7 +34318,7 @@ where
             packet_array_protocol_receive_packet_completions_before,
         ],
         provider_publication_cookie, provider_export_rva, caller_rsp, image_frames,
-        _dependency_lease,
+        _device_dispatch_context, _dependency_lease,
     };
     match dispatched {
         ExportDispatch::Returned(result) => ProviderExportService::Replied(tail.finish(result)),
@@ -34387,6 +34406,7 @@ struct ProviderExportTail {
     provider_export_rva: u64,
     caller_rsp: u64,
     image_frames: u64,
+    _device_dispatch_context: Option<HostedDeviceDispatchContextGuard>,
     _dependency_lease: HostedProviderDependencyDispatchLease,
 }
 
@@ -34396,7 +34416,8 @@ impl ProviderExportTail {
             policy, marshal_state, singleton, provider_inst, dependent_index, dependent_inst,
             dependent_binding, dependent_shared, provider_shared, original_args, args,
             packet_array_export, packet_before, provider_publication_cookie,
-            provider_export_rva, caller_rsp, image_frames, _dependency_lease,
+            provider_export_rva, caller_rsp, image_frames,
+            _device_dispatch_context, _dependency_lease,
         } = self;
         let [
             packet_array_protocol_receive_requests_before,
@@ -36927,10 +36948,16 @@ unsafe fn service_hosted_provider_callback_service(
         Ok(binding) => binding,
         Err(status) => return hosted_provider_callback_failure(status),
     };
+    let dependent_shared = dependent_inst.exec_shared_va;
     let _device_dispatch_context = match callback_binding {
         Some(binding) => {
             match HostedDeviceDispatchContextGuard::enter(record.dependent_instance, binding) {
-                Ok(guard) => Some(guard),
+                Ok(mut guard) => {
+                    if let Err(status) = guard.bind_projection_shared(dependent_shared) {
+                        return hosted_provider_callback_failure(status.raw());
+                    }
+                    Some(guard)
+                }
                 Err(status) => return hosted_provider_callback_failure(status.raw()),
             }
         }
@@ -36938,7 +36965,6 @@ unsafe fn service_hosted_provider_callback_service(
     };
     trace_hosted_provider_callback(b"enter", record, callback_args, &provider_stack, Ok(0));
 
-    let dependent_shared = dependent_inst.exec_shared_va;
     let saved_dependent_irql = if mirror_legacy_irql {
         let saved = read_volatile((dependent_shared + SH_HOSTED_CURRENT_IRQL) as *const u8);
         let callback_irql =
@@ -53322,6 +53348,7 @@ pub(crate) fn hosted_video_publication_identity_is_live(
 struct HostedDeviceDispatchContext {
     instance: usize,
     binding: HostedDeviceBinding,
+    projection_shared_va: Option<u64>,
 }
 
 type HostedDeviceContextTicket =
@@ -53370,7 +53397,7 @@ impl HostedDeviceDispatchContextGuard {
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         let ticket = match contexts.retain(
             reservation, (instance, binding.device_id),
-            HostedDeviceDispatchContext { instance, binding },
+            HostedDeviceDispatchContext { instance, binding, projection_shared_va: None },
         ) {
             Ok(ticket) => ticket,
             Err(_) => {
@@ -53383,6 +53410,22 @@ impl HostedDeviceDispatchContextGuard {
             return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
         }
         Ok(Self { ticket: Some(ticket) })
+    }
+
+    /// Attach the exact request bank before entering its component pump. The retained row keeps
+    /// this identity across a suspended File dispatch; a later worker cannot borrow its binding.
+    unsafe fn bind_projection_shared(&mut self, shared_va: u64) -> Result<(), nt_status::NtStatus> {
+        if shared_va == 0 {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let ticket = self.ticket.ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        let context = hosted_device_dispatch_contexts_mut().get_mut(ticket)
+            .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        if context.projection_shared_va.is_some() {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        context.projection_shared_va = Some(shared_va);
+        Ok(())
     }
 
     /// End only this active binding. The generation-keyed row continues to own the context.
@@ -53406,6 +53449,7 @@ impl HostedDeviceDispatchContextGuard {
         };
         let binding = context.binding;
         if ticket.key() != (context.instance, binding.device_id)
+            || context.projection_shared_va.is_none()
             || !binding.used
             || binding.instance != context.instance
             || hosted_device_binding_by_device_id(binding.device_id) != Some(binding)
@@ -53495,7 +53539,11 @@ impl HostedProjectionBindingRejection {
 
 fn current_hosted_device_dispatch_binding_for_projection(
     projection_instance: usize,
+    shared_va: u64,
 ) -> Result<HostedDeviceBinding, HostedProjectionBindingRejection> {
+    if shared_va == 0 {
+        return Err(HostedProjectionBindingRejection::Context);
+    }
     let contexts = unsafe {
         (*core::ptr::addr_of!(HOSTED_DEVICE_DISPATCH_CONTEXTS))
             .as_ref()
@@ -53503,8 +53551,9 @@ fn current_hosted_device_dispatch_binding_for_projection(
     };
     let binding = contexts
         .find_active(|context| {
-            context.instance == projection_instance
-                || context.binding.projection_instance == projection_instance
+            context.projection_shared_va == Some(shared_va)
+                && (context.instance == projection_instance
+                    || context.binding.projection_instance == projection_instance)
         })
         .ok_or(HostedProjectionBindingRejection::Context)?
         .binding;
@@ -67637,7 +67686,9 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             Ok(authenticated) => authenticated,
             Err(status) => return (status.raw(), 0, 0, 0),
         };
-    let binding = match current_hosted_device_dispatch_binding_for_projection(instance_index) {
+    let binding = match current_hosted_device_dispatch_binding_for_projection(
+        instance_index, ch.shared_va,
+    ) {
         Ok(binding) => binding,
         Err(_) => return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0),
     };
@@ -68726,7 +68777,9 @@ pub(crate) fn service_hosted_driver_interrupt(
             }
         };
     }
-    let binding = match current_hosted_device_dispatch_binding_for_projection(instance_index) {
+    let binding = match current_hosted_device_dispatch_binding_for_projection(
+        instance_index, ch.shared_va,
+    ) {
         Ok(binding) => binding,
         Err(rejection) => {
             unsafe {
@@ -76383,7 +76436,7 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
         .filter(|binding| {
             binding.instance == inst && binding.driver_id == dependent_inst.driver_id
         });
-    let _device_dispatch_context = match dispatch_binding {
+    let mut _device_dispatch_context = match dispatch_binding {
         Some(binding) => match HostedDeviceDispatchContextGuard::enter(inst, binding) {
             Ok(guard) => Some(guard),
             Err(status) => {
@@ -76820,6 +76873,11 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
             return Some(HostedIrpTransportResult::NotDispatched {
                 status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
             });
+        }
+    }
+    if let Some(guard) = _device_dispatch_context.as_mut() {
+        if let Err(status) = guard.bind_projection_shared(ch.shared_va) {
+            return Some(HostedIrpTransportResult::NotDispatched { status });
         }
     }
     let mut scsi_srb_pump_timing = ScsiSrbPumpTiming::new(dispatch_request.as_ref()
