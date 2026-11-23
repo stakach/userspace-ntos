@@ -6,7 +6,8 @@
     {"name": "baseline", "actions": [], "wait_seconds": 0},
     {"name": "start-menu", "actions": [{"click": [28, 743]}], "wait_seconds": 60},
     {"name": "start-menu-closed", "actions": [{"key": ["esc"]}], "wait_seconds": 5},
-    {"name": "command-prompt", "actions": [{"double_click": [37, 470]}], "wait_seconds": 120},
-    {"name": "ver", "actions": [{"click": [400, 55]}, {"type": "ver\n"}], "wait_seconds": 20}
+    {"name": "run-dialog", "actions": [{"key": ["meta_l", "r"]}], "wait_seconds": 20},
+    {"name": "command-prompt", "actions": [{"type": "cmd\n"}], "wait_seconds": 20},
+    {"name": "ver", "actions": [{"type": "ver\n"}], "wait_seconds": 20}
   ]
 }
