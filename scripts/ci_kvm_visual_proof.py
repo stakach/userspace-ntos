@@ -10,9 +10,10 @@ import subprocess
 COMMAND = re.compile(r"(?im)^[ \t]*[a-z]:\\[^\r\n>]*>[ \t]*ver[ \t]*$")
 RESULT = re.compile(r"(?im)^[ \t]*Microsoft Windows[ \t]*\[Version[ \t]+\d+(?:\.\d+)+\][ \t]*$")
 READY_TITLE = re.compile(r"(?im)^[^\w\r\n]{0,3}Command Prompt[ \t]*$")
-# Tesseract can read the block cursor immediately after an empty prompt as one comma.
-# Keep the line anchored so a typed command still fails this pre-input checkpoint.
-READY_PROMPT = re.compile(r"(?im)^[ \t]*[a-z]:\\[^\r\n>]{1,128}>,?[ \t]*$")
+# Sparse-text OCR may join up to three punctuation glyphs from adjacent desktop
+# text to the prompt line, and read the block cursor as a trailing comma. Keep
+# the drive-path token and line tail anchored so typed commands still fail.
+READY_PROMPT = re.compile(r"(?im)^[ \t]*[^\w\s]{0,3}[ \t]*[a-z]:\\[^\r\n>]{1,128}>,?[ \t]*$")
 
 
 @dataclass(frozen=True)
