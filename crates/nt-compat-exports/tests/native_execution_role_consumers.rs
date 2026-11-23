@@ -29,7 +29,7 @@ const BASELINE: &[(&str, usize)] = &[
     ("exec_handler.rs", 21),
     ("executor/admission.rs", 1),
     ("executor/exceptions.rs", 4),
-    ("executor/syscall.rs", 2),
+    ("executor/syscall.rs", 1),
     ("executor/syscall_tail.rs", 5),
     ("executor/vm_fault.rs", 3),
     ("service_sec_image.rs", 2),
@@ -192,4 +192,22 @@ fn worker_spawn_uses_publication_owner_instead_of_first_catalog_role() {
         .expect("post-loop source");
     assert!(post_loop.contains("unique_live_execution_target("),
         "diagnostic owner selection must refuse ambiguous live roles");
+}
+
+#[test]
+fn win32k_main_route_uses_admitted_pi_and_live_role() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/executor/syscall.rs"),
+    )
+    .expect("syscall route source");
+    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("hosted_process_top_badge(pi)==Some(lp.msg.badge)"),
+        "main-badge routing must use the admitted event PI");
+    assert!(compact.contains("live_execution_role(pi)"),
+        "a catalog role cannot authorize win32k routing for a pending or retired process");
+    assert!(!compact.contains("hosted_non_native_top_level_badge("),
+        "the old global catalog badge scan must be retired");
+    assert!(compact.contains("||is_wl_worker||(is_tp_worker&&pi!=0)"),
+        "existing authenticated worker routes must remain available");
 }

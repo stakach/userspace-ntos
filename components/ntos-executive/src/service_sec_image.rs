@@ -8654,12 +8654,6 @@ fn hosted_pi_for_top_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usi
     })
 }
 
-fn hosted_non_native_top_level_badge(nt_handler: &ExecNtHandler, badge: u64) -> bool {
-    hosted_pi_for_top_badge(nt_handler, badge)
-        .and_then(|pi| nt_handler.hosted_process_role(pi))
-        .is_some_and(|role| role != nt_exe_image::HostedProcessRole::NativeSession)
-}
-
 fn hosted_pi_has_role(
     nt_handler: &ExecNtHandler,
     pi: usize,
