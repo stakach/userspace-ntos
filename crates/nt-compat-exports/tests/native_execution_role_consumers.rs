@@ -166,3 +166,20 @@ fn current_process_policy_reads_its_committed_live_role() {
     assert!(!compact.contains("current_hosted_process_image"),
         "an observed executable's catalog role is not execution authority");
 }
+
+#[test]
+fn win32k_dispatch_flags_follow_the_committed_process_role() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/executor/syscall_win32k.rs"),
+    )
+    .expect("win32k route source");
+    let dispatch = source.split("let process_role = ").nth(1)
+        .expect("process role selection")
+        .split("let winlogon_gui_client").next().unwrap();
+    let compact: String = dispatch.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.starts_with("nt_handler.live_execution_role(pi);"),
+        "win32k client flags need the running process's committed role");
+    assert!(!source.contains("nt_handler.hosted_process_role(pi)"),
+        "later win32k atom and SAS decisions must use the same live role");
+}

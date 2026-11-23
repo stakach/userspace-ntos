@@ -36,7 +36,7 @@ pub(super) unsafe fn syscall_win32k_route(
     let preentry = crate::spawn_hosts::shared_ingress::owner::runtime::mint_hosted_win32k_preentry_ticket(
         local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge, lp.msg.m0,
     ).ok();
-    let process_role = nt_handler.hosted_process_role(pi);
+    let process_role = nt_handler.live_execution_role(pi);
     let winlogon_gui_client =
         process_role == Some(nt_exe_image::HostedProcessRole::InteractiveLogon);
     let userinit_gui_client = process_role
@@ -2894,7 +2894,7 @@ pub(super) unsafe fn syscall_win32k_route(
     } else {
         None
     };
-    let userinit_gui_client = nt_handler.hosted_process_role(pi)
+    let userinit_gui_client = nt_handler.live_execution_role(pi)
         == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap);
     let get_atom_name_capture = if lp.msg.m0 == 0x10ad {
         let capture = nt_handler.capture_process_identity(pi).and_then(|process| {
@@ -3887,7 +3887,8 @@ pub(super) unsafe fn syscall_win32k_route(
                 );
             }
         }
-        if nt_handler.hosted_process_role(pi)
+        let live_role = nt_handler.live_execution_role(pi);
+        if live_role
             == Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
             && lp.msg.m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
             && r.0 == 0
@@ -3904,7 +3905,7 @@ pub(super) unsafe fn syscall_win32k_route(
                 current_tid,
                 hosted_thread_tcb_or_zero(&nt_handler, current_tid),
                 nt_handler.hosted_thread_role(current_tid),
-                nt_handler.hosted_process_role(pi),
+                live_role,
                 nt_handler.hosted_process_top_badge(pi).unwrap_or(0),
                 main_tid,
                 nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
