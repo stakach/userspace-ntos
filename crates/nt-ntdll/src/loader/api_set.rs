@@ -5,6 +5,10 @@
 //! contracts. An entry applies when its version mask includes the process's api-set version.
 //! The table belongs to the hosted release; the DLL build reads it from the release's ntdll.
 
+use core::cmp::Ordering;
+
+const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
+
 /// `(contract name without extension, host DLL file name, APISET_* version mask)`. Names are
 /// lowercase and a table is sorted by name.
 pub type ApiSetEntry = (&'static str, &'static str, u8);
@@ -46,10 +50,22 @@ pub fn resolve_api_set(table: &[ApiSetEntry], name: &[u8], versions: u8) -> ApiS
         return ApiSetHost::NotAContract;
     }
     let contract = name.strip_suffix(b".dll").unwrap_or(name);
-    let Ok(index) = table.binary_search_by(|(entry, _, _)| entry.as_bytes().cmp(contract)) else {
+    resolve_exact_contract(table, versions, |entry| entry.as_bytes().cmp(contract))
+}
+
+fn resolve_exact_contract(
+    table: &[ApiSetEntry],
+    versions: u8,
+    mut compare: impl FnMut(&str) -> Ordering,
+) -> ApiSetHost {
+    let Ok(index) = table.binary_search_by(|(entry, _, _)| compare(entry)) else {
         return ApiSetHost::NotAContract;
     };
     let (_, host, mask) = table[index];
+    active_api_set_host(host, mask, versions)
+}
+
+fn active_api_set_host(host: &'static str, mask: u8, versions: u8) -> ApiSetHost {
     if mask & versions == 0 {
         ApiSetHost::NotAContract
     } else if host.is_empty() {
@@ -57,6 +73,85 @@ pub fn resolve_api_set(table: &[ApiSetEntry], name: &[u8], versions: u8) -> ApiS
     } else {
         ApiSetHost::Host(host)
     }
+}
+
+fn folded_contract(name: &[u16]) -> impl Iterator<Item = u16> + '_ {
+    name.iter().copied().map(|unit| match unit {
+        0x41..=0x5a => unit + 0x20,
+        _ => unit,
+    })
+}
+
+fn compare_contract(entry: &[u8], name: &[u16]) -> Ordering {
+    entry.iter().copied().map(u16::from).cmp(folded_contract(name))
+}
+
+fn query_contract_family(table: &[ApiSetEntry], name: &[u16], versions: u8) -> (bool, bool) {
+    // The basic presence query asks about a family, excluding the last dash-delimited
+    // component and anything from the first dot. The loader still requires an exact name.
+    let stem = name.split(|&unit| unit == u16::from(b'.')).next().unwrap_or_default();
+    let Some(last_dash) = stem.iter().rposition(|&unit| unit == u16::from(b'-')) else {
+        return (false, false);
+    };
+    let family_prefix = &stem[..=last_dash];
+    let first = table.partition_point(|(entry, _, _)| {
+        compare_contract(entry.as_bytes(), family_prefix) == Ordering::Less
+    });
+
+    let mut in_schema = false;
+    for &(entry, host, mask) in &table[first..] {
+        let entry = entry.as_bytes();
+        let Some(prefix) = entry.get(..family_prefix.len()) else {
+            break;
+        };
+        if compare_contract(prefix, family_prefix) != Ordering::Equal {
+            break;
+        }
+        if entry[family_prefix.len()..].contains(&b'-') {
+            continue;
+        }
+        match active_api_set_host(host, mask, versions) {
+            ApiSetHost::NotAContract => {}
+            ApiSetHost::Unhosted => in_schema = true,
+            ApiSetHost::Host(_) => return (true, true),
+        }
+    }
+    (in_schema, false)
+}
+
+/// Query a counted name without opening a DLL. The result is `(in_active_schema, has_host)`.
+///
+/// With `match_family`, this is the basic API-set presence query. It accepts an extension
+/// and matches the family ignoring the final version component. Otherwise this is the
+/// extended presence query, which requires an exact, extension-free contract name.
+pub fn query_api_set_presence(
+    table: &[ApiSetEntry],
+    name: &[u16],
+    versions: u8,
+    match_family: bool,
+) -> Result<(bool, bool), u32> {
+    let has_prefix = name.len() > 4 && {
+        let prefix = &name[..4];
+        compare_contract(b"api-", prefix) == Ordering::Equal
+            || compare_contract(b"ext-", prefix) == Ordering::Equal
+    };
+    if match_family {
+        return Ok(if has_prefix {
+            query_contract_family(table, name, versions)
+        } else {
+            (false, false)
+        });
+    }
+    if !has_prefix || name.contains(&u16::from(b'.')) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(match resolve_exact_contract(table, versions, |entry| {
+        compare_contract(entry.as_bytes(), name)
+    }) {
+        ApiSetHost::NotAContract => (false, false),
+        ApiSetHost::Unhosted => (true, false),
+        ApiSetHost::Host(_) => (true, true),
+    })
 }
 
 /// Rows of the pinned release's table that its own images and callers use.
@@ -102,6 +197,77 @@ mod tests {
         );
         // No api-set version: nothing is a contract.
         assert_eq!(resolve(b"api-ms-win-core-synch-l1-2-0", 0), ApiSetHost::NotAContract);
+    }
+
+    #[test]
+    fn api_set_presence_distinguishes_schema_membership_from_a_host() {
+        let query = |name: &str, versions, match_family| {
+            let counted: alloc::vec::Vec<u16> = name.encode_utf16().collect();
+            query_api_set_presence(RELEASE_ROWS, &counted, versions, match_family)
+        };
+        for name in [
+            "API-MS-WIN-CORE-SYNCH-L1-2-0.DLL",
+            "API-MS-WIN-CORE-SYNCH-L1-2-9",
+            "API-MS-WIN-CORE-SYNCH-L1-2-9.fake",
+        ] {
+            assert_eq!(query(name, APISET_WIN10, true), Ok((true, true)), "{name}");
+        }
+        assert_eq!(
+            query("Api-Ms-Win-Core-Synch-L1-2-0", APISET_WIN10, false),
+            Ok((true, true))
+        );
+        assert_eq!(
+            query("api-ms-win-core-synch-l1-2-9", APISET_WIN10, false),
+            Ok((false, false))
+        );
+        assert_eq!(
+            query("ext-ms-win-ntos-ksr-l1-1-5", APISET_WIN10, false),
+            Ok((true, false))
+        );
+        assert_eq!(
+            query("ext-ms-win-ntos-ksr-l1-1-5", APISET_WIN7, false),
+            Ok((false, false))
+        );
+        assert_eq!(
+            query("API-MS-WIN-CORE-SYNCH-L1-2-9", APISET_WIN7, true),
+            Ok((false, false))
+        );
+        for name in ["", "foo", "foo.dll", "api-", "ext-"] {
+            assert_eq!(query(name, APISET_WIN10, true), Ok((false, false)), "{name}");
+            assert_eq!(query(name, APISET_WIN10, false), Err(0xc000_000d), "{name}");
+        }
+        for name in ["api-ms-win-core-synch-l1-2", "ext-ms-win-no-such-family-l1-1-0"] {
+            assert_eq!(query(name, APISET_WIN10, true), Ok((false, false)), "{name}");
+            assert_eq!(query(name, APISET_WIN10, false), Ok((false, false)), "{name}");
+        }
+        assert_eq!(
+            query("api-ms-win-core-synch-l1-2-0é", APISET_WIN10, false),
+            Ok((false, false))
+        );
+        for name in [
+            "api-ms-win-core-synch-l1-2-0.dll",
+            "api-ms-win-core-synch-l1-2-9.fake",
+            "api-ms-win-core.synch-l1-2-0",
+        ] {
+            assert_eq!(query(name, APISET_WIN10, false), Err(0xc000_000d), "{name}");
+        }
+        assert_eq!(
+            resolve_api_set(RELEASE_ROWS, b"api-ms-win-core-synch-l1-2-9", APISET_WIN10),
+            ApiSetHost::NotAContract,
+            "family presence does not authorize loader redirection"
+        );
+    }
+
+    #[test]
+    fn basic_presence_checks_the_active_family_without_matching_nested_names() {
+        let table = [
+            ("api-demo-l1-1-0", "", APISET_WIN10),
+            ("api-demo-l1-1-0-child-l1-1-0", "other.dll", APISET_WIN10),
+            ("api-demo-l1-1-7", "demo.dll", APISET_WIN7),
+        ];
+        let name: alloc::vec::Vec<u16> = "api-demo-l1-1-9".encode_utf16().collect();
+        assert_eq!(query_api_set_presence(&table, &name, APISET_WIN10, true), Ok((true, false)));
+        assert_eq!(query_api_set_presence(&table, &name, APISET_WIN7, true), Ok((true, true)));
     }
 
     #[test]

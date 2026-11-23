@@ -1,6 +1,6 @@
 //! `LdrpApplyFileNameRedirection` for the live loader, and its failure diagnostics.
 
-use nt_ntdll::loader::api_set::api_set_version;
+use crate::loader_extra::{current_api_set_version, RELEASE_API_SETS};
 use nt_ntdll::loader::failure_trace::{
     failure_hash, record_load_failure, record_procedure_miss, record_redirected_load,
     record_redirected_unload, FailureLedger, FailureRecord,
@@ -10,8 +10,6 @@ use nt_ntdll::rtl::activation_redirection::RTL_DOS_APPLY_FILE_REDIRECTION_USTR_F
 use nt_ntdll_layout::UnicodeString;
 
 const STATUS_SXS_KEY_NOT_FOUND: u32 = 0xc015_0008;
-
-include!(concat!(env!("OUT_DIR"), "/release_api_sets.rs"));
 
 static LOAD_FAILURES: FailureLedger<24> = FailureLedger::new();
 static PROCEDURE_MISSES: FailureLedger<24> = FailureLedger::new();
@@ -43,16 +41,7 @@ fn emit(record: &FailureRecord) {
 // Kept out of line: the callers recurse, and these buffers must not sit in every frame.
 #[inline(never)]
 pub(super) unsafe fn apply(name: &mut LoadName) -> u32 {
-    // The kernel publishes the OS version in the PEB (OSMajorVersion @0x118, OSMinorVersion
-    // @0x11c); it selects which contracts are active.
-    let versions = unsafe {
-        let peb: u64;
-        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags, readonly));
-        api_set_version(
-            core::ptr::read_unaligned((peb + 0x118) as *const u32),
-            core::ptr::read_unaligned((peb + 0x11c) as *const u32),
-        )
-    };
+    let versions = unsafe { current_api_set_version() };
     match name.apply_api_set(RELEASE_API_SETS, versions) {
         Ok(true) => return 0,
         Ok(false) => {}

@@ -2,8 +2,8 @@
 # baseline-gap-sha256	a42e5d3ab87a3d9538e1451c109ceb06f3c7bd4dbf131ac48f017ab002e206e6
 # architecture	x86_64
 # name	kind	args	flags	alias	group	owner	abi-authority	effective-args	return-class	state
-ApiSetQueryApiSetPresence	stdcall	ptr,ptr	-	-	A1-apiset	ntdll	wine-spec	ptr,ptr	ntstatus	planned
-ApiSetQueryApiSetPresenceEx	stdcall	ptr,ptr,ptr	-	-	A1-apiset	ntdll	wine-spec	ptr,ptr,ptr	ntstatus	planned
+ApiSetQueryApiSetPresence	stdcall	ptr,ptr	-	-	A1-apiset	ntdll	wine-spec	ptr,ptr	ntstatus	implemented
+ApiSetQueryApiSetPresenceEx	stdcall	ptr,ptr,ptr	-	-	A1-apiset	ntdll	wine-spec	ptr,ptr,ptr	ntstatus	implemented
 CsrAllocateCapturePointer	stub	-	-	-	C1-csr	ntdll	unknown	unresolved	unresolved	blocked-abi
 CsrClientMaxMessage	stub	-	-	-	C1-csr	ntdll	unknown	unresolved	unresolved	blocked-abi
 CsrClientSendMessage	stub	-	-	-	C1-csr	ntdll	unknown	unresolved	unresolved	blocked-abi
