@@ -90,7 +90,12 @@ pub(super) fn validated_registration(
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
-    if inst.driver_id == 0 || driver_object == 0 || driver_object != inst.driver_object
+    let canonical_driver_object = if inst.driver_object != 0 {
+        inst.driver_object
+    } else {
+        inst.provisional_driver_object
+    };
+    if inst.driver_id == 0 || driver_object == 0 || driver_object != canonical_driver_object
         || routine < FSD_CODE_VA || routine >= image_end
         || ch.physical_domain != Some(domain)
         || instance(instance_index).is_none()
@@ -218,6 +223,11 @@ pub(super) unsafe fn begin_pending_for_instance(
         ) else {
             return ReinitRun::Done(Ok(()));
         };
+        if ticket.identity.driver_object != inst.driver_object {
+            // Never dispatch a retained prepublication ticket against a different published
+            // DriverObject. It stays Executing and blocks retirement rather than being replayed.
+            return ReinitRun::Done(Err(nt_status::NtStatus::ACCESS_DENIED));
+        }
         match crate::driver_launch::begin_device_projection_control(
             index, ticket.identity.driver_object, FSD_DISPATCH_DRIVER_REINIT,
             ticket.identity.routine, ticket.identity.context, caller,
@@ -331,4 +341,18 @@ pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
     instance_domain_identity(inst).is_some_and(|domain| {
         queue().quiesced(inst.driver_id, domain.domain_id.raw(), domain.cookie)
     })
+}
+
+/// `LoadTail` calls this only after a completed DriverEntry cannot be published. No callback
+/// drain has started yet; a surprising Executing ticket remains retained and blocks teardown.
+pub(super) fn retire_unpublished(index: usize) -> Result<(), nt_status::NtStatus> {
+    let inst = instance(index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::ACCESS_DENIED)?;
+    if inst.provisional_driver_object == 0 {
+        return Ok(());
+    }
+    queue().retire_unstarted_for(
+        inst.driver_id, domain.domain_id.raw(), domain.cookie,
+        inst.provisional_driver_object,
+    ).map(|_| ()).map_err(|_| nt_status::NtStatus::DEVICE_BUSY)
 }

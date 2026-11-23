@@ -63,7 +63,7 @@ impl DomainId { fn raw(self) -> u64 { self.0 } }
 struct HostedDomainIdentity { domain_id: DomainId, cookie: u64 }
 #[derive(Clone, Copy)]
 struct DriverInstance {
-    driver_id: u64, driver_object: u64, exec_shared_va: u64,
+    driver_id: u64, driver_object: u64, provisional_driver_object: u64, exec_shared_va: u64,
     image_frames: u64, exec_pool_va: u64,
 }
 mod spawn_hosts {
@@ -83,6 +83,7 @@ struct DriverReinitializationIdentity {
 static PRIMARY_BANK: AtomicU64 = AtomicU64::new(0);
 static WORKER_BANK: AtomicU64 = AtomicU64::new(0);
 static CANONICAL_DRIVER: AtomicU64 = AtomicU64::new(0);
+static PROVISIONAL_DRIVER: AtomicU64 = AtomicU64::new(0);
 static FOREIGN_DRIVER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -91,6 +92,7 @@ fn current_domain() -> HostedDomainIdentity {
 }
 fn current_instance() -> DriverInstance {
     DriverInstance { driver_id: 42, driver_object: CANONICAL_DRIVER.load(Ordering::Relaxed),
+        provisional_driver_object: PROVISIONAL_DRIVER.load(Ordering::Relaxed),
         exec_shared_va: PRIMARY_BANK.load(Ordering::Relaxed), image_frames: 2, exec_pool_va: 0x9000 }
 }
 fn instance(index: usize) -> Option<DriverInstance> { (index == 3).then(current_instance) }
@@ -102,7 +104,7 @@ fn instance_for_pump_channel(ch: &spawn_hosts::PumpChannel, reply_cap: u64) -> O
         .then_some((3, current_instance()))
 }
 fn hosted_pool_allocation_exec_range(_: u64, object: u64) -> Option<(u64, u64)> {
-    (object == CANONICAL_DRIVER.load(Ordering::Relaxed)
+    (object == PROVISIONAL_DRIVER.load(Ordering::Relaxed)
         || object == FOREIGN_DRIVER.load(Ordering::Relaxed))
         .then_some((object, WDM_X64_DRIVER_OBJECT_SIZE as u64))
 }
@@ -127,6 +129,7 @@ fn setup() -> (spawn_hosts::PumpChannel, spawn_hosts::PumpChannel, u64) {
     let primary = bank(canonical);
     let worker = bank(canonical);
     CANONICAL_DRIVER.store(canonical, Ordering::Relaxed);
+    PROVISIONAL_DRIVER.store(canonical, Ordering::Relaxed);
     FOREIGN_DRIVER.store(foreign, Ordering::Relaxed);
     PRIMARY_BANK.store(primary, Ordering::Relaxed);
     WORKER_BANK.store(worker, Ordering::Relaxed);
@@ -147,6 +150,24 @@ fn exact_worker_bank_registers_the_canonical_driver() {
 fn primary_bank_still_registers_the_canonical_driver() {
     let (primary, _, canonical) = setup();
     assert!(validated_registration(&primary, canonical, 0x1100, 0x55, 88).is_ok());
+}
+#[test]
+fn driver_entry_worker_registers_before_canonical_publication() {
+    let (_, worker, provisional) = setup();
+    CANONICAL_DRIVER.store(0, Ordering::Relaxed);
+    assert_eq!(validated_registration(&worker, provisional, 0x1100, 0x55, 89),
+        Ok(DriverReinitializationIdentity {driver_id: 42, domain_id: 7, domain_cookie: 19,
+            driver_object: provisional, routine: 0x1100, context: 0x55}));
+}
+#[test]
+fn driver_entry_worker_rejects_a_foreign_object_and_stale_generation() {
+    let (_, mut worker, _) = setup();
+    CANONICAL_DRIVER.store(0, Ordering::Relaxed);
+    let foreign = FOREIGN_DRIVER.load(Ordering::Relaxed);
+    unsafe { core::ptr::write_volatile(worker.shared_va as *mut u64, foreign); }
+    assert_eq!(validated_registration(&worker, foreign, 0x1100, 0x55, 89), Err(STATUS_ACCESS_DENIED));
+    worker.physical_domain = Some(HostedDomainIdentity {domain_id: DomainId(7), cookie: 18});
+    assert_eq!(validated_registration(&worker, foreign, 0x1100, 0x55, 89), Err(STATUS_ACCESS_DENIED));
 }
 #[test]
 fn stale_worker_generation_and_wrong_reply_are_rejected() {

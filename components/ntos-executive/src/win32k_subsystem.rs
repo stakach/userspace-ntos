@@ -17095,6 +17095,7 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
             mj: 0x100,
             mj_table_off: u64::MAX,
             pool: pool_alloc_export,
+            pre_driver_entry: None,
             foreign_call2_va: read_volatile(WIN32K_SEH_FOREIGN_CALL2_VA as *const u64),
             support_entry_rva_off: u64::MAX,
             support_count_off: u64::MAX,

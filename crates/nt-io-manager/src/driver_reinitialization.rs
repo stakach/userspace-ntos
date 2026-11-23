@@ -135,8 +135,15 @@ impl DriverReinitializationQueue {
     }
 
     pub fn begin_next_boot(&mut self) -> Option<DriverReinitializationTicket> {
+        self.begin_next_boot_ready(|_| true)
+    }
+
+    /// Keep prepublication boot registrations queued until the exact DriverObject is live.
+    pub fn begin_next_boot_ready(
+        &mut self, ready: impl Fn(DriverReinitializationIdentity) -> bool,
+    ) -> Option<DriverReinitializationTicket> {
         (self.boot_phase == BootPhase::Draining)
-            .then(|| self.begin_matching(Kind::Boot, |_| true)).flatten()
+            .then(|| self.begin_matching(Kind::Boot, ready)).flatten()
     }
 
     pub fn finish_boot_phase(&mut self) -> Result<(), DriverReinitializationError> {
@@ -189,6 +196,28 @@ impl DriverReinitializationQueue {
         }
         row.phase = Phase::Acknowledged;
         Ok(())
+    }
+
+    /// A load that failed before publication cannot dispatch its queued callbacks. Release
+    /// only that exact unpublished DriverObject's never-started rows. An executing callback is
+    /// uncertain and must remain owned, so the whole retirement is refused without mutation.
+    pub fn retire_unstarted_for(
+        &mut self, driver_id: u64, domain_id: u64, domain_cookie: u64, driver_object: u64,
+    ) -> Result<usize, DriverReinitializationError> {
+        if driver_id == 0 || domain_id == 0 || domain_cookie == 0 || driver_object == 0 {
+            return Err(DriverReinitializationError::InvalidIdentity);
+        }
+        let matches = |row: &Row| {
+            row.identity.driver_id == driver_id && row.identity.domain_id == domain_id
+                && row.identity.domain_cookie == domain_cookie
+                && row.identity.driver_object == driver_object
+        };
+        if self.rows.iter().any(|row| matches(row) && row.phase == Phase::Executing) {
+            return Err(DriverReinitializationError::WrongPhase);
+        }
+        let before = self.rows.len();
+        self.rows.retain(|row| !matches(row) || row.phase != Phase::Queued);
+        Ok(before - self.rows.len())
     }
 
     pub fn quiesced(&self, driver_id: u64, domain_id: u64, domain_cookie: u64) -> bool {
@@ -279,6 +308,17 @@ mod tests {
     }
 
     #[test]
+    fn boot_callback_waits_for_exact_driver_object_publication() {
+        let mut queue = DriverReinitializationQueue::new();
+        queue.register_boot(CLASS).unwrap();
+        queue.open_boot_phase().unwrap();
+        assert!(queue.begin_next_boot_ready(|_| false).is_none());
+        let ticket = queue.begin_next_boot_ready(|identity| identity == CLASS).unwrap();
+        assert_eq!(ticket.identity, CLASS);
+        queue.acknowledge(ticket).unwrap();
+    }
+
+    #[test]
     fn boot_registration_after_initial_load_can_join_open_drain() {
         let mut queue = DriverReinitializationQueue::new();
         queue.begin_boot_phase().unwrap();
@@ -321,5 +361,37 @@ mod tests {
         let ticket = queue.begin_next_ready(|identity| identity == CLASS).unwrap();
         assert_eq!(ticket.identity, CLASS);
         queue.acknowledge(ticket).unwrap();
+    }
+
+    #[test]
+    fn failed_unpublished_load_retires_only_its_never_started_callbacks() {
+        let mut queue = DriverReinitializationQueue::new();
+        queue.register(CLASS).unwrap();
+        queue.register_boot(DriverReinitializationIdentity { routine: CLASS.routine + 8, ..CLASS }).unwrap();
+        let next_generation = DriverReinitializationIdentity { domain_cookie: 99, ..CLASS };
+        queue.register(next_generation).unwrap();
+        assert_eq!(queue.retire_unstarted_for(
+            CLASS.driver_id, CLASS.domain_id, CLASS.domain_cookie, CLASS.driver_object,
+        ), Ok(2));
+        assert!(queue.quiesced(CLASS.driver_id, CLASS.domain_id, CLASS.domain_cookie));
+        assert_eq!(queue.begin_next(), Some(DriverReinitializationTicket {
+            registration: 3, identity: next_generation, count: 1,
+        }));
+    }
+
+    #[test]
+    fn uncertain_callback_prevents_unpublished_retirement_without_mutation() {
+        let mut queue = DriverReinitializationQueue::new();
+        queue.register(CLASS).unwrap();
+        queue.register(DriverReinitializationIdentity { routine: CLASS.routine + 8, ..CLASS }).unwrap();
+        let first = queue.begin_next().unwrap();
+        assert_eq!(queue.retire_unstarted_for(
+            CLASS.driver_id, CLASS.domain_id, CLASS.domain_cookie, CLASS.driver_object,
+        ), Err(DriverReinitializationError::WrongPhase));
+        assert!(!queue.quiesced(CLASS.driver_id, CLASS.domain_id, CLASS.domain_cookie));
+        queue.acknowledge(first).unwrap();
+        assert_eq!(queue.retire_unstarted_for(
+            CLASS.driver_id, CLASS.domain_id, CLASS.domain_cookie, CLASS.driver_object,
+        ), Ok(1));
     }
 }
