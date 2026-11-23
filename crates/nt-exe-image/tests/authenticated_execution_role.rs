@@ -148,14 +148,23 @@ fn bootstrap_root_requires_the_actual_mounted_file() {
     let smss = registered(&mut catalog, 0, 0, b"smss.exe",
         HostedProcessRole::NativeSession, HostedProcessRole::NativeSession,
         registered_file);
-    let process = process(12, 1);
+    let identity = process(12, 1);
     let mut roles = ExecutionRoleLedger::<16>::new();
-    assert_eq!(roles.seed_bootstrap_root(&catalog, smss, process,
+    assert_eq!(roles.seed_bootstrap_root(&catalog, smss, identity,
         SectionFileIdentity { mount: other_mount, file_id: registered_file.file_id }),
         Err(nt_exe_image::execution_role::ExecutionRoleError::InvalidBacking));
-    assert_eq!(roles.role(smss, process), None);
-    assert_eq!(roles.seed_bootstrap_root(&catalog, smss, process, registered_file), Ok(()));
-    assert_eq!(roles.role(smss, process), Some(HostedProcessRole::NativeSession));
+    assert_eq!(roles.role(smss, identity), None);
+    assert_eq!(roles.seed_bootstrap_root(&catalog, smss, identity, registered_file), Ok(()));
+    assert_eq!(roles.role(smss, identity), Some(HostedProcessRole::NativeSession));
+    assert_eq!(roles.live_role(smss, identity, |_, _| true),
+        Some(HostedProcessRole::NativeSession));
+    assert_eq!(roles.live_role(smss, identity, |_, _| false), None,
+        "a retired process cannot authorize a new child from its catalog image");
+    assert_eq!(roles.live_role(smss, process(12, 2), |_, _| true), None,
+        "a recycled PID cannot inherit the previous generation's role");
+    assert_eq!(roles.live_role(SpawnTarget { generation: smss.generation + 1, ..smss },
+        identity, |_, _| true), None,
+        "a recycled image slot cannot reuse the previous target's role");
 }
 
 #[test]

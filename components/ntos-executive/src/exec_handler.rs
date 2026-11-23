@@ -9772,6 +9772,14 @@ impl ExecNtHandler {
         })
     }
 
+    pub(crate) fn live_execution_role(&self, pi: usize) -> Option<nt_exe_image::HostedProcessRole> {
+        let target = nt_exe_image::SpawnTarget::from_image(self.hosted_process_image(pi)?);
+        let process = self.capture_process_identity(pi)?;
+        self.execution_roles.live_role(target, process, |target, process| {
+            self.is_live_execution_process(target, process)
+        })
+    }
+
     /// Install the bootstrap execution root only after its exact Ps mechanism and main runtime
     /// have been published. The mounted File identity must match the registered image backing.
     pub(crate) fn seed_bootstrap_execution_role(
@@ -31937,7 +31945,7 @@ impl ExecNtHandler {
     }
 
     fn dynamic_child_role(&self) -> Option<nt_exe_image::HostedProcessRole> {
-        match self.current_hosted_process_role()? {
+        match self.live_execution_role(self.pi)? {
             role if role.is_noninteractive_service_class() => {
                 Some(nt_exe_image::HostedProcessRole::NonInteractiveService)
             }

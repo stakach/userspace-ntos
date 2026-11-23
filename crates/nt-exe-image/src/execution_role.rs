@@ -204,6 +204,18 @@ impl<const N: usize> ExecutionRoleLedger<N> {
         self.entry(target, process).map(|entry| entry.role)
     }
 
+    /// A committed role is authority only while its exact process still runs.
+    pub fn live_role(
+        &self,
+        target: SpawnTarget,
+        process: ProcessIdentity,
+        mut is_live: impl FnMut(SpawnTarget, ProcessIdentity) -> bool,
+    ) -> Option<HostedProcessRole> {
+        self.entry(target, process)
+            .filter(|entry| is_live(entry.target, entry.process))
+            .map(|entry| entry.role)
+    }
+
     /// Select a role only when one committed target still owns a live process.
     pub fn unique_live_target(
         &self,
