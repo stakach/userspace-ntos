@@ -62934,7 +62934,27 @@ pub(crate) fn service_hosted_device(
             Ok(resolved) => resolved,
             Err(status) => return (status.raw(), 0, 0, 0),
         };
-    if inst.exec_arg_va == 0 {
+    use crate::spawn_hosts::shared_ingress::owner::runtime::{self, PhysicalSourceKind};
+    let Some(route) = (unsafe { runtime::channel_route(ch).ok().flatten() }) else {
+        return (STATUS_ACCESS_DENIED, 0, 0, 0);
+    };
+    let Ok(source) = (unsafe { runtime::physical_source(route) }) else {
+        return (STATUS_ACCESS_DENIED, 0, 0, 0);
+    };
+    let arg = match source.kind {
+        PhysicalSourceKind::DispatchWorker { .. } => {
+            let worker_arg = unsafe {
+                hosted_provider_export_lane::executive_arg_for_shared(ch.shared_va)
+                    .or_else(|| hosted_class_irp_lane::executive_arg_for_shared(ch.shared_va))
+            };
+            let Some(arg) = worker_arg else {
+                return (STATUS_ACCESS_DENIED, 0, 0, 0);
+            };
+            arg
+        }
+        _ => inst.exec_arg_va,
+    };
+    if arg == 0 {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
     let owner = HostedDevicePropertyOwner {
@@ -62947,7 +62967,7 @@ pub(crate) fn service_hosted_device(
     };
     let data = unsafe {
         core::slice::from_raw_parts_mut(
-            (inst.exec_arg_va + HOSTED_DEVICE_ARG_DATA_OFF) as *mut u8,
+            (arg + HOSTED_DEVICE_ARG_DATA_OFF) as *mut u8,
             device_property::PROPERTY_CHUNK_BYTES,
         )
     };

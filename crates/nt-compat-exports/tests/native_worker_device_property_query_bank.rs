@@ -66,6 +66,25 @@ impl DeviceId { fn raw(self) -> u64 { self.0 } }
 struct PumpChannel {
     shared_va: u64, tcb: u64, reply_cap: u64, physical_domain: HostedDomainIdentity,
 }
+mod spawn_hosts {
+    pub mod shared_ingress { pub mod owner { pub mod runtime {
+        use super::super::super::super::*;
+        #[derive(Clone, Copy)] pub enum PhysicalSourceKind {
+            Primary, DispatchWorker { ordinal: u64 },
+        }
+        pub struct PhysicalSource { pub kind: PhysicalSourceKind }
+        pub unsafe fn channel_route(ch: &PumpChannel) -> Result<Option<u64>, ()> {
+            Ok(match ch.tcb { 11 => Some(1), 12 => Some(2), _ => None })
+        }
+        pub unsafe fn physical_source(route: u64) -> Result<PhysicalSource, ()> {
+            match route {
+                1 => Ok(PhysicalSource {kind: PhysicalSourceKind::Primary}),
+                2 => Ok(PhysicalSource {kind: PhysicalSourceKind::DispatchWorker {ordinal: 1}}),
+                _ => Err(()),
+            }
+        }
+    } } }
+}
 struct Status(i32);
 impl Status { fn raw(self) -> i32 { self.0 } }
 struct HostedDevicePropertyOwner {
@@ -75,6 +94,7 @@ static PRIMARY_ARG: AtomicU64 = AtomicU64::new(0);
 static WORKER_ARG: AtomicU64 = AtomicU64::new(0);
 static PRIMARY_SHARED: AtomicU64 = AtomicU64::new(0);
 static WORKER_SHARED: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_ROW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 fn domain() -> HostedDomainIdentity {
     HostedDomainIdentity {domain_id: nt_io_manager::HostedDomainId(7), cookie: 19}
 }
@@ -82,7 +102,8 @@ fn authenticated_hosted_pdo(ch: &PumpChannel, pdo: u64, reply: u64)
     -> Result<(usize, DriverInstance, DeviceId), Status> {
     if pdo != 0x1234 || reply != ch.reply_cap || ch.physical_domain != domain()
         || !((ch.shared_va == PRIMARY_SHARED.load(Ordering::Relaxed) && ch.tcb == 11)
-            || (ch.shared_va == WORKER_SHARED.load(Ordering::Relaxed) && ch.tcb == 12))
+            || (ch.shared_va == WORKER_SHARED.load(Ordering::Relaxed) && ch.tcb == 12)
+            || (ch.shared_va == PRIMARY_SHARED.load(Ordering::Relaxed) && ch.tcb == 12))
     { return Err(Status(STATUS_ACCESS_DENIED)); }
     Ok((3, DriverInstance { hosted_domain_id: 7, hosted_domain_cookie: 19,
         exec_arg_va: PRIMARY_ARG.load(Ordering::Relaxed) }, DeviceId(33)))
@@ -93,7 +114,8 @@ mod hosted_provider_export_lane {
 mod hosted_class_irp_lane {
     use super::*;
     pub unsafe fn executive_arg_for_shared(shared: u64) -> Option<u64> {
-        (shared == WORKER_SHARED.load(Ordering::Relaxed))
+        (ACTIVE_ROW.load(Ordering::Relaxed)
+            && shared == WORKER_SHARED.load(Ordering::Relaxed))
             .then(|| WORKER_ARG.load(Ordering::Relaxed))
     }
 }
@@ -120,6 +142,7 @@ fn setup() -> (PumpChannel, PumpChannel, Box<[u8; 32]>, Box<[u8; 32]>) {
     WORKER_ARG.store(worker.as_mut_ptr() as u64, Ordering::Relaxed);
     PRIMARY_SHARED.store(0x1000, Ordering::Relaxed);
     WORKER_SHARED.store(0x2000, Ordering::Relaxed);
+    ACTIVE_ROW.store(true, Ordering::Relaxed);
     (PumpChannel {shared_va: 0x1000, tcb: 11, reply_cap: 81, physical_domain: domain()},
      PumpChannel {shared_va: 0x2000, tcb: 12, reply_cap: 82, physical_domain: domain()},
      primary, worker)
@@ -145,6 +168,24 @@ fn stale_reply_and_foreign_worker_tcb_are_refused_before_writing() {
         STATUS_ACCESS_DENIED);
     worker_ch.tcb = 99;
     assert_eq!(production_property_query(&worker_ch, 0x1234, 1, 2, 3, 82).0,
+        STATUS_ACCESS_DENIED);
+    assert_eq!(&primary[..], &[0x11; 32]);
+    assert_eq!(&worker[..], &[0x22; 32]);
+}
+#[test]
+fn worker_with_no_retained_arg_row_cannot_fall_back_to_primary() {
+    let (_, worker_ch, primary, worker) = setup();
+    ACTIVE_ROW.store(false, Ordering::Relaxed);
+    assert_eq!(production_property_query(&worker_ch, 0x1234, 1, 2, 3, 82).0,
+        STATUS_ACCESS_DENIED);
+    assert_eq!(&primary[..], &[0x11; 32]);
+    assert_eq!(&worker[..], &[0x22; 32]);
+}
+#[test]
+fn worker_route_with_primary_shared_va_cannot_write_primary_arg() {
+    let (primary_ch, _, primary, worker) = setup();
+    let forged = PumpChannel {tcb: 12, reply_cap: 82, ..primary_ch};
+    assert_eq!(production_property_query(&forged, 0x1234, 1, 2, 3, 82).0,
         STATUS_ACCESS_DENIED);
     assert_eq!(&primary[..], &[0x11; 32]);
     assert_eq!(&worker[..], &[0x22; 32]);
@@ -215,7 +256,10 @@ const FSD_SERVICE_DEVICE_LABEL: u64 = 0x123;
 }
 mod nt_status {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)] pub struct NtStatus(pub i32);
-    impl NtStatus { pub const SUCCESS: Self = Self(0); }
+    impl NtStatus {
+        pub const SUCCESS: Self = Self(0);
+        pub const ACCESS_DENIED: Self = Self(-1);
+    }
 }
 trait PropertyQueryTransport {
     type Scratch;
@@ -235,6 +279,8 @@ struct DriverPropertyClient;
 static PRIMARY_ARG: AtomicU64 = AtomicU64::new(0);
 static WORKER_ARG: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_WORKER: AtomicBool = AtomicBool::new(false);
+static ACTIVE_CLASS: AtomicBool = AtomicBool::new(false);
+static ACTIVE_SYSTEM: AtomicBool = AtomicBool::new(false);
 fn primary_arg() -> u64 { PRIMARY_ARG.load(Ordering::Relaxed) }
 mod hosted_provider_export_lane {
     pub fn current_component_arg() -> Option<u64> { None }
@@ -242,7 +288,7 @@ mod hosted_provider_export_lane {
 mod hosted_class_irp_lane {
     use super::*;
     pub fn current_component_arg() -> Option<u64> {
-        ACTIVE_WORKER.load(Ordering::Relaxed)
+        (ACTIVE_WORKER.load(Ordering::Relaxed) && ACTIVE_CLASS.load(Ordering::Relaxed))
             .then(|| WORKER_ARG.load(Ordering::Relaxed))
     }
 }
@@ -253,7 +299,11 @@ fn request_words(request:PropertyQueryRequest) -> (u64,u64,u64,u64) {
     }
 }
 unsafe fn call_on4(_:u64, _:u64, _:u64, _:u64, _:u64) -> (u64,u64,u64,u64,u64) {
-    let arg = if ACTIVE_WORKER.load(Ordering::Relaxed) {
+    if ACTIVE_WORKER.load(Ordering::Relaxed)
+        && !ACTIVE_CLASS.load(Ordering::Relaxed)
+        && !ACTIVE_SYSTEM.load(Ordering::Relaxed)
+    { return (1, nt_status::NtStatus::ACCESS_DENIED.0 as u64, 0, 0, 0); }
+    let arg = if ACTIVE_WORKER.load(Ordering::Relaxed) && ACTIVE_CLASS.load(Ordering::Relaxed) {
         WORKER_ARG.load(Ordering::Relaxed)
     } else { PRIMARY_ARG.load(Ordering::Relaxed) };
     core::ptr::write_bytes((arg + HOSTED_DEVICE_ARG_DATA_OFF) as *mut u8, 0xa5,
@@ -273,6 +323,8 @@ fn setup() -> (Box<[u8;32]>, Box<[u8;32]>) {
     let mut worker = Box::new([0x22;32]);
     PRIMARY_ARG.store(primary.as_mut_ptr() as u64, Ordering::Relaxed);
     WORKER_ARG.store(worker.as_mut_ptr() as u64, Ordering::Relaxed);
+    ACTIVE_CLASS.store(true, Ordering::Relaxed);
+    ACTIVE_SYSTEM.store(false, Ordering::Relaxed);
     (primary, worker)
 }
 #[test]
@@ -295,6 +347,35 @@ fn primary_transport_consumes_its_own_reply() {
     }).unwrap();
     assert_eq!(reply.data, [0xa5;8]);
     assert_eq!(&primary[16..24], &[0xa5;8]);
+    assert_eq!(&worker[..], &[0x22;32]);
+}
+#[test]
+fn unresolved_dispatch_worker_receives_denial_without_copying_primary_arg() {
+    let (primary, worker) = setup();
+    ACTIVE_WORKER.store(true, Ordering::Relaxed);
+    ACTIVE_CLASS.store(false, Ordering::Relaxed);
+    let reply = DriverPropertyClient.exchange(PropertyQueryRequest::Begin {
+        pdo: 0x1234, property: 1, capacity: 8,
+    }).unwrap();
+    assert_eq!(reply.status, nt_status::NtStatus::ACCESS_DENIED);
+    assert_eq!(reply.data, [0;8]);
+    assert_eq!(&primary[..], &[0x11;32]);
+    assert_eq!(&worker[..], &[0x22;32]);
+}
+#[test]
+fn system_thread_keeps_its_existing_primary_arg_transport() {
+    let (primary, worker) = setup();
+    ACTIVE_WORKER.store(true, Ordering::Relaxed);
+    ACTIVE_CLASS.store(false, Ordering::Relaxed);
+    ACTIVE_SYSTEM.store(true, Ordering::Relaxed);
+    let reply = DriverPropertyClient.exchange(PropertyQueryRequest::Begin {
+        pdo: 0x1234, property: 1, capacity: 8,
+    }).unwrap();
+    assert_eq!(reply.status, nt_status::NtStatus::SUCCESS);
+    assert_eq!(reply.data, [0xa5;8]);
+    assert_eq!(&primary[16..24], &[0xa5;8]);
+    assert_eq!(&primary[..16], &[0x11;16]);
+    assert_eq!(&primary[24..], &[0x11;8]);
     assert_eq!(&worker[..], &[0x22;32]);
 }
 "#;

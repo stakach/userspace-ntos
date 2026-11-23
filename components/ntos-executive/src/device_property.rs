@@ -68,6 +68,9 @@ impl PropertyQueryTransport for DriverPropertyClient {
         &mut self,
         request: PropertyQueryRequest,
     ) -> Result<PropertyQueryReply, nt_status::NtStatus> {
+        let arg = hosted_provider_export_lane::current_component_arg()
+            .or_else(hosted_class_irp_lane::current_component_arg)
+            .unwrap_or(FSD_ARG_VADDR);
         let (op, pdo, arg2, arg3) = request_words(request);
         let (_, status, total_len, token, chunk_len) =
             unsafe { call_on4((FSD_SERVICE_DEVICE_LABEL << 12) | 4, op, pdo, arg2, arg3) };
@@ -83,7 +86,7 @@ impl PropertyQueryTransport for DriverPropertyClient {
             unsafe {
                 copy_bytes_unchecked(
                     reply.data.as_mut_ptr() as u64,
-                    FSD_ARG_VADDR + HOSTED_DEVICE_ARG_DATA_OFF,
+                    arg + HOSTED_DEVICE_ARG_DATA_OFF,
                     chunk_len,
                 );
             }
