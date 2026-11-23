@@ -606,6 +606,17 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
             }
             return STATUS_INSUFFICIENT_RESOURCES_I32;
         }
+        let monitor_query = identity.code == nt_video_miniport::IOCTL_VIDEO_ENUM_MONITOR_PDO;
+        if monitor_query && trace_video_init_import(b"monitor-enter", device, identity.code as u64, 0, 0) {
+            print_str(b"[win32k-init-monitor-owner] nonce/ticket/generation/irp/device/output/capacity=");
+            for value in [
+                nonce, source_ticket, source_generation, irp, device,
+                identity.output_va, identity.output_capacity as u64,
+            ] {
+                print_str(b"/"); print_hex_u64(value);
+            }
+            print_str(b"\n");
+        }
         let (words, raw, _, _, _) = crate::driver_launch::call_on4_raw(
             (W32_SOURCE_IOCTL_LABEL << 12) | 4,
             packet,
@@ -635,6 +646,12 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
                     native_allocation_generation: source_generation,
                 }, packet, packet_pin);
                 retire_packet(packet, packet_pin);
+                if monitor_query {
+                    trace_video_init_import(
+                        b"monitor-pending", device, identity.code as u64,
+                        wire::STATUS_PENDING as u64, token,
+                    );
+                }
                 wire::STATUS_PENDING as i32
             }
             Ok(SourceIrpIoctlResponse::Inline { token, status, information, .. })
@@ -643,6 +660,12 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
                     crate::provider_bugcheck::report(0xc4, [W32_SOURCE_IOCTL_LABEL, irp, token, 54]);
                 }
                 retire_packet(packet, packet_pin);
+                if monitor_query {
+                    trace_video_init_import(
+                        b"monitor-return", device, identity.code as u64,
+                        status as u64, information,
+                    );
+                }
                 status as i32
             }
             Err(_)
@@ -653,6 +676,11 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
                 retire_packet(packet, packet_pin);
                 if !reject_unentered(nonce) {
                     crate::provider_bugcheck::report(0xc4, [W32_SOURCE_IOCTL_LABEL, irp, raw, 55]);
+                }
+                if monitor_query {
+                    trace_video_init_import(
+                        b"monitor-rejected", device, identity.code as u64, raw as u32 as u64, 0,
+                    );
                 }
                 raw as u32 as i32
             }
