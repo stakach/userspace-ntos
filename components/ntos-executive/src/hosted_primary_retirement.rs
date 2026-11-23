@@ -309,6 +309,11 @@ pub(super) unsafe fn release_unenrolled(instance_index: usize, inst: DriverInsta
     let Some(domain) = instance_domain_identity(inst) else {
         return false;
     };
+    let port_owner = hosted_port_projection::PhysicalOwner::Primary {
+        instance: instance_index, domain_id: domain.domain_id.raw(), cookie: domain.cookie,
+        tcb: inst.tcb,
+    };
+    if !hosted_port_projection::retirement_allowed(inst.cnode, port_owner) { return false; }
     if hosted_source_stack_lease::blocks_primary_retirement(instance_index, domain, inst.tcb, inst.pml4) {
         return false;
     }
@@ -355,6 +360,11 @@ pub(super) unsafe fn release_unenrolled(instance_index: usize, inst: DriverInsta
     if !execute_effects(index) || !hosted_pretransport_retirement::retire_early(instance_index) {
         return false;
     }
+    row(index).entered = true;
+    if !hosted_port_projection::retired(inst.cnode, port_owner) {
+        return false;
+    }
+    row(index).entered = false;
     row(index).finished = true;
     true
 }
@@ -374,6 +384,11 @@ pub(super) unsafe fn release(instance_index: usize, inst: DriverInstance) -> boo
     let Some(domain) = instance_domain_identity(inst) else {
         return false;
     };
+    let port_owner = hosted_port_projection::PhysicalOwner::Primary {
+        instance: instance_index, domain_id: domain.domain_id.raw(), cookie: domain.cookie,
+        tcb: inst.tcb,
+    };
+    if !hosted_port_projection::retirement_allowed(inst.cnode, port_owner) { return false; }
     if hosted_source_stack_lease::blocks_primary_retirement(instance_index, domain, inst.tcb, inst.pml4) {
         return false;
     }
@@ -467,6 +482,11 @@ pub(super) unsafe fn release(instance_index: usize, inst: DriverInstance) -> boo
     if let Some(table) = hosted_driver_thread_table_mut(instance_index) {
         let _ = table.remove(inst.main_thread_id);
     }
+    row(index).entered = true;
+    if !hosted_port_projection::retired(inst.cnode, port_owner) {
+        return false;
+    }
+    row(index).entered = false;
     row(index).finished = true;
     true
 }

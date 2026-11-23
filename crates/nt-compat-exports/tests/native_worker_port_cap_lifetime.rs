@@ -3,6 +3,8 @@
 use std::process::Command;
 
 const SOURCE: &str = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+const LEDGER: &str =
+    include_str!("../../../components/ntos-executive/src/driver_launch/hosted_port_projection.rs");
 
 fn section(start: &str, end: &str) -> &'static str {
     let from = SOURCE.find(start).expect("production start marker");
@@ -34,7 +36,7 @@ fn physical_worker_cnode_receives_its_projected_port_cap() {
     )
     .replacen("extern \"win64\"", "extern \"C\"", 1);
     let fixture = format!(
-        "{SUPPORT}\n{restore}\n{projection}\n{counter}\n{cap_lookup}\n{read_port}\n{CASES}"
+        "{SUPPORT}\nmod hosted_port_projection {{\n{LEDGER}\n}}\n{restore}\n{projection}\n{counter}\n{cap_lookup}\n{read_port}\n{CASES}"
     );
     let directory = std::env::temp_dir().join(format!("nt-port-cap-worker-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
@@ -53,16 +55,25 @@ fn physical_worker_cnode_receives_its_projected_port_cap() {
         "worker port fixture compile:\n{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let result = Command::new(&binary)
-        .arg("--test-threads=1")
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "worker port regression:\n{}{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+    // A failed native projection retains its owner for the process lifetime. Each case gets
+    // a fresh process; resetting that production quarantine would defeat the contract.
+    for case in [
+        "failed_child_cap_copy_cannot_publish_a_new_worker_bank",
+        "failed_child_cap_delete_cannot_publish_a_new_worker_bank",
+        "primary_and_private_irq_provider_cnodes_keep_independent_caps",
+        "two_worker_banks_retain_their_own_live_port_caps",
+    ] {
+        let result = Command::new(&binary)
+            .args([case, "--exact"])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "worker port regression {case}:\n{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 }
 
 const SUPPORT: &str = r#"
@@ -70,6 +81,7 @@ use core::ptr::{read_volatile, write_volatile};
 const CT_IO_PORT_BASE: u64 = 8;
 const CT_IO_PORT_CAPACITY: u64 = 16;
 const SH_RESOURCE_ADDRESS_KIND_PORT: u8 = 2;
+mod allocator { pub fn enter_durable() {} }
 const SH_RESOURCE_IO_PORT_IN16_CALLS: u64 = 0x100;
 const SH_RESOURCE_IO_PORT_IN16_DENIED: u64 = 0x108;
 const SH_RESOURCE_IO_PORT_IN16_FAILURES: u64 = 0x110;
@@ -80,13 +92,20 @@ const SH_RESOURCE_IO_PORT_LAST_IN16_VALUE: u64 = 0x128;
 #[derive(Clone, Copy)] struct SharedAddressResource { kind: u8, translated_start: u64, len: u64,
     broker_va_or_root_cap: u64, component_cap: u64 }
 #[derive(Clone, Copy)] struct HostedDeviceResourceState { device_id: u64, driver_id: u64,
-    instance: usize, resource: SharedAddressResource }
+    instance: usize, resource: SharedAddressResource, projection_domain: HostedDomainIdentity,
+    pdo_object: u64 }
+#[derive(Clone, Copy)] struct DomainId(u64);
+impl DomainId { fn raw(self) -> u64 { self.0 } }
+#[derive(Clone, Copy)] struct HostedDomainIdentity { domain_id: DomainId, cookie: u64 }
 #[derive(Clone, Copy)] struct HostedDeviceBinding { device_id: u64, driver_id: u64, instance: usize }
 fn hosted_state_address_resources(state: &HostedDeviceResourceState) -> &[SharedAddressResource] {
     core::slice::from_ref(&state.resource)
 }
 mod nt_status {
-    #[derive(Debug)] pub enum NtStatus { INVALID_DEVICE_REQUEST, OBJECT_NAME_NOT_FOUND, DEVICE_BUSY }
+    #[derive(Debug)] pub enum NtStatus {
+        INVALID_DEVICE_REQUEST, OBJECT_NAME_NOT_FOUND, DEVICE_NOT_CONNECTED,
+        DEVICE_BUSY, INSUFFICIENT_RESOURCES,
+    }
 }
 static mut C_NODES: [[u64; 32]; 5] = [[0; 32]; 5];
 static mut WORKER_A: u64 = 0;
@@ -111,7 +130,13 @@ fn cnode_copy_at_r(cnode: u64, slot: u64, cap: u64) -> u64 {
 }
 unsafe fn hosted_device_resource_state_by_device_id(device_id: u64) -> Option<HostedDeviceResourceState> {
     let resource = match device_id { 1 => RESOURCE_A?, 2 => RESOURCE_B?, _ => return None };
-    Some(HostedDeviceResourceState {device_id, driver_id:7, instance:0, resource})
+    Some(HostedDeviceResourceState {device_id, driver_id:7, instance:0, resource,
+        projection_domain: HostedDomainIdentity {domain_id:DomainId(1),cookie:1},pdo_object:device_id})
+}
+unsafe fn hosted_port_projection_owner(cnode:u64)->Option<hosted_port_projection::PhysicalOwner> {
+    (cnode > 0 && cnode < 5).then_some(hosted_port_projection::PhysicalOwner::Primary {
+        instance:cnode as usize,domain_id:1,cookie:1,tcb:cnode,
+    })
 }
 fn instance_by_driver_id(driver_id: u64) -> Option<(usize, DriverInstance)> {
     (driver_id == 7).then_some((0, DriverInstance {cnode:1}))
