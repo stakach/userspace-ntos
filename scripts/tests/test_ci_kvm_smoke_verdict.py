@@ -7,7 +7,7 @@ from scripts.ci_kvm_verdict import InteractionOutcome, boot_verdict
 SEALED = (b"[quiesce] Explorer runtime paint milestones complete; "
           b"boot-progress epoch sealed\r\n")
 BOOT = b"boot: reading Simpleboot memory map\r\n[pm-dynamic] allocated hosted process\r\n"
-COMPLETE = InteractionOutcome(requested=True, completed=5, total=5, errors=0)
+COMPLETE = InteractionOutcome(requested=True, armed=True, completed=5, total=5, errors=0)
 
 
 class DesktopGateTests(unittest.TestCase):
@@ -22,12 +22,19 @@ class DesktopGateTests(unittest.TestCase):
         self.assertFalse(verdict.passed)
         self.assertIn("Explorer desktop never sealed", verdict.reasons)
 
+    def test_seal_is_retained_when_the_bound_expires_before_idle_arms_interaction(self):
+        verdict = boot_verdict(BOOT + SEALED, InteractionOutcome(requested=True, total=5))
+        self.assertTrue(verdict.sealed)
+        self.assertFalse(verdict.passed)
+        self.assertEqual(verdict.reasons, ["scripted interaction never armed"])
+        self.assertFalse(verdict.to_json()["interaction"]["armed"])
+
     def test_the_interaction_must_run_every_step_without_an_input_error(self):
         for outcome in (
             InteractionOutcome(requested=False),
-            InteractionOutcome(requested=True, completed=4, total=5),
-            InteractionOutcome(requested=True, completed=5, total=5, errors=1),
-            InteractionOutcome(requested=True, completed=0, total=0),
+            InteractionOutcome(requested=True, armed=True, completed=4, total=5),
+            InteractionOutcome(requested=True, armed=True, completed=5, total=5, errors=1),
+            InteractionOutcome(requested=True, armed=True, completed=0, total=0),
         ):
             with self.subTest(outcome=outcome):
                 verdict = boot_verdict(BOOT + SEALED, outcome)

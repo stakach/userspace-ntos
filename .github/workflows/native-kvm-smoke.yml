@@ -6,7 +6,7 @@ on:
       boot_seconds:
         description: Bounded guest runtime in seconds
         type: choice
-        default: '300'
+        default: '1200'
         options: ['90', '180', '300', '600', '1200', '1800', '3600']
       boot_runs:
         description: Sequential bounded boots on the same generated disk
@@ -51,6 +51,8 @@ jobs:
     name: Build and boot pinned LiberNT image on KVM
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    env:
+      BOOT_SECONDS: ${{ inputs.boot_seconds }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -255,7 +257,7 @@ jobs:
           if [ -n "$INTERACT" ]; then interact_args=(--interact); fi
           boot_status=0
           rm -f native-kvm-qemu-stopped
-          python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '300' }}" --trace-interrupts "${interact_args[@]}" || boot_status=$?
+          python3 scripts/ci_kvm_smoke.py --seconds "$BOOT_SECONDS" --trace-interrupts "${interact_args[@]}" || boot_status=$?
           if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
           sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot1.sha256
           if [ "${{ inputs.boot_runs || '1' }}" = '2' ]; then
@@ -281,7 +283,7 @@ jobs:
             # The probe has stopped and reaped QEMU; no image rebuild occurs between boots.
             boot_status=0
             rm -f native-kvm-qemu-stopped
-            python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '300' }}" --trace-interrupts "${interact_args[@]}" || boot_status=$?
+            python3 scripts/ci_kvm_smoke.py --seconds "$BOOT_SECONDS" --trace-interrupts "${interact_args[@]}" || boot_status=$?
             if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
             sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot2.sha256
             if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi
@@ -291,7 +293,7 @@ jobs:
           fi
       # A disk is published from a boot that passed the desktop gate, or from a failed boot the
       # runner marked as worth continuing: it went idle after setup completed and a user logged
-      # on, or it ran its whole bound without a fault before any desktop. The manifest records
+      # on, or it ran its whole bound without a fault. The manifest records
       # which kind of stop produced the disk and later runs check it against this conclusion.
       - name: Prepare full stopped writable disk for an exact later run
         id: publish-disk
@@ -303,7 +305,7 @@ jobs:
         run: |
           python3 scripts/ci_kvm_disk_continuation.py publish \
             --boot-runs "${{ inputs.boot_runs || '1' }}" \
-            --boot-seconds "${{ inputs.boot_seconds || '300' }}" \
+            --boot-seconds "$BOOT_SECONDS" \
             --stop "${{ steps.boot.outcome == 'success' && 'desktop' || (hashFiles('native-kvm-post-setup-idle.txt') != '' && 'post-setup-idle' || 'bound-reached') }}"
       - name: Upload full writable disk continuation
         if: always() && steps.publish-disk.outcome == 'success'

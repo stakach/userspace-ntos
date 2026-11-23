@@ -31,20 +31,23 @@ FAULT_RECORDS = (
 
 @dataclass(frozen=True)
 class InteractionOutcome:
-    """What the scripted interaction did; `requested` is false when it never ran."""
+    """Distinguish an omitted script, a script awaiting its trigger and an attempted script."""
 
     requested: bool
+    armed: bool = False
     completed: int = 0
     total: int = 0
     errors: int = 0
 
     def passed(self):
-        return self.requested and self.total > 0 and self.completed == self.total \
+        return self.requested and self.armed and self.total > 0 and self.completed == self.total \
             and self.errors == 0
 
     def describe(self):
         if not self.requested:
             return "scripted interaction was not requested"
+        if not self.armed:
+            return "scripted interaction never armed"
         return (f"scripted interaction {self.completed}/{self.total} steps, "
                 f"{self.errors} input/capture errors")
 

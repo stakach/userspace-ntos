@@ -1176,9 +1176,6 @@ def main():
                     INTERRUPT_TRACE_TAIL.write_bytes(trace.read())
                 INTERRUPT_TRACE.unlink()
 
-    if interaction is not None:
-        print(f"Interaction outcome: {interaction.summary()}"
-              + ("" if interaction.armed else " (desktop seal never observed)"), flush=True)
     serial = LOG.read_bytes()
     panic_site = panic_site or panic_detector.poll()
     if quiesce_fence is not None and terminal_reason is None:
@@ -1202,10 +1199,14 @@ def main():
             and not runner_failures):
         BOUND_REACHED_MARKER.write_text(f"ran the whole {args.seconds}s bound\n")
     outcome = (InteractionOutcome(requested=False) if interaction is None else
-               InteractionOutcome(requested=True, completed=interaction.index,
+               InteractionOutcome(requested=True, armed=interaction.armed,
+                                  completed=interaction.index,
                                   total=len(interaction_script.steps),
                                   errors=interaction.failures))
     verdict = boot_verdict(serial, outcome, runner_failures)
+    if interaction is not None:
+        seal = "Explorer desktop sealed" if verdict.sealed else "Explorer desktop never sealed"
+        print(f"Interaction outcome: {seal}; {outcome.describe()}", flush=True)
     VERDICT.write_text(json.dumps({**verdict.to_json(), "stationary": stationary_reason,
                                    "panic_site": panic_site}, indent=2) + "\n")
     if not verdict.passed:
