@@ -142,8 +142,12 @@ def parse_script(document):
         actions = raw.get("actions")
         if not isinstance(actions, list):
             raise ValueError(f"{field}.actions must be a list")
-        steps.append(Step(name, tuple(_action(action, screen, f"{field}.actions[{number}]")
-                                      for number, action in enumerate(actions, 1)),
+        parsed_actions = tuple(_action(action, screen, f"{field}.actions[{number}]")
+                               for number, action in enumerate(actions, 1))
+        if name == "command-prompt-selected" and (len(parsed_actions) != 1
+                                                    or parsed_actions[0][0] != VERIFIED_POINTER_ACTION):
+            raise ValueError(f"{field}.actions must contain one verified_click")
+        steps.append(Step(name, parsed_actions,
                           _seconds(raw.get("wait_seconds"), f"{field}.wait_seconds")))
     return Script(screen, settle, tuple(steps), arm)
 

@@ -69,6 +69,15 @@ class ParseScriptTests(unittest.TestCase):
         self.assertEqual(script.settle_seconds, 20.0)
         self.assertEqual(script.arm, "seal")
 
+    def test_named_selection_gate_requires_one_verified_click(self):
+        for actions in ([], [{"click": [37, 470]}],
+                        [{"verified_click": [37, 470]}, {"key": ["ret"]}]):
+            with self.subTest(actions=actions), self.assertRaisesRegex(
+                    ValueError, "one verified_click"):
+                parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                              "steps": [{"name": "command-prompt-selected",
+                                         "actions": actions, "wait_seconds": 0}]})
+
     def test_arm_mode_selects_seal_or_sealed_idle(self):
         self.assertEqual(parse_script({**DOCUMENT, "arm": "idle"}).arm, "idle")
         self.assertEqual(load_script(DEFAULT_SCRIPT).arm, "seal")
@@ -337,6 +346,41 @@ class InteractionRunnerTests(unittest.TestCase):
         self.assertEqual(runner.failures, 1)
         self.assertEqual(len(self.performed), 2)  # aim and held click, never Enter
         self.assertEqual(runner.checkpoints["command-prompt-selected"], proof)
+
+    def test_selected_icon_sends_enter_before_ready_prompt_checkpoint(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "baseline", "actions": [], "wait_seconds": 0},
+                                   {"name": "command-prompt-selected", "actions": [
+                                       {"verified_click": [37, 470]}], "wait_seconds": 0},
+                                   {"name": "command-prompt", "actions": [
+                                       {"key": ["ret"]}], "wait_seconds": 0}]})
+        selected = VisualProof(True, image_name="selected.ppm", image_sha256="selected-sha")
+        ready = VisualProof(True, image_name="prompt.ppm", image_sha256="prompt-sha")
+        runner = InteractionRunner(
+            script, self.performed.append, self.captured.append, self.log, self.clock,
+            checks={"command-prompt-selected": lambda _name: selected,
+                    "command-prompt": lambda _name: ready},
+            cursor_probe=lambda _before, after, _target:
+                CursorProof((37, 470), after, "aim-sha"))
+        runner.arm(0)
+        runner.advance(0)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 0)
+        self.assertEqual(keys(self.performed[2]), [("ret", True), ("ret", False)])
+        entries = [json.loads(line) for line in self.log.read_text().splitlines()]
+        selected_index = next(i for i, entry in enumerate(entries)
+                              if entry["event"] == "checkpoint"
+                              and entry["name"] == "command-prompt-selected")
+        enter_index = next(i for i, entry in enumerate(entries)
+                           if entry["event"] == "action"
+                           and entry["name"] == "command-prompt")
+        ready_index = next(i for i, entry in enumerate(entries)
+                           if entry["event"] == "checkpoint"
+                           and entry["name"] == "command-prompt")
+        self.assertLess(selected_index, enter_index)
+        self.assertLess(enter_index, ready_index)
+        self.assertEqual(list(runner.checkpoints), ["command-prompt-selected", "command-prompt"])
 
     def test_seal_detector_finds_the_desktop_record(self):
         path = Path(self.directory.name) / "serial.log"
