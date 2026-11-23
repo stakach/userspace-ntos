@@ -176,6 +176,7 @@ unsafe fn finish_hosted_relation_local_publication(
             Ok(completion) => completion,
             Err(_) => return false,
         };
+        trace_relation_claim(b"terminal", owner.claim, Some(nt_status::NtStatus::SUCCESS));
         owner.invalidation_completion = Some(completion);
         remove_hosted_device_relation_owner(owner.claim);
     }

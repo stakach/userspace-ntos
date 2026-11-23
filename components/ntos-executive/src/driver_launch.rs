@@ -48384,6 +48384,7 @@ unsafe fn complete_hosted_relation_probe_without_publication(
         .map_err(|_| {
             HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
         })?;
+    trace_relation_claim(b"terminal", claim, Some(nt_status::NtStatus::SUCCESS));
     remove_hosted_device_relation_owner(claim);
     let route_reconciliation_ready =
         crate::hosted_pci_topology::note_hosted_pci_relation_completion(
@@ -50082,6 +50083,7 @@ unsafe fn retire_hosted_device_relation_barrier() -> usize {
     let invalidation_completion = hosted_device_relation_invalidations_mut()
         .complete_terminal(claim, status)
         .expect("failed relation query lost its exact invalidation claim");
+    trace_relation_claim(b"terminal", claim, Some(status));
     remove_hosted_device_relation_owner(claim);
     crate::hosted_pci_topology::note_hosted_pci_relation_failure(
         relation_owner,
@@ -50142,6 +50144,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         return 0;
     };
     note_relation_gate(7, 0, queued, selected_pdo);
+    trace_relation_claim(b"claim", claim, None);
     let relation_owner = hosted_device_relation_owner(claim)
         .expect("claimed relation action lost its exact owner");
     let pdo_device_id = nt_io_manager::DeviceId(claim.pdo_device_id);
@@ -51301,7 +51304,8 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                     index += 1;
                     continue;
                 }
-                if finish_hosted_pnp_publication(irp_id).is_err() {
+                if let Err(status) = finish_hosted_pnp_publication(irp_id) {
+                    trace_pnp_publication_repair(b"enter", irp_id, status);
                     transition_hosted_pnp_transaction_phase(
                         irp_id,
                         HostedPnpTransactionPhase::PostPublicationRepair,
@@ -51327,7 +51331,8 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                 index += 1;
             }
             HostedPnpTransactionPhase::PostPublicationRepair => {
-                if finish_hosted_pnp_publication(irp_id).is_ok() {
+                let publication = finish_hosted_pnp_publication(irp_id);
+                if publication.is_ok() {
                     if let Err(status) = mark_pending_start_publication_committed(irp_id) {
                         set_hosted_pnp_indeterminate(irp_id, status)
                             .expect("hosted PnP repaired proof failure lost its transaction");
@@ -51343,6 +51348,9 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                     progress = progress.saturating_add(1);
                     index += 1;
                 } else {
+                    if let Err(status) = publication {
+                        trace_pnp_publication_repair(b"retry", irp_id, status);
+                    }
                     index += 1;
                 }
             }
@@ -56725,6 +56733,65 @@ fn end_relation_observation(sequence: &AtomicU64) {
     sequence.fetch_add(1, Ordering::Release);
 }
 
+fn trace_relation_claim(
+    phase: &[u8], claim: nt_pnp_manager::DeviceRelationInvalidation,
+    status: Option<nt_status::NtStatus>,
+) {
+    static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+    if TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 128 { return; }
+    print_str(b"[hosted-relation-owner] phase="); print_str(phase);
+    print_str(b" sequence/parent/pdo/type=");
+    for value in [claim.sequence, claim.parent.pdo_object_id(),
+        claim.pdo_device_id, claim.relation_type as u64] {
+        print_str(b"/"); print_hex_u64(value);
+    }
+    if let Some(status) = status {
+        print_str(b" status=0x"); print_hex(status.raw() as u32);
+    }
+    print_str(b"\n");
+}
+
+unsafe fn trace_pnp_publication_repair(
+    phase: &[u8], irp_id: IrpId, status: nt_status::NtStatus,
+) {
+    static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+    let Some(transaction) = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+        .as_ref().and_then(|rows| rows.iter().find(|row| row.irp_id == irp_id))
+    else { return; };
+    if transaction.minor != nt_pnp_manager::PnpMinor::StartDevice { return; }
+    if TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    let binding = transaction.binding;
+    let next: &[u8] = if !transaction.mmio_usage_published { b"mmio" }
+        else if !transaction.interrupt_usage_published { b"interrupt" }
+        else if !transaction.dma_usage_published { b"dma" }
+        else if !transaction.resource_snapshot_published { b"resource" }
+        else if !transaction.power_state_published { b"power" }
+        else { b"proof" };
+    // The interrupt step already read this shared field before returning failure.
+    let interrupt_object = if next == b"interrupt" {
+        instance_by_driver_id(binding.driver_id)
+            .filter(|(_, instance)| instance.exec_shared_va != 0)
+            .map(|(_, instance)| read_volatile(
+                (instance.exec_shared_va + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64,
+            )).unwrap_or(0)
+    } else { 0 };
+    print_str(b"[hosted-pnp-publication-repair] phase="); print_str(phase);
+    print_str(b" irp/driver/device/pdo/device-object/pdo-object/interrupt-object=");
+    for value in [irp_id.raw(), binding.driver_id, binding.device_id,
+        binding.pdo_device_id, binding.device_object, binding.pdo_object, interrupt_object] {
+        print_str(b"/"); print_hex_u64(value);
+    }
+    print_str(b" next="); print_str(next);
+    print_str(b" status=0x"); print_hex(status.raw() as u32);
+    print_str(b" published(mmio/irq/dma/resource/power)=");
+    for flag in [transaction.mmio_usage_published, transaction.interrupt_usage_published,
+        transaction.dma_usage_published, transaction.resource_snapshot_published,
+        transaction.power_state_published] {
+        print_str(b"/"); print_u64(flag as u64);
+    }
+    print_str(b"\n");
+}
+
 fn note_relation_gate(reason: u64, active_mask: u64, queued: usize, selected_pdo: u64) {
     if queued == 0 && selected_pdo == 0 && active_mask == 0 && reason != 3 { return; }
     if !begin_relation_observation(&RELATION_GATE_SEQUENCE) { return; }
@@ -56993,7 +57060,7 @@ unsafe fn enqueue_hosted_device_relations(
 unsafe fn enqueue_hosted_sync_device_relations(
     relation_owner: nt_pnp::AcpiPciProviderEndpoint,
     parent: nt_pnp_manager::DevnodeIdentity,
-) -> Result<nt_pnp_manager::SyncDeviceRelationTicket, nt_status::NtStatus> {
+) -> Result<(nt_pnp_manager::SyncDeviceRelationTicket, u64), nt_status::NtStatus> {
     if parent.pdo_object_id() != relation_owner.device_id
         || !hosted_pnp_manager_mut().devnode_identity_is_started(parent)
         || hosted_pnp_manager_mut().devnode_identity_for_pdo(relation_owner.device_id)
@@ -57042,7 +57109,7 @@ unsafe fn enqueue_hosted_sync_device_relations(
             return Err(status);
         }
     }
-    Ok(ticket)
+    Ok((ticket, invalidation.sequence))
 }
 
 unsafe fn hosted_relation_owner_for_device(
