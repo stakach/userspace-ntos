@@ -64629,9 +64629,15 @@ pub(crate) unsafe fn print_i8042_input_census() {
 }
 
 pub(crate) unsafe fn hosted_io_port_fault_grant(
+    channel: &crate::spawn_hosts::PumpChannel,
+    active_reply_cap: u64,
     shared_va: u64,
     port: u16,
 ) -> Option<HostedIoPortFaultGrant> {
+    // The bank identifies the faulting device; only the retained physical route and Reply
+    // identify the CNode that can receive its port cap. An IRQ lane can have a private bank
+    // while its channel's ordinary shared slot still names the primary instance.
+    let cnode = physical_cnode_for_pump_channel(channel, active_reply_cap)?;
     // A dispatch worker's bank holds its own device projection (#427).
     let (instance, inst) = instance_by_shared_va(shared_va)
         .or_else(|| hosted_irq_instance_by_shared_va(shared_va))
@@ -64661,8 +64667,8 @@ pub(crate) unsafe fn hosted_io_port_fault_grant(
     // NT drivers share one address space across their own FDOs. The i8042 mouse FDO, for
     // example, uses controller ports granted to its keyboard sibling. Each sibling must still
     // have a current exact binding and live resource record in this driver generation.
-    let (state, resource) = port_resource(&current_state)
-        .map(|resource| (current_state, resource))
+    let (state, resource, resource_binding) = port_resource(&current_state)
+        .map(|resource| (current_state, resource, current))
         .or_else(|| {
             states.iter().copied().find_map(|state| {
                 if state.instance != instance
@@ -64680,10 +64686,15 @@ pub(crate) unsafe fn hosted_io_port_fault_grant(
                 {
                     return None;
                 }
-                port_resource(&state).map(|resource| (state, resource))
+                port_resource(&state).map(|resource| (state, resource, owner))
             })
         })?;
-    copy_hosted_io_port_caps_to_instance(inst, state).ok()?;
+    if hosted_io_port_cap_effect_pending(current, cnode)
+        || hosted_io_port_cap_effect_pending(resource_binding, cnode)
+    {
+        return None;
+    }
+    copy_hosted_io_port_caps_to_cnode(cnode, state).ok()?;
     if state.device_id == current.device_id {
         write_hosted_resource_state_projection(shared_va, state, false);
     }

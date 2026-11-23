@@ -83,9 +83,11 @@ struct HostedDeviceBinding {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostedIoPortFaultGrant { cap: u64, base: u64, len: u64 }
+mod spawn_hosts { pub struct PumpChannel { pub cnode: u64, pub reply_cap: u64 } }
 
 static WORKER_BANK: AtomicU64 = AtomicU64::new(0);
 static IRQ_BANK: AtomicU64 = AtomicU64::new(0);
+static PENDING_DEVICE: AtomicU64 = AtomicU64::new(0);
 static mut STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut BINDINGS: Option<Vec<HostedDeviceBinding>> = None;
 static mut CNODES: [[u64; 16]; 4] = [[0; 16]; 4];
@@ -108,19 +110,26 @@ unsafe fn hosted_device_resource_states() -> Option<&'static Vec<HostedDeviceRes
 fn hosted_state_address_resources(state: &HostedDeviceResourceState) -> &[SharedAddressResource] {
     &state.address_resources[..state.address_resource_count]
 }
-fn copy_hosted_io_port_caps_to_instance(inst: DriverInstance, state: HostedDeviceResourceState) -> Result<(), ()> {
+fn physical_cnode_for_pump_channel(channel: &spawn_hosts::PumpChannel, reply_cap: u64) -> Option<u64> {
+    (reply_cap != 0 && channel.reply_cap == reply_cap).then_some(channel.cnode)
+}
+fn copy_hosted_io_port_caps_to_cnode(cnode: u64, state: HostedDeviceResourceState) -> Result<(), ()> {
     for resource in hosted_state_address_resources(&state) {
         if resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT {
-            unsafe { CNODES[inst.cnode as usize][resource.component_cap as usize] = resource.broker_va_or_root_cap; }
+            unsafe { CNODES[cnode as usize][resource.component_cap as usize] = resource.broker_va_or_root_cap; }
         }
     }
     Ok(())
+}
+fn hosted_io_port_cap_effect_pending(binding: HostedDeviceBinding, _: u64) -> bool {
+    PENDING_DEVICE.load(Ordering::Relaxed) == binding.device_id
 }
 fn write_hosted_resource_state_projection(_: u64, _: HostedDeviceResourceState, _: bool) {}
 "#;
 
 const CASES: &str = r#"
 fn setup() {
+    PENDING_DEVICE.store(0, Ordering::Relaxed);
     unsafe {
         CNODES = [[0; 16]; 4];
         STATES = Some(vec![
@@ -151,7 +160,8 @@ fn assert_sibling_grant_on_physical_bank(is_irq: bool, physical_cnode: usize) {
     let shared = (&mut *pdo as *mut u64) as u64;
     WORKER_BANK.store(if is_irq { 0 } else { shared }, Ordering::Relaxed);
     IRQ_BANK.store(if is_irq { shared } else { 0 }, Ordering::Relaxed);
-    let grant = unsafe { hosted_io_port_fault_grant(shared, 0x64) };
+    let channel = spawn_hosts::PumpChannel { cnode: physical_cnode as u64, reply_cap: 9 };
+    let grant = unsafe { hosted_io_port_fault_grant(&channel, 9, shared, 0x64) };
     assert_eq!(grant, Some(HostedIoPortFaultGrant { cap: 77, base: 0x64, len: 1 }));
     let (physical_cap, primary_cap) = unsafe {
         (CNODES[physical_cnode][CT_IO_PORT_BASE], CNODES[1][CT_IO_PORT_BASE])
@@ -166,5 +176,29 @@ fn dispatch_worker_sibling_fault_targets_worker_cnode() {
 #[test]
 fn private_irq_sibling_fault_targets_irq_cnode() {
     assert_sibling_grant_on_physical_bank(true, 3);
+}
+#[test]
+fn pending_sibling_cap_effect_denies_a_worker_fault_grant() {
+    setup();
+    let mut pdo = Box::new(222u64);
+    let shared = (&mut *pdo as *mut u64) as u64;
+    WORKER_BANK.store(shared, Ordering::Relaxed);
+    IRQ_BANK.store(0, Ordering::Relaxed);
+    PENDING_DEVICE.store(1, Ordering::Relaxed);
+    let channel = spawn_hosts::PumpChannel { cnode: 2, reply_cap: 9 };
+    assert_eq!(unsafe { hosted_io_port_fault_grant(&channel, 9, shared, 0x64) }, None,
+        "an uncertain sibling cap effect cannot authorize a fault grant");
+    assert_eq!(unsafe { (CNODES[2][CT_IO_PORT_BASE], CNODES[1][CT_IO_PORT_BASE]) }, (0, 0));
+}
+#[test]
+fn unrecognized_reply_cannot_project_a_sibling_port_cap() {
+    setup();
+    let mut pdo = Box::new(222u64);
+    let shared = (&mut *pdo as *mut u64) as u64;
+    WORKER_BANK.store(shared, Ordering::Relaxed);
+    IRQ_BANK.store(0, Ordering::Relaxed);
+    let channel = spawn_hosts::PumpChannel { cnode: 2, reply_cap: 9 };
+    assert_eq!(unsafe { hosted_io_port_fault_grant(&channel, 10, shared, 0x64) }, None);
+    assert_eq!(unsafe { (CNODES[2][CT_IO_PORT_BASE], CNODES[1][CT_IO_PORT_BASE]) }, (0, 0));
 }
 "#;

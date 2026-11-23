@@ -10,7 +10,8 @@ fn hosted_io_port_fault_grant_retains_same_instance_controller_authority() {
         .expect("native I/O-port GP grant selector");
     let end = source[start..]
         .find("\n}\n")
-        .expect("native grant selector closing brace") + 2;
+        .expect("native grant selector closing brace")
+        + 2;
     let selector = &source[start..start + end];
     syn::parse_str::<syn::ItemFn>(selector).expect("native grant selector is a complete function");
     let range_start = source
@@ -82,6 +83,7 @@ struct HostedDeviceResourceState {
 
 #[derive(Clone, Copy)]
 struct DriverInstance { driver_id: u64 }
+mod spawn_hosts { pub struct PumpChannel { pub cnode: u64, pub reply_cap: u64 } }
 
 #[derive(Clone, Copy)]
 struct HostedDeviceBinding {
@@ -142,7 +144,11 @@ fn hosted_state_address_resources(state: &HostedDeviceResourceState) -> &[Shared
     &state.address_resources[..state.address_resource_count]
 }
 
-fn copy_hosted_io_port_caps_to_instance(_: DriverInstance, _: HostedDeviceResourceState) -> Result<(), ()> {
+fn physical_cnode_for_pump_channel(channel: &spawn_hosts::PumpChannel, reply_cap: u64) -> Option<u64> {
+    (reply_cap != 0 && channel.reply_cap == reply_cap).then_some(channel.cnode)
+}
+fn hosted_io_port_cap_effect_pending(_: HostedDeviceBinding, _: u64) -> bool { false }
+fn copy_hosted_io_port_caps_to_cnode(_: u64, _: HostedDeviceResourceState) -> Result<(), ()> {
     Ok(())
 }
 
@@ -181,30 +187,31 @@ fn same_instance_sibling_port_is_available_without_projecting_sibling_resources(
             HostedDeviceBinding { device_id: 2, driver_id: 42, instance: 7, projection_domain: 99, pdo_object: 222, used: true },
         ]);
     }
-    let grant = unsafe { hosted_io_port_fault_grant(shared_va, 0x64) };
+    let channel = spawn_hosts::PumpChannel { cnode: 2, reply_cap: 9 };
+    let grant = unsafe { hosted_io_port_fault_grant(&channel, 9, shared_va, 0x64) };
     assert_eq!(grant, Some(HostedIoPortFaultGrant { cap: 77, base: 0x64, len: 1 }));
     assert_ne!(PROJECTED_PDO.load(Ordering::Relaxed), 111,
         "the mouse PDO must not publish keyboard resource identity");
     PRIVATE_BANK.store(shared_va, Ordering::Relaxed);
-    assert_eq!(unsafe { hosted_io_port_fault_grant(shared_va, 0x64) }, grant,
+    assert_eq!(unsafe { hosted_io_port_fault_grant(&channel, 9, shared_va, 0x64) }, grant,
         "the IRQ private bank must resolve the same live device grant");
     PRIVATE_BANK.store(0, Ordering::Relaxed);
     // #427: a dispatch worker's bank holds its own projection of the same device.
     WORKER_BANK.store(shared_va, Ordering::Relaxed);
-    assert_eq!(unsafe { hosted_io_port_fault_grant(shared_va, 0x64) }, grant,
+    assert_eq!(unsafe { hosted_io_port_fault_grant(&channel, 9, shared_va, 0x64) }, grant,
         "a dispatch worker's bank must resolve its device's port grant");
     WORKER_BANK.store(0, Ordering::Relaxed);
 
     // Neither another driver instance nor a retired cap can authorize this mouse dispatch.
     ACTIVE_INSTANCE.store(8, Ordering::Relaxed);
-    assert_eq!(unsafe { hosted_io_port_fault_grant(shared_va, 0x64) }, None);
+    assert_eq!(unsafe { hosted_io_port_fault_grant(&channel, 9, shared_va, 0x64) }, None);
     ACTIVE_INSTANCE.store(7, Ordering::Relaxed);
     unsafe { STATES.as_mut().unwrap()[0].address_resources[0].broker_va_or_root_cap = 0; }
-    assert_eq!(unsafe { hosted_io_port_fault_grant(shared_va, 0x64) }, None);
+    assert_eq!(unsafe { hosted_io_port_fault_grant(&channel, 9, shared_va, 0x64) }, None);
     unsafe {
         STATES.as_mut().unwrap()[0].address_resources[0].broker_va_or_root_cap = 77;
         BINDINGS.as_mut().unwrap()[0].used = false;
     }
-    assert_eq!(unsafe { hosted_io_port_fault_grant(shared_va, 0x64) }, None);
+    assert_eq!(unsafe { hosted_io_port_fault_grant(&channel, 9, shared_va, 0x64) }, None);
 }
 "#;
