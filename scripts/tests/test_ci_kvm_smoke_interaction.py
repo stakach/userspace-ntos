@@ -297,6 +297,23 @@ class InteractionRunnerTests(unittest.TestCase):
         self.assertEqual(runner.failures, 1)
         self.assertEqual(len(self.performed), 1)  # aim only; no button packet
 
+    def test_bounded_correction_never_clicks_when_cursor_stays_off_target(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "baseline", "actions": [], "wait_seconds": 0},
+                                   {"name": "command-prompt", "actions": [
+                                       {"verified_double_click": [37, 470]}],
+                                    "wait_seconds": 0}]})
+        runner = InteractionRunner(
+            script, self.performed.append, self.captured.append, self.log, self.clock,
+            cursor_probe=lambda _before, after, _target: CursorProof((37, 446), after, "sha"))
+        runner.arm(0)
+        runner.advance(0)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(len(runner.cursor_receipts), 3)
+        self.assertEqual(len(self.performed), 3)  # initial aim and two corrections, no click
+
     def test_seal_detector_finds_the_desktop_record(self):
         path = Path(self.directory.name) / "serial.log"
         path.write_bytes(b"[quiesce] Explorer runtime paint milestones complete; boot-progress "

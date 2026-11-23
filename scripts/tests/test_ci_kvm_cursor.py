@@ -1,4 +1,12 @@
-"""Recorded KVM pointer drift from mainline run 45184256752."""
+"""Recorded KVM pointer drift from mainline run 45184256752.
+
+Fixtures are x=32..43, y=430..509 crops of the original step-4/step-5 PPMs.
+Original boot-1 hashes: c38c1a6fc1226a65d4a8faeef2b33aeb8ca7f3b463cedcf1db2012ac4167873f
+and ba1e252025781f2aecdb67d2330541b5a4192958bd05ece806d342b3e0a22a98.
+Original boot-2 hashes: 4fc5e271ea947425b90789330b00e3ccbe62132834e04ac2acabf95dda0067ee
+and b77ffca21cbb03e0eb00bdb9d05116a60e5e3a6b5fd2a0b980aaa4871ee34489.
+The uncut PPMs stay with the KVM run evidence.
+"""
 
 import sys
 from pathlib import Path

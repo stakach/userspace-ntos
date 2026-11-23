@@ -301,6 +301,7 @@ class InteractionRunner:
                 self._record({"event": "screenshot", "step": self.index + 1,
                               "name": step.name, "file": name})
             except (OSError, RuntimeError, ValueError, KeyError) as error:
+                self.last_capture = None
                 self._fail(step, "screenshot", error)
             if step.name in self.checks:
                 if not captured:
