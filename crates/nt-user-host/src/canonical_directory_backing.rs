@@ -22,7 +22,7 @@ pub enum Publication { Ready, Pending }
 /// Tracks which canonical publish operation the native owner may redrive. A pending backend
 /// effect must be polled; a fresh admission has not started a backend effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CanonicalPublishPhase { Fresh, PendingEffect }
+enum CanonicalPublishPhase { Fresh, BusyNoEffect, PendingEffect }
 
 pub struct CanonicalPublishAdmission { phase: CanonicalPublishPhase }
 
@@ -33,14 +33,19 @@ impl CanonicalPublishAdmission {
         matches!(self.phase, CanonicalPublishPhase::PendingEffect)
     }
 
-    /// A definitely refused admission has not started a backend effect.
-    pub const fn retry_without_effect(&self) -> bool { false }
+    /// The channel refused admission before any backend effect began. A later owner turn may
+    /// retry only after revalidating the caller; cancellation may abort the reserved row.
+    pub const fn retry_without_effect(&self) -> bool {
+        matches!(self.phase, CanonicalPublishPhase::BusyNoEffect)
+    }
 
     pub fn abort_before_effect<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P>(
         &mut self, backings: &mut CanonicalDirectoryBackings<O, L, H, P>, owner: O,
     ) -> Result<(), BackingError> {
         if self.pending_effect() { return Err(BackingError::InvalidPhase); }
-        backings.abort_before_effect(owner)
+        let result = backings.abort_before_effect(owner);
+        if result.is_ok() { self.phase = CanonicalPublishPhase::Fresh; }
+        result
     }
 
     pub fn publish<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P>(
@@ -49,10 +54,20 @@ impl CanonicalPublishAdmission {
     ) -> Result<Publication, BackingError> {
         if self.pending_effect() { return Err(BackingError::InvalidPhase); }
         let result = backings.publish(owner, port);
-        self.phase = if matches!(result, Ok(Publication::Pending)) {
-            CanonicalPublishPhase::PendingEffect
-        } else { CanonicalPublishPhase::Fresh };
-        result
+        match result {
+            Err(BackingError::NoEffect(nt_process::STATUS_DEVICE_BUSY)) => {
+                self.phase = CanonicalPublishPhase::BusyNoEffect;
+                Ok(Publication::Pending)
+            }
+            Ok(Publication::Pending) => {
+                self.phase = CanonicalPublishPhase::PendingEffect;
+                Ok(Publication::Pending)
+            }
+            other => {
+                self.phase = CanonicalPublishPhase::Fresh;
+                other
+            }
+        }
     }
 
     pub fn poll<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P>(
