@@ -72,10 +72,16 @@ const FSD_ARG_BYTES: u64 = 128;
 const ARG_CHUNK_LENGTH: u64 = 0;
 const ARG_CHUNK_BYTES: u64 = 8;
 const OP_REGINFO_CHUNK: u64 = 5;
+const STATUS_INVALID_HANDLE: i32 = -2;
 static PRIMARY_ARG: AtomicU64 = AtomicU64::new(0);
 static WORKER_ARG: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_WORKER: AtomicBool = AtomicBool::new(false);
+static ACTIVE_UNKNOWN_WORKER: AtomicBool = AtomicBool::new(false);
 fn primary_arg() -> u64 { PRIMARY_ARG.load(Ordering::Relaxed) }
+fn current_hosted_worker_scratch_va() -> Option<u64> {
+    (ACTIVE_WORKER.load(Ordering::Relaxed) || ACTIVE_UNKNOWN_WORKER.load(Ordering::Relaxed))
+        .then_some(0x3000)
+}
 mod hosted_provider_export_lane {
     pub fn current_component_arg() -> Option<u64> { None }
 }
@@ -99,6 +105,8 @@ fn setup() -> (Box<[u8;128]>, Box<[u8;128]>) {
     let mut worker = Box::new([0x22;128]);
     PRIMARY_ARG.store(primary.as_mut_ptr() as u64, Ordering::Relaxed);
     WORKER_ARG.store(worker.as_mut_ptr() as u64, Ordering::Relaxed);
+    ACTIVE_WORKER.store(false, Ordering::Relaxed);
+    ACTIVE_UNKNOWN_WORKER.store(false, Ordering::Relaxed);
     (primary, worker)
 }
 #[test]
@@ -115,6 +123,14 @@ fn primary_chunk_still_publishes_to_primary_arg() {
     ACTIVE_WORKER.store(false, Ordering::Relaxed);
     assert_eq!(stream_reginfo_bytes(0x1234, 55, &[0xa5;4]), Ok(()));
     assert_eq!(&primary[8..12], &[0xa5;4]);
+    assert_eq!(&worker[..], &[0x22;128]);
+}
+#[test]
+fn unknown_worker_is_refused_before_it_overwrites_primary() {
+    let (primary, worker) = setup();
+    ACTIVE_UNKNOWN_WORKER.store(true, Ordering::Relaxed);
+    assert_eq!(stream_reginfo_bytes(0x1234, 55, &[0xa5;4]), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(&primary[..], &[0x11;128]);
     assert_eq!(&worker[..], &[0x22;128]);
 }
 "#;
