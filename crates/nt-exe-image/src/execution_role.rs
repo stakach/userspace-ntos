@@ -204,6 +204,19 @@ impl<const N: usize> ExecutionRoleLedger<N> {
         self.entry(target, process).map(|entry| entry.role)
     }
 
+    /// Select a role only when one committed target still owns a live process.
+    pub fn unique_live_target(
+        &self,
+        role: HostedProcessRole,
+        mut is_live: impl FnMut(SpawnTarget, ProcessIdentity) -> bool,
+    ) -> Option<(SpawnTarget, ProcessIdentity)> {
+        let mut matches = self.entries.iter().flatten().filter(|entry| {
+            entry.pending.is_none() && entry.role == role && is_live(entry.target, entry.process)
+        });
+        let entry = matches.next()?;
+        matches.next().is_none().then_some((entry.target, entry.process))
+    }
+
     pub fn creator_of(&self, target: SpawnTarget, process: ProcessIdentity) -> Option<ProcessIdentity> {
         self.entry(target, process).and_then(|entry| entry.creator)
     }

@@ -1,5 +1,5 @@
 //! Finite, read-only main-thread evidence for post-font service readiness.
-//! Each role is selected through published metadata and revalidated after a TCB read.
+//! Each sample requires a unique committed execution role and a live main-thread binding.
 
 use crate::*;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,16 +42,17 @@ unsafe fn sample_role(
     index: usize, role: nt_exe_image::HostedProcessRole, label: &[u8], now: u64,
 ) {
     let Ok(handler_ptr) = service_sec_image::registry_live_handler_pointer() else { return; };
-    let (pi, binding, lifetime, object_wait, event_state) = {
+    let ((target, process), binding, lifetime, object_wait, event_state) = {
         let handler = &*handler_ptr;
-        let Some(pi) = service_sec_image::live_hosted_pi_for_observation_role(handler, role)
+        let Some((target, process)) = handler.unique_live_execution_target(role)
             else { return; };
-        let Some((binding, lifetime)) = handler.hosted_main_thread_sample_owner(pi)
+        let Some((binding, lifetime)) = handler.hosted_main_thread_sample_owner(target.pi)
             else { return; };
-        let object_wait = handler.capture_process_identity(pi).and_then(|process|
-            object_wait::object_waiter_oldest_unselected_for_thread(
-                pi, process, binding.tid, now));
-        (pi, binding, lifetime, object_wait, handler.lsa_rpc_server_active_state())
+        if binding.process != process { return; }
+        let object_wait = object_wait::object_waiter_oldest_unselected_for_thread(
+            target.pi, process, binding.tid, now,
+        );
+        ((target, process), binding, lifetime, object_wait, handler.lsa_rpc_server_active_state())
     };
     let ordinal = {
         let roster = &mut *core::ptr::addr_of_mut!(ROSTER);
@@ -68,8 +69,8 @@ unsafe fn sample_role(
     let mut regs = [0u64; 20];
     let valid = win32k_glue::tcb_read_regs20_checked(binding.tcb, &mut regs);
     let handler = &*handler_ptr;
-    if handler.hosted_main_thread_sample_owner(pi) != Some((binding, lifetime))
-        || service_sec_image::live_hosted_pi_for_observation_role(handler, role) != Some(pi)
+    if handler.unique_live_execution_target(role) != Some((target, process))
+        || handler.hosted_main_thread_sample_owner(target.pi) != Some((binding, lifetime))
     { return; }
 
     let process_generation = match binding.process.generation {
@@ -79,7 +80,7 @@ unsafe fn sample_role(
     print_str(b"[startup-readiness-sample] role="); print_str(label);
     print_str(b" n/t-ms/pi/pid/pgen/tid/tgen/tcb/wait-seq/object/age-ms/event-present/event-signaled/event-ever-set/srm-connected/regs-valid=");
     for (position, value) in [
-        ordinal, now / 10_000, pi as u64, u64::from(binding.process.pid),
+        ordinal, now / 10_000, target.pi as u64, u64::from(binding.process.pid),
         process_generation, binding.tid, lifetime.generation(), binding.tcb,
         object_wait.map_or(0, |(sequence, _, _)| sequence),
         object_wait.map_or(0, |(_, object, _)| object),

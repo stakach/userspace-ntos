@@ -9746,6 +9746,32 @@ impl ExecNtHandler {
         self.hosted_process_image(pi).map(|image| image.role)
     }
 
+    /// Execution-role entries can outlive the running process during retirement.
+    pub(super) fn is_live_execution_process(
+        &self,
+        target: nt_exe_image::SpawnTarget,
+        process: nt_user_host::process_identity::ProcessIdentity,
+    ) -> bool {
+        self.hosted_process_image(target.pi).map(nt_exe_image::SpawnTarget::from_image)
+            == Some(target)
+            && self.capture_process_identity(target.pi) == Some(process)
+            && process.generation == nt_types::ProcessGeneration::Hosted(target.generation)
+            && self.process_mechanisms.get(target.pi).is_some_and(|mechanism| {
+                mechanism.top_badge == target.top_badge
+            })
+            && self.pm.process(process.pid)
+                .is_some_and(|entry| entry.state == nt_process::ProcessState::Running)
+    }
+
+    pub(crate) fn unique_live_execution_target(
+        &self,
+        role: nt_exe_image::HostedProcessRole,
+    ) -> Option<(nt_exe_image::SpawnTarget, nt_user_host::process_identity::ProcessIdentity)> {
+        self.execution_roles.unique_live_target(role, |target, process| {
+            self.is_live_execution_process(target, process)
+        })
+    }
+
     /// Install the bootstrap execution root only after its exact Ps mechanism and main runtime
     /// have been published. The mounted File identity must match the registered image backing.
     pub(crate) fn seed_bootstrap_execution_role(

@@ -12,18 +12,7 @@ impl ExecNtHandler {
         let (parent, service) = self.execution_roles.installer_service_owner(
             target,
             worker,
-            |target, process| {
-                self.hosted_process_image(target.pi).map(nt_exe_image::SpawnTarget::from_image)
-                    == Some(target)
-                    && self.capture_process_identity(target.pi) == Some(process)
-                    && process.generation
-                        == nt_types::ProcessGeneration::Hosted(target.generation)
-                    && self.process_mechanisms.get(target.pi).is_some_and(|mechanism| {
-                        mechanism.top_badge == target.top_badge
-                    })
-                    && self.pm.process(process.pid)
-                        .is_some_and(|entry| entry.state == nt_process::ProcessState::Running)
-            },
+            |target, process| self.is_live_execution_process(target, process),
         )?;
         Some(InstallerOwner { worker, parent, service })
     }

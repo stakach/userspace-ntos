@@ -683,3 +683,51 @@ fn pending_initial_thread_has_no_authority_until_exact_one_shot_commit() {
     assert!(roles.commit_foreign_initial_thread(&catalog, abandoned_token,
         abandoned, abandoned_identity).is_err(), "exact retirement invalidates pending token");
 }
+
+#[test]
+fn role_lookup_requires_one_exact_committed_running_target() {
+    let mut mounts = SectionMountIds::new();
+    let mount = mounts.allocate().unwrap();
+    let mut catalog = OwnedHostedImageCatalog::<16>::new();
+    let smss_file = SectionFileIdentity { mount, file_id: 10 };
+    let smss = registered(
+        &mut catalog, 0, 0, b"smss.exe", HostedProcessRole::NativeSession,
+        HostedProcessRole::NativeSession, smss_file,
+    );
+    let role = HostedProcessRole::InteractiveLogon;
+    let file = SectionFileIdentity { mount, file_id: 11 };
+    let registered_target = registered(
+        &mut catalog, 2, 4, b"winlogon.exe", role, HostedProcessRole::NativeSession, file,
+    );
+    let observation = catalog.capture_image_observation(registered_target).unwrap();
+    let first = child(&mut catalog, b"winlogon.exe", Some(observation));
+    let second = child(&mut catalog, b"winlogon.exe", Some(observation));
+    let smss_process = process(12, smss.generation);
+    let first_process = process(96, first.generation);
+    let second_process = process(104, second.generation);
+    let mut roles = ExecutionRoleLedger::<16>::new();
+    roles.seed_bootstrap_root(&catalog, smss, smss_process, smss_file).unwrap();
+    assert_eq!(roles.unique_live_target(role, |_, _| true), None);
+
+    let first_token = roles.reserve_foreign_initial_thread_role(
+        &catalog, evidence(smss_process, first_process, first, registered_target, file, None),
+    ).unwrap();
+    assert_eq!(roles.unique_live_target(role, |_, _| true), None);
+    roles.commit_foreign_initial_thread(&catalog, first_token, first, first_process).unwrap();
+    let first_live = Some((first, first_process));
+    assert_eq!(roles.unique_live_target(role, |_, _| true), first_live);
+    assert_eq!(roles.unique_live_target(role, |_, _| false), None);
+
+    let second_token = roles.reserve_foreign_initial_thread_role(
+        &catalog, evidence(smss_process, second_process, second, registered_target, file, None),
+    ).unwrap();
+    assert_eq!(roles.unique_live_target(role, |_, _| true), first_live);
+    roles.commit_foreign_initial_thread(&catalog, second_token, second, second_process).unwrap();
+    assert_eq!(roles.unique_live_target(role, |_, _| true), None);
+    assert_eq!(
+        roles.unique_live_target(role, |target, identity| (target, identity) == (first, first_process)),
+        first_live,
+    );
+    roles.retire_exact(first, first_process).unwrap();
+    assert_eq!(roles.unique_live_target(role, |_, _| true), Some((second, second_process)));
+}
