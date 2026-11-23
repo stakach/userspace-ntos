@@ -71285,7 +71285,14 @@ unsafe fn prepare_hosted_dpc_resource_projection(
     shared_va: u64,
     cnode: u64,
 ) -> Result<(), nt_status::NtStatus> {
-    // Always drop the previous ISR/DPC's resource authority before selecting this callback.
+    let binding = resource.and_then(|resource| {
+        hosted_dpc_binding_for_resource(resource, projection_instance)
+    });
+    if binding.is_none() {
+        // A DPC without a valid device must lose the previous callback's physical port cap.
+        clear_hosted_io_port_caps(cnode)?;
+    }
+    // Always drop the previous ISR/DPC's published resource bank before this callback.
     clear_shared_address_resources(shared_va);
     write_volatile((shared_va + SH_RESOURCE_PDO_OBJECT) as *mut u64, 0);
     write_volatile((shared_va + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
@@ -71314,10 +71321,15 @@ unsafe fn prepare_hosted_dpc_resource_projection(
     write_volatile((shared_va + SH_DMA_COMMON_LOGICAL) as *mut u64, 0);
     write_volatile((shared_va + SH_DMA_ADAPTER_ID) as *mut u64, 0);
     write_volatile((shared_va + SH_DMA_ADAPTER_BLOB) as *mut u64, 0);
-    if let Some(resource) = resource {
-        let binding = hosted_dpc_binding_for_resource(resource, projection_instance)
-            .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-        restore_hosted_device_resource_state(binding, shared_va, cnode, false)?;
+    if resource.is_some() && binding.is_none() {
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    }
+    if let Some(binding) = binding {
+        if let Err(status) = restore_hosted_device_resource_state(binding, shared_va, cnode, false) {
+            // Restore can refuse before its copy step; never retain the prior callback's cap.
+            clear_hosted_io_port_caps(cnode)?;
+            return Err(status);
+        }
     }
     Ok(())
 }
