@@ -20,7 +20,11 @@ fn pending_port_effect_keeps_exact_authority_until_quiesced_reconciliation() {
         "unsafe fn hosted_io_port_cap_effects_mut(",
         "\nunsafe fn issue_hosted_io_port_cap(",
     );
-    let fixture = format!("{SUPPORT}\n{record}\n{ledger}\n{CASES}");
+    let retirement = section(
+        "unsafe fn retire_hosted_io_port_cap(",
+        "\nunsafe fn revoke_hosted_device_resource_state(",
+    );
+    let fixture = format!("{SUPPORT}\n{record}\n{ledger}\n{retirement}\n{CASES}");
     let directory =
         std::env::temp_dir().join(format!("nt-port-effect-ledger-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
@@ -60,7 +64,7 @@ const SH_RESOURCE_ADDRESS_KIND_PORT:u8=2;
  driver_id:u64,device_id:u64,pdo_device_id:u64,instance:usize,projection_instance:usize,
  projection_domain:u64,device_object:u64,pdo_object:u64,registry_identity_id:u64,used:bool
 }
-#[derive(Clone,Copy,Default)] struct SharedAddressResource { kind:u8,broker_va_or_root_cap:u64,component_cap:u64 }
+#[derive(Clone,Copy,Default)] struct SharedAddressResource { kind:u8,translated_start:u64,len:u64,broker_va_or_root_cap:u64,component_cap:u64 }
 #[derive(Clone,Copy)] struct HostedDeviceResourceState {device_id:u64,projection_domain:u64,
  address_resource_count:u8,address_resources:[SharedAddressResource;4],io_port_supplemental:bool}
 mod nt_status { #[derive(Debug)] pub enum NtStatus { INVALID_PARAMETER,INVALID_DEVICE_REQUEST,
@@ -72,6 +76,9 @@ static mut FAIL_DELETE:bool=false;
 static mut REVOKES:u64=0;
 static mut DELETES:u64=0;
 static mut RELEASES:u64=0;
+fn hosted_state_address_resources(state:&HostedDeviceResourceState)->&[SharedAddressResource] {
+ &state.address_resources[..state.address_resource_count as usize]
+}
 fn cnode_revoke_r(_:u64)->u64 {unsafe{REVOKES+=1; FAIL_REVOKE as u64}}
 fn cnode_delete_recycle_r(_:u64)->u64 {unsafe{DELETES+=1; FAIL_DELETE as u64}}
 fn hosted_device_resource_states_mut()->&'static mut Vec<HostedDeviceResourceState>{unsafe{&mut STATES}}
@@ -112,7 +119,7 @@ fn uncertain_revoke_is_quarantined_without_native_replay() {
  unsafe {retain_hosted_io_port_cap_effect(effect(binding,2,90,0x3c0)).unwrap();
   let mut resources=[SharedAddressResource::default();4];
   resources[0]=SharedAddressResource{kind:SH_RESOURCE_ADDRESS_KIND_PORT,
-    broker_va_or_root_cap:90,component_cap:8};
+    translated_start:0x3c0,len:2,broker_va_or_root_cap:90,component_cap:8};
   STATES.push(HostedDeviceResourceState{device_id:1,projection_domain:55,
    address_resource_count:1,address_resources:resources,io_port_supplemental:true});
   FAIL_REVOKE=true;
@@ -147,7 +154,7 @@ fn acknowledged_reconciliation_retires_each_effect_once() {
  unsafe {retain_hosted_io_port_cap_effect(effect(binding,2,90,0x3c0)).unwrap();
   let mut resources=[SharedAddressResource::default();4];
   resources[0]=SharedAddressResource{kind:SH_RESOURCE_ADDRESS_KIND_PORT,
-    broker_va_or_root_cap:90,component_cap:8};
+    translated_start:0x3c0,len:2,broker_va_or_root_cap:90,component_cap:8};
   STATES.push(HostedDeviceResourceState{device_id:1,projection_domain:55,
     address_resource_count:1,address_resources:resources,io_port_supplemental:true});
   reconcile_hosted_io_port_cap_effects(owner(55,false)).unwrap();
@@ -159,6 +166,40 @@ fn acknowledged_reconciliation_retires_each_effect_once() {
   assert!(!STATES[0].io_port_supplemental,
     "a retired supplemental range cannot remain advertised on a teardown retry");
   assert_eq!(STATES[0].address_resources[0].broker_va_or_root_cap,0);
+ }
+}
+#[test]
+fn canonical_retirement_never_replays_failed_native_revoke() {
+ reset(); let binding=owner(55,true);
+ unsafe {let mut resources=[SharedAddressResource::default();4];
+  resources[0]=SharedAddressResource{kind:SH_RESOURCE_ADDRESS_KIND_PORT,
+    translated_start:0x3c0,len:2,broker_va_or_root_cap:90,component_cap:8};
+  STATES.push(HostedDeviceResourceState{device_id:1,projection_domain:55,
+    address_resource_count:1,address_resources:resources,io_port_supplemental:false});
+  FAIL_REVOKE=true;
+  assert!(retire_hosted_device_port_caps(binding).is_err());
+  assert_eq!((REVOKES,DELETES),(1,0));
+  FAIL_REVOKE=false;
+  assert!(retire_hosted_device_port_caps(binding).is_err());
+  assert_eq!((REVOKES,DELETES),(1,0),
+    "canonical retirement cannot replay uncertain revoke or recycle its root slot");
+ }
+}
+#[test]
+fn canonical_retirement_never_replays_failed_native_delete() {
+ reset(); let binding=owner(55,true);
+ unsafe {let mut resources=[SharedAddressResource::default();4];
+  resources[0]=SharedAddressResource{kind:SH_RESOURCE_ADDRESS_KIND_PORT,
+    translated_start:0x3c0,len:2,broker_va_or_root_cap:90,component_cap:8};
+  STATES.push(HostedDeviceResourceState{device_id:1,projection_domain:55,
+    address_resource_count:1,address_resources:resources,io_port_supplemental:false});
+  FAIL_DELETE=true;
+  assert!(retire_hosted_device_port_caps(binding).is_err());
+  assert_eq!((REVOKES,DELETES),(1,1));
+  FAIL_DELETE=false;
+  assert!(retire_hosted_device_port_caps(binding).is_err());
+  assert_eq!((REVOKES,DELETES),(1,1),
+    "canonical retirement cannot replay uncertain delete or recycle its root slot");
  }
 }
 "#;

@@ -56365,50 +56365,76 @@ unsafe fn snapshot_shared_address_resources(
     Some((count as u8, resources))
 }
 
-unsafe fn retire_hosted_io_port_cap(cap: u64) -> Result<(), nt_status::NtStatus> {
+unsafe fn retire_hosted_io_port_cap(
+    binding: HostedDeviceBinding,
+    resource: SharedAddressResource,
+) -> Result<(), nt_status::NtStatus> {
+    let cap = resource.broker_va_or_root_cap;
     if cap == 0 {
         return Ok(());
     }
-    if crate::cnode_revoke_r(cap) != 0 {
-        return Err(nt_status::NtStatus::UNSUCCESSFUL);
-    }
-    if crate::cnode_delete_recycle_r(cap) != 0 {
-        return Err(nt_status::NtStatus::UNSUCCESSFUL);
-    }
-    Ok(())
+    // Root-owned canonical retirement has no single child CNode: a root revoke fences every
+    // projection. The effect still retains the exact device generation, range, and root slot.
+    retain_hosted_io_port_cap_effect(HostedIoPortCapEffect {
+        binding,
+        cnode: 0,
+        component_slot: 0,
+        root_cap: cap,
+        start: resource.translated_start,
+        length: resource.len,
+        claim_resource_id: None,
+        root_revoke: HostedIoPortNativeStep::Pending,
+        root_retire: HostedIoPortNativeStep::Pending,
+        claim_released: false,
+    })?;
+    reconcile_hosted_io_port_cap_effects(binding)
 }
 
 unsafe fn retire_hosted_device_port_caps(
     binding: HostedDeviceBinding,
 ) -> Result<(), nt_status::NtStatus> {
-    let states = hosted_device_resource_states_mut();
-    let Some(index) = states.iter().position(|state| {
-        state.device_id != 0
-            && state.device_id == binding.device_id
-            && state.projection_domain == binding.projection_domain
-    }) else {
+    let Some((state_index, state)) = hosted_device_resource_states_mut()
+        .iter()
+        .enumerate()
+        .find(|(_, state)| {
+            state.device_id != 0
+                && state.device_id == binding.device_id
+                && state.projection_domain == binding.projection_domain
+        })
+        .map(|(index, state)| (index, *state))
+    else {
         return Ok(());
     };
-    let state = states[index];
-    let mut resource_index = 0usize;
-    while resource_index < state.address_resource_count as usize {
-        let resource = state.address_resources[resource_index];
+    for resource in hosted_state_address_resources(&state) {
         let cap = resource.broker_va_or_root_cap;
-        if resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT
-            && cap != 0
-            && !states.iter().enumerate().any(|(candidate, state)| {
-                candidate != index
-                    && hosted_state_address_resources(state)
+        if resource.kind != SH_RESOURCE_ADDRESS_KIND_PORT || cap == 0 {
+            continue;
+        }
+        let shared = hosted_device_resource_states_mut()
+            .iter()
+            .enumerate()
+            .any(|(candidate, other)| {
+                candidate != state_index
+                    && hosted_state_address_resources(other)
                         .iter()
                         .any(|resource| resource.broker_va_or_root_cap == cap)
-            })
-        {
-            retire_hosted_io_port_cap(cap)?;
+            });
+        if shared {
+            if let Some(current) = hosted_device_resource_states_mut().iter_mut().find(|current| {
+                current.device_id == binding.device_id
+                    && current.projection_domain == binding.projection_domain
+            }) {
+                for row in current.address_resources.iter_mut() {
+                    if row.kind == SH_RESOURCE_ADDRESS_KIND_PORT
+                        && row.broker_va_or_root_cap == cap
+                    {
+                        row.broker_va_or_root_cap = 0;
+                    }
+                }
+            }
+            continue;
         }
-        if resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT {
-            states[index].address_resources[resource_index].broker_va_or_root_cap = 0;
-        }
-        resource_index += 1;
+        retire_hosted_io_port_cap(binding, *resource)?;
     }
     Ok(())
 }
@@ -63800,11 +63826,12 @@ unsafe fn hosted_io_port_cap_effect_pending(binding: HostedDeviceBinding, cnode:
 unsafe fn retain_hosted_io_port_cap_effect(
     effect: HostedIoPortCapEffect,
 ) -> Result<(), nt_status::NtStatus> {
-    if effect.cnode == 0
-        || effect.root_cap == 0
+    if effect.root_cap == 0
         || effect.length == 0
-        || effect.component_slot < crate::CT_IO_PORT_BASE
-        || effect.component_slot >= crate::CT_IO_PORT_BASE + crate::CT_IO_PORT_CAPACITY
+        || (effect.cnode == 0) != (effect.component_slot == 0)
+        || (effect.cnode != 0
+            && (effect.component_slot < crate::CT_IO_PORT_BASE
+                || effect.component_slot >= crate::CT_IO_PORT_BASE + crate::CT_IO_PORT_CAPACITY))
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -63814,7 +63841,8 @@ unsafe fn retain_hosted_io_port_cap_effect(
     if effects.iter().any(|existing| {
         let existing_end = existing.start.saturating_add(existing.length);
         hosted_io_port_cap_same_owner(existing.binding, effect.binding)
-            || (existing.cnode == effect.cnode
+            || (effect.cnode != 0
+                && existing.cnode == effect.cnode
                 && existing.component_slot == effect.component_slot)
             || (effect.start < existing_end && existing.start < end)
     }) {
