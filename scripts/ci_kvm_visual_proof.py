@@ -8,7 +8,7 @@ import subprocess
 
 
 OCR_PUNCT_PREFIX = r"[ \t]*[^\w\s]{0,3}[ \t]*"
-COMMAND = re.compile(r"(?im)^[ \t]*[a-z]:\\[^\r\n>]*>[ \t]*ver[ \t]*$")
+COMMAND = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]*>[ \t]*ver[ \t]*$")
 RESULT = re.compile(r"(?im)^[ \t]*Microsoft Windows[ \t]*\[Version[ \t]+\d+(?:\.\d+)+\][ \t]*$")
 READY_TITLE = re.compile(r"(?im)^[^\w\r\n]{0,3}Command Prompt[ \t]*$")
 # Sparse-text OCR may join up to three punctuation glyphs from adjacent desktop
