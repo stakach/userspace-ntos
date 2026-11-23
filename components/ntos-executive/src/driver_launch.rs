@@ -582,6 +582,8 @@ mod hosted_io_create_file_ingress;
 mod hosted_io_create_file_work;
 #[path = "hosted_kernel_file_control.rs"]
 mod hosted_kernel_file_control;
+#[path = "hosted_kernel_file_transport.rs"]
+mod hosted_kernel_file_transport;
 #[path = "hosted_kernel_file_read_query.rs"]
 mod hosted_kernel_file_read_query;
 #[path = "hosted_kernel_win32k_async_read.rs"]

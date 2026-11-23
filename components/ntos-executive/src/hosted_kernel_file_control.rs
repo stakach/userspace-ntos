@@ -29,6 +29,7 @@ struct FileWork {
     file: super::hosted_file_capture::Capture,
     instance: DriverInstance,
     domain: nt_io_manager::HostedTransportIdentity,
+    channel: crate::spawn_hosts::PumpChannel,
     component_packet: u64,
     packet_length: u64,
     control_code: u32,
@@ -177,6 +178,7 @@ pub(crate) unsafe fn submit(
             domain: channel.physical_domain.expect("authenticated hosted FSCTL domain"),
             endpoint: channel.fault_ep, vspace: channel.pml4, shared: channel.shared_va,
         },
+        channel: *channel,
         component_packet, packet_length, control_code: code, input, output,
         entered: false, pending_irp: None, terminal: None, copied: 0,
         cancelled_after_entry: false, reply_entered: false,
@@ -305,15 +307,9 @@ impl FileWork {
         }
         if self.cancelled() { return self.finish_cancelled(handler); }
         let (status, information) = self.terminal.expect("hosted FSCTL terminal");
-        let Some((_, live)) = instance_by_shared_va(self.domain.shared) else { return false; };
-        let Some(live_domain) = instance_domain_identity(live) else { return false; };
-        let live_transport = nt_io_manager::HostedTransportIdentity {
-            domain: live_domain, endpoint: live.fault_ep,
-            vspace: live.pml4, shared: live.exec_shared_va,
-        };
-        if !self.domain.matches_live(live_transport) || live.exec_pool_va != self.instance.exec_pool_va {
-            return false;
-        }
+        let Some(live) = hosted_kernel_file_transport::live_instance(
+            &self.channel, self.domain, self.instance, self.route, self.dispatch, self.reply,
+        ) else { return false; };
         let Some(exec) = hosted_instance_pool_allocation_exec_if_live(
             live, self.component_packet, self.packet_length,
         ) else { return false; };

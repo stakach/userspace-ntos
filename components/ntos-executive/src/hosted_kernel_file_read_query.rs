@@ -75,6 +75,7 @@ enum PacketSource {
     Fsd {
         instance: DriverInstance,
         domain: nt_io_manager::HostedTransportIdentity,
+        channel: crate::spawn_hosts::PumpChannel,
     },
     Win32k {
         lease: crate::win32k_subsystem::ProviderPoolPacketLease,
@@ -201,6 +202,7 @@ pub(crate) unsafe fn submit(
             vspace: channel.pml4,
             shared: channel.shared_va,
         },
+        channel: *channel,
     };
     submit_captured(
         channel,
@@ -645,24 +647,10 @@ impl Work {
             return false;
         }
         match &mut self.source {
-            PacketSource::Fsd { instance, domain } => {
-                let Some((_, live)) = instance_by_shared_va(domain.shared) else {
-                    return false;
-                };
-                let Some(live_domain) = instance_domain_identity(live) else {
-                    return false;
-                };
-                let live_transport = nt_io_manager::HostedTransportIdentity {
-                    domain: live_domain,
-                    endpoint: live.fault_ep,
-                    vspace: live.pml4,
-                    shared: live.exec_shared_va,
-                };
-                if !domain.matches_live(live_transport)
-                    || live.exec_pool_va != instance.exec_pool_va
-                {
-                    return false;
-                }
+            PacketSource::Fsd { instance, domain, channel } => {
+                let Some(live) = hosted_kernel_file_transport::live_instance(
+                    channel, *domain, *instance, self.route, self.dispatch, self.reply,
+                ) else { return false; };
                 let Some(exec) = hosted_instance_pool_allocation_exec_if_live(
                     live,
                     self.packet,
