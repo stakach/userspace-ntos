@@ -11630,12 +11630,13 @@ extern "win64" fn s_io_connect_interrupt(
     floating_save: u8,
 ) -> i32 {
     unsafe {
+        let sh = hosted_component_resource_shared_va();
         let granted_vector =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
+            read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
         let granted_affinity =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64);
+            read_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64);
         let granted_policy =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_POLICY) as *const u64);
+            read_volatile((sh + SH_RESOURCE_INTERRUPT_POLICY) as *const u64);
         let granted_irql = granted_policy as u8;
         let granted_mode = (granted_policy >> 8) as u8;
         let granted_share = (granted_policy >> 16) as u8;
@@ -11735,15 +11736,15 @@ extern "win64" fn s_io_connect_interrupt(
         );
         write_unaligned(interrupt_obj_out, projection);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
+            (sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
             projection,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
+            (sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
             service_routine,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
+            (sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
             service_context,
         );
         let (_label, broker_status, interrupt_id, grant_generation, _) = call_on4(
@@ -11759,15 +11760,15 @@ extern "win64" fn s_io_connect_interrupt(
                 write_unaligned(interrupt_obj_out, 0);
             }
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
                 0,
             );
             // Root retains the exact provisioned allocation while a failed or uncertain
@@ -11790,7 +11791,7 @@ extern "win64" fn s_io_connect_interrupt(
             };
         }
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *mut u64,
+            (sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64,
             interrupt_id,
         );
         write_unaligned(
@@ -11820,7 +11821,8 @@ extern "win64" fn s_io_connect_interrupt(
 /// one for this hosted driver.
 extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
     unsafe {
-        let active = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64);
+        let sh = hosted_component_resource_shared_va();
+        let active = read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64);
         if pkinterrupt != 0 && pkinterrupt == active {
             let (_label, status, _, _, _) = call_on4(
                 (FSD_SERVICE_INTERRUPT_LABEL << 12) | 2,
@@ -11833,31 +11835,31 @@ extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
                 return;
             }
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
                 0,
             );
-            write_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
-                0,
-            );
-            write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64,
                 0,
             );
-            clear_dpc_diagnostics(FSD_SHARED_VADDR);
+            write_volatile(
+                (sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
+                0,
+            );
+            clear_dpc_diagnostics(sh);
         }
     }
 }
