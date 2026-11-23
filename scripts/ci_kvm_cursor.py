@@ -1,6 +1,6 @@
 """Measure the guest cursor from two QMP framebuffer captures before clicking.
 
-The comparison is restricted to the icon's neighbourhood. The first frame has the
+The comparison is restricted to a bounded region around the icon. The first frame has the
 cursor elsewhere; only pointer motion is allowed before the second frame. This
 keeps the measurement independent of the guest's cursor artwork and theme.
 """
@@ -17,7 +17,7 @@ except ImportError:
 
 DIFFERENCE_THRESHOLD = 90
 TARGET_TOLERANCE = 3
-SEARCH_RADIUS = 40
+SEARCH_RADIUS = 60
 
 
 @dataclass(frozen=True)
