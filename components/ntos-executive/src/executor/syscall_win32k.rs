@@ -11,10 +11,6 @@ use super::loop_receive::receive;
 use super::*;
 use crate::executor::local;
 
-// #446: bound the registration trace across a boot. The dispatch id and retained Reply slot
-// correlate ingress with route-out; neither a badge nor a numeric slot alone is authority.
-static REGISTER_HOTKEY_TRACE_N: AtomicU64 = AtomicU64::new(0);
-
 unsafe fn trace_register_hotkey_route(
     phase: &[u8],
     client: win32k_glue::Win32kClientContext,
@@ -304,8 +300,10 @@ pub(super) unsafe fn syscall_win32k_route(
         sc.wl_milestone_park = false;
         break 'root_gui_dispatch;
     };
+    // #446: the dispatch id and retained Reply slot correlate ingress with route-out; neither
+    // a badge nor a numeric slot alone is authority. Keep the budget in its executor owner.
     let trace_hotkey_registration = lp.msg.m0 == nt_user_callback::NTUSER_REGISTER_HOT_KEY_SSN
-        && REGISTER_HOTKEY_TRACE_N.fetch_add(1, Ordering::Relaxed) < 32;
+        && local().hotkey_registration_traces.fetch_add(1, Ordering::Relaxed) < 32;
     let hotkey_reply_at_entry = local().reply_main_slot.load(Ordering::Relaxed);
     if trace_hotkey_registration {
         trace_register_hotkey_route(
