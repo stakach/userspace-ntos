@@ -47035,6 +47035,14 @@ unsafe fn dispatch_hosted_acpi_namespace(child_index: usize, output_len: usize) 
             apply_hosted_acpi_namespace_disposition(child_index, disposition);
         }
         ExternalDispatchResult::Pending { irp_id } => {
+            {
+                // Dispatch has entered. Keep the IRP for barrier retirement
+                // even if its stack fails validation.
+                let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_mut()
+                    .expect("hosted relation query disappeared before retaining namespace IRP");
+                query.irp_id = irp_id;
+            }
             let identities = io_manager_mut().irp(irp_id).and_then(|irp| {
                 let current = irp.current_stack()?;
                 let valid_parameters = matches!(
@@ -47063,7 +47071,6 @@ unsafe fn dispatch_hosted_acpi_namespace(child_index: usize, output_len: usize) 
             let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                 .as_mut()
                 .expect("hosted relation query disappeared before namespace completion");
-            query.irp_id = irp_id;
             query.origin_driver_id = origin_driver_id;
             query.completion_driver_id = completion_driver_id;
             query.completion_device_id = completion_device_id;

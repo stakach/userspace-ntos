@@ -77,3 +77,26 @@ fn pending_acpi_namespace_overflow_retains_exact_header() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[test]
+fn pending_namespace_irp_is_owned_before_its_shape_is_checked() {
+    let source = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let dispatch = source
+        .split_once("unsafe fn dispatch_hosted_acpi_namespace(")
+        .unwrap()
+        .1
+        .split_once("unsafe fn hosted_relation_child_identity(")
+        .unwrap()
+        .0;
+    let pending = dispatch
+        .split_once("ExternalDispatchResult::Pending { irp_id } =>")
+        .unwrap()
+        .1;
+    let shape_check = pending
+        .find("io_manager_mut().irp(irp_id)")
+        .expect("pending namespace IRP stack must be authenticated");
+    assert!(
+        pending[..shape_check].contains("query.irp_id = irp_id;"),
+        "a pending IOCTL that fails shape validation must remain owned by the barrier"
+    );
+}
