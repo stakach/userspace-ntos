@@ -85,6 +85,7 @@ mod nt_status {
         DEVICE_BUSY, INSUFFICIENT_RESOURCES,
     }
 }
+fn hosted_io_port_cap_effect_pending(_: HostedDeviceBinding, _: u64) -> bool { false }
 static mut CNODES: [[u64; 32]; 8] = [[0; 32]; 8];
 static mut PHYSICAL_GENERATION: [u64; 8] = [0, 1, 1, 1, 1, 1, 1, 1];
 static mut FAIL_TARGET_CNODE: u64 = 2;

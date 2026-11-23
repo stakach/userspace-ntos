@@ -115,6 +115,7 @@ static mut ACTIVE_CNODE: usize = 0;
 static mut FAIL_DELETE_CNODE: u64 = 0;
 static mut FAIL_COPY_CNODE: u64 = 0;
 static mut PROJECTION_COUNT: u64 = 0;
+static mut PENDING_CNODE: u64 = 0;
 static mut RESOURCE_A: Option<SharedAddressResource> = None;
 static mut RESOURCE_B: Option<SharedAddressResource> = None;
 fn cnode_delete_in_cnode_r(cnode: u64, slot: u64) -> u64 {
@@ -139,6 +140,9 @@ unsafe fn hosted_port_projection_owner(cnode:u64)->Option<hosted_port_projection
 }
 fn instance_by_driver_id(driver_id: u64) -> Option<(usize, DriverInstance)> {
     (driver_id == 7).then_some((0, DriverInstance {cnode:1}))
+}
+fn hosted_io_port_cap_effect_pending(_: HostedDeviceBinding, cnode: u64) -> bool {
+    unsafe { PENDING_CNODE == cnode }
 }
 unsafe fn write_hosted_resource_state_projection(sh: u64, state: HostedDeviceResourceState, _: bool) {
     PROJECTION_COUNT += 1;
@@ -269,6 +273,22 @@ fn failed_child_cap_copy_cannot_publish_a_new_worker_bank() {
             HostedDeviceBinding {device_id:1,driver_id:7,instance:0},WORKER_A,2,false).is_err());
         assert_eq!(PROJECTION_COUNT,0, "failed CNode copy cannot publish resource authority");
         FAIL_COPY_CNODE=0;
+    }
+}
+#[test]
+fn pending_native_cap_effect_blocks_worker_bank_publication() {
+    let mut bank = [0u64; 64];
+    let resource = SharedAddressResource { kind:SH_RESOURCE_ADDRESS_KIND_PORT,
+        translated_start:0x3c0,len:2,broker_va_or_root_cap:0xA,component_cap:8 };
+    unsafe {
+        WORKER_A=bank.as_mut_ptr() as u64;
+        RESOURCE_A=Some(resource);
+        PENDING_CNODE=2;
+        PROJECTION_COUNT=0;
+        assert!(restore_hosted_device_resource_state(
+            HostedDeviceBinding {device_id:1,driver_id:7,instance:0},WORKER_A,2,false).is_err());
+        assert_eq!(PROJECTION_COUNT,0);
+        PENDING_CNODE=0;
     }
 }
 "#;
