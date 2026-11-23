@@ -11,6 +11,51 @@ use super::loop_receive::receive;
 use super::*;
 use crate::executor::local;
 
+// #446: bound the registration trace across a boot. The dispatch id and retained Reply slot
+// correlate ingress with route-out; neither a badge nor a numeric slot alone is authority.
+static REGISTER_HOTKEY_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn trace_register_hotkey_route(
+    phase: &[u8],
+    client: win32k_glue::Win32kClientContext,
+    dispatch_id: u64,
+    reply_at_entry: u64,
+    id: u64,
+    modifiers: u64,
+    vk: u64,
+    result: Option<(u64, bool, bool, bool)>,
+) {
+    print_str(b"[hotkey-register] phase=");
+    print_str(phase);
+    print_str(b" dispatch="); print_u64(dispatch_id);
+    print_str(b" pi="); print_u64(u64::from(client.pi));
+    print_str(b" pid="); print_u64(client.pid);
+    print_str(b" process-generation="); print_u64(client.generation);
+    print_str(b" tid="); print_u64(client.tid);
+    print_str(b" thread-generation=");
+    if let Some(caller) = client.logical_caller {
+        print_u64(caller.thread().generation());
+    } else {
+        print_str(b"unbound");
+    }
+    print_str(b" tcb="); print_hex_u64(client.tcb);
+    print_str(b" badge="); print_u64(client.badge);
+    print_str(b" reply-at-entry="); print_u64(reply_at_entry);
+    print_str(b" reply-now="); print_u64(local().reply_main_slot.load(Ordering::Relaxed));
+    print_str(b" explorer=");
+    print_u64(u64::from(client.process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell)));
+    print_str(b" id="); print_u64(id);
+    print_str(b" modifiers="); print_hex_u64(modifiers);
+    print_str(b" vk="); print_hex_u64(vk);
+    if let Some((status, ok, callback_suspended, parked)) = result {
+        print_str(b" route-status="); print_hex_u64(status);
+        print_str(b" provider-ok="); print_u64(u64::from(ok));
+        print_str(b" callback-suspended="); print_u64(u64::from(callback_suspended));
+        print_str(b" parked="); print_u64(u64::from(parked));
+    }
+    print_str(b"\n");
+}
+
 #[inline(never)]
 pub(super) unsafe fn syscall_win32k_route(
     lp: &mut LoopState<'_>,
@@ -259,6 +304,15 @@ pub(super) unsafe fn syscall_win32k_route(
         sc.wl_milestone_park = false;
         break 'root_gui_dispatch;
     };
+    let trace_hotkey_registration = lp.msg.m0 == nt_user_callback::NTUSER_REGISTER_HOT_KEY_SSN
+        && REGISTER_HOTKEY_TRACE_N.fetch_add(1, Ordering::Relaxed) < 32;
+    let hotkey_reply_at_entry = local().reply_main_slot.load(Ordering::Relaxed);
+    if trace_hotkey_registration {
+        trace_register_hotkey_route(
+            b"entry", dispatch_client, dispatch_id, hotkey_reply_at_entry,
+            a1, a2, a3, None,
+        );
+    }
     trace_cursor_lookup_owner(
         "dispatch-id", dispatch_client, lp.msg.m0, dispatch_id, None, false, false, false,
     );
@@ -4393,6 +4447,13 @@ pub(super) unsafe fn syscall_win32k_route(
     } else {
         sc.handled = false; // dispatch wall — stop with the SSN recorded
         sc.result = 0xC0000001;
+    }
+    if trace_hotkey_registration {
+        trace_register_hotkey_route(
+            b"route-out", dispatch_client, dispatch_id, hotkey_reply_at_entry,
+            a1, a2, a3,
+            Some((st, ok, callback_suspended, sc.component_suspension_park_request)),
+        );
     }
     }
     ControlFlow::Continue(())
