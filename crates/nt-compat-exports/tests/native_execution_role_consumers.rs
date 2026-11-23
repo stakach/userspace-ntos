@@ -1,10 +1,9 @@
 //! Executive policy that still reads the image catalog's role, instead of the live execution-role
 //! chain (`ExecutionRoleLedger`), may only shrink (#310, #429, #432).
 //!
-//! The ledger holds smss and dynamically admitted children, but not the static bootstrap slots
-//! (csrss, winlogon), so these consumers cannot move until those slots are seeded into it. Until
-//! then this ratchet keeps the debt visible: a new catalog-role or parent-walk policy site fails,
-//! and a migrated site must lower its baseline here.
+//! The ledger includes seeded bootstrap roles and dynamically admitted children. This ratchet
+//! keeps remaining catalog-role and parent-walk policy debt visible: a new site fails, and a
+//! migrated site must lower its baseline here.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -20,7 +19,6 @@ const CATALOG_ROLE_CALLS: &[&str] = &[
     "current_process_is_csrss(",
     "current_process_is_winlogon(",
     "hosted_non_native_top_level_badge(",
-    "dynamic_child_role(",
     // Installer ownership by catalog image role after a process-manager parent walk.
     ".can_own_installer_service_work(",
 ];
@@ -29,7 +27,7 @@ const CATALOG_ROLE_CALLS: &[&str] = &[
 const BASELINE: &[(&str, usize)] = &[
     ("diag/post_loop.rs", 1),
     ("exec_file_create.rs", 1),
-    ("exec_handler.rs", 22),
+    ("exec_handler.rs", 21),
     ("executor/admission.rs", 1),
     ("executor/exceptions.rs", 4),
     ("executor/syscall.rs", 2),
@@ -108,4 +106,35 @@ fn the_site_counter_ignores_definitions_and_comments() {
                   if hosted_pi_has_role(pi) && image.can_own_installer_service_work() {}\n\
                   let live = live_hosted_pi_for_role(role);\n";
     assert_eq!(catalog_role_sites(source), 2);
+}
+
+#[test]
+fn dynamic_file_observation_uses_pe_subsystem_after_live_creator_admission() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/exec_handler.rs"),
+    )
+    .expect("executive source");
+    let admission = source
+        .split("unsafe fn admit_dynamic_hosted_exe(")
+        .nth(1)
+        .expect("dynamic File admission")
+        .split("unsafe fn dynamic_hosted_identity_attachments_match(")
+        .next()
+        .expect("admission boundary");
+    let compact: String = admission.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("if!eligible_creator{returnNone;}")
+            && compact.find("if!eligible_creator{returnNone;}")
+                < compact.find("load_hosted_executable_from_volume_path("),
+        "a live eligible creator must be required before loading the dynamic executable"
+    );
+    assert!(
+        compact.contains("HostedProcessRole::for_image_subsystem(pe.subsystem())"),
+        "a dynamic File observation must describe the parsed executable, not its creator"
+    );
+    assert!(
+        compact.contains("catalog.admit_dynamic_executable(leaf,role,"),
+        "the PE-derived role must reach the catalog admission"
+    );
 }

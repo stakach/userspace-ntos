@@ -2979,7 +2979,7 @@ unsafe fn load_hosted_executable_from_volume_path(
 
 unsafe fn admit_dynamic_hosted_exe(
     ctx: ExecLoopCtx,
-    role: Option<nt_exe_image::HostedProcessRole>,
+    eligible_creator: bool,
     name16: &[u16],
     folded_name: &[u8],
     is_sxs: bool,
@@ -2988,7 +2988,9 @@ unsafe fn admit_dynamic_hosted_exe(
     if is_sxs {
         return None;
     }
-    let role = role?;
+    if !eligible_creator {
+        return None;
+    }
     let volume_relative = nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT)?;
     let leaf = nt_exe_image::canonical_exe_leaf(&volume_relative)?;
     if !folded_name
@@ -3021,6 +3023,7 @@ unsafe fn admit_dynamic_hosted_exe(
         Some(existing) => existing,
         None => load_hosted_executable_from_volume_path(&volume_relative, leaf)?,
     };
+    let role = nt_exe_image::HostedProcessRole::for_image_subsystem(pe.subsystem())?;
     let catalog: &'static mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP> =
         &mut *ctx.exe_image_catalog;
     let pi = match catalog.admit_dynamic_executable(
@@ -31944,16 +31947,12 @@ impl ExecNtHandler {
         }
     }
 
-    fn dynamic_child_role(&self) -> Option<nt_exe_image::HostedProcessRole> {
-        match self.live_execution_role(self.pi)? {
-            role if role.is_noninteractive_service_class() => {
-                Some(nt_exe_image::HostedProcessRole::NonInteractiveService)
-            }
-            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
-            | nt_exe_image::HostedProcessRole::InteractiveShell => {
-                Some(nt_exe_image::HostedProcessRole::InteractiveShell)
-            }
-            _ => None,
+    fn can_admit_dynamic_child(&self) -> bool {
+        match self.live_execution_role(self.pi) {
+            Some(role) if role.is_noninteractive_service_class() => true,
+            Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap)
+            | Some(nt_exe_image::HostedProcessRole::InteractiveShell) => true,
+            _ => false,
         }
     }
 
@@ -32876,13 +32875,13 @@ impl ExecNtHandler {
         });
         let volume_file = volume_entry.filter(|entry| !entry.metadata.is_directory);
         let volume_not_directory = volume_file.is_some();
-        let dynamic_role = self.dynamic_child_role();
+        let dynamic_admission_allowed = self.can_admit_dynamic_child();
         let mut hosted_exe_image = {
             let catalog = &*ctx.exe_image_catalog;
             let probed = Self::exe_probe_image(catalog, &nb[..nlen], is_sxs)
                 .filter(|image| Self::hosted_image_exists(*image));
-            match (probed, dynamic_role) {
-                (Some(image), Some(_)) if image.pi >= nt_exe_image::DYNAMIC_PROCESS_FIRST_PI => {
+            match (probed, dynamic_admission_allowed) {
+                (Some(image), true) if image.pi >= nt_exe_image::DYNAMIC_PROCESS_FIRST_PI => {
                     let latest = catalog.get_latest_by_leaf(image.leaf).unwrap_or(image);
                     let latest_unspawned = hosted_process_runtime_for_pi(latest.pi)
                         .and_then(|runtime| runtime.spawned)
@@ -32899,7 +32898,7 @@ impl ExecNtHandler {
         };
         if hosted_exe_image.is_none() {
             if let Some((image, _)) =
-                admit_dynamic_hosted_exe(ctx, dynamic_role, name16, &nb[..nlen], is_sxs)
+                admit_dynamic_hosted_exe(ctx, dynamic_admission_allowed, name16, &nb[..nlen], is_sxs)
             {
                 hosted_exe_image = Some(image);
             }
