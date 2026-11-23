@@ -1231,12 +1231,9 @@ unsafe fn advance(
                 return Step::Progress;
             }
             let metadata = work.file_metadata.expect("image file metadata");
-            // The installed File's exact immutable extent authorizes retained page reads
-            // after publication. Boot reads may finish inline; native mounted reads retain
-            // this Section owner and capture only the bounded PE header windows.
-            let boot_layout_reads = unsafe { crate::fs_loader::exec_fs_mount_identity() }
-                .and_then(crate::fs_loader::exec_block_route_kind)
-                == Some(nt_fs::BlockSourceKind::Boot);
+            // The installed File's exact immutable extent authorizes bounded PE header reads.
+            // Keep this Section and its File capture across a provider Pending completion even
+            // when the physical FAT route can still answer unrelated boot probes inline.
             if work.image_header.is_empty() && work.image_layout.is_none()
                 && work.sparse_image.is_none()
             {
@@ -1249,35 +1246,6 @@ unsafe fn advance(
                 );
                 match immutable {
                     Ok(Some(extent)) if extent == metadata.end_of_file && !metadata.is_directory => {
-                        if boot_layout_reads {
-                            let layout = nt_pe_loader::capture_image_layout(extent, |offset, output| {
-                                let (status, read) = crate::routed_section_io::read_retained(
-                                    capture.file_id(), capture.device_id(), capture.fs_context(),
-                                    offset, output,
-                                );
-                                if status == 0 { Ok(read) } else { Err(status) }
-                            });
-                            match layout {
-                                Ok(layout) => {
-                                    work.image_layout = Some(layout);
-                                    work.timing_header_ready_100ns = Some(monotonic_time_100ns());
-                                    work.phase = Phase::Publish;
-                                }
-                                Err(nt_pe_loader::ImageHeaderCaptureError::Read(status)) => {
-                                    work.status = status;
-                                    work.phase = Phase::ReadyReply;
-                                }
-                                Err(nt_pe_loader::ImageHeaderCaptureError::ShortRead { .. }) => {
-                                    work.status = 0xc000_0185;
-                                    work.phase = Phase::ReadyReply;
-                                }
-                                Err(nt_pe_loader::ImageHeaderCaptureError::Parse(_)) => {
-                                    work.status = STATUS_INVALID_IMAGE_FORMAT;
-                                    work.phase = Phase::ReadyReply;
-                                }
-                            }
-                            return Step::Progress;
-                        }
                         print_str(b"[section-image] retained sparse header extent=");
                         print_u64(extent);
                         print_str(b"\n");
