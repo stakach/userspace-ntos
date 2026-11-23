@@ -90,8 +90,8 @@ pub(super) fn validated_registration(
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
-    if inst.driver_id == 0 || driver_object == 0 || routine < FSD_CODE_VA
-        || routine >= image_end || inst.exec_shared_va != ch.shared_va
+    if inst.driver_id == 0 || driver_object == 0 || driver_object != inst.driver_object
+        || routine < FSD_CODE_VA || routine >= image_end
         || ch.physical_domain != Some(domain)
         || instance(instance_index).is_none()
         || unsafe { read_volatile((ch.shared_va + SH_DRVOBJ) as *const u64) } != driver_object

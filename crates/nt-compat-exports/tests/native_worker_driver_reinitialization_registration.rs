@@ -4,7 +4,8 @@ use std::process::Command;
 
 #[test]
 fn reinitialization_registration_accepts_an_exact_worker_generation() {
-    let source = include_str!("../../../components/ntos-executive/src/hosted_driver_reinitialization.rs");
+    let source =
+        include_str!("../../../components/ntos-executive/src/hosted_driver_reinitialization.rs");
     let start = source
         .find("pub(super) fn validated_registration(")
         .expect("production reinitialization validator");
@@ -15,10 +16,8 @@ fn reinitialization_registration_accepts_an_exact_worker_generation() {
     let validator = &source[start..start + len];
     syn::parse_str::<syn::ItemFn>(validator).expect("validator is a complete function");
     let fixture = format!("{SUPPORT}\nmod production {{\nuse super::*;\n{validator}\n}}\nuse production::validated_registration;\n{CASES}");
-    let directory = std::env::temp_dir().join(format!(
-        "nt-worker-driver-reinit-{}",
-        std::process::id()
-    ));
+    let directory =
+        std::env::temp_dir().join(format!("nt-worker-driver-reinit-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     let input = directory.join("fixture.rs");
     let binary = directory.join("fixture-tests");
