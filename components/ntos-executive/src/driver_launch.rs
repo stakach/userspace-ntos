@@ -33322,8 +33322,8 @@ unsafe fn project_provider_dma_state(
 unsafe fn project_provider_resource_state(
     binding: HostedDeviceBinding,
     dependent_shared: u64,
-    provider_inst: DriverInstance,
     provider_shared: u64,
+    provider_cnode: u64,
 ) -> Result<(), i32> {
     let state = hosted_device_resource_state_by_device_id(binding.device_id).unwrap_or_else(|| {
         read_hosted_device_resource_state_from_shared(binding, dependent_shared)
@@ -33331,7 +33331,7 @@ unsafe fn project_provider_resource_state(
     if state.driver_id != binding.driver_id || state.instance != binding.instance {
         return Err(STATUS_INVALID_DEVICE_REQUEST);
     }
-    copy_hosted_io_port_caps_to_instance(provider_inst, state).map_err(|status| status.raw())?;
+    copy_hosted_io_port_caps_to_cnode(provider_cnode, state).map_err(|status| status.raw())?;
     write_hosted_resource_state_projection(provider_shared, state, false);
     copy_provider_mmio_mapping_state(provider_shared, dependent_shared);
     copy_provider_interrupt_state(provider_shared, dependent_shared);
@@ -34199,6 +34199,7 @@ where
         Some(selection)
     } else { None };
     let provider_shared = reentrant.map_or(provider_inst.exec_shared_va, |row| row.executive_shared);
+    let provider_cnode = reentrant.map_or(provider_inst.cnode, |row| row.cnode);
     let Some(marshal_window) = marshal_window_source.resolve(provider_shared) else {
         return ProviderExportService::Replied(hosted_provider_export_failure(STATUS_DEVICE_NOT_READY));
     };
@@ -34282,8 +34283,8 @@ where
         if let Err(status) = project_provider_resource_state(
             binding,
             dependent_channel.shared_va,
-            provider_inst,
             provider_shared,
+            provider_cnode,
         ) {
             trace_hosted_provider_export_rejection(
                 &singleton.provider,
@@ -34848,7 +34849,7 @@ unsafe fn dispatch_dependent_provider_callback(
     let dependent_binding = current_hosted_device_dispatch_binding(record.dependent_instance)
         .and_then(|binding| hosted_resource_binding_by_device_id(binding.device_id));
     if let Some(binding) = dependent_binding {
-        restore_hosted_device_resource_state(binding, dependent_shared, false)
+        restore_hosted_device_resource_state(binding, dependent_shared, dependent_inst.cnode, false)
             .map_err(|status| status.raw())?;
     }
     match dispatch(record, dependent_inst, exec_code_va, args, stack_args) {
@@ -60896,7 +60897,7 @@ enum HostedIrqConnectionDispatchOutcome {
     DeferredBusy,
 }
 
-unsafe fn hosted_irq_private_shared_va(connection: HostedIrqConnection) -> Option<u64> {
+unsafe fn hosted_irq_private_projection(connection: HostedIrqConnection) -> Option<(u64, u64)> {
     let binding = connection.binding;
     let (_, inst) = instance_by_driver_id(binding.driver_id).filter(|(_, inst)| inst.ready)?;
     hosted_irq_lanes()?.iter().find(|lane| {
@@ -60908,48 +60909,15 @@ unsafe fn hosted_irq_private_shared_va(connection: HostedIrqConnection) -> Optio
             && lane.exec_shared_va != inst.exec_shared_va
             && lane.shared.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
             && lane.arg.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
-    }).map(|lane| lane.exec_shared_va)
+    }).map(|lane| (lane.exec_shared_va, lane.cnode))
 }
 
-/// The IRQ lane installs its own device's I/O-port capabilities in the instance CNode. An
-/// ordinary dispatch of another device that it interrupted gets its own back afterwards, from
-/// its current canonical state; a binding revoked meanwhile gets none (#430).
+/// The IRQ lane has a private CNode. Its port-cap projection cannot replace the primary lane's
+/// caps, so returning from a nested IRQ needs no primary CNode rewrite.
 unsafe fn dispatch_hosted_irq_connection(
     connection: HostedIrqConnection,
 ) -> Result<HostedIrqConnectionDispatchOutcome, nt_status::NtStatus> {
-    let instance = connection.binding.instance;
-    let outer = current_hosted_device_dispatch_binding(instance);
-    let outcome = dispatch_hosted_irq_connection_on_lane(connection);
-    restore_outer_port_caps_after_irq(instance, outer, connection.binding.device_id);
-    outcome
-}
-
-unsafe fn restore_outer_port_caps_after_irq(
-    instance: usize,
-    outer: Option<HostedDeviceBinding>,
-    irq_device: u64,
-) {
-    use nt_hosted_runtime::NestedPortCapRestore;
-    let published = outer.is_some_and(|binding| {
-        current_hosted_device_dispatch_binding(instance) == Some(binding)
-    });
-    let state = outer.and_then(|binding| hosted_device_resource_state_by_device_id(binding.device_id)
-        .filter(|state| state.driver_id == binding.driver_id && state.instance == binding.instance));
-    let action = nt_hosted_runtime::port_caps_after_nested_dispatch(
-        outer.map(|binding| binding.device_id), irq_device, published && state.is_some(),
-    );
-    let Some(binding) = outer else { return };
-    let Some((_, inst)) = instance_by_driver_id(binding.driver_id) else { return };
-    match (action, state) {
-        (NestedPortCapRestore::Keep, _) => {}
-        (NestedPortCapRestore::Restore, Some(state)) => {
-            // A failed copy leaves the slots empty, never holding the IRQ device's ports.
-            let _ = copy_hosted_io_port_caps_to_instance(inst, state);
-        }
-        (NestedPortCapRestore::Restore, None) | (NestedPortCapRestore::Clear, _) => {
-            clear_hosted_io_port_caps(inst);
-        }
-    }
+    dispatch_hosted_irq_connection_on_lane(connection)
 }
 
 unsafe fn dispatch_hosted_irq_connection_on_lane(
@@ -60995,9 +60963,9 @@ unsafe fn dispatch_hosted_irq_connection_on_lane(
     let ordinary_shared = inst.exec_shared_va;
     // Trace a parked ordinary bank while the separate IRQ bank carries this dispatch.
     let _ = retained_hosted_irp_bank_conflicts(ordinary_shared);
-    let irq_shared = hosted_irq_private_shared_va(connection)
+    let (irq_shared, irq_cnode) = hosted_irq_private_projection(connection)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    restore_hosted_device_resource_state(binding, irq_shared, false)?;
+    restore_hosted_device_resource_state(binding, irq_shared, irq_cnode, false)?;
     let outcome = hosted_irq_broker::dispatch_interrupt(connection);
     match outcome {
         Err(status) => {
@@ -63935,25 +63903,28 @@ unsafe fn claim_hosted_supplemental_port_range(
     Ok(())
 }
 
-unsafe fn clear_hosted_io_port_caps(inst: DriverInstance) {
-    if inst.cnode == 0 {
-        return;
+unsafe fn clear_hosted_io_port_caps(cnode: u64) -> Result<(), nt_status::NtStatus> {
+    if cnode == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let mut slot = 0;
     while slot < crate::CT_IO_PORT_CAPACITY {
-        let _ = crate::cnode_delete_in_cnode_r(inst.cnode, crate::CT_IO_PORT_BASE + slot);
+        if crate::cnode_delete_in_cnode_r(cnode, crate::CT_IO_PORT_BASE + slot) != 0 {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
         slot += 1;
     }
+    Ok(())
 }
 
-unsafe fn copy_hosted_io_port_caps_to_instance(
-    inst: DriverInstance,
+unsafe fn copy_hosted_io_port_caps_to_cnode(
+    cnode: u64,
     state: HostedDeviceResourceState,
 ) -> Result<(), nt_status::NtStatus> {
-    if inst.cnode == 0 {
+    if cnode == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    clear_hosted_io_port_caps(inst);
+    clear_hosted_io_port_caps(cnode)?;
     for resource in hosted_state_address_resources(&state) {
         if resource.kind != SH_RESOURCE_ADDRESS_KIND_PORT {
             continue;
@@ -63966,20 +63937,27 @@ unsafe fn copy_hosted_io_port_caps_to_instance(
         {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
-        let copy = crate::cnode_copy_at_r(inst.cnode, component_slot, cap);
+        let copy = crate::cnode_copy_at_r(cnode, component_slot, cap);
         if copy != 0 {
-            clear_hosted_io_port_caps(inst);
+            let _ = clear_hosted_io_port_caps(cnode);
             print_str(b"[driver-launch] IOPort cap restore failed label=");
             print_u64(copy);
             print_str(b" device_id=");
             print_u64(state.device_id);
             print_str(b" cnode=");
-            print_u64(inst.cnode);
+            print_u64(cnode);
             print_str(b"\n");
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
     }
     Ok(())
+}
+
+unsafe fn copy_hosted_io_port_caps_to_instance(
+    inst: DriverInstance,
+    state: HostedDeviceResourceState,
+) -> Result<(), nt_status::NtStatus> {
+    copy_hosted_io_port_caps_to_cnode(inst.cnode, state)
 }
 
 unsafe fn write_hosted_resource_state_projection(
@@ -64200,6 +64178,7 @@ unsafe fn publish_hosted_device_identity_state(
 unsafe fn restore_hosted_device_resource_state(
     binding: HostedDeviceBinding,
     sh: u64,
+    cnode: u64,
     reset_dpc_diagnostics: bool,
 ) -> Result<HostedDeviceResourceState, nt_status::NtStatus> {
     let state = hosted_device_resource_state_by_device_id(binding.device_id)
@@ -64207,9 +64186,9 @@ unsafe fn restore_hosted_device_resource_state(
     if state.driver_id != binding.driver_id || state.instance != binding.instance {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let (_, inst) = instance_by_driver_id(binding.driver_id)
+    let _ = instance_by_driver_id(binding.driver_id)
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    copy_hosted_io_port_caps_to_instance(inst, state)?;
+    copy_hosted_io_port_caps_to_cnode(cnode, state)?;
     write_hosted_resource_state_projection(sh, state, reset_dpc_diagnostics);
     Ok(state)
 }
@@ -71304,6 +71283,7 @@ unsafe fn prepare_hosted_dpc_resource_projection(
     resource: Option<HostedDpcResourceIdentity>,
     projection_instance: usize,
     shared_va: u64,
+    cnode: u64,
 ) -> Result<(), nt_status::NtStatus> {
     // Always drop the previous ISR/DPC's resource authority before selecting this callback.
     clear_shared_address_resources(shared_va);
@@ -71337,7 +71317,7 @@ unsafe fn prepare_hosted_dpc_resource_projection(
     if let Some(resource) = resource {
         let binding = hosted_dpc_binding_for_resource(resource, projection_instance)
             .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-        restore_hosted_device_resource_state(binding, shared_va, false)?;
+        restore_hosted_device_resource_state(binding, shared_va, cnode, false)?;
     }
     Ok(())
 }
@@ -75014,7 +74994,7 @@ pub(crate) unsafe fn start_hosted_device_canonical(
     }
     let sh = inst.exec_shared_va;
     if raw_resource_list.is_empty() {
-        restore_hosted_device_resource_state(binding, sh, false).map_err(|status| {
+        restore_hosted_device_resource_state(binding, sh, inst.cnode, false).map_err(|status| {
             trace_pre_dispatch_start_busy(b"restore", device_id, status);
             local_failure(status)
         })?;
@@ -76699,7 +76679,8 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
                 status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             });
         };
-        if let Err(status) = restore_hosted_device_resource_state(binding, bank, false) {
+        let cnode = class_selection.as_ref().map_or(d.cnode, |selection| selection.cnode);
+        if let Err(status) = restore_hosted_device_resource_state(binding, bank, cnode, false) {
             return Some(HostedIrpTransportResult::NotDispatched { status });
         }
     }

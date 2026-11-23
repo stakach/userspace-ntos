@@ -129,6 +129,7 @@ pub(super) struct Selection {
     pub route: PeerRoute,
     pub shared: u64,
     pub tcb: u64,
+    pub cnode: u64,
     pub request: u64,
     pub label: u64,
     purpose: SelectionPurpose,
@@ -432,7 +433,7 @@ unsafe fn select(instance_index: usize, purpose: SelectionPurpose) -> Option<Sel
     let route = row.route?;
     if !matches!(runtime::ready_for_admission(route), Ok(true)) { return None; }
     let worker = worker(instance_index, row.ordinal)?;
-    Some(Selection { route, shared: row.executive_shared, tcb: worker.tcb,
+    Some(Selection { route, shared: row.executive_shared, tcb: worker.tcb, cnode: worker.cnode,
         request: row.executive_shared + REQUEST_OFFSET, label: LABEL, purpose })
 }
 
