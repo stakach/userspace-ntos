@@ -48,6 +48,7 @@ mod connect_submit;
 pub use connect_submit::{ConnectStageEnd, ConnectSubmitNext, ConnectSubmitStage};
 mod caller_marshal;
 mod gop_bar_projection;
+mod mmio_request;
 mod hosted_driver_thread_object;
 mod hosted_current_thread_kpcr;
 mod hosted_event_projection;
@@ -122,6 +123,8 @@ pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderW
     hosted_provider_worker_admissible};
 pub use gop_bar_projection::{GopBarProjection, GopLegacyVgaPortAuthority,
     GopPciBarAuthority};
+pub use mmio_request::{MmioRequest, MmioRequestAuthority, MmioRequestBacking, MmioRequestError,
+    MmioRequestLedger, MmioRequestOwner, MmioRequestPhase, MmioRequestReceipt};
 pub use hosted_driver_thread_object::{HostedDriverThreadObjectKey,
     HostedDriverThreadObjectRecord};
 pub use hosted_current_thread_kpcr::HostedCurrentThreadKpcr;
