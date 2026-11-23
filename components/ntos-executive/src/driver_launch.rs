@@ -582,6 +582,8 @@ mod hosted_io_create_file_ingress;
 mod hosted_io_create_file_work;
 #[path = "hosted_kernel_file_control.rs"]
 mod hosted_kernel_file_control;
+#[path = "hosted_kernel_file_transport.rs"]
+mod hosted_kernel_file_transport;
 #[path = "hosted_kernel_file_read_query.rs"]
 mod hosted_kernel_file_read_query;
 #[path = "hosted_kernel_win32k_async_read.rs"]
@@ -11630,12 +11632,13 @@ extern "win64" fn s_io_connect_interrupt(
     floating_save: u8,
 ) -> i32 {
     unsafe {
+        let sh = hosted_component_resource_shared_va();
         let granted_vector =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
+            read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
         let granted_affinity =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64);
+            read_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64);
         let granted_policy =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_POLICY) as *const u64);
+            read_volatile((sh + SH_RESOURCE_INTERRUPT_POLICY) as *const u64);
         let granted_irql = granted_policy as u8;
         let granted_mode = (granted_policy >> 8) as u8;
         let granted_share = (granted_policy >> 16) as u8;
@@ -11735,15 +11738,15 @@ extern "win64" fn s_io_connect_interrupt(
         );
         write_unaligned(interrupt_obj_out, projection);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
+            (sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
             projection,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
+            (sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
             service_routine,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
+            (sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
             service_context,
         );
         let (_label, broker_status, interrupt_id, grant_generation, _) = call_on4(
@@ -11759,15 +11762,15 @@ extern "win64" fn s_io_connect_interrupt(
                 write_unaligned(interrupt_obj_out, 0);
             }
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
                 0,
             );
             // Root retains the exact provisioned allocation while a failed or uncertain
@@ -11790,7 +11793,7 @@ extern "win64" fn s_io_connect_interrupt(
             };
         }
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *mut u64,
+            (sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64,
             interrupt_id,
         );
         write_unaligned(
@@ -11820,7 +11823,8 @@ extern "win64" fn s_io_connect_interrupt(
 /// one for this hosted driver.
 extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
     unsafe {
-        let active = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64);
+        let sh = hosted_component_resource_shared_va();
+        let active = read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64);
         if pkinterrupt != 0 && pkinterrupt == active {
             let (_label, status, _, _, _) = call_on4(
                 (FSD_SERVICE_INTERRUPT_LABEL << 12) | 2,
@@ -11833,31 +11837,31 @@ extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
                 return;
             }
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
                 0,
             );
-            write_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
-                0,
-            );
-            write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
+                (sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64,
                 0,
             );
-            clear_dpc_diagnostics(FSD_SHARED_VADDR);
+            write_volatile(
+                (sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
+                0,
+            );
+            clear_dpc_diagnostics(sh);
         }
     }
 }
@@ -20715,24 +20719,25 @@ extern "win64" fn s_video_port_write_register_ushort(register: u64, value: u16) 
 
 extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
     unsafe {
+        let sh = hosted_component_resource_shared_va();
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_CALLS);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
+            (sh + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
             port,
         );
         if let Some(cap) = hosted_port_cap_for_component_io(port, 1) {
             if port == VBE_DISPI_IOPORT_DATA
-                && read_volatile((FSD_SHARED_VADDR + SH_VIDEO_DISPI_SELECTED_INDEX) as *const u64)
+                && read_volatile((sh + SH_VIDEO_DISPI_SELECTED_INDEX) as *const u64)
                     as u16
                     == VBE_DISPI_INDEX_VIDEO_MEMORY_64K
             {
                 if let Some(value) = hosted_video_memory_64k_units() {
                     write_volatile(
-                        (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                        (sh + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
                         0,
                     );
                     write_volatile(
-                        (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                        (sh + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
                         value as u64,
                     );
                     return value;
@@ -20740,11 +20745,11 @@ extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
             }
             let (value, status) = crate::io_in16_r(cap, port as u16);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
                 status,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
                 value as u64,
             );
             if status != 0 {
@@ -20761,11 +20766,11 @@ extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
         } else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_DENIED);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
                 u64::MAX,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
                 0,
             );
             0
@@ -20775,25 +20780,26 @@ extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
 
 extern "win64" fn s_video_port_write_port_ushort(port: u64, value: u16) {
     unsafe {
+        let sh = hosted_component_resource_shared_va();
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_CALLS);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
+            (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
             port,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
+            (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
             value as u64,
         );
         if let Some(cap) = hosted_port_cap_for_component_io(port, 1) {
             let status = crate::io_out16(cap, port as u16, value);
             if status == 0 && port == VBE_DISPI_IOPORT_INDEX {
                 write_volatile(
-                    (FSD_SHARED_VADDR + SH_VIDEO_DISPI_SELECTED_INDEX) as *mut u64,
+                    (sh + SH_VIDEO_DISPI_SELECTED_INDEX) as *mut u64,
                     value as u64,
                 );
             }
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
                 status,
             );
             if status != 0 {
@@ -20811,7 +20817,7 @@ extern "win64" fn s_video_port_write_port_ushort(port: u64, value: u16) {
         } else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_DENIED);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
                 u64::MAX,
             );
         }
@@ -34250,6 +34256,25 @@ where
         }
     }
 
+    // Own the exact worker bank before projecting resources into it. A kept export retains this
+    // context with its continuation until the provider really returns.
+    let _device_dispatch_context = if let Some(binding) = dependent_binding {
+        let admitted = HostedDeviceDispatchContextGuard::enter(dependent_index, binding)
+            .and_then(|mut guard| {
+                guard.bind_projection_shared(provider_shared)?;
+                Ok(guard)
+            });
+        match admitted {
+            Ok(guard) => Some(guard),
+            Err(status) => {
+                abort_provider_export_marshal_before_dispatch(&marshal_state);
+                return ProviderExportService::Replied(
+                    hosted_provider_export_failure(status.raw()));
+            }
+        }
+    } else {
+        None
+    };
     if let Some(binding) = dependent_binding {
         if let Err(status) = project_provider_resource_state(
             binding,
@@ -34295,7 +34320,7 @@ where
             packet_array_protocol_receive_packet_completions_before,
         ],
         provider_publication_cookie, provider_export_rva, caller_rsp, image_frames,
-        _dependency_lease,
+        _device_dispatch_context, _dependency_lease,
     };
     match dispatched {
         ExportDispatch::Returned(result) => ProviderExportService::Replied(tail.finish(result)),
@@ -34383,6 +34408,7 @@ struct ProviderExportTail {
     provider_export_rva: u64,
     caller_rsp: u64,
     image_frames: u64,
+    _device_dispatch_context: Option<HostedDeviceDispatchContextGuard>,
     _dependency_lease: HostedProviderDependencyDispatchLease,
 }
 
@@ -34392,7 +34418,8 @@ impl ProviderExportTail {
             policy, marshal_state, singleton, provider_inst, dependent_index, dependent_inst,
             dependent_binding, dependent_shared, provider_shared, original_args, args,
             packet_array_export, packet_before, provider_publication_cookie,
-            provider_export_rva, caller_rsp, image_frames, _dependency_lease,
+            provider_export_rva, caller_rsp, image_frames,
+            _device_dispatch_context, _dependency_lease,
         } = self;
         let [
             packet_array_protocol_receive_requests_before,
@@ -36923,10 +36950,16 @@ unsafe fn service_hosted_provider_callback_service(
         Ok(binding) => binding,
         Err(status) => return hosted_provider_callback_failure(status),
     };
+    let dependent_shared = dependent_inst.exec_shared_va;
     let _device_dispatch_context = match callback_binding {
         Some(binding) => {
             match HostedDeviceDispatchContextGuard::enter(record.dependent_instance, binding) {
-                Ok(guard) => Some(guard),
+                Ok(mut guard) => {
+                    if let Err(status) = guard.bind_projection_shared(dependent_shared) {
+                        return hosted_provider_callback_failure(status.raw());
+                    }
+                    Some(guard)
+                }
                 Err(status) => return hosted_provider_callback_failure(status.raw()),
             }
         }
@@ -36934,7 +36967,6 @@ unsafe fn service_hosted_provider_callback_service(
     };
     trace_hosted_provider_callback(b"enter", record, callback_args, &provider_stack, Ok(0));
 
-    let dependent_shared = dependent_inst.exec_shared_va;
     let saved_dependent_irql = if mirror_legacy_irql {
         let saved = read_volatile((dependent_shared + SH_HOSTED_CURRENT_IRQL) as *const u8);
         let callback_irql =
@@ -53318,6 +53350,7 @@ pub(crate) fn hosted_video_publication_identity_is_live(
 struct HostedDeviceDispatchContext {
     instance: usize,
     binding: HostedDeviceBinding,
+    projection_shared_va: Option<u64>,
 }
 
 type HostedDeviceContextTicket =
@@ -53366,7 +53399,7 @@ impl HostedDeviceDispatchContextGuard {
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         let ticket = match contexts.retain(
             reservation, (instance, binding.device_id),
-            HostedDeviceDispatchContext { instance, binding },
+            HostedDeviceDispatchContext { instance, binding, projection_shared_va: None },
         ) {
             Ok(ticket) => ticket,
             Err(_) => {
@@ -53379,6 +53412,22 @@ impl HostedDeviceDispatchContextGuard {
             return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
         }
         Ok(Self { ticket: Some(ticket) })
+    }
+
+    /// Attach the exact request bank before entering its component pump. The retained row keeps
+    /// this identity across a suspended File dispatch; a later worker cannot borrow its binding.
+    unsafe fn bind_projection_shared(&mut self, shared_va: u64) -> Result<(), nt_status::NtStatus> {
+        if shared_va == 0 {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let ticket = self.ticket.ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        let context = hosted_device_dispatch_contexts_mut().get_mut(ticket)
+            .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        if context.projection_shared_va.is_some() {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        context.projection_shared_va = Some(shared_va);
+        Ok(())
     }
 
     /// End only this active binding. The generation-keyed row continues to own the context.
@@ -53402,6 +53451,7 @@ impl HostedDeviceDispatchContextGuard {
         };
         let binding = context.binding;
         if ticket.key() != (context.instance, binding.device_id)
+            || context.projection_shared_va.is_none()
             || !binding.used
             || binding.instance != context.instance
             || hosted_device_binding_by_device_id(binding.device_id) != Some(binding)
@@ -53491,7 +53541,11 @@ impl HostedProjectionBindingRejection {
 
 fn current_hosted_device_dispatch_binding_for_projection(
     projection_instance: usize,
+    shared_va: u64,
 ) -> Result<HostedDeviceBinding, HostedProjectionBindingRejection> {
+    if shared_va == 0 {
+        return Err(HostedProjectionBindingRejection::Context);
+    }
     let contexts = unsafe {
         (*core::ptr::addr_of!(HOSTED_DEVICE_DISPATCH_CONTEXTS))
             .as_ref()
@@ -53499,8 +53553,9 @@ fn current_hosted_device_dispatch_binding_for_projection(
     };
     let binding = contexts
         .find_active(|context| {
-            context.instance == projection_instance
-                || context.binding.projection_instance == projection_instance
+            context.projection_shared_va == Some(shared_va)
+                && (context.instance == projection_instance
+                    || context.binding.projection_instance == projection_instance)
         })
         .ok_or(HostedProjectionBindingRejection::Context)?
         .binding;
@@ -60428,6 +60483,7 @@ unsafe fn hosted_irq_connection_line_live(connection: HostedIrqConnection) -> bo
 unsafe fn install_hosted_irq_connection(
     binding: HostedDeviceBinding,
     tokens: nt_resource_manager::InterruptTokens,
+    request_state: HostedDeviceResourceState,
 ) -> Result<(), nt_status::NtStatus> {
     if clear_hosted_irq_orphan_lines() != 0 {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
@@ -60487,10 +60543,8 @@ unsafe fn install_hosted_irq_connection(
     if route.tokens != tokens {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let state = hosted_device_resource_state_by_device_id(binding.device_id)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let authority =
-        retain_hosted_irq_connection_authority(binding, state, route).map_err(|rejection| {
+        retain_hosted_irq_connection_authority(binding, request_state, route).map_err(|rejection| {
             trace_hosted_interrupt_broker_rejection(
                 rejection.name(),
                 Some(binding),
@@ -63667,7 +63721,38 @@ unsafe fn read_hosted_device_resource_state_from_shared(
 }
 
 unsafe fn refresh_hosted_device_resource_state(binding: HostedDeviceBinding, sh: u64) {
-    let state = read_hosted_device_resource_state_from_shared(binding, sh);
+    let mut state = read_hosted_device_resource_state_from_shared(binding, sh);
+    // A lane bank carries a pending CONNECT request and can outlive the dispatch that wrote it.
+    // Only the exact installed root connection may become device-owned interrupt evidence.
+    let connection = hosted_irq_connections().and_then(|connections| {
+        connections.iter().find(|connection| {
+            connection.binding == binding && hosted_irq_connection_active(**connection)
+        })
+    });
+    if let Some(connection) = connection {
+        let tokens = connection.route.tokens;
+        if state.evidence.interrupt_object != connection.interrupt_object
+            || state.evidence.interrupt_id != tokens.interrupt_id
+            || state.evidence.interrupt_routine != tokens.service_routine_token
+            || state.evidence.interrupt_context != tokens.service_context_token
+        {
+            state.evidence.interrupt_delivered_vector = 0;
+            state.evidence.interrupt_isr_claimed = 0;
+            state.evidence.interrupt_deliveries = 0;
+        }
+        state.evidence.interrupt_object = connection.interrupt_object;
+        state.evidence.interrupt_routine = tokens.service_routine_token;
+        state.evidence.interrupt_context = tokens.service_context_token;
+        state.evidence.interrupt_id = tokens.interrupt_id;
+    } else {
+        state.evidence.interrupt_object = 0;
+        state.evidence.interrupt_routine = 0;
+        state.evidence.interrupt_context = 0;
+        state.evidence.interrupt_id = 0;
+        state.evidence.interrupt_delivered_vector = 0;
+        state.evidence.interrupt_isr_claimed = 0;
+        state.evidence.interrupt_deliveries = 0;
+    }
     let states = hosted_device_resource_states_mut();
     if let Some(index) = states.iter().position(|slot| {
         slot.device_id != 0
@@ -67603,7 +67688,9 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             Ok(authenticated) => authenticated,
             Err(status) => return (status.raw(), 0, 0, 0),
         };
-    let binding = match current_hosted_device_dispatch_binding_for_projection(instance_index) {
+    let binding = match current_hosted_device_dispatch_binding_for_projection(
+        instance_index, ch.shared_va,
+    ) {
         Ok(binding) => binding,
         Err(_) => return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0),
     };
@@ -68692,7 +68779,9 @@ pub(crate) fn service_hosted_driver_interrupt(
             }
         };
     }
-    let binding = match current_hosted_device_dispatch_binding_for_projection(instance_index) {
+    let binding = match current_hosted_device_dispatch_binding_for_projection(
+        instance_index, ch.shared_va,
+    ) {
         Ok(binding) => binding,
         Err(rejection) => {
             unsafe {
@@ -68863,6 +68952,14 @@ pub(crate) fn service_hosted_driver_interrupt(
                     status: status.raw(), interrupt_id: 0, grant_generation: 0,
                 };
             }
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64, 0);
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64, 0);
+            refresh_hosted_device_resource_state(binding, sh);
             if let Err(status) = hosted_device_allocations::mark_interrupt_projection_canonical_retired(
                 inst, binding, interrupt_object, identity,
             ) {
@@ -68870,8 +68967,6 @@ pub(crate) fn service_hosted_driver_interrupt(
                     status: status.raw(), interrupt_id: 0, grant_generation: 0,
                 };
             }
-            write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
-            refresh_hosted_device_resource_state(binding, sh);
             HostedDriverInterruptServiceResult::Reply {
                 status: STATUS_SUCCESS,
                 interrupt_id: 0,
@@ -73583,11 +73678,13 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
             )?;
             *effect_started = true;
             retire_hosted_irq_connection(binding, existing)?;
+            // Keep the replacement request bytes in this lane; the canonical snapshot now
+            // sees no active connection even if ledger retirement later refuses.
+            refresh_hosted_device_resource_state(binding, sh);
             hosted_device_allocations::mark_interrupt_projection_canonical_retired(
                 projection_inst, binding, retiring.interrupt_object, old_identity,
             )?;
             write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
-            refresh_hosted_device_resource_state(binding, sh);
         }
     }
     let existing = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
@@ -73627,7 +73724,9 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
             projection_inst, binding, interrupt_object,
         )?;
         *effect_started = true;
-        install_hosted_irq_connection(binding, tokens)?;
+        install_hosted_irq_connection(
+            binding, tokens, read_hosted_device_resource_state_from_shared(binding, sh),
+        )?;
         return hosted_device_allocations::bind_interrupt_projection(
             projection_inst, binding, interrupt_object, existing, grant_generation,
         );
@@ -73656,8 +73755,12 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, connected);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64, 0);
+    let request_state = read_hosted_device_resource_state_from_shared(binding, sh);
     refresh_hosted_device_resource_state(binding, sh);
-    if let Err(status) = install_hosted_irq_connection(binding, connected_tokens) {
+    if let Err(status) = install_hosted_irq_connection(binding, connected_tokens, request_state) {
         if hosted_irq_connections().is_some_and(|connections| {
             connections
                 .iter()
@@ -73683,6 +73786,7 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
         refresh_hosted_device_resource_state(binding, sh);
         return Err(status);
     }
+    refresh_hosted_device_resource_state(binding, sh);
     hosted_device_allocations::bind_interrupt_projection(
         projection_inst, binding, interrupt_object, connected, connected_tokens.grant_generation,
     )?;
@@ -76334,7 +76438,7 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
         .filter(|binding| {
             binding.instance == inst && binding.driver_id == dependent_inst.driver_id
         });
-    let _device_dispatch_context = match dispatch_binding {
+    let mut _device_dispatch_context = match dispatch_binding {
         Some(binding) => match HostedDeviceDispatchContextGuard::enter(inst, binding) {
             Ok(guard) => Some(guard),
             Err(status) => {
@@ -76771,6 +76875,11 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
             return Some(HostedIrpTransportResult::NotDispatched {
                 status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
             });
+        }
+    }
+    if let Some(guard) = _device_dispatch_context.as_mut() {
+        if let Err(status) = guard.bind_projection_shared(ch.shared_va) {
+            return Some(HostedIrpTransportResult::NotDispatched { status });
         }
     }
     let mut scsi_srb_pump_timing = ScsiSrbPumpTiming::new(dispatch_request.as_ref()

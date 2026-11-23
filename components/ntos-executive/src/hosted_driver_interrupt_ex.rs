@@ -67,9 +67,10 @@ pub(super) extern "win64" fn s_io_connect_interrupt_ex(parameters: u64) -> i32 {
         return STATUS_INVALID_PARAMETER;
     };
     let version: u32 = unsafe { field(parameters, 0) };
+    let sh = unsafe { hosted_component_resource_shared_va() };
     let pdo: u64 = full_field!(fields, pdo, u64);
     let granted_pdo = unsafe {
-        read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PDO_OBJECT) as *const u64)
+        read_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *const u64)
     };
     if pdo != 0 && pdo != granted_pdo {
         return STATUS_INVALID_PARAMETER;
@@ -104,13 +105,13 @@ pub(super) extern "win64" fn s_io_connect_interrupt_ex(parameters: u64) -> i32 {
                 return STATUS_INVALID_PARAMETER;
             }
             let vector = unsafe {
-                read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32)
+                read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32)
             };
             let affinity = unsafe {
-                read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64)
+                read_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64)
             };
             let policy = unsafe {
-                read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_POLICY) as *const u64)
+                read_volatile((sh + SH_RESOURCE_INTERRUPT_POLICY) as *const u64)
             };
             let irql = policy as u8;
             let requested_sync_irql: u8 = full_field!(fields, synchronize_irql, u8);
@@ -147,18 +148,19 @@ pub(super) extern "win64" fn s_io_disconnect_interrupt_ex(parameters: u64) {
     if !matches!(version, CONNECT_FULLY_SPECIFIED | CONNECT_LINE_BASED | CONNECT_FULLY_SPECIFIED_GROUP) {
         unsafe { crate::provider_bugcheck::report(0xc4, [0x49524458, parameters, version as u64, 1]) }
     }
+    let sh = unsafe { hosted_component_resource_shared_va() };
     let connection: u64 = unsafe { field(parameters, 8) };
     if connection == 0 {
         return;
     }
     let active = unsafe {
-        read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64)
+        read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64)
     };
     if connection != active {
         unsafe { crate::provider_bugcheck::report(0xc4, [0x49524458, connection, active, 2]) }
     }
     s_io_disconnect_interrupt(connection);
-    if unsafe { read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64) }
+    if unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64) }
         == connection
     {
         unsafe { crate::provider_bugcheck::report(0xc4, [0x49524458, connection, version as u64, 3]) }
