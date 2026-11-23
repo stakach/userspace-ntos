@@ -3457,6 +3457,21 @@ unsafe fn take_ready_deferred_user_callback_return() -> Option<DeferredCallbackR
 }
 
 
+fn live_gui_caller_role(
+    nt_handler: &ExecNtHandler,
+    caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
+    pi: usize,
+) -> Option<nt_exe_image::HostedProcessRole> {
+    let caller = caller?;
+    if caller.pi() != pi
+        || nt_handler.capture_process_identity(pi) != Some(caller.process())
+        || !nt_handler.validate_provider_logical_caller(caller)
+    {
+        return None;
+    }
+    nt_handler.live_execution_role(pi)
+}
+
 unsafe fn process_completed_user_callback_outer_dispatch(
     nt_handler: &mut ExecNtHandler,
     completion_pi: usize,
@@ -3468,6 +3483,9 @@ unsafe fn process_completed_user_callback_outer_dispatch(
     completion_faults: usize,
     completion_scratch_base: u64,
 ) -> bool {
+    let winlogon_completion = live_gui_caller_role(
+        nt_handler, dispatch.logical_caller, completion_pi,
+    ) == Some(nt_exe_image::HostedProcessRole::InteractiveLogon);
     if let Some(context) = dispatch.dispatch_context {
         let requester_generation = nt_handler.hosted_process_generation(completion_pi).unwrap_or(0);
         if !win32k_bulk_mapping::complete_dispatch(
@@ -3565,7 +3583,7 @@ unsafe fn process_completed_user_callback_outer_dispatch(
             print_hex_u64(wparam);
             print_str(b"\n");
         }
-        if completion_pi == 2
+        if winlogon_completion
             && nt_user_callback::message_dispatch_returned_message(dispatch.ssn, dispatch.status)
         {
             let hwnd = u64::from_le_bytes(dispatch.arg_snapshot[0..8].try_into().unwrap());
@@ -3617,9 +3635,10 @@ unsafe fn process_completed_user_callback_outer_dispatch(
             return false;
         }
     }
-    if completion_pi == 2 {
+    if winlogon_completion {
         observe_winlogon_completed_dispatch(
             dispatch,
+            completion_pi as u64,
             completion_scratch_base,
         );
         observe_completed_dialog_modal_dispatch(dispatch, completion_badge, completion_tid);
@@ -3643,17 +3662,14 @@ fn observe_completed_gdi_batch_flush(
     let records = u64::from(receipt.records);
     if records == 0 { return; }
     let Some(caller) = original_caller else { return; };
+    let Some(role) = live_gui_caller_role(nt_handler, Some(caller), caller.pi()) else {
+        return;
+    };
     GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
     GDI_BATCH_RECORDS_FLUSHED.fetch_add(records, Ordering::Relaxed);
     nt_handler.observe_desktop_gui_for(caller, DesktopGuiFact::BatchFlush, 1);
     nt_handler.observe_desktop_gui_for(caller, DesktopGuiFact::BatchRecords, records);
-    let explorer = hosted_process_runtime_for_pi(caller.pi())
-        .is_some_and(|runtime| {
-            runtime.observation_role == nt_exe_image::HostedProcessRole::InteractiveShell
-                && caller.process().generation
-                    == nt_user_host::process_identity::ProcessGeneration::Hosted(runtime.generation)
-        });
-    if explorer {
+    if role == nt_exe_image::HostedProcessRole::InteractiveShell {
         if EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed) == 0 {
             note_boot_progress(BootProgress::ExplorerGdiBatchObserved);
         }
@@ -4118,13 +4134,16 @@ fn record_hosted_client_gdi_mapping(
     nt_handler: &mut ExecNtHandler, pi: usize, gdi_va: u64,
     caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
 ) {
+    let Some(role) = live_gui_caller_role(nt_handler, caller, pi) else {
+        return;
+    };
     if let Some(caller) = caller {
         nt_handler.observe_desktop_gui_for(caller, DesktopGuiFact::GdiMapped, 1);
     }
     let Some(image) = nt_handler.hosted_process_image(pi) else {
         return;
     };
-    let first = match image.observation_role() {
+    let first = match role {
         nt_exe_image::HostedProcessRole::InteractiveLogon => {
             WINLOGON_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0
         }
@@ -9565,6 +9584,7 @@ fn userconnect_write_u64(buffer: &mut [u8], offset: u64, value: u64) {
 
 unsafe fn observe_winlogon_completed_dispatch(
     dispatch: win32k_glue::CompletedWin32kDispatch,
+    pi: u64,
     scratch_base: u64,
 ) {
     if dispatch.ssn != 0x1077 || dispatch.status == 0 {
@@ -9604,7 +9624,7 @@ unsafe fn observe_winlogon_completed_dispatch(
 
     let mut raw = [0u8; 16];
     let descriptor_read =
-        img_spawn::client_copyin_mapped(2, name, &mut raw, scratch_base);
+        img_spawn::client_copyin_mapped(pi, name, &mut raw, scratch_base);
     let descriptor = descriptor_read
         .then(|| nt_user_callback::LargeUnicodeStringDescriptor::parse(&raw))
         .and_then(Result::ok);
@@ -9614,14 +9634,14 @@ unsafe fn observe_winlogon_completed_dispatch(
         raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
     ]);
     let source = if descriptor.is_some()
-        && csrss_frame_get_exact_record(2, raw_buffer & !0xfff)
+        && csrss_frame_get_exact_record(pi, raw_buffer & !0xfff)
             .and_then(nt_memory_manager::ClientFrameRecord::mapped_alias)
             .is_some()
     {
         1
-    } else if descriptor.is_some() && csrss_frame_get(2, raw_buffer & !0xfff) != 0 {
+    } else if descriptor.is_some() && csrss_frame_get(pi, raw_buffer & !0xfff) != 0 {
         3
-    } else if descriptor.is_some() && client_copyin_frame_get(2, raw_buffer & !0xfff) != 0 {
+    } else if descriptor.is_some() && client_copyin_frame_get(pi, raw_buffer & !0xfff) != 0 {
         4
     } else {
         0
@@ -9633,7 +9653,7 @@ unsafe fn observe_winlogon_completed_dispatch(
     if let Some(descriptor) = descriptor {
         let length = descriptor.length_bytes as usize;
         caption_read = img_spawn::client_copyin_mapped(
-            2,
+            pi,
             descriptor.buffer,
             &mut bytes[..length],
             scratch_base,

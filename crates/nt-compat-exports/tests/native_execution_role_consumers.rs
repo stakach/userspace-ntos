@@ -313,3 +313,79 @@ fn terminal_and_ingress_roles_use_admitted_process_owners() {
     assert!(ingress.contains("live_execution_role(pi)"),
         "win32k ingress must reject a stale or pending process role");
 }
+
+#[test]
+fn win32k_worker_route_requires_a_live_non_native_owner() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/executor/syscall.rs"),
+    )
+    .expect("native syscall route source");
+    let route = source.split("} else if lp.msg.m0 >= win32k_subsystem::WIN32K_SERVICE_BASE")
+        .nth(1).expect("win32k ingress route")
+        .split("loop_syscall_win32k::syscall_win32k_route").next().unwrap();
+    let compact: String = route.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("(is_wl_worker||is_tp_worker)")
+        && compact.contains("live_execution_role(pi)")
+        && compact.contains("role!=nt_exe_image::HostedProcessRole::NativeSession"),
+        "a worker badge needs a committed, running non-native process role before win32k dispatch");
+    assert!(!compact.contains("pi!=0"),
+        "a nonzero process slot does not authorize an uncommitted or stale worker");
+}
+
+#[test]
+fn completed_gui_milestones_require_the_exact_live_caller_role() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/service_sec_image.rs"),
+    )
+    .expect("native GUI completion source");
+    let body = |start: &str, end: &str| -> String {
+        source.split(start).nth(1).expect("GUI completion function")
+            .split(end).next().unwrap().chars().filter(|c| !c.is_whitespace()).collect()
+    };
+    let role = body("fn live_gui_caller_role(", "unsafe fn process_completed_user_callback_outer_dispatch(");
+    assert!(role.contains("caller.pi()!=pi")
+        && role.contains("capture_process_identity(pi)!=Some(caller.process())")
+        && role.contains("validate_provider_logical_caller(caller)")
+        && role.contains("live_execution_role(pi)"),
+        "callback effects need the retained exact caller and committed running role");
+    let completion = body("unsafe fn process_completed_user_callback_outer_dispatch(",
+        "fn observe_completed_gdi_batch_flush(");
+    assert!(completion.contains("live_gui_caller_role(nt_handler,dispatch.logical_caller,completion_pi,")
+        && !completion.contains("completion_pi==2"),
+        "Winlogon credential and dialog observations cannot depend on a fixed process slot");
+    let winlogon = body("unsafe fn observe_winlogon_completed_dispatch(",
+        "unsafe fn observe_completed_dialog_modal_dispatch(");
+    assert!(winlogon.contains("client_copyin_mapped(pi")
+        && !winlogon.contains("client_copyin_mapped(2")
+        && !winlogon.contains("csrss_frame_get(2")
+        && !winlogon.contains("client_copyin_frame_get(2"),
+        "Winlogon's dialog capture must read the proven caller's address space");
+    let batch = body("fn observe_completed_gdi_batch_flush(",
+        "fn observe_completed_desktop_dispatch(");
+    assert!(batch.contains("live_gui_caller_role(nt_handler,Some(caller),caller.pi())")
+        && !batch.contains("runtime.observation_role"),
+        "a catalog observation cannot credit Explorer's completed GDI batch");
+    let mapping = body("fn record_hosted_client_gdi_mapping(", "fn ntgdi_bitmap_format_rgb(");
+    assert!(mapping.contains("live_gui_caller_role(nt_handler,caller,pi)")
+        && !mapping.contains("image.observation_role()"),
+        "a catalog observation cannot credit GUI mapping after the process role is gone");
+}
+
+#[test]
+fn inline_winlogon_completion_checks_the_exact_live_caller() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/executor/syscall_win32k.rs"),
+    )
+    .expect("inline win32k route source");
+    let completion = source.split("if winlogon_gui_client && lp.msg.m0 == 0x1077")
+        .nth(1).expect("inline winlogon completion")
+        .split("// ★ BATCH 45").next().unwrap();
+    let compact: String = completion.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("live_gui_caller_role(&nt_handler,dispatch_client.logical_caller,pi)")
+        && compact.contains("observe_winlogon_completed_dispatch(")
+        && compact.contains("piasu64"),
+        "inline Winlogon completion must be tied to its retained live caller and process space");
+}

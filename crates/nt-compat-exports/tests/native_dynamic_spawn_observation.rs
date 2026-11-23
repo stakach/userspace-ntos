@@ -214,16 +214,23 @@ fn final_spawn_gates_observe_dynamic_instances_not_fixed_pi_atomics() {
 }
 
 #[test]
-fn diagnostic_frontiers_use_observational_lookup_without_changing_operational_roles() {
+fn diagnostic_and_operational_frontiers_use_their_respective_role_sources() {
     let file = syn::parse_file(SERVICE).unwrap();
     for name in ["dump_interactive_logon_quiesce", "dump_services_start_quiesce",
-        "pre_user_shell_frontier_pending", "progress_stall_deferral_snapshot"] {
+    ] {
         let observed = audit(function(&file, name));
         assert!(observed.calls.iter().any(|name| name == "live_hosted_pi_for_observation_role"),
             "{name} must not select a static unspawned role registration");
         assert!(!observed.paths.iter().any(|name|
             ["WINLOGON_SPAWNED", "SERVICES_SPAWNED", "LSASS_SPAWNED"].contains(&name.as_str())),
             "{name} must not depend on legacy fixed-PI spawn observations");
+    }
+    for name in ["pre_user_shell_frontier_pending", "progress_stall_deferral_snapshot"] {
+        let operational = audit(function(&file, name));
+        assert!(operational.calls.iter().any(|call| call == "live_hosted_pi_for_execution_role"),
+            "{name} must use a committed running execution role to defer quiescence");
+        assert!(!operational.calls.iter().any(|call| call == "live_hosted_pi_for_observation_role"),
+            "{name} cannot use a catalog observation to keep the guest alive");
     }
     let operational = audit(function(&file, "live_process_context_for_role"));
     assert!(operational.methods.iter().any(|name| name == "unique_live_execution_target"),

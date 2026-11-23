@@ -873,8 +873,10 @@ pub(super) unsafe fn syscall(
         loop_syscall_nt::syscall_nt_route(lp, ev, &call, &mut sc, route)?;
     } else if lp.msg.m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
         && (hosted_non_native_top_level_badge(&nt_handler, lp.msg.badge)
-            || is_wl_worker
-            || (is_tp_worker && pi != 0))
+            || ((is_wl_worker || is_tp_worker)
+                && nt_handler.live_execution_role(pi).is_some_and(|role| {
+                    role != nt_exe_image::HostedProcessRole::NativeSession
+                })))
     {
         loop_syscall_win32k::syscall_win32k_route(lp, ev, &call, &mut sc)?;
     } else {

@@ -4358,9 +4358,13 @@ pub(super) unsafe fn syscall_win32k_route(
         sc.result = nt_user_callback::STATUS_PENDING as u32 as u64;
     } else if ok {
         sc.result = st; // pointer-width NtUser/NtGdi return value back to the caller
-        if winlogon_gui_client && lp.msg.m0 == 0x1077 && st != 0 {
+        if winlogon_gui_client && lp.msg.m0 == 0x1077 && st != 0
+            && live_gui_caller_role(&nt_handler, dispatch_client.logical_caller, pi)
+                == Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
+        {
             observe_winlogon_completed_dispatch(
                 win32k_glue::CompletedWin32kDispatch::new(lp.msg.m0, completion_args, sp, st),
+                pi as u64,
                 scratch_base,
             );
         }
