@@ -55,10 +55,11 @@ class ParseScriptTests(unittest.TestCase):
         # before typing rather than clicking an old window's title bar.
         self.assertEqual([step.name for step in script.steps],
                          ["baseline", "start-menu", "start-menu-closed",
-                          "desktop-clear", "command-prompt", "ver"])
+                          "desktop-clear", "command-prompt-selected", "command-prompt", "ver"])
         self.assertEqual(script.steps[3].actions, (("click", (800, 600)),))
-        self.assertEqual(script.steps[4].actions, (("verified_double_click", (37, 470)),))
-        self.assertEqual(script.steps[5].actions, (("type", "ver\n"),))
+        self.assertEqual(script.steps[4].actions, (("verified_click", (37, 470)),))
+        self.assertEqual(script.steps[5].actions, (("key", ("ret",)),))
+        self.assertEqual(script.steps[6].actions, (("type", "ver\n"),))
 
     def test_document_parses_to_ordered_steps(self):
         script = parse_script(DOCUMENT)
@@ -67,6 +68,15 @@ class ParseScriptTests(unittest.TestCase):
         self.assertEqual(script.steps[2].wait_seconds, 8.0)
         self.assertEqual(script.settle_seconds, 20.0)
         self.assertEqual(script.arm, "seal")
+
+    def test_named_selection_gate_requires_one_verified_click(self):
+        for actions in ([], [{"click": [37, 470]}],
+                        [{"verified_click": [37, 470]}, {"key": ["ret"]}]):
+            with self.subTest(actions=actions), self.assertRaisesRegex(
+                    ValueError, "one verified_click"):
+                parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                              "steps": [{"name": "command-prompt-selected",
+                                         "actions": actions, "wait_seconds": 0}]})
 
     def test_arm_mode_selects_seal_or_sealed_idle(self):
         self.assertEqual(parse_script({**DOCUMENT, "arm": "idle"}).arm, "idle")
@@ -262,7 +272,7 @@ class InteractionRunnerTests(unittest.TestCase):
                                "steps": [
                                    {"name": "baseline", "actions": [], "wait_seconds": 0},
                                    {"name": "command-prompt", "actions": [
-                                       {"verified_double_click": [37, 470]}],
+                                       {"verified_click": [37, 470]}],
                                     "wait_seconds": 0}]})
         positions = iter(((37, 446), (37, 470)))
         def probe(_before, after, _target):
@@ -277,7 +287,8 @@ class InteractionRunnerTests(unittest.TestCase):
         self.assertEqual(rel_sum(self.performed[1]), (0, 24))
         self.assertEqual([events[0]["data"]["down"]
                           for events, _pause in self.performed[2]],
-                         [True, False, True, False])
+                         [True, False])
+        self.assertGreaterEqual(self.performed[2][0][1], 0.15)
         self.assertEqual([receipt["position"] for receipt in runner.cursor_receipts],
                          [[37, 446], [37, 470]])
 
@@ -286,7 +297,7 @@ class InteractionRunnerTests(unittest.TestCase):
                                "steps": [
                                    {"name": "baseline", "actions": [], "wait_seconds": 0},
                                    {"name": "command-prompt", "actions": [
-                                       {"verified_double_click": [37, 470]}],
+                                       {"verified_click": [37, 470]}],
                                     "wait_seconds": 0}]})
         runner = InteractionRunner(
             script, self.performed.append, self.captured.append, self.log, self.clock,
@@ -302,7 +313,7 @@ class InteractionRunnerTests(unittest.TestCase):
                                "steps": [
                                    {"name": "baseline", "actions": [], "wait_seconds": 0},
                                    {"name": "command-prompt", "actions": [
-                                       {"verified_double_click": [37, 470]}],
+                                       {"verified_click": [37, 470]}],
                                     "wait_seconds": 0}]})
         runner = InteractionRunner(
             script, self.performed.append, self.captured.append, self.log, self.clock,
@@ -313,6 +324,63 @@ class InteractionRunnerTests(unittest.TestCase):
         self.assertEqual(runner.failures, 1)
         self.assertEqual(len(runner.cursor_receipts), 3)
         self.assertEqual(len(self.performed), 3)  # initial aim and two corrections, no click
+
+    def test_unselected_icon_halts_before_enter(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "baseline", "actions": [], "wait_seconds": 0},
+                                   {"name": "command-prompt-selected", "actions": [
+                                       {"verified_click": [37, 470]}], "wait_seconds": 0},
+                                   {"name": "command-prompt", "actions": [
+                                       {"key": ["ret"]}], "wait_seconds": 0}]})
+        proof = VisualProof(False, error="Command Prompt icon not selected",
+                            image_name="selection.ppm", image_sha256="recorded-sha")
+        runner = InteractionRunner(
+            script, self.performed.append, self.captured.append, self.log, self.clock,
+            checks={"command-prompt-selected": lambda _name: proof},
+            cursor_probe=lambda _before, after, _target:
+                CursorProof((37, 470), after, "aim-sha"))
+        runner.arm(0)
+        runner.advance(0)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(len(self.performed), 2)  # aim and held click, never Enter
+        self.assertEqual(runner.checkpoints["command-prompt-selected"], proof)
+
+    def test_selected_icon_sends_enter_before_ready_prompt_checkpoint(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "baseline", "actions": [], "wait_seconds": 0},
+                                   {"name": "command-prompt-selected", "actions": [
+                                       {"verified_click": [37, 470]}], "wait_seconds": 0},
+                                   {"name": "command-prompt", "actions": [
+                                       {"key": ["ret"]}], "wait_seconds": 0}]})
+        selected = VisualProof(True, image_name="selected.ppm", image_sha256="selected-sha")
+        ready = VisualProof(True, image_name="prompt.ppm", image_sha256="prompt-sha")
+        runner = InteractionRunner(
+            script, self.performed.append, self.captured.append, self.log, self.clock,
+            checks={"command-prompt-selected": lambda _name: selected,
+                    "command-prompt": lambda _name: ready},
+            cursor_probe=lambda _before, after, _target:
+                CursorProof((37, 470), after, "aim-sha"))
+        runner.arm(0)
+        runner.advance(0)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 0)
+        self.assertEqual(keys(self.performed[2]), [("ret", True), ("ret", False)])
+        entries = [json.loads(line) for line in self.log.read_text().splitlines()]
+        selected_index = next(i for i, entry in enumerate(entries)
+                              if entry["event"] == "checkpoint"
+                              and entry["name"] == "command-prompt-selected")
+        enter_index = next(i for i, entry in enumerate(entries)
+                           if entry["event"] == "action"
+                           and entry["name"] == "command-prompt")
+        ready_index = next(i for i, entry in enumerate(entries)
+                           if entry["event"] == "checkpoint"
+                           and entry["name"] == "command-prompt")
+        self.assertLess(selected_index, enter_index)
+        self.assertLess(enter_index, ready_index)
+        self.assertEqual(list(runner.checkpoints), ["command-prompt-selected", "command-prompt"])
 
     def test_seal_detector_finds_the_desktop_record(self):
         path = Path(self.directory.name) / "serial.log"
