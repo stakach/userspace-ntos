@@ -239,10 +239,10 @@ pub(super) unsafe fn report(
     // === PRIVATE-VM COMMIT/DECOMMIT/RE-COMMIT SELF-TEST (POST-QUIESCE). Runs on the real
     // `vm_map_private_page` path in a real hosted VSpace, at a VA above every placement the boot
     // makes, so it perturbs nothing. See `private_vm_unmap_selftest`. ===
-    if let Some(logon_pi) = hosted_pi_for_role(
-        &nt_handler,
+    if let Some((target, _)) = nt_handler.unique_live_execution_target(
         nt_exe_image::HostedProcessRole::InteractiveLogon,
     ) {
+        let logon_pi = target.pi;
         crate::private_vm_unmap_selftest(
             &mut nt_handler,
             logon_pi,

@@ -225,11 +225,25 @@ fn diagnostic_frontiers_use_observational_lookup_without_changing_operational_ro
             ["WINLOGON_SPAWNED", "SERVICES_SPAWNED", "LSASS_SPAWNED"].contains(&name.as_str())),
             "{name} must not depend on legacy fixed-PI spawn observations");
     }
-    let operational = audit(function(&file, "hosted_pi_for_role"));
-    assert!(operational.methods.iter().any(|name| name == "hosted_process_role"));
-    assert!(!operational.methods.iter().any(|name| name == "observation_role"));
+    let operational = audit(function(&file, "live_process_context_for_role"));
+    assert!(operational.methods.iter().any(|name| name == "unique_live_execution_target"),
+        "worker ownership needs one committed running process, never the first catalog match");
+    assert!(!operational.calls.iter().any(|name| name == "hosted_pi_for_role"));
     let runtime = syn::parse_file(RUNTIME).unwrap();
     let binding = audit(function(&runtime, "runtime_for_image"));
     assert!(binding.calls.iter().any(|name| name == "spawned_signal_for_pi"),
         "operational unspawned admission must retain its exact per-instance signal");
+}
+
+#[test]
+fn missing_live_worker_owner_aborts_the_unentered_publication() {
+    let file = syn::parse_file(SERVICE).unwrap();
+    let multiplexed = audit(function(&file, "spawn_requested_multiplexed_thread"));
+    let local = audit(function(&file, "spawn_requested_local_thread"));
+    for (name, branch) in [("multiplexed", multiplexed), ("winlogon", local)] {
+        assert!(branch.methods.iter().any(|method| method == "abort_unbuilt_hosted_thread_request"),
+            "{name} must retire its exact unentered publication when no unique owner exists");
+    }
+    assert!(!SERVICE.contains("hosted EPROCESS missing before multiplexed thread spawn"));
+    assert!(!SERVICE.contains("winlogon EPROCESS missing before worker spawn"));
 }

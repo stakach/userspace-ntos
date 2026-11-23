@@ -8613,16 +8613,6 @@ fn hosted_top_badge_for_role(
     })
 }
 
-fn hosted_pi_for_role(
-    nt_handler: &ExecNtHandler,
-    role: nt_exe_image::HostedProcessRole,
-) -> Option<usize> {
-    (0..MAX_PI).find(|&pi| {
-        hosted_process_runtime_for_pi(pi).is_some()
-            && nt_handler.hosted_process_role(pi) == Some(role)
-    })
-}
-
 pub(crate) fn live_hosted_pi_for_observation_role(
     nt_handler: &ExecNtHandler,
     role: nt_exe_image::HostedProcessRole,
@@ -11492,9 +11482,11 @@ unsafe fn spawn_requested_multiplexed_thread(
     publication: PreparedHostedThreadPublication,
     fault_ep: u64,
 ) -> Result<(), u32> {
-    let (owner_pi, cid_proc, pml4) =
-        live_process_context_for_role(nt_handler, procs, spec.owner_role)
-            .expect("hosted EPROCESS missing before multiplexed thread spawn");
+    let Some((owner_pi, cid_proc, pml4)) =
+        live_process_context_for_role(nt_handler, procs, spec.owner_role) else {
+            nt_handler.abort_unbuilt_hosted_thread_request(publication);
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        };
     let tid = publication.tid();
     if publication.pid() != cid_proc
         || nt_handler.hosted_thread_tid_for_role(owner_pi, spec.role) != Some(tid)
@@ -12188,10 +12180,12 @@ fn live_process_context_for_role(
     procs: &[ProcExec],
     role: nt_exe_image::HostedProcessRole,
 ) -> Option<(usize, u64, u64)> {
-    let pi = hosted_pi_for_role(nt_handler, role)?;
-    let pid = nt_handler.pm_pid_for_pi(pi)?;
-    nt_handler.pm.process(pid)?;
-    Some((pi, pid as u64, procs[pi].pml4))
+    let (target, process) = nt_handler.unique_live_execution_target(role)?;
+    let pi = target.pi;
+    if nt_handler.pm_pid_for_pi(pi)? != process.pid {
+        return None;
+    }
+    Some((pi, process.pid as u64, procs.get(pi)?.pml4))
 }
 
 #[inline(never)]
@@ -12272,12 +12266,14 @@ unsafe fn spawn_requested_local_thread(
                     return Err(nt_process::STATUS_INVALID_PARAMETER);
                 }
             };
-            let (wl_pi, cid_proc, pml4) = live_process_context_for_role(
+            let Some((wl_pi, cid_proc, pml4)) = live_process_context_for_role(
                 nt_handler,
                 procs,
                 nt_exe_image::HostedProcessRole::InteractiveLogon,
-            )
-            .expect("winlogon EPROCESS missing before worker spawn");
+            ) else {
+                nt_handler.abort_unbuilt_hosted_thread_request(publication);
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            };
             let tid = publication.tid();
             if publication.pid() != cid_proc
                 || nt_handler.hosted_thread_tid_for_role(wl_pi, role) != Some(tid)
