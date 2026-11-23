@@ -10,7 +10,9 @@ import subprocess
 COMMAND = re.compile(r"(?im)^[ \t]*[a-z]:\\[^\r\n>]*>[ \t]*ver[ \t]*$")
 RESULT = re.compile(r"(?im)^[ \t]*Microsoft Windows[ \t]*\[Version[ \t]+\d+(?:\.\d+)+\][ \t]*$")
 READY_TITLE = re.compile(r"(?im)^[^\w\r\n]{0,3}Command Prompt[ \t]*$")
-READY_PROMPT = re.compile(r"(?im)^[ \t]*[a-z]:\\[^\r\n>]{1,128}>[ \t]*$")
+# Tesseract can read the block cursor immediately after an empty prompt as one comma.
+# Keep the line anchored so a typed command still fails this pre-input checkpoint.
+READY_PROMPT = re.compile(r"(?im)^[ \t]*[a-z]:\\[^\r\n>]{1,128}>,?[ \t]*$")
 
 
 @dataclass(frozen=True)
