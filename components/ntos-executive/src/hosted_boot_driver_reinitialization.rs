@@ -47,6 +47,19 @@ pub(super) unsafe fn component_dispatch() -> (i32, u64) {
     hosted_driver_reinitialization::component_dispatch_with_flag(BOOTREINIT_REGISTERED)
 }
 
+/// Boot callbacks need the published DriverObject, even when no device makes the instance ready
+/// for ordinary IRPs. A provisional DriverObject alone never satisfies this predicate.
+pub(super) fn boot_ticket_matches_published_instance(
+    inst: DriverInstance,
+    identity: nt_io_manager::driver_reinitialization::DriverReinitializationIdentity,
+) -> bool {
+    inst.driver_object == identity.driver_object
+        && instance_domain_identity(inst).is_some_and(|domain| {
+            domain.domain_id.raw() == identity.domain_id
+                && domain.cookie == identity.domain_cookie
+        })
+}
+
 /// This phase follows all boot-start DriverEntry launches, matching the NT I/O manager's
 /// one-shot boot reinit drain. An uncertain callback remains Executing and blocks replay.
 pub(crate) unsafe fn run_pending_boot_callbacks() -> Result<usize, nt_status::NtStatus> {
@@ -65,13 +78,8 @@ pub(crate) unsafe fn run_pending_boot_callbacks() -> Result<usize, nt_status::Nt
         }
     }
     while let Some(ticket) = hosted_driver_reinitialization::queue().begin_next_boot_ready(|identity| {
-        instance_by_driver_id(identity.driver_id).is_some_and(|(_, inst)| {
-            inst.driver_object == identity.driver_object
-                && instance_domain_identity(inst).is_some_and(|domain| {
-                    domain.domain_id.raw() == identity.domain_id
-                        && domain.cookie == identity.domain_cookie
-                })
-        })
+        instance_by_driver_id(identity.driver_id)
+            .is_some_and(|(_, inst)| boot_ticket_matches_published_instance(inst, identity))
     }) {
         let (index, inst) = instance_by_driver_id(ticket.identity.driver_id)
             .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;

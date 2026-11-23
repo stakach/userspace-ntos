@@ -44583,7 +44583,6 @@ impl LoadTail {
             print_str(b"\n");
             return Err(status);
         }
-        driver_instances_mut()[instance].driver_object = drvobj;
         let retained = driver_instances_mut()[instance];
         component.drvobj = drvobj;
         component.add_device = add_device;
