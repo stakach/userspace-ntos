@@ -64,7 +64,15 @@ pub(crate) unsafe fn run_pending_boot_callbacks() -> Result<usize, nt_status::Nt
             }
         }
     }
-    while let Some(ticket) = hosted_driver_reinitialization::queue().begin_next_boot() {
+    while let Some(ticket) = hosted_driver_reinitialization::queue().begin_next_boot_ready(|identity| {
+        instance_by_driver_id(identity.driver_id).is_some_and(|(_, inst)| {
+            inst.driver_object == identity.driver_object
+                && instance_domain_identity(inst).is_some_and(|domain| {
+                    domain.domain_id.raw() == identity.domain_id
+                        && domain.cookie == identity.domain_cookie
+                })
+        })
+    }) {
         let (index, inst) = instance_by_driver_id(ticket.identity.driver_id)
             .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
         let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::ACCESS_DENIED)?;

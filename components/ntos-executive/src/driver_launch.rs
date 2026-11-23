@@ -128,6 +128,8 @@ pub(crate) mod hosted_driver_interface_registry;
 mod hosted_device_object_pointer;
 #[path = "hosted_driver_reinitialization.rs"]
 mod hosted_driver_reinitialization;
+#[path = "hosted_driver_object_claim.rs"]
+mod hosted_driver_object_claim;
 #[path = "hosted_boot_driver_reinitialization.rs"]
 mod hosted_boot_driver_reinitialization;
 #[path = "hosted_driver_safe_boot.rs"]
@@ -6480,6 +6482,7 @@ const HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED: u64 = 24;
 const HOSTED_DEVICE_OP_START_NEXT_PACKET: u64 = 25;
 const HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED: u64 = 26;
 const HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT: u64 = 27;
+const HOSTED_DEVICE_OP_CLAIM_DRIVER_OBJECT: u64 = 42;
 const HOSTED_DEVICE_OP_REGISTER_BOOT_DRIVER_REINIT: u64 = 39;
 const HOSTED_DEVICE_OP_GET_INTERFACE_BEGIN: u64 = 28;
 const HOSTED_DEVICE_OP_GET_INTERFACE_PULL: u64 = 29;
@@ -39664,6 +39667,7 @@ pub unsafe extern "C" fn fsd_component_entry(heap_frames: u64) -> ! {
             mj: WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64,
             mj_table_off: SH_MJ_TABLE, // 0x18 — the FSD records its MajorFunction[] base here
             pool: pool_alloc,
+            pre_driver_entry: Some(hosted_driver_object_claim::claim_before_entry),
             foreign_call2_va: read_volatile(
                 (FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL2_VA) as *const u64,
             ),
@@ -44445,13 +44449,23 @@ unsafe fn continue_reinit(
 
 impl LoadTail {
     unsafe fn finish(self, pr: crate::spawn_hosts::PumpResult) -> LoadProgress {
+        let index = self.component.instance;
         match self.publish(pr) {
             Ok(dc) => {
                 let run = hosted_driver_reinitialization::begin_pending_for_instance(
                     dc.instance, initial_system_driver_caller());
                 continue_reinit(dc, run)
             }
-            Err(status) => LoadProgress::Done(Err(status)),
+            Err(status) => {
+                // Only queued, never-executed callbacks can be retired after a failed load.
+                // An uncertain executing ticket keeps the instance quarantined.
+                let status = if hosted_driver_reinitialization::retire_unpublished(index).is_ok() {
+                    status
+                } else {
+                    nt_status::NtStatus::DEVICE_BUSY
+                };
+                LoadProgress::Done(Err(status))
+            }
         }
     }
 
@@ -44524,6 +44538,12 @@ impl LoadTail {
             nt_hosted_runtime::DriverLoadStep::KeepParked =>
                 unreachable!("a returned DriverEntry is never kept"),
         }
+        let Some(published_claim) = hosted_driver_object_claim::published_identity(
+            driver_instances_mut()[instance].provisional_driver_object, drvobj,
+        ) else {
+            print_str(b"[driver-launch] DriverObject claim/publication mismatch\n");
+            return Err(nt_status::NtStatus::ACCESS_DENIED);
+        };
         if let Some(provider) = provider {
             record_hosted_provider_load(
                 provider,
@@ -44591,7 +44611,7 @@ impl LoadTail {
         print_u64(device_count as u64);
         print_str(b"\n");
         // Record the live instance and publish canonical driver/device route ids for callers.
-        register_instance(&dc);
+        register_instance(&dc, published_claim);
         Ok(dc)
     }
 }
@@ -62187,6 +62207,7 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_START_NEXT_PACKET
             | HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED
             | HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT
+            | HOSTED_DEVICE_OP_CLAIM_DRIVER_OBJECT
             | HOSTED_DEVICE_OP_REGISTER_BOOT_DRIVER_REINIT
             | HOSTED_DEVICE_OP_GET_INTERFACE_BEGIN
             | HOSTED_DEVICE_OP_GET_INTERFACE_PULL
@@ -62242,6 +62263,15 @@ pub(crate) fn service_hosted_device(
             0,
             0,
             0,
+        );
+    }
+    if op == HOSTED_DEVICE_OP_CLAIM_DRIVER_OBJECT {
+        if arg2 != 0 || arg3 != 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        return (
+            hosted_driver_object_claim::service_claim(ch, pdo_object, active_reply_cap),
+            0, 0, 0,
         );
     }
     if op == HOSTED_DEVICE_OP_REGISTER_BOOT_DRIVER_REINIT {
@@ -65285,6 +65315,8 @@ pub(crate) struct DriverInstance {
     pub hosted_domain_id: u64,
     pub hosted_domain_cookie: u64,
     pub driver_id: u64,
+    /// Claimed by the root from the harness before any foreign DriverEntry code runs.
+    pub provisional_driver_object: u64,
     pub driver_object: u64,
     pub driver_unload: u64,
     pub add_device: u64,
@@ -65334,6 +65366,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     hosted_domain_id: 0,
     hosted_domain_cookie: 0,
     driver_id: 0,
+    provisional_driver_object: 0,
     driver_object: 0,
     driver_unload: 0,
     add_device: 0,
@@ -66364,7 +66397,7 @@ fn driver_component_has_live_device(dc: &DriverComponent) -> bool {
     false
 }
 
-fn register_instance(dc: &DriverComponent) {
+fn register_instance(dc: &DriverComponent, published_claim: u64) {
     // SAFETY: single-threaded executive; the table is written here + read in dispatch_irp.
     let t = unsafe { driver_instances_mut() };
     while t.len() <= dc.instance {
@@ -66427,6 +66460,7 @@ fn register_instance(dc: &DriverComponent) {
         hosted_domain_id: dc.hosted_domain_id,
         hosted_domain_cookie: dc.hosted_domain_cookie,
         driver_id: dc.driver_id,
+        provisional_driver_object: published_claim,
         driver_object: dc.drvobj,
         driver_unload: dc.driver_unload,
         add_device: dc.add_device,
