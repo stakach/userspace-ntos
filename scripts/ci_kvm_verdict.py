@@ -44,6 +44,7 @@ class InteractionOutcome:
     completed: int = 0
     total: int = 0
     errors: int = 0
+    checkpoints: dict = field(default_factory=dict)
     visual_proof: VisualProof | None = None
 
     def receipts_passed(self):
@@ -59,8 +60,12 @@ class InteractionOutcome:
             return "scripted interaction was not requested"
         if not self.armed:
             return "scripted interaction never armed"
-        return (f"scripted interaction {self.completed}/{self.total} steps, "
-                f"{self.errors} input/capture errors")
+        summary = (f"scripted interaction {self.completed}/{self.total} steps, "
+                   f"{self.errors} input/capture/checkpoint errors")
+        for name, proof in self.checkpoints.items():
+            if not proof.passed:
+                return f"{summary}; {name}: {proof.error}"
+        return summary
 
 
 @dataclass

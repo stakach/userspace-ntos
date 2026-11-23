@@ -7,7 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scripts.ci_kvm_visual_proof import contains_ver_result, prove_ver_result
+from scripts.ci_kvm_visual_proof import (contains_ready_prompt, contains_ver_result,
+                                         prove_ready_prompt, prove_ver_result)
 
 
 BOOT1_OCR = ("C:\\Windows\\svstem32\\cmd.exe\n"
@@ -19,9 +20,39 @@ BOOT2_OCR = ("C:\\Windows\\svstem32\\cmd.exe\n"
              "ReactOS Applications Manager\n"
              "Name Version Description\n"
              "Welcome to ReactOS Applications Manager!\n")
+READY_PROMPT_OCR = ("CAWindows\\svstem32\\emd.exe\n"
+                    "‘Command Prompt\n"
+                    "LiberNT [Version 0.4.17-amd64-dev 20261013-8e478a2]\n"
+                    "C:\\Users\\User>\n"
+                    "Command\nPrompt\n")
+OLD_APPLAUNCH_OCR = ("C:\\Windows\\system32\\cmd.exe\n"
+                     "APPLAUNCH_NO_DISK\nAPPLAUNCH_DONE\n"
+                     "Command\nPrompt\n")
 
 
 class VisualProofTests(unittest.TestCase):
+    def test_ready_prompt_distinguishes_recorded_foreground_from_old_window(self):
+        self.assertTrue(contains_ready_prompt(READY_PROMPT_OCR))
+        self.assertFalse(contains_ready_prompt(OLD_APPLAUNCH_OCR))
+        self.assertFalse(contains_ready_prompt("Command Prompt\nC:\\Users\\User>ver\n"))
+        self.assertFalse(contains_ready_prompt("C:\\Users\\User>\nCommand Prompt\n"))
+
+    def test_ready_prompt_proof_retains_original_ppm_hash_and_ocr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "native-kvm-interact-05-command-prompt.ppm"
+            image.write_bytes(b"P6\n1 1\n255\n\0\0\0")
+            with patch("scripts.ci_kvm_visual_proof.subprocess.run") as ocr:
+                ocr.return_value = subprocess.CompletedProcess([], 0, READY_PROMPT_OCR, "")
+                proof = prove_ready_prompt(image)
+            self.assertTrue(proof.passed)
+            self.assertEqual(proof.image_sha256, hashlib.sha256(image.read_bytes()).hexdigest())
+            self.assertIn("C:\\Users\\User>", proof.ocr_text)
+            with patch("scripts.ci_kvm_visual_proof.subprocess.run") as ocr:
+                ocr.return_value = subprocess.CompletedProcess([], 0, OLD_APPLAUNCH_OCR, "")
+                rejected = prove_ready_prompt(image)
+            self.assertFalse(rejected.passed)
+            self.assertEqual(rejected.image_sha256, proof.image_sha256)
+
     def test_recorded_boot_one_result_is_visible_but_obscured_boot_two_is_not(self):
         self.assertTrue(contains_ver_result(BOOT1_OCR))
         self.assertFalse(contains_ver_result(BOOT2_OCR))

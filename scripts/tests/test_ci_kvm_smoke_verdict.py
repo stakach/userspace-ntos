@@ -89,7 +89,7 @@ class DesktopGateTests(unittest.TestCase):
     def test_the_verdict_record_names_its_interaction(self):
         document = boot_verdict(BOOT + SEALED, COMPLETE).to_json()
         self.assertEqual(document["interaction"]["summary"],
-                         "scripted interaction 5/5 steps, 0 input/capture errors")
+                         "scripted interaction 5/5 steps, 0 input/capture/checkpoint errors")
         self.assertTrue(document["passed"])
 
 
