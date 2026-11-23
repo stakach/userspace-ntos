@@ -10731,13 +10731,34 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     current_location_after_forward,
                 );
                 write_unaligned((irp + 0xb8) as *mut u64, next);
+                let completion_context = read_unaligned(
+                    (next + WDM_X64_IO_STACK_CONTEXT_OFFSET) as *const u64,
+                );
+                let completion_callback = read_unaligned(
+                    (next + WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET) as *const u64,
+                );
+                trace_sync_start_context(
+                    b"pdo-complete-enter", device, irp, completion_context,
+                    completion_callback, next, status as u32 as i32,
+                );
                 let _ = complete_hosted_irp(irp);
+                trace_sync_start_context(
+                    b"pdo-complete-return", device, irp, completion_context,
+                    completion_callback, next, status as u32 as i32,
+                );
+                trace_sync_start_forward(
+                    b"pdo-ack-enter", 2, device, irp, 0, status, accepted, forward_token,
+                );
                 let (ack_label, ack_status, _, _, _) = call_on4(
                     (FSD_SERVICE_LOWER_PNP_FORWARD_LABEL << 12) | 4,
                     2,
                     irp,
                     0,
                     0,
+                );
+                trace_sync_start_forward(
+                    b"pdo-ack-return", 2, device, irp, ack_label, ack_status, accepted,
+                    forward_token,
                 );
                 if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
                     crate::provider_bugcheck::report(
@@ -10798,13 +10819,16 @@ struct HostedSyncForwardContext {
     completed: AtomicBool,
 }
 
-extern "win64" fn s_io_forward_sync_completion(_device: u64, _irp: u64, context: u64) -> i32 {
+extern "win64" fn s_io_forward_sync_completion(device: u64, irp: u64, context: u64) -> i32 {
+    let callback = s_io_forward_sync_completion as *const () as usize as u64;
+    trace_sync_start_context(b"completion-enter", device, irp, context, callback, 0, 0);
     unsafe {
         let state = &*(context as *const HostedSyncForwardContext);
         state.completed.store(true, Ordering::Release);
         // An inline completion may still be followed by STATUS_PENDING; retain the wake.
         s_ke_set_event(context, 0, 0);
     }
+    trace_sync_start_context(b"completion-return", device, irp, context, callback, 0, 0);
     nt_status::NtStatus::MORE_PROCESSING_REQUIRED.raw()
 }
 
@@ -10834,18 +10858,32 @@ extern "win64" fn s_io_forward_irp_synchronously(device: u64, irp: u64) -> u8 {
             event_ptr,
         );
         write_unaligned((next + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8, 0xe0);
-        let status = s_iof_call_driver(device, irp);
-        if read_unaligned(next as *const u8) as u64 == IRP_MJ_PNP
+        let callback = s_io_forward_sync_completion as *const () as usize as u64;
+        let trace_start = read_unaligned(next as *const u8) as u64 == IRP_MJ_PNP
             && read_unaligned((next + WDM_X64_IO_STACK_MINOR_OFFSET) as *const u8) as u64
-                == nt_pnp_abi::IRP_MN_START_DEVICE as u64
-        {
+                == nt_pnp_abi::IRP_MN_START_DEVICE as u64;
+        if trace_start {
+            trace_sync_start_context(b"sync-enter", device, irp, event_ptr, callback, next, 0);
+        }
+        let status = s_iof_call_driver(device, irp);
+        if trace_start {
             trace_sync_start_forward(
                 b"sync-return", 255, device, irp, 0, status as u32 as u64,
                 u64::from(context.completed.load(Ordering::Acquire)), 0,
             );
         }
         if status == nt_status::NtStatus::PENDING.raw() {
+            if trace_start {
+                trace_sync_start_context(
+                    b"wait-enter", device, irp, event_ptr, callback, next, status,
+                );
+            }
             let wait_status = s_ke_wait_for_single_object(event_ptr, 5, 0, 0, 0);
+            if trace_start {
+                trace_sync_start_context(
+                    b"wait-return", device, irp, event_ptr, callback, next, wait_status,
+                );
+            }
             if wait_status != nt_status::NtStatus::SUCCESS.raw() {
                 crate::provider_bugcheck::report(
                     0xc4,
@@ -10918,6 +10956,35 @@ fn trace_sync_start_owner(
         print_str(b" token=");
         print_hex64(token);
     }
+    print_str(b" status=0x");
+    print_hex(status as u32);
+    print_str(b"\n");
+}
+
+fn trace_sync_start_context(
+    phase: &[u8],
+    device: u64,
+    irp: u64,
+    context: u64,
+    callback: u64,
+    stack: u64,
+    status: i32,
+) {
+    if SYNC_START_FORWARD_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 256 {
+        return;
+    }
+    print_str(b"[sync-start-context] phase=");
+    print_str(phase);
+    print_str(b" dev=");
+    print_hex64(device);
+    print_str(b" irp=");
+    print_hex64(irp);
+    print_str(b" context=");
+    print_hex64(context);
+    print_str(b" callback=");
+    print_hex64(callback);
+    print_str(b" stack=");
+    print_hex64(stack);
     print_str(b" status=0x");
     print_hex(status as u32);
     print_str(b"\n");
