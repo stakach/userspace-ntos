@@ -75,6 +75,11 @@ impl<R: Copy + Eq> InitialReplyRetry<R> {
     pub const fn origin(&self) -> InitialThreadReplyOrigin<R> { self.origin }
     pub const fn reply_cap(&self) -> u64 { self.reply_cap }
     pub const fn phase(&self) -> InitialReplyRetryPhase { self.phase }
+    /// A retained row still owns a physical source Reply until terminal acknowledgement.
+    /// Uncertainty is absorbing and must also prevent a global idle decision.
+    pub const fn blocks_terminal_quiescence(&self) -> bool {
+        !matches!(self.phase, InitialReplyRetryPhase::Complete)
+    }
     pub fn exact(&self, source: ThreadBinding<R>, target: ThreadBinding<R>) -> bool {
         self.origin.source == source && self.origin.target == target
     }
@@ -344,6 +349,27 @@ mod tests {
         assert_eq!(retry.reply_cap(), 41);
         assert!(retry.transition(InitialReplyRetryPhase::Replying(status)),
             "terminal reply is allowed only after the caller proves owner retirement");
+    }
+
+    #[test]
+    fn retained_initial_reply_prevents_all_parked_exit_until_terminal_ack() {
+        let origin = reply_origin();
+        let status = 0xc000_0008;
+        let mut row = InitialReplyRetry::new_cancelling(origin, 41, status).unwrap();
+        assert!(row.blocks_terminal_quiescence(),
+            "the parked source is not idle while root still owns its Reply");
+        assert!(row.take_root_transfer(origin.source()));
+        assert!(row.blocks_terminal_quiescence());
+        assert!(row.transition(InitialReplyRetryPhase::Replying(status)));
+        assert!(row.blocks_terminal_quiescence(),
+            "a prepared terminal status is not a delivered Reply");
+        assert!(row.transition(InitialReplyRetryPhase::Complete));
+        assert!(!row.blocks_terminal_quiescence());
+
+        let mut uncertain = InitialReplyRetry::new(origin, 42).unwrap();
+        assert!(uncertain.transition(InitialReplyRetryPhase::ReplyUncertain));
+        assert!(uncertain.blocks_terminal_quiescence(),
+            "an uncertain physical Reply cannot be discarded by quiescence");
     }
 
     #[test]

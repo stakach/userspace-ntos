@@ -366,6 +366,7 @@ static USER_CALLBACK_DEFERRED_RETURNS_WOKEN: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DEFERRED_RETURNS_FULL: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DEFERRED_RETURNS_TRACE: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_QUIESCE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
+static INITIAL_REPLY_QUIESCE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CONTEXT_IMPORT_TRACE: AtomicU64 = AtomicU64::new(0);
 static LPC_RECEIVE_WAIT_PARKED: AtomicU64 = AtomicU64::new(0);
 static LPC_RECEIVE_WAIT_WOKEN: AtomicU64 = AtomicU64::new(0);
@@ -3994,6 +3995,18 @@ fn defer_quiesce_for_active_user_callbacks(site: &[u8]) -> bool {
         print_str(b"\n");
     }
     true
+}
+
+fn defer_quiesce_for_root_continuations(site: &[u8]) -> bool {
+    if unsafe { crate::exec_handler::initial_thread_creation::retained_initial_reply_pending() } {
+        if INITIAL_REPLY_QUIESCE_DEFER_TRACE.fetch_add(1, Ordering::Relaxed) < 8 {
+            print_str(b"[quiesce] deferring ");
+            print_str(site);
+            print_str(b": retained initial creation Reply\n");
+        }
+        return true;
+    }
+    defer_quiesce_for_active_user_callbacks(site)
 }
 
 unsafe fn pending_hosted_fault_endpoint_sender(

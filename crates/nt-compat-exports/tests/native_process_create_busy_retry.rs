@@ -93,3 +93,45 @@ fn retained_initial_owner_must_retire_before_terminal_reply() {
         "a retained non-busy effect must keep the source Reply fenced");
 }
 
+#[test]
+fn retained_initial_reply_fences_all_parked_quiescence_before_redrive() {
+    let dispatch = source("executor/syscall_nt.rs");
+    let branch = dispatch.split("if lp.msg.m0 == SSN_NT_CREATE_THREAD").nth(1)
+        .expect("initial thread syscall branch");
+    let transfer = branch.find("take_retry_transferred(caller)").unwrap();
+    let park = branch.find("mark_wait_parked(").unwrap();
+    let redrive = branch.find("redrive_retry_no_effect(").unwrap();
+    assert!(transfer < park && park < redrive,
+        "the retained Reply must fence the all-parked check before redrive runs");
+
+    let creation = source("initial_thread_creation.rs");
+    let retained = body(&creation, "retained_initial_reply_pending");
+    assert!(retained.contains("INITIAL_CREATE_RETRIES")
+        && retained.contains("blocks_terminal_quiescence"),
+        "the gate must inspect retained Reply ownership, including uncertain rows");
+    let service = source("service_sec_image.rs");
+    let fence = body(&service, "defer_quiesce_for_root_continuations");
+    assert!(fence.contains("retained_initial_reply_pending")
+        && fence.contains("defer_quiesce_for_active_user_callbacks"),
+        "one root-continuation predicate must cover initial Reply and callback ownership");
+
+    let flow = source("executor/flow.rs");
+    for gate in ["park_and_log", "mark_wait_parked"] {
+        assert!(body(&flow, gate).contains("defer_quiesce_for_root_continuations"),
+            "{gate} must not quiesce while the last parked source has an initial Reply");
+    }
+    for (file, required) in [
+        ("executor/syscall_tail.rs", 3),
+        ("executor/vm_fault.rs", 3),
+        ("executor/exceptions.rs", 1),
+    ] {
+        let text = source(file);
+        assert!(text.matches("defer_quiesce_for_root_continuations(").count() >= required,
+            "{file} has terminal quiesce sites that need the retained Reply fence");
+        assert!(!text.contains("defer_quiesce_for_active_user_callbacks("),
+            "{file} must not bypass the retained Reply fence at a terminal gate");
+    }
+    assert!(!flow.contains("defer_quiesce_for_active_user_callbacks("),
+        "both common all-live gates must use the root-continuation fence");
+}
+

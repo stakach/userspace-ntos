@@ -264,7 +264,7 @@ pub(super) unsafe fn cpu_exception(
                 lp.parks.wait_parked,
                 b"winlogon-post-logon-fault",
             )
-            && !defer_quiesce_for_active_user_callbacks(b"winlogon-post-logon-fault")
+            && !defer_quiesce_for_root_continuations(b"winlogon-post-logon-fault")
         {
             print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
             lp.exit.stop = fip;

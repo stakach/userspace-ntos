@@ -86,7 +86,7 @@ impl LoopState<'_> {
                 lp.parks.wait_parked,
                 b"all-live-parked",
             )
-            && !defer_quiesce_for_active_user_callbacks(b"all-live-parked")
+            && !defer_quiesce_for_root_continuations(b"all-live-parked")
             && !crate::mounted_volume::mounted_create_outstanding()
             && !crate::mounted_volume::mounted_read_outstanding()
             && !crate::mounted_volume::mounted_directory_outstanding()
@@ -313,7 +313,7 @@ pub(super) unsafe fn mark_wait_parked(
             parks.wait_parked,
             b"all-live-waiting",
         )
-        && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
+        && !defer_quiesce_for_root_continuations(b"all-live-waiting")
         && !driver_launch::native_disk_proof_hardware_irp_pending()
         && !driver_launch::active_relation_wal_retained()
         && root_maintenance_owner::next_ready_ticket().is_none()
