@@ -621,10 +621,14 @@ fn pending_initial_thread_has_no_authority_until_exact_one_shot_commit() {
     let winlogon_token = roles.reserve_foreign_initial_thread_role(&catalog, winlogon_evidence)
         .unwrap();
     assert_eq!(roles.role(dynamic_winlogon, winlogon_identity), None);
+    assert_eq!(roles.reserved_role(winlogon_token, dynamic_winlogon, winlogon_identity),
+        Some(HostedProcessRole::InteractiveLogon));
+    assert_eq!(roles.reserved_role(winlogon_token, dynamic_winlogon, process(96, 4)), None);
     assert_eq!(roles.creator_of(dynamic_winlogon, winlogon_identity), None);
     assert!(roles.reserve_foreign_initial_thread_role(&catalog, winlogon_evidence).is_err());
     roles.commit_foreign_initial_thread(&catalog, winlogon_token, dynamic_winlogon,
         winlogon_identity).unwrap();
+    assert_eq!(roles.reserved_role(winlogon_token, dynamic_winlogon, winlogon_identity), None);
     assert_eq!(roles.role(dynamic_winlogon, winlogon_identity),
         Some(HostedProcessRole::InteractiveLogon));
     assert!(roles.commit_foreign_initial_thread(&catalog, winlogon_token,
@@ -659,6 +663,8 @@ fn pending_initial_thread_has_no_authority_until_exact_one_shot_commit() {
         SectionFileIdentity { mount, file_id: 13 }, Some(smss_identity));
     let worker_token = roles.reserve_foreign_initial_thread_lineage(&catalog, worker_evidence)
         .unwrap();
+    assert_eq!(roles.reserved_role(worker_token, worker, worker_identity),
+        Some(HostedProcessRole::Application));
     assert_eq!(roles.installer_service_owner(worker, worker_identity, |_, _| true), None);
     roles.commit_foreign_initial_thread(&catalog, worker_token, worker, worker_identity)
         .unwrap();

@@ -368,7 +368,7 @@ fn completed_gui_milestones_require_the_exact_live_caller_role() {
         && !batch.contains("runtime.observation_role"),
         "a catalog observation cannot credit Explorer's completed GDI batch");
     let mapping = body("fn record_hosted_client_gdi_mapping(", "fn ntgdi_bitmap_format_rgb(");
-    assert!(mapping.contains("live_gui_caller_role(nt_handler,caller,pi)")
+    assert!(mapping.contains("live_gui_caller_role(nt_handler,Some(caller),pi)")
         && !mapping.contains("image.observation_role()"),
         "a catalog observation cannot credit GUI mapping after the process role is gone");
 }
@@ -388,4 +388,36 @@ fn inline_winlogon_completion_checks_the_exact_live_caller() {
         && compact.contains("observe_winlogon_completed_dispatch(")
         && compact.contains("piasu64"),
         "inline Winlogon completion must be tied to its retained live caller and process space");
+}
+
+#[test]
+fn precommit_gdi_projection_keeps_its_exact_process_create_role() {
+    let service = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/service_sec_image.rs"),
+    )
+    .expect("GDI projection source");
+    let mapping = service.split("fn record_hosted_client_gdi_mapping(")
+        .nth(1).expect("GDI mapping milestone")
+        .split("fn ntgdi_bitmap_format_rgb(").next().unwrap();
+    let compact: String = mapping.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("live_gui_caller_role(nt_handler,Some(caller),pi)")
+        && compact.contains("initial_thread_creation::process_create_provider_role(nt_handler,caller,"),
+        "committed execution and exact pre-commit process-create are distinct GDI proof phases");
+    let initial = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/initial_thread_creation.rs"),
+    )
+    .expect("initial process-create source");
+    let proof = initial.split("pub(crate) unsafe fn process_create_provider_role(")
+        .nth(1).expect("pre-commit role proof")
+        .split("unsafe fn create_win32_process_before_loader(").next().unwrap();
+    assert!(proof.contains("validate_process_create_provider_caller(handler, caller)")
+        && proof.contains("reservation.target")
+        && proof.contains("reservation.process")
+        && proof.contains("execution_roles.reserved_role(")
+        && proof.contains("is_process_signaled"),
+        "pre-commit GDI attribution needs the retained exact callout and role reservation");
+    assert!(!proof.contains("image.observation_role()"),
+        "a historical catalog observation cannot replace the pending execution-role reservation");
 }

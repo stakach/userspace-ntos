@@ -204,6 +204,18 @@ impl<const N: usize> ExecutionRoleLedger<N> {
         self.entry(target, process).map(|entry| entry.role)
     }
 
+    /// Inspect the role captured by one exact pending initial-thread reservation. This is
+    /// pre-commit callout attribution only; `role` and `live_role` remain unavailable until commit.
+    pub fn reserved_role(
+        &self,
+        token: PendingInitialThreadToken,
+        target: SpawnTarget,
+        process: ProcessIdentity,
+    ) -> Option<HostedProcessRole> {
+        let index = self.pending_index(token, target, process).ok()?;
+        self.entries[index].map(|entry| entry.role)
+    }
+
     /// A committed role is authority only while its exact process still runs.
     pub fn live_role(
         &self,

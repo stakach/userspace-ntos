@@ -351,6 +351,39 @@ pub(crate) unsafe fn validate_process_create_provider_caller(
     })
 }
 
+/// The initial process-create provider callback runs before its execution role is committed.
+/// Attribute only that exact retained callout's GDI projection to the reserved image role;
+/// ordinary syscall and callback dispatch still require a committed live execution role.
+pub(crate) unsafe fn process_create_provider_role(
+    handler: &ExecNtHandler,
+    caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+) -> Option<nt_exe_image::HostedProcessRole> {
+    if !validate_process_create_provider_caller(handler, caller)
+        || handler.pm.is_process_signaled(caller.process().pid)
+    {
+        return None;
+    }
+    let image = handler.hosted_process_image(caller.pi())?;
+    let target = nt_exe_image::SpawnTarget::from_image(image);
+    if caller.process().generation != nt_types::ProcessGeneration::Hosted(target.generation) {
+        return None;
+    }
+    let owner = (&*handler.thread_runtime.table).entries.iter()
+        .filter_map(|slot| slot.owner())
+        .find(|owner| owner.binding().tid == u64::from(caller.thread().thread_id()))?;
+    let slot = owner.initial_creation.try_borrow().ok()?;
+    let initial = slot.as_ref()?;
+    match (initial.origin, initial.role_reservation) {
+        (InitialCreationOrigin::Configured, None) => Some(target.role),
+        (InitialCreationOrigin::Foreign(_), Some(reservation))
+            if reservation.target == target && reservation.process == caller.process() =>
+                handler.execution_roles.reserved_role(
+                    reservation.token, reservation.target, reservation.process,
+                ),
+        _ => None,
+    }
+}
+
 /// Complete the genuine win32k process-create callback while the initial TCB is still dormant.
 /// The published main runtime is an exact Ps target at this boundary, and has not yet entered
 /// initial-thread control (which correctly closes ordinary logical-caller admission).

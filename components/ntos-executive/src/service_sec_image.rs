@@ -4134,12 +4134,16 @@ fn record_hosted_client_gdi_mapping(
     nt_handler: &mut ExecNtHandler, pi: usize, gdi_va: u64,
     caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
 ) {
-    let Some(role) = live_gui_caller_role(nt_handler, caller, pi) else {
+    let Some(caller) = caller else {
         return;
     };
-    if let Some(caller) = caller {
-        nt_handler.observe_desktop_gui_for(caller, DesktopGuiFact::GdiMapped, 1);
-    }
+    let role = live_gui_caller_role(nt_handler, Some(caller), pi).or_else(|| unsafe {
+        crate::exec_handler::initial_thread_creation::process_create_provider_role(
+            nt_handler, caller,
+        )
+    });
+    let Some(role) = role else { return; };
+    nt_handler.observe_desktop_gui_for(caller, DesktopGuiFact::GdiMapped, 1);
     let Some(image) = nt_handler.hosted_process_image(pi) else {
         return;
     };
