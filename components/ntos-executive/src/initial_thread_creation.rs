@@ -392,7 +392,9 @@ unsafe fn capture_initial_win32k_client(
     if crate::win32k_subsystem::registered_win32k_callouts().is_none() {
         return Err(0xC000_00A3);
     }
-    let mut client = crate::win32k_lifecycle_client(binding.tid, handler, role)
+    let mut client = crate::win32k_lifecycle_client_for_tcb(
+        binding.tid, handler, role, binding.tcb,
+    )
         .ok_or(nt_process::STATUS_DEVICE_BUSY)?;
     if client.pi as usize != binding.pi || client.tid != binding.tid
         || client.badge != binding.badge || client.tcb != binding.tcb
