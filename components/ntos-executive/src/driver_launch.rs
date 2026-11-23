@@ -11883,8 +11883,11 @@ extern "win64" fn s_hal_get_adapter(
     device_description: u64,
     number_of_map_registers: *mut u32,
 ) -> u64 {
+    // The active PDO is dispatch-local; the primary bank may belong to another in-flight IRP.
     let pdo = unsafe {
-        read_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *const u64)
+        read_volatile(
+            (hosted_component_resource_shared_va() + SH_ACTIVE_DEVICE_OBJECT) as *const u64,
+        )
     };
     project_hosted_dma_adapter(pdo, device_description, number_of_map_registers)
 }
@@ -55727,7 +55730,6 @@ unsafe fn hosted_dma_adapter_has_live_records(
 unsafe fn authenticated_hosted_dma_free_lease(
     instance_index: usize,
     domain: HostedDomainIdentity,
-    sh: u64,
     lease_id: u64,
     adapter_id: u64,
 ) -> Result<(HostedDmaAdapterLease, HostedPnpPciResourceDescriptor), nt_status::NtStatus> {
@@ -55762,7 +55764,10 @@ unsafe fn authenticated_hosted_dma_free_lease(
         })
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let inst = instance(instance_index).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if inst.exec_shared_va != sh || instance_domain_identity(inst) != Some(domain) {
+    // The calling service authenticates the exact physical lane before reaching this lease
+    // check. The lease belongs to the driver/PDO generation, not to its primary request bank:
+    // an ordinary dispatch worker may free a buffer after the issuing dispatch has yielded.
+    if instance_domain_identity(inst) != Some(domain) {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
     let state = hosted_device_resource_state_by_device_id(binding.device_id)
@@ -55795,7 +55800,6 @@ unsafe fn authenticated_hosted_dma_free_lease(
 unsafe fn free_hosted_dma_common_buffer_lease(
     instance_index: usize,
     domain: HostedDomainIdentity,
-    sh: u64,
     lease_id: u64,
     adapter_id: u64,
     common_buffer_id: u64,
@@ -55803,7 +55807,7 @@ unsafe fn free_hosted_dma_common_buffer_lease(
     length: u64,
 ) -> Result<(), nt_status::NtStatus> {
     let (lease, window) =
-        authenticated_hosted_dma_free_lease(instance_index, domain, sh, lease_id, adapter_id)?;
+        authenticated_hosted_dma_free_lease(instance_index, domain, lease_id, adapter_id)?;
     let offset = logical.checked_sub(window.dma_logical)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     if length == 0 || offset.checked_add(length)
@@ -55837,7 +55841,7 @@ pub(crate) unsafe fn service_hosted_irq_lane_dma_free_mapping(
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
     let (lease, _) = authenticated_hosted_dma_free_lease(
-        instance_index, domain, inst.exec_shared_va, lease_id, adapter_id,
+        instance_index, domain, lease_id, adapter_id,
     )?;
     if lease.adapter_address != Some(adapter_address) {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
@@ -55865,7 +55869,7 @@ pub(crate) unsafe fn service_hosted_irq_lane_dma_query_sg(
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
     let (lease, _) = authenticated_hosted_dma_free_lease(
-        instance_index, domain, inst.exec_shared_va, lease_id, adapter_id,
+        instance_index, domain, lease_id, adapter_id,
     )?;
     if lease.adapter_address != Some(adapter_address) {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
@@ -55889,7 +55893,7 @@ pub(crate) unsafe fn service_hosted_irq_lane_dma_put_sg(
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
     let (lease, _) = authenticated_hosted_dma_free_lease(
-        instance_index, domain, inst.exec_shared_va, lease_id, adapter_id,
+        instance_index, domain, lease_id, adapter_id,
     )?;
     if lease.adapter_address != Some(adapter_address) {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
@@ -67425,7 +67429,6 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             free_hosted_dma_common_buffer_lease(
                 instance_index,
                 domain,
-                ch.shared_va,
                 pdo_object,
                 words[1],
                 words[0],
@@ -67699,7 +67702,6 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         || instance_domain_identity(inst) != Some(binding.projection_domain)
         || binding.pdo_device_id != pdo_device_id.raw()
         || binding.pdo_object != pdo_object
-        || ch.shared_va != inst.exec_shared_va
     {
         return (STATUS_ACCESS_DENIED, 0, 0, 0);
     }
