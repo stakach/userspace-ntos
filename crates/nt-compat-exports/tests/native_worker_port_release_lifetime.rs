@@ -11,7 +11,7 @@ fn failed_child_delete_keeps_the_port_claim_and_canonical_cap() {
         .expect("production claim");
     let tail = &SOURCE[from..];
     let production = &tail[..tail
-        .find("\nunsafe fn clear_hosted_io_port_caps(")
+        .find("\nmod hosted_port_projection;")
         .expect("claim end")];
     let fixture = format!("{SUPPORT}\n{production}\n{CASES}");
     let directory =
