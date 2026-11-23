@@ -25,12 +25,25 @@ READY_PROMPT_OCR = ("CAWindows\\svstem32\\emd.exe\n"
                     "LiberNT [Version 0.4.17-amd64-dev 20261013-8e478a2]\n"
                     "C:\\Users\\User>\n"
                     "Command\nPrompt\n")
+# Run 45220839653 boot 1, original step-6 PPM SHA
+# bd680e8be300fbd1b6c7eebc541b3899676fbdc3bc5bda3f99dda43a48121d21.
+RECORDED_READY_COMMA_OCR = ("CAWindows\\svstem32\\emd.exe\n"
+                            "‘Command Prompt\n"
+                            "LiberNT [Version 0.4.17-amd64-dev 20261013-8e478a2]\n"
+                            "(C) Copyright 2026 LiberNT Team.\n"
+                            "(C) Copyright 1996-2026 ReactOS Team.\n"
+                            "C:\\Users\\User>,\n")
 OLD_APPLAUNCH_OCR = ("C:\\Windows\\system32\\cmd.exe\n"
                      "APPLAUNCH_NO_DISK\nAPPLAUNCH_DONE\n"
                      "Command\nPrompt\n")
 
 
 class VisualProofTests(unittest.TestCase):
+    def test_recorded_ready_prompt_ocr_comma_caret_is_not_a_typed_command(self):
+        self.assertTrue(contains_ready_prompt(RECORDED_READY_COMMA_OCR))
+        self.assertFalse(contains_ready_prompt("Command Prompt\nC:\\Users\\User>,ver\n"))
+        self.assertFalse(contains_ready_prompt(OLD_APPLAUNCH_OCR))
+
     def test_ready_prompt_distinguishes_recorded_foreground_from_old_window(self):
         self.assertTrue(contains_ready_prompt(READY_PROMPT_OCR))
         self.assertFalse(contains_ready_prompt(OLD_APPLAUNCH_OCR))
