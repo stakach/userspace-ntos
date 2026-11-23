@@ -115,10 +115,10 @@ RtlEnumProcessHeaps	stub	-	-	-	U7-heap	ntdll	nt5-source	ptr,ptr	ntstatus	planned
 RtlEnumerateProperties	stub	-	-	-	U4-property	ntdll	nt5-source	ptr,long,ptr,ptr,ptr,ptr	ntstatus	planned
 RtlExtendHeap	stub	-	-	-	U7-heap	ntdll	nt5-source	ptr,long,ptr,int64	ntstatus	planned
 RtlFindExportedRoutineByName	stdcall	ptr,str	-	-	U9-pe-rb	ntdll	wine-spec	ptr,str	ptr	planned
-RtlFindLastBackwardRunSet	stdcall	ptr,long,ptr	-	-	U8-bitmap	ntdll	wine-spec	ptr,long,ptr	u32	planned
-RtlFindLongestRunSet	stdcall	ptr,ptr	-	-	U8-bitmap	ntdll	wine-spec	ptr,ptr	u32	planned
+RtlFindLastBackwardRunSet	stdcall	ptr,long,ptr	-	-	U8-bitmap	ntdll	wine-spec	ptr,long,ptr	u32	implemented
+RtlFindLongestRunSet	stdcall	ptr,ptr	-	-	U8-bitmap	ntdll	wine-spec	ptr,ptr	u32	implemented
 RtlFindRange	stub	-	-	-	U8-bitmap	ntdll	nt5-source	ptr,int64,int64,long,long,long,long,ptr,ptr,ptr	ntstatus	planned
-RtlFindSetRuns	stdcall	ptr,ptr,long,long	-	-	U8-bitmap	ntdll	wine-spec	ptr,ptr,long,long	u32	planned
+RtlFindSetRuns	stdcall	ptr,ptr,long,long	-	-	U8-bitmap	ntdll	wine-spec	ptr,ptr,long,long	u32	implemented
 RtlFlushPropertySet	stub	-	-	-	U4-property	ntdll	nt5-source	ptr	ntstatus	planned
 RtlGetDeviceFamilyInfoEnum	stdcall	ptr,ptr,ptr	-	-	U5-nls	ntdll	wine-spec	ptr,ptr,ptr	void	planned
 RtlGetEnabledExtendedFeatures	stdcall	int64	-	-	U1-context	ntdll	wine-spec	int64	u64	planned

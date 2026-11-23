@@ -21302,6 +21302,25 @@ pub unsafe extern "system" fn rtl_find_last_backward_run_clear(
     }
 }
 
+/// `RtlFindLastBackwardRunSet(PRTL_BITMAP, ULONG FromIndex, PULONG StartingRunIndex) -> ULONG`.
+///
+/// # Safety
+/// `header` is a valid initialized RTL_BITMAP and `starting_run_index` is writable.
+#[export_name = "RtlFindLastBackwardRunSet"]
+pub unsafe extern "system" fn rtl_find_last_backward_run_set(
+    header: *const c_void,
+    from: u32,
+    starting_run_index: *mut u32,
+) -> u32 {
+    unsafe {
+        nt_ntdll::rtl::bitmap::find_last_backward_run_set(
+            header as *const u8,
+            from,
+            starting_run_index,
+        )
+    }
+}
+
 /// `RtlFindClearRuns(PRTL_BITMAP, PRTL_BITMAP_RUN, ULONG, BOOLEAN) -> ULONG`.
 ///
 /// # Safety
@@ -21325,6 +21344,28 @@ pub unsafe extern "system" fn rtl_find_clear_runs(
     }
 }
 
+/// `RtlFindSetRuns(PRTL_BITMAP, PRTL_BITMAP_RUN, ULONG, BOOLEAN) -> ULONG`.
+///
+/// # Safety
+/// `header` is a valid initialized RTL_BITMAP; `run_array` has `size_of_run_array` writable
+/// `RTL_BITMAP_RUN` entries.
+#[export_name = "RtlFindSetRuns"]
+pub unsafe extern "system" fn rtl_find_set_runs(
+    header: *const c_void,
+    run_array: *mut nt_ntdll::rtl::bitmap::BitmapRun,
+    size_of_run_array: u32,
+    locate_longest_runs: u8,
+) -> u32 {
+    unsafe {
+        nt_ntdll::rtl::bitmap::find_set_runs(
+            header as *const u8,
+            run_array,
+            size_of_run_array,
+            locate_longest_runs != 0,
+        )
+    }
+}
+
 /// `RtlFindLongestRunClear(PRTL_BITMAP, PULONG StartingIndex) -> ULONG`.
 ///
 /// # Safety
@@ -21336,6 +21377,18 @@ pub unsafe extern "system" fn rtl_find_longest_run_clear(
 ) -> u32 {
     // SAFETY: raw pointer contract is the ntdll ABI.
     unsafe { nt_ntdll::rtl::bitmap::find_longest_run_clear(header as *const u8, starting_index) }
+}
+
+/// `RtlFindLongestRunSet(PRTL_BITMAP, PULONG StartingIndex) -> ULONG`.
+///
+/// # Safety
+/// `header` is a valid initialized RTL_BITMAP; `starting_index` is null or writable.
+#[export_name = "RtlFindLongestRunSet"]
+pub unsafe extern "system" fn rtl_find_longest_run_set(
+    header: *const c_void,
+    starting_index: *mut u32,
+) -> u32 {
+    unsafe { nt_ntdll::rtl::bitmap::find_longest_run_set(header as *const u8, starting_index) }
 }
 
 /// `RtlFindMostSignificantBit(ULONGLONG) -> CCHAR`.
@@ -30998,8 +31051,11 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_find_next_forward_run_set as *const () as usize,
         rtl_find_first_run_clear as *const () as usize,
         rtl_find_last_backward_run_clear as *const () as usize,
+        rtl_find_last_backward_run_set as *const () as usize,
         rtl_find_clear_runs as *const () as usize,
+        rtl_find_set_runs as *const () as usize,
         rtl_find_longest_run_clear as *const () as usize,
+        rtl_find_longest_run_set as *const () as usize,
         rtl_find_most_significant_bit as *const () as usize,
         rtl_find_least_significant_bit as *const () as usize,
         rtl_create_atom_table as *const () as usize,

@@ -309,15 +309,11 @@ pub unsafe fn find_first_run_clear(bm: *const u8, starting_run_index: *mut u32) 
     unsafe { find_next_forward_run_clear(bm, 0, starting_run_index) }
 }
 
-/// `RtlFindLastBackwardRunClear(RTL_BITMAP*, ULONG from, PULONG start)` — find the clear run
-/// preceding or containing `from`.
-///
-/// # Safety
-/// `bm` must be an initialized bitmap; `starting_run_index` must be writable when a run exists.
-pub unsafe fn find_last_backward_run_clear(
+unsafe fn find_last_backward_run(
     bm: *const u8,
     from: u32,
     starting_run_index: *mut u32,
+    want_set: bool,
 ) -> u32 {
     if bm.is_null() || starting_run_index.is_null() {
         return 0;
@@ -325,14 +321,16 @@ pub unsafe fn find_last_backward_run_clear(
 
     let size = unsafe { hdr_size(bm) };
     if size == 0 {
-        unsafe { core::ptr::write_unaligned(starting_run_index, 0) };
+        if !want_set {
+            unsafe { core::ptr::write_unaligned(starting_run_index, 0) };
+        }
         return 0;
     }
 
     let buf = unsafe { hdr_buffer(bm) };
     let mut bit = from.min(size - 1);
     loop {
-        if !unsafe { get_bit(buf, bit) } {
+        if unsafe { get_bit(buf, bit) } == want_set {
             break;
         }
         if bit == 0 {
@@ -341,12 +339,38 @@ pub unsafe fn find_last_backward_run_clear(
         bit -= 1;
     }
 
-    let last_clear = bit;
-    while bit > 0 && !unsafe { get_bit(buf, bit - 1) } {
+    let last = bit;
+    while bit > 0 && unsafe { get_bit(buf, bit - 1) } == want_set {
         bit -= 1;
     }
     unsafe { core::ptr::write_unaligned(starting_run_index, bit) };
-    last_clear - bit + 1
+    last - bit + 1
+}
+
+/// `RtlFindLastBackwardRunClear(RTL_BITMAP*, ULONG from, PULONG start)` — find the clear run
+/// preceding or containing `from`.
+///
+/// # Safety
+/// `bm` must be an initialized bitmap; `starting_run_index` must be writable.
+pub unsafe fn find_last_backward_run_clear(
+    bm: *const u8,
+    from: u32,
+    starting_run_index: *mut u32,
+) -> u32 {
+    unsafe { find_last_backward_run(bm, from, starting_run_index, false) }
+}
+
+/// `RtlFindLastBackwardRunSet(RTL_BITMAP*, ULONG from, PULONG start)` — scan backwards
+/// from the lesser of `from` and the last logical bit. Leave `start` unchanged if no run exists.
+///
+/// # Safety
+/// `bm` must be an initialized bitmap; `starting_run_index` must be writable.
+pub unsafe fn find_last_backward_run_set(
+    bm: *const u8,
+    from: u32,
+    starting_run_index: *mut u32,
+) -> u32 {
+    unsafe { find_last_backward_run(bm, from, starting_run_index, true) }
 }
 
 /// `RtlClearBits(RTL_BITMAP*, ULONG start, ULONG count)`.
