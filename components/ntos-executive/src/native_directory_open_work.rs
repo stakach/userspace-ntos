@@ -163,6 +163,14 @@ unsafe fn step(handler: &mut ExecNtHandler, work: &mut PendingNativeDirectoryOpe
                 return true;
             }
             Phase::CanonicalPending => {
+                if work.reserved.canonical_retry_without_effect() {
+                    work.phase = if handler.abort_reserved_provider_directory_object(
+                        &mut work.reserved,
+                    ) {
+                        Phase::ReplyReady(nt_process::STATUS_INVALID_HANDLE)
+                    } else { Phase::Quarantined };
+                    return true;
+                }
                 work.phase = match handler.canonical_poll_directory_object(&mut work.reserved) {
                     DirectoryPublishProgress::Pending => return false,
                     DirectoryPublishProgress::Failed(status) => {
@@ -247,6 +255,16 @@ unsafe fn step(handler: &mut ExecNtHandler, work: &mut PendingNativeDirectoryOpe
             true
         }
         Phase::CanonicalPending => {
+            if work.reserved.canonical_retry_without_effect() {
+                if let Err(status) = work.reference.validate(&handler.pm) {
+                    work.phase = if handler.abort_reserved_provider_directory_object(
+                        &mut work.reserved,
+                    ) {
+                        Phase::ReplyReady(status)
+                    } else { Phase::Quarantined };
+                    return true;
+                }
+            }
             work.phase = match handler.canonical_poll_directory_object(&mut work.reserved) {
                 DirectoryPublishProgress::Ready(_) => Phase::LocalCommit,
                 DirectoryPublishProgress::Pending => return false,

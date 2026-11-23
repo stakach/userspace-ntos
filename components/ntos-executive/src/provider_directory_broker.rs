@@ -719,7 +719,14 @@ unsafe fn redrive_one(handler: &mut ExecNtHandler) -> bool {
     let cancelled = runtime::retained_service_cancelled(owner.route, owner.dispatch.0,
         work.reply, work.token);
     if work.phase == PublishPhase::CanonicalPending && cancelled {
-        match handler.canonical_poll_directory_object(&mut entry.staged) {
+        let result = if entry.staged.canonical_retry_without_effect() {
+            if handler.abort_reserved_provider_directory_object(&mut entry.staged) {
+                DirectoryPublishProgress::Failed(STATUS_CANCELLED)
+            } else { DirectoryPublishProgress::Pending }
+        } else {
+            handler.canonical_poll_directory_object(&mut entry.staged)
+        };
+        match result {
             DirectoryPublishProgress::Ready(_) => {
                 match handler.rollback_unpublished_directory_open(
                     &mut entry.staged, STATUS_CANCELLED) {
@@ -760,6 +767,16 @@ unsafe fn redrive_one(handler: &mut ExecNtHandler) -> bool {
         }
     }
     if work.phase == PublishPhase::CanonicalPending {
+        if entry.staged.canonical_retry_without_effect() {
+            if let Err(status) = work.reference.validate(&handler.pm) {
+                if !handler.abort_reserved_provider_directory_object(&mut entry.staged) {
+                    return false;
+                }
+                work.status = status;
+                work.phase = PublishPhase::ReadyReply;
+                return true;
+            }
+        }
         match handler.poll_provider_directory_object(&mut entry.staged) {
             DirectoryPublishProgress::Ready(status) | DirectoryPublishProgress::Failed(status) => {
                 trace_publish_status(owner.dispatch.1, b"poll", status);
