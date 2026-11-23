@@ -20715,24 +20715,25 @@ extern "win64" fn s_video_port_write_register_ushort(register: u64, value: u16) 
 
 extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
     unsafe {
+        let sh = hosted_component_resource_shared_va();
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_CALLS);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
+            (sh + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
             port,
         );
         if let Some(cap) = hosted_port_cap_for_component_io(port, 1) {
             if port == VBE_DISPI_IOPORT_DATA
-                && read_volatile((FSD_SHARED_VADDR + SH_VIDEO_DISPI_SELECTED_INDEX) as *const u64)
+                && read_volatile((sh + SH_VIDEO_DISPI_SELECTED_INDEX) as *const u64)
                     as u16
                     == VBE_DISPI_INDEX_VIDEO_MEMORY_64K
             {
                 if let Some(value) = hosted_video_memory_64k_units() {
                     write_volatile(
-                        (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                        (sh + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
                         0,
                     );
                     write_volatile(
-                        (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                        (sh + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
                         value as u64,
                     );
                     return value;
@@ -20740,11 +20741,11 @@ extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
             }
             let (value, status) = crate::io_in16_r(cap, port as u16);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
                 status,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
                 value as u64,
             );
             if status != 0 {
@@ -20761,11 +20762,11 @@ extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
         } else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_DENIED);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
                 u64::MAX,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
                 0,
             );
             0
@@ -20775,25 +20776,26 @@ extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
 
 extern "win64" fn s_video_port_write_port_ushort(port: u64, value: u16) {
     unsafe {
+        let sh = hosted_component_resource_shared_va();
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_CALLS);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
+            (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
             port,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
+            (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
             value as u64,
         );
         if let Some(cap) = hosted_port_cap_for_component_io(port, 1) {
             let status = crate::io_out16(cap, port as u16, value);
             if status == 0 && port == VBE_DISPI_IOPORT_INDEX {
                 write_volatile(
-                    (FSD_SHARED_VADDR + SH_VIDEO_DISPI_SELECTED_INDEX) as *mut u64,
+                    (sh + SH_VIDEO_DISPI_SELECTED_INDEX) as *mut u64,
                     value as u64,
                 );
             }
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
                 status,
             );
             if status != 0 {
@@ -20811,7 +20813,7 @@ extern "win64" fn s_video_port_write_port_ushort(port: u64, value: u16) {
         } else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_DENIED);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
                 u64::MAX,
             );
         }
