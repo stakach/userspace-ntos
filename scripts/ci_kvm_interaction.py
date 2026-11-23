@@ -33,7 +33,7 @@ POINTER_SETTLE = 0.3  # let the guest drain queued motion before a button change
 CLICK_HOLD = 0.15  # a lone click holds long enough for the guest to read the press
 KEY_PAUSE = 0.05
 POINTER_ACTIONS = ("move", "click", "double_click")
-VERIFIED_POINTER_ACTION = "verified_double_click"
+VERIFIED_POINTER_ACTION = "verified_click"
 MAX_CURSOR_AIMS = 3
 CHAR_QCODES = {" ": "spc", "\n": "ret", "\t": "tab", ".": "dot", ",": "comma",
                "-": "minus", "=": "equal", "/": "slash", "\\": "backslash",
@@ -142,8 +142,12 @@ def parse_script(document):
         actions = raw.get("actions")
         if not isinstance(actions, list):
             raise ValueError(f"{field}.actions must be a list")
-        steps.append(Step(name, tuple(_action(action, screen, f"{field}.actions[{number}]")
-                                      for number, action in enumerate(actions, 1)),
+        parsed_actions = tuple(_action(action, screen, f"{field}.actions[{number}]")
+                               for number, action in enumerate(actions, 1))
+        if name == "command-prompt-selected" and (len(parsed_actions) != 1
+                                                    or parsed_actions[0][0] != VERIFIED_POINTER_ACTION):
+            raise ValueError(f"{field}.actions must contain one verified_click")
+        steps.append(Step(name, parsed_actions,
                           _seconds(raw.get("wait_seconds"), f"{field}.wait_seconds")))
     return Script(screen, settle, tuple(steps), arm)
 
@@ -227,8 +231,8 @@ def relative_pointer_batches(dx, dy):
     return batches
 
 
-def double_click_batches():
-    return [(_button(True), BUTTON_PAUSE), (_button(False), BUTTON_PAUSE)] * 2
+def held_click_batches():
+    return [(_button(True), CLICK_HOLD), (_button(False), BUTTON_PAUSE)]
 
 
 def screenshot_name(index, step):
@@ -330,7 +334,7 @@ class InteractionRunner:
         for number, action in enumerate(step.actions, 1):
             try:
                 if action[0] == VERIFIED_POINTER_ACTION:
-                    self._verified_double_click(step, action[1])
+                    self._verified_click(step, action[1])
                     if self.halted:
                         return
                     self._record({"event": "action", "step": self.index + 1,
@@ -347,7 +351,7 @@ class InteractionRunner:
                     self.halted = True
                     return
 
-    def _verified_double_click(self, step, target):
+    def _verified_click(self, step, target):
         if self.last_capture is None or self.cursor_probe is None:
             raise RuntimeError("verified click requires a prior framebuffer and cursor probe")
         self.perform(pointer_batches(target, self.script.screen))
@@ -363,7 +367,7 @@ class InteractionRunner:
             self.cursor_receipts.append(receipt)
             self._record(receipt)
             if cursor_is_at_target(proof.position, target):
-                self.perform(double_click_batches())
+                self.perform(held_click_batches())
                 return
             if proof.position is None:
                 raise RuntimeError("guest cursor not measurable near target")
