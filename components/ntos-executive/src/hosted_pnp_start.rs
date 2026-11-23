@@ -2145,9 +2145,9 @@ struct PreparedHostedDevnode {
     resource_plan: PreparedHostedResourcePlan,
 }
 
-fn acpi_child_reported_interrupt(
+pub(super) fn acpi_child_reported_interrupt(
     raw: &[u8],
-) -> Result<nt_pnp::PlatformInterruptResource, nt_status::NtStatus> {
+) -> Result<Option<nt_pnp::PlatformInterruptResource>, nt_status::NtStatus> {
     let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
     if nt_cm_resources::validate_cm_resource_list_extent(raw).map_err(|_| invalid)? != raw.len()
         || u32::from_le_bytes(raw.get(0..4).ok_or(invalid)?.try_into().unwrap()) != 1
@@ -2180,7 +2180,7 @@ fn acpi_child_reported_interrupt(
             });
         }
     }
-    interrupt.ok_or(invalid)
+    Ok(interrupt)
 }
 
 unsafe fn prepare_current_hosted_devnode<H>(
@@ -2246,7 +2246,8 @@ where
 
         if let Some(driver_launch::AcceptedAcpiChildResources::Present(resources)) = accepted {
             let admitted = (|| {
-                let interrupt = acpi_child_reported_interrupt(&resources.raw_resources)?;
+                let interrupt = acpi_child_reported_interrupt(&resources.raw_resources)?
+                    .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
 
                 let admitted = nt_pnp::admit_bus_reported_platform_resources(
                     &resources.raw_resources,
@@ -2255,12 +2256,12 @@ where
                     interrupt,
                 ).map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
 
-                let (gsi, _) = crate::resolve_hosted_legacy_irq(
-                    admitted.raw_interrupt.level,
-                    admitted.raw_interrupt.flags != nt_cm_resources::CM_RESOURCE_INTERRUPT_LATCHED,
+                let route = crate::resolve_hosted_acpi_child_interrupt(
+                    &resources.interrupt_resources,
+                    admitted.raw_interrupt,
                 )?;
 
-                if crate::resolve_platform_ioapic_gsi(gsi).is_none() {
+                if crate::resolve_platform_ioapic_gsi(route.gsi).is_none() {
                     return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
                 }
 

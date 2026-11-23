@@ -14298,31 +14298,16 @@ unsafe fn grant_hosted_acpi_child_devnode_resources(
             platform_reset: false,
         });
     }
+    let interrupt_irql = u8::try_from(interrupt.level).map_err(|_| invalid)?;
+    let route = resolve_hosted_acpi_child_interrupt(&resources.interrupt_resources, interrupt)?;
     ensure_acpi_child_interrupt_claim_inactive(identity)?;
-    let (gsi, active_low) = resolve_hosted_legacy_irq(
-        interrupt.level,
-        interrupt.flags != nt_cm_resources::CM_RESOURCE_INTERRUPT_LATCHED,
-    )?;
     let assignment = claim_acpi_child_interrupt(
-        identity,
-        gsi,
-        interrupt.flags != nt_cm_resources::CM_RESOURCE_INTERRUPT_LATCHED,
-        active_low,
-        interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED,
+        identity, route.gsi, route.level_sensitive, route.active_low, route.shared,
     )?;
     translated[interrupt_offset + 8..interrupt_offset + 12]
         .copy_from_slice(&assignment.route.vector.to_le_bytes());
     translated[interrupt_offset + 12..interrupt_offset + 20]
         .copy_from_slice(&1u64.to_le_bytes());
-    let translated_interrupt_level = u32::from_le_bytes(
-        translated[interrupt_offset + 4..interrupt_offset + 8]
-            .try_into()
-            .map_err(|_| invalid)?,
-    );
-    if translated_interrupt_level != interrupt.level {
-        return Err(invalid);
-    }
-    let interrupt_irql = u8::try_from(translated_interrupt_level).map_err(|_| invalid)?;
     if let Err(status) = driver_launch::grant_hosted_device_resources(
         device_id,
         driver_launch::HostedBusIdentity::acpi_child(),

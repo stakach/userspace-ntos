@@ -45707,6 +45707,8 @@ unsafe fn retain_hosted_relation_query_barrier(
         relation_domain: None,
         reported_children: Vec::new(),
         child_properties: Vec::new(),
+        acpi_child_output: None,
+        acpi_child_pending_value: None,
         acpi_pci_scope_sources: Vec::new(),
         acpi_pci_link_candidates: Vec::new(),
         acpi_pci_catalog_update: None,
@@ -46547,6 +46549,7 @@ unsafe fn advance_hosted_device_capabilities(child_index: usize) {
     {
         query.phase = HostedDeviceRelationQueryPhase::DispatchNamespace {
             child_index: 0,
+            kind: HostedAcpiChildQueryKind::Namespace,
             output_len: HOSTED_ACPI_NAMESPACE_HEADER_LEN,
         };
         query.barrier_status = None;
@@ -46775,6 +46778,7 @@ unsafe fn advance_hosted_acpi_namespace(child_index: usize) {
     if next_child < query.reported_children.len() {
         query.phase = HostedDeviceRelationQueryPhase::DispatchNamespace {
             child_index: next_child,
+            kind: HostedAcpiChildQueryKind::Namespace,
             output_len: HOSTED_ACPI_NAMESPACE_HEADER_LEN,
         };
         return;
@@ -46808,276 +46812,358 @@ fn hosted_acpi_namespace_success_payload<'a>(
         .then(|| &payload[..returned])
 }
 
-unsafe fn classify_hosted_acpi_namespace_result(
-    child_index: usize,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedAcpiChildQueryKind {
+    Namespace,
+    InterruptResources,
+}
+
+impl HostedAcpiChildQueryKind {
+    fn with_input<R>(self, f: impl FnOnce(u32, &[u8]) -> R) -> R {
+        match self {
+            Self::Namespace => f(
+                nt_acpi::IOCTL_ACPI_ENUM_CHILDREN,
+                &nt_acpi::immediate_namespace_children_input(),
+            ),
+            Self::InterruptResources => f(
+                nt_acpi::IOCTL_ACPI_EVAL_METHOD,
+                &nt_acpi::eval_method_input(*b"_CRS").expect("valid ACPI method name"),
+            ),
+        }
+    }
+
+    fn valid_output_len(self, len: usize) -> bool {
+        match self {
+            Self::Namespace => {
+                (HOSTED_ACPI_NAMESPACE_HEADER_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES).contains(&len)
+            }
+            Self::InterruptResources => {
+                (nt_acpi::ACPI_EVAL_OUTPUT_PROBE_LEN..=HOSTED_ACPI_ROUTE_MAX_EVAL_BYTES).contains(&len)
+            }
+        }
+    }
+
+    fn diagnostic_name(self) -> &'static [u8] {
+        match self {
+            Self::Namespace => b"namespace",
+            Self::InterruptResources => b"acpi-child-crs",
+        }
+    }
+
+    fn operation(self) -> HostedRelationQueryOperation {
+        match self {
+            Self::Namespace => HostedRelationQueryOperation::AcpiNamespace,
+            Self::InterruptResources => HostedRelationQueryOperation::AcpiChildInterruptResources,
+        }
+    }
+}
+
+enum HostedAcpiChildValue {
+    Namespace(HostedAcpiNamespaceState),
+    InterruptResources(Vec<nt_acpi::InterruptResource>),
+}
+
+enum HostedAcpiChildOutcome {
+    RetryResources,
+    RetryExact(usize),
+    Value(HostedAcpiChildValue),
+    Barrier(nt_status::NtStatus),
+}
+
+fn hosted_acpi_child_requires_interrupt_resources(
+    properties: &HostedBusChildProperties,
+) -> Result<bool, nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    match &properties.bus_information {
+        HostedBusInformationState::Present(bus)
+            if nt_pnp_manager::is_acpi_child_bus_information(bus) => {}
+        HostedBusInformationState::Present(_) | HostedBusInformationState::KnownNone => {
+            return Ok(false);
+        }
+        HostedBusInformationState::Unqueried => return Err(invalid),
+    }
+    match &properties.boot_resources_raw {
+        nt_pnp_manager::PropertyBlobState::Present(raw) => {
+            crate::hosted_pnp_start::acpi_child_reported_interrupt(raw)
+                .map(|interrupt| interrupt.is_some())
+        }
+        nt_pnp_manager::PropertyBlobState::KnownNone => Ok(false),
+        nt_pnp_manager::PropertyBlobState::Unqueried => Err(invalid),
+    }
+}
+
+fn classify_hosted_acpi_child_result(
+    kind: HostedAcpiChildQueryKind,
     output_len: usize,
     status: nt_status::NtStatus,
     information: u64,
     payload: &[u8],
-) -> HostedNamespaceDisposition {
-    if nt_acpi::namespace_children_absent(status.raw() as u32, information) {
-        return match store_hosted_acpi_namespace(
-            child_index,
-            HostedAcpiNamespaceState::NotApplicable,
-        ) {
-            Ok(()) => HostedNamespaceDisposition::Advance,
-            Err(status) => HostedNamespaceDisposition::Barrier(status),
-        };
-    }
-    if matches!(status.raw() as u32, STATUS_BUFFER_OVERFLOW | 0xc000_0023) {
-        return match nt_acpi::namespace_children_probe_retry_len(
-            status.raw() as u32,
-            information,
-            payload,
-            output_len,
-            HOSTED_ACPI_NAMESPACE_MAX_BYTES,
-        ) {
-            Ok(required) => HostedNamespaceDisposition::RetryExact(required),
-            Err(_) => {
-                HostedNamespaceDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+) -> HostedAcpiChildOutcome {
+    use HostedAcpiChildOutcome as Outcome;
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    match kind {
+        HostedAcpiChildQueryKind::Namespace => {
+            if nt_acpi::namespace_children_absent(status.raw() as u32, information) {
+                return Outcome::Value(HostedAcpiChildValue::Namespace(
+                    HostedAcpiNamespaceState::NotApplicable,
+                ));
             }
-        };
-    }
-    if !status.is_success() {
-        return HostedNamespaceDisposition::Barrier(if status.is_success() {
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST
-        } else {
-            status
-        });
-    }
-    let Some(payload) = hosted_acpi_namespace_success_payload(output_len, information, payload)
-    else {
-        return HostedNamespaceDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    };
-    let namespace = match nt_acpi::parse_namespace_children(
-        payload,
-        HOSTED_ACPI_NAMESPACE_MAX_CHILDREN,
-    ) {
-        Ok(namespace) => namespace,
-        Err(error) => {
-            if child_index == 1 {
-                print_str(b"[pnp-namespace-parse] error=");
-                print_u64(error as u64);
-                print_str(b" length=");
-                print_u64(payload.len() as u64);
-                print_str(b"\n");
-                for (index, byte) in payload.iter().take(1024).enumerate() {
-                    if index % 16 == 0 {
-                        print_str(b"[pnp-namespace-byte] offset=");
-                        print_u64(index as u64);
-                        print_str(b" data=");
-                    }
-                    print_hex(u32::from(*byte));
-                    print_str(b",");
-                    if index % 16 == 15 || index + 1 == payload.len().min(1024) {
-                        print_str(b"\n");
-                    }
-                }
+            if matches!(status.raw() as u32, STATUS_BUFFER_OVERFLOW | 0xc000_0023) {
+                return match nt_acpi::namespace_children_probe_retry_len(
+                    status.raw() as u32,
+                    information,
+                    payload,
+                    output_len,
+                    HOSTED_ACPI_NAMESPACE_MAX_BYTES,
+                ) {
+                    Ok(required) => Outcome::RetryExact(required),
+                    Err(_) => Outcome::Barrier(invalid),
+                };
             }
-            return HostedNamespaceDisposition::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            );
+            if !status.is_success() {
+                return Outcome::Barrier(status);
+            }
+            let Some(payload) = hosted_acpi_namespace_success_payload(output_len, information, payload)
+            else {
+                return Outcome::Barrier(invalid);
+            };
+            match nt_acpi::parse_namespace_children(payload, HOSTED_ACPI_NAMESPACE_MAX_CHILDREN) {
+                Ok(namespace) => Outcome::Value(HostedAcpiChildValue::Namespace(
+                    HostedAcpiNamespaceState::Present(namespace),
+                )),
+                Err(nt_acpi::AcpiNamespaceError::Allocation) => Outcome::RetryResources,
+                Err(_) => Outcome::Barrier(invalid),
+            }
         }
-    };
-    match store_hosted_acpi_namespace(child_index, HostedAcpiNamespaceState::Present(namespace)) {
-        Ok(()) => HostedNamespaceDisposition::Advance,
-        Err(status) => HostedNamespaceDisposition::Barrier(status),
+        HostedAcpiChildQueryKind::InterruptResources => {
+            let information = match classify_hosted_acpi_variable_eval_result(
+                output_len, status, information, payload,
+            ) {
+                HostedAcpiVariableEvalDisposition::Payload(information) => information,
+                HostedAcpiVariableEvalDisposition::RetryExact(required) => {
+                    return Outcome::RetryExact(required);
+                }
+                HostedAcpiVariableEvalDisposition::Barrier(status) => return Outcome::Barrier(status),
+            };
+            match nt_acpi::parse_interrupt_resource_template(&payload[..information]) {
+                Ok(resources) if !resources.is_empty() => {
+                    Outcome::Value(HostedAcpiChildValue::InterruptResources(resources))
+                }
+                Err(nt_acpi::PciRoutingError::Allocation) => Outcome::RetryResources,
+                _ => Outcome::Barrier(invalid),
+            }
+        }
     }
+}
+
+unsafe fn stage_hosted_acpi_child_result(
+    outcome: HostedAcpiChildOutcome,
+) -> Option<HostedNamespaceDisposition> {
+    match outcome {
+        HostedAcpiChildOutcome::RetryResources => None,
+        HostedAcpiChildOutcome::RetryExact(required) => {
+            Some(HostedNamespaceDisposition::RetryExact(required))
+        }
+        HostedAcpiChildOutcome::Value(value) => {
+            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                .as_mut()
+                .expect("hosted relation query disappeared before staging ACPI child output");
+            debug_assert!(query.acpi_child_pending_value.is_none());
+            query.acpi_child_pending_value = Some(value);
+            Some(HostedNamespaceDisposition::Advance)
+        }
+        HostedAcpiChildOutcome::Barrier(status) => Some(HostedNamespaceDisposition::Barrier(status)),
+    }
+}
+
+unsafe fn hosted_acpi_child_query_device(child_index: usize) -> Option<nt_io_manager::DeviceId> {
+    let (claim, owner) = {
+        let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref()?;
+        (query.claim, query.relation_owner)
+    };
+    if hosted_device_relation_owner(claim) != Some(owner)
+        || !hosted_device_relation_owner_is_current(owner)
+        || !hosted_pnp_manager_mut().devnode_identity_is_started(claim.parent)
+    {
+        return None;
+    }
+    hosted_relation_child_identity(child_index).map(|(device, _, _)| device)
 }
 
 unsafe fn apply_hosted_acpi_namespace_disposition(
     child_index: usize,
+    kind: HostedAcpiChildQueryKind,
     disposition: HostedNamespaceDisposition,
 ) {
-    match disposition {
-        HostedNamespaceDisposition::RetryExact(output_len) => {
-            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
-                .as_mut()
-                .expect("hosted relation query disappeared before exact ACPI namespace retry");
-            query.phase = HostedDeviceRelationQueryPhase::DispatchNamespace {
-                child_index,
-                output_len,
-            };
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    let barrier = |status| {
+        set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(status))
+    };
+    if let HostedNamespaceDisposition::Barrier(status) = disposition {
+        barrier(status);
+        return;
+    }
+    if hosted_acpi_child_query_device(child_index).is_none() {
+        barrier(invalid);
+        return;
+    }
+    if let HostedNamespaceDisposition::RetryExact(output_len) = disposition {
+        (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY)).as_mut().unwrap().phase =
+            HostedDeviceRelationQueryPhase::DispatchNamespace { child_index, kind, output_len };
+        return;
+    }
+    let value = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_mut()
+        .unwrap()
+        .acpi_child_pending_value
+        .take();
+    match (kind, value) {
+        (HostedAcpiChildQueryKind::Namespace, Some(HostedAcpiChildValue::Namespace(value))) => {
+            if let Err(status) = store_hosted_acpi_namespace(child_index, value) {
+                barrier(status);
+                return;
+            }
+            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY)).as_mut().unwrap();
+            match hosted_acpi_child_requires_interrupt_resources(&query.child_properties[child_index]) {
+                Ok(true) => {
+                    query.phase = HostedDeviceRelationQueryPhase::DispatchNamespace {
+                        child_index,
+                        kind: HostedAcpiChildQueryKind::InterruptResources,
+                        output_len: nt_acpi::ACPI_EVAL_OUTPUT_PROBE_LEN,
+                    };
+                    return;
+                }
+                Ok(false) => {}
+                Err(status) => {
+                    barrier(status);
+                    return;
+                }
+            }
         }
-        HostedNamespaceDisposition::Advance => advance_hosted_acpi_namespace(child_index),
-        HostedNamespaceDisposition::Barrier(status) => {
-            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
-                .as_mut()
-                .expect("hosted relation query disappeared while applying ACPI namespace result");
-            query.phase = HostedDeviceRelationQueryPhase::Barrier;
-            query.barrier_status = Some(status);
+        (
+            HostedAcpiChildQueryKind::InterruptResources,
+            Some(HostedAcpiChildValue::InterruptResources(resources)),
+        ) => {
+            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY)).as_mut().unwrap();
+            let properties = &mut query.child_properties[child_index];
+            if properties.acpi_interrupt_resources.is_some() {
+                barrier(invalid);
+                return;
+            }
+            properties.acpi_interrupt_resources = Some(resources);
+        }
+        _ => {
+            barrier(invalid);
+            return;
         }
     }
+    advance_hosted_acpi_namespace(child_index);
 }
 
-unsafe fn dispatch_hosted_acpi_namespace(child_index: usize, output_len: usize) -> bool {
-    note_hosted_relation_query_operation(
-        HostedRelationQueryOperation::AcpiNamespace,
-        child_index,
-        output_len as u64,
-    );
-    if !(HOSTED_ACPI_NAMESPACE_HEADER_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES).contains(&output_len) {
-        set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        ));
+unsafe fn dispatch_hosted_acpi_namespace(
+    child_index: usize,
+    kind: HostedAcpiChildQueryKind,
+    output_len: usize,
+) -> bool {
+    note_hosted_relation_query_operation(kind.operation(), child_index, output_len as u64);
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    let barrier = |status| {
+        set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(status))
+    };
+    if !kind.valid_output_len(output_len) {
+        barrier(invalid);
         return true;
     }
-    let requires_namespace = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
-        .as_ref()
-        .and_then(|query| query.reported_children.get(child_index))
-        .map(hosted_child_requires_acpi_namespace);
-    match requires_namespace {
-        Some(false) => {
-            let disposition = match store_hosted_acpi_namespace(
-                child_index,
-                HostedAcpiNamespaceState::NotApplicable,
-            ) {
-                Ok(()) => HostedNamespaceDisposition::Advance,
-                Err(status) => HostedNamespaceDisposition::Barrier(status),
-            };
-            apply_hosted_acpi_namespace_disposition(child_index, disposition);
-            return true;
-        }
-        Some(true) => {}
-        None => {
-            set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ));
-            return true;
+    if kind == HostedAcpiChildQueryKind::Namespace {
+        let requires_namespace = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+            .as_ref()
+            .and_then(|query| query.reported_children.get(child_index))
+            .map(hosted_child_requires_acpi_namespace);
+        match requires_namespace {
+            Some(false) => {
+                let outcome = HostedAcpiChildOutcome::Value(HostedAcpiChildValue::Namespace(
+                    HostedAcpiNamespaceState::NotApplicable,
+                ));
+                let disposition = stage_hosted_acpi_child_result(outcome)
+                    .expect("namespace absent is not a resource retry");
+                apply_hosted_acpi_namespace_disposition(child_index, kind, disposition);
+                return true;
+            }
+            Some(true) => {}
+            None => {
+                barrier(invalid);
+                return true;
+            }
         }
     }
-    let child_identity = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
-        .as_ref()
-        .and_then(|query| {
-            Some((
-                nt_io_manager::DeviceId(query.reported_children.get(child_index)?.pdo_object_id),
-                query.relation_domain?,
-                *query.child_pdo_objects.get(child_index)?,
-            ))
-        });
-    let pdo_device_id = match child_identity {
-        Some((pdo_device_id, relation_domain, pdo_object))
-            if io_manager_mut().hosted_device_by_identity(relation_domain, pdo_object)
-                == Some(pdo_device_id)
-                && io_manager_mut()
-                    .device(pdo_device_id)
-                    .is_some_and(|device| !device.delete_pending) =>
-        {
-            pdo_device_id
-        }
-        None | Some(_) => {
-            set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ));
-            return true;
-        }
+    let Some(pdo_device_id) = hosted_acpi_child_query_device(child_index) else {
+        barrier(invalid);
+        return true;
     };
     let mut output = Vec::new();
     if output.try_reserve_exact(output_len).is_err() {
         return false;
     }
     output.resize(output_len, 0);
-    let input = nt_acpi::immediate_namespace_children_input();
-    let result = match io_manager_mut().buffered_device_control_exact_device_payload(
-        ClientId(IO_MANAGER_COMPONENT_ID),
-        pdo_device_id,
-        nt_acpi::IOCTL_ACPI_ENUM_CHILDREN,
-        &input,
-        &mut output,
-    ) {
+    let result = kind.with_input(|ioctl_code, input| {
+        io_manager_mut().buffered_device_control_exact_device_payload(
+            ClientId(IO_MANAGER_COMPONENT_ID), pdo_device_id, ioctl_code, input, &mut output,
+        )
+    });
+    let result = match result {
         Ok(result) => result,
         Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES) => return false,
         Err(status) => {
-            if child_index <= 1 {
-                print_str(b"[pnp-namespace-dispatch] child=");
-                print_u64(child_index as u64);
-                print_str(b" error status=");
-                print_hex(status.raw() as u32);
-                print_str(b" output-len=");
-                print_u64(output_len as u64);
-                print_str(b"\n");
-            }
-            set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
-                status,
-            ));
+            barrier(status);
             return true;
         }
     };
     match result {
-        ExternalDispatchResult::Completed {
-            status,
-            information,
-            ..
-        } => {
-            if child_index <= 1 {
-                print_str(b"[pnp-namespace-dispatch] child=");
-                print_u64(child_index as u64);
-                print_str(b" completed status=");
-                print_hex(status.raw() as u32);
-                print_str(b" information=");
-                print_u64(information);
-                print_str(b" output-len=");
-                print_u64(output_len as u64);
-                print_str(b" header=");
-                for byte in output.iter().take(8) {
-                    print_hex(u32::from(*byte));
-                    print_str(b",");
-                }
-                print_str(b"\n");
-            }
-            let disposition = classify_hosted_acpi_namespace_result(
-                child_index,
-                output_len,
-                status,
-                information,
-                &output,
-            );
-            apply_hosted_acpi_namespace_disposition(child_index, disposition);
+        ExternalDispatchResult::Completed { status, information, .. } => {
+            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                .as_mut()
+                .unwrap();
+            query.driver_status = Some(status);
+            query.acpi_child_output = Some(output);
+            query.phase = HostedDeviceRelationQueryPhase::DecodeNamespace {
+                child_index, kind, output_len, status, information, needs_ack: false,
+            };
         }
         ExternalDispatchResult::Pending { irp_id } => {
             {
-                // Dispatch has entered. Keep the IRP for barrier retirement
-                // even if its stack fails validation.
+                // Dispatch entered. The barrier owns this IRP even if stack validation fails.
                 let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                     .as_mut()
-                    .expect("hosted relation query disappeared before retaining namespace IRP");
+                    .unwrap();
                 query.irp_id = irp_id;
             }
             let identities = io_manager_mut().irp(irp_id).and_then(|irp| {
                 let current = irp.current_stack()?;
-                let valid_parameters = matches!(
-                    &current.parameters,
-                    IoParameters::DeviceControl(parameters)
-                        if parameters.ioctl_code == nt_acpi::IOCTL_ACPI_ENUM_CHILDREN
-                            && parameters.input_len as usize
-                                == nt_acpi::ACPI_ENUM_CHILDREN_INPUT_LEN
-                            && parameters.output_len as usize == output_len
-                );
-                valid_parameters.then_some((
-                    irp.origin_driver_id,
-                    current.driver_id,
-                    current.device_id,
-                ))
+                kind.with_input(|ioctl_code, input| {
+                    matches!(
+                        &current.parameters,
+                        IoParameters::DeviceControl(parameters)
+                            if parameters.ioctl_code == ioctl_code
+                                && parameters.input_len as usize == input.len()
+                                && parameters.output_len as usize == output_len
+                    )
+                    .then_some((irp.origin_driver_id, current.driver_id, current.device_id))
+                })
             });
             let Some((origin_driver_id, completion_driver_id, completion_device_id)) = identities
             else {
-                set_hosted_relation_query_disposition(
-                    HostedDeviceRelationQueryDisposition::Barrier(
-                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-                    ),
-                );
+                barrier(invalid);
                 return true;
             };
             let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                 .as_mut()
-                .expect("hosted relation query disappeared before namespace completion");
+                .unwrap();
             query.origin_driver_id = origin_driver_id;
             query.completion_driver_id = completion_driver_id;
             query.completion_device_id = completion_device_id;
             query.driver_status = None;
             query.phase = HostedDeviceRelationQueryPhase::AwaitingNamespaceCompletion {
-                child_index,
-                output_len,
+                child_index, kind, output_len,
             };
         }
     }
@@ -47522,13 +47608,25 @@ unsafe fn prepare_hosted_relation_devnodes(
             HostedDeviceCapabilitiesState::KnownNone => None,
             HostedDeviceCapabilitiesState::Present(value) => Some(value.clone()),
         };
-        let pdo_properties = nt_pnp_manager::PdoProperties::from_bus_queries(
+        let mut pdo_properties = nt_pnp_manager::PdoProperties::from_bus_queries(
             bus_information,
             capabilities,
             copy_hosted_relation_property_blob(&properties.boot_resources_raw)?,
             nt_pnp_manager::PropertyBlobState::KnownNone,
             copy_hosted_relation_property_blob(&properties.resource_requirements)?,
         );
+        if hosted_acpi_child_requires_interrupt_resources(properties)
+            .map_err(HostedRelationPublishError::Barrier)?
+        {
+            let resources = properties.acpi_interrupt_resources.as_deref().ok_or(
+                HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+            )?;
+            let mut copied = Vec::new();
+            copied.try_reserve_exact(resources.len())
+                .map_err(|_| HostedRelationPublishError::Retry)?;
+            copied.extend_from_slice(resources);
+            pdo_properties = pdo_properties.with_acpi_interrupt_resources(copied);
+        }
         records.push(
             nt_pnp_manager::EnumeratedPdoRecord::new(
                 hosted_relation_instance_path(child)?,
@@ -48988,28 +49086,27 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
             }
             HostedDeviceRelationQueryPhase::DispatchNamespace {
                 child_index,
+                kind,
                 output_len,
             } => {
-                if !dispatch_hosted_acpi_namespace(child_index, output_len) {
+                if !dispatch_hosted_acpi_namespace(child_index, kind, output_len) {
                     return progress;
                 }
                 progress = progress.saturating_add(1);
             }
-            HostedDeviceRelationQueryPhase::AwaitingNamespaceCompletion {
+            HostedDeviceRelationQueryPhase::DecodeNamespace {
                 child_index,
+                kind,
                 output_len,
+                status,
+                information,
+                needs_ack,
             } => {
-                let (
-                    irp_id,
-                    origin_driver_id,
-                    completion_driver_id,
-                    completion_device_id,
-                    pdo_device_id,
-                ) = {
+                let outcome = {
                     let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
                         .as_ref()
                         .unwrap();
-                    let Some(child) = query.reported_children.get(child_index) else {
+                    let Some(payload) = query.acpi_child_output.as_deref() else {
                         set_hosted_relation_query_disposition(
                             HostedDeviceRelationQueryDisposition::Barrier(
                                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -49017,37 +49114,65 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                         );
                         return progress.saturating_add(1);
                     };
+                    classify_hosted_acpi_child_result(kind, output_len, status, information, payload)
+                };
+                let Some(disposition) = stage_hosted_acpi_child_result(outcome) else {
+                    return progress;
+                };
+                let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_mut()
+                    .unwrap();
+                query.acpi_child_output = None;
+                if needs_ack {
+                    query.phase = HostedDeviceRelationQueryPhase::AwaitingNamespaceAck {
+                        child_index, kind, disposition,
+                    };
+                } else {
+                    apply_hosted_acpi_namespace_disposition(child_index, kind, disposition);
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AwaitingNamespaceCompletion {
+                child_index,
+                kind,
+                output_len,
+            } => {
+                let (irp_id, origin_driver_id, completion_driver_id, completion_device_id) = {
+                    let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                        .as_ref()
+                        .unwrap();
                     (
                         query.irp_id,
                         query.origin_driver_id,
                         query.completion_driver_id,
                         query.completion_device_id,
-                        nt_io_manager::DeviceId(child.pdo_object_id),
                     )
                 };
                 let Some(completion) = io_manager_mut().completed_irp(irp_id) else {
                     return progress;
                 };
-                let request_valid = io_manager_mut().irp(irp_id).is_some_and(|irp| {
-                    irp.current_stack().is_some_and(|stack| {
-                        stack.driver_id == completion_driver_id
-                            && stack.device_id == completion_device_id
-                            && matches!(
-                                &stack.parameters,
-                                IoParameters::DeviceControl(parameters)
-                                    if parameters.ioctl_code
-                                        == nt_acpi::IOCTL_ACPI_ENUM_CHILDREN
-                                        && parameters.input_len as usize
-                                            == nt_acpi::ACPI_ENUM_CHILDREN_INPUT_LEN
-                                        && parameters.output_len as usize == output_len
-                            )
-                    })
+                let expected_device = hosted_acpi_child_query_device(child_index);
+                let request_valid = kind.with_input(|ioctl_code, input| {
+                    hosted_acpi_route_request_input_is(irp_id, input)
+                        && io_manager_mut().irp(irp_id).is_some_and(|irp| {
+                            irp.current_stack().is_some_and(|stack| {
+                                stack.driver_id == completion_driver_id
+                                    && stack.device_id == completion_device_id
+                                    && matches!(
+                                        &stack.parameters,
+                                        IoParameters::DeviceControl(parameters)
+                                            if parameters.ioctl_code == ioctl_code
+                                                && parameters.input_len as usize == input.len()
+                                                && parameters.output_len as usize == output_len
+                                    )
+                            })
+                        })
                 });
                 let identity_valid = completion.id == irp_id
                     && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
                     && completion.file_id.is_none()
                     && completion.driver_id == origin_driver_id
-                    && completion.device_id == pdo_device_id
+                    && Some(completion.device_id) == expected_device
                     && completion.major == major::IRP_MJ_DEVICE_CONTROL
                     && completion.minor == 0
                     && completion.completion_driver_id == completion_driver_id
@@ -49069,8 +49194,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .unwrap();
                 query.driver_status = Some(completion.status);
                 query.phase = HostedDeviceRelationQueryPhase::AwaitingNamespaceCopy {
-                    child_index,
-                    output_len,
+                    child_index, kind, output_len,
                     status: completion.status,
                     information: completion.information,
                 };
@@ -49078,6 +49202,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
             }
             HostedDeviceRelationQueryPhase::AwaitingNamespaceCopy {
                 child_index,
+                kind,
                 output_len,
                 status,
                 information,
@@ -49091,36 +49216,38 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     return progress;
                 }
                 payload.resize(output_len, 0);
-                let disposition = match crate::completion_retry::retried_status(
+                let copied = crate::completion_retry::retried_status(
                     io_manager_mut().copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload),
-                ) {
-                    Ok(copied) if copied == output_len => classify_hosted_acpi_namespace_result(
-                        child_index,
-                        output_len,
-                        status,
-                        information,
-                        &payload,
-                    ),
-                    Ok(_) => HostedNamespaceDisposition::Barrier(
-                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-                    ),
+                );
+                let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_mut()
+                    .unwrap();
+                let failure = match copied {
+                    Ok(copied) if copied == output_len => {
+                        query.acpi_child_output = Some(payload);
+                        query.phase = HostedDeviceRelationQueryPhase::DecodeNamespace {
+                            child_index, kind, output_len, status, information, needs_ack: true,
+                        };
+                        progress = progress.saturating_add(1);
+                        continue;
+                    }
+                    Ok(_) => nt_status::NtStatus::INVALID_DEVICE_REQUEST,
                     Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
                     | Err(nt_status::NtStatus::DEVICE_NOT_READY)
                     // Still running: the identical copy collects it.
                     | Err(nt_status::NtStatus::PENDING) => return progress,
-                    Err(copy_status) => HostedNamespaceDisposition::Barrier(copy_status),
+                    Err(status) => status,
                 };
-                (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
-                    .as_mut()
-                    .unwrap()
-                    .phase = HostedDeviceRelationQueryPhase::AwaitingNamespaceAck {
+                query.phase = HostedDeviceRelationQueryPhase::AwaitingNamespaceAck {
                     child_index,
-                    disposition,
+                    kind,
+                    disposition: HostedNamespaceDisposition::Barrier(failure),
                 };
                 progress = progress.saturating_add(1);
             }
             HostedDeviceRelationQueryPhase::AwaitingNamespaceAck {
                 child_index,
+                kind,
                 disposition,
             } => {
                 let irp_id = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
@@ -49129,7 +49256,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .irp_id;
                 match crate::completion_retry::retried_status(io_manager_mut().acknowledge_completed_irp_strict(irp_id)) {
                     Ok(_) => {
-                        apply_hosted_acpi_namespace_disposition(child_index, disposition);
+                        apply_hosted_acpi_namespace_disposition(child_index, kind, disposition);
                         progress = progress.saturating_add(1);
                     }
                     // Still running: stay in this phase; the identical ACK collects it.
@@ -49869,6 +49996,7 @@ unsafe fn retire_hosted_device_relation_barrier() -> usize {
             HostedRelationQueryOperation::AcpiPciRoot => b"pci-root",
             HostedRelationQueryOperation::AcpiPciNamespace => b"pci-namespace",
             HostedRelationQueryOperation::AcpiPciAddress => b"pci-address",
+            HostedRelationQueryOperation::AcpiChildInterruptResources => b"acpi-child-crs",
         });
         if query.last_operation == HostedRelationQueryOperation::AcpiPciAddress {
             if let Some(HostedAcpiPciScopeDiscoveryState::EvaluatingAddresses { plan, .. }) = query
@@ -50070,6 +50198,8 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         relation_domain: None,
         reported_children: Vec::new(),
         child_properties: Vec::new(),
+        acpi_child_output: None,
+        acpi_child_pending_value: None,
         acpi_pci_scope_sources: Vec::new(),
         acpi_pci_link_candidates: Vec::new(),
         acpi_pci_catalog_update: None,
@@ -54127,20 +54257,32 @@ enum HostedDeviceRelationQueryPhase {
     },
     DispatchNamespace {
         child_index: usize,
+        kind: HostedAcpiChildQueryKind,
         output_len: usize,
+    },
+    DecodeNamespace {
+        child_index: usize,
+        kind: HostedAcpiChildQueryKind,
+        output_len: usize,
+        status: nt_status::NtStatus,
+        information: u64,
+        needs_ack: bool,
     },
     AwaitingNamespaceCompletion {
         child_index: usize,
+        kind: HostedAcpiChildQueryKind,
         output_len: usize,
     },
     AwaitingNamespaceCopy {
         child_index: usize,
+        kind: HostedAcpiChildQueryKind,
         output_len: usize,
         status: nt_status::NtStatus,
         information: u64,
     },
     AwaitingNamespaceAck {
         child_index: usize,
+        kind: HostedAcpiChildQueryKind,
         disposition: HostedNamespaceDisposition,
     },
     DispatchAcpiPciRootMethod {
@@ -54347,6 +54489,7 @@ struct HostedBusChildProperties {
     resource_requirements: nt_pnp_manager::PropertyBlobState,
     description: nt_pnp_manager::PropertyBlobState,
     acpi_namespace: HostedAcpiNamespaceState,
+    acpi_interrupt_resources: Option<Vec<nt_acpi::InterruptResource>>,
     acpi_pci_root: HostedAcpiPciRootState,
     acpi_pci_scope_discovery: HostedAcpiPciScopeDiscoveryState,
 }
@@ -54360,6 +54503,7 @@ impl Default for HostedBusChildProperties {
             resource_requirements: nt_pnp_manager::PropertyBlobState::Unqueried,
             description: nt_pnp_manager::PropertyBlobState::Unqueried,
             acpi_namespace: HostedAcpiNamespaceState::Unqueried,
+            acpi_interrupt_resources: None,
             acpi_pci_root: HostedAcpiPciRootState::Unqueried,
             acpi_pci_scope_discovery: HostedAcpiPciScopeDiscoveryState::Unqueried,
         }
@@ -54447,6 +54591,7 @@ enum HostedRelationQueryOperation {
     AcpiPciRoot,
     AcpiPciNamespace,
     AcpiPciAddress,
+    AcpiChildInterruptResources,
 }
 
 struct HostedDeviceRelationQuery {
@@ -54470,6 +54615,8 @@ struct HostedDeviceRelationQuery {
     relation_domain: Option<HostedDomainIdentity>,
     reported_children: Vec<nt_pnp_manager::BusReportedChild>,
     child_properties: Vec<HostedBusChildProperties>,
+    acpi_child_output: Option<Vec<u8>>,
+    acpi_child_pending_value: Option<HostedAcpiChildValue>,
     acpi_pci_scope_sources: Vec<nt_pnp::AcpiPciScopeSource>,
     acpi_pci_link_candidates: Vec<nt_pnp::AcpiPciLinkCandidateFact>,
     acpi_pci_catalog_update: Option<nt_pnp::PreparedAcpiPciScopeCatalogUpdate>,
@@ -56535,6 +56682,7 @@ fn relation_query_phase_code(phase: HostedDeviceRelationQueryPhase) -> u64 {
         | HostedDeviceRelationQueryPhase::AwaitingPropertyCopy { .. }
         | HostedDeviceRelationQueryPhase::AwaitingCapabilitiesCopy { .. }
         | HostedDeviceRelationQueryPhase::AwaitingNamespaceCopy { .. }
+        | HostedDeviceRelationQueryPhase::DecodeNamespace { .. }
         | HostedDeviceRelationQueryPhase::AwaitingAcpiPciRootMethodCopy { .. }
         | HostedDeviceRelationQueryPhase::AwaitingAcpiPciNamespaceFilterCopy { .. }
         | HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodCopy { .. } => 9,
@@ -57184,11 +57332,12 @@ pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
         | HostedDeviceRelationQueryPhase::AwaitingCapabilitiesAck { child_index, .. } => {
             (b"capabilities".as_slice(), child_index)
         }
-        HostedDeviceRelationQueryPhase::DispatchNamespace { child_index, .. }
-        | HostedDeviceRelationQueryPhase::AwaitingNamespaceCompletion { child_index, .. }
-        | HostedDeviceRelationQueryPhase::AwaitingNamespaceCopy { child_index, .. }
-        | HostedDeviceRelationQueryPhase::AwaitingNamespaceAck { child_index, .. } => {
-            (b"namespace".as_slice(), child_index)
+        HostedDeviceRelationQueryPhase::DispatchNamespace { child_index, kind, .. }
+        | HostedDeviceRelationQueryPhase::DecodeNamespace { child_index, kind, .. }
+        | HostedDeviceRelationQueryPhase::AwaitingNamespaceCompletion { child_index, kind, .. }
+        | HostedDeviceRelationQueryPhase::AwaitingNamespaceCopy { child_index, kind, .. }
+        | HostedDeviceRelationQueryPhase::AwaitingNamespaceAck { child_index, kind, .. } => {
+            (kind.diagnostic_name(), child_index)
         }
         HostedDeviceRelationQueryPhase::DispatchAcpiPciRootMethod { child_index, .. }
         | HostedDeviceRelationQueryPhase::AwaitingAcpiPciRootMethodCompletion {
@@ -57304,6 +57453,7 @@ pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
         HostedRelationQueryOperation::AcpiPciRoot => b"pci-root".as_slice(),
         HostedRelationQueryOperation::AcpiPciNamespace => b"pci-namespace".as_slice(),
         HostedRelationQueryOperation::AcpiPciAddress => b"pci-address".as_slice(),
+        HostedRelationQueryOperation::AcpiChildInterruptResources => b"acpi-child-crs".as_slice(),
     });
     print_str(b"/");
     if query.last_child_index == usize::MAX {
@@ -73949,6 +74099,7 @@ pub(crate) unsafe fn hosted_accepted_pci_resource_properties(
 pub(crate) struct HostedAcceptedAcpiChildResources {
     pub raw_resources: Vec<u8>,
     pub resource_requirements: Vec<u8>,
+    pub interrupt_resources: Vec<nt_acpi::InterruptResource>,
     pub provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
     pub child: nt_pnp_manager::DevnodeIdentity,
 }
@@ -74014,9 +74165,16 @@ pub(crate) unsafe fn hosted_accepted_acpi_child_resources(
         ) => (clone_pnp_resource_list(raw)?, clone_pnp_resource_list(requirements)?),
         _ => return Err(invalid),
     };
+    let interrupt_resources = properties.acpi_interrupt_resources.as_deref().ok_or(invalid)?;
+    let mut retained_interrupt_resources = Vec::new();
+    retained_interrupt_resources
+        .try_reserve_exact(interrupt_resources.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    retained_interrupt_resources.extend_from_slice(interrupt_resources);
     Ok(Some(AcceptedAcpiChildResources::Present(HostedAcceptedAcpiChildResources {
         raw_resources,
         resource_requirements,
+        interrupt_resources: retained_interrupt_resources,
         provider,
         child,
     })))
@@ -74161,6 +74319,8 @@ pub(crate) unsafe fn hosted_acpi_child_interrupt_identity(
         nt_pnp_manager::PropertyBlobState::Present(bytes) if bytes == &resources.raw_resources)
         || !matches!(&properties.resource_requirements,
             nt_pnp_manager::PropertyBlobState::Present(bytes) if bytes == &resources.resource_requirements)
+        || properties.acpi_interrupt_resources.as_deref()
+            != Some(resources.interrupt_resources.as_slice())
     {
         return Err(invalid);
     }

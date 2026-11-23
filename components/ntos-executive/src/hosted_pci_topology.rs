@@ -166,19 +166,22 @@ pub(crate) unsafe fn install_hosted_pci_interrupt_overrides(
     Ok(())
 }
 
-/// Resolve a bus-reported ISA IRQ through the checksum-validated MADT override inventory.
-/// A CM interrupt descriptor has no polarity field, so only legacy IRQs with ISA default or
-/// explicit firmware polarity can be admitted here.
-pub(crate) unsafe fn resolve_hosted_legacy_irq(
-    irq: u32,
-    level_sensitive: bool,
-) -> Result<(u32, bool), nt_status::NtStatus> {
+/// Reconcile an accepted PDO's retained firmware interrupt with its bus report.
+pub(crate) unsafe fn resolve_hosted_acpi_child_interrupt(
+    resources: &[nt_acpi::InterruptResource],
+    interrupt: nt_cm_resources::InterruptDescriptor,
+) -> Result<nt_acpi::ResolvedInterruptResource, nt_status::NtStatus> {
     let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
     let authority = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
         .as_ref()
         .ok_or(invalid)?;
     let overrides = authority.interrupt_overrides.as_ref().ok_or(invalid)?;
-    nt_acpi::resolve_legacy_irq(irq, level_sensitive, overrides).map_err(|_| invalid)
+    let reported = nt_acpi::ReportedInterruptResource {
+        line: interrupt.level,
+        level_sensitive: interrupt.flags != nt_cm_resources::CM_RESOURCE_INTERRUPT_LATCHED,
+        shared: interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED,
+    };
+    nt_acpi::reconcile_reported_interrupt(resources, reported, overrides).map_err(|_| invalid)
 }
 
 pub(crate) unsafe fn hosted_pci_topology_generations() -> Option<(u64, u64, u64)> {
