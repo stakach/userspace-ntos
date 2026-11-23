@@ -1,70 +1,98 @@
-//! An IRQ-lane dispatch returns the instance's I/O-port capabilities to the ordinary dispatch it
-//! interrupted (#430).
+//! Compile the native IRQ wrapper to prove a private IRQ CNode leaves the primary cap intact.
 
-use syn::{visit::Visit, Item};
+use std::process::Command;
 
 const SOURCE: &str = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+const IRQ_BROKER: &str = include_str!("../../../components/ntos-executive/src/hosted_irq_broker.rs");
 
-fn function(name: &str) -> syn::ItemFn {
-    let file = syn::parse_file(SOURCE).expect("driver_launch.rs parses");
-    file.items.into_iter().find_map(|item| match item {
-        Item::Fn(function) if function.sig.ident == name => Some(function),
-        _ => None,
-    }).unwrap_or_else(|| panic!("missing native function {name}"))
-}
-
-#[derive(Default)]
-struct Calls(Vec<String>);
-
-impl<'ast> Visit<'ast> for Calls {
-    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
-        if let Some(segment) = path.path.segments.last() {
-            self.0.push(segment.ident.to_string());
-        }
-        syn::visit::visit_expr_path(self, path);
-    }
-}
-
-fn calls(name: &str) -> Vec<String> {
-    let mut calls = Calls::default();
-    calls.visit_item_fn(&function(name));
-    calls.0
-}
-
-fn position(calls: &[String], name: &str) -> usize {
-    calls.iter().position(|call| call == name).unwrap_or_else(|| panic!("no call to {name}"))
+#[test]
+fn dpc_projection_uses_the_retained_private_irq_cnode() {
+    let view = IRQ_BROKER
+        .split_once("struct HostedIrqLaneView {")
+        .expect("retained IRQ lane view")
+        .1
+        .split_once("\nimpl HostedIrqLaneView")
+        .expect("lane view end")
+        .0;
+    assert!(view.contains("cnode: u64"));
+    let selector = IRQ_BROKER
+        .split_once("unsafe fn lane_view_for_domain(")
+        .expect("retained lane selector")
+        .1
+        .split_once("\nunsafe fn ")
+        .expect("lane selector end")
+        .0;
+    assert!(selector.contains("cnode: lane.cnode"));
+    assert!(IRQ_BROKER.contains("lane.shared_va, lane.cnode,"));
 }
 
 #[test]
-fn the_outer_binding_is_captured_before_and_restored_after_every_irq_dispatch() {
-    let calls = calls("dispatch_hosted_irq_connection");
-    let captured = position(&calls, "current_hosted_device_dispatch_binding");
-    let dispatched = position(&calls, "dispatch_hosted_irq_connection_on_lane");
-    let restored = position(&calls, "restore_outer_port_caps_after_irq");
-    assert!(captured < dispatched && dispatched < restored, "{calls:?}");
-    // No early return can skip the restoration: the lane dispatch's outcome is returned after it.
-    assert!(!function("dispatch_hosted_irq_connection")
-        .block.stmts.iter().any(|stmt| has_early_exit(stmt)));
+fn nested_private_irq_never_rewrites_primary_port_caps_on_return() {
+    let start = SOURCE
+        .find("unsafe fn dispatch_hosted_irq_connection(\n")
+        .expect("production IRQ dispatch wrapper");
+    let tail = &SOURCE[start..];
+    let end = tail
+        .find("\nunsafe fn dispatch_hosted_irq_connection_on_lane(")
+        .expect("production IRQ wrapper end");
+    let fixture = format!("{SUPPORT}\n{}\n{CASES}", &tail[..end]);
+    let directory =
+        std::env::temp_dir().join(format!("nt-private-irq-cnode-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let input = directory.join("fixture.rs");
+    let binary = directory.join("fixture-tests");
+    std::fs::write(&input, fixture).unwrap();
+    let compiled = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .args(["--edition=2021", "--test", "-Awarnings"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "IRQ fixture compile:\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let result = Command::new(&binary).output().unwrap();
+    assert!(
+        result.status.success(),
+        "IRQ regression:\n{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
-fn has_early_exit(stmt: &syn::Stmt) -> bool {
-    #[derive(Default)]
-    struct Try(bool);
-    impl<'ast> Visit<'ast> for Try {
-        fn visit_expr_try(&mut self, _: &'ast syn::ExprTry) { self.0 = true; }
-        fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) { self.0 = true; }
-    }
-    let mut found = Try::default();
-    found.visit_stmt(stmt);
-    found.0
+const SUPPORT: &str = r#"
+#[derive(Clone, Copy)] struct HostedDeviceBinding { instance: usize, device_id: u64 }
+#[derive(Clone, Copy)] struct HostedIrqConnection { binding: HostedDeviceBinding }
+enum HostedIrqConnectionDispatchOutcome { Replied }
+mod nt_status { #[derive(Debug)] pub enum NtStatus { INVALID_DEVICE_REQUEST } }
+static mut PRIMARY_CAP: u64 = 0;
+static mut IRQ_CAP: u64 = 0;
+fn current_hosted_device_dispatch_binding(_: usize) -> Option<HostedDeviceBinding> {
+    Some(HostedDeviceBinding { instance:0, device_id:1 })
 }
+unsafe fn dispatch_hosted_irq_connection_on_lane(_: HostedIrqConnection)
+    -> Result<HostedIrqConnectionDispatchOutcome, nt_status::NtStatus> {
+    IRQ_CAP = 0xB;
+    Ok(HostedIrqConnectionDispatchOutcome::Replied)
+}
+unsafe fn restore_outer_port_caps_after_irq(_: usize, _: Option<HostedDeviceBinding>, _: u64) {
+    PRIMARY_CAP = 0;
+}
+"#;
 
+const CASES: &str = r#"
 #[test]
-fn restoration_follows_the_nested_port_cap_rule_and_never_keeps_the_irq_devices_ports() {
-    let calls = calls("restore_outer_port_caps_after_irq");
-    for required in ["port_caps_after_nested_dispatch", "hosted_device_resource_state_by_device_id",
-                     "current_hosted_device_dispatch_binding", "copy_hosted_io_port_caps_to_instance",
-                     "clear_hosted_io_port_caps"] {
-        position(&calls, required);
+fn irq_return_does_not_touch_primary_cnode() {
+    unsafe {
+        PRIMARY_CAP = 0xA;
+        IRQ_CAP = 0;
+        let irq = HostedIrqConnection { binding: HostedDeviceBinding { instance:0, device_id:2 } };
+        assert!(dispatch_hosted_irq_connection(irq).is_ok());
+        assert_eq!(IRQ_CAP,0xB);
+        assert_eq!(PRIMARY_CAP,0xA, "private IRQ cap projection must not rewrite primary CNode");
     }
 }
+"#;

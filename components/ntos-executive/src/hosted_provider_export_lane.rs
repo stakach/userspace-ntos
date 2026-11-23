@@ -98,6 +98,7 @@ pub(super) struct Selection {
     pub component_shared: u64,
     pub executive_shared: u64,
     pub provider: usize,
+    pub cnode: u64,
     pub owner: HostedProviderObjectOwner,
     pub publication: u64,
 }
@@ -635,7 +636,7 @@ pub(super) unsafe fn select(provider: usize, dependent: Dependent,
         return None;
     }
     Some(Selection { index, route, component_shared: row.component_shared,
-        executive_shared: row.executive_shared, provider, owner, publication })
+        executive_shared: row.executive_shared, provider, cnode: worker.cnode, owner, publication })
 }
 
 pub(super) unsafe fn dispatch(selection: Selection, export_rva: u64,
