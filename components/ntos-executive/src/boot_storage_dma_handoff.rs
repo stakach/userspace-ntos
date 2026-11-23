@@ -29,7 +29,8 @@ pub(crate) fn native_storage_cutover_phase() -> CutoverPhase {
 }
 
 const BOOT_GENERATION: u64 = 1;
-pub(crate) const BOOT_DOMAIN: u64 = 2;
+// Hosted devices get a checked nonzero requester ID plus one, so 1 is boot-only.
+pub(crate) const BOOT_DOMAIN: u64 = 1;
 pub(crate) const HOSTED_BOOT_AHCI_IOVA: u64 = AHCI_IOVA + AHCI_BOOT_DMA_PAGES * 0x1000;
 
 pub(crate) struct BootStorageDmaAuthority {
