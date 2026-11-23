@@ -5,6 +5,10 @@ use std::process::Command;
 const SOURCE: &str = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
 const LEDGER: &str =
     include_str!("../../../components/ntos-executive/src/driver_launch/hosted_port_projection.rs");
+const PRIMARY_RETIREMENT: &str =
+    include_str!("../../../components/ntos-executive/src/hosted_primary_retirement.rs");
+const THREAD_RETIREMENT: &str =
+    include_str!("../../../components/ntos-executive/src/hosted_thread_resources.rs");
 
 fn section(start: &str, end: &str) -> &'static str {
     let from = SOURCE.find(start).expect("production start marker");
@@ -57,6 +61,16 @@ fn uncertain_native_projection_never_replays_into_the_same_physical_cnode() {
     );
 }
 
+#[test]
+fn physical_retirement_mismatch_cannot_panic_the_executive() {
+    for source in [SOURCE, PRIMARY_RETIREMENT, THREAD_RETIREMENT] {
+        assert!(
+            !source.contains("assert!(hosted_port_projection::retired("),
+            "physical retirement must retain a fenced failure instead of panicking"
+        );
+    }
+}
+
 const SUPPORT: &str = r#"
 const CT_IO_PORT_BASE: u64 = 8;
 const CT_IO_PORT_CAPACITY: u64 = 16;
@@ -86,9 +100,9 @@ mod nt_status {
     }
 }
 fn hosted_io_port_cap_effect_pending(_: HostedDeviceBinding, _: u64) -> bool { false }
-static mut CNODES: [[u64; 32]; 8] = [[0; 32]; 8];
-static mut PHYSICAL_GENERATION: [u64; 8] = [0, 1, 1, 1, 1, 1, 1, 1];
-static mut PHYSICAL_DOMAIN: [u64; 8] = [0, 1, 1, 1, 1, 1, 1, 1];
+static mut CNODES: [[u64; 32]; 9] = [[0; 32]; 9];
+static mut PHYSICAL_GENERATION: [u64; 9] = [0, 1, 1, 1, 1, 1, 1, 1, 1];
+static mut PHYSICAL_DOMAIN: [u64; 9] = [0, 1, 1, 1, 1, 1, 1, 1, 1];
 static mut FAIL_TARGET_CNODE: u64 = 2;
 static mut DELETE_CALLS: u64 = 0;
 static mut COPY_CALLS: u64 = 0;
@@ -133,7 +147,7 @@ fn instance_by_driver_id(driver_id: u64) -> Option<(usize, DriverInstance)> {
     (driver_id == 11).then_some((0, DriverInstance { cnode: 1 }))
 }
 unsafe fn hosted_port_projection_owner(cnode: u64) -> Option<hosted_port_projection::PhysicalOwner> {
-    (cnode < 8 && PHYSICAL_GENERATION[cnode as usize] != 0).then(||
+    (cnode < 9 && PHYSICAL_GENERATION[cnode as usize] != 0).then(||
         hosted_port_projection::PhysicalOwner::Primary {
             instance: cnode as usize, domain_id: PHYSICAL_DOMAIN[cnode as usize],
             cookie: PHYSICAL_GENERATION[cnode as usize], tcb: cnode,
@@ -151,9 +165,9 @@ fn sibling_binding() -> HostedDeviceBinding {
     HostedDeviceBinding { device_id: 8, driver_id: 11, instance: 0 }
 }
 unsafe fn reset() {
-    CNODES = [[0; 32]; 8];
-    PHYSICAL_GENERATION = [0, 1, 1, 1, 1, 1, 1, 1];
-    PHYSICAL_DOMAIN = [0, 1, 1, 1, 1, 1, 1, 1];
+    CNODES = [[0; 32]; 9];
+    PHYSICAL_GENERATION = [0, 1, 1, 1, 1, 1, 1, 1, 1];
+    PHYSICAL_DOMAIN = [0, 1, 1, 1, 1, 1, 1, 1, 1];
     FAIL_TARGET_CNODE = 2;
     DELETE_CALLS = 0;
     COPY_CALLS = 0;
@@ -276,6 +290,24 @@ fn provider_projection_retains_both_dependent_bank_and_physical_owner_domains() 
         assert!(restore_hosted_device_resource_state(binding(), 100, 1, false).is_err());
         assert_eq!((DELETE_CALLS, COPY_CALLS), calls,
             "a cross-domain provider's uncertain native effect cannot replay");
+    }
+}
+#[test]
+fn unresolved_ticket_finish_keeps_the_native_attempt_fenced_without_panic() {
+    unsafe {
+        reset();
+        FAIL_TARGET_CNODE = 8;
+        FAIL_COPY_AFTER_EFFECT = true;
+        let owner = hosted_port_projection_owner(8).unwrap();
+        let state = hosted_device_resource_state_by_device_id(7).unwrap();
+        let ticket = hosted_port_projection::Ticket::begin(owner, 8, Some(state)).unwrap();
+        assert!(ticket.copy(CT_IO_PORT_BASE, 0xA).is_err());
+        let calls = (DELETE_CALLS, COPY_CALLS);
+        assert!(std::panic::catch_unwind(|| ticket.finish()).is_ok(),
+            "a retained native attempt must not panic the userspace executive");
+        assert!(hosted_port_projection::Ticket::begin(owner, 8, Some(state)).is_err());
+        assert_eq!((DELETE_CALLS, COPY_CALLS), calls,
+            "the unresolved native effect must not be replayed");
     }
 }
 "#;

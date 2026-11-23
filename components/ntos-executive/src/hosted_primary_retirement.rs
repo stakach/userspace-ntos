@@ -360,8 +360,12 @@ pub(super) unsafe fn release_unenrolled(instance_index: usize, inst: DriverInsta
     if !execute_effects(index) || !hosted_pretransport_retirement::retire_early(instance_index) {
         return false;
     }
+    row(index).entered = true;
+    if !hosted_port_projection::retired(inst.cnode, port_owner) {
+        return false;
+    }
+    row(index).entered = false;
     row(index).finished = true;
-    assert!(hosted_port_projection::retired(inst.cnode, port_owner));
     true
 }
 
@@ -478,7 +482,11 @@ pub(super) unsafe fn release(instance_index: usize, inst: DriverInstance) -> boo
     if let Some(table) = hosted_driver_thread_table_mut(instance_index) {
         let _ = table.remove(inst.main_thread_id);
     }
+    row(index).entered = true;
+    if !hosted_port_projection::retired(inst.cnode, port_owner) {
+        return false;
+    }
+    row(index).entered = false;
     row(index).finished = true;
-    assert!(hosted_port_projection::retired(inst.cnode, port_owner));
     true
 }

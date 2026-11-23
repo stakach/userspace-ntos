@@ -178,14 +178,14 @@ impl Ticket {
         Ok(())
     }
 
-    pub(super) unsafe fn finish(self) {
+    pub(super) unsafe fn finish(self) -> Result<(), nt_status::NtStatus> {
         let row = self.row();
-        assert!(
-            row.active && row.attempt.is_none(),
-            "port projection cannot finish uncertain effect"
-        );
+        if !row.active || row.attempt.is_some() {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
         row.published = row.incoming.take();
         row.active = false;
+        Ok(())
     }
 }
 

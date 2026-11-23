@@ -59409,7 +59409,9 @@ unsafe fn release_hosted_irq_lane_mechanism(lane: &mut HostedIrqLaneRuntime) -> 
     if release_hosted_irq_lane_cap(&mut lane.raw_cnode) != 0 {
         return 1;
     }
-    assert!(hosted_port_projection::retired(projection_cnode, projection_owner));
+    if !hosted_port_projection::retired(projection_cnode, projection_owner) {
+        return 1;
+    }
     for leaf in lane.arg.iter_mut().rev() {
         failures += release_hosted_irq_lane_leaf(leaf);
     }
@@ -64265,7 +64267,7 @@ unsafe fn clear_hosted_io_port_caps(cnode: u64) -> Result<(), nt_status::NtStatu
     for slot in 0..crate::CT_IO_PORT_CAPACITY {
         ticket.delete(crate::CT_IO_PORT_BASE + slot)?;
     }
-    ticket.finish();
+    ticket.finish()?;
     Ok(())
 }
 
@@ -64297,7 +64299,7 @@ unsafe fn copy_hosted_io_port_caps_to_cnode(
             ticket.copy(resource.component_cap, resource.broker_va_or_root_cap)?;
         }
     }
-    ticket.finish();
+    ticket.finish()?;
     Ok(())
 }
 

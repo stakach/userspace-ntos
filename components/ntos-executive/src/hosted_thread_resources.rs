@@ -533,10 +533,14 @@ pub(super) unsafe fn retire(id: usize, shared_retired: bool) -> bool {
             }
         };
     }
-    owner(id).finished = true;
     if let Some((cnode, projection)) = port_cnode {
-        assert!(hosted_port_projection::retired(cnode, projection));
+        owner(id).entered = true;
+        if !hosted_port_projection::retired(cnode, projection) {
+            return false;
+        }
+        owner(id).entered = false;
     }
+    owner(id).finished = true;
     true
 }
 
