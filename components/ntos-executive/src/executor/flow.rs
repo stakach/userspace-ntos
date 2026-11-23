@@ -78,12 +78,8 @@ impl LoopState<'_> {
         // QUIESCE: no live top-level process can still make forward progress → nothing left to
         // serve. `wait_parked` counts too (matching every other quiesce site): a crash-park plus
         // all-others-cooperatively-waiting leaves NO runnable signaler, so the next `recv` would
-        // block forever. Additionally, winlogon dying at its post-OpenSCManager GUI/login
-        // frontier (LSA already signalled → services/lsass are just idle RPC servers with no live
-        // client left) is terminal for the boot by the same rule the null-deref arm already
-        // applies — generalized here so it holds for ANY unrecoverable winlogon fault.
-        if ((live_top_badges(nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
-            || (pi == 2 && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0))
+        // block forever. LSA readiness alone does not prove other processes have stopped.
+        if (live_top_badges(nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
             && !pre_user_shell_frontier_pending(
                 nt_handler,
                 lp.parks.crash_parked,

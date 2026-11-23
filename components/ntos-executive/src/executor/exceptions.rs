@@ -257,8 +257,7 @@ pub(super) unsafe fn cpu_exception(
         pfilled[pi] = *filled_pages;
         WINLOGON_POST_LOGON_MILESTONE_PARK.store(fip, Ordering::Relaxed);
         WINLOGON_POST_LOGON_MILESTONE_CR2.store(fip, Ordering::Relaxed);
-        if ((live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
-            || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0)
+        if (live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
             && !pre_user_shell_frontier_pending(
                 &nt_handler,
                 lp.parks.crash_parked,

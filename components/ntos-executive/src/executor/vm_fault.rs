@@ -357,28 +357,6 @@ pub(super) unsafe fn vm_fault(
         )? {
             return ControlFlow::Break(Turn::Next);
         }
-        if pi == 2
-            && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
-            && !pre_user_shell_frontier_pending(
-                &nt_handler,
-                lp.parks.crash_parked,
-                lp.parks.wait_parked,
-                b"winlogon-frontier-crash",
-            )
-            && !defer_quiesce_for_active_user_callbacks(b"winlogon-frontier-crash")
-        {
-            lp.parks.crash_parked |= owner_bit_for_badge(&nt_handler, lp.msg.badge);
-            service_watchdog_record_crash_parked(lp.parks.crash_parked);
-            let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
-            procs[pi].faults = lp.exit.faults;
-            procs[pi].first = lp.exit.first;
-            procs[pi].ntfaults = lp.exit.ntfaults;
-            pfilled[pi] = *filled_pages;
-            print_str(b"[wl-main] winlogon crashed at its post-OpenSCManager GUI/login frontier (LSA signalled, SCM servers idle) -> QUIESCE; run gate\n");
-            lp.exit.stop = lp.msg.m0;
-            lp.exit.record(b"winlogon-main-crash");
-            return ControlFlow::Break(Turn::Exit);
-        }
         // Unrecoverable NULL/low deref on a top-level process thread — a crash. Park+log
         // (the per-process detail above already printed; park_and_log adds the [parked] line).
         return ControlFlow::Break(lp.park_and_log(pi, b"null-deref", lp.msg.m0, addr));
@@ -1088,12 +1066,9 @@ pub(super) unsafe fn vm_fault(
             pfilled[pi] = *filled_pages;
             WINLOGON_POST_LOGON_MILESTONE_PARK.store(lp.msg.m0, Ordering::Relaxed);
             WINLOGON_POST_LOGON_MILESTONE_CR2.store(addr, Ordering::Relaxed);
-            // Same terminal rule `park_and_log!` applies to a parked winlogon: once the LSA
-            // server has signalled, services/lsass are idle RPC servers with no live client
-            // left, so a parked winlogon leaves NO runnable signaler and the next `recv`
-            // would block forever (measured: RUNEXIT=124 without this clause).
-            if ((live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
-                || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0)
+            // A parked winlogon is process-local until every other live owner is parked or
+            // waiting too. LSA readiness is not evidence that its clients have stopped.
+            if (live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
                 && !pre_user_shell_frontier_pending(
                     &nt_handler,
                     lp.parks.crash_parked,

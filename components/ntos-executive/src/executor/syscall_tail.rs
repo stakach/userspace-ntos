@@ -142,8 +142,7 @@ pub(super) unsafe fn syscall_tail(
             pfilled[pi] = *filled_pages;
             WINLOGON_POST_LOGON_MILESTONE_PARK.store(lp.msg.m0, Ordering::Relaxed);
             WINLOGON_POST_LOGON_MILESTONE_CR2.store(lp.msg.m0, Ordering::Relaxed);
-            if ((live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
-                || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0)
+            if (live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
                 && !pre_user_shell_frontier_pending(
                     &nt_handler,
                     lp.parks.crash_parked,
@@ -411,9 +410,7 @@ pub(super) unsafe fn syscall_tail(
             print_str(b" ssn=0x");
             print_hex_u64(lp.msg.m0);
             print_str(b" -> DROP reply and park client\n");
-            if ((live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
-                || (pi == 2
-                    && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0))
+            if (live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
                 && !pre_user_shell_frontier_pending(
                     &nt_handler,
                     lp.parks.crash_parked,
