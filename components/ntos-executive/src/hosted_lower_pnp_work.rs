@@ -112,7 +112,26 @@ pub(super) unsafe fn submit(
     if hosted_driver_pump_caller_tcb(ch, active_reply_cap, caller_badge).is_none() {
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     }
-    if source_work_index(source_instance, source_irp_address).is_some() {
+    if let Some(index) = source_work_index(source_instance, source_irp_address) {
+        let executing = (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, instance, address)| {
+            *active == index
+                && instance.pml4 == source_instance.pml4
+                && instance.exec_pool_va == source_instance.exec_pool_va
+                && instance.hosted_domain_id == source_instance.hosted_domain_id
+                && instance.hosted_domain_cookie == source_instance.hosted_domain_cookie
+                && *address == source_irp_address
+        });
+        let owner = (&*core::ptr::addr_of!(WORK)).get(index).and_then(Option::as_ref)
+            .filter(|work| work.source_instance.pml4 == source_instance.pml4
+                && work.source_instance.exec_pool_va == source_instance.exec_pool_va
+                && work.source_instance.hosted_domain_id == source_instance.hosted_domain_id
+                && work.source_instance.hosted_domain_cookie == source_instance.hosted_domain_cookie
+                && work.source.source_irp_address() == source_irp_address)
+            .map(|work| (work.route, work.dispatch, work.reply, work.token));
+        trace_sync_start_owner(
+            b"pdo-duplicate", target_device_address, source_irp_address,
+            source_instance, index, executing, owner, STATUS_DEVICE_BUSY_LOCAL,
+        );
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }
     let mut source = match hosted_lower_pnp_capture::capture(
@@ -229,6 +248,10 @@ pub(super) unsafe fn submit(
         work.source.release().expect("unparked lower PnP source");
         return Some(STATUS_INSUFFICIENT_RESOURCES_LOCAL);
     }
+    trace_sync_start_owner(
+        b"pdo-parked", target_device_address, source_irp_address,
+        source_instance, index, false, Some((route, dispatch, reply, token)), STATUS_PENDING as i32,
+    );
     None
 }
 

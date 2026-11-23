@@ -1947,6 +1947,7 @@ fn release_cancel_spin_lock_word() {
 static WDM_FORWARD_CALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static WDM_FORWARD_COMPLETION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const WDM_FORWARD_TRACE_CAP: u64 = 64;
+static SYNC_START_FORWARD_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_RESOURCE_LIST_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const PROVIDER_RESOURCE_LIST_TRACE_CAP: u64 = 16;
 static PROVIDER_IO_PORT_RANGE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -10272,6 +10273,13 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             if handler == 0 {
                 // No handler in this domain: the target is cross-domain.
                 if let Some(status) = lane_call_driver(device, irp) {
+                    if major == IRP_MJ_PNP
+                        && forwarded_minor == nt_pnp_abi::IRP_MN_START_DEVICE as u64
+                    {
+                        trace_sync_start_forward(
+                            b"lane-call", 254, device, irp, 0, status as u32 as u64, 0, 0,
+                        );
+                    }
                     return status;
                 }
                 if major == major::IRP_MJ_READ as u64
@@ -10329,10 +10337,25 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                 forwarded_minor,
                 STATUS_PENDING as i32,
             );
-            return call_hosted_pe(handler, &[device, irp]) as u32 as i32;
+            let status = call_hosted_pe(handler, &[device, irp]) as u32 as i32;
+            if major == IRP_MJ_PNP
+                && forwarded_minor == nt_pnp_abi::IRP_MN_START_DEVICE as u64
+            {
+                trace_sync_start_forward(
+                    b"local-handler", 253, device, irp, 0, status as u32 as u64, 0, 0,
+                );
+            }
+            return status;
         }
         // No DRIVER_OBJECT in this domain: the target is cross-domain.
         if let Some(status) = lane_call_driver(device, irp) {
+            if major == IRP_MJ_PNP
+                && forwarded_minor == nt_pnp_abi::IRP_MN_START_DEVICE as u64
+            {
+                trace_sync_start_forward(
+                    b"lane-call", 254, device, irp, 0, status as u32 as u64, 0, 0,
+                );
+            }
             return status;
         }
 
@@ -10605,6 +10628,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                 forwarded_minor,
                 0,
             );
+            trace_sync_start_forward(
+                b"classify-fdo", 9, device, irp, kind_label, kind_status, exact_fdo, 0,
+            );
             if kind_label != 0 || kind_status as u32 as i32 != STATUS_SUCCESS || exact_fdo > 1 {
                 crate::provider_bugcheck::report(
                     0xc4,
@@ -10625,6 +10651,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     device,
                     irp,
                     0,
+                );
+                trace_sync_start_forward(
+                    b"submit-fdo", 6, device, irp, label, status, accepted, start_token,
                 );
                 if label != 0 || accepted > 1 || (accepted != 0 && start_token == 0) {
                     crate::provider_bugcheck::report(
@@ -10661,6 +10690,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                 forwarded_minor,
                 0,
             );
+            trace_sync_start_forward(
+                b"classify-pdo", 0, device, irp, label, classification, foreign, 0,
+            );
             if label != 0 || foreign > 1 {
                 crate::provider_bugcheck::report(
                     0xc4,
@@ -10675,12 +10707,15 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
                     device,
                 );
-                let (label, status, accepted, _, _) = call_on4(
+                let (label, status, accepted, forward_token, _) = call_on4(
                     (FSD_SERVICE_LOWER_PNP_FORWARD_LABEL << 12) | 4,
                     1,
                     device,
                     irp,
                     0,
+                );
+                trace_sync_start_forward(
+                    b"submit-pdo", 1, device, irp, label, status, accepted, forward_token,
                 );
                 if label != 0 || accepted > 1 {
                     crate::provider_bugcheck::report(
@@ -10800,6 +10835,15 @@ extern "win64" fn s_io_forward_irp_synchronously(device: u64, irp: u64) -> u8 {
         );
         write_unaligned((next + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8, 0xe0);
         let status = s_iof_call_driver(device, irp);
+        if read_unaligned(next as *const u8) as u64 == IRP_MJ_PNP
+            && read_unaligned((next + WDM_X64_IO_STACK_MINOR_OFFSET) as *const u8) as u64
+                == nt_pnp_abi::IRP_MN_START_DEVICE as u64
+        {
+            trace_sync_start_forward(
+                b"sync-return", 255, device, irp, 0, status as u32 as u64,
+                u64::from(context.completed.load(Ordering::Acquire)), 0,
+            );
+        }
         if status == nt_status::NtStatus::PENDING.raw() {
             let wait_status = s_ke_wait_for_single_object(event_ptr, 5, 0, 0, 0);
             if wait_status != nt_status::NtStatus::SUCCESS.raw() {
@@ -10815,6 +10859,101 @@ extern "win64" fn s_io_forward_irp_synchronously(device: u64, irp: u64) -> u8 {
     }
 }
 
+
+fn trace_sync_start_owner(
+    phase: &[u8],
+    device: u64,
+    irp: u64,
+    source: DriverInstance,
+    index: usize,
+    executing: bool,
+    owner: Option<(
+        nt_component_suspension::peer_registry::PeerRoute,
+        nt_component_suspension::LaneDispatchIdentity,
+        u64,
+        u64,
+    )>,
+    status: i32,
+) {
+    if SYNC_START_FORWARD_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 256 {
+        return;
+    }
+    print_str(b"[sync-start-owner] phase=");
+    print_str(phase);
+    print_str(b" dev=");
+    print_hex64(device);
+    print_str(b" irp=");
+    print_hex64(irp);
+    print_str(b" pml4=");
+    print_hex64(source.pml4);
+    print_str(b" exec-pool=");
+    print_hex64(source.exec_pool_va);
+    print_str(b" domain=");
+    print_u64(source.hosted_domain_id);
+    print_str(b" cookie=");
+    print_hex64(source.hosted_domain_cookie);
+    print_str(b" work=");
+    print_u64(index as u64);
+    print_str(b" executing=");
+    print_u64(u64::from(executing));
+    print_str(b" work-owner=");
+    print_u64(u64::from(owner.is_some()));
+    if let Some((route, dispatch, reply, token)) = owner {
+        print_str(b" route-endpoint=");
+        print_hex64(route.endpoint());
+        print_str(b" route-badge=");
+        print_hex64(route.badge());
+        print_str(b" route-domain=");
+        print_u64(route.identity().domain);
+        print_str(b" route-generation=");
+        print_u64(route.identity().domain_generation);
+        print_str(b" dispatch-lane=");
+        print_u64(dispatch.lane().index as u64);
+        print_str(b" dispatch-generation=");
+        print_u64(dispatch.lane().generation);
+        print_str(b" dispatch-epoch=");
+        print_u64(dispatch.epoch());
+        print_str(b" reply=");
+        print_hex64(reply);
+        print_str(b" token=");
+        print_hex64(token);
+    }
+    print_str(b" status=0x");
+    print_hex(status as u32);
+    print_str(b"\n");
+}
+
+fn trace_sync_start_forward(
+    phase: &[u8],
+    operation: u64,
+    device: u64,
+    irp: u64,
+    reply_label: u64,
+    status: u64,
+    accepted: u64,
+    token: u64,
+) {
+    if SYNC_START_FORWARD_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 256 {
+        return;
+    }
+    print_str(b"[sync-start-forward] phase=");
+    print_str(phase);
+    print_str(b" op=");
+    print_u64(operation);
+    print_str(b" dev=");
+    print_hex64(device);
+    print_str(b" irp=");
+    print_hex64(irp);
+    print_str(b" label=");
+    print_hex64(reply_label);
+    print_str(b" status=0x");
+    print_hex(status as u32);
+    print_str(b" accepted=");
+    print_u64(accepted);
+    print_str(b" token=");
+    print_hex64(token);
+    print_str(b"\n");
+}
 
 unsafe fn trace_wdm_forward_call(
     device: u64,

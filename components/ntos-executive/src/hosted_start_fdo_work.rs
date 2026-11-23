@@ -157,7 +157,19 @@ pub(super) unsafe fn submit(
     if hosted_driver_pump_caller_tcb(ch, reply_cap, caller_badge).is_none() {
         return Some(INVALID);
     }
-    if work_index(source_instance, source_irp_address).is_some() {
+    if let Some(index) = work_index(source_instance, source_irp_address) {
+        let executing = (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, instance, address)| {
+            *active == index && same_instance(*instance, source_instance)
+                && *address == source_irp_address
+        });
+        let owner = (&*core::ptr::addr_of!(WORK)).get(index).and_then(Option::as_ref)
+            .filter(|work| same_instance(work.source_instance, source_instance)
+                && work.source.source_irp_address() == source_irp_address)
+            .map(|work| (work.route, work.dispatch, work.reply, work.token));
+        trace_sync_start_owner(
+            b"fdo-duplicate", target_address, source_irp_address,
+            source_instance, index, executing, owner, BUSY,
+        );
         return Some(BUSY);
     }
     let Some((shared_va, transfer_id, active_source_instance)) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
@@ -300,6 +312,10 @@ pub(super) unsafe fn submit(
             .expect("unparked START source");
         return Some(RESOURCES);
     }
+    trace_sync_start_owner(
+        b"fdo-parked", target_address, source_irp_address,
+        source_instance, index, false, Some((route, dispatch, reply, token)), STATUS_PENDING as i32,
+    );
     None
 }
 
