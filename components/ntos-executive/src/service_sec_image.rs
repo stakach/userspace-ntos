@@ -8204,7 +8204,7 @@ fn win32k_client_context_for_thread(
             .thread_kernel_object(tid as nt_process::ThreadId)
             .unwrap_or(0),
         role,
-        process_role: nt_handler.hosted_process_role(pi),
+        process_role: nt_handler.live_execution_role(pi),
         top_badge: nt_handler.hosted_process_top_badge(pi).unwrap_or(0),
         teb,
         peb_mirror,

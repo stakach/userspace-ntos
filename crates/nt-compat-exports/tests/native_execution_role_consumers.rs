@@ -21,7 +21,7 @@ const BASELINE: &[(&str, usize)] = &[
     ("hosted_gui_client_info.rs", 1),
     ("initial_thread_creation.rs", 1),
     ("main.rs", 1),
-    ("service_sec_image.rs", 3),
+    ("service_sec_image.rs", 2),
 ];
 
 fn executive_sources(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
@@ -177,6 +177,20 @@ fn win32k_dispatch_flags_follow_the_committed_process_role() {
         "win32k client flags need the running process's committed role");
     assert!(!source.contains("nt_handler.hosted_process_role(pi)"),
         "later win32k atom and SAS decisions must use the same live role");
+}
+
+#[test]
+fn active_win32k_callback_client_carries_the_committed_process_role() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/service_sec_image.rs"),
+    )
+    .expect("win32k client context source");
+    let context = source.split("fn win32k_client_context_for_thread(").nth(1)
+        .expect("active win32k syscall client")
+        .split("unsafe fn sync_win32k_context_to_process_manager(").next().unwrap();
+    assert!(context.contains("process_role: nt_handler.live_execution_role(pi)"),
+        "the dispatch callback frame must carry the same live role as its syscall route");
 }
 
 #[test]
