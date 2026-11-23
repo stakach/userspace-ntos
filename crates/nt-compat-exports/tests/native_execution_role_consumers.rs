@@ -9,24 +9,19 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Catalog-role helpers that decide policy from the image catalog, not the live ledger.
+/// Direct catalog-role reads still need to be reviewed and migrated case by case.
 const CATALOG_ROLE_CALLS: &[&str] = &[
-    "hosted_pi_has_role(",
-    "hosted_owner_has_role(",
-    "hosted_main_badge_has_role(",
-    "hosted_non_native_top_level_badge(",
-    // Installer ownership by catalog image role after a process-manager parent walk.
-    ".can_own_installer_service_work(",
+    ".hosted_process_role(",
 ];
 
 /// Today's sites, per executive source file (counted call sites, definitions excluded).
 const BASELINE: &[(&str, usize)] = &[
-    ("executor/admission.rs", 1),
-    ("executor/exceptions.rs", 4),
+    ("exec_handler.rs", 2),
     ("executor/syscall.rs", 2),
-    ("executor/syscall_tail.rs", 5),
-    ("executor/vm_fault.rs", 3),
-    ("service_sec_image.rs", 2),
+    ("hosted_gui_client_info.rs", 1),
+    ("initial_thread_creation.rs", 1),
+    ("main.rs", 1),
+    ("service_sec_image.rs", 5),
 ];
 
 fn executive_sources(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
@@ -94,11 +89,11 @@ fn catalog_role_policy_consumers_never_grow() {
 
 #[test]
 fn the_site_counter_ignores_definitions_and_comments() {
-    let source = "fn hosted_pi_has_role(pi: usize) -> bool {\n\
-                  // hosted_pi_has_role(x) in a comment\n\
-                  if hosted_pi_has_role(pi) && image.can_own_installer_service_work() {}\n\
-                  let live = live_hosted_pi_for_role(role);\n";
-    assert_eq!(catalog_role_sites(source), 2);
+    let source = "fn hosted_process_role(pi: usize) -> bool {\n\
+                  // handler.hosted_process_role(pi) in a comment\n\
+                  let role = handler.hosted_process_role(pi);\n\
+                  let live = handler.live_execution_role(pi);\n";
+    assert_eq!(catalog_role_sites(source), 1);
 }
 
 #[test]
@@ -182,4 +177,33 @@ fn win32k_dispatch_flags_follow_the_committed_process_role() {
         "win32k client flags need the running process's committed role");
     assert!(!source.contains("nt_handler.hosted_process_role(pi)"),
         "later win32k atom and SAS decisions must use the same live role");
+}
+
+#[test]
+fn terminal_and_ingress_roles_use_admitted_process_owners() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/service_sec_image.rs"),
+    )
+    .expect("executive service source");
+    let body = |start: &str, end: &str| -> String {
+        source.split(start).nth(1).expect("role helper")
+            .split(end).next().unwrap().chars().filter(|c| !c.is_whitespace()).collect()
+    };
+    let top = body("fn hosted_pi_for_top_badge(", "fn hosted_non_native_top_level_badge(");
+    assert!(top.contains("admit_hosted_thread_ingress(badge)")
+        && top.contains("hosted_process_top_badge(runtime.pi)==Some(badge)"),
+        "a top-level badge must identify its exact admitted main runtime");
+    assert!(!top.contains("0..MAX_PI"), "first-match badge lookup is not authority");
+
+    let direct = body("fn hosted_pi_has_role(", "fn hosted_main_badge_has_role(");
+    assert!(direct.contains("live_execution_role(pi)==Some(role)"),
+        "terminal decisions need a committed running process role");
+    let owner = body("fn hosted_owner_has_role(", "fn live_hosted_pi_for_role(");
+    assert!(owner.contains("admit_hosted_thread_ingress(badge)")
+        && owner.contains("live_execution_role(runtime.pi)==Some(role)"),
+        "worker containment must use the exact admitted owner rather than re-resolving its badge");
+    let ingress = body("fn hosted_non_native_top_level_badge(", "fn hosted_pi_has_role(");
+    assert!(ingress.contains("live_execution_role(pi)"),
+        "win32k ingress must reject a stale or pending process role");
 }

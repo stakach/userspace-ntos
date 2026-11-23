@@ -8663,15 +8663,14 @@ pub(crate) fn live_hosted_pi_for_observation_role(
 }
 
 fn hosted_pi_for_top_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
-    (0..MAX_PI).find(|&pi| {
-        hosted_process_runtime_for_pi(pi).is_some()
-            && nt_handler.hosted_process_top_badge(pi) == Some(badge)
-    })
+    let runtime = nt_handler.admit_hosted_thread_ingress(badge).ok()?;
+    (nt_handler.hosted_process_top_badge(runtime.pi) == Some(badge))
+        .then_some(runtime.pi)
 }
 
 fn hosted_non_native_top_level_badge(nt_handler: &ExecNtHandler, badge: u64) -> bool {
     hosted_pi_for_top_badge(nt_handler, badge)
-        .and_then(|pi| nt_handler.hosted_process_role(pi))
+        .and_then(|pi| nt_handler.live_execution_role(pi))
         .is_some_and(|role| role != nt_exe_image::HostedProcessRole::NativeSession)
 }
 
@@ -8680,7 +8679,7 @@ fn hosted_pi_has_role(
     pi: usize,
     role: nt_exe_image::HostedProcessRole,
 ) -> bool {
-    nt_handler.hosted_process_role(pi) == Some(role)
+    nt_handler.live_execution_role(pi) == Some(role)
 }
 
 fn hosted_main_badge_has_role(
@@ -8697,8 +8696,9 @@ fn hosted_owner_has_role(
     badge: u64,
     role: nt_exe_image::HostedProcessRole,
 ) -> bool {
-    owner_top_badge_for(nt_handler, badge)
-        .is_some_and(|owner| hosted_main_badge_has_role(nt_handler, owner, role))
+    nt_handler.admit_hosted_thread_ingress(badge)
+        .ok()
+        .is_some_and(|runtime| nt_handler.live_execution_role(runtime.pi) == Some(role))
 }
 
 fn live_hosted_pi_for_role(
