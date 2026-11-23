@@ -220,7 +220,8 @@ class InteractionRunner:
     is quiet between steps is not classified stationary before the script finishes.
     """
 
-    def __init__(self, script, perform, capture, log_path, clock=time.monotonic):
+    def __init__(self, script, perform, capture, log_path, clock=time.monotonic,
+                 checks=None):
         self.script = script
         self.perform = perform
         self.capture = capture
@@ -231,6 +232,9 @@ class InteractionRunner:
         self.acted = False
         self.next_at = None
         self.failures = 0
+        self.checks = checks or {}
+        self.checkpoints = {}
+        self.halted = False
 
     @property
     def armed(self):
@@ -238,7 +242,7 @@ class InteractionRunner:
 
     @property
     def finished(self):
-        return self.index >= len(self.script.steps)
+        return self.halted or self.index >= len(self.script.steps)
 
     @property
     def in_progress(self):
@@ -263,12 +267,31 @@ class InteractionRunner:
                 continue
             name = screenshot_name(self.index + 1, step)
             shots.append(name)
+            captured = False
             try:
                 self.capture(name)
+                captured = True
                 self._record({"event": "screenshot", "step": self.index + 1,
                               "name": step.name, "file": name})
             except (OSError, RuntimeError, ValueError, KeyError) as error:
                 self._fail(step, "screenshot", error)
+            if step.name in self.checks:
+                if not captured:
+                    self.halted = True
+                else:
+                    try:
+                        proof = self.checks[step.name](name)
+                        self.checkpoints[step.name] = proof
+                        self._record({"event": "checkpoint", "step": self.index + 1,
+                                      "name": step.name, "passed": proof.passed,
+                                      "error": proof.error, "ocr_text": proof.ocr_text,
+                                      "image_sha256": proof.image_sha256})
+                        if not proof.passed:
+                            self.failures += 1
+                            self.halted = True
+                    except (OSError, RuntimeError, ValueError, KeyError) as error:
+                        self._fail(step, "checkpoint", error)
+                        self.halted = True
             self.index += 1
             self.acted = False
             now = self.clock()
@@ -292,7 +315,7 @@ class InteractionRunner:
 
     def summary(self):
         return (f"{self.index}/{len(self.script.steps)} interaction steps completed, "
-                f"{self.failures} input/capture errors")
+                f"{self.failures} input/capture/checkpoint errors")
 
     def _record(self, entry):
         entry = {"elapsed_seconds": round(self.clock() - (self.armed_at or 0), 2), **entry}

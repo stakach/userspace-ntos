@@ -11,6 +11,7 @@ from scripts.ci_kvm_interaction import (
     parse_script, pointer_batches, relative_deltas, screenshot_name, text_chords,
 )
 from scripts.ci_kvm_smoke import DESKTOP_EPOCH_SEALED_RECORD, SerialPanicDetector
+from scripts.ci_kvm_visual_proof import VisualProof
 
 DOCUMENT = {
     "screen": [1024, 768],
@@ -47,16 +48,16 @@ class ParseScriptTests(unittest.TestCase):
         self.assertEqual(script.screen, (1024, 768))
         self.assertEqual(script.steps[0].name, "baseline")
         self.assertEqual(script.steps[1].actions, (("click", (28, 743)),))
-        # Run 45161796204 left the menu over the desktop icon on boot 2 and
-        # the old APPLAUNCH window at the fixed title-bar click on boot 1.
-        # Explorer's Win+R hotkey must launch cmd from either foreground state.
+        # Run 45161796204 left the menu over the desktop icon on boot 2; run
+        # 45173753341 proved Win+R sent no visible Run dialog on either boot.
+        # Dismiss overlays on neutral desktop, then check the prompt image
+        # before typing rather than clicking an old window's title bar.
         self.assertEqual([step.name for step in script.steps],
                          ["baseline", "start-menu", "start-menu-closed",
-                          "run-dialog", "command-prompt", "ver"])
-        self.assertEqual(script.steps[3].actions, (("key", ("meta_l", "r")),))
-        self.assertEqual(script.steps[4].actions, (("type", "cmd\n"),))
+                          "desktop-clear", "command-prompt", "ver"])
+        self.assertEqual(script.steps[3].actions, (("click", (800, 600)),))
+        self.assertEqual(script.steps[4].actions, (("double_click", (37, 470)),))
         self.assertEqual(script.steps[5].actions, (("type", "ver\n"),))
-        self.assertLessEqual(script.steps[4].wait_seconds, 30)
 
     def test_document_parses_to_ordered_steps(self):
         script = parse_script(DOCUMENT)
@@ -231,6 +232,29 @@ class InteractionRunnerTests(unittest.TestCase):
         entries = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertEqual([entry["event"] for entry in entries].count("error"), 6)
         self.assertIn("refused", entries[2]["error"])
+
+    def test_missing_ready_prompt_halts_before_typing_ver_and_retains_proof(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "command-prompt", "actions": [{"type": "cmd\n"}],
+                                    "wait_seconds": 0},
+                                   {"name": "ver", "actions": [{"type": "ver\n"}],
+                                    "wait_seconds": 0}]})
+        proof = VisualProof(False, "APPLAUNCH_DONE\n", "ready Command Prompt not visible",
+                            "native-kvm-interact-01-command-prompt.ppm", "recorded-image-sha")
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock,
+                                   checks={"command-prompt": lambda _name: proof})
+        runner.arm(0)
+        runner.advance(0)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.index, 1)
+        self.assertEqual(len(self.performed), 1)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(runner.checkpoints["command-prompt"], proof)
+        entries = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(entries[-1]["image_sha256"], "recorded-image-sha")
+        self.assertEqual(entries[-1]["event"], "checkpoint")
 
     def test_seal_detector_finds_the_desktop_record(self):
         path = Path(self.directory.name) / "serial.log"

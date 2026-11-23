@@ -17,13 +17,13 @@ if __package__:
     from .ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
                                      read_run_state, request_quit)
     from .ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
-    from .ci_kvm_visual_proof import VisualProof, prove_ver_result
+    from .ci_kvm_visual_proof import VisualProof, prove_ready_prompt, prove_ver_result
 else:
     from ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script, screenshot_name
     from ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
                                     read_run_state, request_quit)
     from ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
-    from ci_kvm_visual_proof import VisualProof, prove_ver_result
+    from ci_kvm_visual_proof import VisualProof, prove_ready_prompt, prove_ver_result
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -966,7 +966,8 @@ def main():
         if interaction_script is not None:
             interaction = InteractionRunner(
                 interaction_script, send_input_batches,
-                lambda name: capture_framebuffer(ROOT / name), INTERACTION_LOG)
+                lambda name: capture_framebuffer(ROOT / name), INTERACTION_LOG,
+                checks={"command-prompt": lambda name: prove_ready_prompt(ROOT / name)})
             seal_detector = SerialPanicDetector(LOG, DESKTOP_EPOCH_SEALED_RECORD)
         def capture_terminal_evidence(reason):
             nonlocal captured, stall_captured
@@ -1215,6 +1216,7 @@ def main():
                                   completed=interaction.index,
                                   total=len(interaction_script.steps),
                                   errors=interaction.failures,
+                                  checkpoints=interaction.checkpoints,
                                   visual_proof=visual_proof))
     verdict = boot_verdict(serial, outcome, runner_failures)
     if interaction is not None:
