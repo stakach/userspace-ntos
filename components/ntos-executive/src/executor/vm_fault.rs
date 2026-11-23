@@ -302,6 +302,7 @@ pub(super) unsafe fn vm_fault(
                     lp.parks.wait_parked,
                     b"winlogon-worker-terminal",
                 )
+                && !defer_quiesce_for_root_continuations(b"winlogon-worker-terminal")
             {
                 print_str(b"[wl-worker] terminal wall while winlogon main waits for this worker -> run gate\n");
                 lp.exit.stop = lp.msg.m0;
@@ -985,7 +986,7 @@ pub(super) unsafe fn vm_fault(
                     lp.parks.wait_parked,
                     b"lsass-post-signal-fault",
                 )
-                && !defer_quiesce_for_active_user_callbacks(b"lsass-post-signal-fault")
+                && !defer_quiesce_for_root_continuations(b"lsass-post-signal-fault")
                 && !driver_launch::native_disk_proof_hardware_irp_pending()
                 && !driver_launch::active_relation_wal_retained()
                 && !crate::mounted_volume::mounted_create_outstanding()
@@ -1075,7 +1076,7 @@ pub(super) unsafe fn vm_fault(
                     lp.parks.wait_parked,
                     b"winlogon-post-logon-syscall",
                 )
-                && !defer_quiesce_for_active_user_callbacks(b"winlogon-post-logon-syscall")
+                && !defer_quiesce_for_root_continuations(b"winlogon-post-logon-syscall")
             {
                 print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                 lp.exit.stop = lp.msg.m0;

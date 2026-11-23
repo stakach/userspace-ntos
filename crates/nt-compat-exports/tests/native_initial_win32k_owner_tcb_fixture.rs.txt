@@ -1,0 +1,82 @@
+const EXECUTIVE_WIN32K_SCRATCH_BASE: u64 = 0;
+
+mod nt_process { pub type ThreadId = u32; }
+mod nt_types {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum ProcessGeneration { Hosted(u64) }
+}
+mod nt_exe_image {
+    #[derive(Clone, Copy)]
+    pub struct HostedProcessRole;
+    pub struct Image;
+    pub struct SpawnTarget { pub generation: u64 }
+    impl SpawnTarget { pub fn from_image(_: Image) -> Self { Self { generation: 3 } } }
+}
+mod win32k_subsystem { pub const WIN32K_TOKEN_USER_SID_MAX: usize = 8; }
+mod win32k_glue {
+    use crate::nt_exe_image::HostedProcessRole;
+    pub struct Win32kClientContext {
+        pub logical_caller: Option<u64>,
+        pub pi: u32,
+        pub generation: u64,
+        pub pid: u64,
+        pub badge: u64,
+        pub tid: u64,
+        pub tcb: u64,
+        pub eprocess: u64,
+        pub ethread: u64,
+        pub role: Option<u8>,
+        pub process_role: Option<HostedProcessRole>,
+        pub top_badge: u64,
+        pub teb: u64,
+        pub peb_mirror: u64,
+        pub scratch_base: u64,
+        pub token_authentication_id: u64,
+        pub token_user_sid: [u8; 8],
+        pub token_user_sid_len: u32,
+    }
+}
+
+struct Runtime { tcb: u64 }
+struct ThreadRuntime;
+impl ThreadRuntime {
+    fn get_by_tid(&self, tid: u64) -> Option<Runtime> {
+        (tid == 7).then_some(Runtime { tcb: 42 })
+    }
+}
+struct ProcessManager;
+impl ProcessManager {
+    fn thread_teb(&self, tid: nt_process::ThreadId) -> Option<u64> {
+        (tid == 7).then_some(0x1000)
+    }
+    fn process_kernel_object(&self, _: u32) -> Option<u64> { Some(0x2000) }
+    fn thread_kernel_object(&self, _: nt_process::ThreadId) -> Option<u64> { Some(0x3000) }
+}
+struct ProcessIdentity { pid: u32, generation: nt_types::ProcessGeneration }
+struct Luid { low: u32, high: i32 }
+struct ExecNtHandler { thread_runtime: ThreadRuntime, pm: ProcessManager }
+impl ExecNtHandler {
+    fn hosted_thread_tcb(&self, _: u64) -> Option<u64> { None }
+    fn hosted_thread_pi_for_tid(&self, tid: u64) -> Option<usize> {
+        (tid == 7).then_some(2)
+    }
+    fn pm_pid_for_pi(&self, pi: usize) -> Option<u32> { (pi == 2).then_some(88) }
+    fn hosted_thread_badge_for_tid(&self, tid: u64) -> Option<u64> {
+        (tid == 7).then_some(9)
+    }
+    fn hosted_process_image(&self, pi: usize) -> Option<nt_exe_image::Image> {
+        (pi == 2).then_some(nt_exe_image::Image)
+    }
+    fn capture_process_identity(&self, pi: usize) -> Option<ProcessIdentity> {
+        (pi == 2).then_some(ProcessIdentity {
+            pid: 88, generation: nt_types::ProcessGeneration::Hosted(3),
+        })
+    }
+    fn primary_token_authentication_id_for_pi(&self, _: usize) -> Option<Luid> { None }
+    fn primary_token_user_sid_for_pi(&self, _: usize, _: &mut [u8; 8]) -> Option<usize> { None }
+    fn capture_provider_logical_caller(&self, _: usize, _: u64, _: u64, tcb: u64) -> Option<u64> {
+        Some(tcb)
+    }
+    fn hosted_thread_role(&self, _: u64) -> Option<u8> { None }
+    fn hosted_process_top_badge(&self, _: usize) -> Option<u64> { None }
+}

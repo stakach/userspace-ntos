@@ -57,6 +57,14 @@ use nt_user_host::process_create_callout::InitialReplyRetryPhase as RetryPhase;
 
 static mut INITIAL_CREATE_RETRIES: alloc::vec::Vec<InitialCreateRetry> = alloc::vec::Vec::new();
 
+/// A parked source is not globally idle while this table still owns its exact Reply. Completed
+/// and transferred rows leave the table in `redrive_retry_no_effect`; uncertainty stays fenced.
+pub(crate) unsafe fn retained_initial_reply_pending() -> bool {
+    (&*core::ptr::addr_of!(INITIAL_CREATE_RETRIES))
+        .iter()
+        .any(InitialCreateRetry::blocks_terminal_quiescence)
+}
+
 unsafe fn prepare_foreign_retry_slot(caller: Binding, target: Binding) -> Result<(), u32> {
     nt_user_host::process_create_callout::InitialThreadReplyOrigin::new(caller, target)
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
@@ -384,7 +392,9 @@ unsafe fn capture_initial_win32k_client(
     if crate::win32k_subsystem::registered_win32k_callouts().is_none() {
         return Err(0xC000_00A3);
     }
-    let mut client = crate::win32k_lifecycle_client(binding.tid, handler, role)
+    let mut client = crate::win32k_lifecycle_client_for_tcb(
+        binding.tid, handler, role, binding.tcb,
+    )
         .ok_or(nt_process::STATUS_DEVICE_BUSY)?;
     if client.pi as usize != binding.pi || client.tid != binding.tid
         || client.badge != binding.badge || client.tcb != binding.tcb

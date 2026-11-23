@@ -238,8 +238,9 @@ fn initial_win32k_client_does_not_require_a_committed_role() {
         "the client role must come from its retained exact initial owner");
     assert!(capture.contains("role.unwrap_or(image.role).uses_win32_client_gdi()"),
         "a foreign GUI process without a role reservation still needs ordinary Win32k creation");
-    assert!(capture.contains("win32k_lifecycle_client(binding.tid, handler, role)"),
-        "initial process-create must pass its validated pre-commit role explicitly");
+    assert!(capture.contains("win32k_lifecycle_client_for_tcb(")
+        && capture.contains("binding.tid, handler, role, binding.tcb"),
+        "initial process-create must pass its exact retained TCB and pre-commit role explicitly");
     let role = source.split("unsafe fn precommit_initial_win32k_role(").nth(1)
         .expect("focused pre-commit role selector")
         .split("unsafe fn capture_initial_win32k_client(").next().unwrap();

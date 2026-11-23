@@ -87,7 +87,7 @@ pub(super) unsafe fn syscall_tail(
                 && !explorer_chrome_pending
                 && WINLOGON_KEY_OPENED.load(Ordering::Relaxed) != 0
                 && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
-                && !defer_quiesce_for_active_user_callbacks(b"winlogon-milestone")
+                && !defer_quiesce_for_root_continuations(b"winlogon-milestone")
             {
                 print_str(b"[quiesce] winlogon reached its win32k SAS-window milestone + steady state -> run gate\n");
                 lp.exit.stop = lp.msg.m0;
@@ -154,6 +154,7 @@ pub(super) unsafe fn syscall_tail(
                     lp.parks.crash_parked,
                     lp.parks.wait_parked,
                 )
+                && !defer_quiesce_for_root_continuations(b"winlogon-post-logon-callback")
             {
                 print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                 lp.exit.stop = lp.msg.m0;
@@ -417,7 +418,7 @@ pub(super) unsafe fn syscall_tail(
                     lp.parks.wait_parked,
                     b"bad-callback-resume",
                 )
-                && !defer_quiesce_for_active_user_callbacks(b"bad-callback-resume")
+                && !defer_quiesce_for_root_continuations(b"bad-callback-resume")
             {
                 print_str(b"[quiesce] active callback bad-resume park reached steady state -> run gate\n");
                 lp.exit.stop = resume_ip;

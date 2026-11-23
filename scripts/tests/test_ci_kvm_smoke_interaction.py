@@ -58,10 +58,33 @@ class ParseScriptTests(unittest.TestCase):
 
     def test_arm_mode_selects_seal_or_sealed_idle(self):
         self.assertEqual(parse_script({**DOCUMENT, "arm": "idle"}).arm, "idle")
-        self.assertEqual(load_script(DEFAULT_SCRIPT).arm, "idle")
+        self.assertEqual(load_script(DEFAULT_SCRIPT).arm, "seal")
         for bad in ("later", "", 1, None):
             with self.subTest(bad), self.assertRaises(ValueError):
                 parse_script({**DOCUMENT, "arm": bad})
+
+    def test_production_script_arms_at_seal_while_background_work_continues(self):
+        script = load_script(DEFAULT_SCRIPT)
+        self.assertEqual(script.arm, "seal",
+                         "a painted Explorer desktop must accept input while services continue")
+        self.assertEqual(script.settle_seconds, 10)
+        with tempfile.TemporaryDirectory() as directory:
+            serial = Path(directory) / "serial.log"
+            serial.write_bytes(
+                b"[quiesce] Explorer runtime paint milestones complete; boot-progress "
+                b"epoch sealed\n[hosted-process] another background child started\n"
+            )
+            self.assertIsNotNone(SerialPanicDetector(
+                serial, DESKTOP_EPOCH_SEALED_RECORD).poll())
+            screenshots = []
+            now = [100.0]
+            interaction = InteractionRunner(
+                script, lambda _batches: None, screenshots.append,
+                Path(directory) / "interaction.jsonl", clock=lambda: now[0])
+            interaction.arm(now[0])
+            now[0] = 110.0
+            interaction.advance(now[0])
+            self.assertEqual(screenshots, ["native-kvm-interact-01-baseline.ppm"])
 
     def test_invalid_documents_fail_before_boot(self):
         def mutate(change):
