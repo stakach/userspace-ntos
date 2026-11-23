@@ -30,7 +30,7 @@ on:
         type: string
         default: ''
       interact:
-        description: After the sealed Explorer desktop, drive scripts/kvm_interaction_steps.json through QMP input and screenshot each step. The desktop gate requires every step, so clearing this fails the gate
+        description: After the sealed Explorer desktop, drive scripts/kvm_interaction_steps.json through QMP input and prove the visible command result. Clearing this fails the gate
         type: boolean
         default: true
       multicore:
@@ -110,12 +110,12 @@ jobs:
         run: |
           sudo apt-get update
           # The headless QMP/PPM runner does not need QEMU's GUI and multimedia recommends.
-          sudo apt-get install -y --no-install-recommends build-essential clang curl libarchive-tools ovmf qemu-system-x86 7zip mtools dosfstools
+          sudo apt-get install -y --no-install-recommends build-essential clang curl libarchive-tools ovmf qemu-system-x86 7zip mtools dosfstools tesseract-ocr tesseract-ocr-eng
           # Ubuntu's 7zip package exposes 7z; the project uses the equivalent 7zz CLI.
           if ! command -v 7zz >/dev/null && command -v 7z >/dev/null; then
             sudo ln -s "$(command -v 7z)" /usr/local/bin/7zz
           fi
-          for tool in bsdtar 7zz qemu-system-x86_64 clang cc python3 mcopy mdir mmd mkfs.fat; do
+          for tool in bsdtar 7zz qemu-system-x86_64 clang cc python3 mcopy mdir mmd mkfs.fat tesseract; do
             command -v "$tool"
           done
       - name: Install the current nightly for the native build

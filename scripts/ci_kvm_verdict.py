@@ -3,7 +3,8 @@
 A boot passes exactly when:
 
 * Explorer sealed the desktop's boot-progress epoch;
-* the scripted interaction ran every step with no input or capture error;
+* the scripted interaction ran every step with no input or capture error and the
+  final framebuffer visibly contains the typed command and its result;
 * the serial log holds no executive panic, provider bugcheck, service-loop exit, kernel
   panic or kernel halt;
 * the runner saw no other terminal stop (a guest reset, a refused hive durability verdict,
@@ -14,6 +15,11 @@ The rule is pure so that it can be tested against recorded serial output.
 
 from dataclasses import asdict, dataclass, field
 import re
+
+try:
+    from .ci_kvm_visual_proof import VisualProof
+except ImportError:
+    from ci_kvm_visual_proof import VisualProof
 
 DESKTOP_SEALED = re.compile(
     rb"\[quiesce\] Explorer runtime paint milestones complete; boot-progress epoch sealed"
@@ -38,10 +44,15 @@ class InteractionOutcome:
     completed: int = 0
     total: int = 0
     errors: int = 0
+    visual_proof: VisualProof | None = None
+
+    def receipts_passed(self):
+        return self.requested and self.armed and self.total > 0 \
+            and self.completed == self.total and self.errors == 0
 
     def passed(self):
-        return self.requested and self.armed and self.total > 0 and self.completed == self.total \
-            and self.errors == 0
+        return self.receipts_passed() and self.visual_proof is not None \
+            and self.visual_proof.passed
 
     def describe(self):
         if not self.requested:
@@ -84,7 +95,12 @@ def boot_verdict(serial, interaction, runner_failures=()):
     reasons = list(runner_failures) + faults
     if not sealed:
         reasons.append("Explorer desktop never sealed")
-    if not interaction.passed():
+    if not interaction.receipts_passed():
         reasons.append(interaction.describe())
+    elif interaction.visual_proof is None or not interaction.visual_proof.passed:
+        reason = "visible command result missing"
+        if interaction.visual_proof is not None and interaction.visual_proof.error:
+            reason += f": {interaction.visual_proof.error}"
+        reasons.append(reason)
     return BootVerdict(passed=not reasons, sealed=sealed, interaction=interaction,
                        faults=faults, reasons=reasons)

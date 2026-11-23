@@ -3,14 +3,25 @@
 import unittest
 
 from scripts.ci_kvm_verdict import InteractionOutcome, boot_verdict
+from scripts.ci_kvm_visual_proof import VisualProof
 
 SEALED = (b"[quiesce] Explorer runtime paint milestones complete; "
           b"boot-progress epoch sealed\r\n")
 BOOT = b"boot: reading Simpleboot memory map\r\n[pm-dynamic] allocated hosted process\r\n"
-COMPLETE = InteractionOutcome(requested=True, armed=True, completed=5, total=5, errors=0)
+COMPLETE = InteractionOutcome(requested=True, armed=True, completed=5, total=5, errors=0,
+                              visual_proof=VisualProof(True, "C:\\Users\\User>ver\nMicrosoft Windows [Version 10.0.26100.1]"))
 
 
 class DesktopGateTests(unittest.TestCase):
+    def test_completed_input_receipts_without_visible_command_result_fail(self):
+        # KVM 45151572631 boot 2 sent every QMP action and captured every image,
+        # but Applications Manager covered the prompt and no `ver` result was visible.
+        receipts_only = InteractionOutcome(requested=True, armed=True, completed=5,
+                                           total=5, errors=0)
+        verdict = boot_verdict(BOOT + SEALED, receipts_only)
+        self.assertFalse(verdict.passed)
+        self.assertIn("visible command result missing", verdict.reasons)
+
     def test_a_sealed_desktop_with_a_complete_interaction_and_a_clean_log_passes(self):
         verdict = boot_verdict(BOOT + SEALED + b"[user-callback] B completed\r\n", COMPLETE)
         self.assertTrue(verdict.passed, verdict.reasons)
