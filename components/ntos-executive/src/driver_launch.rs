@@ -59283,6 +59283,17 @@ unsafe fn release_hosted_irq_lane_cap(cap: &mut u64) -> u64 {
 
 unsafe fn release_hosted_irq_lane_mechanism(lane: &mut HostedIrqLaneRuntime) -> u64 {
     lane.state = HostedIrqLaneState::ShuttingDown;
+    let projection_cnode = lane.cnode;
+    let projection_owner = hosted_port_projection::PhysicalOwner::Irq {
+        instance: lane.projection_instance,
+        domain_id: lane.domain.domain_id.raw(),
+        cookie: lane.domain.cookie,
+        generation: lane.identity.lane_generation,
+        tcb: lane.tcb,
+    };
+    if !hosted_port_projection::retirement_allowed(projection_cnode, projection_owner) {
+        return 1;
+    }
     if lane.ingress_entered && !lane.ingress_retired {
         // Shared ingress owns the peer aliases and all rotated Replies. Native drain/retirement
         // must acknowledge those obligations before this physical allocation can be released.
@@ -59344,6 +59355,7 @@ unsafe fn release_hosted_irq_lane_mechanism(lane: &mut HostedIrqLaneRuntime) -> 
     if release_hosted_irq_lane_cap(&mut lane.raw_cnode) != 0 {
         return 1;
     }
+    assert!(hosted_port_projection::retired(projection_cnode, projection_owner));
     for leaf in lane.arg.iter_mut().rev() {
         failures += release_hosted_irq_lane_leaf(leaf);
     }
@@ -61590,6 +61602,9 @@ unsafe fn clear_hosted_resource_projection(
     binding: HostedDeviceBinding,
     sh: u64,
 ) -> Result<(), nt_status::NtStatus> {
+    if hosted_port_projection::quarantines_domain(binding.projection_domain) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if hosted_video_caller_aperture::blocks_device_retirement(binding.device_id)
         || hosted_video_caller_aperture::blocks_device_retirement(binding.pdo_device_id) {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
@@ -63903,17 +63918,73 @@ unsafe fn claim_hosted_supplemental_port_range(
     Ok(())
 }
 
-unsafe fn clear_hosted_io_port_caps(cnode: u64) -> Result<(), nt_status::NtStatus> {
-    if cnode == 0 {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    let mut slot = 0;
-    while slot < crate::CT_IO_PORT_CAPACITY {
-        if crate::cnode_delete_in_cnode_r(cnode, crate::CT_IO_PORT_BASE + slot) != 0 {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+mod hosted_port_projection;
+
+unsafe fn hosted_port_projection_owner(
+    cnode: u64,
+) -> Option<hosted_port_projection::PhysicalOwner> {
+    use hosted_port_projection::PhysicalOwner;
+    let mut found = None;
+    let mut ambiguous = false;
+    let mut select = |candidate| {
+        if found.replace(candidate).is_some() {
+            ambiguous = true;
         }
-        slot += 1;
+    };
+    if let Some(instances) = driver_instances() {
+        for (index, inst) in instances.iter().copied().enumerate() {
+            if inst.used && inst.cnode == cnode {
+                let domain = instance_domain_identity(inst)?;
+                select(PhysicalOwner::Primary {
+                    instance: index,
+                    domain_id: domain.domain_id.raw(),
+                    cookie: domain.cookie,
+                    tcb: inst.tcb,
+                });
+            }
+        }
     }
+    if let Some(workers) = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_ref() {
+        for worker in workers.iter().copied().filter(|worker| worker.cnode == cnode) {
+            let inst = instance(worker.instance)?;
+            if instance_domain_identity(inst) != Some(worker.domain)
+                || worker.pml4 != inst.pml4
+            {
+                return None;
+            }
+            select(PhysicalOwner::Thread {
+                construction: worker.construction,
+                domain_id: worker.domain.domain_id.raw(),
+                cookie: worker.domain.cookie,
+                tcb: worker.tcb,
+            });
+        }
+    }
+    if let Some(lanes) = hosted_irq_lanes() {
+        for lane in lanes.iter().filter(|lane| lane.cnode == cnode) {
+            if lane.state != HostedIrqLaneState::Ready {
+                return None;
+            }
+            select(PhysicalOwner::Irq {
+                instance: lane.projection_instance,
+                domain_id: lane.domain.domain_id.raw(),
+                cookie: lane.domain.cookie,
+                generation: lane.identity.lane_generation,
+                tcb: lane.tcb,
+            });
+        }
+    }
+    if ambiguous { None } else { found }
+}
+
+unsafe fn clear_hosted_io_port_caps(cnode: u64) -> Result<(), nt_status::NtStatus> {
+    let owner = hosted_port_projection_owner(cnode)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let ticket = hosted_port_projection::Ticket::begin(owner, cnode, None)?;
+    for slot in 0..crate::CT_IO_PORT_CAPACITY {
+        ticket.delete(crate::CT_IO_PORT_BASE + slot)?;
+    }
+    ticket.finish();
     Ok(())
 }
 
@@ -63921,10 +63992,6 @@ unsafe fn copy_hosted_io_port_caps_to_cnode(
     cnode: u64,
     state: HostedDeviceResourceState,
 ) -> Result<(), nt_status::NtStatus> {
-    if cnode == 0 {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    clear_hosted_io_port_caps(cnode)?;
     for resource in hosted_state_address_resources(&state) {
         if resource.kind != SH_RESOURCE_ADDRESS_KIND_PORT {
             continue;
@@ -63937,19 +64004,19 @@ unsafe fn copy_hosted_io_port_caps_to_cnode(
         {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
-        let copy = crate::cnode_copy_at_r(cnode, component_slot, cap);
-        if copy != 0 {
-            let _ = clear_hosted_io_port_caps(cnode);
-            print_str(b"[driver-launch] IOPort cap restore failed label=");
-            print_u64(copy);
-            print_str(b" device_id=");
-            print_u64(state.device_id);
-            print_str(b" cnode=");
-            print_u64(cnode);
-            print_str(b"\n");
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let owner = hosted_port_projection_owner(cnode)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let ticket = hosted_port_projection::Ticket::begin(owner, cnode, Some(state))?;
+    for slot in 0..crate::CT_IO_PORT_CAPACITY {
+        ticket.delete(crate::CT_IO_PORT_BASE + slot)?;
+    }
+    for resource in hosted_state_address_resources(&state) {
+        if resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT {
+            ticket.copy(resource.component_cap, resource.broker_va_or_root_cap)?;
         }
     }
+    ticket.finish();
     Ok(())
 }
 

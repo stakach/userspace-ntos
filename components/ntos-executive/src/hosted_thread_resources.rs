@@ -437,6 +437,19 @@ pub(super) unsafe fn retire(id: usize, shared_retired: bool) -> bool {
     if owner(id).finished {
         return true;
     }
+    let port_cnode = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES))
+        .as_ref()
+        .and_then(|rows| rows.iter().find(|runtime| runtime.construction == id))
+        .map(|runtime| (runtime.cnode, hosted_port_projection::PhysicalOwner::Thread {
+            construction: id,
+            domain_id: runtime.domain.domain_id.raw(),
+            cookie: runtime.domain.cookie,
+            tcb: runtime.tcb,
+        }));
+    if port_cnode.is_some_and(|(cnode, projection)|
+        !hosted_port_projection::retirement_allowed(cnode, projection)) {
+        return false;
+    }
     if owner(id).priority_plan.is_some() {
         return false;
     }
@@ -521,6 +534,9 @@ pub(super) unsafe fn retire(id: usize, shared_retired: bool) -> bool {
         };
     }
     owner(id).finished = true;
+    if let Some((cnode, projection)) = port_cnode {
+        assert!(hosted_port_projection::retired(cnode, projection));
+    }
     true
 }
 

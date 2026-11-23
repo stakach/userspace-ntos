@@ -309,6 +309,11 @@ pub(super) unsafe fn release_unenrolled(instance_index: usize, inst: DriverInsta
     let Some(domain) = instance_domain_identity(inst) else {
         return false;
     };
+    let port_owner = hosted_port_projection::PhysicalOwner::Primary {
+        instance: instance_index, domain_id: domain.domain_id.raw(), cookie: domain.cookie,
+        tcb: inst.tcb,
+    };
+    if !hosted_port_projection::retirement_allowed(inst.cnode, port_owner) { return false; }
     if hosted_source_stack_lease::blocks_primary_retirement(instance_index, domain, inst.tcb, inst.pml4) {
         return false;
     }
@@ -356,6 +361,7 @@ pub(super) unsafe fn release_unenrolled(instance_index: usize, inst: DriverInsta
         return false;
     }
     row(index).finished = true;
+    assert!(hosted_port_projection::retired(inst.cnode, port_owner));
     true
 }
 
@@ -374,6 +380,11 @@ pub(super) unsafe fn release(instance_index: usize, inst: DriverInstance) -> boo
     let Some(domain) = instance_domain_identity(inst) else {
         return false;
     };
+    let port_owner = hosted_port_projection::PhysicalOwner::Primary {
+        instance: instance_index, domain_id: domain.domain_id.raw(), cookie: domain.cookie,
+        tcb: inst.tcb,
+    };
+    if !hosted_port_projection::retirement_allowed(inst.cnode, port_owner) { return false; }
     if hosted_source_stack_lease::blocks_primary_retirement(instance_index, domain, inst.tcb, inst.pml4) {
         return false;
     }
@@ -468,5 +479,6 @@ pub(super) unsafe fn release(instance_index: usize, inst: DriverInstance) -> boo
         let _ = table.remove(inst.main_thread_id);
     }
     row(index).finished = true;
+    assert!(hosted_port_projection::retired(inst.cnode, port_owner));
     true
 }
