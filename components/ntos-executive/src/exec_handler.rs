@@ -21513,12 +21513,24 @@ impl ExecNtHandler {
             let Some(mechanism) = self.process_mechanisms.get(pi) else {
                 return HostedProcessDeletionOutcome::Pending(candidate.phase);
             };
-            let role = self.hosted_process_role(pi);
-            if !candidate.matches_mechanism(mechanism)
-                || self.ps_object_retirements.prepare_provider_context(
-                    candidate, mechanism.top_badge, role,
-                ).is_err()
-            {
+            if !candidate.matches_mechanism(mechanism) {
+                return HostedProcessDeletionOutcome::Pending(candidate.phase);
+            }
+            let badge = mechanism.top_badge;
+            let Some(target) = self.hosted_process_image(pi)
+                .map(nt_exe_image::SpawnTarget::from_image)
+                .filter(|target| target.generation == candidate.generation)
+            else { return HostedProcessDeletionOutcome::Pending(candidate.phase); };
+            let Some(process) = self.capture_process_identity(pi)
+                .filter(|process| process.pid == pid
+                    && process.generation == nt_types::ProcessGeneration::Hosted(candidate.generation))
+            else { return HostedProcessDeletionOutcome::Pending(candidate.phase); };
+            let Some(role) = self.execution_roles.role(target, process) else {
+                return HostedProcessDeletionOutcome::Pending(candidate.phase);
+            };
+            if self.ps_object_retirements.prepare_provider_context(
+                candidate, badge, Some(role),
+            ).is_err() {
                 return HostedProcessDeletionOutcome::Pending(candidate.phase);
             }
         }

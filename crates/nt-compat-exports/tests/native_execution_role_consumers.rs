@@ -16,7 +16,6 @@ const CATALOG_ROLE_CALLS: &[&str] = &[
 
 /// Today's sites, per executive source file (counted call sites, definitions excluded).
 const BASELINE: &[(&str, usize)] = &[
-    ("exec_handler.rs", 1),
     ("initial_thread_creation.rs", 1),
     ("main.rs", 1),
 ];
@@ -188,6 +187,22 @@ fn active_win32k_callback_client_carries_the_committed_process_role() {
         .split("unsafe fn sync_win32k_context_to_process_manager(").next().unwrap();
     assert!(context.contains("process_role: nt_handler.live_execution_role(pi)"),
         "the dispatch callback frame must carry the same live role as its syscall route");
+}
+
+#[test]
+fn provider_retirement_freezes_the_exact_committed_role() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/exec_handler.rs"),
+    )
+    .expect("process retirement source");
+    let prepare = source.split("pub(crate) fn try_delete_hosted_process_object(").nth(1)
+        .expect("hosted process deletion")
+        .split("fn trace_hosted_process_delete_blockers(").next().unwrap();
+    assert!(prepare.contains("self.execution_roles.role("),
+        "the provider finalizer must freeze the generation-bound committed role, not the image catalog");
+    assert!(!prepare.contains("self.hosted_process_role(pi)"),
+        "a signaled process's catalog role is not retirement authority");
 }
 
 #[test]

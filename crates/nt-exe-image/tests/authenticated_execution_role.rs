@@ -160,11 +160,16 @@ fn bootstrap_root_requires_the_actual_mounted_file() {
         Some(HostedProcessRole::NativeSession));
     assert_eq!(roles.live_role(smss, identity, |_, _| false), None,
         "a retired process cannot authorize a new child from its catalog image");
+    assert_eq!(roles.role(smss, identity), Some(HostedProcessRole::NativeSession),
+        "provider retirement can still freeze the exact committed role after liveness ends");
     assert_eq!(roles.live_role(smss, process(12, 2), |_, _| true), None,
         "a recycled PID cannot inherit the previous generation's role");
     assert_eq!(roles.live_role(SpawnTarget { generation: smss.generation + 1, ..smss },
         identity, |_, _| true), None,
         "a recycled image slot cannot reuse the previous target's role");
+    assert_eq!(roles.retire_exact(smss, identity), Ok(()));
+    assert_eq!(roles.role(smss, identity), None,
+        "the committed role is gone after exact execution retirement");
 }
 
 #[test]
