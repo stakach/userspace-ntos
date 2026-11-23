@@ -138,3 +138,21 @@ fn dynamic_file_observation_uses_pe_subsystem_after_live_creator_admission() {
         "the PE-derived role must reach the catalog admission"
     );
 }
+
+#[test]
+fn csrss_workers_require_the_committed_live_role() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/exec_handler.rs"),
+    )
+    .expect("executive source");
+    assert!(source.contains("&& self.current_process_is_csrss()"),
+        "the special CSRSS worker path must keep its role gate");
+    let gate = source.split("fn current_process_is_csrss(&self) -> bool {").nth(1)
+        .expect("CSRSS worker role gate")
+        .split("fn current_process_is_lsass(").next().unwrap();
+    let compact: String = gate.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains(
+        "self.live_execution_role(self.pi)==Some(nt_exe_image::HostedProcessRole::Win32Subsystem)"
+    ), "a generic File image must gain CSRSS worker authority only from its committed live role");
+}

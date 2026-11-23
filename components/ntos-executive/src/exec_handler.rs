@@ -9928,7 +9928,8 @@ impl ExecNtHandler {
     }
 
     fn current_process_is_csrss(&self) -> bool {
-        self.current_process_has_role(nt_exe_image::HostedProcessRole::Win32Subsystem)
+        self.live_execution_role(self.pi)
+            == Some(nt_exe_image::HostedProcessRole::Win32Subsystem)
     }
 
     fn current_process_is_lsass(&self) -> bool {
