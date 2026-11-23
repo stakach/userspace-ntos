@@ -1,6 +1,7 @@
 //! Generation-owned scanout alias for a hosted display provider's GOP handoff.
 
 use super::*;
+use nt_pnp_context::resource_mapping::MappingCache;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase { Mapping, Ready, Uncertain, Retired }
@@ -49,7 +50,7 @@ pub(super) unsafe fn map_scanout(
     print_str(b" cache=");
     print_u64(cache);
     print_str(b"\n");
-    if !matches!(cache, 0 | 2) { reject!(b"cache"); }
+    if cache != nt_hal_abi::MM_NON_CACHED as u64 { reject!(b"cache"); }
     let Some((instance_index, inst)) = instance_for_pump_channel(channel, reply_cap) else {
         reject!(b"pump-instance");
     };
@@ -165,7 +166,8 @@ pub(super) unsafe fn map_scanout(
         }
         // Adopt before PageMap; a nonzero error after entry leaves the effect uncertain.
         rows[index].owner.as_mut().unwrap().adopt_alias_cap(cap, true);
-        if page_map_r(cap, target_va, RW_NX, inst.pml4) != 0 {
+        if page_map_r(cap, target_va,
+            hosted_resource_mapping::page_map_rights(RW_NX, MappingCache::Uncached), inst.pml4) != 0 {
             rows[index].phase = Phase::Uncertain;
             return 0;
         }

@@ -132,7 +132,26 @@ struct Mapping {
     owner: ResourceOwner,
     translated_start: u64,
     length: u64,
+    cache: MemoryCache,
     valid: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MemoryCache {
+    NonCached,
+    Cached,
+    WriteCombined,
+}
+
+impl MemoryCache {
+    fn from_abi(cache: u32) -> Result<Self, HalError> {
+        match cache {
+            MM_NON_CACHED => Ok(Self::NonCached),
+            MM_CACHED => Ok(Self::Cached),
+            MM_WRITE_COMBINED => Ok(Self::WriteCombined),
+            _ => Err(HalError::AccessDenied),
+        }
+    }
 }
 
 struct Interrupt {
@@ -1155,13 +1174,14 @@ impl ResourceManager {
 
     /// `MmMapIoSpace` (spec §8.2, §6.1): map succeeds only if `[phys, phys+len)` lies
     /// within a memory resource assigned to `owner`, not revoked, and the assignment
-    /// grants at least read access.
+    /// grants at least read access and the requested cache type matches the assignment.
+    /// Overlapping live mappings must use the same cache type, even across owners.
     pub fn map_io_space(
         &mut self,
         owner: ResourceOwner,
         phys: u64,
         length: u64,
-        _cache: u32,
+        cache: u32,
     ) -> Result<Granted, HalError> {
         let m = self
             .memory
@@ -1197,6 +1217,17 @@ impl ResourceManager {
         if m.rights & RIGHT_READ == 0 {
             return Err(HalError::AccessDenied);
         }
+        let requested_cache = MemoryCache::from_abi(cache)?;
+        if self.mappings.iter().any(|mapping| {
+            mapping.valid
+                && mapping.cache != requested_cache
+                && ranges_overlap(mapping.translated_start, mapping.length, phys, length)
+        }) {
+            return Err(HalError::ConflictingAddress);
+        }
+        if requested_cache != MemoryCache::from_abi(m.cache)? {
+            return Err(HalError::AccessDenied);
+        }
         self.mappings
             .try_reserve(1)
             .map_err(|_| HalError::InsufficientResources)?;
@@ -1218,6 +1249,7 @@ impl ResourceManager {
             owner,
             translated_start: g.translated_start,
             length,
+            cache: requested_cache,
             valid: true,
         });
         Ok(g)
@@ -1541,6 +1573,64 @@ mod tests {
             rm.unmap_io_space(owner, g.mapping_id),
             Err(HalError::StaleId)
         );
+    }
+
+    #[test]
+    fn conflicting_mmio_cache_alias_is_rejected_without_changing_mapping_owner() {
+        let (mut rm, owner) = rm();
+        let cached_owner = ResourceOwner::new(2, 200, 20);
+        // Fixture assignments deliberately alias one translated physical range so the map
+        // policy is exercised independently of assignment admission.
+        rm.assign_memory(
+            cached_owner,
+            101,
+            0x2000_0000,
+            0x1000_0000,
+            0x1000,
+            MM_CACHED,
+            RIGHT_READ,
+        );
+        let first = rm
+            .map_io_space(owner, 0x1000_0000, 0x1000, MM_NON_CACHED)
+            .unwrap();
+        let next = rm.next_mapping_id;
+        let count = rm.mappings.len();
+
+        assert_eq!(
+            rm.map_io_space(cached_owner, 0x1000_0000, 0x800, MM_CACHED),
+            Err(HalError::ConflictingAddress),
+        );
+        assert!(rm.mapping_valid(first.mapping_id));
+        assert_eq!(rm.mappings.len(), count);
+        assert_eq!(rm.next_mapping_id, next);
+
+        let same_cache = rm
+            .map_io_space(owner, 0x1000_0000, 0x800, MM_NON_CACHED)
+            .unwrap();
+        rm.unmap_io_space(owner, first.mapping_id).unwrap();
+        assert!(rm.mapping_valid(same_cache.mapping_id));
+        assert_eq!(
+            rm.map_io_space(cached_owner, 0x1000_0000, 0x800, MM_CACHED),
+            Err(HalError::ConflictingAddress),
+        );
+        rm.unmap_io_space(owner, same_cache.mapping_id).unwrap();
+        let cached = rm
+            .map_io_space(cached_owner, 0x1000_0000, 0x800, MM_CACHED)
+            .unwrap();
+        assert_eq!(
+            rm.map_io_space(owner, 0x1000_0000, 0x800, MM_NON_CACHED),
+            Err(HalError::ConflictingAddress),
+        );
+        rm.unmap_io_space(cached_owner, cached.mapping_id).unwrap();
+        assert_eq!(
+            rm.map_io_space(owner, 0x1000_0000, 0x800, MM_CACHED),
+            Err(HalError::AccessDenied),
+            "an assigned noncached BAR cannot be silently remapped as cached",
+        );
+        let replacement = rm
+            .map_io_space(owner, 0x1000_0000, 0x800, MM_NON_CACHED)
+            .unwrap();
+        assert_ne!(replacement.mapping_id, same_cache.mapping_id);
     }
 
     #[test]

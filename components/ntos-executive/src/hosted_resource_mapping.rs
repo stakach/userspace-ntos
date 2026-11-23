@@ -2,9 +2,18 @@
 
 use super::*;
 use nt_pnp_context::resource_mapping::{
-    Admission, MappingDomain, MappingError, MappingKey, MappingOwner, OwnerReceipt, ReleaseAction,
+    Admission, MappingCache, MappingDomain, MappingError, MappingKey, MappingOwner, OwnerReceipt, ReleaseAction,
     ResourceMappingTable,
 };
+
+/// rust-micro's compressed x86 PageMap ABI uses bit 3 for PWT+PCD (strong UC).
+/// The other supported mode leaves those bits clear (writeback).
+pub(super) const fn page_map_rights(rights: u64, cache: MappingCache) -> u64 {
+    match cache {
+        MappingCache::WriteBack => rights,
+        MappingCache::Uncached => rights | 0b1000,
+    }
+}
 
 static mut MAPPINGS: ResourceMappingTable = ResourceMappingTable::new();
 
@@ -78,6 +87,7 @@ pub(super) unsafe fn map_run(
     frame_base: u64,
     pages: u64,
     rights: u64,
+    cache: MappingCache,
 ) -> Result<(), nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let bytes = pages
@@ -123,7 +133,7 @@ pub(super) unsafe fn map_run(
             physical_page,
             source_cap,
             rights,
-            attributes: 0,
+            cache,
         };
         let receipt = match table_mut().prepare(key, owner).map_err(status)? {
             Admission::Joined(_) => {
@@ -150,7 +160,7 @@ pub(super) unsafe fn map_run(
         let (cap, effect) = table_mut()
             .begin_map(receipt)
             .expect("resource cap must be recorded before entering PageMap");
-        let error = page_map_r(cap, virtual_page, rights, inst.pml4);
+        let error = page_map_r(cap, virtual_page, page_map_rights(rights, cache), inst.pml4);
         if error != 0 {
             let _ = table_mut().mark_map_uncertain(effect);
             return Err(nt_status::NtStatus::UNSUCCESSFUL);

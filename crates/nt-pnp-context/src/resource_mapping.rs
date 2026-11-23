@@ -16,6 +16,14 @@ pub struct MappingDomain {
     pub cookie: u64,
 }
 
+/// Cache behavior of a physical resource leaf that the native PageMap ABI can represent.
+/// Write combining is excluded until the kernel exposes a PAT mapping contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MappingCache {
+    WriteBack,
+    Uncached,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MappingKey {
     pub domain: MappingDomain,
@@ -26,7 +34,7 @@ pub struct MappingKey {
     /// the backing for repairs even if this source alias's context subsequently retires.
     pub source_cap: u64,
     pub rights: u64,
-    pub attributes: u64,
+    pub cache: MappingCache,
 }
 
 impl MappingKey {
@@ -38,7 +46,7 @@ impl MappingKey {
             && self.virtual_page == other.virtual_page
             && self.physical_page == other.physical_page
             && self.rights == other.rights
-            && self.attributes == other.attributes
+            && self.cache == other.cache
     }
 }
 
@@ -188,6 +196,16 @@ impl ResourceMappingTable {
         }
         if owner.device_id == 0 {
             return Err(MappingError::InvalidOwner);
+        }
+
+        // A different VSpace address still aliases the same physical page. Keep uncertain and
+        // retiring rows authoritative until their native effects are proved retired.
+        if self
+            .rows
+            .iter()
+            .any(|row| row.key.physical_page == key.physical_page && row.key.cache != key.cache)
+        {
+            return Err(MappingError::Conflict);
         }
 
         // A reused numeric VSpace cannot carry leaves from another domain generation.

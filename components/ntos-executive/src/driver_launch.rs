@@ -11542,17 +11542,24 @@ extern "win64" fn s_mm_get_virtual_for_physical(physical_address: u64) -> u64 {
 extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
     unsafe {
         let shared = hosted_component_resource_shared_va();
-        if let Some(existing) = hosted_component_virtual_address(phys, length) {
-            trace_hosted_mm_map_io_space(phys, length, cache, existing, b"component-map");
-            return existing;
-        }
-        let Some(resource) = find_shared_address_resource_by_range(
+        let assigned = find_shared_address_resource_by_range(
             shared,
             SH_RESOURCE_ADDRESS_KIND_MEMORY,
             phys,
             length,
             true,
-        ) else {
+        );
+        // BAR leaves are installed as strong UC when the grant is published. Returning a
+        // preexisting VA for another cache request would claim an attribute the PTE lacks.
+        if assigned.is_some() && cache != nt_hal_abi::MM_NON_CACHED {
+            trace_hosted_mm_map_io_space(phys, length, cache, 0, b"cache-mismatch");
+            return 0;
+        }
+        if let Some(existing) = hosted_component_virtual_address(phys, length) {
+            trace_hosted_mm_map_io_space(phys, length, cache, existing, b"component-map");
+            return existing;
+        }
+        let Some(resource) = assigned else {
             if let Some(projected) = hosted_driver_contiguous_memory::map_physical(
                 phys, length, cache) {
                 trace_hosted_mm_map_io_space(phys, length, cache, projected, b"contiguous-owned");
@@ -44904,6 +44911,7 @@ unsafe fn map_hosted_resource_frame_run(
     frame_base: u64,
     pages: u64,
     rights: u64,
+    cache: nt_pnp_context::resource_mapping::MappingCache,
 ) -> Result<(), nt_status::NtStatus> {
     hosted_resource_mapping::map_run(
         instance_index,
@@ -44915,6 +44923,7 @@ unsafe fn map_hosted_resource_frame_run(
         frame_base,
         pages,
         rights,
+        cache,
     )
 }
 
@@ -67698,6 +67707,7 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                     window.dma_frame_base,
                     window.dma_pages,
                     RW_NX,
+                    nt_pnp_context::resource_mapping::MappingCache::WriteBack,
                 )
             } {
                 if unsafe {
@@ -72795,6 +72805,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             instance_index, inst, paging_domain, device_id, pnp_context_lease,
             grant.component_va & !0xfff, grant.frame_base, grant.map_pages,
             if grant.writable { RW_NX } else { RO_NX },
+            nt_pnp_context::resource_mapping::MappingCache::Uncached,
         ) {
             rollback_staged_hosted_resource_grant(
                 binding,
@@ -72858,6 +72869,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             dma_frame_base,
             dma_pages,
             RW_NX,
+            nt_pnp_context::resource_mapping::MappingCache::WriteBack,
         ) {
             rollback_staged_hosted_resource_grant(
                 binding,
@@ -72880,6 +72892,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                 dma_frame_base,
                 dma_pages,
                 RW_NX,
+                nt_pnp_context::resource_mapping::MappingCache::WriteBack,
             ) {
                 rollback_staged_hosted_resource_grant(
                     binding,
