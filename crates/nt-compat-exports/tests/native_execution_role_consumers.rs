@@ -249,6 +249,43 @@ fn initial_win32k_client_does_not_require_a_committed_role() {
 }
 
 #[test]
+fn shell_frontiers_and_completed_paint_use_committed_roles() {
+    let service = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/service_sec_image.rs"),
+    )
+    .expect("shell frontier source");
+    let body = |start: &str, end: &str| {
+        service.split(start).nth(1).expect("frontier function")
+            .split(end).next().unwrap()
+    };
+    for (start, end) in [
+        ("unsafe fn progress_stall_deferral_snapshot(", "unsafe fn trace_progress_stall_deferral("),
+        ("unsafe fn interactive_shell_chrome_frontier_pending(", "unsafe fn defer_quiesce_for_interactive_shell_chrome("),
+        ("unsafe fn pre_user_shell_frontier_pending(", "unsafe fn dump_shell_launch_quiesce("),
+        ("fn userinit_shell_frontier_pending(", "fn pi_is_top_level("),
+    ] {
+        let frontier = body(start, end);
+        assert!(frontier.contains("live_hosted_pi_for_execution_role("),
+            "{start}: a catalog observation cannot defer or end global quiescence");
+        assert!(!frontier.contains("live_hosted_pi_for_observation_role("),
+            "{start}: runtime role authority must come from the ledger");
+    }
+    let selector = body("fn live_hosted_pi_for_execution_role(", "fn hosted_pi_for_top_badge(");
+    assert!(selector.contains("unique_live_execution_target(role)"),
+        "shell gates must select the unique exact running ledger target");
+    let route = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/executor/syscall_win32k.rs"),
+    )
+    .expect("win32k route source");
+    assert!(route.contains("let explorer_direct_gdi_draw = explorer_gui_client"),
+        "completed Explorer draws must use the live role already selected for dispatch");
+    assert!(!route.contains("observed_explorer_gui_client"),
+        "catalog observation cannot advance Explorer's boot milestone counters");
+}
+
+#[test]
 fn terminal_and_ingress_roles_use_admitted_process_owners() {
     let source = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))

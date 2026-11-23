@@ -4068,7 +4068,7 @@ unsafe fn progress_stall_deferral_snapshot(
         });
     }
     if interactive_shell_chrome_frontier_pending(nt_handler, crash_parked, wait_parked) {
-        let pi = live_hosted_pi_for_observation_role(
+        let pi = live_hosted_pi_for_execution_role(
             nt_handler,
             nt_exe_image::HostedProcessRole::InteractiveShell,
         )?;
@@ -8651,6 +8651,13 @@ pub(crate) fn live_hosted_pi_for_observation_role(
     selected
 }
 
+fn live_hosted_pi_for_execution_role(
+    nt_handler: &ExecNtHandler,
+    role: nt_exe_image::HostedProcessRole,
+) -> Option<usize> {
+    nt_handler.unique_live_execution_target(role).map(|(target, _)| target.pi)
+}
+
 fn hosted_pi_for_top_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
     let runtime = nt_handler.admit_hosted_thread_ingress(badge).ok()?;
     (nt_handler.hosted_process_top_badge(runtime.pi) == Some(badge))
@@ -8725,7 +8732,7 @@ unsafe fn interactive_shell_chrome_frontier_pending(
     if explorer_chrome_runtime_milestones_reached() {
         return false;
     }
-    let Some(pi) = live_hosted_pi_for_observation_role(
+    let Some(pi) = live_hosted_pi_for_execution_role(
         nt_handler,
         nt_exe_image::HostedProcessRole::InteractiveShell,
     ) else {
@@ -8773,11 +8780,11 @@ unsafe fn pre_user_shell_frontier_pending(
     wait_parked: u64,
     reason: &[u8],
 ) -> bool {
-    if live_hosted_pi_for_observation_role(
+    if live_hosted_pi_for_execution_role(
         nt_handler,
         nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
     ).is_some()
-        || live_hosted_pi_for_observation_role(
+        || live_hosted_pi_for_execution_role(
             nt_handler,
             nt_exe_image::HostedProcessRole::ServiceControlManager,
         ).is_none()
@@ -8789,7 +8796,7 @@ unsafe fn pre_user_shell_frontier_pending(
     // Those waiters are live, but they are not runnable work that should defer the interactive
     // login gate once the pre-user-shell path has otherwise gone idle.
     let mut runnable_owners = runnable_top_badges(nt_handler) & !(crash_parked | wait_parked);
-    if let Some(winlogon_badge) = live_hosted_pi_for_observation_role(
+    if let Some(winlogon_badge) = live_hosted_pi_for_execution_role(
         nt_handler,
         nt_exe_image::HostedProcessRole::InteractiveLogon,
     ).and_then(|pi| nt_handler.hosted_process_top_badge(pi))
@@ -8815,7 +8822,7 @@ unsafe fn pre_user_shell_frontier_pending(
         print_str(b" lsa-active=");
         print_u64(LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed));
         print_str(b" userinit=");
-        print_u64(live_hosted_pi_for_observation_role(
+        print_u64(live_hosted_pi_for_execution_role(
             nt_handler,
             nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
         ).is_some() as u64);
@@ -17735,7 +17742,7 @@ fn userinit_shell_frontier_pending(
     if USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) != 0 {
         return false;
     }
-    let Some(userinit_badge) = live_hosted_pi_for_observation_role(
+    let Some(userinit_badge) = live_hosted_pi_for_execution_role(
         nt_handler,
         nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
     )

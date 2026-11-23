@@ -43,8 +43,6 @@ pub(super) unsafe fn syscall_win32k_route(
         == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap);
     let explorer_gui_client =
         process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell);
-    let observed_explorer_gui_client = nt_handler.hosted_process_observation_role(pi)
-        == Some(nt_exe_image::HostedProcessRole::InteractiveShell);
     let shell_gui_client = matches!(
         process_role,
         Some(
@@ -73,7 +71,7 @@ pub(super) unsafe fn syscall_win32k_route(
                 modal_message_buffer,
             )
         };
-    let explorer_direct_gdi_draw = observed_explorer_gui_client
+    let explorer_direct_gdi_draw = explorer_gui_client
         && matches!(
             lp.msg.m0,
             NTGDI_BIT_BLT_SSN
@@ -3781,7 +3779,7 @@ pub(super) unsafe fn syscall_win32k_route(
             observe_completed_desktop_dispatch(&mut nt_handler, client.logical_caller,
                 lp.msg.m0, completion_args, r.0, dispatch_return);
         }
-        if observed_explorer_gui_client && r.1 && r.0 != 0 {
+        if explorer_gui_client && r.1 && r.0 != 0 {
             match lp.msg.m0 {
                 NTUSER_BEGIN_PAINT_SSN => {
                     if EXPLORER_BEGIN_PAINTS.fetch_add(1, Ordering::Relaxed) == 0 {
