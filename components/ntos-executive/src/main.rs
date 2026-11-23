@@ -19146,10 +19146,25 @@ fn win32k_lifecycle_client(
     handler: &ExecNtHandler,
     process_role: Option<nt_exe_image::HostedProcessRole>,
 ) -> Option<win32k_glue::Win32kClientContext> {
+    let tcb = handler.hosted_thread_tcb(tid)?;
+    win32k_lifecycle_client_for_tcb(tid, handler, process_role, tcb)
+}
+
+/// Initial process creation supplies the dormant target TCB from its exact retained owner.
+/// Ordinary callers enter through `win32k_lifecycle_client` and its executable gate.
+fn win32k_lifecycle_client_for_tcb(
+    tid: u64,
+    handler: &ExecNtHandler,
+    process_role: Option<nt_exe_image::HostedProcessRole>,
+    tcb: u64,
+) -> Option<win32k_glue::Win32kClientContext> {
+    let runtime = handler.thread_runtime.get_by_tid(tid)?;
+    if tcb <= 1 || runtime.tcb != tcb {
+        return None;
+    }
     let pi = handler.hosted_thread_pi_for_tid(tid)?;
     let pid = handler.pm_pid_for_pi(pi)?;
     let badge = handler.hosted_thread_badge_for_tid(tid)?;
-    let tcb = handler.hosted_thread_tcb(tid)?;
     let teb = handler.pm.thread_teb(tid as nt_process::ThreadId)?;
     let target = nt_exe_image::SpawnTarget::from_image(handler.hosted_process_image(pi)?);
     if target.generation == 0 {
