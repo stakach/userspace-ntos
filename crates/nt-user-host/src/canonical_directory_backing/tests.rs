@@ -243,6 +243,168 @@ fn failed_open_if_native_publication_preserves_existing_permanent_name() {
 struct DelayedPort { create_calls: u32, close_calls: u32, create_ready: bool, close_ready: bool,
     incoherent: bool }
 
+struct BusyAdmissionPort {
+    channel_busy: bool, refusal_status: u32, create_calls: u32, next_handle: u64,
+}
+
+impl DirectoryPort for BusyAdmissionPort {
+    type Handle = u64;
+    type Pending = ();
+
+    fn create(&mut self, _: &[u16], _: u32, _: u32) -> PortCreate<u64, ()> {
+        self.create_calls += 1;
+        if self.channel_busy {
+            PortCreate::NoEffect(self.refusal_status)
+        } else {
+            self.next_handle += 1;
+            PortCreate::Completed(Ok(CanonicalHandle {
+                handle: self.next_handle, created: true,
+            }))
+        }
+    }
+    fn open(&mut self, path: &[u16], access: u32, attributes: u32) -> PortCreate<u64, ()> {
+        self.create(path, access, attributes)
+    }
+    fn poll_create(&mut self, _: &mut ()) -> Option<PortTerminal<CanonicalHandle<u64>>> {
+        panic!("a no-effect busy admission must not be polled as an in-flight effect")
+    }
+    fn make_temporary(&mut self, _: u64) -> PortEffect<()> { unreachable!() }
+    fn make_permanent(&mut self, _: u64) -> PortEffect<()> { unreachable!() }
+    fn close(&mut self, _: u64) -> PortEffect<()> { unreachable!() }
+    fn poll_effect(&mut self, _: &mut ()) -> Option<PortTerminal<()>> { unreachable!() }
+}
+
+struct BusyThenPendingPort { busy: bool, create_calls: u32, poll_calls: u32 }
+
+impl DirectoryPort for BusyThenPendingPort {
+    type Handle = u64;
+    type Pending = u64;
+
+    fn create(&mut self, _: &[u16], _: u32, _: u32) -> PortCreate<u64, u64> {
+        self.create_calls += 1;
+        if self.busy { PortCreate::NoEffect(0x8000_0011) }
+        else { PortCreate::Indeterminate(77) }
+    }
+    fn open(&mut self, path: &[u16], access: u32, attributes: u32) -> PortCreate<u64, u64> {
+        self.create(path, access, attributes)
+    }
+    fn poll_create(&mut self, pending: &mut u64) -> Option<PortTerminal<CanonicalHandle<u64>>> {
+        assert_eq!(*pending, 77);
+        self.poll_calls += 1;
+        (self.poll_calls == 2).then_some(PortTerminal::Success(CanonicalHandle {
+            handle: 93, created: true,
+        }))
+    }
+    fn make_temporary(&mut self, _: u64) -> PortEffect<u64> { unreachable!() }
+    fn make_permanent(&mut self, _: u64) -> PortEffect<u64> { unreachable!() }
+    fn close(&mut self, _: u64) -> PortEffect<u64> { unreachable!() }
+    fn poll_effect(&mut self, _: &mut u64) -> Option<PortTerminal<()>> { unreachable!() }
+}
+
+#[test]
+fn busy_no_effect_directory_admission_waits_for_owned_close_then_retries_exact_owner() {
+    let path: Vec<u16> = "\\Windows".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, u64, ()>::new();
+    backing.reserve(1, DirectoryAction::Create, &path, 0, 0).unwrap();
+    let mut admission = CanonicalPublishAdmission::new();
+    let mut port = BusyAdmissionPort { channel_busy: true, refusal_status: 0x8000_0011,
+        create_calls: 0, next_handle: 90 };
+
+    assert_eq!(admission.publish(&mut backing, 1, &mut port), Ok(Publication::Pending));
+    assert!(admission.retry_without_effect());
+    assert!(!admission.pending_effect());
+    assert_eq!(backing.reserve(2, DirectoryAction::Create, &path, 0, 0),
+        Err(BackingError::PathOccupied));
+    assert_eq!(admission.poll(&mut backing, 1, &mut port), Err(BackingError::InvalidPhase));
+    assert_eq!(admission.publish(&mut backing, 1, &mut port), Ok(Publication::Pending));
+    assert_eq!(port.create_calls, 2); // one admission attempt per pump turn
+    port.channel_busy = false; // the older close's exact poll has retired its channel owner
+    assert_eq!(admission.publish(&mut backing, 1, &mut port), Ok(Publication::Ready));
+    assert_eq!(port.create_calls, 3);
+    assert!(!admission.retry_without_effect());
+    assert_eq!(backing.bind_local(1, 55), Ok(91));
+}
+
+#[test]
+fn cancelled_busy_admission_aborts_reserved_owner_without_starting_new_effect() {
+    let path: Vec<u16> = "\\RPC Control".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, u64, ()>::new();
+    backing.reserve(3, DirectoryAction::Create, &path, 0, 0).unwrap();
+    let mut admission = CanonicalPublishAdmission::new();
+    let mut port = BusyAdmissionPort { channel_busy: true, refusal_status: 0x8000_0011,
+        create_calls: 0, next_handle: 90 };
+
+    assert_eq!(admission.publish(&mut backing, 3, &mut port), Ok(Publication::Pending));
+    assert!(admission.retry_without_effect());
+    assert_eq!(admission.abort_before_effect(&mut backing, 3), Ok(()));
+    port.channel_busy = false;
+    assert_eq!(port.create_calls, 1);
+    assert_eq!(backing.reserve(4, DirectoryAction::Create, &path, 0, 0), Ok(()));
+}
+
+#[test]
+fn two_directory_owners_wait_on_one_busy_channel_without_exchanging_reservations() {
+    let a: Vec<u16> = "\\Windows".encode_utf16().collect();
+    let b: Vec<u16> = "\\RPC Control".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, u64, ()>::new();
+    backing.reserve(10, DirectoryAction::Create, &a, 0, 0).unwrap();
+    backing.reserve(11, DirectoryAction::Create, &b, 0, 0).unwrap();
+    let mut first = CanonicalPublishAdmission::new();
+    let mut second = CanonicalPublishAdmission::new();
+    let mut port = BusyAdmissionPort { channel_busy: true, refusal_status: 0x8000_0011,
+        create_calls: 0, next_handle: 90 };
+
+    assert_eq!(first.publish(&mut backing, 10, &mut port), Ok(Publication::Pending));
+    assert_eq!(second.publish(&mut backing, 11, &mut port), Ok(Publication::Pending));
+    assert_eq!(port.create_calls, 2);
+    assert!(first.retry_without_effect() && second.retry_without_effect());
+
+    port.channel_busy = false;
+    assert_eq!(second.publish(&mut backing, 11, &mut port), Ok(Publication::Ready));
+    assert_eq!(first.publish(&mut backing, 10, &mut port), Ok(Publication::Ready));
+    assert_eq!(backing.bind_local(10, 100), Ok(92));
+    assert_eq!(backing.bind_local(11, 101), Ok(91));
+    assert_eq!(port.create_calls, 4);
+}
+
+#[test]
+fn non_busy_no_effect_directory_refusal_stays_terminal() {
+    let path: Vec<u16> = "\\Invalid".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, u64, ()>::new();
+    backing.reserve(12, DirectoryAction::Create, &path, 0, 0).unwrap();
+    let mut admission = CanonicalPublishAdmission::new();
+    let mut port = BusyAdmissionPort { channel_busy: true, refusal_status: 0xC000_000D,
+        create_calls: 0, next_handle: 90 };
+
+    assert_eq!(admission.publish(&mut backing, 12, &mut port),
+        Err(BackingError::NoEffect(0xC000_000D)));
+    assert!(!admission.retry_without_effect());
+    assert_eq!(port.create_calls, 1);
+    assert_eq!(admission.abort_before_effect(&mut backing, 12), Ok(()));
+}
+
+#[test]
+fn busy_retry_that_starts_an_uncertain_effect_switches_to_exact_poll_without_replay() {
+    let path: Vec<u16> = "\\Pending".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, u64, u64>::new();
+    backing.reserve(13, DirectoryAction::Create, &path, 0, 0).unwrap();
+    let mut admission = CanonicalPublishAdmission::new();
+    let mut port = BusyThenPendingPort { busy: true, create_calls: 0, poll_calls: 0 };
+
+    assert_eq!(admission.publish(&mut backing, 13, &mut port), Ok(Publication::Pending));
+    assert!(admission.retry_without_effect());
+    port.busy = false;
+    assert_eq!(admission.publish(&mut backing, 13, &mut port), Ok(Publication::Pending));
+    assert!(admission.pending_effect());
+    assert!(!admission.retry_without_effect());
+    assert_eq!(admission.publish(&mut backing, 13, &mut port), Err(BackingError::InvalidPhase));
+    assert_eq!(admission.abort_before_effect(&mut backing, 13), Err(BackingError::InvalidPhase));
+    assert_eq!(admission.poll(&mut backing, 13, &mut port), Ok(None));
+    assert_eq!(admission.poll(&mut backing, 13, &mut port), Ok(Some(Publication::Ready)));
+    assert_eq!(port.create_calls, 2);
+    assert_eq!(port.poll_calls, 2);
+}
+
 impl DirectoryPort for DelayedPort {
     type Handle = u64;
     type Pending = u64;
@@ -300,6 +462,26 @@ fn uncertain_create_and_close_hold_exact_owner_without_replay() {
     assert_eq!(backing.poll_close(5, &mut port), Ok(Some(Publication::Ready)));
     assert_eq!(port.close_calls, 1);
     backing.retire_terminal(1).unwrap();
+}
+
+#[test]
+fn in_flight_directory_publish_cannot_be_reentered_or_aborted() {
+    let path: Vec<u16> = "\\Device\\Pending".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, u64, u64>::new();
+    backing.reserve(20, DirectoryAction::Create, &path, 0, 0).unwrap();
+    let mut admission = CanonicalPublishAdmission::new();
+    let mut port = DelayedPort { create_calls: 0, close_calls: 0,
+        create_ready: false, close_ready: false, incoherent: false };
+
+    assert_eq!(admission.publish(&mut backing, 20, &mut port), Ok(Publication::Pending));
+    assert!(admission.pending_effect());
+    assert!(!admission.retry_without_effect());
+    assert_eq!(admission.publish(&mut backing, 20, &mut port), Err(BackingError::InvalidPhase));
+    assert_eq!(admission.abort_before_effect(&mut backing, 20), Err(BackingError::InvalidPhase));
+    assert_eq!(port.create_calls, 1);
+    port.create_ready = true;
+    assert_eq!(admission.poll(&mut backing, 20, &mut port), Ok(Some(Publication::Ready)));
+    assert_eq!(port.create_calls, 1);
 }
 
 #[test]

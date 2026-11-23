@@ -25,12 +25,53 @@ READY_PROMPT_OCR = ("CAWindows\\svstem32\\emd.exe\n"
                     "LiberNT [Version 0.4.17-amd64-dev 20261013-8e478a2]\n"
                     "C:\\Users\\User>\n"
                     "Command\nPrompt\n")
+# Run 45220839653 boot 1, original step-6 PPM SHA
+# bd680e8be300fbd1b6c7eebc541b3899676fbdc3bc5bda3f99dda43a48121d21.
+RECORDED_READY_COMMA_OCR = ("CAWindows\\svstem32\\emd.exe\n"
+                            "‘Command Prompt\n"
+                            "LiberNT [Version 0.4.17-amd64-dev 20261013-8e478a2]\n"
+                            "(C) Copyright 2026 LiberNT Team.\n"
+                            "(C) Copyright 1996-2026 ReactOS Team.\n"
+                            "C:\\Users\\User>,\n")
 OLD_APPLAUNCH_OCR = ("C:\\Windows\\system32\\cmd.exe\n"
                      "APPLAUNCH_NO_DISK\nAPPLAUNCH_DONE\n"
                      "Command\nPrompt\n")
+RECORDED_SPILLOVER_OCR = (Path(__file__).with_name("fixtures") /
+                          "ready_prompt_45248027167.txt").read_text()
+RECORDED_BOOT2_VER_OCR = (Path(__file__).with_name("fixtures") /
+                          "ver_boot2_45256201173.txt").read_text()
 
 
 class VisualProofTests(unittest.TestCase):
+    def test_recorded_boot2_ver_ignores_separate_punctuation_spillover(self):
+        # Original boot-2 step-7 PPM SHA-256 from mainline run 45256201173:
+        # 5d81ceacaabece252cef893f1435a9cf28f1a3ecb39a04767caef4611abf29a2.
+        # Both the command and version are visible; PSM 11 joined an unrelated glyph.
+        self.assertTrue(contains_ver_result(RECORDED_BOOT2_VER_OCR))
+        self.assertFalse(contains_ver_result(RECORDED_BOOT2_VER_OCR.replace(
+            "C:\\Users\\User>ver", "C:\\Users\\User>dir")))
+        self.assertFalse(contains_ver_result(RECORDED_BOOT2_VER_OCR.replace(
+            "Microsoft Windows [Version 10.0.26100.1]", "Version unavailable")))
+        self.assertFalse(contains_ver_result("Command Prompt\nabc C:\\Users\\User>ver\n"
+                                             "Microsoft Windows [Version 10.0.26100.1]\n"))
+        self.assertFalse(contains_ver_result("Command Prompt\n!!!! C:\\Users\\User>ver\n"
+                                             "Microsoft Windows [Version 10.0.26100.1]\n"))
+
+    def test_recorded_ready_prompt_ignores_separate_punctuation_spillover(self):
+        # Original full step-6 PPM SHA-256 from mainline run 45248027167:
+        # 2cb84c651432283ecf1e3e4bcae3209a2326a5ddb285712b6ff8d54df7e835dc.
+        # PSM 11 joins an unrelated desktop glyph into the prompt's OCR line.
+        self.assertTrue(contains_ready_prompt(RECORDED_SPILLOVER_OCR))
+        self.assertFalse(contains_ready_prompt(OLD_APPLAUNCH_OCR))
+        self.assertFalse(contains_ready_prompt("Command Prompt\nabc C:\\Users\\User>,\n"))
+        self.assertFalse(contains_ready_prompt("Command Prompt\n(;} C:\\Users\\User>,ver\n"))
+        self.assertFalse(contains_ready_prompt("Command Prompt\n!!!! C:\\Users\\User>,\n"))
+
+    def test_recorded_ready_prompt_ocr_comma_caret_is_not_a_typed_command(self):
+        self.assertTrue(contains_ready_prompt(RECORDED_READY_COMMA_OCR))
+        self.assertFalse(contains_ready_prompt("Command Prompt\nC:\\Users\\User>,ver\n"))
+        self.assertFalse(contains_ready_prompt(OLD_APPLAUNCH_OCR))
+
     def test_ready_prompt_distinguishes_recorded_foreground_from_old_window(self):
         self.assertTrue(contains_ready_prompt(READY_PROMPT_OCR))
         self.assertFalse(contains_ready_prompt(OLD_APPLAUNCH_OCR))
