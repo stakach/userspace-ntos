@@ -1,7 +1,9 @@
 //! Staged native directory-object opens over the executive's canonical namespace.
 
 use super::*;
-use nt_user_host::canonical_directory_backing::{BackingError, DirectoryAction, Publication};
+use nt_user_host::canonical_directory_backing::{
+    BackingError, CanonicalPublishAdmission, DirectoryAction, Publication,
+};
 
 pub(crate) enum DirectoryPublishProgress { Ready(u32), Pending, Failed(u32) }
 
@@ -13,7 +15,7 @@ pub(crate) struct ReservedDirectoryObjectOpen {
     created_index: Option<usize>,
     security: directory_security::DirectorySecurityAdmission,
     canonical: CanonicalDirectoryReservation,
-    canonical_pending: bool,
+    canonical_publish: CanonicalPublishAdmission,
     rollback_failure: Option<u32>,
     rollback_pending: bool,
     canonical_quarantined: bool,
@@ -45,6 +47,10 @@ impl ReservedDirectoryObjectOpen {
     /// An uncertain canonical effect retains ownership but has no safe retry or timer wake.
     pub(crate) fn canonical_retryable(&self) -> bool {
         !self.canonical_quarantined
+    }
+
+    pub(crate) fn canonical_retry_without_effect(&self) -> bool {
+        self.canonical_publish.retry_without_effect()
     }
 }
 
@@ -205,7 +211,7 @@ impl ExecNtHandler {
             created_index: None,
             security,
             canonical,
-            canonical_pending: false,
+            canonical_publish: CanonicalPublishAdmission::new(),
             rollback_failure: None,
             rollback_pending: false,
             canonical_quarantined: false,
@@ -246,12 +252,9 @@ impl ExecNtHandler {
             CanonicalDirectoryReservation::Existing(_) => DirectoryPublishProgress::Ready(0),
             CanonicalDirectoryReservation::Reserved(owner) => {
                 let mut port = crate::canonical_directory_port::CanonicalDirectoryPort::new();
-                match self.canonical_directories.publish(owner, &mut port) {
+                match staged.canonical_publish.publish(&mut self.canonical_directories, owner, &mut port) {
                     Ok(Publication::Ready) => DirectoryPublishProgress::Ready(0),
-                    Ok(Publication::Pending) => {
-                        staged.canonical_pending = true;
-                        DirectoryPublishProgress::Pending
-                    }
+                    Ok(Publication::Pending) => DirectoryPublishProgress::Pending,
                     Err(BackingError::EffectUncertain) => {
                         staged.canonical_quarantined = true;
                         DirectoryPublishProgress::Pending
@@ -349,12 +352,16 @@ impl ExecNtHandler {
                 }
             };
         }
-        if !staged.canonical_pending { return DirectoryPublishProgress::Failed(0xC000_0008); }
-        match self.canonical_directories.poll_publish(owner, &mut port) {
-            Ok(Some(Publication::Ready)) => {
-                staged.canonical_pending = false;
-                DirectoryPublishProgress::Ready(0)
-            }
+        if staged.canonical_retry_without_effect() {
+            // A later admission is a new native effect, so revalidate the captured caller.
+            let caller = staged.security.caller();
+            return self.canonical_publish_directory_object(staged, caller);
+        }
+        if !staged.canonical_publish.pending_effect() {
+            return DirectoryPublishProgress::Failed(0xC000_0008);
+        }
+        match staged.canonical_publish.poll(&mut self.canonical_directories, owner, &mut port) {
+            Ok(Some(Publication::Ready)) => DirectoryPublishProgress::Ready(0),
             Ok(None) | Ok(Some(Publication::Pending)) => DirectoryPublishProgress::Pending,
             Err(BackingError::EffectUncertain) => {
                 staged.canonical_quarantined = true;
@@ -362,7 +369,6 @@ impl ExecNtHandler {
             }
             Err(error) => {
                 trace_directory_failure(b"canonical-poll", backing_status(error));
-                staged.canonical_pending = false;
                 if self.abort_reserved_provider_directory_object(staged) {
                     DirectoryPublishProgress::Failed(backing_status(error))
                 } else { DirectoryPublishProgress::Pending }
@@ -519,7 +525,7 @@ impl ExecNtHandler {
         &mut self,
         staged: &mut ReservedProviderDirectoryObject,
     ) -> bool {
-        if staged.canonical_pending || staged.canonical_quarantined
+        if staged.canonical_publish.pending_effect() || staged.canonical_quarantined
             || (staged.local_committed && !staged.native_aborted)
         {
             return false;
@@ -530,7 +536,9 @@ impl ExecNtHandler {
         }
         staged.native_aborted = true;
         if let CanonicalDirectoryReservation::Reserved(owner) = staged.canonical {
-            if self.canonical_directories.abort_before_effect(owner).is_err()
+            if staged.canonical_publish.abort_before_effect(
+                &mut self.canonical_directories, owner,
+            ).is_err()
                 && self.canonical_directories.retire_terminal(owner).is_err()
             {
                 staged.canonical_quarantined = true;

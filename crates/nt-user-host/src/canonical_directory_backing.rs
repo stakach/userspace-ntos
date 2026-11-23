@@ -19,6 +19,56 @@ pub enum BackingError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Publication { Ready, Pending }
 
+/// Tracks which canonical publish operation the native owner may redrive. A pending backend
+/// effect must be polled; a fresh admission has not started a backend effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanonicalPublishPhase { Fresh, PendingEffect }
+
+pub struct CanonicalPublishAdmission { phase: CanonicalPublishPhase }
+
+impl CanonicalPublishAdmission {
+    pub const fn new() -> Self { Self { phase: CanonicalPublishPhase::Fresh } }
+
+    pub const fn pending_effect(&self) -> bool {
+        matches!(self.phase, CanonicalPublishPhase::PendingEffect)
+    }
+
+    /// A definitely refused admission has not started a backend effect.
+    pub const fn retry_without_effect(&self) -> bool { false }
+
+    pub fn abort_before_effect<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P>(
+        &mut self, backings: &mut CanonicalDirectoryBackings<O, L, H, P>, owner: O,
+    ) -> Result<(), BackingError> {
+        if self.pending_effect() { return Err(BackingError::InvalidPhase); }
+        backings.abort_before_effect(owner)
+    }
+
+    pub fn publish<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P>(
+        &mut self, backings: &mut CanonicalDirectoryBackings<O, L, H, P>, owner: O,
+        port: &mut impl DirectoryPort<Handle=H, Pending=P>,
+    ) -> Result<Publication, BackingError> {
+        if self.pending_effect() { return Err(BackingError::InvalidPhase); }
+        let result = backings.publish(owner, port);
+        self.phase = if matches!(result, Ok(Publication::Pending)) {
+            CanonicalPublishPhase::PendingEffect
+        } else { CanonicalPublishPhase::Fresh };
+        result
+    }
+
+    pub fn poll<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P>(
+        &mut self, backings: &mut CanonicalDirectoryBackings<O, L, H, P>, owner: O,
+        port: &mut impl DirectoryPort<Handle=H, Pending=P>,
+    ) -> Result<Option<Publication>, BackingError> {
+        if !self.pending_effect() { return Err(BackingError::InvalidPhase); }
+        let result = backings.poll_publish(owner, port);
+        if !matches!(result, Ok(None) | Ok(Some(Publication::Pending))
+            | Err(BackingError::EffectUncertain)) {
+            self.phase = CanonicalPublishPhase::Fresh;
+        }
+        result
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectoryAction { Create, Open }
 
