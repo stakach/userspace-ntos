@@ -310,7 +310,7 @@ unsafe fn capture_initial_win32k_client(
     if handler.capture_process_identity(binding.pi) != Some(binding.process) {
         return Err(nt_process::STATUS_INVALID_HANDLE);
     }
-    let mut client = crate::win32k_lifecycle_client(binding.tid, handler)
+    let mut client = crate::win32k_lifecycle_client(binding.tid, handler, role)
         .ok_or(nt_process::STATUS_DEVICE_BUSY)?;
     if client.pi as usize != binding.pi || client.tid != binding.tid
         || client.badge != binding.badge || client.tcb != binding.tcb

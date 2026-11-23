@@ -825,6 +825,7 @@ diagnosis-free failure.
 
 ## Keep Failed Capability Slots Retained
 - A failed capability copy does not prove its destination slot stayed empty. Record the slot and entered copy before the call; retain both on any ambiguous error, and recycle only after a separate exact observation proves the slot vacant or the copied cap has been safely deleted.
+- A client constructor shared by process creation before role commit and teardown after process exit cannot fetch a Running-only role internally. Validate each caller's exact process identity and pass its phase's role explicitly; test both callers when changing that shared boundary.
 
 ## Keep Isolated Service Diagnostics Off Shared Image Statics
 - Object and Configuration Manager services map the shared root image read-only. A new atomic trace counter in `.bss` can pass a native build yet fault on its first isolated-service write. Keep per-service diagnostic budgets on private stack or owned heap state, and use a focused read-only-image regression before a boot.

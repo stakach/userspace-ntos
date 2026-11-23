@@ -17,7 +17,6 @@ const CATALOG_ROLE_CALLS: &[&str] = &[
 /// Today's sites, per executive source file (counted call sites, definitions excluded).
 const BASELINE: &[(&str, usize)] = &[
     ("initial_thread_creation.rs", 1),
-    ("main.rs", 1),
 ];
 
 fn executive_sources(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
@@ -203,6 +202,50 @@ fn provider_retirement_freezes_the_exact_committed_role() {
         "the provider finalizer must freeze the generation-bound committed role, not the image catalog");
     assert!(!prepare.contains("self.hosted_process_role(pi)"),
         "a signaled process's catalog role is not retirement authority");
+}
+
+#[test]
+fn win32k_lifecycle_client_keeps_the_exact_committed_role_after_process_exit() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/main.rs"),
+    )
+    .expect("win32k lifecycle source");
+    let retirement = source.split("unsafe fn release_hosted_thread_win32_context(").nth(1)
+        .expect("lifecycle retirement")
+        .split("unsafe fn terminate_hosted_thread_mechanism(").next().unwrap();
+    assert!(retirement.contains("handler.execution_roles.role("),
+        "a signaled process retains an exact committed role until execution retirement");
+    assert!(retirement.contains("win32k_lifecycle_client(tid, handler, process_role)"),
+        "retirement must pass its exact retained role into the client constructor");
+    assert!(!retirement.contains("handler.hosted_process_role(pi)"),
+        "provider retirement cannot inherit a replacement catalog role");
+}
+
+#[test]
+fn initial_win32k_client_does_not_require_a_committed_role() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/initial_thread_creation.rs"),
+    )
+    .expect("initial thread source");
+    let capture = source.split("unsafe fn capture_initial_win32k_client(").nth(1)
+        .expect("pre-commit win32k client capture")
+        .split("pub(crate) unsafe fn validate_process_create_provider_caller(").next().unwrap();
+    assert!(capture.contains("handler.capture_process_identity(binding.pi) != Some(binding.process)"),
+        "the pre-commit observation must be tied to the exact reserved process");
+    assert!(capture.contains("win32k_lifecycle_client(binding.tid, handler, role)"),
+        "initial process-create must pass its validated pre-commit role explicitly");
+    let constructor = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/main.rs"),
+    )
+    .expect("win32k lifecycle constructor");
+    let constructor = constructor.split("fn win32k_lifecycle_client(").nth(1)
+        .expect("shared client constructor")
+        .split("unsafe fn release_hosted_thread_win32_context(").next().unwrap();
+    assert!(!constructor.contains("handler.execution_roles.role("),
+        "the shared constructor also serves a pre-commit initial process-create callout");
 }
 
 #[test]
