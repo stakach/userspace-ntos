@@ -47,6 +47,10 @@ class ParseScriptTests(unittest.TestCase):
         self.assertEqual(script.screen, (1024, 768))
         self.assertEqual(script.steps[0].name, "baseline")
         self.assertEqual(script.steps[1].actions, (("click", (28, 743)),))
+        # The second boot can put Applications Manager over cmd while leaving its
+        # title bar exposed. Focus that visible cmd window before typing.
+        self.assertEqual(script.steps[4].actions,
+                         (("click", (400, 55)), ("type", "ver\n")))
 
     def test_document_parses_to_ordered_steps(self):
         script = parse_script(DOCUMENT)

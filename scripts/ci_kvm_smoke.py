@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded CI KVM boot, gated on the sealed Explorer desktop and the scripted interaction (#31)."""
+"""Bounded CI KVM boot, gated on Explorer and a visible command result (#31, #440)."""
 
 import argparse
 import json
@@ -13,15 +13,17 @@ import threading
 import time
 
 if __package__:
-    from .ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script
+    from .ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script, screenshot_name
     from .ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
                                      read_run_state, request_quit)
     from .ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
+    from .ci_kvm_visual_proof import VisualProof, prove_ver_result
 else:
-    from ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script
+    from ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script, screenshot_name
     from ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
                                     read_run_state, request_quit)
     from ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
+    from ci_kvm_visual_proof import VisualProof, prove_ver_result
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1198,11 +1200,22 @@ def main():
     elif (bound_stop.is_set() and not panic_site and not terminal_reason
             and not runner_failures):
         BOUND_REACHED_MARKER.write_text(f"ran the whole {args.seconds}s bound\n")
+    visual_proof = None
+    if interaction is not None:
+        ver_step = next(((number, step) for number, step in
+                         enumerate(interaction_script.steps, 1) if step.name == "ver"), None)
+        if ver_step is None:
+            visual_proof = VisualProof(False, error="script has no ver step")
+        else:
+            visual_proof = prove_ver_result(ROOT / screenshot_name(*ver_step))
+        print("Visible command result: "
+              + ("verified" if visual_proof.passed else visual_proof.error), flush=True)
     outcome = (InteractionOutcome(requested=False) if interaction is None else
                InteractionOutcome(requested=True, armed=interaction.armed,
                                   completed=interaction.index,
                                   total=len(interaction_script.steps),
-                                  errors=interaction.failures))
+                                  errors=interaction.failures,
+                                  visual_proof=visual_proof))
     verdict = boot_verdict(serial, outcome, runner_failures)
     if interaction is not None:
         seal = "Explorer desktop sealed" if verdict.sealed else "Explorer desktop never sealed"
@@ -1213,7 +1226,8 @@ def main():
         raise SystemExit("KVM desktop gate failed: " + "; ".join(verdict.reasons)
                          + "; inspect native-kvm-smoke.log and native-kvm-verdict.json")
     print("KVM desktop gate passed: Explorer sealed the desktop, the scripted interaction "
-          f"completed ({outcome.describe()}) and the log records no fault")
+          f"completed ({outcome.describe()}), the command result was visible and the log "
+          "records no fault")
 
 if __name__ == "__main__":
     main()
