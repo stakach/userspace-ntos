@@ -1066,6 +1066,12 @@ def main():
                         print(f"Interaction {time.monotonic() - started:.0f}s: {name}", flush=True)
                     if interaction.finished:
                         print(f"Interaction finished: {interaction.summary()}", flush=True)
+                    if interaction.halted:
+                        terminal_reason = "interaction checkpoint failed"
+                        print("Guest interaction checkpoint failed; stopping bounded boot",
+                              flush=True)
+                        capture_terminal_evidence(terminal_reason)
+                        break
                 if time.monotonic() >= next_blockstats and QMP_SOCKET.exists():
                     try:
                         blockstats = read_bootdisk_blockstats()
