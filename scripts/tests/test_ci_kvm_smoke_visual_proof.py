@@ -28,6 +28,8 @@ class VisualProofTests(unittest.TestCase):
         self.assertFalse(contains_ver_result(
             "Microsoft Windows [Version 10.0.26100.1]\nC:\\Users\\User>ver\n"))
         self.assertFalse(contains_ver_result("C:\\Users\\User>ver\n"))
+        self.assertFalse(contains_ver_result(
+            "C:\\Users\\User>\nver\nMicrosoft Windows [Version 10.0.26100.1]\n"))
 
     def test_original_ppm_is_inspected_and_ocr_text_is_retained(self):
         with tempfile.TemporaryDirectory() as directory:

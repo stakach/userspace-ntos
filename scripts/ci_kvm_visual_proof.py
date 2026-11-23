@@ -7,8 +7,8 @@ import re
 import subprocess
 
 
-COMMAND = re.compile(r"(?im)^\s*[a-z]:\\[^\r\n>]*>\s*ver\s*$")
-RESULT = re.compile(r"(?im)^\s*Microsoft Windows\s*\[Version\s+\d+(?:\.\d+)+\]\s*$")
+COMMAND = re.compile(r"(?im)^[ \t]*[a-z]:\\[^\r\n>]*>[ \t]*ver[ \t]*$")
+RESULT = re.compile(r"(?im)^[ \t]*Microsoft Windows[ \t]*\[Version[ \t]+\d+(?:\.\d+)+\][ \t]*$")
 
 
 @dataclass(frozen=True)
