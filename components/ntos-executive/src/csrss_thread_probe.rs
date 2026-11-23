@@ -55,19 +55,22 @@ unsafe fn sample_once(now_100ns: u64) {
     let Ok(handler_ptr) = service_sec_image::registry_live_handler_pointer() else { return };
     // Copy exact identities and wait evidence before diagnostic seL4 calls.
     // The handler borrow ends here and does not cross an IPC buffer mutation.
-    let (pi, binding, lifetime, smss_wait) = {
+    let ((target, process), binding, lifetime, smss_wait) = {
         let handler = &*handler_ptr;
-        let Some(pi) = service_sec_image::live_hosted_pi_for_observation_role(
-            handler, nt_exe_image::HostedProcessRole::Win32Subsystem,
+        let Some((target, process)) = handler.unique_live_execution_target(
+            nt_exe_image::HostedProcessRole::Win32Subsystem,
         ) else { return };
-        let Some((binding, lifetime)) = handler.hosted_main_thread_sample_owner(pi) else { return };
-        let smss_wait = service_sec_image::live_hosted_pi_for_observation_role(
-            handler, nt_exe_image::HostedProcessRole::NativeSession,
-        ).and_then(|smss_pi| handler.capture_process_identity(smss_pi)
-            .and_then(|process| object_wait::object_waiter_oldest_unselected_for_process(
-                smss_pi, process, now_100ns,
-            )));
-        (pi, binding, lifetime, smss_wait)
+        let Some((binding, lifetime)) = handler.hosted_main_thread_sample_owner(target.pi)
+            else { return };
+        if binding.process != process { return; }
+        let smss_wait = handler.unique_live_execution_target(
+            nt_exe_image::HostedProcessRole::NativeSession,
+        ).and_then(|(smss_target, smss_process)| {
+            object_wait::object_waiter_oldest_unselected_for_process(
+                smss_target.pi, smss_process, now_100ns,
+            )
+        });
+        ((target, process), binding, lifetime, smss_wait)
     };
 
     let ordinal = {
@@ -92,11 +95,11 @@ unsafe fn sample_once(now_100ns: u64) {
     // current exact owner before reporting any sampled state.
     let mut regs = [0u64; 20];
     let valid = win32k_glue::tcb_read_regs20_checked(binding.tcb, &mut regs);
-    let exact_after = (&*handler_ptr).hosted_main_thread_sample_owner(pi)
+    let exact_after = (&*handler_ptr).hosted_main_thread_sample_owner(target.pi)
         == Some((binding, lifetime))
-        && service_sec_image::live_hosted_pi_for_observation_role(
-            &*handler_ptr, nt_exe_image::HostedProcessRole::Win32Subsystem,
-        ) == Some(pi);
+        && (&*handler_ptr).unique_live_execution_target(
+            nt_exe_image::HostedProcessRole::Win32Subsystem,
+        ) == Some((target, process));
     if !exact_after { return; }
 
     let process_generation = match binding.process.generation {
@@ -105,7 +108,7 @@ unsafe fn sample_once(now_100ns: u64) {
     };
     print_str(b"[csrss-main-sample] n/t-ms/pi/pid/pgen/tid/tgen/badge/tcb/last-role-ssn/role-ssn-count/smss-wait-seq/object/age-ms/regs-valid=");
     for (index, value) in [
-        ordinal, now_100ns / 10_000, pi as u64, u64::from(binding.process.pid),
+        ordinal, now_100ns / 10_000, target.pi as u64, u64::from(binding.process.pid),
         process_generation, binding.tid, lifetime.generation(), binding.badge,
         binding.tcb, LAST_CSRSS_ROLE_SSN.load(Ordering::Relaxed),
         CSRSS_ROLE_SSN_COUNT.load(Ordering::Relaxed),
