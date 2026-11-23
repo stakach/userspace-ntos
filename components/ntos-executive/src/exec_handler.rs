@@ -30393,7 +30393,7 @@ impl ExecNtHandler {
                     .ok()
                     .and_then(|pid| self.pi_for_pid(pid))
                     .is_some_and(|client_pi| {
-                        self.hosted_process_role(client_pi)
+                        self.live_execution_role(client_pi)
                             == Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
                     })
                 {

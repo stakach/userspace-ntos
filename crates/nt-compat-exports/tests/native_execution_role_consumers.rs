@@ -16,12 +16,12 @@ const CATALOG_ROLE_CALLS: &[&str] = &[
 
 /// Today's sites, per executive source file (counted call sites, definitions excluded).
 const BASELINE: &[(&str, usize)] = &[
-    ("exec_handler.rs", 2),
+    ("exec_handler.rs", 1),
     ("executor/syscall.rs", 2),
     ("hosted_gui_client_info.rs", 1),
     ("initial_thread_creation.rs", 1),
     ("main.rs", 1),
-    ("service_sec_image.rs", 5),
+    ("service_sec_image.rs", 3),
 ];
 
 fn executive_sources(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {

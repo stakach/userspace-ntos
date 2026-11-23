@@ -13105,7 +13105,7 @@ unsafe fn lpc_connect_wait_complete(
             CSR_AUTHENTIC_ACCEPTS.fetch_add(1, Ordering::Relaxed);
             CSR_AUTHENTIC_ACCEPT_MASK.fetch_or(1u64 << pi, Ordering::Relaxed);
             CSR_CONNECTED_MASK.fetch_or(1u64 << pi, Ordering::Relaxed);
-            if nt_handler.hosted_process_role(pi)
+            if nt_handler.live_execution_role(pi)
                 == Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
             {
                 WINLOGON_CSR_CONNECTED.store(1, Ordering::Relaxed);
@@ -13119,7 +13119,7 @@ unsafe fn lpc_connect_wait_complete(
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as u64)
                 .unwrap_or(0);
             LSA_OPERATIONAL_MODE.store(operational_mode, Ordering::Relaxed);
-            if nt_handler.hosted_process_role(pi)
+            if nt_handler.live_execution_role(pi)
                 == Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
             {
                 WINLOGON_LSA_PORT_HANDLE.store(completion.client_handle, Ordering::Relaxed);
