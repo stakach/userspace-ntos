@@ -25,7 +25,6 @@ const CATALOG_ROLE_CALLS: &[&str] = &[
 
 /// Today's sites, per executive source file (counted call sites, definitions excluded).
 const BASELINE: &[(&str, usize)] = &[
-    ("diag/post_loop.rs", 1),
     ("exec_file_create.rs", 1),
     ("exec_handler.rs", 21),
     ("executor/admission.rs", 1),
@@ -33,7 +32,7 @@ const BASELINE: &[(&str, usize)] = &[
     ("executor/syscall.rs", 2),
     ("executor/syscall_tail.rs", 5),
     ("executor/vm_fault.rs", 3),
-    ("service_sec_image.rs", 3),
+    ("service_sec_image.rs", 2),
 ];
 
 fn executive_sources(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
@@ -166,4 +165,31 @@ fn event_role_checks_require_live_owner_and_preserve_main_badge_scope() {
         "worker owner check must authenticate the event ingress");
     assert!(owner.contains("hosted_pi_has_role(nt_handler,runtime.pi,role)"),
         "worker role authority must come from its exact admitted owner");
+}
+
+#[test]
+fn worker_spawn_uses_publication_owner_instead_of_first_catalog_role() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../components/ntos-executive/src");
+    let source = fs::read_to_string(root.join("service_sec_image.rs"))
+        .expect("executive source");
+    let context = source
+        .split("fn live_process_context_for_role(")
+        .nth(1)
+        .expect("worker context helper")
+        .split("unsafe fn spawn_requested_local_thread(")
+        .next()
+        .expect("worker context boundary");
+    let compact: String = context.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("owner_pi:usize") && compact.contains("expected_pid:u64"),
+        "worker context must be checked against the already reserved publication owner");
+    assert!(compact.contains("live_execution_role(owner_pi)!=Some(role)"),
+        "a stale or pending catalog role cannot select a worker owner");
+    assert!(!compact.contains("hosted_pi_for_role("),
+        "worker owner must not come from the first matching catalog entry");
+
+    let post_loop = fs::read_to_string(root.join("diag/post_loop.rs"))
+        .expect("post-loop source");
+    assert!(post_loop.contains("unique_live_execution_target("),
+        "diagnostic owner selection must refuse ambiguous live roles");
 }

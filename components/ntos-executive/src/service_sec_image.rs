@@ -8598,31 +8598,6 @@ unsafe fn observe_winlogon_sas_logon_state() {
     print_str(b"\n");
 }
 
-fn hosted_top_badge_for_pi(nt_handler: &ExecNtHandler, pi: usize) -> u64 {
-    nt_handler.hosted_process_top_badge(pi).unwrap_or(0)
-}
-
-fn hosted_top_badge_for_role(
-    nt_handler: &ExecNtHandler,
-    role: nt_exe_image::HostedProcessRole,
-) -> Option<u64> {
-    (0..MAX_PI).find_map(|pi| {
-        (nt_handler.hosted_process_role(pi) == Some(role))
-            .then(|| nt_handler.hosted_process_top_badge(pi))
-            .flatten()
-    })
-}
-
-fn hosted_pi_for_role(
-    nt_handler: &ExecNtHandler,
-    role: nt_exe_image::HostedProcessRole,
-) -> Option<usize> {
-    (0..MAX_PI).find(|&pi| {
-        hosted_process_runtime_for_pi(pi).is_some()
-            && nt_handler.hosted_process_role(pi) == Some(role)
-    })
-}
-
 pub(crate) fn live_hosted_pi_for_observation_role(
     nt_handler: &ExecNtHandler,
     role: nt_exe_image::HostedProcessRole,
@@ -8711,24 +8686,6 @@ fn hosted_owner_has_role(
 ) -> bool {
     nt_handler.admit_hosted_thread_ingress(badge).ok()
         .is_some_and(|runtime| hosted_pi_has_role(nt_handler, runtime.pi, role))
-}
-
-fn live_hosted_pi_for_role(
-    nt_handler: &ExecNtHandler,
-    role: nt_exe_image::HostedProcessRole,
-) -> Option<usize> {
-    for pi in 0..MAX_PI {
-        if nt_handler.hosted_process_role(pi) != Some(role) {
-            continue;
-        }
-        let Some(pid) = nt_handler.pm_pid_for_pi(pi) else {
-            continue;
-        };
-        if nt_handler.pm.process(pid).is_some() {
-            return Some(pi);
-        }
-    }
-    None
 }
 
 fn hosted_leaf_for_fault_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<&[u8]> {
@@ -11494,13 +11451,14 @@ unsafe fn spawn_requested_multiplexed_thread(
     publication: PreparedHostedThreadPublication,
     fault_ep: u64,
 ) -> Result<(), u32> {
-    let (owner_pi, cid_proc, pml4) =
-        live_process_context_for_role(nt_handler, procs, spec.owner_role)
-            .expect("hosted EPROCESS missing before multiplexed thread spawn");
+    let Some((owner_pi, cid_proc, pml4)) = live_process_context_for_role(
+        nt_handler, procs, publication.owner_pi, publication.pid(), spec.owner_role,
+    ) else {
+        nt_handler.abort_unbuilt_hosted_thread_request(publication);
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    };
     let tid = publication.tid();
-    if publication.pid() != cid_proc
-        || nt_handler.hosted_thread_tid_for_role(owner_pi, spec.role) != Some(tid)
-    {
+    if nt_handler.hosted_thread_tid_for_role(owner_pi, spec.role) != Some(tid) {
         nt_handler.abort_unbuilt_hosted_thread_publication(
             publication, owner_pi, spec.badge, spec.role,
         );
@@ -12188,12 +12146,21 @@ unsafe fn print_quiesce_addr(
 fn live_process_context_for_role(
     nt_handler: &ExecNtHandler,
     procs: &[ProcExec],
+    owner_pi: usize,
+    expected_pid: u64,
     role: nt_exe_image::HostedProcessRole,
 ) -> Option<(usize, u64, u64)> {
-    let pi = hosted_pi_for_role(nt_handler, role)?;
-    let pid = nt_handler.pm_pid_for_pi(pi)?;
-    nt_handler.pm.process(pid)?;
-    Some((pi, pid as u64, procs[pi].pml4))
+    let process = procs.get(owner_pi)?;
+    if nt_handler.live_execution_role(owner_pi) != Some(role) {
+        return None;
+    }
+    let pid = nt_handler.pm_pid_for_pi(owner_pi)?;
+    if u64::from(pid) != expected_pid
+        || nt_handler.pm.process(pid)?.state != nt_process::ProcessState::Running
+    {
+        return None;
+    }
+    Some((owner_pi, expected_pid, process.pml4))
 }
 
 #[inline(never)]
@@ -12274,16 +12241,18 @@ unsafe fn spawn_requested_local_thread(
                     return Err(nt_process::STATUS_INVALID_PARAMETER);
                 }
             };
-            let (wl_pi, cid_proc, pml4) = live_process_context_for_role(
+            let Some((wl_pi, cid_proc, pml4)) = live_process_context_for_role(
                 nt_handler,
                 procs,
+                publication.owner_pi,
+                publication.pid(),
                 nt_exe_image::HostedProcessRole::InteractiveLogon,
-            )
-            .expect("winlogon EPROCESS missing before worker spawn");
+            ) else {
+                nt_handler.abort_unbuilt_hosted_thread_request(publication);
+                return Err(nt_process::STATUS_INVALID_PARAMETER);
+            };
             let tid = publication.tid();
-            if publication.pid() != cid_proc
-                || nt_handler.hosted_thread_tid_for_role(wl_pi, role) != Some(tid)
-            {
+            if nt_handler.hosted_thread_tid_for_role(wl_pi, role) != Some(tid) {
                 print_str(b"[wl-thread] missing reserved runtime role before spawn\n");
                 nt_handler.abort_unbuilt_hosted_thread_publication(
                     publication, wl_pi, badge, role,
