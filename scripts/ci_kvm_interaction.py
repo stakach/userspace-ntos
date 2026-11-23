@@ -16,6 +16,11 @@ from pathlib import Path
 import re
 import time
 
+try:
+    from .ci_kvm_cursor import cursor_is_at_target
+except ImportError:
+    from ci_kvm_cursor import cursor_is_at_target
+
 
 DEFAULT_SCRIPT = Path(__file__).with_name("kvm_interaction_steps.json")
 STEP_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
@@ -28,6 +33,8 @@ POINTER_SETTLE = 0.3  # let the guest drain queued motion before a button change
 CLICK_HOLD = 0.15  # a lone click holds long enough for the guest to read the press
 KEY_PAUSE = 0.05
 POINTER_ACTIONS = ("move", "click", "double_click")
+VERIFIED_POINTER_ACTION = "verified_double_click"
+MAX_CURSOR_AIMS = 3
 CHAR_QCODES = {" ": "spc", "\n": "ret", "\t": "tab", ".": "dot", ",": "comma",
                "-": "minus", "=": "equal", "/": "slash", "\\": "backslash",
                ";": "semicolon", "'": "apostrophe"}
@@ -90,7 +97,7 @@ def _action(value, screen, field):
     if not isinstance(value, dict) or len(value) != 1:
         raise ValueError(f"{field} must be an object with exactly one action")
     (kind, argument), = value.items()
-    if kind in POINTER_ACTIONS:
+    if kind in (*POINTER_ACTIONS, VERIFIED_POINTER_ACTION):
         return kind, _point(argument, screen, f"{field}.{kind}")
     if kind == "key":
         if (not isinstance(argument, list) or not argument
@@ -191,6 +198,8 @@ def chord_batches(codes):
 def action_batches(action, screen):
     """Expand one parsed action into (QMP input events, pause seconds) batches."""
     kind, argument = action
+    if kind == VERIFIED_POINTER_ACTION:
+        raise ValueError("verified click needs a framebuffer checkpoint")
     if kind in POINTER_ACTIONS:
         batches = pointer_batches(argument, screen)
         clicks = {"move": 0, "click": 1, "double_click": 2}[kind]
@@ -208,6 +217,20 @@ def action_batches(action, screen):
     return [batch for chord in text_chords(argument) for batch in chord_batches(chord)]
 
 
+def relative_pointer_batches(dx, dy):
+    """Correct a measured guest cursor without resetting it to an assumed origin."""
+    batches = [(_rel(x, y), MOVE_PAUSE)
+               for x, y in relative_deltas(dx, dy, POINTER_STEP)]
+    if batches:
+        events, _pause = batches[-1]
+        batches[-1] = events, POINTER_SETTLE
+    return batches
+
+
+def double_click_batches():
+    return [(_button(True), BUTTON_PAUSE), (_button(False), BUTTON_PAUSE)] * 2
+
+
 def screenshot_name(index, step):
     return f"native-kvm-interact-{index:02d}-{step.name}.ppm"
 
@@ -221,7 +244,7 @@ class InteractionRunner:
     """
 
     def __init__(self, script, perform, capture, log_path, clock=time.monotonic,
-                 checks=None):
+                 checks=None, cursor_probe=None):
         self.script = script
         self.perform = perform
         self.capture = capture
@@ -234,6 +257,9 @@ class InteractionRunner:
         self.failures = 0
         self.checks = checks or {}
         self.checkpoints = {}
+        self.cursor_probe = cursor_probe
+        self.cursor_receipts = []
+        self.last_capture = None
         self.halted = False
 
     @property
@@ -271,6 +297,7 @@ class InteractionRunner:
             try:
                 self.capture(name)
                 captured = True
+                self.last_capture = name
                 self._record({"event": "screenshot", "step": self.index + 1,
                               "name": step.name, "file": name})
             except (OSError, RuntimeError, ValueError, KeyError) as error:
@@ -301,12 +328,48 @@ class InteractionRunner:
     def _act(self, step):
         for number, action in enumerate(step.actions, 1):
             try:
+                if action[0] == VERIFIED_POINTER_ACTION:
+                    self._verified_double_click(step, action[1])
+                    if self.halted:
+                        return
+                    self._record({"event": "action", "step": self.index + 1,
+                                  "name": step.name, "action": number,
+                                  "kind": action[0], "argument": list(action[1])})
+                    continue
                 self.perform(action_batches(action, self.script.screen))
                 self._record({"event": "action", "step": self.index + 1, "name": step.name,
                               "action": number, "kind": action[0],
                               "argument": list(action[1]) if action[0] != "type" else action[1]})
             except (OSError, RuntimeError, ValueError, KeyError) as error:
                 self._fail(step, f"action {number} {action[0]}", error)
+                if action[0] == VERIFIED_POINTER_ACTION:
+                    self.halted = True
+                    return
+
+    def _verified_double_click(self, step, target):
+        if self.last_capture is None or self.cursor_probe is None:
+            raise RuntimeError("verified click requires a prior framebuffer and cursor probe")
+        self.perform(pointer_batches(target, self.script.screen))
+        for attempt in range(1, MAX_CURSOR_AIMS + 1):
+            name = screenshot_name(self.index + 1, step).removesuffix(".ppm")
+            name += f"-aim-{attempt}.ppm"
+            self.capture(name)
+            proof = self.cursor_probe(self.last_capture, name, target)
+            receipt = {"event": "cursor-aim", "step": self.index + 1,
+                       "attempt": attempt, "target": list(target),
+                       "position": list(proof.position) if proof.position else None,
+                       "file": proof.image_name, "image_sha256": proof.image_sha256}
+            self.cursor_receipts.append(receipt)
+            self._record(receipt)
+            if cursor_is_at_target(proof.position, target):
+                self.perform(double_click_batches())
+                return
+            if proof.position is None:
+                raise RuntimeError("guest cursor not measurable near target")
+            if attempt < MAX_CURSOR_AIMS:
+                self.perform(relative_pointer_batches(target[0] - proof.position[0],
+                                                     target[1] - proof.position[1]))
+        raise RuntimeError("guest cursor missed target after bounded correction")
 
     def _fail(self, step, what, error):
         self.failures += 1

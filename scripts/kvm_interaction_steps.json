@@ -7,7 +7,7 @@
     {"name": "start-menu", "actions": [{"click": [28, 743]}], "wait_seconds": 60},
     {"name": "start-menu-closed", "actions": [{"key": ["esc"]}], "wait_seconds": 5},
     {"name": "desktop-clear", "actions": [{"click": [800, 600]}], "wait_seconds": 5},
-    {"name": "command-prompt", "actions": [{"double_click": [37, 470]}], "wait_seconds": 120},
+    {"name": "command-prompt", "actions": [{"verified_double_click": [37, 470]}], "wait_seconds": 120},
     {"name": "ver", "actions": [{"type": "ver\n"}], "wait_seconds": 20}
   ]
 }

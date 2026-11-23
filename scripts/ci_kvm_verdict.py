@@ -45,6 +45,7 @@ class InteractionOutcome:
     total: int = 0
     errors: int = 0
     checkpoints: dict = field(default_factory=dict)
+    cursor_receipts: list = field(default_factory=list)
     visual_proof: VisualProof | None = None
 
     def receipts_passed(self):
