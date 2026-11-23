@@ -14,10 +14,6 @@ const CATALOG_ROLE_CALLS: &[&str] = &[
     "hosted_pi_has_role(",
     "hosted_owner_has_role(",
     "hosted_main_badge_has_role(",
-    "current_hosted_process_role(",
-    "hosted_pi_for_role(",
-    "current_process_is_csrss(",
-    "current_process_is_winlogon(",
     "hosted_non_native_top_level_badge(",
     // Installer ownership by catalog image role after a process-manager parent walk.
     ".can_own_installer_service_work(",
@@ -25,8 +21,6 @@ const CATALOG_ROLE_CALLS: &[&str] = &[
 
 /// Today's sites, per executive source file (counted call sites, definitions excluded).
 const BASELINE: &[(&str, usize)] = &[
-    ("exec_file_create.rs", 1),
-    ("exec_handler.rs", 19),
     ("executor/admission.rs", 1),
     ("executor/exceptions.rs", 4),
     ("executor/syscall.rs", 2),
@@ -154,4 +148,21 @@ fn csrss_workers_require_the_committed_live_role() {
     assert!(compact.contains(
         "self.live_execution_role(self.pi)==Some(nt_exe_image::HostedProcessRole::Win32Subsystem)"
     ), "a generic File image must gain CSRSS worker authority only from its committed live role");
+}
+
+#[test]
+fn current_process_policy_reads_its_committed_live_role() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/exec_handler.rs"),
+    )
+    .expect("executive source");
+    let helper = source.split("fn current_hosted_process_role(&self) -> Option<nt_exe_image::HostedProcessRole> {")
+        .nth(1).expect("current process role helper")
+        .split("fn current_process_has_role(").next().unwrap();
+    let compact: String = helper.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("self.live_execution_role(self.pi)"),
+        "role-owned threads and current-process policy need a committed live role");
+    assert!(!compact.contains("current_hosted_process_image"),
+        "an observed executable's catalog role is not execution authority");
 }

@@ -9911,7 +9911,7 @@ impl ExecNtHandler {
     }
 
     fn current_hosted_process_role(&self) -> Option<nt_exe_image::HostedProcessRole> {
-        self.current_hosted_process_image().map(|image| image.role)
+        self.live_execution_role(self.pi)
     }
 
     fn current_process_has_role(&self, role: nt_exe_image::HostedProcessRole) -> bool {
