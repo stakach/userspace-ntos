@@ -764,7 +764,7 @@ pub(super) unsafe fn syscall(
     // provenance keeps this proof independent of listener/thread identities.
     if lp.msg.m0 == SSN_NT_READ_VM
         && LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0
-        && nt_handler.hosted_process_role(pi)
+        && nt_handler.live_execution_role(pi)
             == Some(nt_exe_image::HostedProcessRole::LocalSecurityAuthority)
     {
         LSA_LOGON_CLIENT_READS.fetch_add(1, Ordering::Relaxed);
@@ -788,7 +788,7 @@ pub(super) unsafe fn syscall(
     let trace_lsa_logon = native_call_transport
         && LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0
         && nt_handler.current_tid == LSA_LOGON_SERVER_TID.load(Ordering::Relaxed)
-        && nt_handler.hosted_process_role(pi)
+        && nt_handler.live_execution_role(pi)
             == Some(nt_exe_image::HostedProcessRole::LocalSecurityAuthority);
     let lsa_logon_trace_seq = if trace_lsa_logon {
         let n = LSA_LOGON_SSN_TRACE.fetch_add(1, Ordering::Relaxed);

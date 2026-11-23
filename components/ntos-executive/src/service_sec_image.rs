@@ -8602,17 +8602,6 @@ fn hosted_top_badge_for_pi(nt_handler: &ExecNtHandler, pi: usize) -> u64 {
     nt_handler.hosted_process_top_badge(pi).unwrap_or(0)
 }
 
-fn hosted_top_badge_for_role(
-    nt_handler: &ExecNtHandler,
-    role: nt_exe_image::HostedProcessRole,
-) -> Option<u64> {
-    (0..MAX_PI).find_map(|pi| {
-        (nt_handler.hosted_process_role(pi) == Some(role))
-            .then(|| nt_handler.hosted_process_top_badge(pi))
-            .flatten()
-    })
-}
-
 pub(crate) fn live_hosted_pi_for_observation_role(
     nt_handler: &ExecNtHandler,
     role: nt_exe_image::HostedProcessRole,
@@ -8699,24 +8688,6 @@ fn hosted_owner_has_role(
     nt_handler.admit_hosted_thread_ingress(badge)
         .ok()
         .is_some_and(|runtime| nt_handler.live_execution_role(runtime.pi) == Some(role))
-}
-
-fn live_hosted_pi_for_role(
-    nt_handler: &ExecNtHandler,
-    role: nt_exe_image::HostedProcessRole,
-) -> Option<usize> {
-    for pi in 0..MAX_PI {
-        if nt_handler.hosted_process_role(pi) != Some(role) {
-            continue;
-        }
-        let Some(pid) = nt_handler.pm_pid_for_pi(pi) else {
-            continue;
-        };
-        if nt_handler.pm.process(pid).is_some() {
-            return Some(pi);
-        }
-    }
-    None
 }
 
 fn hosted_leaf_for_fault_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<&[u8]> {

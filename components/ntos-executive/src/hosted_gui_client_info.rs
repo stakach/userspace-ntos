@@ -289,7 +289,7 @@ pub(super) unsafe fn service(
         core::ptr::write_volatile((teb_alias + 0x898) as *mut u16, keyboard.codepage);
     }
     log_refreshed_gui_thread_client_info(
-        handler.hosted_process_role(pi) == Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
+        handler.live_execution_role(pi) == Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
         pi,
         packet.thread_id,
         teb_alias,

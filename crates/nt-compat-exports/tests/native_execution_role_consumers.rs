@@ -17,11 +17,8 @@ const CATALOG_ROLE_CALLS: &[&str] = &[
 /// Today's sites, per executive source file (counted call sites, definitions excluded).
 const BASELINE: &[(&str, usize)] = &[
     ("exec_handler.rs", 1),
-    ("executor/syscall.rs", 2),
-    ("hosted_gui_client_info.rs", 1),
     ("initial_thread_creation.rs", 1),
     ("main.rs", 1),
-    ("service_sec_image.rs", 2),
 ];
 
 fn executive_sources(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
@@ -213,7 +210,7 @@ fn terminal_and_ingress_roles_use_admitted_process_owners() {
     let direct = body("fn hosted_pi_has_role(", "fn hosted_main_badge_has_role(");
     assert!(direct.contains("live_execution_role(pi)==Some(role)"),
         "terminal decisions need a committed running process role");
-    let owner = body("fn hosted_owner_has_role(", "fn live_hosted_pi_for_role(");
+    let owner = body("fn hosted_owner_has_role(", "fn hosted_leaf_for_fault_badge(");
     assert!(owner.contains("admit_hosted_thread_ingress(badge)")
         && owner.contains("live_execution_role(runtime.pi)==Some(role)"),
         "worker containment must use the exact admitted owner rather than re-resolving its badge");
