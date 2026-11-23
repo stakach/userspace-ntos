@@ -6412,7 +6412,9 @@ unsafe fn pump_service_io_port_fault(
         nt_kernel_exec::x86_io::PortIoPort::Dx => (regs[6] & 0xFFFF) as u16,
         nt_kernel_exec::x86_io::PortIoPort::Immediate(port) => port as u16,
     };
-    let grant = crate::driver_launch::hosted_io_port_fault_grant(shared_va, port).or_else(|| {
+    let grant = crate::driver_launch::hosted_io_port_fault_grant(
+        ch, active_reply_cap, shared_va, port,
+    ).or_else(|| {
         crate::driver_launch::hosted_legacy_vga_port_fault_grant(
             ch, active_reply_cap, port, is_in, bits,
         )
