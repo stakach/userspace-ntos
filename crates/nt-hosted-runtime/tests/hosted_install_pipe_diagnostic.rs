@@ -18,6 +18,54 @@ fn pipe_name(id: &str) -> Vec<u16> {
 }
 
 #[test]
+fn last_terminal_retains_exact_pipe_owner_and_child_generation() {
+    let mut trace = InstallPipeDiagnostic::<1>::new();
+    let name = pipe_name("af990c70-ff1e-416f-b1aa-57a14d8ab3fa");
+    assert_eq!(trace.last_terminal(), None);
+    assert!(trace.register_server(PIPE, &name));
+    assert!(trace.attach_child(PIPE, &name, CHILD, CLIENT_FILE));
+    let terminal = trace.record_child_terminal(CHILD, 0x1234).expect("exact terminal");
+    assert_eq!(trace.last_terminal(), Some(terminal));
+    assert_eq!(trace.last_terminal().unwrap().pipe.owner_pid, PIPE.owner_pid);
+    assert_eq!(trace.last_terminal().unwrap().pipe.owner_generation, PIPE.owner_generation);
+    assert_eq!(trace.last_terminal().unwrap().child, CHILD);
+    assert_eq!(trace.last_terminal().unwrap().client_file_id, CLIENT_FILE);
+    assert_eq!(trace.last_terminal().unwrap().exit_status, 0x1234);
+}
+
+#[test]
+fn rejected_terminal_cannot_replace_last_terminal_but_pid_reuse_can() {
+    let mut trace = InstallPipeDiagnostic::<1>::new();
+    let name = pipe_name("af990c70-ff1e-416f-b1aa-57a14d8ab3fa");
+    assert!(trace.register_server(PIPE, &name));
+    assert!(trace.attach_child(PIPE, &name, CHILD, CLIENT_FILE));
+    let first = trace.record_child_terminal(CHILD, 0).expect("first exact terminal");
+    assert!(trace.record_child_terminal(CHILD, 0xdead).is_none(), "duplicate is rejected");
+    assert!(trace.record_child_terminal(InstallChildIdentity {
+        generation: CHILD.generation + 1, ..CHILD
+    }, 0xbeef).is_none(), "unattached reused PID is rejected");
+    assert_eq!(trace.last_terminal(), Some(first));
+
+    let reused_pipe = InstallPipeIdentity {
+        owner_generation: PIPE.owner_generation + 1,
+        file_id: PIPE.file_id + (1u64 << 40),
+        ..PIPE
+    };
+    let reused_child = InstallChildIdentity { generation: CHILD.generation + 1, ..CHILD };
+    let reused_client_file = CLIENT_FILE + (1u64 << 40);
+    assert!(trace.register_server(reused_pipe, &name));
+    assert!(trace.attach_child(reused_pipe, &name, reused_child, reused_client_file));
+    assert!(trace.record_child_terminal(CHILD, 0xface).is_none(), "old generation is rejected");
+    assert_eq!(trace.last_terminal(), Some(first));
+    let second = trace.record_child_terminal(reused_child, 0x4321).expect("reused PID's exact terminal");
+    assert_eq!(trace.last_terminal(), Some(second));
+    assert_eq!(second.pipe, reused_pipe);
+    assert_eq!(second.child, reused_child);
+    assert_eq!(second.client_file_id, reused_client_file);
+    assert_eq!(trace.counts().terminal, 2);
+}
+
+#[test]
 fn fifth_write_reports_exact_device_and_child_terminal_for_one_pipe_generation() {
     let mut trace = InstallPipeDiagnostic::<2>::new();
     let name = pipe_name("af990c70-ff1e-416f-b1aa-57a14d8ab3fa");

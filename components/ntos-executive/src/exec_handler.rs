@@ -596,12 +596,8 @@ static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PROCESS_WAIT_REQUEST_TRACE_N: AtomicU64 = AtomicU64::new(0);
-static SETUP_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
-static SETUP_WAIT_EVENT_INDEX: AtomicU64 = AtomicU64::new(0);
-static SETUP_WAIT_PROCESS_PI: AtomicU64 = AtomicU64::new(0);
-static SETUP_WAIT_PROCESS_PID: AtomicU64 = AtomicU64::new(0);
-static SETUP_WAIT_PROCESS_GENERATION: AtomicU64 = AtomicU64::new(0);
-static SETUP_WAIT_TRANSITION_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PNP_NO_PENDING_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PNP_NO_PENDING_TRANSITION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EVENT_DELETE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_POST_LSA_REGISTRY_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -1799,6 +1795,20 @@ pub(crate) fn trace_io_completion_packet(
     print_str(b"\n");
 }
 
+/// Resolve the current namespace object on every observation. Neither a process-local handle
+/// nor a previously seen object index can identify a later Event after close and reuse.
+fn is_pnp_no_pending_install_event(handler: &ExecNtHandler, index: usize) -> bool {
+    const PATH: &[u8] = b"\\BaseNamedObjects\\pnp_no_pending_install_events";
+    if !handler.obj_ns.get(index).is_some_and(|entry| entry.kind == OBJ_KIND_EVENT)
+        || handler.events.query_existing(index as u64).is_none()
+    {
+        return false;
+    }
+    let mut path = [0u8; 192];
+    handler.object_namespace_path_exact(index, &mut path)
+        .is_some_and(|len| path[..len].eq_ignore_ascii_case(PATH))
+}
+
 fn trace_wait_object(
     handler: &ExecNtHandler,
     phase: &[u8],
@@ -1838,33 +1848,18 @@ fn trace_wait_object(
         && handler.current_badge == 4
         && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
         && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0;
-    let setup_identity = handler.current_hosted_process_image().and_then(|image| {
-        if image.process_name.eq_ignore_ascii_case("setup.exe")
-            && handler.hosted_process_generation(handler.pi) == Some(image.generation)
-        {
-            handler.pm_pid_for_pi(handler.pi).map(|pid| (pid, image.generation))
-        } else {
-            None
-        }
-    });
-    let trace_setup = setup_identity.is_some()
-        && handle == 0x34
-        && object.kind() == WaitObject::KIND_DISPATCHER;
-    if handler.pi != 6 && handler.pi != 11 && !trace_winlogon && !trace_setup {
+    let trace_pnp_no_pending = object.kind() == WaitObject::KIND_DISPATCHER
+        && is_pnp_no_pending_install_event(handler, object.id() as usize);
+    if handler.pi != 6 && handler.pi != 11 && !trace_winlogon && !trace_pnp_no_pending {
         return;
     }
-    let n = if trace_setup {
-        let (pid, generation) = setup_identity.unwrap();
-        SETUP_WAIT_PROCESS_PI.store(handler.pi as u64 + 1, Ordering::Relaxed);
-        SETUP_WAIT_PROCESS_PID.store(pid as u64, Ordering::Relaxed);
-        SETUP_WAIT_PROCESS_GENERATION.store(generation, Ordering::Relaxed);
-        SETUP_WAIT_EVENT_INDEX.store(object.id() + 1, Ordering::Relaxed);
-        SETUP_WAIT_TRACE_N.fetch_add(1, Ordering::Relaxed)
+    let n = if trace_pnp_no_pending {
+        PNP_NO_PENDING_WAIT_TRACE_N.fetch_add(1, Ordering::Relaxed)
     } else {
         WAIT_OBJECT_TRACE_N.fetch_add(1, Ordering::Relaxed)
     };
-    if (trace_setup && (n >= 4096 || (n >= 16 && n % 32 != 0)))
-        || (!trace_setup && n >= 192)
+    if (trace_pnp_no_pending && (n >= 4096 || (n >= 64 && !n.is_power_of_two())))
+        || (!trace_pnp_no_pending && n >= 192)
     {
         return;
     }
@@ -1920,7 +1915,7 @@ fn trace_wait_object(
     print_str(b"\n");
 }
 
-fn trace_setup_wait_event_transition(
+fn trace_pnp_no_pending_event_transition(
     handler: &ExecNtHandler,
     phase: &[u8],
     handle: u64,
@@ -1928,27 +1923,14 @@ fn trace_setup_wait_event_transition(
     previous: bool,
     woken: u64,
 ) {
-    let Some(setup_pi) = SETUP_WAIT_PROCESS_PI.load(Ordering::Relaxed).checked_sub(1) else {
-        return;
-    };
-    let setup_pi = setup_pi as usize;
-    let generation = SETUP_WAIT_PROCESS_GENERATION.load(Ordering::Relaxed);
-    if SETUP_WAIT_EVENT_INDEX.load(Ordering::Relaxed) != index as u64 + 1
-        || handler.pm_pid_for_pi(setup_pi).map(u64::from)
-            != Some(SETUP_WAIT_PROCESS_PID.load(Ordering::Relaxed))
-        || handler.hosted_process_generation(setup_pi) != Some(generation)
-        || !handler.hosted_process_image(setup_pi).is_some_and(|image| {
-            image.generation == generation
-                && image.process_name.eq_ignore_ascii_case("setup.exe")
-        })
-    {
+    if !is_pnp_no_pending_install_event(handler, index) {
         return;
     }
-    let n = SETUP_WAIT_TRANSITION_TRACE_N.fetch_add(1, Ordering::Relaxed);
-    if n >= 4096 || (n >= 16 && n % 32 != 0) {
+    let n = PNP_NO_PENDING_TRANSITION_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 4096 || (n >= 64 && !n.is_power_of_two()) {
         return;
     }
-    print_str(b"[setup-wait-event] pi=");
+    print_str(b"[pnp-no-pending-event] pi=");
     print_u64(handler.pi as u64);
     print_str(b" tid=");
     print_u64(handler.current_tid);
@@ -1962,6 +1944,35 @@ fn trace_setup_wait_event_transition(
     print_u64(previous as u64);
     print_str(b" woken=");
     print_u64(woken as u64);
+    let mut matches = 0u64;
+    for slot in 0..object_waiter_len() {
+        let Some((identity, record)) = object_waiter_record(slot) else { continue; };
+        if !record.objects.iter().take(record.count as usize)
+            .any(|object| *object == WaitObject::dispatcher(index))
+        {
+            continue;
+        }
+        matches += 1;
+        if matches > 12 { continue; }
+        let process = record.caller.process();
+        let (generation_kind, generation) = match process.generation {
+            nt_types::ProcessGeneration::Hosted(value) => (b"hosted" as &[u8], value),
+            nt_types::ProcessGeneration::Temporary(value) => (b"temporary" as &[u8], value),
+        };
+        print_str(b" waiter-pi/pid/gen-kind/gen/tid/thread-gen/seq/claimed/reply/replied/wait-all=");
+        for (part, value) in [
+            record.pi as u64, process.pid as u64, generation,
+            record.tid, record.caller.thread().generation(), record.sequence,
+            object_waiter_is_claimed(identity) as u64, record.reply_cap,
+            record.reply_sent as u64, record.wait_all as u64,
+        ].into_iter().enumerate() {
+            if part != 0 { print_str(b"/"); }
+            if part == 2 { print_str(generation_kind); print_str(b":"); }
+            print_u64(value);
+        }
+    }
+    print_str(b" waiter-count=");
+    print_u64(matches);
     print_str(b"\n");
 }
 
@@ -11096,11 +11107,14 @@ impl ExecNtHandler {
         };
         let mut woken = 0;
         if !previous {
+            trace_pnp_no_pending_event_transition(
+                self, b"internal-set-before-wake", 0, index, previous, 0,
+            );
             // SAFETY: native dispatch is serialized; the signal and waiter selection are one
             // executive transition.
             woken = unsafe { wait_wake_event_set(index, self) };
         }
-        trace_setup_wait_event_transition(self, b"internal-set", 0, index, previous, woken);
+        trace_pnp_no_pending_event_transition(self, b"internal-set", 0, index, previous, woken);
         0
     }
 
@@ -36237,7 +36251,7 @@ impl ExecNtHandler {
                             0,
                             0,
                         );
-                        trace_setup_wait_event_transition(
+                        trace_pnp_no_pending_event_transition(
                             self, b"reset", args[0], index, previous, 0,
                         );
                         0
@@ -36284,6 +36298,9 @@ impl ExecNtHandler {
                         // are one executive transition.
                         let mut woken = 0;
                         if !previous {
+                            trace_pnp_no_pending_event_transition(
+                                self, b"set-before-wake", args[0], index, previous, 0,
+                            );
                             woken = unsafe { wait_wake_event_set(index, self) };
                         }
                         trace_tp_worker_event_transition(
@@ -36295,7 +36312,7 @@ impl ExecNtHandler {
                             0,
                             woken,
                         );
-                        trace_setup_wait_event_transition(
+                        trace_pnp_no_pending_event_transition(
                             self, b"set", args[0], index, previous, woken,
                         );
                         0

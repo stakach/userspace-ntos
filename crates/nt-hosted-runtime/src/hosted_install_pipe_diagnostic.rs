@@ -87,6 +87,7 @@ struct Slot {
 pub struct InstallPipeDiagnostic<const N: usize> {
     slots: [Option<Slot>; N],
     counts: InstallPipeCounts,
+    last_terminal: Option<InstallPipeTerminal>,
 }
 
 fn valid_ascii_name(name: &[u16]) -> Option<usize> {
@@ -161,7 +162,7 @@ fn device_name_matches(payload: &[u8], expected_bytes: usize) -> bool {
 
 impl<const N: usize> InstallPipeDiagnostic<N> {
     pub fn new() -> Self {
-        Self { slots: core::array::from_fn(|_| None), counts: InstallPipeCounts { published: 0, terminal: 0, rejected: 0, overflow: 0 } }
+        Self { slots: core::array::from_fn(|_| None), counts: InstallPipeCounts { published: 0, terminal: 0, rejected: 0, overflow: 0 }, last_terminal: None }
     }
 
     pub fn register_server(&mut self, pipe: InstallPipeIdentity, name: &[u16]) -> bool {
@@ -335,11 +336,16 @@ impl<const N: usize> InstallPipeDiagnostic<N> {
         })) else { self.reject(); return None; };
         let slot = slot.take()?;
         self.counts.terminal = self.counts.terminal.saturating_add(1);
-        Some(InstallPipeTerminal { pipe: slot.pipe, child, client_file_id: slot.client_file_id,
-            exit_status })
+        let terminal = InstallPipeTerminal { pipe: slot.pipe, child, client_file_id: slot.client_file_id,
+            exit_status };
+        self.last_terminal = Some(terminal);
+        Some(terminal)
     }
 
     pub fn counts(&self) -> InstallPipeCounts { self.counts }
+
+    /// Most recent exact child terminal; rejected observations do not replace it.
+    pub fn last_terminal(&self) -> Option<InstallPipeTerminal> { self.last_terminal }
 
     /// First completed Enum open for an assigned instance by its exact attached child.
     /// This is a work-position sample; neither a successful open nor an advance proves install.

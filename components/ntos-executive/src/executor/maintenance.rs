@@ -949,11 +949,13 @@ pub(super) unsafe fn maintain(
             );
             crate::sample_object_namespace_census(&nt_handler.obj_ns, now);
             crate::sample_retained_record_census(now);
+            let census_before = CENSUS_PERIODIC_DUMPS.load(Ordering::Relaxed);
             census_tick_static(now);
             native_process_time_census::sample_after_census(&nt_handler);
             installer_child_span_census::maybe_sample_gap(&nt_handler, now);
             installer_child_span_census::print_census(&nt_handler);
-            if CENSUS_LAST_DUMP.load(Ordering::Relaxed) == now {
+            if CENSUS_PERIODIC_DUMPS.load(Ordering::Relaxed) != census_before {
+                nt_handler.print_install_pipe_parent_wait_census(now);
             }
         }
         let verdict = lp.diag.milestones.observe(ep, crate::boot_progress_sealed(), now);
