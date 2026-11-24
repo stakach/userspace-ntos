@@ -29,6 +29,13 @@ pub(super) unsafe fn validate_interrupt_projection(
     interrupt_projection::validate(inst, binding, address)
 }
 
+pub(super) unsafe fn has_live_interrupt_projection_for_binding(
+    inst: DriverInstance,
+    binding: HostedDeviceBinding,
+) -> Result<Option<(u64, u64, Option<(u64, u64)>)>, nt_status::NtStatus> {
+    interrupt_projection::has_live_for_binding(inst, binding)
+}
+
 pub(super) unsafe fn bind_interrupt_projection(
     inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
     interrupt_id: u64, grant_generation: u64,

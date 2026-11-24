@@ -104,9 +104,13 @@ fn replacing_a_retiring_interrupt_tombstones_its_old_projection_after_canonical_
         .unwrap_or_else(|| panic!("replacement must call {name}"));
     assert!(position("admit_interrupt_projection_canonical_retirement")
         < position("retire_hosted_irq_connection"));
-    assert!(position("retire_hosted_irq_connection")
-        < position("mark_interrupt_projection_canonical_retired"),
-        "the old raw interrupt address must become a tombstone after canonical release");
+    let retire = DRIVER.split_once("unsafe fn retire_hosted_irq_connection(").unwrap().1
+        .split_once("\nunsafe fn retire_hosted_irq_connections_for_binding(").unwrap().0;
+    assert!(retire.find("unregister_hosted_irq_actual_lock(connection)").unwrap()
+        < retire.find("mark_interrupt_projection_canonical_retired(").unwrap());
+    assert!(retire.find("mark_interrupt_projection_canonical_retired(").unwrap()
+        < retire.find("hosted_irq_connections_mut().remove(connection_index)").unwrap(),
+        "the projection must become a tombstone before its retryable root row is removed");
 }
 
 #[test]

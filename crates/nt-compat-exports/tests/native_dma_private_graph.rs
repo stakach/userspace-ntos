@@ -60,7 +60,7 @@ fn shared_map_replay_requires_root_mapping_receipt_and_cannot_register_anew() {
         "a forged or stale shared record must not create another manager mapping");
     let source = SOURCE.split("unsafe fn replay_hosted_dma_allocation_records(")
         .nth(1).expect("replay function exists");
-    let body = source.split("unsafe fn record_hosted_mmio_usage(")
+    let body = source.split("unsafe fn publish_hosted_interrupt_connection_from_shared(")
         .next().expect("following function exists");
     assert!(body.contains("lease.owner") && body.contains("hosted_dma_owner(binding)"),
         "replay must bind the graph receipt to this device owner");

@@ -33,6 +33,34 @@ pub(super) fn owns_pool(inst: DriverInstance) -> bool {
     projections().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
 }
 
+/// A non-retired projection remains an exact owner even without an installed root connection.
+/// In particular, EffectStarted is uncertain and cannot be replayed from a mutable shared bank.
+pub(super) unsafe fn has_live_for_binding(
+    inst: DriverInstance,
+    binding: HostedDeviceBinding,
+) -> Result<Option<(u64, u64, Option<(u64, u64)>)>, nt_status::NtStatus> {
+    let _catalog = lock();
+    let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    let mut found = None;
+    for row in projections().iter().filter(|row| {
+        row.binding == binding && row.phase != ProjectionPhase::Tombstone
+    }) {
+        if !same_arena(row.instance, inst) {
+            return Err(nt_status::NtStatus::ACCESS_DENIED);
+        }
+        if found.is_some() || allocation(inst, row.allocation.component_address)? != row.allocation {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        let connection = match row.phase {
+            ProjectionPhase::Bound(id, generation) => Some((id, generation)),
+            _ => None,
+        };
+        found = Some((row.allocation.component_address, row.allocation.pool_generation, connection));
+    }
+    Ok(found)
+}
+
 fn row_index(inst: DriverInstance, binding: HostedDeviceBinding, address: u64) -> Option<usize> {
     projections().iter().position(|row| {
         same_arena(row.instance, inst)

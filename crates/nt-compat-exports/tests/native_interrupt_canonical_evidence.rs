@@ -7,10 +7,10 @@ use std::process::Command;
 fn interrupt_evidence_follows_exact_root_connection_across_lane_reuse() {
     let source = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
     let start = source
-        .find("unsafe fn refresh_hosted_device_resource_state(")
-        .expect("native device state refresh");
+        .find("unsafe fn refresh_hosted_interrupt_evidence(")
+        .expect("native interrupt evidence refresh");
     let end = source[start..]
-        .find("\nunsafe fn hosted_io_port_cap_effects_mut(")
+        .find("\n/// A later device dispatch may own the instance's shared bank.")
         .expect("native refresh boundary");
     let fixture = format!("{SUPPORT}\n{}\n{CASES}", &source[start..start + end]);
     let directory = std::env::temp_dir().join(format!(
