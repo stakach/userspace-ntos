@@ -147,7 +147,11 @@ unsafe fn answer(kept: Kept) -> Result<HostedIrpTransportResult, Kept> {
         HostedPumpRestore::Restored(pr) | HostedPumpRestore::Unattributed(pr) if pr.completed =>
             FindAdapterPump::Returned {
                 dispatch_status: pr.status as u32,
-                vp_status: pr.result as u32,
+                // Generic IRP pumps mirror dispatch NTSTATUS in `result`. The miniport's
+                // independent VP_STATUS is written into this exact retained request bank.
+                vp_status: if pr.status < 0 { VP_NO_ERROR } else {
+                    read_volatile((kept.shared_va + SH_VIDEO_FIND_ADAPTER_STATUS) as *const u32)
+                },
             },
         HostedPumpRestore::Restored(_) | HostedPumpRestore::Unattributed(_) =>
             FindAdapterPump::Uncertain,
