@@ -12494,6 +12494,19 @@ extern "win64" fn s_dma_allocate_common_buffer(
                 HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
                 candidate_logical, va, requested,
             );
+            if reply >> 12 != 0 || reply & 0x7f != 4
+                || claim_status as u32 as i32 != STATUS_SUCCESS
+            {
+                static COMMON_REGISTRATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+                if COMMON_REGISTRATION_FAILURES.fetch_add(1, Ordering::Relaxed) < 16 {
+                    print_str(b"[dma-common-registration] adapter/record/logical/len/reply/status/detail=");
+                    for value in [metadata.adapter_id, record, candidate_logical, requested,
+                        reply, claim_status, claim_id] {
+                        print_str(b"/0x"); print_hex_u64(value);
+                    }
+                    print_str(b"\n");
+                }
+            }
             if reply >> 12 != 0 || reply & 0x7f != 4 {
                 // A malformed or absent receipt cannot prove that registration had no effect.
                 return 0;
@@ -74605,7 +74618,25 @@ unsafe fn replay_hosted_dma_allocation_records(
         let Some(record) = dma_allocation_record(sh, record_index) else {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         };
-        let snapshot = dma_allocation_record_snapshot(record)?;
+        let snapshot = dma_allocation_record_snapshot(record).map_err(|status| {
+            static DMA_PUBLICATION_BUSY: AtomicU64 = AtomicU64::new(0);
+            if DMA_PUBLICATION_BUSY.fetch_add(1, Ordering::Relaxed) < 16 {
+                print_str(b"[dma-publication-busy] index/record/length/flags/logical/va/kind/source/map/adapter=");
+                for value in [record_index, record,
+                    dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN),
+                    dma_record_load(record, SH_DMA_ALLOC_RECORD_FLAGS),
+                    dma_record_load(record, SH_DMA_ALLOC_RECORD_LOGICAL),
+                    dma_record_load(record, SH_DMA_ALLOC_RECORD_VA),
+                    dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND),
+                    dma_record_load(record, SH_DMA_ALLOC_RECORD_SOURCE_VA),
+                    dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER),
+                    dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID)] {
+                    print_str(b"/0x"); print_hex_u64(value);
+                }
+                print_str(b"\n");
+            }
+            status
+        })?;
         let (logical, len, va, kind, dma_adapter_id) = (
             snapshot.logical, snapshot.length, snapshot.va, snapshot.kind, snapshot.adapter_id,
         );
