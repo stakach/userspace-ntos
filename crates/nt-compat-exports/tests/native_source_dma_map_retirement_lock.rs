@@ -174,7 +174,7 @@ fn hosted_irq_lane_service(_: nt_hosted_runtime::HostedIrqServiceCommand) -> Hos
     panic!("unexpected IRQ lane")
 }
 
-unsafe fn call_on5(
+unsafe fn call_on5_raw(
     _: u64, adapter: u64, operation: u64, map: u64, arg3: u64, arg4: u64,
 ) -> (u64, u64, u64, u64, u64) {
     assert!(!LOCKED.load(Ordering::Acquire), "provider retirement under spin guard");

@@ -5,6 +5,14 @@ use std::process::Command;
 #[test]
 fn map_transfer_releases_spin_guard_and_fences_uncertain_replay() {
     let source = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let decoded_start = source
+        .find("pub(crate) unsafe fn call_on5(")
+        .expect("production decoded five-word transport");
+    let decoded_end = source[decoded_start..]
+        .find("\n/// Keep the complete reply MessageInfo")
+        .expect("following raw transport") + decoded_start;
+    let decoded = &source[decoded_start..decoded_end];
+    syn::parse_str::<syn::ItemFn>(decoded).expect("complete decoded transport");
     let start = source
         .find("extern \"win64\" fn s_dma_map_transfer(")
         .expect("native MapTransfer");
@@ -19,7 +27,7 @@ fn map_transfer_releases_spin_guard_and_fences_uncertain_replay() {
         "fn s_dma_map_transfer(",
         1,
     );
-    let fixture = format!("{PORTS}\n{host_body}\n{CASES}");
+    let fixture = format!("{PORTS}\n{decoded}\n{host_body}\n{CASES}");
     let directory = std::env::temp_dir().join(format!(
         "nt-native-dma-map-transfer-lock-{}",
         std::process::id()
@@ -89,6 +97,7 @@ static ASSERT_PROVIDER_UNLOCKED: AtomicBool = AtomicBool::new(false);
 static CONFLICT_ONCE: AtomicBool = AtomicBool::new(false);
 static MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MAP_STATUS: AtomicI32 = AtomicI32::new(STATUS_UNCERTAIN_RESULT);
+static MAP_REPLY_INFO: AtomicU64 = AtomicU64::new(4);
 static MAP_DETAIL0: AtomicU64 = AtomicU64::new(0);
 static MAP_DETAIL1: AtomicU64 = AtomicU64::new(0);
 static GRANT_VA: AtomicU64 = AtomicU64::new(0x4000_0000);
@@ -125,7 +134,7 @@ unsafe fn trace_hosted_dma_sg(
     _: &[u8], _: &[u8], _: i32, _: u64, _: u64, _: u64,
     _: u32, _: u64, _: u64, _: u64,
 ) {}
-unsafe fn call_on5(
+unsafe fn call_on5_raw(
     _: u64, adapter: u64, operation: u64, address: u64, backing: u64, length: u64,
 ) -> (u64, u64, u64, u64, u64) {
     assert_eq!(read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64), 1,
@@ -152,10 +161,12 @@ unsafe fn call_on5(
                     GRANT_VA.load(Ordering::Relaxed) + expected_logical - 0x1000, 64),
                 "a conflict must advance to the next exact root candidate");
             if CONFLICT_ONCE.load(Ordering::Relaxed) && attempt == 0 {
-                (4, nt_status::NtStatus::CONFLICTING_ADDRESSES.raw() as u64, 0x2000, 0, 0)
+                (MAP_REPLY_INFO.load(Ordering::Relaxed),
+                    nt_status::NtStatus::CONFLICTING_ADDRESSES.raw() as u64, 0x2000, 0, 0)
             } else {
                 let status = MAP_STATUS.load(Ordering::Relaxed);
-                (4, status as u64, if status == STATUS_SUCCESS { 71 } else { 0 },
+                (MAP_REPLY_INFO.load(Ordering::Relaxed),
+                    status as u64, if status == STATUS_SUCCESS { 71 } else { 0 },
                     MAP_DETAIL0.load(Ordering::Relaxed), MAP_DETAIL1.load(Ordering::Relaxed))
             }
         }
@@ -230,6 +241,7 @@ fn setup() -> ([u64; 48], [u64; 4]) {
     CONFLICT_ONCE.store(false, Ordering::Release);
     MAP_CALLS.store(0, Ordering::Relaxed);
     MAP_STATUS.store(STATUS_UNCERTAIN_RESULT, Ordering::Relaxed);
+    MAP_REPLY_INFO.store(4, Ordering::Relaxed);
     MAP_DETAIL0.store(0, Ordering::Relaxed);
     MAP_DETAIL1.store(0, Ordering::Relaxed);
     GRANT_VA.store(0x4000_0000, Ordering::Relaxed);
@@ -250,6 +262,23 @@ fn provider_ipc_runs_without_allocation_spin_guard() {
     assert_eq!(s_dma_map_transfer(7, 17, token.as_ptr() as u64,
         0x5000_0000, &mut length, 0), 0);
     assert!(!LOCKED.load(Ordering::Acquire));
+}
+
+#[test]
+fn decoded_legacy_transport_returns_label_not_reply_length() {
+    let (mut shared, _token) = setup();
+    unsafe {
+        FSD_SHARED_VADDR = shared.as_mut_ptr() as u64;
+        write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, 1);
+        let (label, status, _, _, _) = call_on5(
+            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+            0,
+            HOSTED_DMA_SERVICE_PROBE_SCSI_SOURCE << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+            0x5000_0000, 64, 0,
+        );
+        assert_eq!(label, 0);
+        assert_eq!(status as i32, STATUS_INVALID_DEVICE_REQUEST);
+    }
 }
 
 #[test]
@@ -294,6 +323,27 @@ fn malformed_success_keeps_the_pending_claim() {
     assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 1);
     assert_eq!(unsafe { dma_record_load(FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORDS,
         SH_DMA_ALLOC_RECORD_LEN) }, DMA_RECORD_RESERVED);
+}
+
+#[test]
+fn malformed_raw_reply_keeps_the_pending_claim() {
+    for reply_info in [0, (1 << 12) | 4] {
+        let (mut shared, token) = setup();
+        let mut grant = [0xA5u8; 0x3000];
+        unsafe { FSD_SHARED_VADDR = shared.as_mut_ptr() as u64; }
+        GRANT_VA.store(grant.as_mut_ptr() as u64, Ordering::Relaxed);
+        MAP_STATUS.store(STATUS_SUCCESS, Ordering::Relaxed);
+        MAP_REPLY_INFO.store(reply_info, Ordering::Relaxed);
+        let mut length = 64u32;
+        let map = token.as_ptr() as u64;
+        assert_eq!(s_dma_map_transfer(7, 17, map, 0x5000_0000, &mut length, 0), 0);
+        assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(unsafe { dma_record_load(FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORDS,
+            SH_DMA_ALLOC_RECORD_LEN) }, DMA_RECORD_RESERVED);
+        length = 64;
+        assert_eq!(s_dma_map_transfer(7, 17, map, 0x5000_0000, &mut length, 0), 0);
+        assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 1);
+    }
 }
 
 #[test]

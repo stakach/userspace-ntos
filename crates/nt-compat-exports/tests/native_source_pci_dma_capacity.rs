@@ -154,7 +154,7 @@ fn publish_dma_allocation_record(record: u64, length: u64, _direction: u64) {
 fn dma_root_conflict_next(_adapter: u64, _logical: u64, _length: u64) -> Result<Option<u64>, ()> {
     Ok(None)
 }
-fn call_on5(_label: u64, adapter: u64, operation: u64, logical: u64, va: u64, length: u64) -> (u64, u64, u64, u64, u64) {
+fn call_on5_raw(_label: u64, adapter: u64, operation: u64, logical: u64, va: u64, length: u64) -> (u64, u64, u64, u64, u64) {
     assert_eq!(adapter, 7);
     assert_eq!(operation, HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT);
     assert!(logical >= 0x1000 && logical + length <= 0x1000 + unsafe { GRANT_LEN });

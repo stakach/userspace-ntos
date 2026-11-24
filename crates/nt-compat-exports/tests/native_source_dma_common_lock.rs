@@ -182,7 +182,7 @@ unsafe fn dma_root_conflict_next(
     assert!(!LOCKED.load(Ordering::Acquire), "read-only root query under spin guard");
     Ok(None)
 }
-unsafe fn call_on5(
+unsafe fn call_on5_raw(
     _label: u64, adapter_or_lease: u64, operation: u64,
     logical_or_adapter: u64, va_or_logical: u64, length: u64,
 ) -> (u64, u64, u64, u64, u64) {
@@ -202,6 +202,7 @@ unsafe fn call_on5(
                 "root replay high-water mark must include pending claim");
         assert_eq!(length, 4096);
         REGISTER_EFFECTS.fetch_add(1, Ordering::Relaxed);
+        // This fixture models call_on5_raw: label zero and four reply words.
         let reply = if REGISTER_REPLY_VALID.load(Ordering::Acquire) { 4 } else { 0 };
         if REGISTER_FORGED_CONFLICT.swap(false, Ordering::AcqRel) {
             (reply, nt_status::NtStatus::CONFLICTING_ADDRESSES.raw() as u32 as u64,

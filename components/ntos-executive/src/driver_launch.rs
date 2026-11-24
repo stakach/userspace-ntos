@@ -12488,7 +12488,7 @@ extern "win64" fn s_dma_allocate_common_buffer(
                 }
                 record
             };
-            let (reply, claim_status, claim_id, _, _) = call_on5(
+            let (reply, claim_status, claim_id, _, _) = call_on5_raw(
                 (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
                 adapter,
                 HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
@@ -12600,7 +12600,7 @@ extern "win64" fn s_dma_free_common_buffer(
             let lease_id = read_unaligned(
                 (adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64,
             );
-            let (reply, status, adapter_reply, logical_reply, length_reply) = call_on5(
+            let (reply, status, adapter_reply, logical_reply, length_reply) = call_on5_raw(
                 (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
                 lease_id,
                 (HOSTED_DMA_SERVICE_FREE_COMMON_BUFFER
@@ -12977,7 +12977,7 @@ unsafe fn dma_retire_map_token(adapter: u64, map: u64) -> DmaMapRetirement {
             _ => DmaMapRetirement::Uncertain,
         };
     }
-    let (reply, status, value0, value1, value2) = call_on5(
+    let (reply, status, value0, value1, value2) = call_on5_raw(
         (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
         adapter,
         HOSTED_DMA_SERVICE_FREE_MAP << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
@@ -13380,13 +13380,13 @@ extern "win64" fn s_dma_map_transfer(
             return 0;
         };
         let mut ownership = PendingMapRecord { record, effect_started: false };
-        let (probe_label, probe_status, coherent_logical, coherent_reservation, _) = call_on5(
+        let (probe_reply, probe_status, coherent_logical, coherent_reservation, _) = call_on5_raw(
             (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
             0,
             HOSTED_DMA_SERVICE_PROBE_SCSI_SOURCE << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
             source_va, mapped_len, 0,
         );
-        let coherent = if probe_label >> 12 != 0 || probe_label & 0x7f != 4 {
+        let coherent = if probe_reply >> 12 != 0 || probe_reply & 0x7f != 4 {
             write_unaligned(length, 0);
             return 0;
         } else if probe_status as u32 as i32 == STATUS_SUCCESS
@@ -13416,7 +13416,7 @@ extern "win64" fn s_dma_map_transfer(
                 dma_record_store(record, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_COHERENT_MAP);
             }
             ownership.effect_started = true;
-            let (reply, status, alias_id, detail0, detail1) = call_on5(
+            let (reply, status, alias_id, detail0, detail1) = call_on5_raw(
                 (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
                 adapter,
                 (HOSTED_DMA_SERVICE_MAP_TRANSFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
@@ -13562,7 +13562,7 @@ extern "win64" fn s_dma_map_transfer(
                 dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, bounce_va);
             }
             ownership.effect_started = true;
-            let (reply, mapped_status, mapping_id, detail0, detail1) = call_on5(
+            let (reply, mapped_status, mapping_id, detail0, detail1) = call_on5_raw(
                 (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
                 adapter,
                 (HOSTED_DMA_SERVICE_MAP_TRANSFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
@@ -40389,6 +40389,21 @@ pub(crate) unsafe fn call_on5(
     arg3: u64,
     arg4: u64,
 ) -> (u64, u64, u64, u64, u64) {
+    let (reply_info, m0, m1, m2, m3) =
+        call_on5_raw(msginfo, arg0, arg1, arg2, arg3, arg4);
+    (reply_info >> 12, m0, m1, m2, m3)
+}
+
+/// Keep the complete reply MessageInfo when the caller must authenticate its length.
+#[inline(never)]
+pub(crate) unsafe fn call_on5_raw(
+    msginfo: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+) -> (u64, u64, u64, u64, u64) {
     let rsp: u64;
     core::arch::asm!(
         "mov {}, rsp",
@@ -40410,7 +40425,7 @@ pub(crate) unsafe fn call_on5(
         })
         .unwrap_or(crate::IPCBUF_VADDR);
     core::ptr::write_volatile((ipc_buffer_va + 8 + 4 * 8) as *mut u64, arg4);
-    call_on4(msginfo, arg0, arg1, arg2, arg3)
+    call_on4_raw(msginfo, arg0, arg1, arg2, arg3)
 }
 
 core::arch::global_asm!(
