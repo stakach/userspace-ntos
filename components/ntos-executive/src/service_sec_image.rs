@@ -15528,11 +15528,17 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
         end(Step::VideoRetirements, t, crate::video_device::drain_video_file_retirements());
     let t = begin();
     let serviced = end(Step::Backends, t, driver_launch::service_pending_file_backends() as u64);
-    let t = begin();
-    let native_blocks = service_mounted_native_blocks_and_redrive_backends();
-    end(Step::NativeBlocks, t, native_blocks);
-    let t = begin();
-    let pumped = end(Step::IoCompletions, t, driver_launch::pump_hosted_io_completions() as u64);
+    let (native_blocks, pumped) = nt_hosted_runtime::service_mounted_around_io_pump(
+        || {
+            let t = begin();
+            end(Step::NativeBlocks, t, service_mounted_native_blocks_and_redrive_backends())
+        },
+        || {
+            let t = begin();
+            end(Step::IoCompletions, t, driver_launch::pump_hosted_io_completions())
+        },
+        driver_launch::mounted_native_physical_irp_pending,
+    );
     if crate::config_manager_take_device_action_wake() {
         nt_handler.pnp_signal_pending_action();
     }

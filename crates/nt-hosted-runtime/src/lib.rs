@@ -29,6 +29,7 @@ mod installer_fault_receipt;
 mod primary_alias_activation;
 mod native_block_stage_sample;
 mod native_cache_claim_drain;
+mod mounted_completion_pass;
 mod retained_system_fold_phase;
 mod driver_load_receipt;
 mod dxg_registration;
@@ -187,6 +188,7 @@ pub use hosted_install_pipe_diagnostic::{is_install_pipe_name, InstallChildIdent
 pub use native_block_stage_sample::{NativeBlockStageObservation, NativeBlockStageOwner, NativeBlockStageSample,
     NativeBlockStageSampler};
 pub use native_cache_claim_drain::{drain_cached_claims, CacheClaimStep};
+pub use mounted_completion_pass::service_mounted_around_io_pump;
 pub use retained_system_fold_phase::RetainedSystemFoldPhase;
 
 pub const PAGE_SIZE: u64 = 0x1000;
