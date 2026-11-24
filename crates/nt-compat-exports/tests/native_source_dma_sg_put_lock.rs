@@ -45,7 +45,7 @@ fn put_sg_never_holds_allocation_spin_guard_across_provider_effects() {
         "native DMA fixture must compile:\n{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let result = Command::new(&binary).output().unwrap();
+    let result = Command::new(&binary).arg("--test-threads=1").output().unwrap();
     let _ = std::fs::remove_dir_all(directory);
     assert!(
         result.status.success(),
@@ -114,14 +114,24 @@ unsafe fn dma_clear_records_for_map(map: u64) {
 "#;
 
 const CASES: &str = r#"
-#[test]
-fn uncertain_retirement_keeps_the_claim_and_success_clears_once() {
+fn reset() {
+    LOCKED.store(false, Ordering::Release);
+    RESERVED.store(false, Ordering::Release);
+    RETIRE_SUCCEEDS.store(false, Ordering::Release);
+    QUERIES.store(0, Ordering::Relaxed);
+    RETIRES.store(0, Ordering::Relaxed);
+    CLEARS.store(0, Ordering::Relaxed);
     unsafe {
         CONTEXT[2] = 17; // MDL
         CONTEXT[3] = 23; // current VA
         CONTEXT[4] = 31; // length
         CONTEXT[5] = 1;  // write to device
     }
+}
+
+#[test]
+fn uncertain_retirement_keeps_the_claim_and_refuses_replay() {
+    reset();
     s_dma_put_scatter_gather_list(7, 11, 0);
     assert_eq!(QUERIES.load(Ordering::Relaxed), 1);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
@@ -132,11 +142,16 @@ fn uncertain_retirement_keeps_the_claim_and_success_clears_once() {
     // A second entry cannot replay the uncertain provider effect.
     s_dma_put_scatter_gather_list(7, 11, 0);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
+    assert!(RESERVED.load(Ordering::Acquire));
+}
+
+#[test]
+fn successful_retirement_clears_its_claim_once() {
+    reset();
     RETIRE_SUCCEEDS.store(true, Ordering::Relaxed);
-    // A separate fresh list may retire successfully after its own claim.
-    RESERVED.store(false, Ordering::Release);
     s_dma_put_scatter_gather_list(7, 11, 0);
-    assert_eq!(RETIRES.load(Ordering::Relaxed), 2);
+    assert_eq!(QUERIES.load(Ordering::Relaxed), 1);
+    assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
     assert_eq!(CLEARS.load(Ordering::Relaxed), 1);
     assert!(!RESERVED.load(Ordering::Acquire));
     assert!(!LOCKED.load(Ordering::Acquire));

@@ -12336,9 +12336,21 @@ unsafe fn dma_allocation_range_overlaps(
         let record_len = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
         if dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) == adapter_id
             && logical != 0 && record_len != 0 {
-            if record_len == DMA_RECORD_RESERVED {
-                return Some(u64::MAX);
-            }
+            let record_len = if record_len == DMA_RECORD_RESERVED {
+                // A COMMON record stores its exact pending length in MAP_REGISTER until
+                // publication. Other pending kinds retain the conservative full-window block.
+                if dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND)
+                    != HOSTED_DMA_RECORD_KIND_COMMON {
+                    return Some(u64::MAX);
+                }
+                let pending_len = dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER);
+                if pending_len == 0 {
+                    return Some(u64::MAX);
+                }
+                pending_len
+            } else {
+                record_len
+            };
             let Some(record_offset) = logical.checked_sub(grant_logical) else {
                 i += 1;
                 continue;
@@ -12412,14 +12424,9 @@ extern "win64" fn s_dma_allocate_common_buffer(
             return 0;
         }
 
-        let _allocation_guard = HostedDmaAllocationGuard::acquire();
-
-        let Some(record) = first_free_dma_allocation_record(FSD_SHARED_VADDR) else {
-            return 0;
-        };
         let mut offset = 0u64;
         let mut conflict_retries = 0u32;
-        let (offset, claim_id) = loop {
+        loop {
             let Some(aligned) = align_up(offset, HOSTED_DMA_COMMON_ALIGNMENT) else {
                 return 0;
             };
@@ -12429,16 +12436,6 @@ extern "win64" fn s_dma_allocate_common_buffer(
             if end > metadata.grant_len {
                 return 0;
             }
-            if let Some(next_offset) = dma_allocation_range_overlaps(
-                FSD_SHARED_VADDR,
-                metadata.adapter_id,
-                metadata.grant_logical,
-                aligned,
-                requested,
-            ) {
-                offset = next_offset;
-                continue;
-            }
             let Some(candidate_logical) = metadata.grant_logical.checked_add(aligned) else {
                 return 0;
             };
@@ -12447,6 +12444,9 @@ extern "win64" fn s_dma_allocate_common_buffer(
                     let Some(next_offset) = next_logical.checked_sub(metadata.grant_logical) else {
                         return 0;
                     };
+                    if next_offset <= aligned {
+                        return 0;
+                    }
                     offset = next_offset;
                     continue;
                 }
@@ -12454,15 +12454,59 @@ extern "win64" fn s_dma_allocate_common_buffer(
                 Err(_) => return 0,
             }
             let Some(va) = metadata.grant_va.checked_add(aligned) else { return 0; };
-            let logical = candidate_logical;
-            let (_label, claim_status, claim_id, _, _) = call_on5(
+            // Claim the exact local range before root registration. A pending record blocks
+            // competing local allocations and replay while the IPC effect is uncertain.
+            let record = {
+                let _allocation_guard = HostedDmaAllocationGuard::acquire();
+                if let Some(next_offset) = dma_allocation_range_overlaps(
+                    FSD_SHARED_VADDR,
+                    metadata.adapter_id,
+                    metadata.grant_logical,
+                    aligned,
+                    requested,
+                ) {
+                    offset = next_offset;
+                    continue;
+                }
+                let Some(record) = first_free_dma_allocation_record(FSD_SHARED_VADDR) else {
+                    return 0;
+                };
+                begin_dma_allocation_record(record);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_LOGICAL, candidate_logical);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, va);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_COMMON);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_SOURCE_VA, 0);
+                // COMMON has no map-register owner. While RESERVED this field holds the
+                // requested length so local overlap checks protect the exact pending range.
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, requested);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID, metadata.adapter_id);
+                let count = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+                let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS)
+                    / SH_DMA_ALLOC_RECORD_SIZE).saturating_add(1);
+                if used > count {
+                    write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, used);
+                }
+                record
+            };
+            let (reply, claim_status, claim_id, _, _) = call_on5(
                 (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
                 adapter,
                 HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
-                logical, va, requested,
+                candidate_logical, va, requested,
             );
-            if claim_status as u32 as i32 == nt_status::NtStatus::CONFLICTING_ADDRESSES.raw()
-                && claim_id > logical && conflict_retries < HOSTED_DMA_CONFLICT_RETRY_LIMIT {
+            if reply >> 12 != 0 || reply & 0x7f != 4 {
+                // A malformed or absent receipt cannot prove that registration had no effect.
+                return 0;
+            }
+            if claim_status as u32 as i32 == nt_status::NtStatus::CONFLICTING_ADDRESSES.raw() {
+                // A definite conflict did not acquire a root claim. Recycle only this case;
+                // every other failed or lost registration retains its pending owner.
+                let _allocation_guard = HostedDmaAllocationGuard::acquire();
+                clear_dma_allocation_record(record);
+                if claim_id <= candidate_logical
+                    || conflict_retries >= HOSTED_DMA_CONFLICT_RETRY_LIMIT {
+                    return 0;
+                }
                 let Some(next_offset) = claim_id.checked_sub(metadata.grant_logical) else {
                     return 0;
                 };
@@ -12470,52 +12514,37 @@ extern "win64" fn s_dma_allocate_common_buffer(
                 conflict_retries += 1;
                 continue;
             }
-            if claim_status as u32 as i32 != STATUS_SUCCESS || claim_id == 0 {
+            if claim_status as u32 as i32 != STATUS_SUCCESS
+                || claim_id == 0
+                || claim_id >= (1u64 << HOSTED_DMA_SERVICE_OPERATION_SHIFT) {
                 return 0;
             }
-            break (aligned, claim_id);
-        };
-
-        let va = metadata.grant_va + offset;
-        let logical = metadata.grant_logical + offset;
-        // Common-buffer allocation does not promise zeroed memory, and provider-domain NDIS must
-        // not dereference a VA that belongs to the dependent miniport VSpace.
-        begin_dma_allocation_record(record);
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_LOGICAL, logical);
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, va);
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_COMMON);
-        // SOURCE_VA carries the root common-buffer generation for COMMON records.
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_SOURCE_VA, claim_id);
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, 0);
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID, metadata.adapter_id);
-        publish_dma_allocation_record(record, requested, 0);
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64,
-            requested,
-        );
-        write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *mut u64, va);
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *mut u64,
-            logical,
-        );
-        let count = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
-        let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS) / SH_DMA_ALLOC_RECORD_SIZE)
-            .saturating_add(1);
-        if used > count {
-            write_volatile(
-                (FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64,
-                used,
-            );
+            // Common-buffer allocation does not promise zeroed memory. Provider-domain NDIS
+            // must not dereference a VA belonging to the dependent miniport VSpace.
+            {
+                let _allocation_guard = HostedDmaAllocationGuard::acquire();
+                // SOURCE_VA carries the root common-buffer generation for COMMON records.
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_SOURCE_VA, claim_id);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, 0);
+                publish_dma_allocation_record(record, requested, 0);
+                write_volatile(
+                    (FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64, requested,
+                );
+                write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *mut u64, va);
+                write_volatile(
+                    (FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *mut u64,
+                    candidate_logical,
+                );
+                let cursor = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *const u64);
+                if end > cursor {
+                    write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *mut u64, end);
+                }
+            }
+            if !logical_out.is_null() {
+                write_unaligned(logical_out, candidate_logical as i64);
+            }
+            return va;
         }
-        let cursor = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *const u64);
-        let end = offset + requested;
-        if end > cursor {
-            write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *mut u64, end);
-        }
-        if !logical_out.is_null() {
-            write_unaligned(logical_out, logical as i64);
-        }
-        va
     }
 }
 
@@ -12531,77 +12560,82 @@ extern "win64" fn s_dma_free_common_buffer(
         let Some(metadata) = dma_adapter_metadata(adapter) else {
             return;
         };
-        let _allocation_guard = HostedDmaAllocationGuard::acquire();
         let logical = logical as u64;
-        let mut i = 0u64;
-        let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
-        while i < capacity {
-            if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
-                let active_logical =
-                    dma_record_load(record, SH_DMA_ALLOC_RECORD_LOGICAL);
-                let active_len = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
-                let active_va = dma_record_load(record, SH_DMA_ALLOC_RECORD_VA);
-                let claim_id = dma_record_load(record, SH_DMA_ALLOC_RECORD_SOURCE_VA);
-                let kind = dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND);
-                if active_logical != 0
-                    && kind == HOSTED_DMA_RECORD_KIND_COMMON
-                    && dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID)
-                        == metadata.adapter_id
-                    && logical == active_logical
-                    && virtual_address == active_va
-                    && length as u64 == active_len
-                {
-                    if claim_id == 0 || claim_id >= (1u64 << HOSTED_DMA_SERVICE_OPERATION_SHIFT) {
-                        return;
-                    }
-                    // Hide this claim from root record replay before asking the manager to
-                    // retire it. A failed or lost reply leaves the slot reserved.
-                    begin_dma_allocation_record(record);
-                    let lease_id = read_unaligned(
-                        (adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64,
-                    );
-                    let (reply, status, adapter_reply, logical_reply, length_reply) = call_on5(
-                        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
-                        lease_id,
-                        (HOSTED_DMA_SERVICE_FREE_COMMON_BUFFER
-                            << HOSTED_DMA_SERVICE_OPERATION_SHIFT) | claim_id,
-                        metadata.adapter_id,
-                        active_logical,
-                        active_len,
-                    );
-                    if reply >> 12 != 0
-                        || reply & 0x7f != 4
-                        || status as u32 as i32 != STATUS_SUCCESS
-                        || adapter_reply != 0
-                        || logical_reply != 0
-                        || length_reply != 0
+        let allocation = {
+            let _allocation_guard = HostedDmaAllocationGuard::acquire();
+            let mut i = 0u64;
+            let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
+            let mut matching = None;
+            while i < capacity {
+                if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
+                    let active_logical = dma_record_load(record, SH_DMA_ALLOC_RECORD_LOGICAL);
+                    let active_len = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
+                    let active_va = dma_record_load(record, SH_DMA_ALLOC_RECORD_VA);
+                    let claim_id = dma_record_load(record, SH_DMA_ALLOC_RECORD_SOURCE_VA);
+                    let kind = dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND);
+                    if active_logical != 0
+                        && kind == HOSTED_DMA_RECORD_KIND_COMMON
+                        && dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID)
+                            == metadata.adapter_id
+                        && logical == active_logical
+                        && virtual_address == active_va
+                        && length as u64 == active_len
                     {
-                        // Free is void in the NT ABI. The root receipt is required before
-                        // recycling a record or allowing this logical address to be reused.
-                        crate::provider_bugcheck::report(
-                            0xc4,
-                            [FSD_SERVICE_DMA_ADAPTER_LABEL, lease_id, active_logical, status],
-                        );
+                        if claim_id == 0 || claim_id >= (1u64 << HOSTED_DMA_SERVICE_OPERATION_SHIFT) {
+                            return;
+                        }
+                        // Hide this claim from root record replay before asking the manager to
+                        // retire it. A failed or lost reply leaves the slot reserved.
+                        begin_dma_allocation_record(record);
+                        dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, active_len);
+                        matching = Some((record, active_logical, active_len, claim_id));
+                        break;
                     }
-                    write_volatile(
-                        (FSD_SHARED_VADDR + SH_DMA_FREED_LOGICAL) as *mut u64,
-                        active_logical,
-                    );
-                    clear_dma_allocation_record(record);
-                    if read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *const u64)
-                        == active_logical
-                    {
-                        write_volatile(
-                            (FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *mut u64,
-                            0,
-                        );
-                        write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *mut u64, 0);
-                        write_volatile((FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64, 0);
-                    }
-                    return;
                 }
+                i += 1;
             }
-            i += 1;
+            matching
+        };
+        if let Some((record, active_logical, active_len, claim_id)) = allocation {
+            let lease_id = read_unaligned(
+                (adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64,
+            );
+            let (reply, status, adapter_reply, logical_reply, length_reply) = call_on5(
+                (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+                lease_id,
+                (HOSTED_DMA_SERVICE_FREE_COMMON_BUFFER
+                    << HOSTED_DMA_SERVICE_OPERATION_SHIFT) | claim_id,
+                metadata.adapter_id,
+                active_logical,
+                active_len,
+            );
+            if reply >> 12 != 0
+                || reply & 0x7f != 4
+                || status as u32 as i32 != STATUS_SUCCESS
+                || adapter_reply != 0
+                || logical_reply != 0
+                || length_reply != 0
+            {
+                // Free is void in the NT ABI. The root receipt is required before
+                // recycling a record or allowing this logical address to be reused.
+                crate::provider_bugcheck::report(
+                    0xc4,
+                    [FSD_SERVICE_DMA_ADAPTER_LABEL, lease_id, active_logical, status],
+                );
+            }
+            let _allocation_guard = HostedDmaAllocationGuard::acquire();
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_DMA_FREED_LOGICAL) as *mut u64,
+                active_logical,
+            );
+            clear_dma_allocation_record(record);
+            if read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *const u64)
+                == active_logical
+            {
+                write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
+                write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *mut u64, 0);
+                write_volatile((FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64, 0);
+            }
         }
     }
 }
@@ -13451,6 +13485,7 @@ unsafe fn dma_find_map_record(adapter_id: u64, map_register_base: u64, source_va
             && dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) == adapter_id
             && token == map_register_base
             && active_len != 0
+            && active_len != DMA_RECORD_RESERVED
             && (source_va == 0 || source_va == active_source)
         {
             return Some(record);
