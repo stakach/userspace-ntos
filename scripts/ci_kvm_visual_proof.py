@@ -17,8 +17,11 @@ READY_TITLE = re.compile(r"(?im)^[^\w\r\n]{0,3}Command Prompt[ \t]*$")
 READY_PROMPT = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]{1,128}>,?[ \t]*$")
 START_PROGRAMS = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"All Programs[ \t]*$")
 START_SEARCH_BOX = re.compile(r"(?im)^[ \t]*Search programs and files[ \t]*$")
-SEARCH_QUERY = re.compile(r"(?im)^[ \t]*command[ \t]*$")
-SEARCH_COMMAND_PROMPT = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"Command Prompt[ \t]*$")
+SEARCH_QUERY = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"command[ \t]*$")
+# Sparse OCR can read the shortcut's small icon as a numbered glyph ("2)").
+# Keep the title anchored and limit that prefix so console text cannot pass.
+SEARCH_RESULT_PREFIX = r"[ \t]*(?:[0-9]{1,2}[)\].][ \t]*)?[^\w\s]{0,3}[ \t]*"
+SEARCH_COMMAND_PROMPT = re.compile(r"(?im)^" + SEARCH_RESULT_PREFIX + r"Command Prompt[ \t]*$")
 
 
 @dataclass(frozen=True)

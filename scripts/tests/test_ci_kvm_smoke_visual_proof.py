@@ -54,12 +54,16 @@ class VisualProofTests(unittest.TestCase):
         # LiberNT paints result rows directly, above the edit at the bottom;
         # it does not paint a standalone "Programs" heading in search mode.
         results = "Command Prompt\ncommand\n"
+        recorded_search = "2) Command Prompt\nUser\n\u00bb\n\u2018command\nShut down\n"
         self.assertTrue(contains_start_menu_search_box(menu))
         # Tesseract on the actual 45425894277 Start screenshot includes
         # Explorer's chevron as a prefix to the All Programs line.
         self.assertTrue(contains_start_menu_search_box(recorded_menu))
         self.assertFalse(contains_start_menu_search_box("Command Prompt\nC:\\Users\\User>\n"))
         self.assertTrue(contains_command_prompt_search_result(results))
+        # Actual 45439719217 OCR read the shortcut icon as "2)" and the edit
+        # caret as a leading quote, though both are plainly visible.
+        self.assertTrue(contains_command_prompt_search_result(recorded_search))
         self.assertFalse(contains_command_prompt_search_result(menu))
         self.assertFalse(contains_command_prompt_search_result(
             "command\nNo items match your search.\n"))
@@ -82,6 +86,11 @@ class VisualProofTests(unittest.TestCase):
                 result = prove_command_prompt_search_result(image)
                 self.assertTrue(result.passed)
                 self.assertEqual(result.image_sha256, expected_sha)
+                ocr.return_value = subprocess.CompletedProcess(
+                    [], 0, "2) Command Prompt\n\u2018command\n", "")
+                recorded = prove_command_prompt_search_result(image)
+                self.assertTrue(recorded.passed)
+                self.assertEqual(recorded.image_sha256, expected_sha)
                 ocr.return_value = subprocess.CompletedProcess(
                     [], 0, "command\nNo items match your search.\n", "")
                 missing = prove_command_prompt_search_result(image)
