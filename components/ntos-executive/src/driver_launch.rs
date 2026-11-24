@@ -53456,6 +53456,28 @@ impl HostedDeviceDispatchContextGuard {
         }
         Ok(Self { ticket: Some(ticket) })
     }
+
+    /// The retained context owns the binding and physical request bank across a child yield.
+    /// A caller must project this exact binding before re-entering the component receive half.
+    unsafe fn projection_binding(
+        &self,
+        shared_va: u64,
+    ) -> Result<HostedDeviceBinding, nt_status::NtStatus> {
+        let ticket = self
+            .ticket
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let context = hosted_device_dispatch_contexts_mut()
+            .get(ticket)
+            .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        if context.projection_shared_va != Some(shared_va)
+            || ticket.key() != (context.instance, context.binding.device_id)
+            || hosted_device_binding_by_device_id(context.binding.device_id)
+                != Some(context.binding)
+        {
+            return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+        }
+        Ok(context.binding)
+    }
 }
 
 impl Drop for HostedDeviceDispatchContextGuard {
@@ -76919,6 +76941,36 @@ impl FileIrpPumpContinuation {
         Ok(())
     }
 
+    /// A sibling grant may have changed the driver's primary resource bank while this File
+    /// owner was parked. Reproject only the selected lane's retained device before resuming it.
+    unsafe fn reproject_resource_bank(&self) -> Result<(), nt_status::NtStatus> {
+        let context = match self.device_context.as_ref() {
+            Some(FileDeviceContextOwner::Active(context)) => context,
+            Some(FileDeviceContextOwner::Suspended(_)) => {
+                return Err(nt_status::NtStatus::DEVICE_BUSY);
+            }
+            None => return Ok(()),
+        };
+        let binding = context.projection_binding(self.shared_va)?;
+        if let Some(provider) = self.provider_binding {
+            if provider != binding {
+                return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+            }
+            project_provider_device_dispatch_state(
+                binding,
+                self.dependent_inst.exec_shared_va,
+                self.d,
+                self.shared_va,
+            )
+        } else {
+            let cnode = self
+                .class_selection
+                .as_ref()
+                .map_or(self.d.cnode, |selection| selection.cnode);
+            restore_hosted_device_resource_state(binding, self.shared_va, cnode, false).map(|_| ())
+        }
+    }
+
     /// Resume the receive half after an outer-loop child step. A physical or SEH refusal
     /// returns this entire owner to the File row; it never replays the initial ReplyRequest.
     pub(super) unsafe fn resume_after_child(
@@ -76931,6 +76983,10 @@ impl FileIrpPumpContinuation {
             return Err(self);
         }
         if self.rebind_bindings().is_err() {
+            self.suspend_bindings();
+            return Err(self);
+        }
+        if self.reproject_resource_bank().is_err() {
             self.suspend_bindings();
             return Err(self);
         }
