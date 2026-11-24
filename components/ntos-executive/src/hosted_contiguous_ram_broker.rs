@@ -77,6 +77,7 @@ pub(super) struct VideoProjectionPin {
     pub(super) provider_page_base: u64,
     pub(super) pages: u64,
     pub(super) frame_slot_base: u64,
+    pub(super) cache: ContiguousRamCachePolicy,
     pub(super) generation: u64,
     held: bool,
 }
@@ -418,6 +419,10 @@ pub(super) unsafe fn pin_video_projection(
         source.slot == row.source_slot && source.child == row.source_child
             && source.owner == row.mapping.producer() && published_mapping(source).is_some()
     })?;
+    let cache = ContiguousRamCachePolicy::for_nt_type(source.cache)?;
+    if row.mapping.virtual_address(consumer, physical, length, source.cache)? != address {
+        return None;
+    }
     let first_frame = first_physical_page.checked_sub(source.physical_start)? / PAGE;
     if first_frame.checked_add(pages)? > source.frames
         || last_physical > source.physical_start.checked_add(source.length)?
@@ -427,7 +432,7 @@ pub(super) unsafe fn pin_video_projection(
     row.video_pins = row.video_pins.checked_add(1)?;
     Some(VideoProjectionPin {
         projection_index: index, consumer, source_child: source.child,
-        provider_page_base, pages, frame_slot_base,
+        provider_page_base, pages, frame_slot_base, cache,
         generation: source.child, held: true,
     })
 }
