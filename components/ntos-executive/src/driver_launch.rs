@@ -53088,21 +53088,26 @@ pub(crate) fn loaded_driver_pnp_start_context(path: &str) -> Option<(u64, bool)>
 }
 
 #[inline(never)]
-pub(crate) fn open_io_device(
+pub(crate) fn begin_retained_io_device_open(
     device_path: &str,
     desired_access: AccessMask,
-) -> Result<(u64, u64, u64, u64), nt_status::NtStatus> {
+) -> Result<nt_io_manager::InternalOpenProgress, nt_status::NtStatus> {
     let path = parse_nt_path(device_path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let client = ClientId(IO_MANAGER_COMPONENT_ID);
-    let (handle, file_id, device_id, file_object_id) = io_manager_mut().open_with_details(
+    io_manager_mut().begin_retained_internal_open(
         client,
         &path,
         desired_access,
         ShareAccess::READ | ShareAccess::WRITE | ShareAccess::DELETE,
         CreateOptions::NON_DIRECTORY_FILE,
         1,
-    )?;
-    Ok((handle.0, file_id.raw(), device_id.raw(), file_object_id.0))
+    )
+}
+
+pub(crate) fn poll_retained_io_device_open(
+    owner: nt_io_manager::RetainedInternalOpen,
+) -> nt_io_manager::InternalOpenProgress {
+    io_manager_mut().poll_retained_internal_open(owner)
 }
 
 #[inline(never)]

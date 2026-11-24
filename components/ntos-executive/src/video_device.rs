@@ -40,6 +40,26 @@ pub(crate) struct HostedVideoDeviceRegistration<'a> {
     pub(crate) allocate_projection: unsafe fn(u64) -> Option<RootProviderPoolAllocation>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VideoPublicationProgress {
+    Published,
+    Pending,
+    Failed,
+}
+
+/// A private CREATE and the exact route that requested it. The File handle stays inside the
+/// I/O Manager until that same IRP has a real terminal completion and strict ACK (#474).
+struct PendingVideoPublication {
+    identity: crate::driver_launch::HostedVideoPublicationIdentity,
+    route_info: crate::driver_launch::HostedVideoRouteInfo,
+    metadata: VideoRegistrationMetadata,
+    owner_id: u64,
+    open: nt_io_manager::RetainedInternalOpen,
+    allocate_projection: unsafe fn(u64) -> Option<RootProviderPoolAllocation>,
+}
+
+static mut PENDING_VIDEO_PUBLICATION: Option<PendingVideoPublication> = None;
+
 #[derive(Clone, Copy)]
 struct VideoRegistrationMetadata {
     object_number: u32,
@@ -153,6 +173,7 @@ struct VideoBridgeState {
     objects: VideoProjectionObjects,
     metadata: Option<VideoRegistrationMetadata>,
     route: VideoIoRoute,
+    identity: Option<crate::driver_launch::HostedVideoPublicationIdentity>,
     ready: bool,
 }
 
@@ -162,6 +183,7 @@ impl VideoBridgeState {
             objects: VideoProjectionObjects::empty(),
             metadata: None,
             route: VideoIoRoute::empty(),
+            identity: None,
             ready: false,
         }
     }
@@ -306,6 +328,12 @@ pub(crate) fn video_publication_active() -> bool {
     VIDEO_PUBLICATION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
 }
 
+pub(crate) unsafe fn video_publication_pending_for(device_id: u64) -> bool {
+    (*addr_of!(PENDING_VIDEO_PUBLICATION))
+        .as_ref()
+        .is_some_and(|pending| pending.identity.device_id == device_id)
+}
+
 pub(crate) unsafe fn video_file_owners_quiesced() -> bool {
     !VIDEO_PUBLICATION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
         && !video_projection_owners::has_owners()
@@ -318,27 +346,39 @@ pub(crate) unsafe fn video_file_retirement_pending() -> u64 {
 #[inline(never)]
 pub(crate) unsafe fn publish_hosted_video_device_route(
     reg: &HostedVideoDeviceRegistration<'_>,
-) -> bool {
+) -> VideoPublicationProgress {
+    if (*addr_of!(PENDING_VIDEO_PUBLICATION)).is_some() {
+        return resume_hosted_video_device_route(reg.device_id);
+    }
     let Some(_publication) = PublicationGuard::enter() else {
-        print_hosted_video_publish_failure(b"publication-busy", None);
-        return false;
+        return VideoPublicationProgress::Pending;
     };
     let mut observation = PublicationObservation::enter(reg.device_id);
+    let Some(identity) = crate::driver_launch::hosted_video_publication_identity(reg.device_id)
+        .filter(|identity| crate::driver_launch::hosted_video_publication_identity_is_live(*identity))
+    else {
+        print_hosted_video_publish_failure(b"device-identity", None);
+        return VideoPublicationProgress::Failed;
+    };
+    let state = video_state_snapshot();
+    if state.ready && state.identity == Some(identity) && state.route.ready() {
+        return VideoPublicationProgress::Published;
+    }
     let old_route = video_state_snapshot().route;
     if old_route.owner_id != 0
         && video_projection_owners::pointer_reference_count(old_route.owner_id) != Some(0)
     {
         print_hosted_video_publish_failure(b"route-busy", None);
-        return false;
+        return VideoPublicationProgress::Failed;
     }
     let Some(route_info) = crate::driver_launch::hosted_video_route_info(reg.device_id) else {
         print_hosted_video_publish_failure(b"route-info", None);
-        return false;
+        return VideoPublicationProgress::Failed;
     };
     observation.stage(2); // before projected driver/device objects
     if !ensure_video_objects(reg.allocate_projection) {
         print_hosted_video_publish_failure(b"objects", None);
-        return false;
+        return VideoPublicationProgress::Failed;
     }
     observation.stage(3); // after projected driver/device objects
     observation.stage(4); // before device identity binding
@@ -347,7 +387,7 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         nt_io_manager::DeviceId(route_info.device_id),
     ) {
         print_hosted_video_publish_failure(b"device-identity", Some(NtStatus(status)));
-        return false;
+        return VideoPublicationProgress::Failed;
     }
     observation.stage(5); // after device identity binding
     observation.stage(6); // before metadata allocation
@@ -359,7 +399,7 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         reg.allocate_projection,
     ) else {
         print_hosted_video_publish_failure(b"metadata", None);
-        return false;
+        return VideoPublicationProgress::Failed;
     };
     observation.stage(7); // after metadata allocation
     observation.stage(8); // before File owner reservation
@@ -367,43 +407,125 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         Ok(owner) => owner,
         Err(status) => {
             print_hosted_video_publish_failure(b"file-owner", Some(status));
-            return false;
+            return VideoPublicationProgress::Failed;
         }
     };
     observation.owner_reserved(owner_id); // after File owner reservation
     observation.stage(10); // before native IRP_MJ_CREATE
-    let (file_handle, file_id, opened_device, file_object_id) =
-        match open_video_device_route(metadata) {
-            Ok(route) => route,
-            Err(status) => {
-                video_projection_owners::retire(owner_id);
-                print_hosted_video_publish_failure(b"open", Some(status));
-                return false;
-            }
+    match open_video_device_route(metadata) {
+        Ok(nt_io_manager::InternalOpenProgress::Ready(Ok(details))) => {
+            observation.stage(11); // after native IRP_MJ_CREATE
+            finish_hosted_video_device_route(
+                &mut observation, identity, &route_info, metadata, owner_id,
+                reg.allocate_projection, details,
+            )
+        }
+        Ok(nt_io_manager::InternalOpenProgress::Pending(open))
+        | Ok(nt_io_manager::InternalOpenProgress::Fenced(open, _)) => {
+            *addr_of_mut!(PENDING_VIDEO_PUBLICATION) = Some(PendingVideoPublication {
+                identity, route_info, metadata, owner_id, open,
+                allocate_projection: reg.allocate_projection,
+            });
+            observation.stage(20); // exact CREATE retained, no handle published
+            VideoPublicationProgress::Pending
+        }
+        Ok(nt_io_manager::InternalOpenProgress::Ready(Err(status))) | Err(status) => {
+            video_projection_owners::retire(owner_id);
+            print_hosted_video_publish_failure(b"open", Some(status));
+            VideoPublicationProgress::Failed
+        }
+    }
+}
+
+pub(crate) unsafe fn resume_hosted_video_device_route(device_id: u64) -> VideoPublicationProgress {
+    let Some(_publication) = PublicationGuard::enter() else {
+        return VideoPublicationProgress::Pending;
+    };
+    let mut observation = PublicationObservation::enter(device_id);
+    let Some(mut pending) = (*addr_of_mut!(PENDING_VIDEO_PUBLICATION)).take() else {
+        let state = video_state_snapshot();
+        return if state.ready && state.identity.is_some_and(|identity| {
+            identity.device_id == device_id
+                && crate::driver_launch::hosted_video_publication_identity(device_id) == Some(identity)
+                && crate::driver_launch::hosted_video_publication_identity_is_live(identity)
+        }) {
+            VideoPublicationProgress::Published
+        } else {
+            VideoPublicationProgress::Failed
         };
-    observation.stage(11); // after native IRP_MJ_CREATE
+    };
+    if pending.identity.device_id != device_id {
+        *addr_of_mut!(PENDING_VIDEO_PUBLICATION) = Some(pending);
+        print_hosted_video_publish_failure(b"pending-identity", None);
+        return VideoPublicationProgress::Failed;
+    }
+    match crate::driver_launch::poll_retained_io_device_open(pending.open) {
+        nt_io_manager::InternalOpenProgress::Pending(open)
+        | nt_io_manager::InternalOpenProgress::Fenced(open, _) => {
+            pending.open = open;
+            *addr_of_mut!(PENDING_VIDEO_PUBLICATION) = Some(pending);
+            observation.stage(20);
+            VideoPublicationProgress::Pending
+        }
+        nt_io_manager::InternalOpenProgress::Ready(Err(status)) => {
+            video_projection_owners::retire(pending.owner_id);
+            print_hosted_video_publish_failure(b"open-completion", Some(status));
+            VideoPublicationProgress::Failed
+        }
+        nt_io_manager::InternalOpenProgress::Ready(Ok(details)) => {
+            observation.stage(11);
+            finish_hosted_video_device_route(
+                &mut observation, pending.identity, &pending.route_info, pending.metadata,
+                pending.owner_id, pending.allocate_projection, details,
+            )
+        }
+    }
+}
+
+unsafe fn finish_hosted_video_device_route(
+    observation: &mut PublicationObservation,
+    identity: crate::driver_launch::HostedVideoPublicationIdentity,
+    route_info: &crate::driver_launch::HostedVideoRouteInfo,
+    metadata: VideoRegistrationMetadata,
+    owner_id: u64,
+    allocate_projection: unsafe fn(u64) -> Option<RootProviderPoolAllocation>,
+    details: (nt_types::HandleValue, nt_io_manager::FileId, nt_io_manager::DeviceId, nt_types::ObjectId),
+) -> VideoPublicationProgress {
+    let (file_handle, file_id, opened_device, file_object_id) =
+        (details.0.0, details.1.raw(), details.2.raw(), details.3.0);
     video_projection_owners::attach_open(owner_id, file_handle, file_id)
         .expect("reserved video File owner disappeared during open");
-    if opened_device != route_info.device_id {
+    let current_route = crate::driver_launch::hosted_video_route_info(route_info.device_id);
+    if opened_device != route_info.device_id
+        || !crate::driver_launch::hosted_video_publication_identity_is_live(identity)
+        || crate::driver_launch::hosted_video_publication_identity(route_info.device_id) != Some(identity)
+        || current_route.is_none_or(|current| {
+            current.driver_id != route_info.driver_id
+                || current.device_object_id != route_info.device_object_id
+                || current.object_number != route_info.object_number
+                || current.device_path != route_info.device_path
+                || current.driver_object_path != route_info.driver_object_path
+        })
+    {
         video_projection_owners::retire(owner_id);
         print_hosted_video_publish_failure(
             b"opened-device",
             Some(NtStatus::INVALID_DEVICE_REQUEST),
         );
-        return false;
+        return VideoPublicationProgress::Failed;
     }
     observation.stage(12); // before File projection preparation
     let file_projection = match video_projection_owners::prepare(
         owner_id,
         route_info.device_id,
         video_state_snapshot().objects.device,
-        reg.allocate_projection,
+        allocate_projection,
     ) {
         Ok(address) => address,
         Err(status) => {
             video_projection_owners::retire(owner_id);
             print_hosted_video_publish_failure(b"file-projection", Some(status));
-            return false;
+            return VideoPublicationProgress::Failed;
         }
     };
     observation.stage(13); // after File projection preparation
@@ -411,10 +533,11 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
     if !teardown_video_io_route() {
         video_projection_owners::retire(owner_id);
         print_hosted_video_publish_failure(b"teardown", None);
-        return false;
+        return VideoPublicationProgress::Failed;
     }
     observation.stage(15); // after old route teardown
     (*addr_of_mut!(VIDEO_STATE)).metadata = Some(metadata);
+    (*addr_of_mut!(VIDEO_STATE)).identity = Some(identity);
     commit_video_io_route(
         owner_id,
         file_projection,
@@ -432,12 +555,12 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         (*addr_of_mut!(VIDEO_STATE)).metadata = None;
         (*addr_of_mut!(VIDEO_STATE)).ready = false;
         print_hosted_video_publish_failure(b"devicemap", None);
-        return false;
+        return VideoPublicationProgress::Failed;
     }
     observation.stage(17); // after Configuration Manager DeviceMap writes
     (*addr_of_mut!(VIDEO_STATE)).ready = true;
     observation.stage(18); // completed publication
-    true
+    VideoPublicationProgress::Published
 }
 
 fn print_hosted_video_publish_failure(stage: &[u8], status: Option<NtStatus>) {
@@ -631,10 +754,10 @@ unsafe fn video_io_route_ids_present(metadata: VideoRegistrationMetadata) -> boo
 #[inline(never)]
 unsafe fn open_video_device_route(
     metadata: VideoRegistrationMetadata,
-) -> Result<(u64, u64, u64, u64), NtStatus> {
+) -> Result<nt_io_manager::InternalOpenProgress, NtStatus> {
     let device_path =
         core::str::from_utf8(metadata.device_path()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
-    crate::driver_launch::open_io_device(
+    crate::driver_launch::begin_retained_io_device_open(
         device_path,
         nt_types::AccessMask::GENERIC_READ | nt_types::AccessMask::GENERIC_WRITE,
     )
@@ -691,6 +814,7 @@ unsafe fn teardown_video_io_route() -> bool {
         }
     }
     (*addr_of_mut!(VIDEO_STATE)).route = VideoIoRoute::empty();
+    (*addr_of_mut!(VIDEO_STATE)).identity = None;
     true
 }
 
