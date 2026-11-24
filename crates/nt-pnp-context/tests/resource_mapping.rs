@@ -104,20 +104,32 @@ fn conflicting_cache_in_another_vspace_stays_blocked_through_uncertain_effects()
     alias.source_cap = 51;
     alias.cache = MappingCache::Uncached;
 
-    assert_eq!(table.prepare(alias, second_owner), Err(MappingError::Conflict));
+    assert_eq!(
+        table.prepare(alias, second_owner),
+        Err(MappingError::Conflict)
+    );
     table.attach_cap(first, 70).unwrap();
     let (_, effect) = table.begin_map(first).unwrap();
     table.mark_map_uncertain(effect).unwrap();
-    assert_eq!(table.prepare(alias, second_owner), Err(MappingError::Conflict));
+    assert_eq!(
+        table.prepare(alias, second_owner),
+        Err(MappingError::Conflict)
+    );
     assert_eq!(table.iter().count(), 1);
 
     let mut retiring = ResourceMappingTable::new();
     let first = new(&mut retiring, key(), first_owner);
     retiring.attach_cap(first, 71).unwrap();
     map(&mut retiring, first);
-    assert_eq!(retiring.begin_release(first), Ok(ReleaseAction::DeleteCap(71)));
+    assert_eq!(
+        retiring.begin_release(first),
+        Ok(ReleaseAction::DeleteCap(71))
+    );
     retiring.mark_delete_uncertain(first).unwrap();
-    assert_eq!(retiring.prepare(alias, second_owner), Err(MappingError::Conflict));
+    assert_eq!(
+        retiring.prepare(alias, second_owner),
+        Err(MappingError::Conflict)
+    );
     assert_eq!(retiring.iter().count(), 1);
 }
 

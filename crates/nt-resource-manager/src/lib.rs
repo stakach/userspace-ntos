@@ -1704,15 +1704,39 @@ mod tests {
         let mut rm = ResourceManager::new();
         let first = ResourceOwner::new(1, 10, 100);
         let second = ResourceOwner::new(2, 20, 200);
-        rm.claim_memory(first, 300, 0x3000_0000, 0x3000_0000, 0x400, MM_NON_CACHED, RIGHT_READ)
-            .unwrap();
+        rm.claim_memory(
+            first,
+            300,
+            0x3000_0000,
+            0x3000_0000,
+            0x400,
+            MM_NON_CACHED,
+            RIGHT_READ,
+        )
+        .unwrap();
         assert_eq!(
-            rm.claim_memory(second, 301, 0x3000_0400, 0x3000_0400, 0x400, MM_CACHED, RIGHT_READ),
+            rm.claim_memory(
+                second,
+                301,
+                0x3000_0400,
+                0x3000_0400,
+                0x400,
+                MM_CACHED,
+                RIGHT_READ
+            ),
             Err(HalError::ConflictingAddress),
         );
         assert!(rm.query_resources(second).is_empty());
         assert_eq!(
-            rm.claim_memory(second, 301, 0x3000_0400, 0x3000_0400, 0x400, MM_NON_CACHED, RIGHT_READ),
+            rm.claim_memory(
+                second,
+                301,
+                0x3000_0400,
+                0x3000_0400,
+                0x400,
+                MM_NON_CACHED,
+                RIGHT_READ
+            ),
             Ok(()),
         );
     }
@@ -1722,8 +1746,16 @@ mod tests {
         let mut rm = ResourceManager::new();
         let first = ResourceOwner::new(1, 10, 100);
         let second = ResourceOwner::new(2, 20, 200);
-        rm.claim_memory(first, 300, 0x3000_0000, 0x3000_0000, 0x400, MM_NON_CACHED, RIGHT_READ)
-            .unwrap();
+        rm.claim_memory(
+            first,
+            300,
+            0x3000_0000,
+            0x3000_0000,
+            0x400,
+            MM_NON_CACHED,
+            RIGHT_READ,
+        )
+        .unwrap();
         let cached = HalResourceDescriptor {
             kind: RES_KIND_MEMORY,
             share: SHARE_EXCLUSIVE,
@@ -1740,7 +1772,10 @@ mod tests {
             Err(HalError::ConflictingAddress),
         );
         assert!(rm.query_resources(second).is_empty());
-        let uncached = HalResourceDescriptor { arg0: MM_NON_CACHED as u64, ..cached };
+        let uncached = HalResourceDescriptor {
+            arg0: MM_NON_CACHED as u64,
+            ..cached
+        };
         assert_eq!(rm.replace_owner_assignments(second, &[uncached]), Ok(()));
     }
 
