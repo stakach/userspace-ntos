@@ -136,6 +136,66 @@ impl HostedRelationPublication {
     }
 }
 
+/// A revision refusal has no CM writer token. Rebuild every policy-dependent byte against the
+/// newly observed SYSTEM generation before advancing that exact retained BEGIN owner.
+unsafe fn revalidate_hosted_relation_begin_revision(
+    owner: &mut HostedRelationPublication,
+) -> Result<bool, HostedRelationPublishError> {
+    let attempt = owner.attempt.as_ref().expect("retained relation BEGIN");
+    let mount = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(HostedRelationPublishError::Retry)?;
+    let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if mount != attempt.mount() || mount.identity_token() != owner.mount_identity {
+        return Err(HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_HANDLE));
+    }
+    if generation <= attempt.expected_generation() {
+        return Err(HostedRelationPublishError::Retry);
+    }
+    let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref().ok_or(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ))?;
+    if query.claim != owner.claim
+        || !hosted_device_relation_owner_is_current(query.relation_owner)
+        || !hosted_pnp_manager_mut().devnode_identity_is_started(owner.claim.parent)
+        || owner.parent_relation.parent() != owner.claim.parent
+    {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
+    let prepared = owner.prepared_relations.as_ref().ok_or(
+        HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+    )?;
+    if prepared.relation_identity() != owner.parent_relation.relation() {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
+    let HostedRelationRegistryInputs { mutations, critical_starts } =
+        collect_hosted_relation_registry_inputs(
+            generation, prepared, &owner.reported_children, &owner.child_properties,
+        )?;
+    hosted_critical_child_starts_mut().reserve_capacity(critical_starts.len())
+        .map_err(|_| HostedRelationPublishError::Retry)?;
+    if mutations.is_empty() {
+        relation_begin_attempts().take_failure(
+            owner.attempt.as_mut().expect("retained no-token revision"),
+        ).map_err(hosted_relation_error_from_config)?;
+        owner.attempt = None;
+        owner._mutations = mutations;
+        owner.critical_starts = critical_starts;
+        return Ok(false);
+    }
+    let client_mutations = borrow_hosted_relation_client_mutations(&mutations)?;
+    relation_begin_attempts().retry_acknowledged_revision_with_mutations(
+        owner.attempt.as_mut().expect("retained no-token revision"),
+        mount, generation, &client_mutations,
+    ).map_err(hosted_relation_error_from_config)?;
+    owner._mutations = mutations;
+    owner.critical_starts = critical_starts;
+    Ok(true)
+}
+
 unsafe fn finish_hosted_relation_local_publication(
     owner: &mut HostedRelationPublication,
 ) -> bool {
@@ -388,10 +448,12 @@ unsafe fn advance_hosted_relation_publication(
                 }
             }
             Phase::Begin => {
-                let attempt = owner.attempt.as_mut().expect("retained relation BEGIN");
-                if attempt.is_acknowledged() {
-                    if attempt.outcome_status() == Some(0) {
-                        let upload = match relation_begin_attempts().take_upload(attempt) {
+                if owner.attempt.as_ref().expect("retained relation BEGIN").is_acknowledged() {
+                    let status = owner.attempt.as_ref().unwrap().outcome_status();
+                    if status == Some(0) {
+                        let upload = match relation_begin_attempts().take_upload(
+                            owner.attempt.as_mut().expect("retained successful BEGIN"),
+                        ) {
                             Ok(upload) => upload,
                             Err(_) => return owner.pending(),
                         };
@@ -400,16 +462,40 @@ unsafe fn advance_hosted_relation_publication(
                         owner.phase = Phase::Prepare;
                         continue;
                     }
+                    if status == Some(nt_status::NtStatus::DEVICE_BUSY.raw()) {
+                        if relation_begin_attempts().retry_acknowledged_busy(
+                            owner.attempt.as_mut().expect("retained busy BEGIN"),
+                        ).is_err() {
+                            return owner.pending();
+                        }
+                        return owner.pending();
+                    }
+                    let mut refusal = None;
+                    if status == Some(0xC000_0059u32 as i32) {
+                        match revalidate_hosted_relation_begin_revision(owner) {
+                            Ok(true) => return owner.pending(),
+                            Ok(false) => {
+                                owner.phase = Phase::PostCommitRepair;
+                                continue;
+                            }
+                            Err(HostedRelationPublishError::Retry) => return owner.pending(),
+                            Err(HostedRelationPublishError::Barrier(status)) => {
+                                refusal = Some(status);
+                            }
+                        }
+                    }
+                    let attempt = owner.attempt.as_mut().expect("retained failed BEGIN");
                     let (status, ()) = match relation_begin_attempts().take_failure(attempt) {
                         Ok(failure) => failure,
                         Err(_) => return owner.pending(),
                     };
                     owner.refusal_origin = Some(owner.phase);
-                    owner.refusal = nt_status::NtStatus(status);
+                    owner.refusal = refusal.unwrap_or(nt_status::NtStatus(status));
                     owner.attempt = None;
                     owner.phase = Phase::AbortProvider;
                     continue;
                 }
+                let attempt = owner.attempt.as_mut().expect("retained relation BEGIN");
                 let operation = if attempt.server_nonce().is_none() {
                     CmMutationBeginOperation::Query
                 } else if attempt.outcome_status().is_none() {

@@ -48109,6 +48109,70 @@ fn trace_hosted_relation_admission_failure(
     }
 }
 
+struct HostedRelationRegistryInputs {
+    mutations: Vec<HostedRelationRegistryMutation>,
+    critical_starts: Vec<(u64, String)>,
+}
+
+fn borrow_hosted_relation_client_mutations(
+    mutations: &[HostedRelationRegistryMutation],
+) -> Result<Vec<nt_config_client::SystemHiveMutation<'_>>, HostedRelationPublishError> {
+    let mut borrowed = Vec::new();
+    borrowed.try_reserve_exact(mutations.len())
+        .map_err(|_| HostedRelationPublishError::Retry)?;
+    for mutation in mutations {
+        borrowed.push(mutation.as_client_mutation());
+    }
+    Ok(borrowed)
+}
+
+/// Read every registry input that determines this relation's semantic journal at one SYSTEM
+/// generation. Admission and a no-token BEGIN revision retry must use the same policy path.
+unsafe fn collect_hosted_relation_registry_inputs(
+    expected_generation: u64,
+    prepared: &nt_pnp_manager::PreparedBusRelations,
+    reported_children: &[nt_pnp_manager::BusReportedChild],
+    child_properties: &[HostedBusChildProperties],
+) -> Result<HostedRelationRegistryInputs, HostedRelationPublishError> {
+    let mut policies = Vec::new();
+    let mut existing = Vec::new();
+    policies.try_reserve_exact(prepared.changes().len())
+        .map_err(|_| HostedRelationPublishError::Retry)?;
+    existing.try_reserve_exact(prepared.changes().len())
+        .map_err(|_| HostedRelationPublishError::Retry)?;
+    for change in prepared.changes() {
+        let enum_path = hosted_relation_enum_path(&change.child)?;
+        policies.push(if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
+            None
+        } else {
+            resolve_hosted_relation_policy(expected_generation, &change.child)
+                .inspect_err(|error| trace_hosted_relation_admission_failure(b"cm-policy", error))?
+        });
+        existing.push(existing_hosted_relation_values(
+            expected_generation, change, &enum_path,
+        ).inspect_err(|error| trace_hosted_relation_admission_failure(b"cm-existing", error))?);
+    }
+
+    let mut critical_starts = Vec::new();
+    critical_starts.try_reserve_exact(reported_children.len())
+        .map_err(|_| HostedRelationPublishError::Retry)?;
+    for child in reported_children {
+        if resolve_hosted_relation_policy(expected_generation, child)
+            .inspect_err(|error| trace_hosted_relation_admission_failure(b"cm-critical", error))?
+            .as_ref().is_some_and(|policy| policy.service_name.is_some())
+        {
+            critical_starts.push((child.pdo_object_id, hosted_relation_instance_path(child)?));
+        }
+    }
+    if crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != expected_generation {
+        return Err(HostedRelationPublishError::Retry);
+    }
+    let mutations = build_hosted_relation_mutations(
+        prepared, &policies, &existing, reported_children, child_properties,
+    )?;
+    Ok(HostedRelationRegistryInputs { mutations, critical_starts })
+}
+
 unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishError> {
     if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
         .as_ref().and_then(|query| query.publication.as_ref()).is_none()
@@ -48189,59 +48253,14 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             parent_relation,
         )?;
 
-        let mut policies = Vec::new();
-        let mut existing = Vec::new();
-        policies
-            .try_reserve_exact(prepared.changes().len())
-            .map_err(|_| HostedRelationPublishError::Retry)?;
-        existing
-            .try_reserve_exact(prepared.changes().len())
-            .map_err(|_| HostedRelationPublishError::Retry)?;
-        for change in prepared.changes() {
-            let enum_path = hosted_relation_enum_path(&change.child)?;
-            policies.push(
-                if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
-                    None
-                } else {
-                    resolve_hosted_relation_policy(expected_generation, &change.child)
-                        .inspect_err(|error| trace_hosted_relation_admission_failure(b"cm-policy", error))?
-                },
-            );
-            existing.push(existing_hosted_relation_values(
-                expected_generation,
-                change,
-                &enum_path,
-            ).inspect_err(|error| trace_hosted_relation_admission_failure(b"cm-existing", error))?);
-        }
-
-        if crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != expected_generation {
-            return Err(HostedRelationPublishError::Retry);
-        }
-
-        let mut critical_starts = Vec::new();
-        critical_starts
-            .try_reserve_exact(query.reported_children.len())
-            .map_err(|_| HostedRelationPublishError::Retry)?;
-        for child in &query.reported_children {
-            if resolve_hosted_relation_policy(expected_generation, child)
-                .inspect_err(|error| trace_hosted_relation_admission_failure(b"cm-critical", error))?
-                .as_ref()
-                .is_some_and(|policy| policy.service_name.is_some())
-            {
-                critical_starts.push((child.pdo_object_id, hosted_relation_instance_path(child)?));
-            }
-        }
+        let HostedRelationRegistryInputs { mutations, critical_starts } =
+            collect_hosted_relation_registry_inputs(
+                expected_generation, &prepared,
+                &query.reported_children, &query.child_properties,
+            )?;
         hosted_critical_child_starts_mut()
             .reserve_capacity(critical_starts.len())
             .map_err(|_| HostedRelationPublishError::Retry)?;
-
-        let mutations = build_hosted_relation_mutations(
-            &prepared,
-            &policies,
-            &existing,
-            &query.reported_children,
-            &query.child_properties,
-        )?;
         let mut providers = Vec::new();
         providers
             .try_reserve_exact(query.reported_children.len())
@@ -48294,8 +48313,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         let (phase, attempt) = if mutations.is_empty() {
             (HostedRelationPublicationPhase::PostCommitRepair, None)
         } else {
-            let client_mutations: Vec<_> = mutations.iter()
-                .map(HostedRelationRegistryMutation::as_client_mutation).collect();
+            let client_mutations = borrow_hosted_relation_client_mutations(&mutations)?;
             let mount = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
                 .expect("validated SYSTEM mount disappeared before relation BEGIN");
             match reserve_relation_mutation_begin(mount, expected_generation, &client_mutations) {
