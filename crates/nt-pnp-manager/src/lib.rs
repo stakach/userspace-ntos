@@ -1531,6 +1531,51 @@ impl PnpManager {
             && nt_cm_resources::decode_single_bus_number_resource(boot_raw).is_ok()
     }
 
+    /// The exact started PCI root retained its provider's complete bus-owned assignment.
+    /// Its routing windows are not function MMIO grants; publication must still match the
+    /// original provider query and checked parent-address translation byte for byte.
+    pub fn devnode_has_started_bus_owned_root_assignment(
+        &self,
+        identity: DevnodeIdentity,
+    ) -> bool {
+        let Some(properties) = self.started_pdo_properties(identity) else {
+            return false;
+        };
+        let Some(information) = properties.bus_information.as_ref() else {
+            return false;
+        };
+        if information.bus_type_guid != GUID_BUS_TYPE_PCI
+            || information.legacy_bus_type != INTERFACE_TYPE_PCI_BUS
+        {
+            return false;
+        }
+        let (
+            PropertyBlobState::Present(boot_raw),
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::Present(requirements),
+            PropertyBlobState::Present(filtered),
+            PropertyBlobState::Present(assigned_raw),
+            PropertyBlobState::Present(assigned_translated),
+        ) = (
+            &properties.boot_resources_raw,
+            &properties.boot_resources_translated,
+            &properties.resource_requirements,
+            &properties.filtered_resource_requirements,
+            &properties.allocated_resources_raw,
+            &properties.allocated_resources_translated,
+        ) else {
+            return false;
+        };
+        boot_raw == assigned_raw
+            && requirements == filtered
+            && nt_cm_resources::admit_bus_owned_root_resources(
+                boot_raw,
+                requirements,
+                information.bus_number,
+            )
+            .is_ok_and(|translated| translated == *assigned_translated)
+    }
+
     /// Commit only a terminal driver's state query to the same started PDO generation.
     pub fn set_queried_pnp_device_state(
         &mut self,
@@ -3840,6 +3885,53 @@ mod tests {
         altered.allocated_resources_raw = PropertyBlobState::Present(trailing.clone());
         altered.allocated_resources_translated = PropertyBlobState::Present(trailing);
         assert_rejected(altered);
+    }
+
+    #[test]
+    fn started_bus_owned_root_assignment_rejects_stale_identity() {
+        let mut lines =
+            include_str!("../../nt-cm-resources/src/libernt_pci_root_resources.hex").lines();
+        let decode = |hex: &str| {
+            hex.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let raw = decode(lines.next().unwrap());
+        let requirements = decode(lines.next().unwrap());
+        let translated = nt_cm_resources::admit_bus_owned_root_resources(&raw, &requirements, 0)
+            .unwrap();
+        let mut pnp = PnpManager::new();
+        let pdo = 0x4530;
+        let properties = PdoProperties::from_bus_queries(
+            Some(PnpBusInformation {
+                bus_type_guid: GUID_BUS_TYPE_PCI,
+                legacy_bus_type: INTERFACE_TYPE_PCI_BUS,
+                bus_number: 0,
+            }),
+            None,
+            PropertyBlobState::Present(raw.clone()),
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::Present(requirements.clone()),
+        );
+        pnp.register_enumerated_pdo(r"ACPI\PNP0A08\0", pdo, properties)
+            .unwrap();
+        pnp.commit_device_stack(pdo, 0x4531, 0x4533).unwrap();
+        let identity = pnp.devnode_identity_for_pdo(pdo).unwrap();
+        pnp.commit_filtered_resource_requirements(pdo, requirements)
+            .unwrap();
+        pnp.commit_resource_assignment(pdo, raw, translated).unwrap();
+        let start = begin_pnp(&mut pnp, pdo, PnpMinor::StartDevice).unwrap();
+        complete_pnp(&mut pnp, &start, true).unwrap();
+        assert!(pnp.devnode_has_started_bus_owned_root_assignment(identity));
+        assert!(!pnp.devnode_has_started_bus_owned_root_assignment(DevnodeIdentity {
+            generation: identity.generation + 1,
+            ..identity
+        }));
+        assert!(!pnp.devnode_has_started_bus_owned_root_assignment(DevnodeIdentity {
+            pdo_object_id: pdo + 1,
+            ..identity
+        }));
     }
 
     #[test]
