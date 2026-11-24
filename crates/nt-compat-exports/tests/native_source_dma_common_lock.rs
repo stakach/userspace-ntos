@@ -60,7 +60,10 @@ fn common_buffer_provider_effects_do_not_hold_the_allocation_guard() {
 
 const PORTS: &str = r#"
 use std::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+fn print_str(_text: &[u8]) {}
+fn print_hex_u64(_value: u64) {}
 
 const HOSTED_DMA_COMMON_ALIGNMENT: u64 = 0x1000;
 const HOSTED_DMA_RECORD_KIND_COMMON: u64 = 1;

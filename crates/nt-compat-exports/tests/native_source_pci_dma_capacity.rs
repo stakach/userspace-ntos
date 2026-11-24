@@ -71,6 +71,10 @@ fn constant<'a>(source: &'a str, name: &str) -> &'a str {
 
 const PORTS: &str = r#"
 use std::ptr::{read_volatile, write_unaligned, write_volatile};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn print_str(_text: &[u8]) {}
+fn print_hex_u64(_value: u64) {}
 
 const HOSTED_DMA_COMMON_ALIGNMENT: u64 = 0x1000;
 const HOSTED_DMA_RECORD_KIND_COMMON: u64 = 1;
