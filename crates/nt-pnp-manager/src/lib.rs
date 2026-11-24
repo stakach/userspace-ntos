@@ -1484,6 +1484,22 @@ impl PnpManager {
         })
     }
 
+    /// The exact started PDO has completed an empty raw and translated assignment.
+    /// An unqueried resource set is not evidence that no resources were assigned.
+    pub fn devnode_has_started_empty_assignment(&self, identity: DevnodeIdentity) -> bool {
+        self.devnodes.iter().any(|devnode| {
+            devnode.id == identity.devnode_id
+                && devnode.generation == identity.generation
+                && devnode.pdo_object_id == identity.pdo_object_id
+                && devnode.state == DeviceState::Started
+                && devnode.pending_dispatch.is_none()
+                && devnode.pdo_properties.as_ref().is_some_and(|properties| {
+                    properties.allocated_resources_raw == PropertyBlobState::KnownNone
+                        && properties.allocated_resources_translated == PropertyBlobState::KnownNone
+                })
+        })
+    }
+
     /// Commit only a terminal driver's state query to the same started PDO generation.
     pub fn set_queried_pnp_device_state(
         &mut self,
@@ -3666,6 +3682,42 @@ mod tests {
         p.rollback_device_stack(pdo, 0x4001, 0x55).unwrap();
         assert_eq!(p.state(id), Some(Enumerated));
         assert_eq!(p.fdo(id), Some(0));
+    }
+
+    #[test]
+    fn started_empty_assignment_requires_exact_completed_devnode() {
+        let mut p = PnpManager::new();
+        let empty_pdo = 0x4100;
+        let empty_id = p.register_enumerated_pdo(
+            r"ROOT\BASICDISPLAY\0000", empty_pdo, pci_properties(),
+        ).unwrap();
+        p.commit_device_stack(empty_pdo, 0x4101, 0x55).unwrap();
+        let identity = p.devnode_identity_for_pdo(empty_pdo).unwrap();
+        assert!(!p.devnode_has_started_empty_assignment(identity));
+
+        p.commit_resource_assignment(empty_pdo, vec![], vec![]).unwrap();
+        assert!(!p.devnode_has_started_empty_assignment(identity));
+        let start = begin_pnp(&mut p, empty_pdo, PnpMinor::StartDevice).unwrap();
+        assert!(!p.devnode_has_started_empty_assignment(identity));
+        complete_pnp(&mut p, &start, true).unwrap();
+        assert_eq!(p.state(empty_id), Some(DeviceState::Started));
+        assert!(p.devnode_has_started_empty_assignment(identity));
+        assert!(!p.devnode_has_started_empty_assignment(DevnodeIdentity {
+            generation: identity.generation + 1,
+            ..identity
+        }));
+        assert!(!p.devnode_has_started_empty_assignment(DevnodeIdentity {
+            pdo_object_id: empty_pdo + 1,
+            ..identity
+        }));
+
+        let assigned_pdo = 0x4200;
+        let assigned_id = assigned_pci_devnode(&mut p, assigned_pdo);
+        let assigned = p.devnode_identity_for_pdo(assigned_pdo).unwrap();
+        let start = begin_pnp(&mut p, assigned_pdo, PnpMinor::StartDevice).unwrap();
+        complete_pnp(&mut p, &start, true).unwrap();
+        assert_eq!(p.state(assigned_id), Some(DeviceState::Started));
+        assert!(!p.devnode_has_started_empty_assignment(assigned));
     }
 
     #[test]

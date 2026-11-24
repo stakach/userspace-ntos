@@ -21,20 +21,27 @@ unsafe fn requests_mut() -> &'static mut nt_hosted_runtime::MmioRequestLedger {
     slot.as_mut().unwrap()
 }
 
-unsafe fn pnp_owner(
-    binding: HostedDeviceBinding,
-) -> Option<(nt_hosted_runtime::MmioRequestOwner, HostedDeviceResourceState)> {
+unsafe fn retained_pnp_state(binding: HostedDeviceBinding) -> Option<HostedDeviceResourceState> {
     if hosted_device_binding_by_device_id(binding.device_id) != Some(binding) {
         return None;
     }
     let state = hosted_device_resource_state_by_device_id(binding.device_id)?;
-    let lease = state.pnp_context_lease?;
     if state.driver_id != binding.driver_id
         || state.instance != binding.instance
         || state.projection_domain != binding.projection_domain
         || state.pdo_object != binding.pdo_object
-        || !crate::hosted_pnp_context_lease_is_live(lease)
     {
+        return None;
+    }
+    Some(state)
+}
+
+unsafe fn pnp_owner(
+    binding: HostedDeviceBinding,
+) -> Option<(nt_hosted_runtime::MmioRequestOwner, HostedDeviceResourceState)> {
+    let state = retained_pnp_state(binding)?;
+    let lease = state.pnp_context_lease?;
+    if !crate::hosted_pnp_context_lease_is_live(lease) {
         return None;
     }
     Some((nt_hosted_runtime::MmioRequestOwner {
@@ -246,6 +253,27 @@ pub(crate) fn service_hosted_driver_mmio_request(
 pub(super) unsafe fn validate_publication(
     binding: HostedDeviceBinding,
 ) -> Result<(), nt_status::NtStatus> {
+    let state = retained_pnp_state(binding).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    if state.address_resource_count == 0 && state.pnp_context_lease.is_none() {
+        let pnp = hosted_pnp_manager_mut();
+        let identity = pnp.devnode_identity_for_pdo(binding.pdo_device_id)
+            .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        if pnp.fdo(identity.devnode_id()) != Some(binding.device_id)
+            || !pnp.devnode_has_started_empty_assignment(identity)
+        {
+            return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+        }
+        if (*core::ptr::addr_of!(REQUESTS)).as_ref().is_some_and(|ledger| {
+            ledger.has_pnp_device_rows(
+                binding.projection_domain.domain_id.raw(),
+                binding.projection_domain.cookie,
+                binding.device_id,
+            )
+        }) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        return Ok(());
+    }
     let (owner, state) = pnp_owner(binding).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     let resources = state.address_resources
         .get(..usize::from(state.address_resource_count))
