@@ -5,6 +5,10 @@ use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::hosted_forward_target::HostedForwardTarget;
 use nt_video_miniport::caller_pool_map::{BackingSelection, PoolMapIdentity, PoolMapPhase, PoolMapPlan, PoolMapTransaction};
 
+#[path = "hosted_video_pool_cache.rs"]
+mod hosted_video_pool_cache;
+use hosted_video_pool_cache::VideoAliasBackingCache;
+
 const PRESENT_DIRTY_RECT: u32 = 0x0023_2480;
 const PAGE_TABLE_BYTES: u64 = 0x20_0000;
 
@@ -36,6 +40,13 @@ enum BackingPin {
 }
 
 impl BackingPin {
+    fn cache(&self) -> VideoAliasBackingCache {
+        match self {
+            Self::Pool(_) => VideoAliasBackingCache::PoolRam,
+            Self::Projection(pin) => VideoAliasBackingCache::Contiguous(pin.cache),
+        }
+    }
+
     unsafe fn release(&mut self) -> bool {
         match self {
             Self::Pool(pin) => hosted_device_allocations::release_video_pool_pin(pin).is_ok(),
@@ -441,6 +452,9 @@ pub(super) unsafe fn publish_map(
 
 unsafe fn build_alias(row: &mut Mapping) -> Result<(), nt_status::NtStatus> {
     row.transaction.pin_allocation().map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let backing_cache = row.pin.as_ref()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+        .cache();
     let plan = row.transaction.plan();
     let cap = try_alloc_slot().ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     row.vspace.slot = cap;
@@ -484,7 +498,9 @@ unsafe fn build_alias(row: &mut Mapping) -> Result<(), nt_status::NtStatus> {
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
         row.stage = b"map-frame";
         row.in_flight = true;
-        let error = page_map_r(cap, plan.page_va(index as u64).unwrap(), RW_NX, row.vspace.slot);
+        let error = page_map_r(cap, plan.page_va(index as u64).unwrap(),
+            hosted_video_pool_cache::page_map_rights(backing_cache, RW_NX),
+            row.vspace.slot);
         row.in_flight = false;
         if error != 0 { return Err(native_error(error)); }
         frame.mapped = true;
