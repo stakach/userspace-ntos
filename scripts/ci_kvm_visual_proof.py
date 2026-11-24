@@ -16,7 +16,8 @@ READY_TITLE = re.compile(r"(?im)^[^\w\r\n]{0,3}Command Prompt[ \t]*$")
 # the drive-path token and line tail anchored so typed commands still fail.
 READY_PROMPT = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]{1,128}>,?[ \t]*$")
 START_PROGRAMS = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"All Programs[ \t]*$")
-START_SEARCH_BOX = re.compile(r"(?im)^[ \t]*Search programs and files[ \t]*$")
+START_SEARCH_BOX = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX +
+                              r"[Il]?Search programs and files[ \t]*$")
 SEARCH_QUERY = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"command[ \t]*$")
 # Sparse OCR can read the shortcut's small icon as a numbered glyph ("2)").
 # Keep the title anchored and limit that prefix so console text cannot pass.

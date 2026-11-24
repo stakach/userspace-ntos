@@ -51,6 +51,7 @@ class VisualProofTests(unittest.TestCase):
         # shortcuts.inf names the cmd.exe Accessories link "Command Prompt".
         menu = "All Programs\nSearch programs and files\nShut down\n"
         recorded_menu = "\u00bb All Programs\n\u00bb\nSearch programs and files\n\u2018Shut down\n"
+        caret_menu = "All Programs\nIsearch programs and files\nShut down\n"
         # LiberNT paints result rows directly, above the edit at the bottom;
         # it does not paint a standalone "Programs" heading in search mode.
         results = "Command Prompt\ncommand\n"
@@ -59,6 +60,9 @@ class VisualProofTests(unittest.TestCase):
         # Tesseract on the actual 45425894277 Start screenshot includes
         # Explorer's chevron as a prefix to the All Programs line.
         self.assertTrue(contains_start_menu_search_box(recorded_menu))
+        # Actual 45443331583 OCR joined the focused edit's insertion caret
+        # to the placeholder even though the full menu was visible.
+        self.assertTrue(contains_start_menu_search_box(caret_menu))
         self.assertFalse(contains_start_menu_search_box("Command Prompt\nC:\\Users\\User>\n"))
         self.assertTrue(contains_command_prompt_search_result(results))
         # Actual 45439719217 OCR read the shortcut icon as "2)" and the edit
