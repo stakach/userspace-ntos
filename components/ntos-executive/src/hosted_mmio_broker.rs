@@ -188,6 +188,34 @@ pub(super) unsafe fn request_for_binding(
     }
 }
 
+fn trace_assigned_map_miss(
+    stage: &[u8],
+    instance: usize,
+    shared_va: u64,
+    address: u64,
+    length: u64,
+    device_id: u64,
+) {
+    static TRACED: AtomicU64 = AtomicU64::new(0);
+    let n = TRACED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 32 && !n.is_power_of_two() { return; }
+    print_str(b"[assigned-mmio-route] n=");
+    print_u64(n);
+    print_str(b" stage=");
+    print_str(stage);
+    print_str(b" instance=");
+    print_u64(instance as u64);
+    print_str(b" shared=0x");
+    print_hex_u64(shared_va);
+    print_str(b" phys=0x");
+    print_hex_u64(address);
+    print_str(b" len=");
+    print_u64(length);
+    print_str(b" device=");
+    print_u64(device_id);
+    print_str(b"\n");
+}
+
 pub(crate) fn service_hosted_driver_mmio_request(
     channel: &crate::spawn_hosts::PumpChannel,
     caller_badge: u64,
@@ -207,21 +235,32 @@ pub(crate) fn service_hosted_driver_mmio_request(
     if length == 0 || address.checked_add(length).is_none() {
         return (nt_status::NtStatus::INVALID_PARAMETER.raw(), 0);
     }
-    if let Ok(binding) = current_hosted_device_dispatch_binding_for_projection(
-        instance_index, channel.shared_va,
-    ) {
-        if operation == 2 {
-            let result = unsafe { request_for_binding(binding, operation, address, length, cache) };
-            if result.0 == nt_status::NtStatus::SUCCESS.raw() {
-                return result;
+    match current_hosted_device_dispatch_binding_for_projection(instance_index, channel.shared_va) {
+        Ok(binding) => {
+            if operation == 2 {
+                let result = unsafe { request_for_binding(binding, operation, address, length, cache) };
+                if result.0 == nt_status::NtStatus::SUCCESS.raw() {
+                    return result;
+                }
+                // A GOP projection may coexist with an unrelated PnP binding in this process.
+                // Its unmap still needs the exact provider publication and projection receipt.
+            } else if operation == 1 {
+                match unsafe { pnp_owner(binding) } {
+                    Some((_, state)) if mapped_memory_resource(state, address, length).is_some() =>
+                        return unsafe { request_for_binding(binding, operation, address, length, cache) },
+                    Some(_) => trace_assigned_map_miss(b"resource", instance_index,
+                        channel.shared_va, address, length, binding.device_id),
+                    None => trace_assigned_map_miss(b"owner", instance_index,
+                        channel.shared_va, address, length, binding.device_id),
+                }
+            } else {
+                return unsafe { request_for_binding(binding, operation, address, length, cache) };
             }
-            // A GOP projection may coexist with an unrelated PnP binding in this process.
-            // Its unmap still needs the exact provider publication and projection receipt.
-        } else if operation != 1 || unsafe { pnp_owner(binding) }
-            .is_some_and(|(_, state)| mapped_memory_resource(state, address, length).is_some())
-        {
-            return unsafe { request_for_binding(binding, operation, address, length, cache) };
         }
+        Err(rejection) if operation == 1 =>
+            trace_assigned_map_miss(rejection.name(), instance_index,
+                channel.shared_va, address, length, 0),
+        Err(_) => {},
     }
     // A driver may pass MmGetPhysicalAddress of its own live NonPagedPool allocation, even
     // while a PnP FDO binding is active. Borrow its existing WB VA with a separate receipt.
