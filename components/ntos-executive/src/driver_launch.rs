@@ -12940,7 +12940,14 @@ unsafe fn dma_allocate_private_graph(
     (status as u32 as i32 == STATUS_SUCCESS && map != 0).then_some((map, context, list))
 }
 
-unsafe fn dma_retire_map_token(adapter: u64, map: u64) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DmaMapRetirement {
+    Retired,
+    NoEffect,
+    Uncertain,
+}
+
+unsafe fn dma_retire_map_token(adapter: u64, map: u64) -> DmaMapRetirement {
     if let Some((_, identity, _, _, grant)) = hosted_irq_lane_context() {
         let metadata = dma_adapter_metadata(adapter)
             .unwrap_or_else(|| hosted_irq_lane_protocol_fault(adapter));
@@ -12961,18 +12968,30 @@ unsafe fn dma_retire_map_token(adapter: u64, map: u64) -> bool {
             argument_count: 4,
             arguments,
         });
-        if result.faulted || result.value_count != 0 || result.status != STATUS_SUCCESS {
-            hosted_irq_lane_protocol_fault(lease_id);
+        if result.faulted || result.value_count != 0 {
+            return DmaMapRetirement::Uncertain;
         }
-        return true;
+        return match result.status {
+            STATUS_SUCCESS => DmaMapRetirement::Retired,
+            STATUS_INVALID_HANDLE => DmaMapRetirement::NoEffect,
+            _ => DmaMapRetirement::Uncertain,
+        };
     }
-    let (_label, status, _, _, _) = call_on5(
+    let (reply, status, value0, value1, value2) = call_on5(
         (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
         adapter,
         HOSTED_DMA_SERVICE_FREE_MAP << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
         map, 0, 0,
     );
-    status as u32 as i32 == STATUS_SUCCESS
+    if reply >> 12 != 0 || reply & 0x7f != 4
+        || value0 != 0 || value1 != 0 || value2 != 0 {
+        return DmaMapRetirement::Uncertain;
+    }
+    match status as u32 as i32 {
+        STATUS_SUCCESS => DmaMapRetirement::Retired,
+        STATUS_INVALID_HANDLE => DmaMapRetirement::NoEffect,
+        _ => DmaMapRetirement::Uncertain,
+    }
 }
 
 unsafe fn dma_retire_sg_list(adapter: u64, list: u64) -> bool {
@@ -13049,31 +13068,67 @@ unsafe fn dma_query_sg_members(adapter: u64, list: u64) -> Option<(u64, u64)> {
 }
 
 unsafe fn dma_reserve_records_for_map(map_register_base: u64) -> bool {
+    if map_register_base == 0 {
+        return false;
+    }
+    let adapter_id = read_unaligned((map_register_base + 16) as *const u64);
+    if adapter_id == 0 {
+        return false;
+    }
     let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
+    let count = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    if count > capacity {
+        return false;
+    }
+    let mut has_active = false;
     let mut i = 0u64;
     while i < capacity {
-        if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
-            let kind = dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND);
-            let token = dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER);
-            if matches!(kind, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
-                | HOSTED_DMA_RECORD_KIND_COHERENT_MAP) && token == map_register_base {
-                if dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN)
-                    == DMA_RECORD_RESERVED {
-                    return false;
-                }
+        let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) else {
+            return false;
+        };
+        let kind = dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND);
+        if matches!(kind, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
+            | HOSTED_DMA_RECORD_KIND_COHERENT_MAP)
+            && dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER) == map_register_base {
+            let length = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
+            if i >= count || length == DMA_RECORD_RESERVED
+                || dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) != adapter_id {
+                return false;
             }
+            has_active |= length != 0;
         }
         i += 1;
     }
+    if !has_active {
+        // The token itself owns a pending retirement even when no mapping was published.
+        // Root must see the reservation through the high-water count before the IPC effect.
+        let Some(record) = first_free_dma_allocation_record(FSD_SHARED_VADDR) else {
+            return false;
+        };
+        begin_dma_allocation_record(record);
+        dma_record_store(record, SH_DMA_ALLOC_RECORD_LOGICAL, 0);
+        dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, 0);
+        dma_record_store(record, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER);
+        dma_record_store(record, SH_DMA_ALLOC_RECORD_SOURCE_VA, 0);
+        dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, map_register_base);
+        dma_record_store(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID, adapter_id);
+        let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS)
+            / SH_DMA_ALLOC_RECORD_SIZE).saturating_add(1);
+        if used > count {
+            write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, used);
+        }
+        return true;
+    }
     i = 0;
-    while i < capacity {
-        if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
-            let kind = dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND);
-            let token = dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER);
-            if matches!(kind, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
-                | HOSTED_DMA_RECORD_KIND_COHERENT_MAP) && token == map_register_base {
-                begin_dma_allocation_record(record);
-            }
+    while i < count {
+        let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) else {
+            return false;
+        };
+        let kind = dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND);
+        if matches!(kind, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
+            | HOSTED_DMA_RECORD_KIND_COHERENT_MAP)
+            && dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER) == map_register_base {
+            begin_dma_allocation_record(record);
         }
         i += 1;
     }
@@ -13081,6 +13136,7 @@ unsafe fn dma_reserve_records_for_map(map_register_base: u64) -> bool {
 }
 
 unsafe fn dma_clear_records_for_map(map_register_base: u64) {
+    let adapter_id = read_unaligned((map_register_base + 16) as *const u64);
     let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
     let mut i = 0u64;
     while i < capacity {
@@ -13088,11 +13144,51 @@ unsafe fn dma_clear_records_for_map(map_register_base: u64) {
             let kind = dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND);
             let token = dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER);
             if matches!(kind, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
-                | HOSTED_DMA_RECORD_KIND_COHERENT_MAP) && token == map_register_base {
+                | HOSTED_DMA_RECORD_KIND_COHERENT_MAP) && token == map_register_base
+                && dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) == adapter_id {
                 clear_dma_allocation_record(record);
             }
         }
         i += 1;
+    }
+}
+
+unsafe fn dma_clear_token_only_retirement_claim(map_register_base: u64) {
+    let adapter_id = read_unaligned((map_register_base + 16) as *const u64);
+    let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
+    let mut i = 0u64;
+    while i < capacity {
+        if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
+            if dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND)
+                == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
+                && dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER) == map_register_base
+                && dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) == adapter_id
+                && dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN) == DMA_RECORD_RESERVED
+                && dma_record_load(record, SH_DMA_ALLOC_RECORD_LOGICAL) == 0
+                && dma_record_load(record, SH_DMA_ALLOC_RECORD_VA) == 0
+                && dma_record_load(record, SH_DMA_ALLOC_RECORD_SOURCE_VA) == 0 {
+                clear_dma_allocation_record(record);
+            }
+        }
+        i += 1;
+    }
+}
+
+unsafe fn dma_retire_claimed_map(adapter: u64, map_register_base: u64) {
+    // The provider call can suspend. The caller has already recorded ownership and dropped
+    // the allocation guard, so only a verified result may reopen the local claim.
+    match dma_retire_map_token(adapter, map_register_base) {
+        DmaMapRetirement::Retired => {
+            let _allocation_guard = HostedDmaAllocationGuard::acquire();
+            dma_clear_records_for_map(map_register_base);
+        }
+        DmaMapRetirement::NoEffect => {
+            let _allocation_guard = HostedDmaAllocationGuard::acquire();
+            // A stale token with no published mapping acquired only the sentinel. A foreign
+            // or ambiguous owner may still have active rows; keep those rows reserved.
+            dma_clear_token_only_retirement_claim(map_register_base);
+        }
+        DmaMapRetirement::Uncertain => {}
     }
 }
 
@@ -13135,10 +13231,12 @@ extern "win64" fn s_dma_allocate_adapter_channel(
         ) as u32;
         if action == 2 {
             // DeallocateObject: the caller did not retain the map-register token.
-            let _allocation_guard = HostedDmaAllocationGuard::acquire();
-            if dma_reserve_records_for_map(map_register)
-                && dma_retire_map_token(adapter, map_register) {
-                dma_clear_records_for_map(map_register);
+            let reserved = {
+                let _allocation_guard = HostedDmaAllocationGuard::acquire();
+                dma_reserve_records_for_map(map_register)
+            };
+            if reserved {
+                dma_retire_claimed_map(adapter, map_register);
             }
         }
         0
@@ -13155,6 +13253,12 @@ extern "win64" fn s_dma_map_transfer(
     length: *mut u32,
     write_to_device: u8,
 ) -> i64 {
+    fn authenticated_map_no_effect(status: i32, value: u64, detail0: u64, detail1: u64) -> bool {
+        value == 0 && detail0 == 0 && detail1 == 0
+            && (status == nt_status::NtStatus::INVALID_HANDLE.raw()
+                || status == nt_status::NtStatus::DEVICE_BUSY.raw()
+                || status == nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw())
+    }
     // A failed pre-effect query may release its local claim. Once MAP_TRANSFER has been sent,
     // only a definite conflict or an acknowledged publication can change that ownership.
     struct PendingMapRecord {
@@ -13320,16 +13424,17 @@ extern "win64" fn s_dma_map_transfer(
                 logical, source_va, mapped_len,
             );
             if reply >> 12 == 0 && reply & 0x7f == 4
-                && status as u32 as i32 == nt_status::NtStatus::INVALID_HANDLE.raw()
-                && alias_id == 0 && detail0 == 0 && detail1 == 0
+                && authenticated_map_no_effect(status as u32 as i32,
+                    alias_id, detail0, detail1)
             {
-                // The exact root graph rejected this stale token before any mapping effect.
+                // The exact root graph rejected the call before any mapping effect.
                 ownership.effect_started = false;
             }
             if reply >> 12 != 0 || reply & 0x7f != 4
                 || status as u32 as i32 != STATUS_SUCCESS
                 || alias_id == 0
                 || alias_id >= (1u64 << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
+                || detail0 != 0 || detail1 != 0
             {
                 write_unaligned(length, 0);
                 trace_hosted_dma_sg(
@@ -13468,10 +13573,10 @@ extern "win64" fn s_dma_map_transfer(
                 write_unaligned(length, 0);
                 return 0;
             }
-            if mapped_status as u32 as i32 == nt_status::NtStatus::INVALID_HANDLE.raw()
-                && mapping_id == 0 && detail0 == 0 && detail1 == 0
+            if authenticated_map_no_effect(mapped_status as u32 as i32,
+                mapping_id, detail0, detail1)
             {
-                // Root's exact token lookup rejected this call before registering a mapping.
+                // Root rejected this call before registering a mapping.
                 ownership.effect_started = false;
             }
             let definite_conflict = mapped_status as u32 as i32
@@ -13498,6 +13603,7 @@ extern "win64" fn s_dma_map_transfer(
             if mapped_status as u32 as i32 != STATUS_SUCCESS
                 || mapping_id == 0
                 || mapping_id >= (1u64 << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
+                || detail0 != 0 || detail1 != 0
             {
                 write_unaligned(length, 0);
                 trace_hosted_dma_sg(
@@ -13630,14 +13736,14 @@ extern "win64" fn s_dma_free_map_registers(
         {
             return;
         }
-        let _allocation_guard = HostedDmaAllocationGuard::acquire();
-        if !dma_reserve_records_for_map(map_register_base) {
+        let reserved = {
+            let _allocation_guard = HostedDmaAllocationGuard::acquire();
+            dma_reserve_records_for_map(map_register_base)
+        };
+        if !reserved {
             return;
         }
-        if !dma_retire_map_token(adapter, map_register_base) {
-            return;
-        }
-        dma_clear_records_for_map(map_register_base);
+        dma_retire_claimed_map(adapter, map_register_base);
     }
 }
 

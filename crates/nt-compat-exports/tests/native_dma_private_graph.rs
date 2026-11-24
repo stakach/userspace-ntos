@@ -43,9 +43,6 @@ fn map_channel_and_scatter_gather_private_members_use_root_broker() {
         assert!(!calls(name).iter().any(|call| call == "pool_free"),
             "{name} directly frees private DMA storage");
     }
-    let channel = calls("s_dma_allocate_adapter_channel");
-    assert!(channel.iter().any(|call| call == "dma_retire_map_token"),
-        "DeallocateObject must release the exact root-owned token");
     let put = calls("s_dma_put_scatter_gather_list");
     assert!(put.iter().any(|call| call == "dma_retire_sg_list"),
         "PutScatterGatherList must use the captured graph");

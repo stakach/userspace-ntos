@@ -58,7 +58,7 @@ const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = -1;
 const STATUS_INVALID_DEVICE_REQUEST: i32 = -2;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = -3;
-const STATUS_DEVICE_BUSY: i32 = -4;
+const STATUS_UNCERTAIN_RESULT: i32 = -4;
 const FSD_SERVICE_DMA_ADAPTER_LABEL: u64 = 9;
 const HOSTED_DMA_SERVICE_OPERATION_SHIFT: u64 = 56;
 const HOSTED_DMA_SERVICE_OPERATION_MASK: u64 = 0xff << HOSTED_DMA_SERVICE_OPERATION_SHIFT;
@@ -88,7 +88,9 @@ static LOCKED: AtomicBool = AtomicBool::new(false);
 static ASSERT_PROVIDER_UNLOCKED: AtomicBool = AtomicBool::new(false);
 static CONFLICT_ONCE: AtomicBool = AtomicBool::new(false);
 static MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
-static MAP_STATUS: AtomicI32 = AtomicI32::new(STATUS_DEVICE_BUSY);
+static MAP_STATUS: AtomicI32 = AtomicI32::new(STATUS_UNCERTAIN_RESULT);
+static MAP_DETAIL0: AtomicU64 = AtomicU64::new(0);
+static MAP_DETAIL1: AtomicU64 = AtomicU64::new(0);
 static GRANT_VA: AtomicU64 = AtomicU64::new(0x4000_0000);
 static mut FSD_SHARED_VADDR: u64 = 0;
 
@@ -153,7 +155,8 @@ unsafe fn call_on5(
                 (4, nt_status::NtStatus::CONFLICTING_ADDRESSES.raw() as u64, 0x2000, 0, 0)
             } else {
                 let status = MAP_STATUS.load(Ordering::Relaxed);
-                (4, status as u64, if status == STATUS_SUCCESS { 71 } else { 0 }, 0, 0)
+                (4, status as u64, if status == STATUS_SUCCESS { 71 } else { 0 },
+                    MAP_DETAIL0.load(Ordering::Relaxed), MAP_DETAIL1.load(Ordering::Relaxed))
             }
         }
         other => panic!("unexpected DMA provider operation {other}"),
@@ -213,6 +216,8 @@ mod nt_status {
     impl NtStatus {
         pub const CONFLICTING_ADDRESSES: Self = Self(-5);
         pub const INVALID_HANDLE: Self = Self(-6);
+        pub const DEVICE_BUSY: Self = Self(0x8000_0011u32 as i32);
+        pub const INSUFFICIENT_RESOURCES: Self = Self(0xC000_009Au32 as i32);
         pub fn raw(self) -> i32 { self.0 }
     }
 }
@@ -224,7 +229,9 @@ fn setup() -> ([u64; 48], [u64; 4]) {
     ASSERT_PROVIDER_UNLOCKED.store(false, Ordering::Release);
     CONFLICT_ONCE.store(false, Ordering::Release);
     MAP_CALLS.store(0, Ordering::Relaxed);
-    MAP_STATUS.store(STATUS_DEVICE_BUSY, Ordering::Relaxed);
+    MAP_STATUS.store(STATUS_UNCERTAIN_RESULT, Ordering::Relaxed);
+    MAP_DETAIL0.store(0, Ordering::Relaxed);
+    MAP_DETAIL1.store(0, Ordering::Relaxed);
     GRANT_VA.store(0x4000_0000, Ordering::Relaxed);
     let mut shared = [0u64; 48];
     unsafe { FSD_SHARED_VADDR = shared.as_mut_ptr() as u64; }
@@ -271,6 +278,39 @@ fn authenticated_invalid_handle_clears_the_pre_effect_claim() {
     assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 1);
     assert_eq!(unsafe { dma_record_load(FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORDS,
         SH_DMA_ALLOC_RECORD_LEN) }, 0, "root rejected token before mapping effect");
+}
+
+#[test]
+fn malformed_success_keeps_the_pending_claim() {
+    let (mut shared, token) = setup();
+    let mut grant = [0xA5u8; 0x3000];
+    unsafe { FSD_SHARED_VADDR = shared.as_mut_ptr() as u64; }
+    GRANT_VA.store(grant.as_mut_ptr() as u64, Ordering::Relaxed);
+    MAP_STATUS.store(STATUS_SUCCESS, Ordering::Relaxed);
+    MAP_DETAIL0.store(1, Ordering::Relaxed);
+    let mut length = 64u32;
+    let map = token.as_ptr() as u64;
+    assert_eq!(s_dma_map_transfer(7, 17, map, 0x5000_0000, &mut length, 0), 0);
+    assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 1);
+    assert_eq!(unsafe { dma_record_load(FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORDS,
+        SH_DMA_ALLOC_RECORD_LEN) }, DMA_RECORD_RESERVED);
+}
+
+#[test]
+fn authenticated_pre_effect_pressure_releases_the_claim() {
+    for status in [nt_status::NtStatus::DEVICE_BUSY.raw(),
+        nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw()] {
+        let (mut shared, token) = setup();
+        unsafe { FSD_SHARED_VADDR = shared.as_mut_ptr() as u64; }
+        MAP_STATUS.store(status, Ordering::Relaxed);
+        let mut length = 64u32;
+        let map = token.as_ptr() as u64;
+        assert_eq!(s_dma_map_transfer(7, 17, map, 0x5000_0000, &mut length, 0), 0);
+        assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(unsafe { dma_record_load(FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORDS,
+            SH_DMA_ALLOC_RECORD_LEN) }, 0,
+            "authenticated pre-effect refusal should allow a later retry");
+    }
 }
 
 fn assert_published_map(record: u64, token: u64, logical: u64, bounce_va: u64) {
