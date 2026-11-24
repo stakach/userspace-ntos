@@ -599,11 +599,20 @@ impl MmioRequestLedger {
         if self.rows[index].phase != MmioRequestPhase::Unmapping {
             return Err(MmioRequestError::Unavailable);
         }
-        if matches!(self.rows[index].request.owner.authority, MmioRequestAuthority::Pnp { .. })
-            && matches!(self.rows[index].backing, Some(MmioRequestBacking::Assigned { .. }))
+        let owner = self.rows[index].request.owner;
+        if let (
+            MmioRequestAuthority::Pnp { .. },
+            Some(MmioRequestBacking::Assigned { resource_id, .. }),
+        ) = (owner.authority, self.rows[index].backing)
         {
-            self.rows[index].virtual_start = None;
-            self.rows[index].phase = MmioRequestPhase::CompletedUse;
+            // The exact call is settled; one completed receipt per owner/resource is enough
+            // to prove StartDevice use. Runtime map/unmap loops must not grow history forever.
+            if self.has_completed_assigned_use(owner, resource_id) {
+                self.rows.remove(index);
+            } else {
+                self.rows[index].virtual_start = None;
+                self.rows[index].phase = MmioRequestPhase::CompletedUse;
+            }
         } else {
             self.rows.remove(index);
         }

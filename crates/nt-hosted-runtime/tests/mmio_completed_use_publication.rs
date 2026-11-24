@@ -278,6 +278,8 @@ fn duplicate_calls_keep_distinct_evidence_and_other_resources_do_not_satisfy_pub
     assert_eq!(selected, first);
     ledger.acknowledge_unmap(selected).unwrap();
     assert_eq!(ledger.live_count(), 0);
+    assert_eq!(ledger.phase(first), None);
+    assert_eq!(ledger.phase(second), Some(MmioRequestPhase::CompletedUse));
     assert_eq!(
         publication_for_resources(&resources, Some(&ledger), owner, |_| None),
         Ok(())
@@ -306,4 +308,78 @@ fn duplicate_calls_keep_distinct_evidence_and_other_resources_do_not_satisfy_pub
         Err(NtStatus::DEVICE_BUSY),
         "a live map of an unassigned resource must block even with valid completed evidence"
     );
+}
+
+#[test]
+fn repeated_finished_calls_retain_one_proof_per_exact_owner_and_resource() {
+    let owner = owner(11, 23, lease());
+    let other_resource = RESOURCE_ID + 1;
+    let mut ledger = MmioRequestLedger::new();
+    let mut receipts = Vec::new();
+
+    for mapping_id in 1..=64 {
+        let receipt = ledger.prepare(request(owner, PHYS)).unwrap();
+        ledger
+            .complete(
+                receipt,
+                VA,
+                MmioRequestBacking::Assigned {
+                    resource_id: RESOURCE_ID,
+                    mapping_id,
+                },
+            )
+            .unwrap();
+        let (selected, backing) = ledger.begin_unmap(owner, VA, LEN).unwrap();
+        assert_eq!(selected, receipt);
+        assert_eq!(
+            backing,
+            MmioRequestBacking::Assigned {
+                resource_id: RESOURCE_ID,
+                mapping_id,
+            }
+        );
+        ledger.acknowledge_unmap(selected).unwrap();
+        assert!(
+            ledger.begin_unmap(owner, VA, LEN).is_err(),
+            "a completed receipt cannot replay its resource-manager unmap"
+        );
+        receipts.push(receipt);
+        assert_eq!(ledger.live_count(), 0);
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|&&id| { ledger.phase(id) == Some(MmioRequestPhase::CompletedUse) })
+                .count(),
+            1,
+            "finished runtime calls cannot grow publication history"
+        );
+        assert_eq!(publication(Some(&ledger), owner, |_| None), Ok(()));
+    }
+
+    let second = ledger.prepare(request(owner, PHYS + 0x2000)).unwrap();
+    ledger
+        .complete(
+            second,
+            VA + 0x2000,
+            MmioRequestBacking::Assigned {
+                resource_id: other_resource,
+                mapping_id: 65,
+            },
+        )
+        .unwrap();
+    let (selected, _) = ledger.begin_unmap(owner, VA + 0x2000, LEN).unwrap();
+    assert_eq!(selected, second);
+    ledger.acknowledge_unmap(selected).unwrap();
+    assert_eq!(
+        ledger.phase(second),
+        Some(MmioRequestPhase::CompletedUse),
+        "a distinct assigned resource retains its own exact evidence"
+    );
+    assert_eq!(
+        ledger.phase(receipts[0]),
+        Some(MmioRequestPhase::CompletedUse)
+    );
+    ledger.retire_completed_pnp_owner(owner);
+    assert_eq!(ledger.phase(receipts[0]), None);
+    assert_eq!(ledger.phase(second), None);
 }
