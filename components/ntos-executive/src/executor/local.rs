@@ -61,6 +61,8 @@ pub(crate) struct ExecutorLocal {
     pub(crate) receive_trace: [ReceiveTraceFrame; RECEIVE_TRACE_DEPTH],
     /// Bounded NtUserRegisterHotKey diagnostics emitted by this executor.
     pub(crate) hotkey_registration_traces: AtomicU64,
+    /// Bounded fatal dialog text receipts from this executor's Win32k input capture.
+    pub(crate) fatal_dialog_text_receipts: AtomicU64,
     /// Index of the hosted process whose event this executor is serving. Client copy-in and
     /// copy-out resolve user addresses against this process. The service loop sets it, with
     /// [`Self::scratch_base`], at the top of each iteration. A redrive that completes another
@@ -100,6 +102,7 @@ impl ExecutorLocal {
             receive_depth: AtomicU64::new(0),
             receive_trace: [const { ReceiveTraceFrame::new() }; RECEIVE_TRACE_DEPTH],
             hotkey_registration_traces: AtomicU64::new(0),
+            fatal_dialog_text_receipts: AtomicU64::new(0),
             // Before the first event is admitted, boot work addresses the first hosted process.
             client_pi: AtomicU64::new(0),
             scratch_base: AtomicU64::new(crate::SMSS_SCRATCH_BASE),

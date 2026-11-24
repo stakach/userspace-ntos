@@ -11,8 +11,6 @@ use super::loop_receive::receive;
 use super::*;
 use crate::executor::local;
 
-static FATAL_DIALOG_TEXT_RECEIPTS: AtomicU64 = AtomicU64::new(0);
-
 /// Observe only a diagnostic string that the normal GDI text-extent route has already copied.
 /// This does not probe guest memory, change arguments, or influence the provider's return value.
 unsafe fn trace_fatal_dialog_text(
@@ -34,7 +32,11 @@ unsafe fn trace_fatal_dialog_text(
     let Some(process) = handler.capture_process_identity(pi) else {
         return;
     };
-    if FATAL_DIALOG_TEXT_RECEIPTS.fetch_add(1, Ordering::Relaxed) >= 4 {
+    if local()
+        .fatal_dialog_text_receipts
+        .fetch_add(1, Ordering::Relaxed)
+        >= 4
+    {
         return;
     }
     let (generation_kind, generation) = match process.generation {
