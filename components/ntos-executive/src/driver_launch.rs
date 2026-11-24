@@ -13155,6 +13155,22 @@ extern "win64" fn s_dma_map_transfer(
     length: *mut u32,
     write_to_device: u8,
 ) -> i64 {
+    // A failed pre-effect query may release its local claim. Once MAP_TRANSFER has been sent,
+    // only a definite conflict or an acknowledged publication can change that ownership.
+    struct PendingMapRecord {
+        record: u64,
+        effect_started: bool,
+    }
+    impl Drop for PendingMapRecord {
+        fn drop(&mut self) {
+            if !self.effect_started {
+                unsafe {
+                    let _allocation_guard = HostedDmaAllocationGuard::acquire();
+                    clear_dma_allocation_record(self.record);
+                }
+            }
+        }
+    }
     unsafe {
         let Some(metadata) = dma_adapter_metadata(adapter) else {
             trace_hosted_dma_sg(
@@ -13209,14 +13225,67 @@ extern "win64" fn s_dma_map_transfer(
             );
             return 0;
         };
-        let _allocation_guard = HostedDmaAllocationGuard::acquire();
-        let (_probe_label, probe_status, coherent_logical, coherent_reservation, _) = call_on5(
+        let record = {
+            let _allocation_guard = HostedDmaAllocationGuard::acquire();
+            let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
+            let count = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+            if count > capacity {
+                write_unaligned(length, 0);
+                return 0;
+            }
+            let mut index = 0;
+            while index < count {
+                let Some(existing) = dma_allocation_record(FSD_SHARED_VADDR, index) else {
+                    write_unaligned(length, 0);
+                    return 0;
+                };
+                if dma_record_load(existing, SH_DMA_ALLOC_RECORD_MAP_REGISTER) == map_register_base
+                    && dma_record_load(existing, SH_DMA_ALLOC_RECORD_LEN) == DMA_RECORD_RESERVED
+                {
+                    // A matching token remains owned even if its previous root reply was lost.
+                    // Root validates its physical identity and PDO generation on every effect.
+                    write_unaligned(length, 0);
+                    return 0;
+                }
+                index += 1;
+            }
+            if let Some(record) = first_free_dma_allocation_record(FSD_SHARED_VADDR) {
+                begin_dma_allocation_record(record);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_LOGICAL, 0);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, 0);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_SOURCE_VA, source_va);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, map_register_base);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID, metadata.adapter_id);
+                let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS)
+                    / SH_DMA_ALLOC_RECORD_SIZE).saturating_add(1);
+                if used > count {
+                    write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, used);
+                }
+                Some(record)
+            } else {
+                None
+            }
+        };
+        let Some(record) = record else {
+            write_unaligned(length, 0);
+            trace_hosted_dma_sg(
+                b"map", b"no-record", STATUS_INSUFFICIENT_RESOURCES,
+                adapter, mdl, current_va, requested as u32, 0, map_register_base, 0,
+            );
+            return 0;
+        };
+        let mut ownership = PendingMapRecord { record, effect_started: false };
+        let (probe_label, probe_status, coherent_logical, coherent_reservation, _) = call_on5(
             (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
             0,
             HOSTED_DMA_SERVICE_PROBE_SCSI_SOURCE << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
             source_va, mapped_len, 0,
         );
-        let coherent = if probe_status as u32 as i32 == STATUS_SUCCESS
+        let coherent = if probe_label >> 12 != 0 || probe_label & 0x7f != 4 {
+            write_unaligned(length, 0);
+            return 0;
+        } else if probe_status as u32 as i32 == STATUS_SUCCESS
             && coherent_logical != 0 && coherent_reservation != 0 {
             Some(coherent_logical)
         } else if probe_status as u32 as i32 == STATUS_INVALID_DEVICE_REQUEST {
@@ -13229,23 +13298,6 @@ extern "win64" fn s_dma_map_transfer(
             );
             return 0;
         };
-        let Some(record) = first_free_dma_allocation_record(FSD_SHARED_VADDR) else {
-            write_unaligned(length, 0);
-            trace_hosted_dma_sg(
-                b"map",
-                b"no-record",
-                STATUS_INSUFFICIENT_RESOURCES,
-                adapter,
-                mdl,
-                current_va,
-                requested as u32,
-                0,
-                map_register_base,
-                0,
-            );
-            return 0;
-        };
-
         if let Some(logical) = coherent {
             match logical.checked_sub(metadata.grant_logical) {
                 Some(offset) if offset < metadata.grant_len
@@ -13253,18 +13305,40 @@ extern "win64" fn s_dma_map_transfer(
                     && metadata.grant_va.checked_add(offset) == Some(source_va) => {}
                 _ => { write_unaligned(length, 0); return 0; }
             }
-            let (_label, status, alias_id, _, _) = call_on5(
+            {
+                let _allocation_guard = HostedDmaAllocationGuard::acquire();
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_LOGICAL, logical);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, source_va);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_COHERENT_MAP);
+            }
+            ownership.effect_started = true;
+            let (reply, status, alias_id, detail0, detail1) = call_on5(
                 (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
                 adapter,
                 (HOSTED_DMA_SERVICE_MAP_TRANSFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
                     | map_register_base,
                 logical, source_va, mapped_len,
             );
-            if status as u32 as i32 != STATUS_SUCCESS || alias_id == 0 {
+            if reply >> 12 == 0 && reply & 0x7f == 4
+                && status as u32 as i32 == nt_status::NtStatus::INVALID_HANDLE.raw()
+                && alias_id == 0 && detail0 == 0 && detail1 == 0
+            {
+                // The exact root graph rejected this stale token before any mapping effect.
+                ownership.effect_started = false;
+            }
+            if reply >> 12 != 0 || reply & 0x7f != 4
+                || status as u32 as i32 != STATUS_SUCCESS
+                || alias_id == 0
+                || alias_id >= (1u64 << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
+            {
                 write_unaligned(length, 0);
                 trace_hosted_dma_sg(
                     b"map", b"coherent-map-failed",
-                    if alias_id == 0 && status as u32 as i32 == STATUS_SUCCESS {
+                    if reply >> 12 != 0 || reply & 0x7f != 4 {
+                        STATUS_INVALID_DEVICE_REQUEST
+                    } else if (alias_id == 0
+                        || alias_id >= (1u64 << HOSTED_DMA_SERVICE_OPERATION_SHIFT))
+                        && status as u32 as i32 == STATUS_SUCCESS {
                         STATUS_INSUFFICIENT_RESOURCES
                     } else {
                         status as u32 as i32
@@ -13275,20 +13349,10 @@ extern "win64" fn s_dma_map_transfer(
             }
             // Software miniports and hardware DMA see the same grant bytes. PutSG must not
             // flush a separate bounce buffer over the software completion.
-            begin_dma_allocation_record(record);
-            dma_record_store(record, SH_DMA_ALLOC_RECORD_LOGICAL, logical);
-            dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, source_va);
-            dma_record_store(record, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_COHERENT_MAP);
-            dma_record_store(record, SH_DMA_ALLOC_RECORD_SOURCE_VA, source_va);
-            dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, map_register_base);
-            dma_record_store(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID, metadata.adapter_id);
-            publish_dma_allocation_record(record, mapped_len,
-                if write_to_device != 0 { HOSTED_DMA_RECORD_FLAG_WRITE_TO_DEVICE } else { 0 });
-            let count = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
-            let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS)
-                / SH_DMA_ALLOC_RECORD_SIZE).saturating_add(1);
-            if used > count {
-                write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, used);
+            {
+                let _allocation_guard = HostedDmaAllocationGuard::acquire();
+                publish_dma_allocation_record(record, mapped_len,
+                    if write_to_device != 0 { HOSTED_DMA_RECORD_FLAG_WRITE_TO_DEVICE } else { 0 });
             }
             write_unaligned(length, mapped_len as u32);
             return logical as i64;
@@ -13296,7 +13360,7 @@ extern "win64" fn s_dma_map_transfer(
 
         let mut offset = 0u64;
         let mut conflict_retries = 0u32;
-        let (offset, mapping_id) = loop {
+        let offset = loop {
             let Some(aligned) = align_up(offset, HOSTED_DMA_COMMON_ALIGNMENT) else {
                 write_unaligned(length, 0);
                 trace_hosted_dma_sg(
@@ -13387,16 +13451,42 @@ extern "win64" fn s_dma_map_transfer(
                 write_unaligned(length, 0);
                 return 0;
             }
-            let (_label, mapped_status, mapping_id, _, _) = call_on5(
+            {
+                let _allocation_guard = HostedDmaAllocationGuard::acquire();
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_LOGICAL, candidate_logical);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, bounce_va);
+            }
+            ownership.effect_started = true;
+            let (reply, mapped_status, mapping_id, detail0, detail1) = call_on5(
                 (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
                 adapter,
                 (HOSTED_DMA_SERVICE_MAP_TRANSFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
                     | map_register_base,
                 candidate_logical, bounce_va, mapped_len,
             );
-            if mapped_status as u32 as i32 == nt_status::NtStatus::CONFLICTING_ADDRESSES.raw()
+            if reply >> 12 != 0 || reply & 0x7f != 4 {
+                write_unaligned(length, 0);
+                return 0;
+            }
+            if mapped_status as u32 as i32 == nt_status::NtStatus::INVALID_HANDLE.raw()
+                && mapping_id == 0 && detail0 == 0 && detail1 == 0
+            {
+                // Root's exact token lookup rejected this call before registering a mapping.
+                ownership.effect_started = false;
+            }
+            let definite_conflict = mapped_status as u32 as i32
+                == nt_status::NtStatus::CONFLICTING_ADDRESSES.raw()
                 && mapping_id > candidate_logical
-                && conflict_retries < HOSTED_DMA_CONFLICT_RETRY_LIMIT {
+                && detail0 == 0 && detail1 == 0;
+            if definite_conflict {
+                // Root rejected this exact candidate before making a mapping. Keep the
+                // token reserved while retrying, but remove this candidate from local overlap.
+                ownership.effect_started = false;
+                let _allocation_guard = HostedDmaAllocationGuard::acquire();
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_LOGICAL, 0);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, 0);
+            }
+            if definite_conflict && conflict_retries < HOSTED_DMA_CONFLICT_RETRY_LIMIT {
                 let Some(next_offset) = mapping_id.checked_sub(metadata.grant_logical) else {
                     write_unaligned(length, 0);
                     return 0;
@@ -13405,11 +13495,16 @@ extern "win64" fn s_dma_map_transfer(
                 conflict_retries += 1;
                 continue;
             }
-            if mapped_status as u32 as i32 != STATUS_SUCCESS || mapping_id == 0 {
+            if mapped_status as u32 as i32 != STATUS_SUCCESS
+                || mapping_id == 0
+                || mapping_id >= (1u64 << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
+            {
                 write_unaligned(length, 0);
                 trace_hosted_dma_sg(
                     b"map", b"root-map-failed",
-                    if mapping_id == 0 && mapped_status as u32 as i32 == STATUS_SUCCESS {
+                    if (mapping_id == 0
+                        || mapping_id >= (1u64 << HOSTED_DMA_SERVICE_OPERATION_SHIFT))
+                        && mapped_status as u32 as i32 == STATUS_SUCCESS {
                         STATUS_INSUFFICIENT_RESOURCES
                     } else {
                         mapped_status as u32 as i32
@@ -13419,7 +13514,7 @@ extern "win64" fn s_dma_map_transfer(
                 );
                 return 0;
             }
-            break (aligned, mapping_id);
+            break aligned;
         };
 
         let bounce_va = metadata.grant_va + offset;
@@ -13431,28 +13526,15 @@ extern "win64" fn s_dma_map_transfer(
         } else {
             core::ptr::write_bytes(bounce_va as *mut u8, 0, mapped_len as usize);
         }
-        begin_dma_allocation_record(record);
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_LOGICAL, logical);
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, bounce_va);
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER);
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_SOURCE_VA, source_va);
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, map_register_base);
-        dma_record_store(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID, metadata.adapter_id);
-        publish_dma_allocation_record(record, mapped_len,
-            if write_to_device != 0 { HOSTED_DMA_RECORD_FLAG_WRITE_TO_DEVICE } else { 0 });
-        let count = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
-        let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS) / SH_DMA_ALLOC_RECORD_SIZE)
-            .saturating_add(1);
-        if used > count {
-            write_volatile(
-                (FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64,
-                used,
-            );
-        }
-        let cursor = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *const u64);
-        let end = offset + mapped_len;
-        if end > cursor {
-            write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *mut u64, end);
+        {
+            let _allocation_guard = HostedDmaAllocationGuard::acquire();
+            publish_dma_allocation_record(record, mapped_len,
+                if write_to_device != 0 { HOSTED_DMA_RECORD_FLAG_WRITE_TO_DEVICE } else { 0 });
+            let cursor = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *const u64);
+            let end = offset + mapped_len;
+            if end > cursor {
+                write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *mut u64, end);
+            }
         }
         write_unaligned(length, mapped_len as u32);
         trace_hosted_dma_sg(
