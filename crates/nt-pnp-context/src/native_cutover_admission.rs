@@ -108,8 +108,10 @@ mod tests {
             CutoverPhase::Unavailable,
         ] {
             assert!(!phase.admit_video_route_progress(false));
-            assert!(phase.admit_video_route_progress(true),
-                "the retained CREATE must be observed without issuing another CREATE");
+            assert!(
+                phase.admit_video_route_progress(true),
+                "the retained CREATE must be observed without issuing another CREATE"
+            );
         }
         assert!(CutoverPhase::Boot.admit_video_route_progress(false));
         assert!(CutoverPhase::NativePublished.admit_video_route_progress(false));
