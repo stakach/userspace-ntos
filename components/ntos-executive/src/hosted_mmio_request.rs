@@ -67,7 +67,7 @@ pub(super) fn map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
             // The same authenticated root request path checks its publication and records an
             // independent receipt even when the generation's VA projection already exists.
             if let Some(projected) = submit_mmio_map_request(phys, length, cache) {
-                trace_hosted_mm_map_io_space(phys, length, cache, projected, b"gop-bar");
+                trace_hosted_mm_map_io_space(phys, length, cache, projected, b"root-request");
                 return projected;
             }
             trace_hosted_mm_map_io_space(phys, length, cache, 0, b"not-assigned");

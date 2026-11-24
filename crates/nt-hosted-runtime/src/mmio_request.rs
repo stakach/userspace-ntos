@@ -33,6 +33,101 @@ pub enum MmioRequestAuthority {
         instance: usize,
         child: u64,
     },
+    PoolOwned {
+        instance: usize,
+        pool_cap_base: u64,
+        allocation_base: u64,
+        allocation_generation: u64,
+        allocation_capacity: u64,
+    },
+}
+
+/// Root-captured, generation-bearing source of an already mapped WB pool allocation.
+/// `cap_physical` must query the executive's frame cap, never a component-written table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PoolOwnedRamSource {
+    pub instance: usize,
+    pub domain_id: u64,
+    pub domain_cookie: u64,
+    pub pool_va_base: u64,
+    pub pool_cap_base: u64,
+    pub pool_frames: u64,
+    pub allocation_base: u64,
+    pub allocation_capacity: u64,
+    pub allocation_generation: u64,
+}
+
+impl PoolOwnedRamSource {
+    pub const fn owner(self) -> MmioRequestOwner {
+        MmioRequestOwner {
+            domain_id: self.domain_id,
+            domain_cookie: self.domain_cookie,
+            authority: MmioRequestAuthority::PoolOwned {
+                instance: self.instance,
+                pool_cap_base: self.pool_cap_base,
+                allocation_base: self.allocation_base,
+                allocation_generation: self.allocation_generation,
+                allocation_capacity: self.allocation_capacity,
+            },
+        }
+    }
+
+    pub fn project(
+        self,
+        physical_start: u64,
+        length: u64,
+        mut cap_physical: impl FnMut(u64) -> Option<u64>,
+    ) -> Option<u64> {
+        if self.domain_id == 0 || self.domain_cookie == 0 || self.pool_cap_base == 0
+            || self.pool_frames == 0 || self.allocation_generation == 0
+            || self.allocation_capacity == 0 || length == 0
+        {
+            return None;
+        }
+        let physical_end = physical_start.checked_add(length)?;
+        let pool_end = self.pool_va_base.checked_add(self.pool_frames.checked_mul(0x1000)?)?;
+        let allocation_end = self.allocation_base.checked_add(self.allocation_capacity)?;
+        if self.allocation_base < self.pool_va_base || allocation_end > pool_end {
+            return None;
+        }
+        let first_index = (self.allocation_base - self.pool_va_base) / 0x1000;
+        let last_index = (allocation_end - 1 - self.pool_va_base) / 0x1000;
+        let first_page = physical_start & !0xfff;
+        let offset = physical_start & 0xfff;
+        let mut found = None;
+        for index in first_index..=last_index {
+            let cap = self.pool_cap_base.checked_add(index)?;
+            if cap_physical(cap)? != first_page {
+                continue;
+            }
+            let va = self.pool_va_base.checked_add(index.checked_mul(0x1000)?)?
+                .checked_add(offset)?;
+            let va_end = va.checked_add(length)?;
+            if va < self.allocation_base || va_end > allocation_end {
+                continue;
+            }
+            let last_page = (physical_end - 1) & !0xfff;
+            let spanned_pages = (last_page - first_page) / 0x1000;
+            let mut matches = true;
+            for page in 1..=spanned_pages {
+                let next_index = index.checked_add(page)?;
+                if next_index >= self.pool_frames
+                    || cap_physical(self.pool_cap_base.checked_add(next_index)?)?
+                        != first_page.checked_add(page.checked_mul(0x1000)?)?
+                {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(va);
+            }
+        }
+        found
+    }
 }
 
 impl MmioRequestOwner {
@@ -48,6 +143,10 @@ impl MmioRequestOwner {
                 ..
             } => publication != 0 && inventory_generation != 0,
             MmioRequestAuthority::ContiguousOwned { child, .. } => child != 0,
+            MmioRequestAuthority::PoolOwned {
+                pool_cap_base, allocation_base, allocation_generation, allocation_capacity, ..
+            } => pool_cap_base != 0 && allocation_base != 0
+                && allocation_generation != 0 && allocation_capacity != 0,
         }
     }
 
@@ -72,6 +171,26 @@ pub struct MmioRequest {
 }
 
 impl MmioRequest {
+    pub fn from_pool_owned(
+        source: PoolOwnedRamSource,
+        owner: MmioRequestOwner,
+        physical_start: u64,
+        length: u64,
+        requested_cache: u32,
+        effective_cache: u32,
+        cap_physical: impl FnMut(u64) -> Option<u64>,
+    ) -> Option<(Self, u64)> {
+        if owner != source.owner()
+            || effective_cache != nt_hal_abi::MM_CACHED
+            || !matches!(requested_cache,
+                nt_hal_abi::MM_NON_CACHED | nt_hal_abi::MM_CACHED)
+        {
+            return None;
+        }
+        let va = source.project(physical_start, length, cap_physical)?;
+        Some((Self { owner, physical_start, length, cache: requested_cache }, va))
+    }
+
     /// The published source mapping proves both the returned VA and requested cache before any
     /// per-call receipt is prepared. The child comes from the selected live allocation row.
     pub fn from_contiguous_published(
@@ -111,6 +230,11 @@ pub enum MmioRequestBacking {
     ContiguousOwned {
         child: u64,
     },
+    PoolOwned {
+        allocation_base: u64,
+        allocation_generation: u64,
+        effective_cache: u32,
+    },
 }
 
 impl MmioRequestBacking {
@@ -125,6 +249,9 @@ impl MmioRequestBacking {
                 inventory_generation,
             } => publication != 0 && inventory_generation != 0,
             Self::ContiguousOwned { child } => child != 0,
+            Self::PoolOwned { allocation_base, allocation_generation, effective_cache } =>
+                allocation_base != 0 && allocation_generation != 0
+                    && effective_cache == nt_hal_abi::MM_CACHED,
         }
     }
 }
@@ -249,6 +376,39 @@ impl MmioRequestLedger {
             .any(|row| row.request.owner == MmioRequestOwner::contiguous_owned(owner, child))
     }
 
+    pub fn has_pool_source_rows(
+        &self,
+        pool_cap_base: u64,
+        allocation_base: u64,
+        allocation_capacity: u64,
+    ) -> bool {
+        let Some(end) = allocation_base.checked_add(allocation_capacity) else {
+            return true;
+        };
+        self.rows.iter().any(|row| {
+            let MmioRequestAuthority::PoolOwned {
+                pool_cap_base: row_pool_cap_base,
+                allocation_base: row_allocation_base,
+                allocation_capacity: row_allocation_capacity,
+                ..
+            } = row.request.owner.authority else { return false };
+            // A stale or uncertain generation still fences reuse of overlapping storage.
+            let row_end = row_allocation_base.saturating_add(row_allocation_capacity);
+            pool_cap_base == row_pool_cap_base
+                && allocation_base < row_end && row_allocation_base < end
+        })
+    }
+
+    /// A driver VSpace and its frame caps remain owned while any logical pool map can still
+    /// name them, including a map or unmap whose outcome is uncertain.
+    pub fn has_pool_cap_rows(&self, pool_cap_base: u64) -> bool {
+        pool_cap_base != 0 && self.rows.iter().any(|row| matches!(
+            row.request.owner.authority,
+            MmioRequestAuthority::PoolOwned { pool_cap_base: owned, .. }
+                if owned == pool_cap_base
+        ))
+    }
+
     pub fn phase(&self, receipt: MmioRequestReceipt) -> Option<MmioRequestPhase> {
         self.rows
             .iter()
@@ -351,6 +511,13 @@ impl MmioRequestLedger {
                 (MmioRequestAuthority::ContiguousOwned { child: owner_child, .. },
                  MmioRequestBacking::ContiguousOwned { child }) if owner_child == child
             );
+        let same_authority = same_authority || matches!(
+            (row.request.owner.authority, backing),
+            (MmioRequestAuthority::PoolOwned { allocation_base: owner_base,
+                allocation_generation: owner_generation, .. },
+             MmioRequestBacking::PoolOwned { allocation_base, allocation_generation, .. })
+                if owner_base == allocation_base && owner_generation == allocation_generation
+        );
         if virtual_start == 0
             || virtual_start.checked_add(row.request.length).is_none()
             || !backing.valid()

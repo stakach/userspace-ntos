@@ -4695,6 +4695,9 @@ unsafe fn hosted_pool_alloc_locked(pool_view_base: u64, size: u64) -> Option<u64
 }
 
 unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, p: u64) -> bool {
+    if hosted_mmio_broker::hosted_pool_owned_mmio::has_source_rows(inst, p) {
+        return false;
+    }
     let Some(position) = hosted_pool_free_list_position(inst.exec_pool_va, p) else {
         if FSD_POOL_INVALID_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
             print_str(b"[fsd-pool-invalid] executive free pointer=");
@@ -66782,6 +66785,11 @@ pub(crate) struct HostedVideoRouteInfo {
 }
 
 fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
+    if instance(i).is_some_and(|inst| unsafe {
+        hosted_mmio_broker::hosted_pool_owned_mmio::blocks_instance_retirement(inst)
+    }) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if unsafe { instance(i).is_some_and(|inst| hosted_driver_pci_route_query::blocks_instance_retirement(inst))
         || hosted_driver_process_notify::blocks_instance_retirement(i)
         || hosted_driver_dynamic_type::blocks_instance_retirement(i) } {

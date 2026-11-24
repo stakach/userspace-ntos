@@ -7,6 +7,9 @@ use super::*;
 
 #[path = "hosted_mmio_publication_policy.rs"]
 mod hosted_mmio_publication_policy;
+#[path = "hosted_pool_owned_mmio.rs"]
+pub(super) mod hosted_pool_owned_mmio;
+use hosted_pool_owned_mmio::{map_owned_pool, unmap_owned_pool};
 
 static mut REQUESTS: Option<nt_hosted_runtime::MmioRequestLedger> = None;
 
@@ -178,11 +181,14 @@ pub(crate) fn service_hosted_driver_mmio_request(
     cache: u64,
 ) -> (i32, u64) {
     let refused = (nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw(), 0);
-    let Some((instance_index, _)) = instance_for_pump_channel(channel, active_reply_cap) else {
+    let Some((instance_index, inst)) = instance_for_pump_channel(channel, active_reply_cap) else {
         return refused;
     };
     if hosted_driver_pump_caller_tcb(channel, active_reply_cap, caller_badge).is_none() {
         return refused;
+    }
+    if length == 0 || address.checked_add(length).is_none() {
+        return (nt_status::NtStatus::INVALID_PARAMETER.raw(), 0);
     }
     if let Ok(binding) = current_hosted_device_dispatch_binding_for_projection(
         instance_index, channel.shared_va,
@@ -199,6 +205,23 @@ pub(crate) fn service_hosted_driver_mmio_request(
         {
             return unsafe { request_for_binding(binding, operation, address, length, cache) };
         }
+    }
+    // A driver may pass MmGetPhysicalAddress of its own live NonPagedPool allocation, even
+    // while a PnP FDO binding is active. Borrow its existing WB VA with a separate receipt.
+    match operation {
+        1 if cache <= u32::MAX as u64 =>
+            match unsafe { map_owned_pool(instance_index, inst, address, length, cache as u32) } {
+                Ok(Some(va)) => return (nt_status::NtStatus::SUCCESS.raw(), va),
+                Ok(None) => {},
+                Err(status) => return (status.raw(), 0),
+            },
+        2 if cache == 0 =>
+            match unsafe { unmap_owned_pool(instance_index, inst, address, length) } {
+                Ok(true) => return (nt_status::NtStatus::SUCCESS.raw(), 0),
+                Ok(false) => {},
+                Err(status) => return (status.raw(), 0),
+            },
+        _ => {},
     }
     // A registered GOP provider may have no PnP FDO. Its publication and PCI inventory are
     // checked inside the projection service, then each successful call enters this ledger.
