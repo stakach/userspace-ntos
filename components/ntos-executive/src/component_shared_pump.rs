@@ -938,12 +938,23 @@ unsafe fn parked_dispatch_wait_yield(
 }
 
 /// One live shared receive on this executor's stack (see `ExecutorLocal::receive_depth`).
-struct PumpReceiveScope;
+struct PumpReceiveScope {
+    trace_index: Option<usize>,
+}
 
 impl PumpReceiveScope {
-    fn enter() -> Self {
-        crate::executor::local().receive_depth.fetch_add(1, Ordering::AcqRel);
-        Self
+    fn enter(ch: &PumpChannel, route: PeerRoute) -> Self {
+        let local = crate::executor::local();
+        let depth = local.receive_depth.fetch_add(1, Ordering::AcqRel);
+        let trace_index = usize::try_from(depth).ok()
+            .filter(|index| *index < crate::executor::RECEIVE_TRACE_DEPTH);
+        if let Some(index) = trace_index {
+            let frame = &local.receive_trace[index];
+            frame.tcb.store(ch.tcb, Ordering::Relaxed);
+            frame.reply.store(ch.reply_cap, Ordering::Relaxed);
+            frame.route.store(route.badge(), Ordering::Release);
+        }
+        Self { trace_index }
     }
 
     /// Called from inside a receive: another pump's receive encloses it.
@@ -954,7 +965,11 @@ impl PumpReceiveScope {
 
 impl Drop for PumpReceiveScope {
     fn drop(&mut self) {
-        crate::executor::local().receive_depth.fetch_sub(1, Ordering::AcqRel);
+        let local = crate::executor::local();
+        if let Some(index) = self.trace_index {
+            local.receive_trace[index].route.store(0, Ordering::Release);
+        }
+        local.receive_depth.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -977,6 +992,20 @@ unsafe fn trace_enclosed_dispatch_wait(
         crate::print_u64(value);
     }
     crate::print_str(b"\n");
+    let local = crate::executor::local();
+    let depth = local.receive_depth.load(Ordering::Acquire);
+    for (index, frame) in local.receive_trace.iter().enumerate().take(depth as usize) {
+        let frame_route = frame.route.load(Ordering::Acquire);
+        if frame_route == 0 { continue; }
+        let tcb = frame.tcb.load(Ordering::Relaxed);
+        let reply = frame.reply.load(Ordering::Relaxed);
+        if frame.route.load(Ordering::Acquire) != frame_route { continue; }
+        crate::print_str(b"[parked-dispatch-stack] sample/depth/route/tcb/reply=");
+        for value in [n, index as u64 + 1, frame_route, tcb, reply] {
+            crate::print_str(b"/"); crate::print_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
     let running = runtime::hold_snapshot().running;
     crate::print_str(b"[parked-dispatch-owner] sample/running-route/lane/lane-gen/epoch/reply/tcb=");
     for value in [n,
@@ -1044,7 +1073,7 @@ pub(super) unsafe fn receive(
     ch: &PumpChannel, route: PeerRoute, retained_seh: bool, serviced_scheduler_yield: bool,
 ) -> PumpMessage {
     let census_scope = ReceiveCensusScope::enter(ch, route, retained_seh);
-    let _receive_scope = PumpReceiveScope::enter();
+    let _receive_scope = PumpReceiveScope::enter(ch, route);
     // A retained exception walk and an ordinary syscall channel without kernel IRQ yield cannot
     // return a scheduler continuation. Give already-latched work one isolated pass here instead.
     let inline_irq_checkpoint =

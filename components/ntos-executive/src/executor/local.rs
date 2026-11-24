@@ -16,6 +16,26 @@
 use core::ops::Deref;
 use core::sync::atomic::{AtomicU64, AtomicUsize};
 
+pub(crate) const RECEIVE_TRACE_DEPTH: usize = 8;
+
+/// Diagnostic-only stack of entered shared receives. The route is published last and cleared
+/// first, so a sampled frame never claims authority over a Reply or provider continuation.
+pub(crate) struct ReceiveTraceFrame {
+    pub(crate) route: AtomicU64,
+    pub(crate) tcb: AtomicU64,
+    pub(crate) reply: AtomicU64,
+}
+
+impl ReceiveTraceFrame {
+    const fn new() -> Self {
+        Self {
+            route: AtomicU64::new(0),
+            tcb: AtomicU64::new(0),
+            reply: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Fields are atomics so the block is `Sync` without `unsafe`. Exactly one executor runs at a
 /// time, and each call site keeps the ordering it used before the state moved here.
 pub(crate) struct ExecutorLocal {
@@ -37,6 +57,8 @@ pub(crate) struct ExecutorLocal {
     /// Live shared pump receives on this executor's stack. Above one, the innermost receive
     /// was entered inside another pump's receive, which keeps the root off its own boundary.
     pub(crate) receive_depth: AtomicU64,
+    /// Read-only evidence of the actual LIFO receive chain, bounded independently of depth.
+    pub(crate) receive_trace: [ReceiveTraceFrame; RECEIVE_TRACE_DEPTH],
     /// Bounded NtUserRegisterHotKey diagnostics emitted by this executor.
     pub(crate) hotkey_registration_traces: AtomicU64,
     /// Index of the hosted process whose event this executor is serving. Client copy-in and
@@ -76,6 +98,7 @@ impl ExecutorLocal {
             reply_main_slot: AtomicU64::new(0),
             scheduler_depth: AtomicU64::new(0),
             receive_depth: AtomicU64::new(0),
+            receive_trace: [const { ReceiveTraceFrame::new() }; RECEIVE_TRACE_DEPTH],
             hotkey_registration_traces: AtomicU64::new(0),
             // Before the first event is admitted, boot work addresses the first hosted process.
             client_pi: AtomicU64::new(0),
