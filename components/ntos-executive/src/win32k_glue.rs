@@ -2795,10 +2795,7 @@ unsafe fn trace_nested_callback_frontier(
     phase: &[u8], dispatch_id: u64, ssn: u64, client: Win32kClientContext,
     completed: bool, callback_wait: bool, provider_wait: bool, lpc_wait: bool,
 ) {
-    if USER_CALLBACK_NESTED_FRONTIER_TRACES.try_update(
-        Ordering::Relaxed, Ordering::Relaxed,
-        |count| (count < 4096).then_some(count + 1),
-    ).is_err() {
+    if !bounded_trace_sample(&USER_CALLBACK_NESTED_FRONTIER_TRACES, 128) {
         return;
     }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
