@@ -3197,6 +3197,7 @@ unsafe fn start_filtered_devnode(
                     device_id,
                     &grant.raw_resource_list,
                     &grant.translated_resource_list,
+                    grant.bus_owned_root_proof,
                 ),
                 Err(status) => {
                     trace_canonical_start_failure(b"assignment", device_id, status);
@@ -3210,7 +3211,7 @@ unsafe fn start_filtered_devnode(
         }
         Ok(None) => {
             match driver_launch::commit_hosted_device_resource_assignment(device_id, &[], &[]) {
-                Ok(()) => canonical_start_status(device_id, &[], &[]),
+                Ok(()) => canonical_start_status(device_id, &[], &[], None),
                 Err(status) => {
                     trace_canonical_start_failure(b"empty-assignment", device_id, status);
                     CanonicalStartDisposition::Terminal {
@@ -3301,11 +3302,13 @@ unsafe fn canonical_start_status(
     device_id: u64,
     raw_resource_list: &[u8],
     translated_resource_list: &[u8],
+    bus_owned_root_proof: Option<driver_launch::HostedBusOwnedRootPublicationProof>,
 ) -> CanonicalStartDisposition {
     match driver_launch::start_hosted_device_canonical(
         device_id,
         raw_resource_list,
         translated_resource_list,
+        bus_owned_root_proof,
     ) {
         Ok(driver_launch::HostedPnpStartOutcome::Started { receipt }) => {
             CanonicalStartDisposition::Terminal {

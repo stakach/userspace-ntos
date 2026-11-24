@@ -6,6 +6,8 @@ const START: &str = include_str!("../../../components/ntos-executive/src/hosted_
 const MAIN: &str = include_str!("../../../components/ntos-executive/src/main.rs");
 const PNP: &str = include_str!("../../nt-pnp-manager/src/lib.rs");
 const BUS: &str = include_str!("../../nt-pnp-manager/src/bus_properties.rs");
+const LAUNCH: &str = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+const ADMISSION: &str = include_str!("../../../components/ntos-executive/src/hosted_pnp_start.rs");
 
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -90,4 +92,30 @@ fn bus_number_only_publication_needs_typed_started_proof_before_lease_bound_maps
     assert!(proof.contains("decode_single_bus_number_resource"));
     assert!(proof.contains("PropertyBlobState::KnownNone"));
     assert!(proof.contains("PropertyBlobState::Present"));
+}
+
+#[test]
+fn bus_owned_root_proof_survives_grant_start_and_publication_without_enabling_maps() {
+    let grant = between(MAIN, "struct HostedDevnodeGrant {", "fn hosted_pci_grant_error(");
+    assert!(grant.contains("bus_owned_root_proof"));
+    let bus_root = between(
+        MAIN,
+        "PreparedHostedResourcePlan::BusOwnedRoot { resources } => {",
+        "PreparedHostedResourcePlan::Pci {",
+    );
+    assert!(bus_root.contains("resources.publication_proof()"));
+    let proof = between(LAUNCH, "impl HostedBusOwnedRootResources {", "/// Adopt a bus-number-bearing PDO's complete");
+    assert!(proof.contains("child: self.child"));
+    assert!(proof.contains("provider: self.provider"));
+    let start = between(ADMISSION, "let start_status = match grant_prepared_hosted_devnode_resources(", "unsafe fn canonical_start_status(");
+    assert!(start.contains("grant.bus_owned_root_proof"));
+    let transaction = between(LAUNCH, "struct HostedPnpTransaction {", "enum HostedFilterRequirementsDisposition");
+    assert!(transaction.contains("bus_owned_root_proof"));
+    let publication = between(LAUNCH, "unsafe fn finish_hosted_start_publication(", "unsafe fn finish_hosted_stop_publication(");
+    assert!(publication.contains("transaction.bus_owned_root_proof"));
+    assert!(publication.contains("hosted_mmio_broker::validate_publication"));
+    let no_lease = between(MMIO, "if state.address_resource_count == 0 && state.pnp_context_lease.is_none() {", "let (owner, state) = pnp_owner(binding)");
+    assert!(no_lease.contains("devnode_has_started_bus_owned_root_assignment"));
+    assert!(no_lease.contains("has_retained_pnp_device_rows(binding)"));
+    assert!(MMIO.contains("pub(super) unsafe fn map_assigned"));
 }

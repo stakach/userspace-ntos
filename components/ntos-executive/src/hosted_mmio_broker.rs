@@ -262,6 +262,7 @@ pub(crate) fn service_hosted_driver_mmio_request(
 /// StartDevice reads only the exact binding's receipts, never the driver's mutable last-map bank.
 pub(super) unsafe fn validate_publication(
     binding: HostedDeviceBinding,
+    bus_owned_root_proof: Option<driver_launch::HostedBusOwnedRootPublicationProof>,
 ) -> Result<(), nt_status::NtStatus> {
     let state = retained_pnp_state(binding).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     if state.address_resource_count == 0 && state.pnp_context_lease.is_none() {
@@ -270,7 +271,10 @@ pub(super) unsafe fn validate_publication(
             .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
         if pnp.fdo(identity.devnode_id()) != Some(binding.device_id)
             || !(pnp.devnode_has_started_empty_assignment(identity)
-                || pnp.devnode_has_started_bus_number_assignment(identity))
+                || pnp.devnode_has_started_bus_number_assignment(identity)
+                || (bus_owned_root_proof.is_some_and(|proof| {
+                    driver_launch::bus_owned_root_publication_proof_is_current(binding, proof)
+                }) && pnp.devnode_has_started_bus_owned_root_assignment(identity)))
         {
             return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
         }

@@ -30,7 +30,7 @@ fn failed_start_settles_before_success_only_resource_publication() {
         .expect("failed StartDevice must let the retained terminal receipt progress")
         + failed_exit;
     let first_success_gate = publication
-        .find("hosted_mmio_broker::validate_publication(binding)?")
+        .find("hosted_mmio_broker::validate_publication(binding, bus_owned_root_proof)?")
         .expect("successful StartDevice still validates exact MMIO use");
     assert!(status < failed_exit && return_ok < first_success_gate);
     for gate in [

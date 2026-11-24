@@ -150,7 +150,7 @@ fn delayed_start_does_not_reread_a_mutable_resource_snapshot() {
         .split_once("\nunsafe fn ")
         .expect("next native function")
         .0;
-    assert!(body.contains("hosted_mmio_broker::validate_publication(binding)?"));
+    assert!(body.contains("hosted_mmio_broker::validate_publication(binding, bus_owned_root_proof)?"));
     assert!(!body.contains("SH_ACTIVE_DEVICE_OBJECT"));
     assert!(!body.contains("record_hosted_mmio_usage("));
     assert!(

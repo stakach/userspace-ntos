@@ -13652,6 +13652,7 @@ enum HostedDevnodeGrantKind {
 
 struct HostedDevnodeGrant {
     kind: HostedDevnodeGrantKind,
+    bus_owned_root_proof: Option<driver_launch::HostedBusOwnedRootPublicationProof>,
     raw_resource_list: alloc::vec::Vec<u8>,
     translated_resource_list: alloc::vec::Vec<u8>,
     mmio_phys: u64,
@@ -14053,6 +14054,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
             dev: grant.device.dev,
             func: grant.device.func,
         },
+        bus_owned_root_proof: None,
         raw_resource_list: grant.raw_resource_list,
         translated_resource_list: grant.translated_resource_list,
         mmio_phys: memory.map(|memory| memory.start).unwrap_or(0),
@@ -14220,6 +14222,7 @@ unsafe fn grant_hosted_platform_devnode_resources(
     )?;
     Ok(Some(HostedDevnodeGrant {
         kind: HostedDevnodeGrantKind::RootBus,
+        bus_owned_root_proof: None,
         raw_resource_list: grant.raw_resource_list,
         translated_resource_list: grant.translated_resource_list,
         mmio_phys: translated_memory
@@ -14330,6 +14333,7 @@ unsafe fn grant_hosted_acpi_child_devnode_resources(
     }
     Ok(Some(HostedDevnodeGrant {
         kind: HostedDevnodeGrantKind::AcpiChild,
+        bus_owned_root_proof: None,
         raw_resource_list: resources.raw_resources,
         translated_resource_list: translated,
         mmio_phys: 0,
@@ -14353,6 +14357,7 @@ unsafe fn grant_hosted_devnode_resources(
             }
             Ok(Some(HostedDevnodeGrant {
                 kind: HostedDevnodeGrantKind::RootBus,
+                bus_owned_root_proof: None,
                 raw_resource_list: resources.raw_resources,
                 translated_resource_list: resources.translated_resources,
                 mmio_phys: 0,
@@ -14373,6 +14378,7 @@ unsafe fn grant_hosted_devnode_resources(
             }
             Ok(Some(HostedDevnodeGrant {
                 kind: HostedDevnodeGrantKind::RootBus,
+                bus_owned_root_proof: Some(resources.publication_proof()),
                 raw_resource_list: resources.snapshot.raw_resources,
                 translated_resource_list: resources.translated_resources,
                 mmio_phys: 0,

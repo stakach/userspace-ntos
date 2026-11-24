@@ -29,7 +29,7 @@ fn empty_assignment_reaches_successful_start_publication_without_a_context_lease
         "unsafe fn finish_hosted_start_publication(",
         "unsafe fn finish_hosted_stop_publication(",
     );
-    assert!(start.contains("hosted_mmio_broker::validate_publication(binding)?"));
+    assert!(start.contains("hosted_mmio_broker::validate_publication(binding, bus_owned_root_proof)?"));
 
     let validation = between(
         MMIO,

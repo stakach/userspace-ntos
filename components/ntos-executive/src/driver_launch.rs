@@ -50747,6 +50747,33 @@ pub(crate) struct HostedBusOwnedRootResources {
     pub child: nt_pnp_manager::DevnodeIdentity,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct HostedBusOwnedRootPublicationProof {
+    child: nt_pnp_manager::DevnodeIdentity,
+    provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
+}
+
+impl HostedBusOwnedRootResources {
+    pub(crate) fn publication_proof(&self) -> HostedBusOwnedRootPublicationProof {
+        HostedBusOwnedRootPublicationProof {
+            child: self.child,
+            provider: self.provider,
+        }
+    }
+}
+
+pub(crate) unsafe fn bus_owned_root_publication_proof_is_current(
+    binding: HostedDeviceBinding,
+    proof: HostedBusOwnedRootPublicationProof,
+) -> bool {
+    let pdo = binding.pdo_device_id;
+    proof.child.pdo_object_id() == pdo
+        && hosted_pnp_manager_mut().devnode_identity_for_pdo(pdo) == Some(proof.child)
+        && hosted_accepted_pdo_provider_catalog()
+            .resolve(hosted_pnp_manager_mut(), hosted_bus_relations(), io_manager_mut(), pdo)
+            == Ok(proof.provider)
+}
+
 /// Adopt a bus-number-bearing PDO's complete current resource assignment. The accepted parent
 /// provider and exact child generation are retained through native START preparation.
 pub(crate) unsafe fn hosted_accepted_bus_owned_root_resources(
@@ -55296,6 +55323,7 @@ fn hosted_pnp_physical_provider_current(provider: HostedPnpPhysicalProvider) -> 
 
 struct HostedPnpTransaction {
     binding: HostedDeviceBinding,
+    bus_owned_root_proof: Option<HostedBusOwnedRootPublicationProof>,
     stack_device_ids: Vec<nt_io_manager::DeviceId>,
     irp_id: IrpId,
     minor: nt_pnp_manager::PnpMinor,
@@ -58785,6 +58813,7 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
         .find(|transaction| transaction.irp_id == irp_id)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let binding = transaction.binding;
+    let bus_owned_root_proof = transaction.bus_owned_root_proof;
     let terminal_status = transaction
         .driver_status
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
@@ -58803,7 +58832,7 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
 
     if !mmio_usage_published {
-        hosted_mmio_broker::validate_publication(binding)?;
+        hosted_mmio_broker::validate_publication(binding, bus_owned_root_proof)?;
         hosted_pnp_transactions_mut()
             .iter_mut()
             .find(|transaction| transaction.irp_id == irp_id)
@@ -75480,6 +75509,7 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
     }
     let transaction = HostedPnpTransaction {
         binding,
+        bus_owned_root_proof: None,
         stack_device_ids,
         irp_id,
         minor,
@@ -75698,6 +75728,7 @@ pub(crate) unsafe fn start_hosted_device_canonical(
     device_id: u64,
     raw_resource_list: &[u8],
     translated_resource_list: &[u8],
+    bus_owned_root_proof: Option<HostedBusOwnedRootPublicationProof>,
 ) -> Result<HostedPnpStartOutcome, HostedPnpStartFailure> {
     let local_failure = |status| HostedPnpStartFailure {
         status,
@@ -75708,6 +75739,11 @@ pub(crate) unsafe fn start_hosted_device_canonical(
     }
     let binding = hosted_device_binding_by_device_id(device_id)
         .ok_or_else(|| local_failure(nt_status::NtStatus::INVALID_PARAMETER))?;
+    if bus_owned_root_proof.is_some_and(|proof| {
+        !bus_owned_root_publication_proof_is_current(binding, proof)
+    }) {
+        return Err(local_failure(nt_status::NtStatus::DEVICE_NOT_CONNECTED));
+    }
     let (_, inst) = instance_by_driver_id(binding.driver_id)
         .ok_or_else(|| local_failure(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND))?;
     if !inst.ready {
@@ -75787,6 +75823,7 @@ pub(crate) unsafe fn start_hosted_device_canonical(
     }
     let transaction = HostedPnpTransaction {
         binding,
+        bus_owned_root_proof,
         stack_device_ids,
         irp_id,
         minor: nt_pnp_manager::PnpMinor::StartDevice,
