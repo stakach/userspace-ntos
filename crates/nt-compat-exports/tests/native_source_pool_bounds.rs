@@ -152,7 +152,7 @@ fn actual_native_source_pool_bounds_and_fallback_behavior() {
 }
 
 const PORTS: &str = r#"
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -195,6 +195,14 @@ fn hosted_driver_runtime_for_worker_component_range(_:usize,_:u64,_:u64)->Option
 #[derive(Default)]
 struct Memory { words:BTreeMap<u64,u64>, reads:Vec<u64>, writes:Vec<u64>, translations:usize }
 thread_local! { static MEMORY:RefCell<Memory> = RefCell::new(Memory::default()); }
+thread_local! { static POOL_MMIO_ROWS:Cell<bool> = const { Cell::new(false) }; }
+mod hosted_mmio_broker {
+    pub mod hosted_pool_owned_mmio {
+        pub fn has_source_rows(_:super::super::DriverInstance, _:u64)->bool {
+            super::super::POOL_MMIO_ROWS.with(|rows| rows.get())
+        }
+    }
+}
 unsafe fn read_volatile<T:Copy>(pointer:*const T)->T {
     assert_eq!(core::mem::size_of::<T>(), 8);
     let value = MEMORY.with(|memory| {
@@ -225,6 +233,7 @@ fn instance()->DriverInstance {
         exec_stack_va:0x5000_0000, exec_shared_va:0x6000_0000, exec_arg_va:0x7000_0000 }
 }
 fn reset(used:u64, capacity:u64, generation:u64, free:bool) {
+    POOL_MMIO_ROWS.with(|rows| rows.set(false));
     MEMORY.with(|memory| {
         let mut state = Memory::default();
         state.words.insert(instance().exec_pool_va, used);
@@ -371,6 +380,21 @@ fn executive_free_inserts_in_address_order_and_reuse_preserves_links() {
         assert_eq!(memory.words[&(view + 8)], 7,
             "reused allocation must carry its new generation instead of a free link");
     });
+}
+
+#[test]
+fn live_pool_mmio_receipt_fences_free_before_pool_metadata_changes() {
+    let first = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
+    reset(POOL_DATA_OFF + 16 + 0x80, 0x80, 7, false);
+    POOL_MMIO_ROWS.with(|rows| rows.set(true));
+    assert!(!unsafe { hosted_instance_pool_free_unlocked(instance(), first) });
+    MEMORY.with(|memory| {
+        let memory = memory.borrow();
+        assert!(memory.writes.is_empty(), "a live pool MMIO receipt must fence free before mutation");
+        assert_eq!(memory.words.get(&(instance().exec_pool_va + 8)), None);
+    });
+    POOL_MMIO_ROWS.with(|rows| rows.set(false));
+    assert!(unsafe { hosted_instance_pool_free_unlocked(instance(), first) });
 }
 
 #[test]
