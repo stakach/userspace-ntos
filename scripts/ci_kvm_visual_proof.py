@@ -15,10 +15,10 @@ READY_TITLE = re.compile(r"(?im)^[^\w\r\n]{0,3}Command Prompt[ \t]*$")
 # text to the prompt line, and read the block cursor as a trailing comma. Keep
 # the drive-path token and line tail anchored so typed commands still fail.
 READY_PROMPT = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]{1,128}>,?[ \t]*$")
-START_PROGRAMS = re.compile(r"(?im)^[ \t]*All Programs[ \t]*$")
+START_PROGRAMS = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"All Programs[ \t]*$")
 START_SEARCH_BOX = re.compile(r"(?im)^[ \t]*Search programs and files[ \t]*$")
-SEARCH_PROGRAMS = re.compile(r"(?im)^[ \t]*Programs[ \t]*$")
-SEARCH_COMMAND_PROMPT = re.compile(r"(?im)^[ \t]*Command Prompt[ \t]*$")
+SEARCH_QUERY = re.compile(r"(?im)^[ \t]*command[ \t]*$")
+SEARCH_COMMAND_PROMPT = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"Command Prompt[ \t]*$")
 
 
 @dataclass(frozen=True)
@@ -49,8 +49,7 @@ def contains_start_menu_search_box(text):
 
 def contains_command_prompt_search_result(text):
     """Require the shortcut result, rather than typed query text or an old console."""
-    programs = SEARCH_PROGRAMS.search(text)
-    return programs is not None and SEARCH_COMMAND_PROMPT.search(text, programs.end()) is not None
+    return SEARCH_QUERY.search(text) is not None and SEARCH_COMMAND_PROMPT.search(text) is not None
 
 
 def _prove_image(image, predicate, missing):

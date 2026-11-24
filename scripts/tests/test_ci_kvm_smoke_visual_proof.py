@@ -50,8 +50,14 @@ class VisualProofTests(unittest.TestCase):
         # Pinned LiberNT startmnu2.cpp filters Start Menu shortcut names. Its
         # shortcuts.inf names the cmd.exe Accessories link "Command Prompt".
         menu = "All Programs\nSearch programs and files\nShut down\n"
-        results = "command\nPrograms\nCommand Prompt\nSearch programs and files\n"
+        recorded_menu = "\u00bb All Programs\n\u00bb\nSearch programs and files\n\u2018Shut down\n"
+        # LiberNT paints result rows directly, above the edit at the bottom;
+        # it does not paint a standalone "Programs" heading in search mode.
+        results = "Command Prompt\ncommand\n"
         self.assertTrue(contains_start_menu_search_box(menu))
+        # Tesseract on the actual 45425894277 Start screenshot includes
+        # Explorer's chevron as a prefix to the All Programs line.
+        self.assertTrue(contains_start_menu_search_box(recorded_menu))
         self.assertFalse(contains_start_menu_search_box("Command Prompt\nC:\\Users\\User>\n"))
         self.assertTrue(contains_command_prompt_search_result(results))
         self.assertFalse(contains_command_prompt_search_result(menu))
@@ -72,7 +78,7 @@ class VisualProofTests(unittest.TestCase):
                 self.assertTrue(menu.passed)
                 self.assertEqual(menu.image_sha256, expected_sha)
                 ocr.return_value = subprocess.CompletedProcess(
-                    [], 0, "command\nPrograms\nCommand Prompt\n", "")
+                    [], 0, "Command Prompt\ncommand\n", "")
                 result = prove_command_prompt_search_result(image)
                 self.assertTrue(result.passed)
                 self.assertEqual(result.image_sha256, expected_sha)

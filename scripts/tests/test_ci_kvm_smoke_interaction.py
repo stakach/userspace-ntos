@@ -11,7 +11,7 @@ from scripts.ci_kvm_interaction import (
     parse_script, pointer_batches, relative_deltas, screenshot_name, text_chords,
 )
 from scripts.ci_kvm_smoke import DESKTOP_EPOCH_SEALED_RECORD, SerialPanicDetector
-from scripts.ci_kvm_cursor import CursorProof, SEARCH_RADIUS
+from scripts.ci_kvm_cursor import CursorProof
 from scripts.ci_kvm_visual_proof import VisualProof
 
 DOCUMENT = {
@@ -48,22 +48,20 @@ class ParseScriptTests(unittest.TestCase):
         script = load_script(DEFAULT_SCRIPT)
         self.assertEqual(script.screen, (1024, 768))
         self.assertEqual(script.steps[0].name, "baseline")
-        # The cursor is parked outside the search field before its verified
-        # click; otherwise old and new cursor pixels overlap the proof region.
+        # Prove cursor aim and a real click on neutral wallpaper. LiberNT's
+        # Start menu focuses its edit on open, so typing needs no second click.
         self.assertEqual(script.steps[1].actions,
-                         (("click", (28, 743)), ("move", (360, 500))))
+                         (("verified_click", (925, 100)),))
+        self.assertEqual(script.steps[2].actions, (("click", (28, 743)),))
         # The installed LiberNT desktop has no Command Prompt icon. Its Start
         # menu searches shortcut names, so "command" can find Command Prompt;
         # the result must be visible before Enter launches it.
         self.assertEqual([step.name for step in script.steps],
-                         ["baseline", "start-menu", "command-prompt-search",
+                         ["baseline", "desktop-pointer", "start-menu", "command-prompt-search",
                           "command-prompt", "ver"])
-        self.assertEqual(script.steps[2].actions,
-                         (("verified_click", (80, 692)), ("type", "command")))
-        self.assertGreater(abs(script.steps[1].actions[-1][1][0]
-                               - script.steps[2].actions[0][1][0]), SEARCH_RADIUS)
-        self.assertEqual(script.steps[3].actions, (("key", ("ret",)),))
-        self.assertEqual(script.steps[4].actions, (("type", "ver\n"),))
+        self.assertEqual(script.steps[3].actions, (("type", "command"),))
+        self.assertEqual(script.steps[4].actions, (("key", ("ret",)),))
+        self.assertEqual(script.steps[5].actions, (("type", "ver\n"),))
 
     def test_document_parses_to_ordered_steps(self):
         script = parse_script(DOCUMENT)
@@ -325,7 +323,6 @@ class InteractionRunnerTests(unittest.TestCase):
                                "steps": [
                                    {"name": "baseline", "actions": [], "wait_seconds": 0},
                                    {"name": "command-prompt-search", "actions": [
-                                       {"verified_click": [80, 692]},
                                        {"type": "command"}], "wait_seconds": 0},
                                    {"name": "command-prompt", "actions": [
                                        {"key": ["ret"]}], "wait_seconds": 0}]})
@@ -333,14 +330,12 @@ class InteractionRunnerTests(unittest.TestCase):
                             image_name="search.ppm", image_sha256="recorded-sha")
         runner = InteractionRunner(
             script, self.performed.append, self.captured.append, self.log, self.clock,
-            checks={"command-prompt-search": lambda _name: proof},
-            cursor_probe=lambda _before, after, _target:
-                CursorProof((80, 692), after, "aim-sha"))
+            checks={"command-prompt-search": lambda _name: proof})
         runner.arm(0)
         runner.advance(0)
         self.assertTrue(runner.finished)
         self.assertEqual(runner.failures, 1)
-        self.assertEqual(len(self.performed), 3)  # aim, click, query; never Enter
+        self.assertEqual(len(self.performed), 1)  # query, never Enter
         self.assertFalse(any(event["type"] == "key"
                              and event["data"]["key"]["data"] == "ret"
                              and event["data"]["down"]
@@ -353,7 +348,6 @@ class InteractionRunnerTests(unittest.TestCase):
                                "steps": [
                                    {"name": "baseline", "actions": [], "wait_seconds": 0},
                                    {"name": "command-prompt-search", "actions": [
-                                       {"verified_click": [80, 692]},
                                        {"type": "command"}], "wait_seconds": 0},
                                    {"name": "command-prompt", "actions": [
                                        {"key": ["ret"]}], "wait_seconds": 0}]})
@@ -362,14 +356,12 @@ class InteractionRunnerTests(unittest.TestCase):
         runner = InteractionRunner(
             script, self.performed.append, self.captured.append, self.log, self.clock,
             checks={"command-prompt-search": lambda _name: selected,
-                    "command-prompt": lambda _name: ready},
-            cursor_probe=lambda _before, after, _target:
-                CursorProof((80, 692), after, "aim-sha"))
+                    "command-prompt": lambda _name: ready})
         runner.arm(0)
         runner.advance(0)
         self.assertTrue(runner.finished)
         self.assertEqual(runner.failures, 0)
-        self.assertEqual(keys(self.performed[3]), [("ret", True), ("ret", False)])
+        self.assertEqual(keys(self.performed[1]), [("ret", True), ("ret", False)])
         entries = [json.loads(line) for line in self.log.read_text().splitlines()]
         selected_index = next(i for i, entry in enumerate(entries)
                               if entry["event"] == "checkpoint"
