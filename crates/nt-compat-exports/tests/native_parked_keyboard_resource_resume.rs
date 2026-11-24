@@ -12,6 +12,9 @@ impl Drop for FixtureDirectory {
 }
 
 const DRIVER: &str = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+const OWNER: &str = include_str!(
+    "../../nt-hosted-runtime/src/retained_dispatch_context.rs"
+);
 
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -36,7 +39,7 @@ fn parked_keyboard_reprojects_its_resource_bank_before_resuming_start() {
         "\n}\n\npub(super) enum HostedIrpDispatchProgress",
     );
     let fixture = format!(
-        "{SUPPORT}\nmod native {{\nuse super::*;\nimpl FileIrpPumpContinuation {{\n    unsafe fn rebind_bindings({rebind}\n    pub(super) unsafe fn resume_after_child({resume}\n}}\n}}\n{CASES}"
+        "mod retained_dispatch_context {{\n{OWNER}\n}}\n{SUPPORT}\nmod native {{\nuse super::*;\nimpl FileIrpPumpContinuation {{\n    unsafe fn rebind_bindings({rebind}\n    pub(super) unsafe fn resume_after_child({resume}\n}}\n}}\n{CASES}"
     );
     let directory = FixtureDirectory(std::env::temp_dir().join(format!(
         "nt-parked-keyboard-resource-resume-{}-{}",
@@ -168,14 +171,23 @@ impl HostedDeviceDispatchContextGuard {
         })
     }
 }
+impl retained_dispatch_context::RetainedContextBinding for HostedDeviceDispatchContextGuard {
+    type Suspended = SuspendedHostedDeviceDispatchContext;
+    type Error = nt_status::NtStatus;
+
+    fn suspend(self) -> Result<Self::Suspended, (Self::Error, Self)> {
+        self.suspend()
+    }
+    fn resume(ticket: Self::Suspended) -> Result<Self, (Self::Error, Self::Suspended)> {
+        unsafe { Self::resume(ticket) }
+    }
+}
+type DeviceDispatchContextOwner =
+    retained_dispatch_context::RetainedContextOwner<HostedDeviceDispatchContextGuard>;
 
 enum FileTransferOwner {
     Active(ActiveHostedIrpTransferGuard),
     Suspended(SuspendedActiveHostedIrpTransfer),
-}
-enum FileDeviceContextOwner {
-    Active(HostedDeviceDispatchContextGuard),
-    Suspended(SuspendedHostedDeviceDispatchContext),
 }
 
 mod component_scheduler {
@@ -209,7 +221,7 @@ mod component_scheduler {
 struct FileIrpPumpContinuation {
     pump: Option<component_scheduler::HostedPumpRestore>,
     transfer: Option<FileTransferOwner>,
-    device_context: Option<FileDeviceContextOwner>,
+    device_context: Option<DeviceDispatchContextOwner>,
     class_selection: Option<Selection>,
     dependent_inst: DriverInstance,
     d: DriverInstance,
@@ -234,11 +246,7 @@ impl FileIrpPumpContinuation {
             });
         }
         if let Some(owner) = self.device_context.take() {
-            self.device_context = Some(match owner {
-                FileDeviceContextOwner::Active(guard) =>
-                    FileDeviceContextOwner::Suspended(guard.suspend().ok().unwrap()),
-                owner => owner,
-            });
+            self.device_context = Some(owner.suspend().unwrap_or_else(|(_, owner)| owner));
         }
     }
     fn finish(self, _: &mut [u8]) -> HostedIrpTransportResult {
@@ -262,7 +270,7 @@ fn keyboard_start_uses_keyboard_vector_and_cap_after_mouse_grant() {
     let keyboard = FileIrpPumpContinuation {
         pump: Some(component_scheduler::HostedPumpRestore::ChildWorkReady { epoch: 1 }),
         transfer: Some(FileTransferOwner::Suspended(SuspendedActiveHostedIrpTransfer)),
-        device_context: Some(FileDeviceContextOwner::Suspended(
+        device_context: Some(DeviceDispatchContextOwner::Suspended(
             SuspendedHostedDeviceDispatchContext {
                 binding: HostedDeviceBinding { vector: 11, port_cap: 0x60 },
                 shared_va: 100,
@@ -303,7 +311,7 @@ fn worker_reprojects_its_own_bank_without_changing_parked_primary() {
     let mouse = FileIrpPumpContinuation {
         pump: Some(component_scheduler::HostedPumpRestore::ChildWorkReady { epoch: 2 }),
         transfer: Some(FileTransferOwner::Suspended(SuspendedActiveHostedIrpTransfer)),
-        device_context: Some(FileDeviceContextOwner::Suspended(
+        device_context: Some(DeviceDispatchContextOwner::Suspended(
             SuspendedHostedDeviceDispatchContext {
                 binding: HostedDeviceBinding { vector: 12, port_cap: 0x64 },
                 shared_va: 200,
@@ -334,7 +342,7 @@ fn refused_reprojection_retains_child_and_exact_owners_without_retrying_pump() {
     let keyboard = FileIrpPumpContinuation {
         pump: Some(component_scheduler::HostedPumpRestore::ChildWorkReady { epoch: 3 }),
         transfer: Some(FileTransferOwner::Suspended(SuspendedActiveHostedIrpTransfer)),
-        device_context: Some(FileDeviceContextOwner::Suspended(
+        device_context: Some(DeviceDispatchContextOwner::Suspended(
             SuspendedHostedDeviceDispatchContext {
                 binding: HostedDeviceBinding { vector: 11, port_cap: 0x60 },
                 shared_va: 100,
@@ -354,7 +362,7 @@ fn refused_reprojection_retains_child_and_exact_owners_without_retrying_pump() {
         Some(component_scheduler::HostedPumpRestore::ChildWorkReady { .. })));
     assert_eq!(retained.child_step, Some(3));
     assert!(matches!(retained.transfer, Some(FileTransferOwner::Suspended(_))));
-    assert!(matches!(retained.device_context, Some(FileDeviceContextOwner::Suspended(_))));
+    assert!(matches!(retained.device_context, Some(DeviceDispatchContextOwner::Suspended(_))));
     assert_eq!(CHILD_RESUMES.load(Ordering::Relaxed), before);
 }
 "#;

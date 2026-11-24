@@ -53596,6 +53596,24 @@ impl Drop for HostedDeviceDispatchContextGuard {
     }
 }
 
+impl nt_hosted_runtime::retained_dispatch_context::RetainedContextBinding
+    for HostedDeviceDispatchContextGuard
+{
+    type Suspended = SuspendedHostedDeviceDispatchContext;
+    type Error = nt_status::NtStatus;
+
+    fn suspend(self) -> Result<Self::Suspended, (Self::Error, Self)> {
+        unsafe { HostedDeviceDispatchContextGuard::suspend(self) }
+    }
+
+    fn resume(ticket: Self::Suspended) -> Result<Self, (Self::Error, Self::Suspended)> {
+        unsafe { HostedDeviceDispatchContextGuard::resume(ticket) }
+    }
+}
+
+type DeviceDispatchContextOwner =
+    nt_hosted_runtime::retained_dispatch_context::RetainedContextOwner<HostedDeviceDispatchContextGuard>;
+
 unsafe fn hosted_device_dispatch_contexts_mut() -> &'static mut HostedDeviceContextLeases {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_DISPATCH_CONTEXTS);
     if slot.is_none() {
@@ -76908,18 +76926,13 @@ enum FileTransferOwner {
     Suspended(SuspendedActiveHostedIrpTransfer),
 }
 
-enum FileDeviceContextOwner {
-    Active(HostedDeviceDispatchContextGuard),
-    Suspended(SuspendedHostedDeviceDispatchContext),
-}
-
 /// The native half of an entered File dispatch. This is move-only because a yielded pump may
 /// resume its exact receive half once; an epoch is a lookup witness, never Reply authority.
 #[must_use = "retain until the exact File pump resumes or is quarantined"]
 pub(super) struct FileIrpPumpContinuation {
     pump: Option<component_scheduler::HostedPumpRestore>,
     transfer: Option<FileTransferOwner>,
-    device_context: Option<FileDeviceContextOwner>,
+    device_context: Option<DeviceDispatchContextOwner>,
     active_dispatch: ActiveHostedDispatchDiagnosticGuard,
     class_selection: Option<hosted_class_irp_lane::Selection>,
     scsi_timing: ScsiSrbPumpTiming,
@@ -76969,14 +76982,11 @@ impl FileIrpPumpContinuation {
             });
         }
         if let Some(owner) = self.device_context.take() {
-            self.device_context = Some(match owner {
-                FileDeviceContextOwner::Suspended(ticket) => FileDeviceContextOwner::Suspended(ticket),
-                FileDeviceContextOwner::Active(guard) => match guard.suspend() {
-                Ok(ticket) => FileDeviceContextOwner::Suspended(ticket),
-                Err((_, guard)) => {
+            self.device_context = Some(match owner.suspend() {
+                Ok(owner) => owner,
+                Err((_, owner)) => {
                     self.ready_for_child = false;
-                    FileDeviceContextOwner::Active(guard)
-                }
+                    owner
                 },
             });
         }
@@ -77038,17 +77048,12 @@ impl FileIrpPumpContinuation {
             });
         }
         if let Some(owner) = self.device_context.take() {
-            self.device_context = Some(match owner {
-                FileDeviceContextOwner::Active(guard) => FileDeviceContextOwner::Active(guard),
-                FileDeviceContextOwner::Suspended(ticket) => {
-                    match HostedDeviceDispatchContextGuard::resume(ticket) {
-                        Ok(guard) => FileDeviceContextOwner::Active(guard),
-                        Err((status, ticket)) => {
-                            self.device_context = Some(FileDeviceContextOwner::Suspended(ticket));
-                            return Err(status);
-                        }
-                    }
-                }
+            self.device_context = Some(match owner.resume() {
+                Ok(owner) => owner,
+                Err((status, owner)) => {
+                    self.device_context = Some(owner);
+                    return Err(status);
+                },
             });
         }
         Ok(())
@@ -77058,10 +77063,7 @@ impl FileIrpPumpContinuation {
     /// owner was parked. Reproject only the selected lane's retained device before resuming it.
     unsafe fn reproject_resource_bank(&self) -> Result<(), nt_status::NtStatus> {
         let context = match self.device_context.as_ref() {
-            Some(FileDeviceContextOwner::Active(context)) => context,
-            Some(FileDeviceContextOwner::Suspended(_)) => {
-                return Err(nt_status::NtStatus::DEVICE_BUSY);
-            }
+            Some(owner) => owner.active_ref().ok_or(nt_status::NtStatus::DEVICE_BUSY)?,
             None => return Ok(()),
         };
         let binding = context.projection_binding(self.shared_va)?;
@@ -77841,7 +77843,7 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
     let mut continuation = FileIrpPumpContinuation {
         pump: Some(pump),
         transfer: Some(FileTransferOwner::Active(transfer_guard)),
-        device_context: _device_dispatch_context.map(FileDeviceContextOwner::Active),
+        device_context: _device_dispatch_context.map(DeviceDispatchContextOwner::active),
         active_dispatch,
         class_selection,
         scsi_timing: scsi_srb_pump_timing,

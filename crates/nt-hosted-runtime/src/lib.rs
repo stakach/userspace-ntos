@@ -34,6 +34,7 @@ mod driver_load_receipt;
 mod dxg_registration;
 mod contiguous_ram;
 mod provider_export_worker;
+pub mod retained_dispatch_context;
 mod ordinary_irp_lane;
 pub use ordinary_irp_lane::{
     in_flight_caller_reply, parks_file_caller, DispatchProgress, InFlightCallers, InFlightReply,
