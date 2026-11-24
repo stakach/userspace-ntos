@@ -93,6 +93,7 @@ struct Work {
     tid: u64,
     badge: u64,
     reply: u64,
+    installer_fault_ticket: Option<nt_hosted_runtime::InstallerFaultTicket>,
     logical: ProviderLogicalCaller,
     view: exec_handler::native_image_view::NativeImageViewDescriptor,
     page: u64,
@@ -252,7 +253,7 @@ unsafe fn prepare_page_as(
     let origin_driver = driver_launch::io_manager_mut().device(DeviceId(device))
         .ok_or(INVALID)?.driver_id.raw();
     Ok(Some(Work {
-        pi, tid, badge, reply, logical, view, page, rva, access,
+        pi, tid, badge, reply, installer_fault_ticket: None, logical, view, page, rva, access,
         observation, info, lease, origin_driver, capture: Some(capture),
         fill: ImagePageFillCapture::new(plan), span: None, read: None,
         phase: if decision == RoutedSourceReadDecision::EnterRead {
@@ -266,7 +267,7 @@ unsafe fn prepare_page_as(
     }))
 }
 
-unsafe fn install_work(work: Work, reply_already_parked: bool) -> Result<(), u32> {
+unsafe fn install_work(work: Work, reply_already_parked: bool) -> Result<usize, u32> {
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     let index = rows.iter().enumerate().find_map(|(index, row)|
         (row.is_none() && EXECUTING_INDEX.load(Ordering::Acquire) != index as u64).then_some(index));
@@ -274,11 +275,14 @@ unsafe fn install_work(work: Work, reply_already_parked: bool) -> Result<(), u32
     let park = if reply_already_parked { None } else {
         Some(root_reply_park::RootReplyPark::prepare().ok_or(RESOURCES)?)
     };
-    match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
+    let index = match index {
+        Some(index) => { rows[index] = Some(work); index }
+        None => { rows.push(Some(work)); rows.len() - 1 }
+    };
     if let Some(park) = park { park.commit(); }
     ADMISSIONS.fetch_add(1, Ordering::Release);
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
-    Ok(())
+    Ok(index)
 }
 
 /// Returns false for local images, protection faults, or a source page already owned by the
@@ -292,7 +296,13 @@ pub(crate) unsafe fn submit(
     let Some(work) = prepare_page(handler, pi, page, access, observation, Purpose::Fault,
         reply, false)?
         else { return Ok(false); };
-    install_work(work, false)?;
+    let index = install_work(work, false)?;
+    let installed = (&mut *core::ptr::addr_of_mut!(WORK))[index]
+        .as_mut().expect("just-installed routed image fault");
+    installed.installer_fault_ticket = crate::installer_child_span_census::claim_routed_fault(
+        handler, installed.logical, installed.pi, installed.tid, installed.badge,
+        installed.reply, installed.page,
+    );
     Ok(true)
 }
 
@@ -1079,6 +1089,13 @@ unsafe fn advance(
             }
             if parked_reply::retire_sent(work.reply).is_err() { return false; }
             thread_wait_state_clear_badge_ready(handler, work.badge);
+            if matches!(work.purpose, Purpose::Fault) {
+                if let Some(ticket) = work.installer_fault_ticket.take() {
+                    crate::installer_child_span_census::complete_routed_fault(
+                        handler, work.logical, work.badge, work.reply, ticket,
+                    );
+                }
+            }
             true
         }
         Phase::Cancel => {

@@ -84,6 +84,7 @@ struct Work {
     tid: u64,
     badge: u64,
     reply: u64,
+    installer_fault_ticket: Option<nt_hosted_runtime::InstallerFaultTicket>,
     logical: ProviderLogicalCaller,
     process: nt_user_host::process_identity::ProcessIdentity,
     view: GenericSectionView,
@@ -245,6 +246,7 @@ unsafe fn submit_owned(
         tid,
         badge: handler.current_badge,
         reply,
+        installer_fault_ticket: None,
         logical,
         process,
         view,
@@ -267,11 +269,19 @@ unsafe fn submit_owned(
         failure: None,
         failure_logged: false,
     };
-    match index {
-        Some(index) => rows[index] = Some(work),
-        None => rows.push(Some(work)),
-    }
+    let index = match index {
+        Some(index) => { rows[index] = Some(work); index }
+        None => { rows.push(Some(work)); rows.len() - 1 }
+    };
     if let Some(park) = park { park.commit(); }
+    if matches!(purpose, Purpose::Fault) {
+        let installed = rows[index].as_mut().expect("just-installed routed Section fault");
+        installed.installer_fault_ticket =
+            crate::installer_child_span_census::claim_routed_fault(
+                handler, installed.logical, installed.pi, installed.tid, installed.badge,
+                installed.reply, installed.page,
+            );
+    }
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
     Ok(crate::routed_pagein_source::RoutedPageInSource::Mapped { section, view, lease })
 }
@@ -936,6 +946,13 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 return false;
             }
             thread_wait_state_clear_badge_ready(handler, work.badge);
+            if matches!(work.purpose, Purpose::Fault) {
+                if let Some(ticket) = work.installer_fault_ticket.take() {
+                    crate::installer_child_span_census::complete_routed_fault(
+                        handler, work.logical, work.badge, work.reply, ticket,
+                    );
+                }
+            }
             true
         }
         Phase::Cancel => {

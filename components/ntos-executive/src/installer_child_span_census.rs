@@ -4,6 +4,7 @@
 use crate::*;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_hosted_runtime::{CensusEpochGate, InstallerFaultReceipt, InstallerFaultReceipts,
+    InstallerFaultTicket,
     InstallerSyscallSpans, SpanOwner};
 use core::fmt::Write;
 
@@ -103,6 +104,42 @@ pub(crate) fn note_fault(handler: &ExecNtHandler, pi: usize, tid: u64, badge: u6
     let _ = unsafe { (&mut *core::ptr::addr_of_mut!(FAULTS)).record(
         InstallerFaultReceipt { owner, badge, reply, fault_ip: ip, fault_addr: addr,
             fault_error_code: error_code, entered_at_100ns: now }) };
+}
+
+/// Claim the exact ingress observation only after a routed fault Work and its Reply have
+/// been durably installed. The retained logical caller, not a numeric Reply, proves which
+/// thread incarnation owns the worker. Other VM faults remain outside this accounting.
+pub(crate) fn claim_routed_fault(handler: &ExecNtHandler,
+    logical: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    pi: usize, tid: u64, badge: u64, reply: u64, page: u64,
+) -> Option<InstallerFaultTicket> {
+    if logical.pi() != pi || u64::from(logical.thread().thread_id()) != tid
+        || logical.badge() != badge || handler.capture_process_identity(pi) != Some(logical.process())
+    { return None; }
+    let owner = exact_owner(handler, pi, tid, badge)?;
+    if logical.thread().generation() != owner.thread_generation { return None; }
+    let receipt = unsafe { (&mut *core::ptr::addr_of_mut!(FAULTS)) }
+        .claim_exact(owner, badge, reply, page)?;
+    unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)) }
+        .fault_enter(owner, reply, receipt.entered_at_100ns)
+}
+
+/// A routed worker may settle its diagnostic only after its exact Reply was acknowledged
+/// and the parked slot retired. A cancelled or uncertain worker leaves the ticket unresolved.
+pub(crate) fn complete_routed_fault(handler: &ExecNtHandler,
+    logical: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    badge: u64, reply: u64, ticket: InstallerFaultTicket,
+) {
+    let owner = ticket.owner();
+    if ticket.reply() != reply || logical.pi() != owner.process_index
+        || u64::from(logical.thread().thread_id()) != owner.thread_id
+        || logical.thread().generation() != owner.thread_generation
+        || logical.badge() != badge
+        || handler.capture_process_identity(owner.process_index) != Some(logical.process())
+        || exact_owner(handler, owner.process_index, owner.thread_id, badge) != Some(owner)
+    { return; }
+    let _ = unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)) }
+        .fault_reply_accepted(ticket, monotonic_time_100ns());
 }
 
 pub(crate) fn activate_after_enum_open(handler: &ExecNtHandler, pi: usize) {
@@ -356,6 +393,11 @@ pub(crate) fn print_census(handler: &ExecNtHandler) {
         print_u64(snapshot.overflow_transition_pairs); print_str(b"/");
         print_u64(snapshot.untracked_transition_gaps); print_str(b"/");
         print_u64(snapshot.untracked_transition_gap_100ns / 10_000);
+        print_str(b" routed-fault-gap-ms/residual-gap-ms/unresolved-faults/fault-admission-overflow=");
+        print_u64(snapshot.completed_fault_gap_100ns / 10_000); print_str(b"/");
+        print_u64(snapshot.residual_gap_100ns / 10_000); print_str(b"/");
+        print_u64(snapshot.unresolved_faults); print_str(b"/");
+        print_u64(snapshot.fault_admission_overflow);
         // This exact return-to-next-entry interval belongs to the pi/generation/tid above.
         // It excludes pending dispatch returns, whose terminal time is not observed here.
         print_str(b" longest-gap/present/from-ssn/from-status/to-ssn/from-at-100ns/to-at-100ns=");
