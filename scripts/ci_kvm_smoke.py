@@ -13,19 +13,23 @@ import threading
 import time
 
 if __package__:
-    from .ci_kvm_cursor import prove_cursor_position, prove_selected_icon
+    from .ci_kvm_cursor import prove_cursor_position
     from .ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script, screenshot_name
     from .ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
                                      read_run_state, request_quit)
     from .ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
-    from .ci_kvm_visual_proof import VisualProof, prove_ready_prompt, prove_ver_result
+    from .ci_kvm_visual_proof import (VisualProof, prove_command_prompt_search_result,
+                                      prove_ready_prompt, prove_start_menu_search_box,
+                                      prove_ver_result)
 else:
-    from ci_kvm_cursor import prove_cursor_position, prove_selected_icon
+    from ci_kvm_cursor import prove_cursor_position
     from ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script, screenshot_name
     from ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
                                     read_run_state, request_quit)
     from ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
-    from ci_kvm_visual_proof import VisualProof, prove_ready_prompt, prove_ver_result
+    from ci_kvm_visual_proof import (VisualProof, prove_command_prompt_search_result,
+                                    prove_ready_prompt, prove_start_menu_search_box,
+                                    prove_ver_result)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1031,13 +1035,11 @@ def main():
         interaction = seal_detector = None
         desktop_sealed = False
         if interaction_script is not None:
-            checks = {"command-prompt": lambda name: prove_ready_prompt(ROOT / name)}
-            selected_step = next((step for step in interaction_script.steps
-                                  if step.name == "command-prompt-selected"), None)
-            if selected_step is not None:
-                target = selected_step.actions[0][1]
-                checks["command-prompt-selected"] = lambda name: prove_selected_icon(
-                    ROOT / interaction.cursor_receipts[-1]["file"], ROOT / name, target)
+            checks = {
+                "start-menu": lambda name: prove_start_menu_search_box(ROOT / name),
+                "command-prompt-search": lambda name: prove_command_prompt_search_result(ROOT / name),
+                "command-prompt": lambda name: prove_ready_prompt(ROOT / name),
+            }
             interaction = InteractionRunner(
                 interaction_script, send_input_batches,
                 lambda name: capture_framebuffer(ROOT / name), INTERACTION_LOG,

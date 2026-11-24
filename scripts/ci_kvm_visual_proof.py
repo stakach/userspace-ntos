@@ -15,6 +15,10 @@ READY_TITLE = re.compile(r"(?im)^[^\w\r\n]{0,3}Command Prompt[ \t]*$")
 # text to the prompt line, and read the block cursor as a trailing comma. Keep
 # the drive-path token and line tail anchored so typed commands still fail.
 READY_PROMPT = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]{1,128}>,?[ \t]*$")
+START_PROGRAMS = re.compile(r"(?im)^[ \t]*All Programs[ \t]*$")
+START_SEARCH_BOX = re.compile(r"(?im)^[ \t]*Search programs and files[ \t]*$")
+SEARCH_PROGRAMS = re.compile(r"(?im)^[ \t]*Programs[ \t]*$")
+SEARCH_COMMAND_PROMPT = re.compile(r"(?im)^[ \t]*Command Prompt[ \t]*$")
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,17 @@ def contains_ready_prompt(text):
     """Find a foreground Command Prompt title followed by a ready input prompt."""
     title = READY_TITLE.search(text)
     return title is not None and READY_PROMPT.search(text, title.end()) is not None
+
+
+def contains_start_menu_search_box(text):
+    """Require the visible Start menu before targeting its search field."""
+    return START_PROGRAMS.search(text) is not None and START_SEARCH_BOX.search(text) is not None
+
+
+def contains_command_prompt_search_result(text):
+    """Require the shortcut result, rather than typed query text or an old console."""
+    programs = SEARCH_PROGRAMS.search(text)
+    return programs is not None and SEARCH_COMMAND_PROMPT.search(text, programs.end()) is not None
 
 
 def _prove_image(image, predicate, missing):
@@ -72,6 +87,18 @@ def _prove_image(image, predicate, missing):
 def prove_ready_prompt(image):
     """Require a visible ready Command Prompt before any test command is typed."""
     return _prove_image(image, contains_ready_prompt, "ready Command Prompt not visible")
+
+
+def prove_start_menu_search_box(image):
+    """Require the original frame to show the Start menu search control."""
+    return _prove_image(image, contains_start_menu_search_box,
+                        "Start menu search box not visible")
+
+
+def prove_command_prompt_search_result(image):
+    """Require a visible shortcut search result before sending Enter."""
+    return _prove_image(image, contains_command_prompt_search_result,
+                        "Command Prompt search result not visible")
 
 
 def prove_ver_result(image):
