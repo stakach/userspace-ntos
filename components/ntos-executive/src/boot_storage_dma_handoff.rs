@@ -259,7 +259,7 @@ pub(crate) fn begin_native_start_after_preload(
                 driver_launch::hosted_nonstorage_relation_query_active(accepted_pdo)
             } || !admit_native_drain(
                 driver_launch::hosted_pnp_lifecycle_dispatch_active(),
-                crate::video_device::video_publication_active(),
+                unsafe { crate::video_device::video_create_in_flight() },
             ) {
                 trace_native_start_once(65536, b"waiting-relation");
                 return Ok(NativeStartAdmission::WaitingForRelation);

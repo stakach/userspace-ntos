@@ -1093,11 +1093,13 @@ impl OwnedHostedPnpStartBatch {
                 continue;
             }
             if let Some((devnode_index, owner, enqueue_relations_after_publish)) = self.pending_video_publication {
-                if !crate::boot_storage_dma_handoff::native_storage_cutover_phase().admit_video_create() {
-                    return OwnedHostedPnpStartProgress::AwaitingCompletion;
-                }
                 let device_id = owner.identity().device_id;
                 let retained_open = crate::video_device::video_publication_pending_for(device_id);
+                if !crate::boot_storage_dma_handoff::native_storage_cutover_phase()
+                    .admit_video_route_progress(retained_open)
+                {
+                    return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                }
                 if !retained_open && (!owner.matches_current(driver_launch::hosted_video_publication_identity(device_id))
                     || !driver_launch::hosted_video_publication_identity_is_live(owner.identity())) {
                     self.pending_video_publication = None;

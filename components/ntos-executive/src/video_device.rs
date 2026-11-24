@@ -324,8 +324,9 @@ impl Drop for PublicationGuard {
     }
 }
 
-pub(crate) fn video_publication_active() -> bool {
+pub(crate) unsafe fn video_create_in_flight() -> bool {
     VIDEO_PUBLICATION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+        || (*addr_of!(PENDING_VIDEO_PUBLICATION)).is_some()
 }
 
 pub(crate) unsafe fn video_publication_pending_for(device_id: u64) -> bool {
@@ -347,8 +348,12 @@ pub(crate) unsafe fn video_file_retirement_pending() -> u64 {
 pub(crate) unsafe fn publish_hosted_video_device_route(
     reg: &HostedVideoDeviceRegistration<'_>,
 ) -> VideoPublicationProgress {
-    if (*addr_of!(PENDING_VIDEO_PUBLICATION)).is_some() {
-        return resume_hosted_video_device_route(reg.device_id);
+    if let Some(pending) = (*addr_of!(PENDING_VIDEO_PUBLICATION)).as_ref() {
+        return if pending.identity.device_id == reg.device_id {
+            resume_hosted_video_device_route(reg.device_id)
+        } else {
+            VideoPublicationProgress::Pending
+        };
     }
     let Some(_publication) = PublicationGuard::enter() else {
         return VideoPublicationProgress::Pending;
