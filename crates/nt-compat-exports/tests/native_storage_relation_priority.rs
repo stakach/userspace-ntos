@@ -48,12 +48,13 @@ fn native_drain_waits_for_entered_lifecycle_and_video_create() {
     let drain = start.find(".begin_drain(").expect("controller drain");
     let lifecycle = start.find("hosted_pnp_lifecycle_dispatch_active()")
         .expect("an entered unrelated FILTER/START must finish before drain");
-    let video = start.find("video_publication_active()")
-        .expect("post-START native video CREATE remains active after PnP terminal");
+    let video = start.find("video_create_in_flight()")
+        .expect("entered native video CREATE remains owned after PnP terminal");
     assert!(lifecycle < drain && video < drain,
         "both entered owners must finish while boot storage still admits durable writes");
-    assert!(VIDEO.contains("VIDEO_PUBLICATION_ACTIVE.load("),
-        "the publication guard, rather than a diagnostic census or persistent File owner, is authority");
+    assert!(VIDEO.contains("VIDEO_PUBLICATION_ACTIVE.load(")
+        && VIDEO.contains("PENDING_VIDEO_PUBLICATION)).is_some()"),
+        "both the entered publication guard and retained pending CREATE must block drain");
     assert!(start.contains("NativeStartAdmission::WaitingForRelation"),
         "a refused drain must retain the exact controller grant owner");
 }
@@ -95,14 +96,15 @@ fn post_start_video_open_waits_for_exact_native_publication() {
         && START.contains("hosted_video_publication_identity_is_live"),
         "the callback must also retain and recheck the exact PnP relation generation");
     assert!(START.contains("native_storage_cutover_phase().admit_video_create()")
+        && START.contains(".admit_video_route_progress(retained_open)")
         && HANDOFF.contains("published_native_storage_mount()")
         && DRIVER.contains("native_storage_route()")
         && HANDOFF.contains("exec_block_route_kind("),
-        "video CREATE resumes only after the matching mounted route becomes Native");
+        "new CREATE needs boot or published native admission, while an entered one can settle");
     let drive = START.split_once("unsafe fn drive_inner(&mut self, pump_before_observe: bool,")
         .expect("retained Start batch").1.split_once("enum HostedPnpRebalanceStage")
         .expect("Start batch boundary").0;
-    assert!(drive.find("if let Some((devnode_index, owner)) = self.pending_video_publication")
+    assert!(drive.find("if let Some((devnode_index, owner, enqueue_relations_after_publish)) = self.pending_video_publication")
         .expect("deferred video branch")
         < drive.find("nt_driver_start::BatchPhase::Complete =>")
             .expect("completed batch branch"),
