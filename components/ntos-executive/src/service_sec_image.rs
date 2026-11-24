@@ -15364,7 +15364,7 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
             nt_pnp_manager::ExistingDeviceStartDisposition::RequiresAction => {}
         }
         progress += 1;
-        let spec = match live_config_existing_device_launch_spec(instance, SERVICE_DEMAND_START) {
+        let spec = match live_config_existing_device_launch_spec(instance, SERVICE_DEMAND_START, false) {
             Ok(spec) if spec.class == driver_launch::DriverClass::Device && spec.devnodes.len() == 1 => spec,
             Ok(_) => {
                 driver_launch::complete_hosted_critical_child_start(

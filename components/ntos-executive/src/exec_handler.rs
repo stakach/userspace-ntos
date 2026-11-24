@@ -11,6 +11,7 @@ use nt_io_manager::{LocalFileObject, PendingFileRoute};
 
 static PNP_START_RESULT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PNP_START_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PNP_START_LOOKUP_CONTEXT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PNP_DEVICE_STATUS_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PNP_DEVICE_STATUS_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // Diagnostic only: identify any legacy FAT lookup attempted after the boot route drains.
@@ -19534,9 +19535,54 @@ impl ExecNtHandler {
             nt_pnp_manager::ExistingDeviceStartDisposition::RequiresAction => {}
         }
 
-        let spec = match live_config_existing_device_launch_spec(&instance, SERVICE_DEMAND_START) {
+        let spec = match live_config_existing_device_launch_spec(&instance, SERVICE_DEMAND_START, true) {
             Ok(spec) => spec,
-            Err(status) => no_start_irp!(status as u32),
+            Err(status) => {
+                if PNP_START_LOOKUP_CONTEXT_TRACE_N.fetch_add(1, Ordering::Relaxed) < 32 {
+                    print_str(b"[pnp-start-lookup-context] call=");
+                    print_u64(request.sequence());
+                    print_str(b" caller-pid/gen=");
+                    print_u64(caller_pid);
+                    print_str(b"/");
+                    print_u64(caller_generation);
+                    print_str(b" instance=");
+                    print_str(instance.as_bytes());
+                    print_str(b" status=0x");
+                    print_hex_u64(status as u32 as u64);
+                    print_str(b" devnode/gen/pdo/state=");
+                    if let Some((devnode_id, generation, pdo_id, state, raw_device_ok)) =
+                        driver_launch::hosted_pnp_start_diagnostic_identity(&instance)
+                    {
+                        print_u64(devnode_id);
+                        print_str(b"/");
+                        print_u64(generation);
+                        print_str(b"/");
+                        print_u64(pdo_id);
+                        print_str(b"/");
+                        print_u64(state as u32 as u64);
+                        print_str(b" raw-device-ok=");
+                        match raw_device_ok {
+                            Some(true) => print_str(b"true"),
+                            Some(false) => print_str(b"false"),
+                            None => print_str(b"unknown"),
+                        }
+                    } else {
+                        print_str(b"unavailable raw-device-ok=unknown");
+                    }
+                    print_str(b" runtime-status/problem=");
+                    if let Some(slot) = self.pnp_status_slot(&instance) {
+                        let record = self.pnp_status.records[slot];
+                        print_str(b"0x");
+                        print_hex_u64(record.status as u64);
+                        print_str(b"/0x");
+                        print_hex_u64(record.problem as u64);
+                    } else {
+                        print_str(b"unavailable");
+                    }
+                    print_str(b"\n");
+                }
+                no_start_irp!(status as u32)
+            }
         };
         if spec.class != driver_launch::DriverClass::Device || spec.devnodes.len() != 1 {
             no_start_irp!(STATUS_INVALID_PARAMETER);
@@ -19730,7 +19776,7 @@ impl ExecNtHandler {
             Ok(false) => return STATUS_NO_SUCH_DEVICE,
             Err(status) => return status,
         }
-        let spec = match live_config_existing_device_launch_spec(&instance, SERVICE_DEMAND_START) {
+        let spec = match live_config_existing_device_launch_spec(&instance, SERVICE_DEMAND_START, false) {
             Ok(spec) if spec.class == driver_launch::DriverClass::Device => spec,
             Ok(_) => return STATUS_INVALID_PARAMETER,
             Err(status) => return status as u32,

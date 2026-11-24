@@ -51040,6 +51040,21 @@ pub(crate) unsafe fn hosted_pnp_device_state_for_instance(
     hosted_pnp_manager_mut().state(devnode_id)
 }
 
+pub(crate) unsafe fn hosted_pnp_start_diagnostic_identity(
+    instance_id: &str,
+) -> Option<(u64, u64, u64, nt_pnp_manager::DeviceState, Option<bool>)> {
+    let pnp = hosted_pnp_manager_mut();
+    let devnode_id = pnp.devnode_for_instance(instance_id)?;
+    let generation = pnp.generation(devnode_id)?;
+    let pdo_id = pnp.pdo(devnode_id)?;
+    let state = pnp.state(devnode_id)?;
+    let raw_device_ok = pnp
+        .enumerated_pdo_properties(pdo_id)
+        .and_then(|properties| properties.capabilities.as_ref())
+        .map(|capabilities| capabilities.raw_device_ok);
+    Some((devnode_id, generation, pdo_id, state, raw_device_ok))
+}
+
 /// A non-START lifecycle completion keeps its detached owner until the exact provider ACK
 /// retires the canonical IRP. PnP state changes and publication follow that retirement.
 unsafe fn drain_hosted_detached_lifecycle_completion(irp_id: IrpId) -> bool {
