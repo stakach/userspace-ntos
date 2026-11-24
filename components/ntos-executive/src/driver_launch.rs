@@ -109,6 +109,11 @@ mod hosted_primary_retirement;
 mod hosted_pretransport_retirement;
 #[path = "hosted_resource_mapping.rs"]
 mod hosted_resource_mapping;
+#[path = "hosted_mmio_request.rs"]
+mod hosted_mmio_request;
+#[path = "hosted_mmio_broker.rs"]
+mod hosted_mmio_broker;
+pub(crate) use hosted_mmio_broker::service_hosted_driver_mmio_request;
 #[path = "hosted_component_mmio_fault.rs"]
 pub(crate) mod hosted_component_mmio_fault;
 #[path = "hosted_exception_images.rs"]
@@ -1499,6 +1504,8 @@ pub const FSD_SERVICE_REMOVE_DPC_LABEL: u64 = 0x7BA;
 pub const FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL: u64 = 0x7BB;
 pub const FSD_SERVICE_UUID_CREATE_LABEL: u64 = 0x7BC;
 pub const FSD_SERVICE_GOP_QUERY_LABEL: u64 = 0x7BD;
+pub const FSD_SERVICE_MMIO_REQUEST_LABEL: u64 = 0x7F2;
+const MM_NON_CACHED: u32 = nt_hal_abi::MM_NON_CACHED;
 pub const FSD_SERVICE_DISPLAY_OWNERSHIP_LABEL: u64 = 0x7BE;
 pub const FSD_SERVICE_PNP_NOTIFICATION_LABEL: u64 = 0x7BF;
 pub const FSD_SERVICE_PROPERTY_WRITE_LABEL: u64 = 0x7C0;
@@ -1958,10 +1965,7 @@ const HOSTED_HAL_TRANSLATE_TRACE_CAP: u64 = 32;
 static HOSTED_INTERRUPT_VECTOR_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_INTERRUPT_CONNECT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_INTERRUPT_BROKER_REJECTION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_MMIO_MAP_SUCCESS_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_MMIO_MAP_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_INTERRUPT_TRACE_CAP: u64 = 32;
-const HOSTED_MMIO_MAP_TRACE_CAP: u64 = 32;
 static HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP: u64 = 16;
 static HOSTED_PROVIDER_EXPORT_REJECTION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -5121,29 +5125,6 @@ fn print_hex64(value: u64) {
             b'a' + (nib - 10)
         });
     }
-}
-
-fn trace_hosted_mm_map_io_space(phys: u64, length: u64, cache: u32, result: u64, decision: &[u8]) {
-    let counter = if result == 0 {
-        &HOSTED_MMIO_MAP_FAILURE_TRACE_COUNT
-    } else {
-        &HOSTED_MMIO_MAP_SUCCESS_TRACE_COUNT
-    };
-    let trace = counter.fetch_add(1, Ordering::Relaxed);
-    if trace >= HOSTED_MMIO_MAP_TRACE_CAP {
-        return;
-    }
-    print_str(b"[hosted-mmio] MmMapIoSpace phys=");
-    print_hex64(phys);
-    print_str(b" len=");
-    print_u64(length);
-    print_str(b" cache=");
-    print_u64(cache as u64);
-    print_str(b" result=");
-    print_hex64(result);
-    print_str(b" decision=");
-    print_str(decision);
-    print_str(b"\n");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11541,81 +11522,52 @@ extern "win64" fn s_mm_get_virtual_for_physical(physical_address: u64) -> u64 {
     unsafe { hosted_component_virtual_address(physical_address, 1).unwrap_or(0) }
 }
 
-/// `PVOID MmMapIoSpace(PHYSICAL_ADDRESS, SIZE_T, MEMORY_CACHING_TYPE)` — return the component VA
-/// for a BAR range the executive already granted to this hosted driver. Requests outside the active
-/// grant fail with NULL; there is no success fallback.
-extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
+fn submit_mmio_map_request(phys: u64, length: u64, cache: u32) -> Option<u64> {
     unsafe {
-        let shared = hosted_component_resource_shared_va();
-        if let Some(existing) = hosted_component_virtual_address(phys, length) {
-            trace_hosted_mm_map_io_space(phys, length, cache, existing, b"component-map");
-            return existing;
+        if hosted_irq_lane_context().is_some() {
+            let result = hosted_irq_lane_request(
+                nt_hosted_runtime::HostedIrqServiceKind::MmioRequest,
+                FSD_SERVICE_MMIO_REQUEST_LABEL,
+                &[1, phys, length, cache as u64],
+            )?;
+            return (result.status == nt_status::NtStatus::SUCCESS.raw()
+                && result.value_count == 1 && result.values[0] != 0)
+                .then_some(result.values[0]);
         }
-        let Some(resource) = find_shared_address_resource_by_range(
-            shared,
-            SH_RESOURCE_ADDRESS_KIND_MEMORY,
-            phys,
-            length,
-            true,
-        ) else {
-            if let Some(projected) = hosted_driver_contiguous_memory::map_physical(
-                phys, length, cache) {
-                trace_hosted_mm_map_io_space(phys, length, cache, projected, b"contiguous-owned");
-                return projected;
-            }
-            // A live GOP/Dxg registration may own the boot scanout through its PCI display BAR
-            // even when this component has no ordinary PnP memory grant (ROOT miniports).
-            let (words, projected, _, _, _) = call_on4_raw(
-                (FSD_SERVICE_GOP_QUERY_LABEL << 12) | 3,
-                phys, length, cache as u64, 0,
-            );
-            if words == 1 && projected != 0 {
-                write_volatile((shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, phys);
-                write_volatile((shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, length);
-                trace_hosted_mm_map_io_space(phys, length, cache, projected, b"gop-bar");
-                return projected;
-            }
-            trace_hosted_mm_map_io_space(phys, length, cache, 0, b"not-assigned");
-            return 0;
-        };
-        if resource.va == 0 || resource.map_len > resource.len {
-            trace_hosted_mm_map_io_space(phys, length, cache, 0, b"invalid-grant");
-            return 0;
-        }
-        let offset = phys - resource.translated_start;
-        write_volatile(
-            (shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
-            phys,
+        let (words, status, va, _, _) = call_on4_raw(
+            (FSD_SERVICE_MMIO_REQUEST_LABEL << 12) | 4,
+            1, phys, length, cache as u64,
         );
-        write_volatile(
-            (shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
-            length,
-        );
-        let result = resource.va + offset;
-        trace_hosted_mm_map_io_space(phys, length, cache, result, b"resource-grant");
-        result
+        (words == 2 && status as u32 as i32 == nt_status::NtStatus::SUCCESS.raw() && va != 0)
+            .then_some(va)
     }
 }
 
-/// `void MmUnmapIoSpace(PVOID, SIZE_T)` — revoke the recorded projection. The VSpace mapping is
-/// owned by the executive grant and is torn down with the component.
-extern "win64" fn s_mm_unmap_io_space(base: u64, _length: u64) {
+fn submit_mmio_unmap_request(base: u64, length: u64) -> bool {
     unsafe {
-        if hosted_driver_contiguous_memory::unmap_physical(base, _length) { return; }
-        let shared = hosted_provider_export_lane::current_component_bank()
-            .or_else(hosted_class_irp_lane::current_component_bank)
-            .unwrap_or(FSD_SHARED_VADDR);
-        if find_shared_address_resource_by_va(shared, base, 1).is_some() {
-            write_volatile(
-                (shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
-                0,
-            );
-            write_volatile(
-                (shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
-                0,
-            );
+        if hosted_irq_lane_context().is_some() {
+            return hosted_irq_lane_request(
+                nt_hosted_runtime::HostedIrqServiceKind::MmioRequest,
+                FSD_SERVICE_MMIO_REQUEST_LABEL,
+                &[2, base, length, 0],
+            ).is_some_and(|result| result.status == nt_status::NtStatus::SUCCESS.raw());
         }
+        let (words, status, _, _, _) = call_on4_raw(
+            (FSD_SERVICE_MMIO_REQUEST_LABEL << 12) | 4,
+            2, base, length, 0,
+        );
+        words == 2 && status as u32 as i32 == nt_status::NtStatus::SUCCESS.raw()
     }
+}
+
+/// `PVOID MmMapIoSpace(PHYSICAL_ADDRESS, SIZE_T, MEMORY_CACHING_TYPE)`.
+extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
+    hosted_mmio_request::map_io_space(phys, length, cache)
+}
+
+/// `void MmUnmapIoSpace(PVOID, SIZE_T)`.
+extern "win64" fn s_mm_unmap_io_space(base: u64, length: u64) {
+    hosted_mmio_request::unmap_io_space(base, length)
 }
 
 /// `NTSTATUS IoConnectInterrupt(...)` — validate the requested vector against the active PnP grant
@@ -44963,6 +44915,7 @@ unsafe fn map_hosted_resource_frame_run(
     frame_base: u64,
     pages: u64,
     rights: u64,
+    cache: nt_pnp_context::resource_mapping::MappingCache,
 ) -> Result<(), nt_status::NtStatus> {
     hosted_resource_mapping::map_run(
         instance_index,
@@ -44974,6 +44927,7 @@ unsafe fn map_hosted_resource_frame_run(
         frame_base,
         pages,
         rights,
+        cache,
     )
 }
 
@@ -58663,7 +58617,7 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
 
     if !mmio_usage_published {
-        record_hosted_mmio_usage(binding, sh)?;
+        hosted_mmio_broker::validate_publication(binding)?;
         hosted_pnp_transactions_mut()
             .iter_mut()
             .find(|transaction| transaction.irp_id == irp_id)
@@ -61693,6 +61647,7 @@ unsafe fn clear_hosted_resource_projection(
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     preflight_hosted_dma_adapter_leases(binding)?;
+    hosted_mmio_broker::preflight_retirement(binding)?;
     // Mask and drain ISR delivery before retiring an adapter it may still use. The read-only
     // preflight above refuses a known busy owner before this first retirement effect.
     retire_hosted_irq_connections_for_binding(binding)?;
@@ -61703,6 +61658,7 @@ unsafe fn clear_hosted_resource_projection(
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     preflight_hosted_dma_adapter_leases(binding)?;
+    hosted_mmio_broker::retire_binding(binding)?;
     revoke_hosted_dma_adapter_leases(binding)?;
     reconcile_hosted_io_port_cap_effects(binding)?;
     let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
@@ -68210,6 +68166,7 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                     window.dma_frame_base,
                     window.dma_pages,
                     RW_NX,
+                    nt_pnp_context::resource_mapping::MappingCache::WriteBack,
                 )
             } {
                 if unsafe {
@@ -73336,6 +73293,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             instance_index, inst, paging_domain, device_id, pnp_context_lease,
             grant.component_va & !0xfff, grant.frame_base, grant.map_pages,
             if grant.writable { RW_NX } else { RO_NX },
+            nt_pnp_context::resource_mapping::MappingCache::Uncached,
         ) {
             rollback_staged_hosted_resource_grant(
                 binding,
@@ -73399,6 +73357,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             dma_frame_base,
             dma_pages,
             RW_NX,
+            nt_pnp_context::resource_mapping::MappingCache::WriteBack,
         ) {
             rollback_staged_hosted_resource_grant(
                 binding,
@@ -73421,6 +73380,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                 dma_frame_base,
                 dma_pages,
                 RW_NX,
+                nt_pnp_context::resource_mapping::MappingCache::WriteBack,
             ) {
                 rollback_staged_hosted_resource_grant(
                     binding,
@@ -74000,40 +73960,6 @@ unsafe fn replay_hosted_dma_allocation_records(
         record_index += 1;
     }
 
-    Ok(())
-}
-
-unsafe fn record_hosted_mmio_usage(
-    binding: HostedDeviceBinding,
-    sh: u64,
-) -> Result<(), nt_status::NtStatus> {
-    let owner = hosted_resource_owner(binding);
-    let mapped_phys = read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *const u64);
-    let mapped_len = read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64);
-    if mapped_phys != 0 || mapped_len != 0 {
-        let resource = find_shared_address_resource_by_range(
-            sh,
-            SH_RESOURCE_ADDRESS_KIND_MEMORY,
-            mapped_phys,
-            mapped_len,
-            true,
-        )
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        let expected_resource_id =
-            hosted_mmio_resource_id(binding.device_id, resource.resource_index)
-                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-        let mapped = hosted_resource_manager_mut()
-            .map_io_space(owner, mapped_phys, mapped_len, nt_hal_abi::MM_NON_CACHED)
-            .map_err(hosted_hal_status)?;
-        if mapped.resource_id != expected_resource_id
-            || mapped.translated_start != mapped_phys
-            || mapped.length != mapped_len
-            || resource.va == 0
-        {
-            let _ = hosted_resource_manager_mut().unmap_io_space(owner, mapped.mapping_id);
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        }
-    }
     Ok(())
 }
 
