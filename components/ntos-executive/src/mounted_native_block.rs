@@ -370,7 +370,7 @@ impl SectorClaim {
             Self::Create(c) => {
                 let sector = bytes.and_then(|bytes| <&[u8; 512]>::try_from(bytes)
                     .map_err(|_| nt_fs::FatPathError::Corrupt));
-                crate::mounted_volume::complete_mounted_create_sector(c, sector)
+                let _lookup_result = crate::mounted_volume::complete_mounted_create_sector(c, sector)
                     .expect("entered CREATE sector claim lost");
             }
             Self::Overlay(c) => {
@@ -397,7 +397,9 @@ impl SectorClaim {
             Self::Create(c) => {
                 let sector = bytes.and_then(|bytes| <&[u8; 512]>::try_from(bytes)
                     .map_err(|_| nt_fs::FatPathError::Corrupt));
-                crate::mounted_volume::complete_physical_mounted_create_sector(c, sector)
+                // The inner FAT error is retained for File IRP delivery; only an invalid
+                // claim is an ownership violation here.
+                let _lookup_result = crate::mounted_volume::complete_physical_mounted_create_sector(c, sector)
                     .expect("settled physical CREATE sector claim lost");
             }
             Self::Directory(c) => {
@@ -511,7 +513,7 @@ impl WorkClaim {
     fn complete_cached(self, bytes: &[u8; 512]) {
         match self {
             Self::Sector(SectorClaim::Create(claim)) => {
-                crate::mounted_volume::complete_cached_mounted_create_sector(claim, bytes)
+                let _lookup_result = crate::mounted_volume::complete_cached_mounted_create_sector(claim, bytes)
                     .expect("copied exact CREATE sector claim lost");
             }
             Self::Sector(SectorClaim::Directory(claim)) => {
