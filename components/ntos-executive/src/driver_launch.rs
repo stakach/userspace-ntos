@@ -66251,14 +66251,29 @@ unsafe fn allocate_hosted_driver_component_slot(instance: usize) -> Option<usize
 
 /// Whether `instance`'s dispatch on `route` is parked in a provider wait (a captured
 /// KeWaitForSingleObject/KeWaitForMultipleObjects inside the dispatch it is running).
-/// Bounded evidence of an ordinary IRP admitted on the worker while the primary is parked (#427).
-fn trace_ordinary_irp_lane(instance: usize, major: u64, irp: u64) {
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if n > 32 && !n.is_power_of_two() { return; }
-    print_str(b"[ordinary-irp-lane] n/instance/major/irp/lane=");
+/// Bounded per-instance evidence of why an ordinary IRP can or cannot use its worker.
+/// A global budget hid later instances behind unrelated early boot dispatches (#481).
+fn trace_ordinary_irp_lane(instance: usize, major: u64, irp: u64, stage: u64,
+    primary_admits: bool, parked: bool, prepare: u64, selected: bool) {
+    static DECISIONS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+    static SELECTIONS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+    let counters = if stage == 1 { &DECISIONS } else { &SELECTIONS };
+    let Some(counter) = counters.get(instance) else { return; };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() { return; }
+    let (phase, route, claim_idle, worker) = unsafe {
+        hosted_class_irp_lane::ordinary_admission_snapshot(instance)
+    };
+    // Stage 1 is the parked-primary decision; stage 2 is select_new's result.
+    // Prepare is 0 when skipped, 1 on success, or the exact NTSTATUS on refusal.
+    print_str(b"[ordinary-irp-lane] n/instance/major/irp/stage/primary/parked/prepare/selected/phase/route/claim_idle/worker=");
     print_u64(n); print_str(b"/"); print_u64(instance as u64); print_str(b"/");
-    print_hex_u64(major); print_str(b"/"); print_hex_u64(irp); print_str(b"/worker\n");
+    print_hex_u64(major); print_str(b"/"); print_hex_u64(irp); print_str(b"/");
+    print_u64(stage); print_str(b"/"); print_u64(u64::from(primary_admits)); print_str(b"/");
+    print_u64(u64::from(parked)); print_str(b"/"); print_hex_u64(prepare); print_str(b"/");
+    print_u64(u64::from(selected)); print_str(b"/"); print_u64(phase); print_str(b"/");
+    print_u64(route); print_str(b"/"); print_u64(claim_idle); print_str(b"/");
+    print_u64(worker); print_str(b"\n");
 }
 
 unsafe fn hosted_driver_waiters_mut() -> &'static mut Vec<HostedDriverRawWaiter> {
@@ -77471,10 +77486,17 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
             // Only the primary's own parked dispatch counts, never another waiter on its route.
             let waiting = !primary_admits
                 && crate::spawn_hosts::shared_ingress::owner::runtime::primary_dispatch_parked(route);
-            let worker_admits = waiting && hosted_class_irp_lane::prepare(dispatch_index).is_ok();
+            let prepared = if waiting {
+                Some(hosted_class_irp_lane::prepare(dispatch_index))
+            } else { None };
+            let worker_admits = matches!(prepared, Some(Ok(())));
             let lane = nt_hosted_runtime::select_ordinary_irp_lane(primary_admits, waiting, worker_admits);
-            if lane == nt_hosted_runtime::OrdinaryIrpLane::Worker {
-                trace_ordinary_irp_lane(dispatch_index, major, canonical_irp_id);
+            if waiting {
+                trace_ordinary_irp_lane(dispatch_index, major, canonical_irp_id, 1,
+                    primary_admits, waiting, prepared.map_or(0, |result| match result {
+                        Ok(()) => 1,
+                        Err(status) => status.raw() as u32 as u64,
+                    }), lane == nt_hosted_runtime::OrdinaryIrpLane::Worker);
             }
             lane == nt_hosted_runtime::OrdinaryIrpLane::Worker
         });
@@ -77513,6 +77535,10 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
         } else {
             hosted_class_irp_lane::select_control(dispatch_index, canonical_irp_id)
         };
+        if parked_primary_worker {
+            trace_ordinary_irp_lane(dispatch_index, major, canonical_irp_id, 2,
+                false, true, 1, selection.is_some());
+        }
         match selection {
             Some(selection) => Some(selection),
             None => {

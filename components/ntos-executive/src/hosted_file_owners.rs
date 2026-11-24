@@ -2212,6 +2212,38 @@ fn trace_file_return_probe_status(
     print_str(b"\n");
 }
 
+/// Bounded per-instance observation of ordinary File terminal and ACK ownership (#481).
+/// Stages: 1 terminal publish attempt, 2 published, 3 publish refused;
+/// 4 synchronous terminal retired, 5 retirement refused; 6 ACK attempt,
+/// 7 ACK retired without backend, 8 backend ACK retired, 9 backend ACK retained.
+fn trace_file_terminal_ack(stage: u64, id: u64, irp: IrpId,
+    status: Option<nt_status::NtStatus>) {
+    let owner = row(id);
+    if owner.irp_id != Some(irp) { return; }
+    static COUNT: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+    let instance = owner.primary_driver
+        .and_then(|driver| instance_by_driver_id(driver.raw()))
+        .map_or(usize::MAX, |(index, _)| index);
+    let Some(counter) = COUNT.get(instance) else { return; };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() { return; }
+    let flight = match owner.flight {
+        Flight::Preparing => 1, Flight::QueuedDispatch => 2, Flight::Dispatch => 3,
+        Flight::PumpSuspended => 4, Flight::PumpReturned => 5, Flight::Copy => 6,
+        Flight::Cancel => 7, Flight::Acknowledge => 8, Flight::Idle => 9,
+        Flight::Blocked => 10,
+    };
+    print_str(b"[file-terminal-ack] n/instance/row/irp/major/stage/flight/completion/receipt/status=");
+    print_u64(n); print_str(b"/"); print_u64(instance as u64); print_str(b"/");
+    print_u64(id); print_str(b"/"); print_hex_u64(irp.raw()); print_str(b"/");
+    print_hex_u64(owner.phase_major as u64); print_str(b"/"); print_u64(stage);
+    print_str(b"/"); print_u64(flight); print_str(b"/");
+    print_u64(u64::from(owner.completion.is_some())); print_str(b"/");
+    print_u64(u64::from(owner.terminal_receipt.is_some())); print_str(b"/");
+    print_hex_u64(status.map_or(0, |status| status.raw() as u32 as u64));
+    print_str(b"\n");
+}
+
 /// What a dispatch does when no hosted lane can admit its IRP yet (#427).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Admission {
@@ -2545,18 +2577,21 @@ fn take_deferred(id: u64) -> bool {
 fn publish_terminal(
     id: u64, irp_id: IrpId, terminal: ExternalFileIrpTerminal,
 ) -> Result<(), nt_status::NtStatus> {
+    trace_file_terminal_ack(1, id, irp_id, None);
     match io_manager_mut().queue_external_file_irp_terminal(terminal, row(id).output_capture) {
         Ok(completion) => {
             row(id).completion = Some(*completion.completion());
             keep(id, Payload::Completion(completion));
             crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
             trace_plain_pump(b"published", irp_id);
+            trace_file_terminal_ack(2, id, irp_id, None);
             Ok(())
         }
         Err(rejection) => {
             let (status, terminal) = rejection.into_parts();
             block(id, Payload::Terminal(terminal), status);
             trace_plain_pump(b"unpublished", irp_id);
+            trace_file_terminal_ack(3, id, irp_id, Some(status));
             Err(status)
         }
     }
@@ -2573,6 +2608,7 @@ fn retire_returned_terminal(
             assert!(io_manager_mut().accepts_external_file_irp_receipt(&receipt));
             row(id).terminal_receipt = Some(receipt);
             row(id).settled_buffers = Some(buffers);
+            trace_file_terminal_ack(4, id, irp_id, None);
             let mut retired = match remove(id) {
                 Ok(retired) => {
                     trace_file_return_probe(79, irp_id);
@@ -2598,6 +2634,7 @@ fn retire_returned_terminal(
             let (status, terminal) = rejection.into_parts();
             block(id, Payload::Terminal(terminal), status);
             trace_file_return_probe_status(81, irp_id, Some(status));
+            trace_file_terminal_ack(5, id, irp_id, Some(status));
             DispatchResult::Outstanding { irp_id }
         }
     }
@@ -3086,6 +3123,7 @@ pub(super) fn acknowledge_port_connect(irp_id: IrpId) -> Result<[u8; 16], nt_sta
 fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    trace_file_terminal_ack(6, id, irp_id, None);
     ensure_completion(id)?;
     if monotonic_time_100ns() < row(id).retry_after {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
@@ -3133,6 +3171,7 @@ fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_
                 }
                 row(id).terminal_receipt = Some(receipt);
                 row(id).settled_buffers = Some(buffers);
+                trace_file_terminal_ack(7, id, irp_id, None);
                 let mut retired = remove(id)?;
                 return retired.settled_buffers.take()
                     .ok_or(nt_status::NtStatus::INVALID_PARAMETER);
@@ -3169,6 +3208,7 @@ fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_
                     assert!(receipt.backend_acknowledged());
                     row(id).terminal_receipt = Some(receipt);
                     row(id).settled_buffers = Some(buffers);
+                    trace_file_terminal_ack(8, id, irp_id, None);
                     let mut retired = remove(id)?;
                     return Ok(retired.settled_buffers.take()
                         .expect("acknowledged File buffers missing"));
@@ -3206,6 +3246,7 @@ fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_
             assert!(io_manager_mut().accepts_external_file_irp_receipt(&receipt));
             row(id).terminal_receipt = Some(receipt);
             row(id).settled_buffers = Some(buffers);
+            trace_file_terminal_ack(8, id, irp_id, None);
             let mut retired = remove(id)?;
             Ok(retired.settled_buffers.take()
                 .expect("acknowledged File buffers missing"))
@@ -3213,6 +3254,7 @@ fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_
         Err(rejection) => {
             let (status, returned) = rejection.into_parts();
             retry_later(id, Payload::Acknowledgement(returned), status);
+            trace_file_terminal_ack(9, id, irp_id, Some(status));
             Err(status)
         }
     }

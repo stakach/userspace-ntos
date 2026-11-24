@@ -441,6 +441,24 @@ pub(super) unsafe fn select_new(instance_index: usize) -> Option<Selection> {
     select(instance_index, SelectionPurpose::New)
 }
 
+/// Read-only admission census for an ordinary dispatch. Zero phase means no lane exists;
+/// otherwise phase is the `Phase` discriminant plus one. Route admission is 0 when absent,
+/// 1 when ready, 2 when busy, and 3 when the route query failed.
+pub(super) unsafe fn ordinary_admission_snapshot(instance_index: usize) -> (u64, u64, u64, u64) {
+    let Some(index) = index_for(instance_index) else { return (0, 0, 0, 0); };
+    let row = &(&*core::ptr::addr_of!(LANES))[index];
+    let route = match row.route {
+        None => 0,
+        Some(route) => match runtime::ready_for_admission(route) {
+            Ok(true) => 1,
+            Ok(false) => 2,
+            Err(_) => 3,
+        },
+    };
+    (row.phase as u64 + 1, route, u64::from(row.current_irp.admits_new()),
+        u64::from(worker(instance_index, row.ordinal).is_some()))
+}
+
 pub(super) unsafe fn select_callback(instance_index: usize) -> Option<Selection> {
     select(instance_index, SelectionPurpose::Callback)
 }
