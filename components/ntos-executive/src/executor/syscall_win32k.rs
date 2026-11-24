@@ -11,6 +11,55 @@ use super::loop_receive::receive;
 use super::*;
 use crate::executor::local;
 
+static FATAL_DIALOG_TEXT_RECEIPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Observe only a diagnostic string that the normal GDI text-extent route has already copied.
+/// This does not probe guest memory, change arguments, or influence the provider's return value.
+unsafe fn trace_fatal_dialog_text(
+    handler: &ExecNtHandler,
+    pi: usize,
+    tid: u64,
+    staged_text: u64,
+    byte_len: usize,
+) {
+    let mut text = [0u8; 128];
+    let input = core::slice::from_raw_parts(staged_text as *const u8, byte_len);
+    let Some((written, truncated)) = nt_kernel_exec::user_string::bounded_utf16_suffix_receipt(
+        input,
+        b"Rebooting now!",
+        &mut text,
+    ) else {
+        return;
+    };
+    let Some(process) = handler.capture_process_identity(pi) else {
+        return;
+    };
+    if FATAL_DIALOG_TEXT_RECEIPTS.fetch_add(1, Ordering::Relaxed) >= 4 {
+        return;
+    }
+    let (generation_kind, generation) = match process.generation {
+        nt_types::ProcessGeneration::Hosted(value) => (b"hosted" as &[u8], value),
+        nt_types::ProcessGeneration::Temporary(value) => (b"temporary" as &[u8], value),
+    };
+    print_str(b"[fatal-dialog-text] source=NtGdiGetTextExtent pi=");
+    print_u64(pi as u64);
+    print_str(b" pid=");
+    print_u64(process.pid as u64);
+    print_str(b" generation-kind=");
+    print_str(generation_kind);
+    print_str(b" process-generation=");
+    print_u64(generation);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" input-bytes=");
+    print_u64(byte_len as u64);
+    print_str(b" truncated=");
+    print_u64(truncated as u64);
+    print_str(b" text=\"");
+    print_str(&text[..written]);
+    print_str(b"\"\n");
+}
+
 unsafe fn trace_register_hotkey_route(
     phase: &[u8],
     client: win32k_glue::Win32kClientContext,
@@ -2266,6 +2315,15 @@ pub(super) unsafe fn syscall_win32k_route(
                             )
                         };
                         if copied_string {
+                            if count != 0 {
+                                trace_fatal_dialog_text(
+                                    &nt_handler,
+                                    pi,
+                                    current_tid as u64,
+                                    staged_string,
+                                    string_bytes,
+                                );
+                            }
                             d_a1 = staged_string;
                             d_a3 = staged_size;
                             get_text_extent_stack_args = [fl as u32 as u64];

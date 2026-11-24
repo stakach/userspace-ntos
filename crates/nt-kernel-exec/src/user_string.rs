@@ -84,6 +84,39 @@ pub fn large_string_input(raw: &[u8; 16], capture_cap: u64) -> Option<LargeStrin
     })
 }
 
+/// Render an already-captured, counted UTF-16 string only when it ends in an ASCII suffix.
+/// The suffix is checked against the complete input before any output is written. This keeps a
+/// diagnostic receipt bounded without mistaking a truncated prefix for the whole message.
+pub fn bounded_utf16_suffix_receipt(
+    input: &[u8],
+    suffix: &[u8],
+    output: &mut [u8],
+) -> Option<(usize, bool)> {
+    if input.len() & 1 != 0 || suffix.is_empty() || suffix.len() > input.len() / 2 {
+        return None;
+    }
+    let suffix_start = input.len() - suffix.len() * 2;
+    for (index, expected) in suffix.iter().copied().enumerate() {
+        if !expected.is_ascii() || input[suffix_start + index * 2] != expected
+            || input[suffix_start + index * 2 + 1] != 0
+        {
+            return None;
+        }
+    }
+
+    let chars = input.len() / 2;
+    let written = chars.min(output.len());
+    for index in 0..written {
+        let value = u16::from_le_bytes([input[index * 2], input[index * 2 + 1]]);
+        output[index] = match value {
+            0x20..=0x7e => value as u8,
+            0x09 | 0x0a | 0x0d => b' ',
+            _ => b'?',
+        };
+    }
+    Some((written, chars > output.len()))
+}
+
 pub fn required_unicode_string(
     raw: &[u8; 16],
     capture_cap: usize,
@@ -137,6 +170,7 @@ pub fn capture_stack_tail<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     fn descriptor(length: u16, maximum: u16, buffer: u64) -> [u8; 16] {
         let mut raw = [0; 16];
@@ -268,5 +302,74 @@ mod tests {
         );
         assert_eq!(reads, 2);
         assert_eq!(capture_stack_tail(addresses, Some), Some(addresses));
+    }
+
+    fn utf16_bytes(text: &str) -> Vec<u8> {
+        text.encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
+    #[test]
+    fn bounded_utf16_suffix_receipt_preserves_distinct_fatal_dialogs() {
+        let cases = [
+            (
+                "SetupOpenInfFileW() failed to open 'syssetup.inf' (Error: 2)\n\nRebooting now!",
+                "SetupOpenInfFileW() failed to open 'syssetup.inf' (Error: 2)  Rebooting now!",
+            ),
+            (
+                "InstallSysSetupInfDevices() failed!\n\nRebooting now!",
+                "InstallSysSetupInfDevices() failed!  Rebooting now!",
+            ),
+            (
+                "InstallSysSetupInfComponents() failed!\n\nRebooting now!",
+                "InstallSysSetupInfComponents() failed!  Rebooting now!",
+            ),
+            (
+                "EnableUserModePnpManager() failed!\n\nRebooting now!",
+                "EnableUserModePnpManager() failed!  Rebooting now!",
+            ),
+            (
+                "CMP_WaitNoPendingInstallEvents() failed!\n\nRebooting now!",
+                "CMP_WaitNoPendingInstallEvents() failed!  Rebooting now!",
+            ),
+        ];
+        for (input, expected) in cases {
+            let mut output = [0u8; 128];
+            let (written, truncated) = bounded_utf16_suffix_receipt(
+                &utf16_bytes(input),
+                b"Rebooting now!",
+                &mut output,
+            )
+            .expect("the complete fatal dialog suffix must be recognized");
+            assert!(!truncated);
+            assert_eq!(&output[..written], expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn bounded_utf16_suffix_receipt_checks_full_input_before_bounded_rendering() {
+        let input = utf16_bytes("A long component failure with a diagnostic code\n\nRebooting now!");
+        let mut output = [0u8; 12];
+        assert_eq!(
+            bounded_utf16_suffix_receipt(&input, b"Rebooting now!", &mut output),
+            Some((12, true)),
+        );
+        assert_eq!(&output, b"A long compo");
+
+        let mut unchanged = [0x5au8; 12];
+        assert_eq!(
+            bounded_utf16_suffix_receipt(
+                &utf16_bytes("Failed to load LiveCD!"),
+                b"Rebooting now!",
+                &mut unchanged,
+            ),
+            None,
+        );
+        assert_eq!(unchanged, [0x5a; 12]);
+        assert_eq!(
+            bounded_utf16_suffix_receipt(&input[..input.len() - 1], b"Rebooting now!", &mut unchanged),
+            None,
+        );
     }
 }
