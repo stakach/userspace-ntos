@@ -139,6 +139,8 @@ struct Row {
     queue_not_admitted: bool,
     /// [`LANE_EPOCH`] when it was last refused; it is retried only after a lane has freed.
     admission_epoch: u64,
+    /// Diagnostic first sighting of this row's queue, independent of later retries.
+    queue_trace_emitted: bool,
 }
 
 /// Counts dispatches refused admission with nothing entered, for callers that retry them
@@ -615,6 +617,7 @@ fn reserve(
         phase_major: 0,
         queue_not_admitted: false,
         admission_epoch: 0,
+        queue_trace_emitted: false,
     });
     Ok(id)
 }
@@ -2287,7 +2290,53 @@ fn trace_irp_queue(stage: usize, id: u64, major: u8) {
 }
 
 /// Retain a not-admitted preparation; nothing was entered, so it may be begun again.
-fn queue_unadmitted(id: u64, prepared: PreparedExternalFileIrp) {
+#[repr(u64)]
+enum QueueReason {
+    OlderQueuedIrp = 1,
+    NoLane = 2,
+    RedriveNoLane = 3,
+}
+
+/// First refusal per exact File row, including the route state that a sparse global queue
+/// counter cannot preserve once an unrelated driver has filled its print budget (#481).
+fn trace_initial_queue(id: u64, major: u8, reason: QueueReason) {
+    let owner = row(id);
+    if owner.queue_trace_emitted { return; }
+    owner.queue_trace_emitted = true;
+    let (driver, irp) = (owner.primary_driver, owner.irp_id);
+    let Some(instance) = driver.and_then(|driver| instance_by_driver_id(driver.raw()))
+        .map(|(index, _)| index) else { return; };
+    static COUNT: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+    let Some(counter) = COUNT.get(instance) else { return; };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() { return; }
+    let (primary_ready, primary_parked) =
+        match hosted_ingress_sources::primary_route(instance) {
+            Some(route) => {
+                let ready = match unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route) } {
+                    Ok(true) => 1, Ok(false) => 2, Err(_) => 3,
+                };
+                (ready, u64::from(unsafe {
+                    crate::spawn_hosts::shared_ingress::owner::runtime::primary_dispatch_parked(route)
+                }))
+            }
+            None => (0, 0),
+        };
+    let (phase, route, claim_idle, worker) = unsafe {
+        hosted_class_irp_lane::ordinary_admission_snapshot(instance)
+    };
+    print_str(b"[file-first-queue] n/instance/row/irp/major/reason/primary-ready/parked/worker-phase/route/claim-idle/worker=");
+    print_u64(n); print_str(b"/"); print_u64(instance as u64); print_str(b"/");
+    print_u64(id); print_str(b"/"); print_hex_u64(irp.map_or(0, |irp| irp.raw()));
+    print_str(b"/"); print_hex_u64(major as u64); print_str(b"/");
+    print_u64(reason as u64); print_str(b"/"); print_u64(primary_ready); print_str(b"/");
+    print_u64(primary_parked); print_str(b"/"); print_u64(phase); print_str(b"/");
+    print_u64(route); print_str(b"/"); print_u64(claim_idle); print_str(b"/");
+    print_u64(worker); print_str(b"\n");
+}
+
+fn queue_unadmitted(id: u64, prepared: PreparedExternalFileIrp, reason: QueueReason) {
+    trace_initial_queue(id, prepared.projection().major, reason);
     trace_irp_queue(0, id, prepared.projection().major);
     let row = row(id);
     row.payload = Some(Payload::Prepared(prepared));
@@ -2414,7 +2463,7 @@ fn dispatch_with_port_connect<Yield>(
     if row(id).queue_not_admitted && queued_ahead(id) {
         // An older IRP for this driver still waits for a lane; never overtake it.
         let irp_id = prepared.irp_id();
-        queue_unadmitted(id, prepared);
+        queue_unadmitted(id, prepared, QueueReason::OlderQueuedIrp);
         return Ok(DispatchResult::Outstanding { irp_id });
     }
     // This exact retained stack is the last Executive-side point before a disk provider may
@@ -2494,7 +2543,7 @@ fn settle_returned_dispatch(
                 return Ok(DispatchResult::Outstanding { irp_id });
             }
             if row(id).queue_not_admitted {
-                queue_unadmitted(id, prepared);
+                queue_unadmitted(id, prepared, QueueReason::NoLane);
                 return Ok(DispatchResult::Outstanding { irp_id });
             }
             // This caller re-prepares a busy refusal itself.
@@ -2887,7 +2936,7 @@ fn redrive_queued(id: u64) -> QueuedReadRedriveOutcome {
         }
         ExternalFileIrpResult::NotAdmitted { prepared } => {
             // Still no free lane: nothing was entered, so it waits for the next lane change.
-            queue_unadmitted(id, prepared);
+            queue_unadmitted(id, prepared, QueueReason::RedriveNoLane);
             QueuedReadRedriveOutcome::Retained(nt_status::NtStatus::DEVICE_BUSY)
         }
         ExternalFileIrpResult::Returned(terminal) => match publish_terminal(id, irp_id, terminal) {
