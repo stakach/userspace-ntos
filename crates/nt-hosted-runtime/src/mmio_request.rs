@@ -139,6 +139,9 @@ pub enum MmioRequestPhase {
     MapUncertain,
     Unmapping,
     UnmapUncertain,
+    /// The assigned map and its exact unmap both completed for this PnP owner. It proves
+    /// StartDevice use but owns no live resource-manager mapping and cannot authorize replay.
+    CompletedUse,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,9 +181,10 @@ impl MmioRequestLedger {
         }
     }
 
-    /// Includes unresolved effects: these rows remain owned until their outcome is proved.
+    /// Includes unresolved effects, but not acknowledged PnP uses retained only as StartDevice
+    /// evidence. Completed use owns no live resource-manager mapping.
     pub fn live_count(&self) -> usize {
-        self.rows.len()
+        self.rows.iter().filter(|row| row.phase != MmioRequestPhase::CompletedUse).count()
     }
 
     /// Root-only view for exact device publication and teardown. The returned backing is a
@@ -198,13 +202,39 @@ impl MmioRequestLedger {
     > + '_ {
         self.rows
             .iter()
-            .filter(move |row| row.request.owner == owner)
+            .filter(move |row| {
+                row.request.owner == owner && row.phase != MmioRequestPhase::CompletedUse
+            })
             .map(|row| (row.request, row.virtual_start, row.backing, row.phase))
+    }
+
+    /// An acknowledged assigned map/unmap of this exact resource is publication evidence until
+    /// the PnP context retires. It is never a live map or unmap authority.
+    pub fn has_completed_assigned_use(&self, owner: MmioRequestOwner, resource_id: u64) -> bool {
+        matches!(owner.authority, MmioRequestAuthority::Pnp { .. })
+            && self.rows.iter().any(|row| {
+                row.request.owner == owner
+                    && row.phase == MmioRequestPhase::CompletedUse
+                    && matches!(row.backing, Some(MmioRequestBacking::Assigned {
+                        resource_id: row_resource, ..
+                    }) if row_resource == resource_id)
+            })
+    }
+
+    /// Drop completed publication evidence only when the exact PnP context is retired. Live and
+    /// uncertain requests remain owned for the caller's preflight and effect settlement.
+    pub fn retire_completed_pnp_owner(&mut self, owner: MmioRequestOwner) {
+        if matches!(owner.authority, MmioRequestAuthority::Pnp { .. }) {
+            self.rows.retain(|row| {
+                row.request.owner != owner || row.phase != MmioRequestPhase::CompletedUse
+            });
+        }
     }
 
     pub fn has_pnp_device_rows(&self, domain_id: u64, domain_cookie: u64, device_id: u64) -> bool {
         self.rows.iter().any(|row| {
-            row.request.owner.domain_id == domain_id
+            row.phase != MmioRequestPhase::CompletedUse
+                && row.request.owner.domain_id == domain_id
                 && row.request.owner.domain_cookie == domain_cookie
                 && matches!(row.request.owner.authority,
                     MmioRequestAuthority::Pnp { device_id: row_device, .. }
@@ -402,7 +432,14 @@ impl MmioRequestLedger {
         if self.rows[index].phase != MmioRequestPhase::Unmapping {
             return Err(MmioRequestError::Unavailable);
         }
-        self.rows.remove(index);
+        if matches!(self.rows[index].request.owner.authority, MmioRequestAuthority::Pnp { .. })
+            && matches!(self.rows[index].backing, Some(MmioRequestBacking::Assigned { .. }))
+        {
+            self.rows[index].virtual_start = None;
+            self.rows[index].phase = MmioRequestPhase::CompletedUse;
+        } else {
+            self.rows.remove(index);
+        }
         Ok(())
     }
 

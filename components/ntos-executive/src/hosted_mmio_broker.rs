@@ -227,29 +227,13 @@ pub(super) unsafe fn validate_publication(
     let resources = state.address_resources
         .get(..usize::from(state.address_resource_count))
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    let assigned_memory = hosted_mmio_publication_policy::assigned_memory_requires_receipt(resources);
-    let mut ready = 0usize;
-    if let Some(ledger) = (*core::ptr::addr_of!(REQUESTS)).as_ref() {
-        for (request, va, backing, phase) in ledger.owner_rows(owner) {
-            let Some(nt_hosted_runtime::MmioRequestBacking::Assigned {
-                resource_id, mapping_id,
-            }) = backing else {
-                return Err(nt_status::NtStatus::DEVICE_BUSY);
-            };
-            if phase != nt_hosted_runtime::MmioRequestPhase::Ready
-                || va.is_none()
-                || hosted_resource_manager_mut().mapping_info(mapping_id)
-                    != Some((resource_id, request.physical_start, request.length))
-            {
-                return Err(nt_status::NtStatus::DEVICE_BUSY);
-            }
-            ready += 1;
-        }
-    }
-    if assigned_memory && ready == 0 {
-        return Err(nt_status::NtStatus::DEVICE_BUSY);
-    }
-    Ok(())
+    hosted_mmio_publication_policy::validate_receipts(
+        resources,
+        (*core::ptr::addr_of!(REQUESTS)).as_ref(),
+        owner,
+        |mapping_id| hosted_resource_manager_mut().mapping_info(mapping_id),
+        |resource_index| hosted_mmio_resource_id(binding.device_id, resource_index),
+    )
 }
 
 /// Drain ready per-call IDs before resource-page/cap retirement. An uncertain effect fences the
@@ -293,7 +277,10 @@ pub(super) unsafe fn retire_binding(
         let next = (*core::ptr::addr_of!(REQUESTS)).as_ref()
             .and_then(|ledger| ledger.owner_rows(owner)
                 .find_map(|(request, va, _, _)| va.map(|va| (va, request.length))));
-        let Some((base, length)) = next else { return Ok(()); };
+        let Some((base, length)) = next else {
+            requests_mut().retire_completed_pnp_owner(owner);
+            return Ok(());
+        };
         unmap_assigned(binding, base, length)?;
     }
 }
