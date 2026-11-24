@@ -134,6 +134,23 @@ impl SharedDmaRecord {
         }
         Err(Busy)
     }
+
+    /// Ignore a record owned by another adapter without waiting for its pending map effect.
+    /// A zero adapter remains ambiguous and must pass through the normal snapshot check.
+    ///
+    /// # Safety
+    /// The caller must hold the allocation guard used by every writer of this record until
+    /// this method returns. Without that guard, a recycled RESERVED record can still expose
+    /// its previous adapter ID and cause an incorrect skip.
+    pub unsafe fn snapshot_for_relevant_adapter_locked(
+        &self, relevant: impl FnOnce(u64) -> bool,
+    ) -> Result<Option<Snapshot>, Busy> {
+        let adapter_id = self.adapter_id.load(Ordering::SeqCst);
+        if adapter_id != 0 && !relevant(adapter_id) {
+            return Ok(None);
+        }
+        self.snapshot().map(Some)
+    }
 }
 
 const _: () = assert!(core::mem::size_of::<SharedDmaRecord>() == 0x40);
@@ -190,5 +207,23 @@ mod tests {
             }
         }
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn unrelated_reserved_adapter_does_not_block_another_device_publication() {
+        let record = SharedDmaRecord::new();
+        record.begin();
+        record.store(0x00, 0x10c000);
+        record.store(0x18, 2);
+        record.store(0x30, 0x0000_0106_0000_0f00);
+        record.store(0x38, 1);
+
+        // The caller holds the same allocation guard as the writer for each inspection.
+        assert_eq!(unsafe { record.snapshot_for_relevant_adapter_locked(|adapter| {
+            adapter == 3 || adapter == 4
+        }) }, Ok(None));
+        assert_eq!(record.load(0x08), RESERVED, "unrelated replay cannot retire the map");
+        assert_eq!(unsafe { record.snapshot_for_relevant_adapter_locked(|adapter| adapter == 1) },
+            Err(Busy), "the owning device must still wait for an exact settlement");
     }
 }

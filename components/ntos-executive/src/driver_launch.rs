@@ -12171,6 +12171,12 @@ static HOSTED_DMA_ALLOCATION_LOCK: AtomicBool = AtomicBool::new(false);
 struct HostedDmaAllocationGuard;
 
 impl HostedDmaAllocationGuard {
+    fn try_acquire() -> Option<Self> {
+        HOSTED_DMA_ALLOCATION_LOCK.compare_exchange(
+            false, true, Ordering::Acquire, Ordering::Relaxed,
+        ).ok().map(|_| Self)
+    }
+
     fn acquire() -> Self {
         while HOSTED_DMA_ALLOCATION_LOCK.compare_exchange_weak(
             false, true, Ordering::Acquire, Ordering::Relaxed,
@@ -12314,10 +12320,36 @@ unsafe fn dma_record_store(record: u64, offset: u64, value: u64) {
     dma_shared_record(record).store(offset, value)
 }
 
-unsafe fn dma_allocation_record_snapshot(
+unsafe fn dma_allocation_record_snapshot_for_relevant_adapter(
     record: u64,
-) -> Result<nt_dma_manager::shared_record::Snapshot, nt_status::NtStatus> {
-    dma_shared_record(record).snapshot().map_err(|_| nt_status::NtStatus::DEVICE_BUSY)
+    relevant: impl FnOnce(u64) -> bool,
+) -> Result<Option<nt_dma_manager::shared_record::Snapshot>, nt_status::NtStatus> {
+    // Root cannot spin on a component-held guard. Once acquired, the adapter ID and commit
+    // marker cannot change together under us; an unrelated RESERVED map is safe to skip.
+    let _guard = HostedDmaAllocationGuard::try_acquire()
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    dma_shared_record(record).snapshot_for_relevant_adapter_locked(relevant)
+        .map_err(|_| nt_status::NtStatus::DEVICE_BUSY)
+}
+
+unsafe fn dma_allocation_record_count_for_replay(sh: u64)
+    -> Result<u64, nt_status::NtStatus>
+{
+    let _guard = HostedDmaAllocationGuard::try_acquire()
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    Ok(read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64))
+}
+
+unsafe fn dma_adapter_lease_for_binding(
+    binding: HostedDeviceBinding,
+    adapter_id: u64,
+) -> Option<HostedDmaAdapterLease> {
+    hosted_dma_adapter_leases_mut().iter().copied().find(|lease| {
+        lease.adapter_id == adapter_id
+            && lease.owner == hosted_dma_owner(binding)
+            && lease.consumer_domain == binding.projection_domain
+            && lease.pdo_registration.device_id().raw() == binding.pdo_device_id
+    })
 }
 
 unsafe fn dma_allocation_range_overlaps(
@@ -33505,7 +33537,7 @@ unsafe fn provider_dma_allocation_records_valid(
     sh: u64,
 ) -> Result<(), nt_status::NtStatus> {
     let record_capacity = dma_allocation_record_capacity(sh);
-    let record_count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    let record_count = dma_allocation_record_count_for_replay(sh)?;
     if record_capacity != dma_allocation_record_arena_capacity() || record_count > record_capacity {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -33513,22 +33545,24 @@ unsafe fn provider_dma_allocation_records_valid(
     while index < record_count {
         let record = dma_allocation_record(sh, index)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        let snapshot = dma_allocation_record_snapshot(record)?;
+        let mut lease = None;
+        let Some(snapshot) = dma_allocation_record_snapshot_for_relevant_adapter(
+            record, |adapter_id| {
+                lease = dma_adapter_lease_for_binding(binding, adapter_id);
+                lease.is_some()
+            },
+        )? else {
+            index += 1;
+            continue;
+        };
         let (logical, len, va, kind, adapter_id) = (snapshot.logical, snapshot.length,
             snapshot.va, snapshot.kind, snapshot.adapter_id);
         if logical != 0 || len != 0 || va != 0 || kind != 0 || adapter_id != 0 {
             if adapter_id == 0 {
                 return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
             }
-            let lease = hosted_dma_adapter_leases_mut().iter().copied().find(|lease| {
-                lease.adapter_id == adapter_id
-                    && lease.owner == hosted_dma_owner(binding)
-                    && lease.consumer_domain == binding.projection_domain
-                    && lease.pdo_registration.device_id().raw() == binding.pdo_device_id
-            });
             let Some(lease) = lease else {
-                index += 1;
-                continue;
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
             };
             if io_manager_mut().hosted_device_pointer_registration(
                 lease.pdo_registration.domain(), lease.pdo_registration.address(),
@@ -56188,14 +56222,18 @@ unsafe fn hosted_dma_adapter_has_live_records(
         }
         let sh = inst.exec_shared_va;
         let capacity = dma_allocation_record_capacity(sh);
-        let count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+        let count = dma_allocation_record_count_for_replay(sh)?;
         if capacity != dma_allocation_record_arena_capacity() || count > capacity {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         for record_index in 0..count {
             let record = dma_allocation_record(sh, record_index)
                 .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-            let snapshot = dma_allocation_record_snapshot(record)?;
+            let Some(snapshot) = dma_allocation_record_snapshot_for_relevant_adapter(
+                record, |record_adapter| record_adapter == adapter_id,
+            )? else {
+                continue;
+            };
             if snapshot.length != 0 && snapshot.adapter_id == adapter_id {
                 return Ok(true);
             }
@@ -74609,7 +74647,7 @@ unsafe fn replay_hosted_dma_allocation_records(
     sh: u64,
 ) -> Result<(), nt_status::NtStatus> {
     let record_capacity = dma_allocation_record_capacity(sh);
-    let record_count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    let record_count = dma_allocation_record_count_for_replay(sh)?;
     if record_capacity != dma_allocation_record_arena_capacity() || record_count > record_capacity {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -74618,7 +74656,11 @@ unsafe fn replay_hosted_dma_allocation_records(
         let Some(record) = dma_allocation_record(sh, record_index) else {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         };
-        let snapshot = dma_allocation_record_snapshot(record).map_err(|status| {
+        let mut lease = None;
+        let snapshot = dma_allocation_record_snapshot_for_relevant_adapter(record, |adapter_id| {
+            lease = dma_adapter_lease_for_binding(binding, adapter_id);
+            lease.is_some()
+        }).map_err(|status| {
             static DMA_PUBLICATION_BUSY: AtomicU64 = AtomicU64::new(0);
             if DMA_PUBLICATION_BUSY.fetch_add(1, Ordering::Relaxed) < 16 {
                 print_str(b"[dma-publication-busy] index/record/length/flags/logical/va/kind/source/map/adapter=");
@@ -74637,6 +74679,10 @@ unsafe fn replay_hosted_dma_allocation_records(
             }
             status
         })?;
+        let Some(snapshot) = snapshot else {
+            record_index += 1;
+            continue;
+        };
         let (logical, len, va, kind, dma_adapter_id) = (
             snapshot.logical, snapshot.length, snapshot.va, snapshot.kind, snapshot.adapter_id,
         );
@@ -74644,17 +74690,8 @@ unsafe fn replay_hosted_dma_allocation_records(
             if dma_adapter_id == 0 {
                 return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
             }
-            let lease = hosted_dma_adapter_leases_mut().iter().copied().find(|lease| {
-                lease.adapter_id == dma_adapter_id
-                    && lease.owner == hosted_dma_owner(binding)
-                    && lease.consumer_domain == binding.projection_domain
-                    && lease.pdo_registration.device_id().raw() == binding.pdo_device_id
-            });
             let Some(lease) = lease else {
-                // Another device in this instance owns this local projection. Its root claim
-                // is not part of this binding's replay and must not be rewritten here.
-                record_index += 1;
-                continue;
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
             };
             let (dma_grant_va, dma_grant_len, dma_grant_logical) = lease.grant
                 .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
