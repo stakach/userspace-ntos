@@ -56,9 +56,8 @@ class ParseScriptTests(unittest.TestCase):
         # Run 45436226805 captured the shell after 10 s while its menu was
         # still absent; 45425894277 had a visible menu after a 60 s settle.
         self.assertEqual(script.steps[2].wait_seconds, 60.0)
-        # The installed LiberNT desktop has no Command Prompt icon. Its Start
-        # menu searches shortcut names, so "command" can find Command Prompt;
-        # the result must be visible before Enter launches it.
+        # The Start menu searches shortcut names, so "command" can find
+        # Command Prompt; the result must be visible before Enter launches it.
         self.assertEqual([step.name for step in script.steps],
                          ["baseline", "desktop-pointer", "start-menu", "command-prompt-search",
                           "command-prompt", "ver"])
@@ -76,15 +75,17 @@ class ParseScriptTests(unittest.TestCase):
 
     def test_arm_mode_selects_seal_or_sealed_idle(self):
         self.assertEqual(parse_script({**DOCUMENT, "arm": "idle"}).arm, "idle")
-        self.assertEqual(load_script(DEFAULT_SCRIPT).arm, "seal")
+        self.assertEqual(load_script(DEFAULT_SCRIPT).arm, "idle")
         for bad in ("later", "", 1, None):
             with self.subTest(bad), self.assertRaises(ValueError):
                 parse_script({**DOCUMENT, "arm": bad})
 
-    def test_production_script_arms_at_seal_while_background_work_continues(self):
+    def test_production_script_waits_for_sealed_desktop_idle(self):
         script = load_script(DEFAULT_SCRIPT)
-        self.assertEqual(script.arm, "seal",
-                         "a painted Explorer desktop must accept input while services continue")
+        # LiberNT's Run\AppLauncher opens a /c console after Explorer paints.
+        # Starting the search at seal let that console steal Enter before the
+        # interactive Command Prompt shortcut could launch (KVM 45468676396).
+        self.assertEqual(script.arm, "idle")
         self.assertEqual(script.settle_seconds, 10)
         with tempfile.TemporaryDirectory() as directory:
             serial = Path(directory) / "serial.log"

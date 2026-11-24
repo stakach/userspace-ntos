@@ -1,6 +1,6 @@
 {
   "screen": [1024, 768],
-  "arm": "seal",
+  "arm": "idle",
   "settle_seconds": 10,
   "steps": [
     {"name": "baseline", "actions": [], "wait_seconds": 0},
