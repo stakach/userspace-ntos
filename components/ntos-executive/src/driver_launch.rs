@@ -10167,7 +10167,10 @@ impl ForwardProjectionCaller {
 
     /// Submit `irp` (op 1), then unwind its completion routines locally and acknowledge a
     /// synchronous terminal (op 2), hold an inline MPR (op 4), or arm a Pending dispatch (op 3).
-    unsafe fn forward(self, device: u64, irp: u64, next: u64, location_after_forward: u8) -> i32 {
+    unsafe fn forward(
+        self, device: u64, irp: u64, next: u64, location_after_forward: u8,
+        entry: &mut ForwardEntry,
+    ) -> i32 {
         let (reply_label, status, accepted, token, _) =
             call_on4((self.label << 12) | 4, 1, device, irp, 0);
         let disposition = if self.typed {
@@ -10181,6 +10184,7 @@ impl ForwardProjectionCaller {
             crate::provider_bugcheck::report(0xc4, [self.label, 1, irp, reply_label]);
         }
         if accepted == 0 {
+            *entry = ForwardEntry::RejectedBeforeDispatch;
             return status as u32 as i32;
         }
         write_unaligned(
@@ -10228,7 +10232,15 @@ unsafe fn lane_call_driver(device: u64, irp: u64) -> Option<i32> {
     }
 }
 
-extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
+/// A lower status does not prove that the IRP entered the lower driver. Only an authenticated
+/// pre-dispatch rejection may return the caller's IRP for a fresh attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForwardEntry {
+    Entered,
+    RejectedBeforeDispatch,
+}
+
+unsafe fn s_iof_call_driver_with_entry(device: u64, irp: u64, entry: &mut ForwardEntry) -> i32 {
     unsafe {
         let Some((_, previous_location, _)) = validate_hosted_irp_packet(irp) else {
             return 0xC000_0010u32 as i32; // STATUS_INVALID_DEVICE_REQUEST
@@ -10260,6 +10272,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             if handler == 0 {
                 // No handler in this domain: the target is cross-domain.
                 if let Some(status) = lane_call_driver(device, irp) {
+                    *entry = ForwardEntry::RejectedBeforeDispatch;
                     return status;
                 }
                 if major == major::IRP_MJ_READ as u64
@@ -10295,7 +10308,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     }
                 }
                 if let Some(projection) = ForwardProjectionCaller::for_major(major as u8) {
-                    return projection.forward(device, irp, next, current_location_after_forward);
+                    return projection.forward(
+                        device, irp, next, current_location_after_forward, entry,
+                    );
                 }
                 return 0xC000_0010u32 as i32;
             }
@@ -10321,6 +10336,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
         }
         // No DRIVER_OBJECT in this domain: the target is cross-domain.
         if let Some(status) = lane_call_driver(device, irp) {
+            *entry = ForwardEntry::RejectedBeforeDispatch;
             return status;
         }
 
@@ -10354,6 +10370,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     );
                 }
                 if accepted == 0 {
+                    *entry = ForwardEntry::RejectedBeforeDispatch;
                     return status as u32 as i32;
                 }
                 write_unaligned(
@@ -10409,6 +10426,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     );
                 }
                 if accepted == 0 {
+                    *entry = ForwardEntry::RejectedBeforeDispatch;
                     return status as u32 as i32;
                 }
                 write_unaligned(
@@ -10463,6 +10481,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                 );
             }
             if accepted == 0 {
+                *entry = ForwardEntry::RejectedBeforeDispatch;
                 return status as u32 as i32;
             }
             write_unaligned(
@@ -10538,6 +10557,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             if accepted == 0 {
                 cancel_unbound_pnp_completion(irp);
                 if status as u32 as i32 != STATUS_SUCCESS {
+                    *entry = ForwardEntry::RejectedBeforeDispatch;
                     return status as u32 as i32;
                 }
             } else {
@@ -10622,6 +10642,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                 }
                 if accepted == 0 {
                     cancel_unbound_pnp_completion(irp);
+                    *entry = ForwardEntry::RejectedBeforeDispatch;
                     return status as u32 as i32;
                 }
                 bind_held_pnp_completion(irp, start_token);
@@ -10677,6 +10698,7 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     );
                 }
                 if accepted == 0 {
+                    *entry = ForwardEntry::RejectedBeforeDispatch;
                     return status as u32 as i32;
                 }
                 write_unaligned(
@@ -10745,6 +10767,11 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
     }
 }
 
+extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
+    let mut entry = ForwardEntry::Entered;
+    unsafe { s_iof_call_driver_with_entry(device, irp, &mut entry) }
+}
+
 #[repr(C)]
 struct HostedSyncForwardContext {
     event: [u64; 3],
@@ -10774,10 +10801,23 @@ extern "win64" fn s_io_forward_irp_synchronously(device: u64, irp: u64) -> u8 {
             event: [0; 3],
             completed: AtomicBool::new(false),
         };
+        let original_stack = read_unaligned((irp + 0xb8) as *const u64);
+        let original_location =
+            read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
+        let original_status =
+            read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const i32);
+        let original_information =
+            read_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *const u64);
         let event_ptr = context.event.as_mut_ptr() as u64;
         s_ke_initialize_event(event_ptr, 0, 0);
-        s_io_copy_current_irp_stack_location_to_next(irp);
         let next = irp_next_stack_location(irp);
+        let mut original_next = [0u8; WDM_X64_IO_STACK_LOCATION_SIZE];
+        core::ptr::copy_nonoverlapping(
+            next as *const u8,
+            original_next.as_mut_ptr(),
+            WDM_X64_IO_STACK_LOCATION_SIZE,
+        );
+        s_io_copy_current_irp_stack_location_to_next(irp);
         write_unaligned(
             (next + WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET) as *mut u64,
             s_io_forward_sync_completion as *const () as usize as u64,
@@ -10787,7 +10827,43 @@ extern "win64" fn s_io_forward_irp_synchronously(device: u64, irp: u64) -> u8 {
             event_ptr,
         );
         write_unaligned((next + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8, 0xe0);
-        let status = s_iof_call_driver(device, irp);
+        let mut entry = ForwardEntry::Entered;
+        let status = s_iof_call_driver_with_entry(device, irp, &mut entry);
+        if entry == ForwardEntry::RejectedBeforeDispatch {
+            if context.completed.load(Ordering::Acquire)
+                || read_unaligned((irp + 0xb8) as *const u64) != original_stack
+                || read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8)
+                    != original_location
+                || read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const i32)
+                    != original_status
+                || read_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *const u64)
+                    != original_information
+            {
+                crate::provider_bugcheck::report(
+                    0xc4,
+                    [device, irp, event_ptr, status as u32 as u64],
+                );
+            }
+            core::ptr::copy_nonoverlapping(
+                original_next.as_ptr(),
+                next as *mut u8,
+                WDM_X64_IO_STACK_LOCATION_SIZE,
+            );
+            write_unaligned((irp + 0xb8) as *mut u64, original_stack);
+            write_unaligned(
+                (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+                original_location,
+            );
+            write_unaligned(
+                (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
+                original_status,
+            );
+            write_unaligned(
+                (irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64,
+                original_information,
+            );
+            return 0;
+        }
         if status == nt_status::NtStatus::PENDING.raw() {
             let wait_status = s_ke_wait_for_single_object(event_ptr, 5, 0, 0, 0);
             if wait_status != nt_status::NtStatus::SUCCESS.raw() {

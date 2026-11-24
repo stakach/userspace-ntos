@@ -6,7 +6,7 @@ use std::process::Command;
 #[test]
 fn foreign_lower_buffered_control_has_retained_source_route() {
     let source = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
-    let start = source.find("extern \"win64\" fn s_iof_call_driver(").unwrap();
+    let start = source.find("unsafe fn s_iof_call_driver_with_entry(").unwrap();
     let call = &source[start..source[start..].find("if major != IRP_MJ_PNP").unwrap() + start];
     assert!(call.contains("if major == IRP_MJ_DEVICE_CONTROL"));
     assert!(call.contains("forward_hosted_buffered_control("));
