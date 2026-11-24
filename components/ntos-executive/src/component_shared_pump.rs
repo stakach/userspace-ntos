@@ -929,8 +929,8 @@ unsafe fn parked_dispatch_wait_yield(
             Some(crate::win32k_glue::ServiceWaitYield { route, dispatch, reply, token })
         }
         nt_component_suspension::ParkedDispatchReceive::Continue => {
-            if parked.is_some() && PumpReceiveScope::enclosed() {
-                trace_enclosed_dispatch_wait(route, dispatch);
+            if let Some(wait) = parked.filter(|_| PumpReceiveScope::enclosed()) {
+                trace_enclosed_dispatch_wait(ch, route, dispatch, wait);
             }
             None
         }
@@ -960,17 +960,69 @@ impl Drop for PumpReceiveScope {
 
 /// Bounded evidence that a parked File dispatch kept receiving because another pump's receive
 /// encloses it: its own receive services the wake (#420, #427 A).
-fn trace_enclosed_dispatch_wait(route: PeerRoute, dispatch: nt_component_suspension::LaneDispatchIdentity) {
+unsafe fn trace_enclosed_dispatch_wait(
+    ch: &PumpChannel,
+    route: PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    parked: (u64, u64),
+) {
     static TRACED: AtomicU64 = AtomicU64::new(0);
     let n = TRACED.fetch_add(1, Ordering::Relaxed) + 1;
     if n > 16 && !n.is_power_of_two() { return; }
-    crate::print_str(b"[parked-dispatch] stage=enclosed n/route/lane/epoch/depth=");
+    crate::print_str(b"[parked-dispatch] stage=enclosed n/route/lane/epoch/depth/reply/token/tcb/cap/lane-gen=");
     for value in [n, route.badge(), u64::from(dispatch.lane().index), dispatch.epoch(),
-        crate::executor::local().receive_depth.load(Ordering::Relaxed)] {
+        crate::executor::local().receive_depth.load(Ordering::Relaxed),
+        parked.0, parked.1, ch.tcb, ch.reply_cap, dispatch.lane().generation] {
         crate::print_str(b"/");
         crate::print_u64(value);
     }
     crate::print_str(b"\n");
+    let running = runtime::hold_snapshot().running;
+    crate::print_str(b"[parked-dispatch-owner] sample/running-route/lane/lane-gen/epoch/reply/tcb=");
+    for value in [n,
+        running.and_then(|row| row.route).map_or(0, |route| route.badge()),
+        running.map_or(0, |row| u64::from(row.lane.index)),
+        running.map_or(0, |row| row.lane.generation),
+        running.and_then(|row| row.dispatch).map_or(0, |dispatch| dispatch.epoch()),
+        running.and_then(|row| row.binding).map_or(0, |binding| binding.reply_object),
+        running.and_then(|row| row.physical).map_or(0, |source| source.tcb)] {
+        crate::print_str(b"/");
+        crate::print_u64(value);
+    }
+    crate::print_str(b"\n");
+    trace_enclosed_receive_candidates(n);
+}
+
+/// These copied active receive rows identify the enclosing candidate without following a
+/// component mapping. A row is diagnostic context, never authority to resume its Reply.
+fn trace_enclosed_receive_candidates(sample: u64) {
+    for (index, slot) in ACTIVE_IRP_SNAPSHOTS.iter().enumerate() {
+        let sequence = slot.sequence.load(Ordering::Acquire);
+        if sequence == 0 || sequence == SNAPSHOT_CLAIMED { continue; }
+        let values = [slot.route.load(Ordering::Relaxed), slot.tcb.load(Ordering::Relaxed),
+            slot.reply.load(Ordering::Relaxed), slot.source_irp.load(Ordering::Relaxed),
+            slot.major.load(Ordering::Relaxed), slot.minor.load(Ordering::Relaxed)];
+        if slot.sequence.load(Ordering::Acquire) != sequence { continue; }
+        crate::print_str(b"[parked-dispatch-receive] sample/kind/slot/sequence/route/tcb/reply/irp/major/minor=");
+        for value in [sample, 1, index as u64, sequence].into_iter().chain(values) {
+            crate::print_str(b"/"); crate::print_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
+    for (index, slot) in ACTIVE_SYSCALL_SNAPSHOTS.iter().enumerate() {
+        let sequence = slot.sequence.load(Ordering::Acquire);
+        if sequence == 0 || sequence == SNAPSHOT_CLAIMED { continue; }
+        let values = [slot.route.load(Ordering::Relaxed),
+            slot.lane_index.load(Ordering::Relaxed), slot.lane_generation.load(Ordering::Relaxed),
+            slot.tcb.load(Ordering::Relaxed), slot.reply.load(Ordering::Relaxed),
+            slot.ssn.load(Ordering::Relaxed)];
+        if slot.sequence.load(Ordering::Acquire) != sequence { continue; }
+        crate::print_str(b"[parked-dispatch-receive] sample/kind/slot/sequence/route/lane/lane-gen/tcb/reply/ssn=");
+        for value in [sample, 2, index as u64, sequence].into_iter().chain(values) {
+            crate::print_str(b"/"); crate::print_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
 }
 
 static PARKED_DISPATCH_YIELDS: AtomicU64 = AtomicU64::new(0);
