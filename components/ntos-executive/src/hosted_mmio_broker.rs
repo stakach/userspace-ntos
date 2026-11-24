@@ -21,6 +21,16 @@ unsafe fn requests_mut() -> &'static mut nt_hosted_runtime::MmioRequestLedger {
     slot.as_mut().unwrap()
 }
 
+pub(super) unsafe fn has_retained_pnp_device_rows(binding: HostedDeviceBinding) -> bool {
+    (*core::ptr::addr_of!(REQUESTS)).as_ref().is_some_and(|ledger| {
+        ledger.has_pnp_device_rows(
+            binding.projection_domain.domain_id.raw(),
+            binding.projection_domain.cookie,
+            binding.device_id,
+        )
+    })
+}
+
 unsafe fn retained_pnp_state(binding: HostedDeviceBinding) -> Option<HostedDeviceResourceState> {
     if hosted_device_binding_by_device_id(binding.device_id) != Some(binding) {
         return None;
@@ -264,13 +274,7 @@ pub(super) unsafe fn validate_publication(
         {
             return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
         }
-        if (*core::ptr::addr_of!(REQUESTS)).as_ref().is_some_and(|ledger| {
-            ledger.has_pnp_device_rows(
-                binding.projection_domain.domain_id.raw(),
-                binding.projection_domain.cookie,
-                binding.device_id,
-            )
-        }) {
+        if has_retained_pnp_device_rows(binding) {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
         return Ok(());

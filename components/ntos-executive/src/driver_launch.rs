@@ -50644,6 +50644,15 @@ pub(crate) fn hosted_bus_reported_device_id(instance_id: &str) -> Option<u64> {
 
 static BUS_RESOURCE_REFUSAL_TRACES: AtomicU64 = AtomicU64::new(0);
 
+fn hosted_pnp_blob_shape(state: Option<&nt_pnp_manager::PropertyBlobState>) -> (u64, u64) {
+    match state {
+        Some(nt_pnp_manager::PropertyBlobState::Unqueried) => (0, 0),
+        Some(nt_pnp_manager::PropertyBlobState::KnownNone) => (1, 0),
+        Some(nt_pnp_manager::PropertyBlobState::Present(bytes)) => (2, bytes.len() as u64),
+        None => (3, 0),
+    }
+}
+
 /// Bounded native evidence for an exact bus PDO resource refusal. State 0 is unqueried,
 /// 1 is known absent, and 2 is present; the adjacent number is the present byte length.
 pub(crate) unsafe fn trace_hosted_bus_resource_refusal(
@@ -50663,15 +50672,10 @@ pub(crate) unsafe fn trace_hosted_bus_resource_refusal(
     let instance_matches = devnode.is_some_and(|id| {
         pnp.instance_id(id).is_some_and(|name| name.eq_ignore_ascii_case(instance_path))
     });
-    let property_state = |state: &nt_pnp_manager::PropertyBlobState| match state {
-        nt_pnp_manager::PropertyBlobState::Unqueried => (0u64, 0u64),
-        nt_pnp_manager::PropertyBlobState::KnownNone => (1, 0),
-        nt_pnp_manager::PropertyBlobState::Present(bytes) => (2, bytes.len() as u64),
-    };
     let properties = pnp.enumerated_pdo_properties(pdo_device_id);
-    let raw = properties.map(|p| property_state(&p.boot_resources_raw));
-    let translated = properties.map(|p| property_state(&p.boot_resources_translated));
-    let requirements = properties.map(|p| property_state(&p.resource_requirements));
+    let raw = properties.map(|p| hosted_pnp_blob_shape(Some(&p.boot_resources_raw)));
+    let translated = properties.map(|p| hosted_pnp_blob_shape(Some(&p.boot_resources_translated)));
+    let requirements = properties.map(|p| hosted_pnp_blob_shape(Some(&p.resource_requirements)));
     print_str(b"[bus-resource-refusal] stage=");
     print_str(stage);
     print_str(b" instance=");
@@ -56702,6 +56706,93 @@ fn trace_relation_claim(
     print_str(b"\n");
 }
 
+/// One root-side snapshot for the first MMIO publication refusal of an exact Start IRP.
+/// Retrying the retained transaction must not re-read mutable component banks for diagnostics.
+unsafe fn trace_pnp_mmio_admission(irp_id: IrpId, binding: HostedDeviceBinding) {
+    let instance = instance_by_driver_id(binding.driver_id);
+    let current_binding = hosted_device_binding_by_device_id(binding.device_id) == Some(binding);
+    let state = hosted_device_resource_state_by_device_id(binding.device_id);
+    let state_matches = state.is_some_and(|state| {
+        state.driver_id == binding.driver_id
+            && state.instance == binding.instance
+            && state.projection_domain == binding.projection_domain
+            && state.pdo_object == binding.pdo_object
+    });
+    let pnp = (*core::ptr::addr_of!(HOSTED_PNP_MANAGER)).as_ref();
+    let identity = pnp.and_then(|pnp| pnp.devnode_identity_for_pdo(binding.pdo_device_id));
+    let started = identity.is_some_and(|id| {
+        pnp.is_some_and(|pnp| pnp.state(id.devnode_id()) == Some(nt_pnp_manager::DeviceState::Started))
+    });
+    let fdo_matches = identity.is_some_and(|id| {
+        pnp.is_some_and(|pnp| pnp.fdo(id.devnode_id()) == Some(binding.device_id))
+    });
+    let empty = identity.is_some_and(|id| pnp.is_some_and(|pnp| pnp.devnode_has_started_empty_assignment(id)));
+    let bus_number = identity.is_some_and(|id| pnp.is_some_and(|pnp| pnp.devnode_has_started_bus_number_assignment(id)));
+    let properties = pnp.and_then(|pnp| pnp.enumerated_pdo_properties(binding.pdo_device_id));
+    let blobs = properties.map(|p| [
+        hosted_pnp_blob_shape(Some(&p.boot_resources_raw)),
+        hosted_pnp_blob_shape(Some(&p.boot_resources_translated)),
+        hosted_pnp_blob_shape(Some(&p.resource_requirements)),
+        hosted_pnp_blob_shape(Some(&p.filtered_resource_requirements)),
+        hosted_pnp_blob_shape(Some(&p.allocated_resources_raw)),
+        hosted_pnp_blob_shape(Some(&p.allocated_resources_translated)),
+    ]).unwrap_or([(3, 0); 6]);
+    let boot_raw = properties.and_then(|p| match &p.boot_resources_raw {
+        nt_pnp_manager::PropertyBlobState::Present(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    });
+    let assigned_raw = properties.and_then(|p| match &p.allocated_resources_raw {
+        nt_pnp_manager::PropertyBlobState::Present(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    });
+    let assigned_translated = properties.and_then(|p| match &p.allocated_resources_translated {
+        nt_pnp_manager::PropertyBlobState::Present(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    });
+    let raw_shape = boot_raw.and_then(|raw| {
+        if !matches!(nt_cm_resources::validate_cm_resource_list_extent(raw), Ok(len) if len == raw.len()) {
+            return None;
+        }
+        let full = raw.get(0..4)?;
+        let full_count = u32::from_le_bytes([full[0], full[1], full[2], full[3]]) as u64;
+        if full_count != 1 { return Some((full_count, 0, 0)); }
+        let partial = raw.get(16..20)?;
+        let partial_count = u32::from_le_bytes([partial[0], partial[1], partial[2], partial[3]]) as usize;
+        let mut types = 0u64;
+        for index in 0..partial_count {
+            let offset = 20usize.checked_add(index.checked_mul(nt_cm_resources::PARTIAL_DESCRIPTOR_SIZE)?)?;
+            let kind = *raw.get(offset)?;
+            types |= 1u64 << kind.min(63);
+        }
+        Some((full_count, partial_count as u64, types))
+    });
+    print_str(b"[hosted-pnp-mmio-admission] irp=0x"); print_hex_u64(irp_id.raw());
+    print_str(b" gates(instance/binding/state-present/state-match/identity/started/fdo/empty/bus/rows)=");
+    for value in [instance.is_some(), current_binding, state.is_some(), state_matches, identity.is_some(),
+        started, fdo_matches, empty, bus_number,
+        hosted_mmio_broker::has_retained_pnp_device_rows(binding)] {
+        print_str(b"/"); print_u64(value as u64);
+    }
+    print_str(b" state(address-count/lease)=");
+    print_u64(state.map_or(0, |state| state.address_resource_count as u64));
+    print_str(b"/"); print_u64(state.is_some_and(|state| state.pnp_context_lease.is_some()) as u64);
+    print_str(b" blobs(boot-raw/boot-trans/req/filter/assigned-raw/assigned-trans)=");
+    for (kind, length) in blobs {
+        print_str(b"/"); print_u64(kind); print_str(b":"); print_u64(length);
+    }
+    print_str(b" raw(full/partials/types/single-bus)=");
+    let (full, partials, types) = raw_shape.unwrap_or((0, 0, 0));
+    print_u64(full); print_str(b"/"); print_u64(partials);
+    print_str(b"/0x"); print_hex_u64(types);
+    print_str(b"/"); print_u64(boot_raw.is_some_and(|raw| {
+        nt_cm_resources::decode_single_bus_number_resource(raw).is_ok()
+    }) as u64);
+    print_str(b" equal(boot-raw/assigned-trans)=");
+    print_u64((boot_raw.is_some() && boot_raw == assigned_raw) as u64);
+    print_str(b"/"); print_u64((assigned_raw.is_some() && assigned_raw == assigned_translated) as u64);
+    print_str(b"\n");
+}
+
 unsafe fn trace_pnp_publication_repair(
     phase: &[u8], irp_id: IrpId, status: nt_status::NtStatus,
 ) {
@@ -56741,6 +56832,9 @@ unsafe fn trace_pnp_publication_repair(
         print_str(b"/"); print_u64(flag as u64);
     }
     print_str(b"\n");
+    if phase == b"enter" && next == b"mmio" {
+        trace_pnp_mmio_admission(irp_id, binding);
+    }
 }
 
 fn note_relation_gate(reason: u64, active_mask: u64, queued: usize, selected_pdo: u64) {
