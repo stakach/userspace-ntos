@@ -223,6 +223,82 @@ fn exact_transport_uncertainty_retains_the_canonical_target() {
     assert!(io.irp(id).is_some());
 }
 
+struct BusyThenReturnedPnpBackend {
+    busy: std::rc::Rc<std::cell::Cell<bool>>,
+    entered: std::rc::Rc<std::cell::Cell<u32>>,
+}
+
+impl DriverDispatchBackend for BusyThenReturnedPnpBackend {
+    fn dispatch_irp(
+        &mut self,
+        _ctx: DispatchContext<'_>,
+        _irp: &IrpProjection,
+    ) -> Result<DispatchOutcome, NtStatus> {
+        panic!("canonical PnP dispatch must use the specialized backend method")
+    }
+
+    fn dispatch_pnp_irp(
+        &mut self,
+        _ctx: DispatchContext<'_>,
+        _irp: &IrpProjection,
+    ) -> PnpBackendDispatch {
+        if self.busy.get() {
+            return PnpBackendDispatch::NotDispatched {
+                status: NtStatus::DEVICE_BUSY,
+            };
+        }
+        self.entered.set(self.entered.get() + 1);
+        PnpBackendDispatch::Returned {
+            status: NtStatus::SUCCESS,
+            information: 0,
+        }
+    }
+
+    fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+        Err(NtStatus::NOT_SUPPORTED)
+    }
+}
+
+#[test]
+fn certainly_unentered_pnp_busy_returns_exact_preparation_for_retry() {
+    let mut io = io();
+    let busy = std::rc::Rc::new(std::cell::Cell::new(true));
+    let entered = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (client, _, driver, device) = pnp_test_stack(
+        &mut io,
+        Box::new(BusyThenReturnedPnpBackend {
+            busy: busy.clone(),
+            entered: entered.clone(),
+        }),
+    );
+    let prepared = io
+        .prepare_external_pnp_to_exact_device(client, device, 13, parameters(), &[])
+        .unwrap();
+    let id = prepared.irp_id();
+
+    let refusal = io.dispatch_prepared_external_pnp(prepared).unwrap_err();
+    assert_eq!(refusal.status(), NtStatus::DEVICE_BUSY);
+    assert_eq!(refusal.prepared().irp_id(), id);
+    assert_eq!(io.irp(id).unwrap().state, IrpState::Initialized);
+    assert_eq!(io.irp(id).unwrap().origin_device_id, device);
+    assert_eq!(entered.get(), 0);
+    assert!(io.completed_irp(id).is_none());
+
+    busy.set(false);
+    let result = io
+        .dispatch_prepared_external_pnp(refusal.into_prepared())
+        .unwrap();
+    let ExternalPnpDispatchResult::Returned { status, receipt, .. } = result else {
+        panic!("exact retry did not return a real PnP result: {result:?}");
+    };
+    assert_eq!(status, NtStatus::SUCCESS);
+    assert_eq!(receipt.irp_id(), id);
+    assert_eq!(receipt.origin_driver_id(), driver);
+    assert_eq!(receipt.origin_device_id(), device);
+    assert_eq!(entered.get(), 1);
+    assert!(io.irp(id).is_none());
+}
+
 #[test]
 fn foreign_dispatch_rejects_colliding_irp_and_returns_original_preparation() {
     let mut issuer = io();

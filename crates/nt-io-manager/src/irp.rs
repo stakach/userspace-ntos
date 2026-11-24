@@ -703,6 +703,25 @@ impl IrpRecord {
         }
     }
 
+    /// Undo dispatch admission only when the PnP backend certified that it did not enter.
+    /// The ordinary state machine deliberately has no Dispatched -> Initialized edge: an
+    /// entered or uncertain IRP may never regain dispatch authority.
+    pub(crate) fn restore_prepared_pnp_after_no_entry(&mut self, location: u8) -> bool {
+        if self.origin_major != nt_io_abi::major::IRP_MJ_PNP
+            || self.file_id.is_some()
+            || self.state != IrpState::Dispatched
+            || self.current_location != location
+            || self.completion_origin.is_some()
+            || self.returned_output.is_some()
+            || self.external_pnp_terminal_receipt_claimed
+            || self.cancel != CancelState::NotCancelled
+        {
+            return false;
+        }
+        self.state = IrpState::Initialized;
+        true
+    }
+
     /// The current (top-of-stack) I/O stack location, if any.
     pub fn current_stack(&self) -> Option<&IoStackLocation> {
         self.stack.get(self.current_location as usize)

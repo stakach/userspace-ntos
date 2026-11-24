@@ -45772,6 +45772,7 @@ unsafe fn retain_hosted_relation_query_barrier(
         relation_owner: hosted_device_relation_owner(claim)
             .expect("claimed relation action lost its exact owner"),
         irp_id: IrpId(0),
+        prepared: None,
         origin_driver_id: DriverId(0),
         completion_driver_id: DriverId(0),
         completion_device_id: nt_io_manager::DeviceId(0),
@@ -48529,6 +48530,16 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                 .claim
                 .parent;
             if !hosted_pnp_manager_mut().devnode_identity_is_started(parent) {
+                // A lane refusal leaves this exact IRP unentered. It is still a preparation,
+                // so discard it before publishing a failed relation action.
+                let prepared = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_mut().and_then(|query| query.prepared.take());
+                if let Some(prepared) = prepared {
+                    io_manager_mut().discard_prepared_external_pnp(prepared)
+                        .expect("unentered relation IRP could not be discarded");
+                    (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                        .as_mut().unwrap().irp_id = IrpId(0);
+                }
                 set_hosted_relation_query_disposition(
                     HostedDeviceRelationQueryDisposition::Barrier(
                         nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -48540,6 +48551,62 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
         }
         match phase {
             HostedDeviceRelationQueryPhase::AwaitingCompletion => {
+                let prepared = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_mut().unwrap().prepared.take();
+                if let Some(prepared) = prepared {
+                    let irp_id = prepared.irp_id();
+                    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+                        Err(rejection) if rejection.status() == nt_status::NtStatus::DEVICE_BUSY => {
+                            (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                                .as_mut().unwrap().prepared = Some(rejection.into_prepared());
+                            return progress;
+                        }
+                        Err(rejection) => {
+                            let status = rejection.status();
+                            io_manager_mut().discard_prepared_external_pnp(rejection.into_prepared())
+                                .expect("rejected unentered relation IRP could not be discarded");
+                            (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                                .as_mut().unwrap().irp_id = IrpId(0);
+                            set_hosted_relation_query_disposition(
+                                HostedDeviceRelationQueryDisposition::Barrier(status),
+                            );
+                        }
+                        Ok(ExternalPnpDispatchResult::Returned { status, information, .. }) => {
+                            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                                .as_mut().unwrap();
+                            query.driver_status = Some(status);
+                            match nt_pnp_manager::classify_device_relations_result(
+                                status.is_success(), information,
+                            ) {
+                                nt_pnp_manager::DeviceRelationsResultDisposition::NoRelations =>
+                                    set_hosted_relation_query_disposition(
+                                        HostedDeviceRelationQueryDisposition::NoRelations),
+                                nt_pnp_manager::DeviceRelationsResultDisposition::CopyAllocation(information) =>
+                                    query.phase = HostedDeviceRelationQueryPhase::AwaitingCopy {
+                                        information, pending_completion: false,
+                                    },
+                            }
+                        }
+                        Ok(ExternalPnpDispatchResult::ReturnedPayload { .. }) =>
+                            set_hosted_relation_query_disposition(
+                                HostedDeviceRelationQueryDisposition::Barrier(
+                                    nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                                ),
+                            ),
+                        Ok(ExternalPnpDispatchResult::Pending { irp_id: pending_id }) =>
+                            assert_eq!(pending_id, irp_id),
+                        Ok(ExternalPnpDispatchResult::Indeterminate {
+                            irp_id: retained_id, transport_status,
+                        }) => {
+                            assert_eq!(retained_id, irp_id);
+                            set_hosted_relation_query_disposition(
+                                HostedDeviceRelationQueryDisposition::Barrier(transport_status),
+                            );
+                        }
+                    }
+                    progress = progress.saturating_add(1);
+                    continue;
+                }
                 let (irp_id, claim, origin_driver_id, completion_driver_id, completion_device_id) = {
                     let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
                         .as_ref()
@@ -50271,6 +50338,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         completion_device_id,
         allocation_instance,
         phase: HostedDeviceRelationQueryPhase::AwaitingCompletion,
+        prepared: Some(prepared),
         driver_status: None,
         last_information: 0,
         copy_error: None,
@@ -50291,52 +50359,6 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         publication: None,
         provider_ack: None,
     });
-    match io_manager_mut()
-        .dispatch_prepared_external_pnp(prepared)
-        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
-    {
-        ExternalPnpDispatchResult::Returned {
-            status,
-            information,
-            ..
-        } => {
-            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
-                .as_mut()
-                .unwrap();
-            query.driver_status = Some(status);
-            match nt_pnp_manager::classify_device_relations_result(status.is_success(), information)
-            {
-                nt_pnp_manager::DeviceRelationsResultDisposition::NoRelations => {
-                    set_hosted_relation_query_disposition(
-                        HostedDeviceRelationQueryDisposition::NoRelations,
-                    );
-                }
-                nt_pnp_manager::DeviceRelationsResultDisposition::CopyAllocation(information) => {
-                    query.phase = HostedDeviceRelationQueryPhase::AwaitingCopy {
-                        information,
-                        pending_completion: false,
-                    };
-                }
-            }
-        }
-        ExternalPnpDispatchResult::ReturnedPayload { .. } => {
-            set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ));
-        }
-        ExternalPnpDispatchResult::Pending { irp_id: pending_id } => {
-            assert_eq!(pending_id, irp_id);
-        }
-        ExternalPnpDispatchResult::Indeterminate {
-            irp_id: retained_id,
-            transport_status,
-        } => {
-            assert_eq!(retained_id, irp_id);
-            set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
-                transport_status,
-            ));
-        }
-    }
     1usize.saturating_add(drain_hosted_device_relation_query())
 }
 
@@ -54810,6 +54832,8 @@ struct HostedDeviceRelationQuery {
     claim: nt_pnp_manager::DeviceRelationInvalidation,
     relation_owner: nt_pnp::AcpiPciProviderEndpoint,
     irp_id: IrpId,
+    /// Exact unentered PnP request retained across a certified lane refusal (#473).
+    prepared: Option<nt_io_manager::PreparedExternalPnpIrp>,
     origin_driver_id: DriverId,
     completion_driver_id: DriverId,
     completion_device_id: nt_io_manager::DeviceId,
