@@ -74753,7 +74753,7 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
             return Some(hosted_backend_pumps::BackendDispatch::Returned(
                 HostedIrpTransportResult::Returned { status: root_status, information: 0, file_context: 0 }));
         }
-        Some(hosted_video_find_adapter::dispatch(index, inst, binding.device_id, caller))
+        Some(hosted_video_find_adapter::dispatch(index, inst, binding, caller))
     });
     pnp_backend_dispatch(result)
 }

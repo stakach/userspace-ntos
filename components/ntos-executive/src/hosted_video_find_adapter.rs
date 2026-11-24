@@ -18,6 +18,7 @@ pub(super) struct Kept {
     index: usize,
     device_id: u64,
     shared_va: u64,
+    device_context: DeviceDispatchContextOwner,
 }
 
 impl Kept {
@@ -26,8 +27,38 @@ impl Kept {
     /// Resume once from the root boundary. `Err` is a pump that has not returned yet.
     pub(super) unsafe fn resume(self) -> Result<HostedIrpTransportResult, Self> {
         if !self.retryable() { return Err(self); }
-        let Self { pump, index, device_id, shared_va } = self;
-        answer(Self { pump: component_scheduler::retry_child_work(pump), index, device_id, shared_va })
+        let Self { pump, index, device_id, shared_va, device_context } = self;
+        let device_context = match device_context.resume() {
+            Ok(owner) => owner,
+            Err((status, owner)) => {
+                trace(b"context-resume-refused", device_id, status.raw() as u32);
+                return Err(Self { pump, index, device_id, shared_va, device_context: owner });
+            }
+        };
+        // Another device may have projected resources onto this instance while FindAdapter
+        // waited. Reproject only its retained canonical binding before re-entering the pump.
+        let projection = device_context.active_ref()
+            .ok_or(nt_status::NtStatus::DEVICE_BUSY)
+            .and_then(|context| context.projection_binding(shared_va))
+            .and_then(|binding| {
+                let inst = instance(index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+                if inst.driver_id != binding.driver_id || binding.device_id != device_id {
+                    return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+                }
+                restore_hosted_device_resource_state(binding, shared_va, inst.cnode, false)
+                    .map(|_| ())
+            });
+        if let Err(status) = projection {
+            let device_context = match device_context.suspend() {
+                Ok(owner) | Err((_, owner)) => owner,
+            };
+            trace(b"context-projection-refused", device_id, status.raw() as u32);
+            return Err(Self { pump, index, device_id, shared_va, device_context });
+        }
+        answer(Self {
+            pump: component_scheduler::retry_child_work(pump),
+            index, device_id, shared_va, device_context,
+        })
     }
 }
 
@@ -36,12 +67,13 @@ impl Kept {
 pub(super) unsafe fn dispatch(
     index: usize,
     inst: DriverInstance,
-    device_id: u64,
+    binding: HostedDeviceBinding,
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> BackendDispatch {
     let not_dispatched = |status| BackendDispatch::Returned(
         HostedIrpTransportResult::NotDispatched { status });
     let sh = inst.exec_shared_va;
+    let device_id = binding.device_id;
     if !hosted_instance_video_port_initialized(inst) {
         return not_dispatched(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -50,12 +82,30 @@ pub(super) unsafe fn dispatch(
     else {
         return not_dispatched(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
-    if route_index != index || route_inst.driver_id != inst.driver_id {
+    if route_index != index || route_inst.driver_id != inst.driver_id
+        || binding.instance != index || binding.driver_id != inst.driver_id
+        || binding.device_object != device_object
+    {
         return not_dispatched(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let Some(exec_window) = ExecVaWindow::try_for_instance(index) else {
         return not_dispatched(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
+    // The row that keeps an unfinished pump has capacity before resource projection or
+    // provider entry. `reserve_channel` preallocates; it does not claim a row yet.
+    if hosted_backend_pumps::reserve_channel().is_err() {
+        return not_dispatched(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    let mut context = match HostedDeviceDispatchContextGuard::enter(index, binding) {
+        Ok(context) => context,
+        Err(status) => return not_dispatched(status),
+    };
+    if let Err(status) = context.bind_projection_shared(sh) {
+        return not_dispatched(status);
+    }
+    if let Err(status) = restore_hosted_device_resource_state(binding, sh, inst.cnode, false) {
+        return not_dispatched(status);
+    }
     let interface_type = read_volatile((sh + SH_RESOURCE_INTERFACE_TYPE) as *const u32);
     let bus_number = read_volatile((sh + SH_RESOURCE_BUS_NUMBER) as *const u32);
     let interrupt_vector = read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
@@ -76,10 +126,6 @@ pub(super) unsafe fn dispatch(
     let mut raw = [0u8; VIDEO_PORT_CONFIG_INFO_X64_SIZE];
     if config.write(&mut raw).is_err() {
         return not_dispatched(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    // The row that keeps an unfinished pump exists before the provider can enter.
-    if hosted_backend_pumps::reserve_channel().is_err() {
-        return not_dispatched(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
     write_volatile((sh + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, device_object);
     for (idx, byte) in raw.iter().enumerate() {
@@ -130,7 +176,10 @@ pub(super) unsafe fn dispatch(
     // A root caller that may block still waits here for the true result.
     let pump = component_scheduler::service_continuation::settle_for_file_owner(
         component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller));
-    match answer(Kept { pump, index, device_id, shared_va: sh }) {
+    match answer(Kept {
+        pump, index, device_id, shared_va: sh,
+        device_context: DeviceDispatchContextOwner::active(context),
+    }) {
         Ok(result) => BackendDispatch::Returned(result),
         Err(kept) => {
             trace(b"pending", device_id, 0);
@@ -157,15 +206,25 @@ unsafe fn answer(kept: Kept) -> Result<HostedIrpTransportResult, Kept> {
             FindAdapterPump::Uncertain,
         _ => FindAdapterPump::Unfinished,
     };
-    let Kept { index, device_id, shared_va: sh, .. } = kept;
     let start = find_adapter_start(outcome);
     if start != FindAdapterStart::Pending {
         // Whatever FindAdapter did, the lane may be free once its pump stopped (#427).
         hosted_file_owners::lane_freed();
     }
     match start {
-        FindAdapterStart::Pending => Err(kept),
+        FindAdapterStart::Pending => {
+            let Kept { pump, index, device_id, shared_va, device_context } = kept;
+            let device_context = match device_context.suspend() {
+                Ok(owner) => owner,
+                Err((status, owner)) => {
+                    trace(b"context-suspend-refused", device_id, status.raw() as u32);
+                    owner
+                }
+            };
+            Err(Kept { pump, index, device_id, shared_va, device_context })
+        }
         FindAdapterStart::Quarantined => {
+            let Kept { index, device_id, .. } = kept;
             trace(b"quarantined", device_id, 0);
             // The pump left the lane's TCB suspended with its Reply bound: no later dispatch
             // may reply on it.
@@ -175,6 +234,7 @@ unsafe fn answer(kept: Kept) -> Result<HostedIrpTransportResult, Kept> {
             })
         }
         FindAdapterStart::Completed(status) => {
+            let Kept { device_id, shared_va: sh, .. } = kept;
             if let FindAdapterPump::Returned { vp_status, .. } = outcome {
                 let again = read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8);
                 if vp_status != VP_NO_ERROR || again != 0 {
