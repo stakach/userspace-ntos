@@ -13062,6 +13062,18 @@ unsafe fn dma_clear_records_for_map(map_register_base: u64) {
     }
 }
 
+// The spin guard protects only the local shared-record transition. A provider service can
+// suspend this lane and reenter DMA from another lane, so it must run after the guard drops.
+unsafe fn dma_reserve_sg_records(map_register_base: u64) -> bool {
+    let _allocation_guard = HostedDmaAllocationGuard::acquire();
+    dma_reserve_records_for_map(map_register_base)
+}
+
+unsafe fn dma_clear_retired_sg_records(map_register_base: u64) {
+    let _allocation_guard = HostedDmaAllocationGuard::acquire();
+    dma_clear_records_for_map(map_register_base);
+}
+
 extern "win64" fn s_dma_allocate_adapter_channel(
     adapter: u64,
     device_object: u64,
@@ -13892,7 +13904,6 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         if scatter_gather == 0 {
             return;
         }
-        let _allocation_guard = HostedDmaAllocationGuard::acquire();
         let Some((map_register, sg_context)) = dma_query_sg_members(adapter, scatter_gather)
         else { return; };
         let mdl = read_unaligned((sg_context + HOSTED_SG_CONTEXT_MDL) as *const u64);
@@ -13905,13 +13916,15 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         } else {
             stored_write_to_device
         };
-        let _ =
-            s_dma_flush_adapter_buffers(adapter, mdl, map_register, current_va, length, direction);
-        if !dma_reserve_records_for_map(map_register) {
+        // Mark every local mapping for this token before an external effect. A duplicate PutSG
+        // sees the reservation and cannot replay an uncertain provider retirement.
+        if !dma_reserve_sg_records(map_register) {
             return;
         }
+        let _ =
+            s_dma_flush_adapter_buffers(adapter, mdl, map_register, current_va, length, direction);
         if dma_retire_sg_list(adapter, scatter_gather) {
-            dma_clear_records_for_map(map_register);
+            dma_clear_retired_sg_records(map_register);
         }
     }
 }
