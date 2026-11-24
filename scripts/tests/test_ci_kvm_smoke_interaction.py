@@ -53,6 +53,9 @@ class ParseScriptTests(unittest.TestCase):
         self.assertEqual(script.steps[1].actions,
                          (("verified_click", (925, 100)),))
         self.assertEqual(script.steps[2].actions, (("click", (28, 743)),))
+        # Run 45436226805 captured the shell after 10 s while its menu was
+        # still absent; 45425894277 had a visible menu after a 60 s settle.
+        self.assertEqual(script.steps[2].wait_seconds, 60.0)
         # The installed LiberNT desktop has no Command Prompt icon. Its Start
         # menu searches shortcut names, so "command" can find Command Prompt;
         # the result must be visible before Enter launches it.
