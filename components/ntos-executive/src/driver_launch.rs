@@ -58669,6 +58669,12 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
     let terminal_status = transaction
         .driver_status
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    // Lifecycle completion and the exact I/O receipt are already retained. A failed
+    // StartDevice must reach Terminal with its original driver status; resource-use
+    // publication is required only before exposing a successfully started device.
+    if !terminal_status.is_success() {
+        return Ok(());
+    }
     let mmio_usage_published = transaction.mmio_usage_published;
     let interrupt_usage_published = transaction.interrupt_usage_published;
     let dma_usage_published = transaction.dma_usage_published;
@@ -58736,20 +58742,18 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
             .resource_snapshot_published = true;
     }
-    if terminal_status.is_success() {
-        let power_state_published = hosted_pnp_transactions_mut()
-            .iter()
+    let power_state_published = hosted_pnp_transactions_mut()
+        .iter()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+        .power_state_published;
+    if !power_state_published {
+        crate::power_manager::complete_start(binding.pdo_device_id)?;
+        hosted_pnp_transactions_mut()
+            .iter_mut()
             .find(|transaction| transaction.irp_id == irp_id)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
-            .power_state_published;
-        if !power_state_published {
-            crate::power_manager::complete_start(binding.pdo_device_id)?;
-            hosted_pnp_transactions_mut()
-                .iter_mut()
-                .find(|transaction| transaction.irp_id == irp_id)
-                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
-                .power_state_published = true;
-        }
+            .power_state_published = true;
     }
     Ok(())
 }
