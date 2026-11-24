@@ -31,14 +31,14 @@ fn enclosed_wait_traces_exact_parked_reply_and_read_only_receive_candidates() {
 }
 
 #[test]
-fn directory_request_trace_retains_ring_identity_and_labels_running_context() {
+fn directory_request_trace_retains_ring_identity_without_borrowing_ingress() {
     let helper = between(ROOT, "fn trace_ob_owned_directory(",
         "impl nt_object_client::Backend for ObChan");
     for required in ["channel.completion_inbox.active_request()",
-        "channel.completion_inbox.has_parked_owned()", "channel.owned_capture.is_some()",
-        "hold_snapshot().running", "row.binding", "row.physical"] {
+        "channel.completion_inbox.has_parked_owned()", "channel.owned_capture.is_some()"] {
         assert!(helper.contains(required), "missing owned request context: {required}");
     }
+    assert!(!helper.contains("hold_snapshot()"));
     let owned = between(ROOT, "impl nt_object_client::OwnedBackend for ObChan", 
         "static mut OBJECT_CLIENT_PTR:");
     assert!(owned.contains("OB_OP_CREATE_DIRECTORY_HANDLE"));

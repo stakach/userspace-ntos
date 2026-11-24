@@ -15649,26 +15649,18 @@ struct ObChan<'a>(RingChannel<'a>);
 static OB_DIRECTORY_TRACE_REQUEST: AtomicU64 = AtomicU64::new(0);
 static OB_DIRECTORY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// The ring request is the exact owned effect. The current ingress row is diagnostic context;
-/// its Reply is never used as authority to retire the Object Manager request.
+/// The ring request is the exact owned effect. Do not inspect mutable ingress ownership from
+/// this channel callback; the enclosing receive trace reports that context at its own boundary.
 fn trace_ob_owned_directory(
     channel: &RingChannel<'_>, request_id: u64, opcode: u16, stage: &[u8],
     poll: u64, terminal: bool,
 ) {
-    let running = unsafe {
-        spawn_hosts::shared_ingress::owner::runtime::hold_snapshot().running
-    };
     print_str(b"[ob-owned-directory] stage="); print_str(stage);
-    print_str(b" request/opcode/poll/terminal/active/parked/capture/next/running-route/lane/epoch/reply/tcb=");
+    print_str(b" request/opcode/poll/terminal/active/parked/capture/next=");
     for value in [request_id, u64::from(opcode), poll, u64::from(terminal),
         channel.completion_inbox.active_request().unwrap_or(0),
         u64::from(channel.completion_inbox.has_parked_owned()),
-        u64::from(channel.owned_capture.is_some()), channel.next_id,
-        running.and_then(|row| row.route).map_or(0, |route| route.badge()),
-        running.map_or(0, |row| u64::from(row.lane.index)),
-        running.and_then(|row| row.dispatch).map_or(0, |dispatch| dispatch.epoch()),
-        running.and_then(|row| row.binding).map_or(0, |binding| binding.reply_object),
-        running.and_then(|row| row.physical).map_or(0, |source| source.tcb)] {
+        u64::from(channel.owned_capture.is_some()), channel.next_id] {
         print_str(b"/"); print_u64(value);
     }
     print_str(b"\n");
