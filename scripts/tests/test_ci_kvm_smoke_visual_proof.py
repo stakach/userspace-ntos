@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from scripts.ci_kvm_ppm import crop_ppm
 from scripts.ci_kvm_visual_proof import (contains_command_prompt_search_result,
                                          contains_ready_prompt, contains_start_menu_search_box,
                                          contains_ver_result, prove_command_prompt_search_result,
@@ -54,7 +55,7 @@ class VisualProofTests(unittest.TestCase):
         caret_menu = "All Programs\nIsearch programs and files\nShut down\n"
         # LiberNT paints result rows directly, above the edit at the bottom;
         # it does not paint a standalone "Programs" heading in search mode.
-        results = "Command Prompt\ncommand\n"
+        results = "Command Prompt\ncommand\nShut down\n"
         recorded_search = "2) Command Prompt\nUser\n\u00bb\n\u2018command\nShut down\n"
         self.assertTrue(contains_start_menu_search_box(menu))
         # Tesseract on the actual 45425894277 Start screenshot includes
@@ -71,35 +72,54 @@ class VisualProofTests(unittest.TestCase):
         self.assertFalse(contains_command_prompt_search_result(menu))
         self.assertFalse(contains_command_prompt_search_result(
             "command\nNo items match your search.\n"))
-        self.assertFalse(contains_command_prompt_search_result(
-            "Command Prompt\nC:\\Users\\User>command\n"))
+        self.assertTrue(contains_command_prompt_search_result(
+            "2) Command Prompt\nUser\nShut down\n"))
+
+    def test_ppm_crop_preserves_exact_original_pixels_at_double_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "frame.ppm"
+            image.write_bytes(b"P6\n4 2\n255\n" + bytes(range(24)))
+            crop = crop_ppm(image, 1, 0, 3, 2, scale=2)
+            header = b"P6\n4 4\n255\n"
+            self.assertEqual(crop[:len(header)], header)
+            self.assertEqual(crop[len(header):],
+                             bytes([3, 4, 5] * 2 + [6, 7, 8] * 2) * 2 +
+                             bytes([15, 16, 17] * 2 + [18, 19, 20] * 2) * 2)
+            with self.assertRaises(ValueError):
+                crop_ppm(image, 1, 0, 5, 2, scale=2)
 
     def test_shell_search_proofs_retain_original_frame_and_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "native-kvm-interact-03-command-prompt-search.ppm"
             image.write_bytes(b"P6\n1 1\n255\n\0\0\0")
             expected_sha = hashlib.sha256(image.read_bytes()).hexdigest()
-            with patch("scripts.ci_kvm_visual_proof.subprocess.run") as ocr:
+            with patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=b"P6\n1 1\n255\n\0\0\0") as crop, \
+                    patch("scripts.ci_kvm_visual_proof.subprocess.run") as ocr:
                 ocr.return_value = subprocess.CompletedProcess(
                     [], 0, "All Programs\nSearch programs and files\n", "")
                 menu = prove_start_menu_search_box(image)
                 self.assertTrue(menu.passed)
                 self.assertEqual(menu.image_sha256, expected_sha)
-                ocr.return_value = subprocess.CompletedProcess(
-                    [], 0, "Command Prompt\ncommand\n", "")
+                ocr.side_effect = [
+                    # Full-frame OCR from run 45446936802 mangled the tiny
+                    # edit text, while the same frame's crop reads command.
+                    subprocess.CompletedProcess([], 0, "2) Command Prompt\nUser\neanncst|\nShut down\n", ""),
+                    subprocess.CompletedProcess([], 0, b"command\n", b""),
+                ]
                 result = prove_command_prompt_search_result(image)
                 self.assertTrue(result.passed)
                 self.assertEqual(result.image_sha256, expected_sha)
-                ocr.return_value = subprocess.CompletedProcess(
-                    [], 0, "2) Command Prompt\n\u2018command\n", "")
-                recorded = prove_command_prompt_search_result(image)
-                self.assertTrue(recorded.passed)
-                self.assertEqual(recorded.image_sha256, expected_sha)
-                ocr.return_value = subprocess.CompletedProcess(
-                    [], 0, "command\nNo items match your search.\n", "")
+                self.assertIn("search query crop: command", result.ocr_text)
+                crop.assert_called_once_with(image, 17, 683, 210, 702, scale=2)
+                self.assertEqual(ocr.call_args.args[:2], (["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "7"],))
+                self.assertEqual(ocr.call_args.kwargs["input"], b"P6\n1 1\n255\n\0\0\0")
+                ocr.side_effect = [
+                    subprocess.CompletedProcess([], 0, "2) Command Prompt\nUser\nShut down\n", ""),
+                    subprocess.CompletedProcess([], 0, b"Search programs and files\n", b""),
+                ]
                 missing = prove_command_prompt_search_result(image)
                 self.assertFalse(missing.passed)
-                self.assertIn("command", missing.ocr_text)
+                self.assertIn("Search programs and files", missing.ocr_text)
                 self.assertEqual(missing.image_sha256, expected_sha)
 
     def test_recorded_boot2_ver_ignores_separate_punctuation_spillover(self):
