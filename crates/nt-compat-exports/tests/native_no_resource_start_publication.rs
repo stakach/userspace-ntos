@@ -55,7 +55,12 @@ fn empty_assignment_reaches_successful_start_publication_without_a_context_lease
         "a default empty projection is not proof of a committed empty assignment",
     );
     assert!(
-        validation.contains("has_pnp_device_rows"),
+        validation.contains("has_retained_pnp_device_rows(binding)"),
         "an unexpected retained MMIO request must fence empty-resource publication",
     );
+    let retained_rows = between(MMIO, "unsafe fn has_retained_pnp_device_rows(", "unsafe fn retained_pnp_state(");
+    assert!(retained_rows.contains("ledger.has_pnp_device_rows("));
+    assert!(retained_rows.contains("binding.projection_domain.domain_id.raw()"));
+    assert!(retained_rows.contains("binding.projection_domain.cookie"));
+    assert!(retained_rows.contains("binding.device_id"));
 }

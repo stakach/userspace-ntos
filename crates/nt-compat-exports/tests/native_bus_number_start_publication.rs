@@ -65,7 +65,12 @@ fn bus_number_only_publication_needs_typed_started_proof_before_lease_bound_maps
         .expect("assigned MMIO requests must retain live lease authority");
     assert!(no_lease < bus_only && bus_only < lease_bound);
     assert!(publication.contains("pnp.fdo(identity.devnode_id()) != Some(binding.device_id)"));
-    assert!(publication.contains("has_pnp_device_rows"));
+    assert!(publication.contains("has_retained_pnp_device_rows(binding)"));
+    let retained_rows = between(MMIO, "unsafe fn has_retained_pnp_device_rows(", "unsafe fn retained_pnp_state(");
+    assert!(retained_rows.contains("ledger.has_pnp_device_rows("));
+    assert!(retained_rows.contains("binding.projection_domain.domain_id.raw()"));
+    assert!(retained_rows.contains("binding.projection_domain.cookie"));
+    assert!(retained_rows.contains("binding.device_id"));
 
     let proof = between(
         PNP,
