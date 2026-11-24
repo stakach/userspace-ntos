@@ -259,7 +259,8 @@ pub(super) unsafe fn validate_publication(
         let identity = pnp.devnode_identity_for_pdo(binding.pdo_device_id)
             .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
         if pnp.fdo(identity.devnode_id()) != Some(binding.device_id)
-            || !pnp.devnode_has_started_empty_assignment(identity)
+            || !(pnp.devnode_has_started_empty_assignment(identity)
+                || pnp.devnode_has_started_bus_number_assignment(identity))
         {
             return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
         }

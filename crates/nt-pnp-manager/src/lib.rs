@@ -1484,20 +1484,51 @@ impl PnpManager {
         })
     }
 
-    /// The exact started PDO has completed an empty raw and translated assignment.
-    /// An unqueried resource set is not evidence that no resources were assigned.
-    pub fn devnode_has_started_empty_assignment(&self, identity: DevnodeIdentity) -> bool {
-        self.devnodes.iter().any(|devnode| {
+    fn started_pdo_properties(&self, identity: DevnodeIdentity) -> Option<&PdoProperties> {
+        self.devnodes.iter().find(|devnode| {
             devnode.id == identity.devnode_id
                 && devnode.generation == identity.generation
                 && devnode.pdo_object_id == identity.pdo_object_id
                 && devnode.state == DeviceState::Started
                 && devnode.pending_dispatch.is_none()
-                && devnode.pdo_properties.as_ref().is_some_and(|properties| {
-                    properties.allocated_resources_raw == PropertyBlobState::KnownNone
-                        && properties.allocated_resources_translated == PropertyBlobState::KnownNone
-                })
+        })?.pdo_properties.as_ref()
+    }
+
+    /// The exact started PDO has completed an empty raw and translated assignment.
+    /// An unqueried resource set is not evidence that no resources were assigned.
+    pub fn devnode_has_started_empty_assignment(&self, identity: DevnodeIdentity) -> bool {
+        self.started_pdo_properties(identity).is_some_and(|properties| {
+            properties.allocated_resources_raw == PropertyBlobState::KnownNone
+                && properties.allocated_resources_translated == PropertyBlobState::KnownNone
         })
+    }
+
+    /// The exact started PDO retained one bus-reported BusNumber descriptor as both Start lists.
+    /// A mixed list or a changed assignment is not authority for lease-free publication.
+    pub fn devnode_has_started_bus_number_assignment(&self, identity: DevnodeIdentity) -> bool {
+        let Some(properties) = self.started_pdo_properties(identity) else {
+            return false;
+        };
+        let (
+            PropertyBlobState::Present(boot_raw),
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::Present(assigned_raw),
+            PropertyBlobState::Present(assigned_translated),
+        ) = (
+            &properties.boot_resources_raw,
+            &properties.boot_resources_translated,
+            &properties.resource_requirements,
+            &properties.filtered_resource_requirements,
+            &properties.allocated_resources_raw,
+            &properties.allocated_resources_translated,
+        ) else {
+            return false;
+        };
+        boot_raw == assigned_raw
+            && assigned_raw == assigned_translated
+            && nt_cm_resources::decode_single_bus_number_resource(boot_raw).is_ok()
     }
 
     /// Commit only a terminal driver's state query to the same started PDO generation.
@@ -3718,6 +3749,97 @@ mod tests {
         complete_pnp(&mut p, &start, true).unwrap();
         assert_eq!(p.state(assigned_id), Some(DeviceState::Started));
         assert!(!p.devnode_has_started_empty_assignment(assigned));
+    }
+
+    #[test]
+    fn started_bus_number_assignment_requires_exact_boot_and_committed_lists() {
+        let mut bus_number = vec![0u8; 40];
+        bus_number[0..4].copy_from_slice(&1u32.to_le_bytes());
+        bus_number[4..8]
+            .copy_from_slice(&(nt_cm_resources::INTERFACE_TYPE_INTERNAL as u32).to_le_bytes());
+        bus_number[12..14].copy_from_slice(&1u16.to_le_bytes());
+        bus_number[14..16].copy_from_slice(&1u16.to_le_bytes());
+        bus_number[16..20].copy_from_slice(&1u32.to_le_bytes());
+        bus_number[20] = nt_cm_resources::CM_RESOURCE_TYPE_BUS_NUMBER;
+        bus_number[21] = nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE;
+        bus_number[28..32].copy_from_slice(&1u32.to_le_bytes());
+        assert!(nt_cm_resources::decode_single_bus_number_resource(&bus_number).is_ok());
+
+        let mut p = PnpManager::new();
+        let pdo = 0x4300;
+        let properties = PdoProperties::from_bus_queries(
+            None,
+            None,
+            PropertyBlobState::Present(bus_number.clone()),
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::KnownNone,
+        );
+        let id = p.register_enumerated_pdo(r"ACPI\PNP0A08\0", pdo, properties).unwrap();
+        p.commit_device_stack(pdo, 0x4301, 0x56).unwrap();
+        let identity = p.devnode_identity_for_pdo(pdo).unwrap();
+        assert!(!p.devnode_has_started_bus_number_assignment(identity));
+        p.commit_filtered_resource_requirements(pdo, vec![]).unwrap();
+        p.commit_resource_assignment(pdo, bus_number.clone(), bus_number.clone()).unwrap();
+        let start = begin_pnp(&mut p, pdo, PnpMinor::StartDevice).unwrap();
+        assert!(!p.devnode_has_started_bus_number_assignment(identity));
+        complete_pnp(&mut p, &start, true).unwrap();
+        assert_eq!(p.state(id), Some(DeviceState::Started));
+        assert!(p.devnode_has_started_bus_number_assignment(identity));
+        assert!(!p.devnode_has_started_bus_number_assignment(DevnodeIdentity {
+            generation: identity.generation + 1,
+            ..identity
+        }));
+        assert!(!p.devnode_has_started_bus_number_assignment(DevnodeIdentity {
+            pdo_object_id: pdo + 1,
+            ..identity
+        }));
+
+        let original = p.devnodes.iter().find(|node| node.id == id)
+            .unwrap().pdo_properties.as_ref().unwrap().clone();
+        let mut assert_rejected = |properties: PdoProperties| {
+            p.devnodes.iter_mut().find(|node| node.id == id)
+                .unwrap().pdo_properties = Some(properties);
+            assert!(!p.devnode_has_started_bus_number_assignment(identity));
+        };
+        let mut altered = original.clone();
+        altered.allocated_resources_raw = PropertyBlobState::Unqueried;
+        assert_rejected(altered);
+        let mut altered = original.clone();
+        altered.allocated_resources_translated = PropertyBlobState::Present(vec![1]);
+        assert_rejected(altered);
+        let mut altered = original.clone();
+        let mut changed_boot = bus_number.clone();
+        changed_boot[24..28].copy_from_slice(&1u32.to_le_bytes());
+        altered.boot_resources_raw = PropertyBlobState::Present(changed_boot);
+        assert_rejected(altered);
+        let mut altered = original.clone();
+        altered.boot_resources_translated = PropertyBlobState::Present(bus_number.clone());
+        assert_rejected(altered);
+        let mut altered = original.clone();
+        altered.resource_requirements = PropertyBlobState::Present(bus_number.clone());
+        assert_rejected(altered);
+        let mut altered = original.clone();
+        altered.filtered_resource_requirements = PropertyBlobState::Unqueried;
+        assert_rejected(altered);
+        let mut altered = original.clone();
+        altered.filtered_resource_requirements = PropertyBlobState::Present(vec![1]);
+        assert_rejected(altered);
+        let mut mixed = bus_number.clone();
+        mixed.resize(60, 0);
+        mixed[16..20].copy_from_slice(&2u32.to_le_bytes());
+        mixed[40] = nt_cm_resources::CM_RESOURCE_TYPE_MEMORY;
+        let mut altered = original.clone();
+        altered.boot_resources_raw = PropertyBlobState::Present(mixed.clone());
+        altered.allocated_resources_raw = PropertyBlobState::Present(mixed.clone());
+        altered.allocated_resources_translated = PropertyBlobState::Present(mixed);
+        assert_rejected(altered);
+        let mut trailing = bus_number;
+        trailing.push(0);
+        let mut altered = original;
+        altered.boot_resources_raw = PropertyBlobState::Present(trailing.clone());
+        altered.allocated_resources_raw = PropertyBlobState::Present(trailing.clone());
+        altered.allocated_resources_translated = PropertyBlobState::Present(trailing);
+        assert_rejected(altered);
     }
 
     #[test]
