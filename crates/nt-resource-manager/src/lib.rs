@@ -132,7 +132,26 @@ struct Mapping {
     owner: ResourceOwner,
     translated_start: u64,
     length: u64,
+    cache: MemoryCache,
     valid: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MemoryCache {
+    NonCached,
+    Cached,
+    WriteCombined,
+}
+
+impl MemoryCache {
+    fn from_abi(cache: u32) -> Result<Self, HalError> {
+        match cache {
+            MM_NON_CACHED => Ok(Self::NonCached),
+            MM_CACHED => Ok(Self::Cached),
+            MM_WRITE_COMBINED => Ok(Self::WriteCombined),
+            _ => Err(HalError::AccessDenied),
+        }
+    }
 }
 
 struct Interrupt {
@@ -239,6 +258,21 @@ fn ranges_overlap(first_start: u64, first_len: u64, second_start: u64, second_le
         return true;
     };
     first_start <= second_end && second_start <= first_end
+}
+
+fn physical_pages_overlap(
+    first_start: u64,
+    first_len: u64,
+    second_start: u64,
+    second_len: u64,
+) -> bool {
+    let Some(first_end) = first_start.checked_add(first_len.saturating_sub(1)) else {
+        return true;
+    };
+    let Some(second_end) = second_start.checked_add(second_len.saturating_sub(1)) else {
+        return true;
+    };
+    first_start >> 12 <= second_end >> 12 && second_start >> 12 <= first_end >> 12
 }
 
 fn range_contains_address(start: u64, length: u64, address: u64) -> bool {
@@ -548,23 +582,36 @@ impl ResourceManager {
                         );
                         existing.owner != owner
                             && !existing.revoked
-                            && ranges_overlap(
+                            && !delegated_parent
+                            && ((candidate.cache != existing.cache
+                                && physical_pages_overlap(
+                                    candidate.translated_start,
+                                    candidate.length,
+                                    existing.translated_start,
+                                    existing.length,
+                                ))
+                                || (ranges_overlap(
+                                    candidate.translated_start,
+                                    candidate.length,
+                                    existing.translated_start,
+                                    existing.length,
+                                ) && (candidate.share == SHARE_EXCLUSIVE
+                                    || existing.share == SHARE_EXCLUSIVE)))
+                    }) || memory.iter().any(|existing: &MemoryResource| {
+                        (candidate.cache != existing.cache
+                            && physical_pages_overlap(
                                 candidate.translated_start,
                                 candidate.length,
                                 existing.translated_start,
                                 existing.length,
-                            )
-                            && (candidate.share == SHARE_EXCLUSIVE
-                                || existing.share == SHARE_EXCLUSIVE)
-                            && !delegated_parent
-                    }) || memory.iter().any(|existing: &MemoryResource| {
-                        ranges_overlap(
-                            candidate.translated_start,
-                            candidate.length,
-                            existing.translated_start,
-                            existing.length,
-                        ) && (candidate.share == SHARE_EXCLUSIVE
-                            || existing.share == SHARE_EXCLUSIVE)
+                            ))
+                            || (ranges_overlap(
+                                candidate.translated_start,
+                                candidate.length,
+                                existing.translated_start,
+                                existing.length,
+                            ) && (candidate.share == SHARE_EXCLUSIVE
+                                || existing.share == SHARE_EXCLUSIVE))
                     }) {
                         return Err(HalError::ConflictingAddress);
                     }
@@ -874,12 +921,18 @@ impl ResourceManager {
         }
         if self.memory.iter().any(|memory| {
             !memory.revoked
-                && ranges_overlap(
+                && (ranges_overlap(
                     translated_start,
                     length,
                     memory.translated_start,
                     memory.length,
-                )
+                ) || (memory.cache != cache
+                    && physical_pages_overlap(
+                        translated_start,
+                        length,
+                        memory.translated_start,
+                        memory.length,
+                    )))
         }) {
             return Err(HalError::ConflictingAddress);
         }
@@ -1155,13 +1208,14 @@ impl ResourceManager {
 
     /// `MmMapIoSpace` (spec §8.2, §6.1): map succeeds only if `[phys, phys+len)` lies
     /// within a memory resource assigned to `owner`, not revoked, and the assignment
-    /// grants at least read access.
+    /// grants at least read access and the requested cache type matches the assignment.
+    /// Overlapping live mappings must use the same cache type, even across owners.
     pub fn map_io_space(
         &mut self,
         owner: ResourceOwner,
         phys: u64,
         length: u64,
-        _cache: u32,
+        cache: u32,
     ) -> Result<Granted, HalError> {
         let m = self
             .memory
@@ -1197,6 +1251,17 @@ impl ResourceManager {
         if m.rights & RIGHT_READ == 0 {
             return Err(HalError::AccessDenied);
         }
+        let requested_cache = MemoryCache::from_abi(cache)?;
+        if self.mappings.iter().any(|mapping| {
+            mapping.valid
+                && mapping.cache != requested_cache
+                && physical_pages_overlap(mapping.translated_start, mapping.length, phys, length)
+        }) {
+            return Err(HalError::ConflictingAddress);
+        }
+        if requested_cache != MemoryCache::from_abi(m.cache)? {
+            return Err(HalError::AccessDenied);
+        }
         self.mappings
             .try_reserve(1)
             .map_err(|_| HalError::InsufficientResources)?;
@@ -1218,6 +1283,7 @@ impl ResourceManager {
             owner,
             translated_start: g.translated_start,
             length,
+            cache: requested_cache,
             valid: true,
         });
         Ok(g)
@@ -1541,6 +1607,176 @@ mod tests {
             rm.unmap_io_space(owner, g.mapping_id),
             Err(HalError::StaleId)
         );
+    }
+
+    #[test]
+    fn conflicting_mmio_cache_alias_is_rejected_without_changing_mapping_owner() {
+        let (mut rm, owner) = rm();
+        let cached_owner = ResourceOwner::new(2, 200, 20);
+        // Fixture assignments deliberately alias one translated physical range so the map
+        // policy is exercised independently of assignment admission.
+        rm.assign_memory(
+            cached_owner,
+            101,
+            0x2000_0000,
+            0x1000_0000,
+            0x1000,
+            MM_CACHED,
+            RIGHT_READ,
+        );
+        let first = rm
+            .map_io_space(owner, 0x1000_0000, 0x1000, MM_NON_CACHED)
+            .unwrap();
+        let next = rm.next_mapping_id;
+        let count = rm.mappings.len();
+
+        assert_eq!(
+            rm.map_io_space(cached_owner, 0x1000_0000, 0x800, MM_CACHED),
+            Err(HalError::ConflictingAddress),
+        );
+        assert!(rm.mapping_valid(first.mapping_id));
+        assert_eq!(rm.mappings.len(), count);
+        assert_eq!(rm.next_mapping_id, next);
+
+        let same_cache = rm
+            .map_io_space(owner, 0x1000_0000, 0x800, MM_NON_CACHED)
+            .unwrap();
+        rm.unmap_io_space(owner, first.mapping_id).unwrap();
+        assert!(rm.mapping_valid(same_cache.mapping_id));
+        assert_eq!(
+            rm.map_io_space(cached_owner, 0x1000_0000, 0x800, MM_CACHED),
+            Err(HalError::ConflictingAddress),
+        );
+        rm.unmap_io_space(owner, same_cache.mapping_id).unwrap();
+        let cached = rm
+            .map_io_space(cached_owner, 0x1000_0000, 0x800, MM_CACHED)
+            .unwrap();
+        assert_eq!(
+            rm.map_io_space(owner, 0x1000_0000, 0x800, MM_NON_CACHED),
+            Err(HalError::ConflictingAddress),
+        );
+        rm.unmap_io_space(cached_owner, cached.mapping_id).unwrap();
+        assert_eq!(
+            rm.map_io_space(owner, 0x1000_0000, 0x800, MM_CACHED),
+            Err(HalError::AccessDenied),
+            "an assigned noncached BAR cannot be silently remapped as cached",
+        );
+        let replacement = rm
+            .map_io_space(owner, 0x1000_0000, 0x800, MM_NON_CACHED)
+            .unwrap();
+        assert_ne!(replacement.mapping_id, same_cache.mapping_id);
+    }
+
+    #[test]
+    fn disjoint_byte_ranges_in_one_physical_page_cannot_use_different_cache_types() {
+        let (mut rm, uncached_owner) = rm();
+        let cached_owner = ResourceOwner::new(2, 200, 20);
+        rm.assign_memory(
+            cached_owner,
+            101,
+            0x2000_0000,
+            0x1000_0000,
+            0x1000,
+            MM_CACHED,
+            RIGHT_READ,
+        );
+
+        let first = rm
+            .map_io_space(uncached_owner, 0x1000_0000, 0x400, MM_NON_CACHED)
+            .unwrap();
+        let next = rm.next_mapping_id;
+        assert_eq!(
+            rm.map_io_space(cached_owner, 0x1000_0400, 0x400, MM_CACHED),
+            Err(HalError::ConflictingAddress),
+            "cache attributes apply to the physical page, even for disjoint byte ranges",
+        );
+        assert_eq!(rm.next_mapping_id, next);
+        assert!(rm.mapping_valid(first.mapping_id));
+
+        rm.unmap_io_space(uncached_owner, first.mapping_id).unwrap();
+        assert!(rm
+            .map_io_space(cached_owner, 0x1000_0400, 0x400, MM_CACHED)
+            .is_ok());
+    }
+
+    #[test]
+    fn memory_claim_rejects_conflicting_cache_on_a_shared_physical_page() {
+        let mut rm = ResourceManager::new();
+        let first = ResourceOwner::new(1, 10, 100);
+        let second = ResourceOwner::new(2, 20, 200);
+        rm.claim_memory(
+            first,
+            300,
+            0x3000_0000,
+            0x3000_0000,
+            0x400,
+            MM_NON_CACHED,
+            RIGHT_READ,
+        )
+        .unwrap();
+        assert_eq!(
+            rm.claim_memory(
+                second,
+                301,
+                0x3000_0400,
+                0x3000_0400,
+                0x400,
+                MM_CACHED,
+                RIGHT_READ
+            ),
+            Err(HalError::ConflictingAddress),
+        );
+        assert!(rm.query_resources(second).is_empty());
+        assert_eq!(
+            rm.claim_memory(
+                second,
+                301,
+                0x3000_0400,
+                0x3000_0400,
+                0x400,
+                MM_NON_CACHED,
+                RIGHT_READ
+            ),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn assignment_batch_rejects_conflicting_cache_on_a_shared_physical_page() {
+        let mut rm = ResourceManager::new();
+        let first = ResourceOwner::new(1, 10, 100);
+        let second = ResourceOwner::new(2, 20, 200);
+        rm.claim_memory(
+            first,
+            300,
+            0x3000_0000,
+            0x3000_0000,
+            0x400,
+            MM_NON_CACHED,
+            RIGHT_READ,
+        )
+        .unwrap();
+        let cached = HalResourceDescriptor {
+            kind: RES_KIND_MEMORY,
+            share: SHARE_EXCLUSIVE,
+            resource_id: 301,
+            raw_start: 0x3000_0400,
+            translated_start: 0x3000_0400,
+            length: 0x400,
+            arg0: MM_CACHED as u64,
+            arg1: RIGHT_READ,
+            ..Default::default()
+        };
+        assert_eq!(
+            rm.replace_owner_assignments(second, &[cached]),
+            Err(HalError::ConflictingAddress),
+        );
+        assert!(rm.query_resources(second).is_empty());
+        let uncached = HalResourceDescriptor {
+            arg0: MM_NON_CACHED as u64,
+            ..cached
+        };
+        assert_eq!(rm.replace_owner_assignments(second, &[uncached]), Ok(()));
     }
 
     #[test]

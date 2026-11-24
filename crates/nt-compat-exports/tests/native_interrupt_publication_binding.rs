@@ -7,9 +7,7 @@
 #[path = "../../../components/ntos-executive/src/hosted_device_publication_decision.rs"]
 mod native_decision;
 
-use native_decision::{
-    InstalledInterrupt, LiveInterruptProjection, MmioPublication, StartPublication,
-};
+use native_decision::{InstalledInterrupt, LiveInterruptProjection, StartPublication};
 use syn::visit::Visit;
 
 const KEYBOARD_INTERRUPT: u64 = 0x1000_e803_a10;
@@ -143,24 +141,6 @@ fn disconnecting_keyboard_does_not_clear_the_mouse_bank() {
 }
 
 #[test]
-fn delayed_mmio_publication_never_reads_another_devices_bank() {
-    assert_eq!(
-        native_decision::mmio_publication(false),
-        MmioPublication::NoMap,
-        "a device with no assigned memory has no MMIO usage to publish",
-    );
-}
-
-#[test]
-fn assigned_memory_cannot_use_a_matching_mutable_bank_marker_as_a_mapping_receipt() {
-    assert_eq!(
-        native_decision::mmio_publication(true),
-        MmioPublication::Unresolved,
-        "an assigned memory grant needs its exact per-device mapping receipt",
-    );
-}
-
-#[test]
 fn delayed_start_does_not_reread_a_mutable_resource_snapshot() {
     let source = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
     let body = source
@@ -170,7 +150,7 @@ fn delayed_start_does_not_reread_a_mutable_resource_snapshot() {
         .split_once("\nunsafe fn ")
         .expect("next native function")
         .0;
-    assert!(body.contains("retained_hosted_device_resource_state(binding)?"));
+    assert!(body.contains("hosted_mmio_broker::validate_publication(binding)?"));
     assert!(!body.contains("SH_ACTIVE_DEVICE_OBJECT"));
     assert!(!body.contains("record_hosted_mmio_usage("));
     assert!(
@@ -210,7 +190,7 @@ fn native_call_sites_use_the_tested_binding_decisions() {
         calls.0
     };
     assert!(native_calls("finish_hosted_start_publication").contains(&"start_publication".into()));
-    assert!(native_calls("finish_hosted_start_publication").contains(&"mmio_publication".into()));
+    assert!(native_calls("finish_hosted_start_publication").contains(&"validate_publication".into()));
     assert!(native_calls("finish_hosted_start_publication")
         .contains(&"refresh_hosted_device_interrupt_state_from_retained".into()));
     let broker = native_calls("service_hosted_driver_interrupt");

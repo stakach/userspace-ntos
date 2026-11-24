@@ -1,7 +1,7 @@
 //! Repair only a live, granted device resource leaf using its original retained cap.
 
 use super::*;
-use nt_pnp_context::resource_mapping::{MappingDomain, MappingPhase};
+use nt_pnp_context::resource_mapping::{MappingCache, MappingDomain, MappingPhase};
 
 pub(crate) unsafe fn service_fault(
     channel: &crate::spawn_hosts::PumpChannel,
@@ -38,7 +38,7 @@ pub(crate) unsafe fn service_fault(
                     id: domain.domain_id.raw(),
                     cookie: domain.cookie,
                 })
-            || key.attributes != 0
+            || key.cache != MappingCache::Uncached
             || (fsr & 2 != 0 && key.rights & 1 == 0)
         {
             return None;
@@ -123,6 +123,9 @@ pub(crate) unsafe fn service_fault(
     let Some((cap, effect)) = hosted_resource_mapping::begin_remap(receipt) else {
         return Some(false);
     };
-    let error = page_map_r(cap, key.virtual_page, key.rights, key.pml4);
+    let error = page_map_r(
+        cap, key.virtual_page,
+        hosted_resource_mapping::page_map_rights(key.rights, key.cache), key.pml4,
+    );
     Some(hosted_resource_mapping::finish_remap(effect, error))
 }

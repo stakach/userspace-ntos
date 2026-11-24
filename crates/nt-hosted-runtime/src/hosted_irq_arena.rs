@@ -186,6 +186,8 @@ pub enum HostedIrqServiceKind {
     /// local completion unwind. `operation` is the primary forward's: 2 acknowledges a
     /// terminal, 3 arms a Pending dispatch, 4 holds an inline STATUS_MORE_PROCESSING_REQUIRED.
     CallDriverAcknowledge = 28,
+    /// MmMapIoSpace / MmUnmapIoSpace through the exact IRQ or DPC device grant.
+    MmioRequest = 29,
 }
 
 impl HostedIrqServiceKind {
@@ -219,6 +221,7 @@ impl HostedIrqServiceKind {
             26 => Some(Self::CurrentIdentity),
             27 => Some(Self::CallDriver),
             28 => Some(Self::CallDriverAcknowledge),
+            29 => Some(Self::MmioRequest),
             _ => None,
         }
     }
@@ -648,6 +651,15 @@ impl HostedIrqServiceCommand {
                         && self.arguments[..2].iter().all(|argument| *argument != 0)
                         && (2..=4).contains(&self.arguments[2])
                         && self.arguments[3..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::MmioRequest => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 4
+                        && matches!(self.arguments[0], 1 | 2)
+                        && self.arguments[2] != 0
+                        && self.arguments[3] <= u32::MAX as u64
+                        && (self.arguments[0] == 1 || self.arguments[3] == 0)
+                        && self.arguments[4..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::PoolRetirement => {
                     self.authority_cookie == 0
@@ -2676,7 +2688,8 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
         assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
-        assert_eq!(HostedIrqServiceKind::from_raw(29), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(29), Some(HostedIrqServiceKind::MmioRequest));
+        assert_eq!(HostedIrqServiceKind::from_raw(30), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -3172,6 +3185,28 @@ mod tests {
         set.arguments[0] = 0x2000;
         set.arguments[4] = 1;
         assert!(!set.valid(), "set must not carry hidden arguments");
+    }
+
+    #[test]
+    fn mmio_service_admits_only_exact_map_and_unmap_shapes() {
+        let mut command = service();
+        command.kind = HostedIrqServiceKind::MmioRequest;
+        command.authority_cookie = 0;
+        command.argument_count = 4;
+        command.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        command.arguments[..4].copy_from_slice(&[1, 0xe000_0000, 0x1000, 0]);
+        assert!(command.valid());
+        command.arguments[3] = u32::MAX as u64 + 1;
+        assert!(!command.valid());
+        command.arguments[3] = 0;
+        command.arguments[0] = 2;
+        command.arguments[1] = 0x7000_0000;
+        assert!(command.valid());
+        command.arguments[3] = 1;
+        assert!(!command.valid());
+        command.arguments[3] = 0;
+        command.arguments[4] = 1;
+        assert!(!command.valid());
     }
 
     fn service() -> HostedIrqServiceCommand {

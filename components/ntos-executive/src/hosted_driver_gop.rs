@@ -195,6 +195,20 @@ pub(crate) fn service_hosted_driver_gop_map(
     ) }
 }
 
+pub(crate) fn service_hosted_driver_gop_unmap(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller_badge: u64,
+    reply_cap: u64,
+    base: u64,
+    length: u64,
+) -> Result<(), nt_status::NtStatus> {
+    unsafe {
+        hosted_gop_bar_projection::unmap_scanout(
+            channel, caller_badge, reply_cap, base, length,
+        )
+    }
+}
+
 pub(super) unsafe fn retire_hosted_gop_projection(
     instance_index: usize,
     domain: HostedDomainIdentity,

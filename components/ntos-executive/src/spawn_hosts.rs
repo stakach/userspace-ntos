@@ -4853,14 +4853,24 @@ unsafe fn component_pump_loop(
         {
             let result = if msg.mi == (crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL << 12) {
                 crate::driver_launch::service_hosted_driver_gop_query(ch, msg.badge, *reply_cap)
-            } else if msg.mi == ((crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL << 12) | 3) {
-                crate::driver_launch::service_hosted_driver_gop_map(
-                    ch, msg.badge, *reply_cap, msg.m0, msg.m1, msg.m2,
-                )
             } else {
                 0
             };
             pump_reply_recv4_into!(ch, *reply_cap, msg, 1, result, 0, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_MMIO_REQUEST_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_MMIO_REQUEST_LABEL << 12) | 4)
+            {
+                crate::driver_launch::service_hosted_driver_mmio_request(
+                    ch, msg.badge, *reply_cap, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_DISPLAY_OWNERSHIP_LABEL
             && ch.caps.kind == ReqKind::Irp

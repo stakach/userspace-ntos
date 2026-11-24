@@ -21,21 +21,6 @@ pub(crate) struct LiveInterruptProjection {
     pub connection: Option<(u64, u64)>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MmioPublication {
-    NoMap,
-    Unresolved,
-}
-
-/// Assigned memory requires a per-binding map receipt; the shared bank is never that receipt.
-pub(crate) fn mmio_publication(has_assigned_memory: bool) -> MmioPublication {
-    if has_assigned_memory {
-        MmioPublication::Unresolved
-    } else {
-        MmioPublication::NoMap
-    }
-}
-
 /// The exact installed connection belongs to a device binding; the shared bank is per instance.
 /// IoConnectInterrupt settles the canonical connect synchronously. A delayed StartDevice
 /// publication may observe that result or an exact unresolved projection, never replay a
