@@ -9,6 +9,11 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 
+try:
+    from .ci_kvm_ppm import read_ppm
+except ImportError:
+    from ci_kvm_ppm import read_ppm
+
 DIFFERENCE_THRESHOLD = 90
 TARGET_TOLERANCE = 3
 SEARCH_RADIUS = 60
@@ -21,29 +26,14 @@ class CursorProof:
     image_sha256: str
 
 
-def _read_ppm(path):
-    data = Path(path).read_bytes()
-    header = data.split(b"\n", 3)
-    if len(header) != 4 or header[0] != b"P6" or header[2] != b"255":
-        raise ValueError(f"unsupported QMP PPM: {path}")
-    try:
-        width, height = (int(value) for value in header[1].split())
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"invalid QMP PPM dimensions: {path}") from error
-    pixels = header[3]
-    if width <= 0 or height <= 0 or len(pixels) != width * height * 3:
-        raise ValueError(f"invalid QMP PPM pixel data: {path}")
-    return width, height, pixels
-
-
 def measure_cursor_hotspot(before, after, origin=(0, 0), search=None):
     """Return the top-left cursor hotspot from changed pixels, or None.
 
     ``origin`` maps a cropped recorded frame back to full-screen coordinates.
     Runtime captures use the full screen and a narrow ``search`` rectangle.
     """
-    width, height, old = _read_ppm(before)
-    new_width, new_height, new = _read_ppm(after)
+    width, height, old = read_ppm(before)
+    new_width, new_height, new = read_ppm(after)
     if (width, height) != (new_width, new_height):
         raise ValueError("cursor frame dimensions differ")
     left, top, right, bottom = search or (0, 0, width, height)
@@ -77,7 +67,7 @@ def cursor_is_at_target(position, target):
 def prove_cursor_position(before, after, target):
     """Measure a cursor near a target and retain the original screenshot hash."""
     after = Path(after)
-    width, height, _pixels = _read_ppm(after)
+    width, height, _pixels = read_ppm(after)
     left = max(0, target[0] - SEARCH_RADIUS)
     top = max(0, target[1] - SEARCH_RADIUS)
     right = min(width, target[0] + SEARCH_RADIUS + 1)
