@@ -123,7 +123,8 @@ pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderW
 pub use gop_bar_projection::{GopBarProjection, GopLegacyVgaPortAuthority,
     GopPciBarAuthority};
 pub use mmio_request::{MmioRequest, MmioRequestAuthority, MmioRequestBacking, MmioRequestError,
-    MmioRequestLedger, MmioRequestOwner, MmioRequestPhase, MmioRequestReceipt};
+    MmioRequestLedger, MmioRequestOwner, MmioRequestPhase, MmioRequestReceipt,
+    PoolOwnedRamSource};
 pub use hosted_driver_thread_object::{HostedDriverThreadObjectKey,
     HostedDriverThreadObjectRecord};
 pub use hosted_current_thread_kpcr::HostedCurrentThreadKpcr;
