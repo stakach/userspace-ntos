@@ -571,7 +571,7 @@ impl MountedVolumeBackend {
                     let lookup = match self.create_lookup(&resolved.payload.relative) {
                         Ok(lookup) => lookup,
                         Err(_) => {
-                            resolved.result = Err(nt_fs::FatPathError::NoCapacity);
+                            resolved.result = Err(nt_fs::FatPathError::NoCapacity.into());
                             self.pending_creates.borrow_mut().restore_resolved(resolved)
                                 .expect("failed lookup admission retains terminal CREATE");
                             return 1;
@@ -605,11 +605,7 @@ impl MountedVolumeBackend {
                 }
             },
             Err(error) => {
-                let status = match error {
-                    nt_fs::FatPathError::NoCapacity => NtStatus::INSUFFICIENT_RESOURCES,
-                    _ => NtStatus(nt_fs::STATUS_DATA_ERROR as i32),
-                };
-                self.complete_create(resolved.payload, status, 0, None);
+                self.complete_create(resolved.payload, error.status(), 0, None);
                 return 1;
             }
         };
@@ -882,10 +878,7 @@ impl MountedVolumeBackend {
             return 0;
         }
         let outcome = match &resolved.result {
-            Err(error) => Err(match error {
-                nt_fs::FatPathError::NoCapacity => NtStatus::INSUFFICIENT_RESOURCES,
-                _ => status(nt_fs::STATUS_DATA_ERROR),
-            }),
+            Err(error) => Err(error.status()),
             Ok(installed) => {
                 let owner = &mut resolved.payload;
                 let overlay = unsafe {
@@ -1905,6 +1898,7 @@ fn status(raw: u32) -> NtStatus {
 
 fn overlay_prepare_status(error: nt_fs::OverlayPrepareError) -> NtStatus {
     match error {
+        nt_fs::OverlayPrepareError::Provider(status) => status,
         nt_fs::OverlayPrepareError::NoCapacity => NtStatus::INSUFFICIENT_RESOURCES,
         nt_fs::OverlayPrepareError::ParentMissing => NtStatus::OBJECT_PATH_NOT_FOUND,
         nt_fs::OverlayPrepareError::ParentNotDirectory => status(nt_fs::STATUS_NOT_A_DIRECTORY),

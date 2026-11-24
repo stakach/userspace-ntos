@@ -2,14 +2,14 @@
 
 use alloc::vec::Vec;
 
-use nt_fs::{FatDirectoryRecord, FatPathError, FatPathLookup, FatPathProgress, FatPathRequest};
+use nt_fs::{FatDirectoryRecord, FatPathLookup, FatPathProgress, FatPathRequest, MountedSectorError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CreateLookupError { Invalid, Duplicate, NoCapacity, WrongClaim }
 
 /// The outer result validates the retained claim. The inner result is the sector lookup's
 /// terminal outcome, which remains owned by the CREATE entry for File IRP delivery.
-pub(crate) type CreateSectorCompletion = Result<Result<FatPathProgress, FatPathError>, CreateLookupError>;
+pub(crate) type CreateSectorCompletion = Result<Result<FatPathProgress, MountedSectorError>, CreateLookupError>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CreateSectorClaim {
@@ -22,7 +22,7 @@ pub(crate) struct ResolvedCreate<P> {
     pub irp: u64,
     pub mount: u64,
     pub payload: P,
-    pub result: Result<CreateLookupFound, FatPathError>,
+    pub result: Result<CreateLookupFound, MountedSectorError>,
     pub attribution: CreateLookupAttribution,
     lookup: Option<FatPathLookup>,
 }
@@ -57,7 +57,7 @@ struct Entry<P> {
     payload: Option<P>,
     lookup: Option<FatPathLookup>,
     claimed: Option<FatPathRequest>,
-    result: Option<Result<CreateLookupFound, FatPathError>>,
+    result: Option<Result<CreateLookupFound, MountedSectorError>>,
     attribution: CreateLookupAttribution,
 }
 
@@ -178,7 +178,7 @@ impl<P> CreateLookupQueue<P> {
 
     /// Preserve the existing unattributed completion path, including an unentered refusal.
     /// A failure keeps the owner for terminal CREATE completion; no command is replayed.
-    pub fn complete(&mut self, claim: CreateSectorClaim, sector: Result<&[u8; 512], FatPathError>)
+    pub fn complete(&mut self, claim: CreateSectorClaim, sector: Result<&[u8; 512], MountedSectorError>)
         -> CreateSectorCompletion
     {
         self.complete_attributed(claim, sector, CompletionSource::Unattributed)
@@ -187,7 +187,7 @@ impl<P> CreateLookupQueue<P> {
     /// The native block owner calls this only after the command has reached an exact
     /// terminal and a pending command has passed strict provider ACK.
     pub fn complete_physical(&mut self, claim: CreateSectorClaim,
-        sector: Result<&[u8; 512], FatPathError>) -> CreateSectorCompletion
+        sector: Result<&[u8; 512], MountedSectorError>) -> CreateSectorCompletion
     {
         self.complete_attributed(claim, sector, CompletionSource::Physical)
     }
@@ -195,13 +195,13 @@ impl<P> CreateLookupQueue<P> {
     /// A copied sector has no provider command or terminal; count it only after the exact
     /// logical claim has been accepted. Physical completions use `complete_physical`.
     pub fn complete_cached(&mut self, claim: CreateSectorClaim,
-        sector: Result<&[u8; 512], FatPathError>) -> CreateSectorCompletion
+        sector: Result<&[u8; 512], MountedSectorError>) -> CreateSectorCompletion
     {
         self.complete_attributed(claim, sector, CompletionSource::Cached)
     }
 
     fn complete_attributed(&mut self, claim: CreateSectorClaim,
-        sector: Result<&[u8; 512], FatPathError>, source: CompletionSource)
+        sector: Result<&[u8; 512], MountedSectorError>, source: CompletionSource)
         -> CreateSectorCompletion
     {
         let entry = self.entries.iter_mut().find(|entry| entry.irp == claim.irp && entry.mount == claim.mount)
@@ -222,7 +222,7 @@ impl<P> CreateLookupQueue<P> {
         }
         let result = match sector {
             Ok(bytes) => entry.lookup.as_mut().ok_or(CreateLookupError::WrongClaim)?
-                .feed(claim.request, bytes),
+                .feed(claim.request, bytes).map_err(MountedSectorError::Fat),
             Err(error) => Err(error),
         };
         entry.claimed = None;
@@ -280,7 +280,7 @@ impl<P> CreateLookupQueue<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nt_fs::FatPathGeometry;
+    use nt_fs::{FatPathError, FatPathGeometry};
 
     fn lookup() -> FatPathLookup {
         FatPathLookup::new(FatPathGeometry {
@@ -422,8 +422,8 @@ mod tests {
         let mut queue = CreateLookupQueue::new();
         queue.capture(32, 7, (), lookup()).unwrap();
         let refused = queue.claim_next().unwrap();
-        assert_eq!(queue.complete(refused, Err(FatPathError::Corrupt)),
-            Ok(Err(FatPathError::Corrupt)));
+        assert_eq!(queue.complete(refused, Err(FatPathError::Corrupt.into())),
+            Ok(Err(FatPathError::Corrupt.into())));
         assert_eq!(queue.take_resolved().unwrap().attribution,
             CreateLookupAttribution::default());
     }
@@ -434,23 +434,43 @@ mod tests {
         queue.capture(33, 7, 91, lookup()).unwrap();
         let claim = queue.claim_next().unwrap();
         assert_eq!(queue.complete_physical(CreateSectorClaim { irp: 34, ..claim },
-            Err(FatPathError::Corrupt)), Err(CreateLookupError::WrongClaim));
-        assert_eq!(queue.complete_physical(claim, Err(FatPathError::Corrupt)),
-            Ok(Err(FatPathError::Corrupt)),
+            Err(FatPathError::Corrupt.into())), Err(CreateLookupError::WrongClaim));
+        assert_eq!(queue.complete_physical(claim, Err(FatPathError::Corrupt.into())),
+            Ok(Err(FatPathError::Corrupt.into())),
             "a terminal sector error must not be reported as a lost claim");
-        assert_eq!(queue.complete_physical(claim, Err(FatPathError::Corrupt)),
+        assert_eq!(queue.complete_physical(claim, Err(FatPathError::Corrupt.into())),
             Err(CreateLookupError::WrongClaim));
         assert!(queue.claim_next().is_none());
         let resolved = queue.take_resolved().unwrap();
         assert_eq!((resolved.irp, resolved.mount, resolved.payload), (33, 7, 91));
-        assert_eq!(resolved.result, Err(FatPathError::Corrupt));
+        assert_eq!(resolved.result, Err(FatPathError::Corrupt.into()));
         assert_eq!(resolved.attribution, CreateLookupAttribution {
             copied_cache_completions: 0, physical_settlements: 1,
         });
         queue.restore_resolved(resolved).unwrap();
         assert!(queue.claim_next().is_none());
         let retried = queue.take_resolved().unwrap();
-        assert_eq!(retried.result, Err(FatPathError::Corrupt));
+        assert_eq!(retried.result, Err(FatPathError::Corrupt.into()));
         assert_eq!(retried.attribution.physical_settlements, 1);
+    }
+
+    #[test]
+    fn authenticated_physical_failure_retains_provider_status_and_exact_claim() {
+        let mut queue = CreateLookupQueue::new();
+        queue.capture(35, 7, 92, lookup()).unwrap();
+        let claim = queue.claim_next().unwrap();
+        let failure = nt_fs::MountedSectorError::Provider(
+            nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+        assert_eq!(queue.complete_physical(CreateSectorClaim { mount: 8, ..claim },
+            Err(failure)), Err(CreateLookupError::WrongClaim));
+        assert_eq!(queue.complete_physical(claim, Err(failure)), Ok(Err(failure)));
+        assert_eq!(queue.complete_physical(claim, Err(failure)),
+            Err(CreateLookupError::WrongClaim));
+        let resolved = queue.take_resolved().unwrap();
+        assert_eq!(resolved.result, Err(failure));
+        assert_eq!(resolved.attribution.physical_settlements, 1);
+        queue.restore_resolved(resolved).unwrap();
+        assert_eq!(queue.take_resolved().unwrap().result, Err(failure));
+        assert!(queue.claim_next().is_none());
     }
 }
