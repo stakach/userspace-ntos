@@ -483,7 +483,7 @@ impl WorkClaim {
             Self::Snapshot(claim) => {
                 use crate::writable_fs::native_snapshot_io::SnapshotCompletion;
                 let owner_kind = claim.owner_kind();
-                let provider_status = result.err().map(|status| status.raw() as u32);
+                let terminal_status = result.err().map(|status| status.raw() as u32);
                 match unsafe {
                     crate::writable_fs::native_snapshot_io::complete_native_snapshot_io(claim, result)
                 } {
@@ -491,8 +491,8 @@ impl WorkClaim {
                     Ok(SnapshotCompletion::Failed(status)) => {
                         print_str(b"[native-snapshot-terminal] owner=");
                         print_str(owner_kind);
-                        print_str(b" provider-status=0x");
-                        print_hex64(provider_status.unwrap_or(0) as u64);
+                        print_str(b" terminal-status=0x");
+                        print_hex64(terminal_status.unwrap_or(0) as u64);
                         print_str(b" owner-status=0x");
                         print_hex64(status as u64);
                         print_str(b"\n");
@@ -503,10 +503,10 @@ impl WorkClaim {
         }
     }
 
-    fn complete_physical(self, result: Result<&[u8], nt_status::NtStatus>) {
+    fn complete_physical(self, result: Result<&[u8], nt_fs::MountedSectorError>) {
         match self {
-            Self::Sector(claim) => claim.complete_physical(result.map_err(nt_fs::MountedSectorError::Provider)),
-            claim => claim.complete(result),
+            Self::Sector(claim) => claim.complete_physical(result),
+            claim => claim.complete(result.map_err(nt_fs::MountedSectorError::status)),
         }
     }
 
@@ -832,20 +832,20 @@ fn terminal_data<'a>(
     route: nt_io_manager::scsi_srb_transport::ScsiSrbRoute,
     irp: IrpId,
     terminal: &'a Terminal,
-) -> Result<&'a [u8], nt_status::NtStatus> {
+) -> Result<&'a [u8], nt_fs::MountedSectorError> {
     if !terminal.status.is_success() {
-        return Err(terminal.status);
+        return Err(nt_fs::MountedSectorError::Provider(terminal.status));
     }
     let packet = decode_scsi_completion(&terminal.packet, route, irp)
-        .map_err(|_| nt_status::NtStatus(nt_fs::STATUS_DATA_ERROR as i32))?;
+        .map_err(|_| nt_fs::MountedSectorError::Transport)?;
     command.verify_completion(packet.srb, packet.data.len())
-        .map_err(|_| nt_status::NtStatus(nt_fs::STATUS_DATA_ERROR as i32))?;
+        .map_err(|_| nt_fs::MountedSectorError::Transport)?;
     match command.kind() {
         nt_io_manager::scsi_block_command::BlockCommandKind::Read => Ok(packet.data),
         nt_io_manager::scsi_block_command::BlockCommandKind::Write
         | nt_io_manager::scsi_block_command::BlockCommandKind::Flush => Ok(&[]),
         nt_io_manager::scsi_block_command::BlockCommandKind::Capacity =>
-            Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+            Err(nt_fs::MountedSectorError::Transport),
     }
 }
 
