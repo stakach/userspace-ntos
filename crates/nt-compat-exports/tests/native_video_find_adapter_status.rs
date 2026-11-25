@@ -114,6 +114,7 @@ static MAPS: AtomicU32 = AtomicU32::new(0);
 #[derive(Clone, Copy)]
 struct HostedDeviceBinding { device_id: u64, driver_id: u64, bank: u64 }
 struct DriverInstance { driver_id: u64, cnode: u64 }
+#[derive(Clone, Copy)] struct HostedDomainIdentity;
 fn instance(index: usize) -> Option<DriverInstance> {
     (index == 18).then_some(DriverInstance { driver_id: 99, cnode: 1 })
 }
@@ -180,6 +181,7 @@ fn context(shared_va: u64) -> DeviceDispatchContextOwner {
 struct Kept {
     pump: component_scheduler::HostedPumpRestore,
     index: usize,
+    domain: HostedDomainIdentity,
     device_id: u64,
     shared_va: u64,
     device_context: DeviceDispatchContextOwner,
@@ -190,7 +192,7 @@ enum HostedIrpTransportResult {
     Indeterminate { transport_status: nt_status::NtStatus },
 }
 
-mod hosted_file_owners { pub fn lane_freed() {} }
+mod hosted_file_owners { pub fn lane_freed(_: usize, _: super::HostedDomainIdentity) {} }
 fn register_instance_ready(_: usize, _: bool) {}
 fn trace(_: &[u8], _: u64, _: u32) {}
 fn print_str(_: &[u8]) {}
@@ -217,7 +219,7 @@ fn completed_dispatch_reads_the_miniports_own_vp_status() {
         pump: component_scheduler::HostedPumpRestore::Restored(PumpResult {
             completed: true, status: 0, result: 0,
         }),
-        index: 18, device_id: 0x4e, shared_va,
+        index: 18, domain: HostedDomainIdentity, device_id: 0x4e, shared_va,
         device_context: context(shared_va),
     }) };
     match result {
@@ -235,7 +237,7 @@ fn a_failed_wrapper_dispatch_precedes_any_vp_status() {
         pump: component_scheduler::HostedPumpRestore::Restored(PumpResult {
             completed: true, status: failed, result: failed as u32 as u64,
         }),
-        index: 18, device_id: 0x4e, shared_va,
+        index: 18, domain: HostedDomainIdentity, device_id: 0x4e, shared_va,
         device_context: context(shared_va),
     }) };
     match result {
@@ -250,7 +252,7 @@ fn unfinished_and_uncertain_pumps_do_not_consume_a_stale_bank_value() {
     let (_storage, shared_va) = bank(nt_video_miniport::VP_ERROR_DEV_NOT_EXIST);
     let pending = unsafe { answer(Kept {
         pump: component_scheduler::HostedPumpRestore::Pending,
-        index: 18, device_id: 0x4e, shared_va,
+        index: 18, domain: HostedDomainIdentity, device_id: 0x4e, shared_va,
         device_context: context(shared_va),
     }) };
     assert!(pending.is_err(), "a pending pump keeps its native owner");
@@ -258,7 +260,7 @@ fn unfinished_and_uncertain_pumps_do_not_consume_a_stale_bank_value() {
         pump: component_scheduler::HostedPumpRestore::Restored(PumpResult {
             completed: false, status: 0, result: 0,
         }),
-        index: 18, device_id: 0x4e, shared_va,
+        index: 18, domain: HostedDomainIdentity, device_id: 0x4e, shared_va,
         device_context: context(shared_va),
     }) };
     assert!(matches!(uncertain,
@@ -271,7 +273,7 @@ fn pending_find_adapter_rebinds_its_assigned_bank_before_provider_retry() {
     let (_storage, shared_va) = bank(nt_video_miniport::VP_NO_ERROR);
     let kept = unsafe { answer(Kept {
         pump: component_scheduler::HostedPumpRestore::Pending,
-        index: 18, device_id: 0x4e, shared_va,
+        index: 18, domain: HostedDomainIdentity, device_id: 0x4e, shared_va,
         device_context: context(shared_va),
     }) }.err().expect("pending native pump");
     assert!(!ACTIVE.load(Ordering::SeqCst));
@@ -287,7 +289,7 @@ fn changed_device_or_generation_refuses_pending_resume_without_provider_replay()
     let (_storage, shared_va) = bank(nt_video_miniport::VP_NO_ERROR);
     let kept = unsafe { answer(Kept {
         pump: component_scheduler::HostedPumpRestore::Pending,
-        index: 18, device_id: 0x4e, shared_va,
+        index: 18, domain: HostedDomainIdentity, device_id: 0x4e, shared_va,
         device_context: context(shared_va),
     }) }.err().expect("pending native pump");
     PUBLISHED_DEVICE.store(0x50, Ordering::SeqCst);

@@ -97,6 +97,89 @@ impl Authority {
     }
 }
 
+/// Value-only lane-availability observation for a queued File IRP. The owner keeps the
+/// exact driver instance and hosted-domain generation; foreign lane changes cannot wake it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AdmissionReceipt {
+    owner: Option<Authority>,
+    refused: AdmissionEpoch,
+    ready: bool,
+}
+
+#[derive(Clone, Copy)]
+struct QueueHeadTicket {
+    id: u64,
+    owner: Authority,
+}
+
+/// A missing shared-lane registration is distinct from a retired native instance. Neither
+/// can borrow an epoch from a replacement instance with the same numeric driver id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionEpoch {
+    Retired,
+    MissingDomain,
+    Ready(u64),
+}
+
+impl AdmissionReceipt {
+    const EMPTY: Self = Self { owner: None, refused: AdmissionEpoch::Retired, ready: false };
+
+    fn ready_for(owner: Authority) -> bool {
+        if !owner.live() { return false; }
+        let Some(route) = hosted_ingress_sources::primary_route(owner.instance) else {
+            return false;
+        };
+        let primary_ready = matches!(unsafe {
+            crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route)
+        }, Ok(true));
+        primary_ready || (unsafe {
+            crate::spawn_hosts::shared_ingress::owner::runtime::primary_dispatch_parked(route)
+                && hosted_class_irp_lane::ordinary_ready(owner.instance)
+        })
+    }
+
+    fn became_ready(self) -> bool {
+        !self.ready && self.owner.is_some_and(Self::ready_for)
+    }
+
+    fn epoch_for(owner: Option<Authority>) -> AdmissionEpoch {
+        let Some(owner) = owner.filter(|owner| owner.live()) else {
+            return AdmissionEpoch::Retired;
+        };
+        let Some(worker) = instance(owner.instance).map(|inst| inst.file_worker_epoch) else {
+            return AdmissionEpoch::Retired;
+        };
+        let idle = unsafe {
+            crate::spawn_hosts::shared_ingress::owner::runtime::lane_idle_epoch_for_domain(
+                owner.domain,
+            )
+        };
+        match idle {
+            Some(idle) => AdmissionEpoch::Ready(worker.wrapping_add(idle)),
+            None => AdmissionEpoch::MissingDomain,
+        }
+    }
+
+    fn current_epoch(self) -> AdmissionEpoch {
+        Self::epoch_for(self.owner)
+    }
+
+    fn refresh(self) -> Self {
+        Self { owner: self.owner, refused: self.current_epoch(),
+            ready: self.owner.is_some_and(Self::ready_for) }
+    }
+
+    fn capture(driver: Option<nt_io_manager::DriverId>) -> Self {
+        let owner = driver.and_then(|driver| {
+            let (index, _) = instance_by_driver_id(driver.raw())?;
+            Authority::capture(index)
+                .filter(|authority| authority.driver_id == driver.raw())
+        });
+        Self { owner, refused: Self::epoch_for(owner),
+            ready: owner.is_some_and(Self::ready_for) }
+    }
+}
+
 struct Row {
     caller: nt_process::native_handle::NativeHandleCaller,
     requestor: nt_process::native_handle::NativeThreadProcessReference,
@@ -137,12 +220,19 @@ struct Row {
     /// A syscall caller's ordinary IRP that no lane admitted waits in `QueuedDispatch` rather
     /// than failing with a synthetic STATUS_DEVICE_BUSY (#427).
     queue_not_admitted: bool,
-    /// [`LANE_EPOCH`] when it was last refused; it is retried only after a lane has freed.
-    admission_epoch: u64,
+    /// Exact instance lifetime and its own lane-availability epoch at last refusal.
+    admission_receipt: AdmissionReceipt,
     /// Diagnostic first sighting of this row's queue, independent of later retries.
     queue_trace_emitted: bool,
     nested_pnp_trace: bool,
     nested_pnp_trace_count: u8,
+    /// One owned continuation drive after a worker startup yielded at first admission.
+    startup_probe_owed: bool,
+    /// Stage of the last queued startup attempt; only a changed stage earns another drive.
+    startup_probe_phase: Option<component_scheduler::PendingSchedulerProgress>,
+    /// An unavailable exact authority may be redriven once for manager disposition.
+    retired_probe_consumed: bool,
+    missing_domain_probe_consumed: bool,
 }
 
 /// Counts dispatches refused admission with nothing entered, for callers that retry them
@@ -153,16 +243,22 @@ pub(super) fn admission_refusals() -> u64 {
     ADMISSION_REFUSALS.load(Ordering::Acquire)
 }
 
-/// Advanced whenever a worker lane's IRP claim ends (#427).
+/// Advanced when a worker lane frees or a never-admitted queue head retires (#427).
 static LANE_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// A worker claim ended, so that lane may now admit a queued IRP. A lane returning to Idle
 /// advances the lanes' own idle epoch.
-pub(super) fn lane_freed() {
+pub(super) fn lane_freed(instance_index: usize, domain: HostedDomainIdentity) {
+    let table = unsafe { driver_instances_mut() };
+    let Some(inst) = table.get_mut(instance_index)
+        .filter(|inst| inst.used && instance_domain_identity(**inst) == Some(domain))
+    else { return; };
+    inst.file_worker_epoch = inst.file_worker_epoch.wrapping_add(1);
     LANE_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
-/// Changes whenever any hosted lane becomes admissible or a worker claim ends (#427).
+/// Changes whenever a hosted lane becomes admissible, a worker claim ends, or a queued
+/// head retires without occupying a lane (#427).
 pub(super) fn admission_epoch() -> u64 {
     LANE_EPOCH.load(Ordering::Acquire)
         .wrapping_add(unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::lane_idle_epoch() })
@@ -544,6 +640,7 @@ fn quarantine_release(id: u64, status: nt_status::NtStatus) {
 }
 
 fn remove(id: u64) -> Result<Row, nt_status::NtStatus> {
+    let queue_head = queue_head_ticket(id);
     if let Err(status) = release_projection_owners(id) {
         quarantine_release(id, status);
         return Err(status);
@@ -560,13 +657,14 @@ fn remove(id: u64) -> Result<Row, nt_status::NtStatus> {
         return Err(status);
     }
     let retired = rows().swap_remove(index);
+    if let Some(ticket) = queue_head { queue_head_retired(ticket); }
     // No later control targets a retired owner's IRP, so the worker lane that entered it is
     // free for the next one, even when its terminal returned with no ACK.
     if let (Some(irp), Some(driver)) = (retired.irp_id, retired.primary_driver) {
-        if let Some((instance, _)) = instance_by_driver_id(driver.raw()) {
-            unsafe { hosted_class_irp_lane::release_irp(instance, irp.raw()) };
+        if let Some(authority) = retired.authorities.iter().copied()
+            .find(|authority| authority.driver_id == driver.raw() && authority.live()) {
+            unsafe { hosted_class_irp_lane::release_irp(authority.instance, irp.raw()) };
         }
-        lane_freed();
         // A caller held on this IRP is released by ordinary completion delivery (#427).
         crate::service_sec_image::hosted_file_dispatch_returned(irp.raw());
     }
@@ -618,10 +716,14 @@ fn reserve(
         phase_bank_ticks: 0,
         phase_major: 0,
         queue_not_admitted: false,
-        admission_epoch: 0,
+        admission_receipt: AdmissionReceipt::EMPTY,
         queue_trace_emitted: false,
         nested_pnp_trace: false,
         nested_pnp_trace_count: 0,
+        startup_probe_owed: false,
+        startup_probe_phase: None,
+        retired_probe_consumed: false,
+        missing_domain_probe_consumed: false,
     });
     Ok(id)
 }
@@ -796,7 +898,42 @@ fn block(id: u64, payload: Payload, status: nt_status::NtStatus) {
     }
 }
 
+fn queue_head_ticket(id: u64) -> Option<QueueHeadTicket> {
+    let (queued, authority) = {
+        let owner = row(id);
+        (owner.queue_not_admitted && owner.flight == Flight::QueuedDispatch,
+            owner.admission_receipt.owner)
+    };
+    if !queued || queued_ahead(id) {
+        return None;
+    }
+    let owner = authority.filter(|owner| owner.live())?;
+    Some(QueueHeadTicket { id, owner })
+}
+
+fn queue_head_retired(ticket: QueueHeadTicket) {
+    if !ticket.owner.live() || rows().iter().any(|row| {
+        row.id == ticket.id && row.flight == Flight::QueuedDispatch
+    }) {
+        return;
+    }
+    // A cancelled preparation never occupied a lane. The next exact queued owner needs
+    // its own retry observation even though no physical lane-free event occurred.
+    if !rows().iter().any(|row| {
+        row.id > ticket.id && row.queue_not_admitted
+            && row.flight == Flight::QueuedDispatch
+            && row.admission_receipt.owner == Some(ticket.owner)
+    }) { return; }
+    let Some(inst) = unsafe { driver_instances_mut() }.get_mut(ticket.owner.instance)
+        .filter(|inst| inst.used && inst.driver_id == ticket.owner.driver_id
+            && instance_domain_identity(**inst) == Some(ticket.owner.domain))
+    else { return; };
+    inst.file_worker_epoch = inst.file_worker_epoch.wrapping_add(1);
+    LANE_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
 fn keep(id: u64, payload: Payload) {
+    let queue_head = queue_head_ticket(id);
     let row = row(id);
     row.payload = Some(payload);
     row.flight = Flight::Idle;
@@ -807,6 +944,7 @@ fn keep(id: u64, payload: Payload) {
         trace_nested_pnp_create_owner(4, id, irp);
         crate::service_sec_image::hosted_file_dispatch_returned(irp.raw());
     }
+    if let Some(ticket) = queue_head { queue_head_retired(ticket); }
 }
 
 fn retry_later(id: u64, payload: Payload, status: nt_status::NtStatus) {
@@ -2258,12 +2396,16 @@ fn trace_nested_pnp_create_owner(stage: u64, id: u64, irp: IrpId) {
     }).or_else(|| owner.authorities.first());
     let authority_live = !owner.authorities.is_empty()
         && owner.authorities.iter().all(|authority| authority.live());
+    let refused_epoch = match owner.admission_receipt.refused {
+        AdmissionEpoch::Ready(epoch) => epoch,
+        AdmissionEpoch::Retired | AdmissionEpoch::MissingDomain => 0,
+    };
     print_str(b"[nested-pnp-create-owner] stage/row/irp/device/driver/stack/flight/payload/pump/queued/epoch/retry/ready/completion/receipt/blocked=");
     for value in [stage, id, irp.raw(),
         owner.primary_device.map_or(0, |device| device.raw()),
         owner.primary_driver.map_or(0, |driver| driver.raw()),
         owner.stack.len() as u64, flight, payload, pump,
-        u64::from(owner.queue_not_admitted), owner.admission_epoch,
+        u64::from(owner.queue_not_admitted), refused_epoch,
         owner.retry_after, u64::from(owner.work_ready),
         u64::from(owner.completion.is_some()),
         u64::from(owner.terminal_receipt.is_some()),
@@ -2369,6 +2511,7 @@ fn trace_irp_queue(stage: usize, id: u64, major: u8) {
 
 /// Retain a not-admitted preparation; nothing was entered, so it may be begun again.
 #[repr(u64)]
+#[derive(Clone, Copy)]
 enum QueueReason {
     OlderQueuedIrp = 1,
     NoLane = 2,
@@ -2416,11 +2559,31 @@ fn trace_initial_queue(id: u64, major: u8, reason: QueueReason) {
 fn queue_unadmitted(id: u64, prepared: PreparedExternalFileIrp, reason: QueueReason) {
     trace_initial_queue(id, prepared.projection().major, reason);
     trace_irp_queue(0, id, prepared.projection().major);
+    let previous = row(id).admission_receipt;
+    let admission_receipt = if matches!(reason, QueueReason::RedriveNoLane) {
+        previous.refresh()
+    } else {
+        AdmissionReceipt::capture(row(id).primary_driver)
+    };
+    let startup_phase = admission_receipt.owner.filter(|owner| owner.live()).and_then(|owner| unsafe {
+        hosted_class_irp_lane::startup_retry_progress(owner.instance)
+    });
+    let startup_probe_owed = match reason {
+        QueueReason::NoLane => startup_phase.is_some(),
+        QueueReason::RedriveNoLane => startup_phase.is_some()
+            && startup_phase != row(id).startup_probe_phase,
+        QueueReason::OlderQueuedIrp => false,
+    };
     let row = row(id);
     row.payload = Some(Payload::Prepared(prepared));
     row.flight = Flight::QueuedDispatch;
     row.blocked_status = None;
-    row.admission_epoch = admission_epoch();
+    row.admission_receipt = admission_receipt;
+    row.startup_probe_owed = startup_probe_owed;
+    row.startup_probe_phase = startup_phase;
+    if matches!(admission_receipt.refused, AdmissionEpoch::Ready(_)) {
+        row.missing_domain_probe_consumed = false;
+    }
     if let Some(irp) = row.irp_id {
         trace_nested_pnp_create_owner(5, id, irp);
     }
@@ -2429,11 +2592,30 @@ fn queue_unadmitted(id: u64, prepared: PreparedExternalFileIrp, reason: QueueRea
 fn queued_admissions() -> Vec<nt_hosted_runtime::QueuedIrp> {
     rows().iter()
         .filter(|row| row.queue_not_admitted && row.flight == Flight::QueuedDispatch)
-        .map(|row| nt_hosted_runtime::QueuedIrp {
-            id: row.id,
-            driver: row.primary_driver.map_or(0, |driver| driver.raw()),
-            refused_at: row.admission_epoch,
-            cancel_queued: queued_cancel(row),
+        .map(|row| {
+            let current_epoch = row.admission_receipt.current_epoch();
+            let (refused_at, current) = match (row.admission_receipt.refused, current_epoch) {
+                (AdmissionEpoch::Ready(refused), AdmissionEpoch::Ready(now)) =>
+                    (refused, Some(now)),
+                (_, AdmissionEpoch::Ready(now)) => (now, Some(now)),
+                (AdmissionEpoch::Ready(refused), _) => (refused, None),
+                _ => (0, None),
+            };
+            nt_hosted_runtime::QueuedIrp {
+                id: row.id,
+                driver: row.primary_driver.map_or(0, |driver| driver.raw()),
+                refused_at,
+                current_epoch: current,
+                wake_without_epoch: row.startup_probe_owed
+                    || row.admission_receipt.became_ready()
+                    || (matches!(row.admission_receipt.refused, AdmissionEpoch::MissingDomain)
+                        && matches!(current_epoch, AdmissionEpoch::Ready(_)))
+                    || (matches!(current_epoch, AdmissionEpoch::Retired)
+                        && !row.retired_probe_consumed)
+                    || (matches!(current_epoch, AdmissionEpoch::MissingDomain)
+                        && !row.missing_domain_probe_consumed),
+                cancel_queued: queued_cancel(row),
+            }
         })
         .collect()
 }
@@ -2461,14 +2643,13 @@ pub(super) fn dispatch_progress(irp_id: IrpId) -> Option<nt_hosted_runtime::Disp
     })
 }
 
-/// Queued not-admitted rows a lane change or a queued cancel may now move.
+/// Queued not-admitted rows an exact lane/readiness change, startup continuation or cancel may move.
 pub(super) fn queued_admission_due() -> bool {
     if !rows().iter().any(|row| row.queue_not_admitted && row.flight == Flight::QueuedDispatch) {
         return false;
     }
     let _transient = crate::allocator::enter_transient();
-    !nt_hosted_runtime::queued_admission_candidates(
-        &queued_admissions(), admission_epoch()).is_empty()
+    !nt_hosted_runtime::queued_admission_candidates(&queued_admissions()).is_empty()
 }
 
 fn queued_cancel(row: &Row) -> bool {
@@ -2484,8 +2665,7 @@ fn queued_cancel(row: &Row) -> bool {
 /// Reply.
 pub(super) fn redrive_queued_dispatches() -> usize {
     let _durable = crate::allocator::enter_durable();
-    let candidates = nt_hosted_runtime::queued_admission_candidates(
-        &queued_admissions(), admission_epoch());
+    let candidates = nt_hosted_runtime::queued_admission_candidates(&queued_admissions());
     candidates.into_iter()
         .filter(|id| matches!(redrive_queued(*id), QueuedReadRedriveOutcome::Progressed))
         .count()
@@ -2894,6 +3074,13 @@ pub(super) fn redrive_queued_read(irp_id: IrpId) -> QueuedReadRedriveOutcome {
 fn redrive_queued(id: u64) -> QueuedReadRedriveOutcome {
     let _durable = crate::allocator::enter_durable();
     if row(id).flight != Flight::QueuedDispatch { return QueuedReadRedriveOutcome::NoWork }
+    row(id).startup_probe_owed = false;
+    let current_epoch = row(id).admission_receipt.current_epoch();
+    match current_epoch {
+        AdmissionEpoch::Retired => row(id).retired_probe_consumed = true,
+        AdmissionEpoch::MissingDomain => row(id).missing_domain_probe_consumed = true,
+        AdmissionEpoch::Ready(_) => {}
+    }
     let Some(irp_id) = row(id).irp_id else { return QueuedReadRedriveOutcome::NoWork };
     // A queued caller may be cancelled or abandoned before this explicit redrive. The manager
     // owns that intent; never infer a new provider call merely from a live native route.

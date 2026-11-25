@@ -767,29 +767,42 @@ fn a_primary_parked_in_its_own_dispatch_diverts_any_major_to_the_worker() {
     assert!(nt_hosted_runtime::worker_lane_dispatches_major(0x1b), "IRP_MJ_PNP is not excluded");
 }
 
-/// An IRP queued because no lane admitted it is retried when ANY lane becomes admissible again,
-/// not only when a File row retires (#427): here the primary was busy in a non-File dispatch,
-/// and its return to Idle must make the queued IRP a candidate.
+/// A queued IRP retries when its own physical domain becomes Idle. Another hosted domain
+/// may finish work without changing this driver's admission receipt (#427).
 #[test]
-fn a_lane_returning_to_idle_advances_the_admission_epoch() {
+fn only_own_domain_idle_advances_the_admission_epoch() {
     let mut lanes = Lanes::new(2, 2);
     let mut peers = PeerRegistry::new(20, 2);
     let (primary, _) = lanes.allocate_shared_staged(&mut peers, 1, 2,
         LaneBinding { executor_id: 10, receive_endpoint: 20, reply_object: 30 }).unwrap();
+    let (foreign, _) = lanes.allocate_shared_staged(&mut peers, 3, 4,
+        LaneBinding { executor_id: 11, receive_endpoint: 20, reply_object: 31 }).unwrap();
     let before_startup = lanes.idle_epoch();
     lanes.begin_startup(primary, 30, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
     lanes.complete_startup(primary, 30,
         |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)).unwrap();
     assert_ne!(lanes.idle_epoch(), before_startup, "a started lane became admissible");
+    assert_eq!(lanes.idle_epoch_for_domain(1, 2), Some(1));
+    lanes.begin_startup(foreign, 31, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
+    lanes.complete_startup(foreign, 31,
+        |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)).unwrap();
+    assert_eq!(lanes.idle_epoch_for_domain(1, 2), Some(1));
 
-    // A non-File dispatch occupies the primary; an IRP is refused and queued at this epoch.
+    // Another driver's return cannot wake the IRP waiting on this domain.
+    let refused_at = lanes.idle_epoch_for_domain(1, 2).unwrap();
+    let mut queue = [nt_hosted_runtime::QueuedIrp { id: 1, driver: 6, refused_at,
+        current_epoch: lanes.idle_epoch_for_domain(1, 2), wake_without_epoch: false,
+        cancel_queued: false }];
+    assert!(nt_hosted_runtime::queued_admission_candidates(&queue).is_empty());
+    lanes.begin_dispatch(foreign, 31).unwrap();
+    lanes.finish_dispatch(foreign, 31).unwrap();
+    queue[0].current_epoch = lanes.idle_epoch_for_domain(1, 2);
+    assert!(nt_hosted_runtime::queued_admission_candidates(&queue).is_empty());
     lanes.begin_dispatch(primary, 30).unwrap();
-    let refused_at = lanes.idle_epoch();
-    let queue = [nt_hosted_runtime::QueuedIrp { id: 1, driver: 6, refused_at, cancel_queued: false }];
-    assert!(nt_hosted_runtime::queued_admission_candidates(&queue, lanes.idle_epoch()).is_empty());
     lanes.finish_dispatch(primary, 30).unwrap();
-    assert_eq!(nt_hosted_runtime::queued_admission_candidates(&queue, lanes.idle_epoch()), [1],
-        "the queued IRP waited for an unrelated File retirement");
+    queue[0].current_epoch = lanes.idle_epoch_for_domain(1, 2);
+    assert_eq!(nt_hosted_runtime::queued_admission_candidates(&queue), [1],
+        "the queued IRP must wake when its own primary lane returns");
 }
 
 #[test]

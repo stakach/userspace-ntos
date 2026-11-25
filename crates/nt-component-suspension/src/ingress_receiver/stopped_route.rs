@@ -135,7 +135,7 @@ impl<M> IngressReceiver<M> {
         if lanes.running == Some(route.identity().lane) {
             lanes.running = None;
         }
-        lanes.lane_became_idle();
+        lanes.lane_became_idle(route.identity().lane);
         Ok(())
     }
 }
