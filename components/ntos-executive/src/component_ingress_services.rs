@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::{print_hex_u64, print_str};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, PartialEq)]
 enum WaitPhase {
