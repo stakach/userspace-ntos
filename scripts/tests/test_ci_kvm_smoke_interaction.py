@@ -48,18 +48,22 @@ class ParseScriptTests(unittest.TestCase):
         script = load_script(DEFAULT_SCRIPT)
         self.assertEqual(script.screen, (1024, 768))
         self.assertEqual(script.steps[0].name, "baseline")
-        self.assertEqual(script.steps[1].actions, (("click", (28, 743)),))
-        # Run 45161796204 left the menu over the desktop icon on boot 2; run
-        # 45173753341 proved Win+R sent no visible Run dialog on either boot.
-        # Dismiss overlays on neutral desktop, then check the prompt image
-        # before typing rather than clicking an old window's title bar.
+        # Prove cursor aim and a real click on neutral wallpaper. LiberNT's
+        # Start menu focuses its edit on open, so typing needs no second click.
+        self.assertEqual(script.steps[1].actions,
+                         (("verified_click", (925, 100)),))
+        self.assertEqual(script.steps[2].actions, (("click", (28, 743)),))
+        # Run 45436226805 captured the shell after 10 s while its menu was
+        # still absent; 45425894277 had a visible menu after a 60 s settle.
+        self.assertEqual(script.steps[2].wait_seconds, 60.0)
+        # The Start menu searches shortcut names, so "command" can find
+        # Command Prompt; the result must be visible before Enter launches it.
         self.assertEqual([step.name for step in script.steps],
-                         ["baseline", "start-menu", "start-menu-closed",
-                          "desktop-clear", "command-prompt-selected", "command-prompt", "ver"])
-        self.assertEqual(script.steps[3].actions, (("click", (800, 600)),))
-        self.assertEqual(script.steps[4].actions, (("verified_click", (37, 470)),))
-        self.assertEqual(script.steps[5].actions, (("key", ("ret",)),))
-        self.assertEqual(script.steps[6].actions, (("type", "ver\n"),))
+                         ["baseline", "desktop-pointer", "start-menu", "command-prompt-search",
+                          "command-prompt", "ver"])
+        self.assertEqual(script.steps[3].actions, (("type", "command"),))
+        self.assertEqual(script.steps[4].actions, (("key", ("ret",)),))
+        self.assertEqual(script.steps[5].actions, (("type", "ver\n"),))
 
     def test_document_parses_to_ordered_steps(self):
         script = parse_script(DOCUMENT)
@@ -69,26 +73,19 @@ class ParseScriptTests(unittest.TestCase):
         self.assertEqual(script.settle_seconds, 20.0)
         self.assertEqual(script.arm, "seal")
 
-    def test_named_selection_gate_requires_one_verified_click(self):
-        for actions in ([], [{"click": [37, 470]}],
-                        [{"verified_click": [37, 470]}, {"key": ["ret"]}]):
-            with self.subTest(actions=actions), self.assertRaisesRegex(
-                    ValueError, "one verified_click"):
-                parse_script({"screen": [1024, 768], "settle_seconds": 0,
-                              "steps": [{"name": "command-prompt-selected",
-                                         "actions": actions, "wait_seconds": 0}]})
-
     def test_arm_mode_selects_seal_or_sealed_idle(self):
         self.assertEqual(parse_script({**DOCUMENT, "arm": "idle"}).arm, "idle")
-        self.assertEqual(load_script(DEFAULT_SCRIPT).arm, "seal")
+        self.assertEqual(load_script(DEFAULT_SCRIPT).arm, "idle")
         for bad in ("later", "", 1, None):
             with self.subTest(bad), self.assertRaises(ValueError):
                 parse_script({**DOCUMENT, "arm": bad})
 
-    def test_production_script_arms_at_seal_while_background_work_continues(self):
+    def test_production_script_waits_for_sealed_desktop_idle(self):
         script = load_script(DEFAULT_SCRIPT)
-        self.assertEqual(script.arm, "seal",
-                         "a painted Explorer desktop must accept input while services continue")
+        # LiberNT's Run\AppLauncher opens a /c console after Explorer paints.
+        # Starting the search at seal let that console steal Enter before the
+        # interactive Command Prompt shortcut could launch (KVM 45468676396).
+        self.assertEqual(script.arm, "idle")
         self.assertEqual(script.settle_seconds, 10)
         with tempfile.TemporaryDirectory() as directory:
             serial = Path(directory) / "serial.log"
@@ -325,53 +322,54 @@ class InteractionRunnerTests(unittest.TestCase):
         self.assertEqual(len(runner.cursor_receipts), 3)
         self.assertEqual(len(self.performed), 3)  # initial aim and two corrections, no click
 
-    def test_unselected_icon_halts_before_enter(self):
+    def test_missing_search_result_halts_before_enter(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
                                "steps": [
                                    {"name": "baseline", "actions": [], "wait_seconds": 0},
-                                   {"name": "command-prompt-selected", "actions": [
-                                       {"verified_click": [37, 470]}], "wait_seconds": 0},
+                                   {"name": "command-prompt-search", "actions": [
+                                       {"type": "command"}], "wait_seconds": 0},
                                    {"name": "command-prompt", "actions": [
                                        {"key": ["ret"]}], "wait_seconds": 0}]})
-        proof = VisualProof(False, error="Command Prompt icon not selected",
-                            image_name="selection.ppm", image_sha256="recorded-sha")
+        proof = VisualProof(False, error="Command Prompt search result not visible",
+                            image_name="search.ppm", image_sha256="recorded-sha")
         runner = InteractionRunner(
             script, self.performed.append, self.captured.append, self.log, self.clock,
-            checks={"command-prompt-selected": lambda _name: proof},
-            cursor_probe=lambda _before, after, _target:
-                CursorProof((37, 470), after, "aim-sha"))
+            checks={"command-prompt-search": lambda _name: proof})
         runner.arm(0)
         runner.advance(0)
         self.assertTrue(runner.finished)
         self.assertEqual(runner.failures, 1)
-        self.assertEqual(len(self.performed), 2)  # aim and held click, never Enter
-        self.assertEqual(runner.checkpoints["command-prompt-selected"], proof)
+        self.assertEqual(len(self.performed), 1)  # query, never Enter
+        self.assertFalse(any(event["type"] == "key"
+                             and event["data"]["key"]["data"] == "ret"
+                             and event["data"]["down"]
+                             for batch in self.performed for events, _pause in batch
+                             for event in events))
+        self.assertEqual(runner.checkpoints["command-prompt-search"], proof)
 
-    def test_selected_icon_sends_enter_before_ready_prompt_checkpoint(self):
+    def test_visible_search_result_sends_enter_before_ready_prompt_checkpoint(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
                                "steps": [
                                    {"name": "baseline", "actions": [], "wait_seconds": 0},
-                                   {"name": "command-prompt-selected", "actions": [
-                                       {"verified_click": [37, 470]}], "wait_seconds": 0},
+                                   {"name": "command-prompt-search", "actions": [
+                                       {"type": "command"}], "wait_seconds": 0},
                                    {"name": "command-prompt", "actions": [
                                        {"key": ["ret"]}], "wait_seconds": 0}]})
-        selected = VisualProof(True, image_name="selected.ppm", image_sha256="selected-sha")
+        selected = VisualProof(True, image_name="search.ppm", image_sha256="search-sha")
         ready = VisualProof(True, image_name="prompt.ppm", image_sha256="prompt-sha")
         runner = InteractionRunner(
             script, self.performed.append, self.captured.append, self.log, self.clock,
-            checks={"command-prompt-selected": lambda _name: selected,
-                    "command-prompt": lambda _name: ready},
-            cursor_probe=lambda _before, after, _target:
-                CursorProof((37, 470), after, "aim-sha"))
+            checks={"command-prompt-search": lambda _name: selected,
+                    "command-prompt": lambda _name: ready})
         runner.arm(0)
         runner.advance(0)
         self.assertTrue(runner.finished)
         self.assertEqual(runner.failures, 0)
-        self.assertEqual(keys(self.performed[2]), [("ret", True), ("ret", False)])
+        self.assertEqual(keys(self.performed[1]), [("ret", True), ("ret", False)])
         entries = [json.loads(line) for line in self.log.read_text().splitlines()]
         selected_index = next(i for i, entry in enumerate(entries)
                               if entry["event"] == "checkpoint"
-                              and entry["name"] == "command-prompt-selected")
+                              and entry["name"] == "command-prompt-search")
         enter_index = next(i for i, entry in enumerate(entries)
                            if entry["event"] == "action"
                            and entry["name"] == "command-prompt")
@@ -380,7 +378,7 @@ class InteractionRunnerTests(unittest.TestCase):
                            and entry["name"] == "command-prompt")
         self.assertLess(selected_index, enter_index)
         self.assertLess(enter_index, ready_index)
-        self.assertEqual(list(runner.checkpoints), ["command-prompt-selected", "command-prompt"])
+        self.assertEqual(list(runner.checkpoints), ["command-prompt-search", "command-prompt"])
 
     def test_seal_detector_finds_the_desktop_record(self):
         path = Path(self.directory.name) / "serial.log"

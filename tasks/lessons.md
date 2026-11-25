@@ -976,3 +976,12 @@ diagnosis-free failure.
 - Look ids up from the hash when a script needs them
   (`gh run list ... --jq '.[] | select(.headSha|startswith("<hash>")) | .databaseId'`), instead
   of typing a run id into a wait loop.
+
+## Match Fixture Replies To The Transport Contract
+- A DMA regression fixture returned raw seL4 MessageInfo `4` from a mock named `call_on5`,
+  while production `call_on5` returns the decoded label (`reply_info >> 12`), normally zero.
+  The new common-buffer path then rejected a successful registration, returned NULL to
+  LiberNT StorPort, and caused storahci to assert during native boot (#482).
+- When a caller needs to authenticate reply length, use a transport that preserves raw
+  MessageInfo. Execute the production decoded wrapper in a fixture and model raw and decoded
+  replies separately; a mock with the right name but the wrong return contract conceals bugs.

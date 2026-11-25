@@ -72,7 +72,7 @@ fn inline_mpr_uses_held_ack_instead_of_terminal_ack() {
     }
     let file = source("driver_launch.rs");
     let mut branch = HeldBranch::default();
-    visit_function(&file, "s_iof_call_driver", &mut branch);
+    visit_function(&file, "s_iof_call_driver_with_entry", &mut branch);
     assert!(branch.0, "actual MPR receipt must select Held ACK rather than unconditional op2");
     let helper = calls(&source("hosted_forward_origin.rs"), "acknowledge_inline_held");
     assert!(helper.iter().any(|name| name == "call_on4"), "Held ACK is a real broker exchange");

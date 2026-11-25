@@ -6,6 +6,11 @@ from pathlib import Path
 import re
 import subprocess
 
+try:
+    from .ci_kvm_ppm import crop_ppm
+except ImportError:
+    from ci_kvm_ppm import crop_ppm
+
 
 OCR_PUNCT_PREFIX = r"[ \t]*[^\w\s]{0,3}[ \t]*"
 COMMAND = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]*>[ \t]*ver[ \t]*$")
@@ -15,6 +20,17 @@ READY_TITLE = re.compile(r"(?im)^[^\w\r\n]{0,3}Command Prompt[ \t]*$")
 # text to the prompt line, and read the block cursor as a trailing comma. Keep
 # the drive-path token and line tail anchored so typed commands still fail.
 READY_PROMPT = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]{1,128}>,?[ \t]*$")
+START_PROGRAMS = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"All Programs[ \t]*$")
+START_SEARCH_BOX = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX +
+                              r"[Il]?Search programs and files[ \t]*$")
+# Sparse OCR can read the shortcut's small icon as a numbered glyph ("2)").
+# Keep the title anchored and limit that prefix so console text cannot pass.
+SEARCH_RESULT_PREFIX = r"[ \t]*(?:[0-9]{1,2}[)\].][ \t]*)?[^\w\s]{0,3}[ \t]*"
+SEARCH_COMMAND_PROMPT = re.compile(r"(?im)^" + SEARCH_RESULT_PREFIX + r"Command Prompt[ \t]*$")
+SEARCH_MENU_SHUTDOWN = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"Shut down[ \t]*$")
+# Pinned 1024x768 LiberNT Start edit interior. The full-frame sparse OCR has
+# misread its tiny text; a doubled crop reads the exact query on saved frames.
+SEARCH_QUERY_CROP = (17, 683, 210, 702)
 
 
 @dataclass(frozen=True)
@@ -36,6 +52,17 @@ def contains_ready_prompt(text):
     """Find a foreground Command Prompt title followed by a ready input prompt."""
     title = READY_TITLE.search(text)
     return title is not None and READY_PROMPT.search(text, title.end()) is not None
+
+
+def contains_start_menu_search_box(text):
+    """Require the visible Start menu before targeting its search field."""
+    return START_PROGRAMS.search(text) is not None and START_SEARCH_BOX.search(text) is not None
+
+
+def contains_command_prompt_search_result(text):
+    """Require a shortcut result in the Start menu, not an old console title."""
+    return (SEARCH_COMMAND_PROMPT.search(text) is not None and
+            SEARCH_MENU_SHUTDOWN.search(text) is not None)
 
 
 def _prove_image(image, predicate, missing):
@@ -72,6 +99,42 @@ def _prove_image(image, predicate, missing):
 def prove_ready_prompt(image):
     """Require a visible ready Command Prompt before any test command is typed."""
     return _prove_image(image, contains_ready_prompt, "ready Command Prompt not visible")
+
+
+def prove_start_menu_search_box(image):
+    """Require the original frame to show the Start menu search control."""
+    return _prove_image(image, contains_start_menu_search_box,
+                        "Start menu search box not visible")
+
+
+def prove_command_prompt_search_result(image):
+    """Require the visible result and exact typed query in the original frame."""
+    result = _prove_image(image, contains_command_prompt_search_result,
+                          "Command Prompt search result not visible")
+    if not result.passed:
+        return result
+    try:
+        query_frame = crop_ppm(image, *SEARCH_QUERY_CROP, scale=2)
+        query = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "7"],
+            input=query_frame, capture_output=True,
+            timeout=20, check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return VisualProof(False, result.ocr_text, f"search query OCR unavailable: {error}",
+                           result.image_name, result.image_sha256)
+    query_text = query.stdout.decode("utf-8", errors="replace").strip()
+    transcript = result.ocr_text + "\nsearch query crop: " + query_text
+    if query.returncode != 0:
+        detail = query.stderr.decode("utf-8", errors="replace").strip()
+        return VisualProof(False, transcript,
+                           f"search query OCR failed ({query.returncode}): {detail}",
+                           result.image_name, result.image_sha256)
+    if query_text.casefold() != "command":
+        return VisualProof(False, transcript, "exact command query not visible",
+                           result.image_name, result.image_sha256)
+    return VisualProof(True, transcript, image_name=result.image_name,
+                       image_sha256=result.image_sha256)
 
 
 def prove_ver_result(image):

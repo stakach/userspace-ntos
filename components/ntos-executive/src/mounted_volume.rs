@@ -105,7 +105,7 @@ pub(crate) fn mounted_directory_outstanding() -> bool {
 
 pub(crate) fn complete_mounted_directory_sector(
     claim: crate::mounted_volume_backend::mounted_directory_lookup::DirectorySectorClaim,
-    sector: Result<&[u8; 512], nt_fs::FatPathError>,
+    sector: Result<&[u8; 512], nt_fs::MountedSectorError>,
 ) -> Result<nt_fs::FatDirectoryProgress, crate::mounted_volume_backend::mounted_directory_lookup::DirectoryLookupError> {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_DIRECTORY_QUEUE)).as_ref().cloned() }
         .ok_or(crate::mounted_volume_backend::mounted_directory_lookup::DirectoryLookupError::Invalid)?;
@@ -146,7 +146,7 @@ pub(crate) fn mounted_read_receive_snapshot() -> Result<Option<[u64; 9]>, ()> {
 
 pub(crate) fn complete_mounted_read_sectors(
     claim: crate::mounted_volume_backend::mounted_installed_read::ReadSectorClaim,
-    sectors: Result<&[u8], nt_fs::FatPathError>,
+    sectors: Result<&[u8], nt_fs::MountedSectorError>,
 ) -> Result<nt_fs::FatRangeProgress, crate::mounted_volume_backend::mounted_installed_read::ReadError> {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_READ_QUEUE)).as_ref().cloned() }
         .ok_or(crate::mounted_volume_backend::mounted_installed_read::ReadError::Invalid)?;
@@ -194,7 +194,7 @@ pub(crate) fn claim_mounted_overlay_sector() -> Option<nt_fs::OverlaySectorClaim
 }
 
 pub(crate) fn complete_mounted_overlay_sector(claim: nt_fs::OverlaySectorClaim,
-    sector: Result<&[u8; 512], nt_fs::FatPathError>) -> Result<nt_fs::OverlayPrepareProgress, nt_fs::OverlayPrepareError> {
+    sector: Result<&[u8; 512], nt_fs::MountedSectorError>) -> Result<nt_fs::OverlayPrepareProgress, nt_fs::OverlayPrepareError> {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_OVERLAY_QUEUE)).as_ref().cloned() }
         .ok_or(nt_fs::OverlayPrepareError::Invalid)?;
     let result = queue.borrow_mut().complete_sector(claim, sector);
@@ -236,8 +236,8 @@ pub(crate) fn print_mounted_create_census() {
 
 pub(crate) fn complete_mounted_create_sector(
     claim: crate::mounted_volume_backend::mounted_create_lookup::CreateSectorClaim,
-    sector: Result<&[u8; 512], nt_fs::FatPathError>,
-) -> Result<nt_fs::FatPathProgress, crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError> {
+    sector: Result<&[u8; 512], nt_fs::MountedSectorError>,
+) -> crate::mounted_volume_backend::mounted_create_lookup::CreateSectorCompletion {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref().cloned() }
         .ok_or(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError::Invalid)?;
     let completed = queue.borrow_mut().complete(claim, sector);
@@ -247,7 +247,7 @@ pub(crate) fn complete_mounted_create_sector(
 pub(crate) fn complete_cached_mounted_create_sector(
     claim: crate::mounted_volume_backend::mounted_create_lookup::CreateSectorClaim,
     sector: &[u8; 512],
-) -> Result<nt_fs::FatPathProgress, crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError> {
+) -> crate::mounted_volume_backend::mounted_create_lookup::CreateSectorCompletion {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref().cloned() }
         .ok_or(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError::Invalid)?;
     let completed = queue.borrow_mut().complete_cached(claim, Ok(sector));
@@ -266,8 +266,8 @@ pub(crate) fn complete_cached_mounted_create_sector(
 
 pub(crate) fn complete_physical_mounted_create_sector(
     claim: crate::mounted_volume_backend::mounted_create_lookup::CreateSectorClaim,
-    sector: Result<&[u8; 512], nt_fs::FatPathError>,
-) -> Result<nt_fs::FatPathProgress, crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError> {
+    sector: Result<&[u8; 512], nt_fs::MountedSectorError>,
+) -> crate::mounted_volume_backend::mounted_create_lookup::CreateSectorCompletion {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref().cloned() }
         .ok_or(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError::Invalid)?;
     let completed = queue.borrow_mut().complete_physical(claim, sector);

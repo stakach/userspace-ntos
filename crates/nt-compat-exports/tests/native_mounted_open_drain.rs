@@ -77,7 +77,7 @@ fn native_resolved_writable_create_has_a_continuation_beyond_resident_busy() {
     let mut creates = mounted_create_lookup::CreateLookupQueue::new();
     creates.capture(0x225, 7, b"bootstat.dat".to_vec(), lookup).unwrap();
     let claim = creates.claim_next().unwrap();
-    assert_eq!(creates.complete(claim, Ok(&[0; 512])), Ok(FatPathProgress::NotFound));
+    assert_eq!(creates.complete(claim, Ok(&[0; 512])), Ok(Ok(FatPathProgress::NotFound)));
     for _ in 0..2 {
         let resolved = creates.take_resolved().unwrap();
         assert_eq!((resolved.irp, resolved.mount), (0x225, 7));
@@ -127,7 +127,7 @@ fn acknowledged_native_fat_sector_can_dispatch_its_successor_in_the_same_service
     root[..11].copy_from_slice(b"WINDOWS    ");
     root[11] = 0x10;
     root[26..28].copy_from_slice(&3u16.to_le_bytes());
-    assert_eq!(creates.complete(first, Ok(&root)), Ok(FatPathProgress::Pending));
+    assert_eq!(creates.complete(first, Ok(&root)), Ok(Ok(FatPathProgress::Pending)));
     let second = creates.claim_next().expect("exact first terminal enables next FAT sector");
     assert_eq!((second.irp, second.mount, second.request.sector), (0x226, 7, 101));
     assert!(creates.claim_next().is_none(), "only one physical successor can enter");
@@ -240,7 +240,7 @@ fn pending_create_keeps_exact_mount_and_sector_until_native_completion() {
     assert_eq!(route.complete_native(ticket, 511), Err(BlockRouteError::Incomplete));
     assert!(creates.take_resolved().is_none());
     route.complete_native(ticket, 512).unwrap();
-    assert_eq!(creates.complete(claim, Ok(&[0; 512])), Ok(FatPathProgress::NotFound));
+    assert_eq!(creates.complete(claim, Ok(&[0; 512])), Ok(Ok(FatPathProgress::NotFound)));
     let resolved = creates.take_resolved().expect("exact terminal CREATE");
     assert_eq!(resolved.irp, 0x21);
     assert_eq!(resolved.mount, 7);

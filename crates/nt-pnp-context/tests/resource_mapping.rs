@@ -1,7 +1,7 @@
 use nt_pnp_context::{
     resource_mapping::{
-        Admission, MappingDomain, MappingError, MappingKey, MappingOwner, MappingPhase,
-        ReleaseAction, ResourceMappingTable,
+        Admission, MappingCache, MappingDomain, MappingError, MappingKey, MappingOwner,
+        MappingPhase, ReleaseAction, ResourceMappingTable,
     },
     ContextRegistry,
 };
@@ -33,7 +33,7 @@ fn key() -> MappingKey {
         physical_page: 0x8106_2000,
         source_cap: 50,
         rights: 3,
-        attributes: 0,
+        cache: MappingCache::WriteBack,
     }
 }
 
@@ -55,6 +55,82 @@ fn map(
     let (_, effect) = table.begin_map(owner).unwrap();
     table.acknowledge_map(effect).unwrap();
     effect
+}
+
+#[test]
+fn conflicting_physical_cache_alias_is_rejected_before_mapping_effect() {
+    let mut table = ResourceMappingTable::new();
+    let [first_owner, second_owner] = owners();
+    let first = new(&mut table, key(), first_owner);
+    table.attach_cap(first, 70).unwrap();
+    map(&mut table, first);
+
+    let mut alias = key();
+    alias.virtual_page += 0x1000;
+    alias.source_cap = 51;
+    alias.cache = MappingCache::Uncached;
+    assert_eq!(
+        table.prepare(alias, second_owner),
+        Err(MappingError::Conflict)
+    );
+    assert_eq!(table.iter().count(), 1);
+    let original = table.iter().next().unwrap();
+    assert_eq!(original.phase(), MappingPhase::Mapped);
+    assert_eq!(original.cap(), Some(70));
+    assert_eq!(
+        original.owners().collect::<Vec<_>>(),
+        vec![(first, first_owner)]
+    );
+
+    alias.cache = MappingCache::WriteBack;
+    let same_cache = new(&mut table, alias, second_owner);
+    assert_eq!(table.iter().count(), 2);
+    assert_eq!(
+        table.begin_release(same_cache),
+        Ok(ReleaseAction::UnmappedReleased)
+    );
+    assert_eq!(table.iter().count(), 1);
+}
+
+#[test]
+fn conflicting_cache_in_another_vspace_stays_blocked_through_uncertain_effects() {
+    let mut table = ResourceMappingTable::new();
+    let [first_owner, second_owner] = owners();
+    let first = new(&mut table, key(), first_owner);
+    let mut alias = key();
+    alias.domain = MappingDomain { id: 2, cookie: 9 };
+    alias.pml4 = 41;
+    alias.virtual_page = 0x4000;
+    alias.source_cap = 51;
+    alias.cache = MappingCache::Uncached;
+
+    assert_eq!(
+        table.prepare(alias, second_owner),
+        Err(MappingError::Conflict)
+    );
+    table.attach_cap(first, 70).unwrap();
+    let (_, effect) = table.begin_map(first).unwrap();
+    table.mark_map_uncertain(effect).unwrap();
+    assert_eq!(
+        table.prepare(alias, second_owner),
+        Err(MappingError::Conflict)
+    );
+    assert_eq!(table.iter().count(), 1);
+
+    let mut retiring = ResourceMappingTable::new();
+    let first = new(&mut retiring, key(), first_owner);
+    retiring.attach_cap(first, 71).unwrap();
+    map(&mut retiring, first);
+    assert_eq!(
+        retiring.begin_release(first),
+        Ok(ReleaseAction::DeleteCap(71))
+    );
+    retiring.mark_delete_uncertain(first).unwrap();
+    assert_eq!(
+        retiring.prepare(alias, second_owner),
+        Err(MappingError::Conflict)
+    );
+    assert_eq!(retiring.iter().count(), 1);
 }
 
 #[test]
@@ -165,7 +241,7 @@ fn different_backing_or_rights_cannot_replace_a_live_leaf() {
         match change {
             0 => other.physical_page += 0x1000,
             1 => other.rights = 1,
-            _ => other.attributes = 1,
+            _ => other.cache = MappingCache::Uncached,
         }
         assert_eq!(table.prepare(other, b), Err(MappingError::Conflict));
         assert_eq!(table.iter().count(), 1);

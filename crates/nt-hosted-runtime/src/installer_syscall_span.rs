@@ -45,6 +45,20 @@ pub struct SpanOwner {
     pub thread_generation: u64,
 }
 
+/// A value-only witness minted at fault admission. The Reply number can be reused; only
+/// this exact owner and sequence can complete the observation that admitted it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstallerFaultTicket {
+    owner: SpanOwner,
+    reply: u64,
+    sequence: u64,
+}
+
+impl InstallerFaultTicket {
+    pub const fn owner(self) -> SpanOwner { self.owner }
+    pub const fn reply(self) -> u64 { self.reply }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSample {
     pub ssn: u32,
@@ -96,6 +110,14 @@ pub struct SpanSnapshot<const TOP: usize> {
     pub retained_pending: u64,
     pub unresolved_replaced: u64,
     pub total_gap_100ns: u64,
+    /// Acknowledged, instrumented fault time in closed return-to-next-entry gaps.
+    pub completed_fault_gap_100ns: u64,
+    /// Closed gap time not covered by an instrumented fault; includes unobserved faults.
+    pub residual_gap_100ns: u64,
+    /// Faults still awaiting an acknowledged Reply, never counted as completed time.
+    pub unresolved_faults: u64,
+    /// Diagnostic fault admissions refused without an unused exact witness.
+    pub fault_admission_overflow: u64,
     pub max_gap_100ns: u64,
     pub longest_gap: Option<LongestGap>,
     pub last_return_age_100ns: Option<u64>,
@@ -124,6 +146,13 @@ struct ActiveSpan { ssn: u32, at_100ns: u64 }
 struct LastReturn { ssn: u32, status: u32, at_100ns: u64 }
 
 #[derive(Clone, Copy)]
+struct ActiveFault {
+    ticket: InstallerFaultTicket,
+    entered_at_100ns: u64,
+    crossed_next_entry: bool,
+}
+
+#[derive(Clone, Copy)]
 struct Counter { calls: u64, total_100ns: u64, max_100ns: u64 }
 
 impl Counter { const EMPTY: Self = Self { calls: 0, total_100ns: 0, max_100ns: 0 }; }
@@ -148,6 +177,10 @@ struct Row {
     active: Option<ActiveSpan>,
     pending: Option<ActiveSpan>,
     last_return: Option<LastReturn>,
+    active_fault: Option<ActiveFault>,
+    completed_fault_open_gap_100ns: u64,
+    completed_fault_gap_100ns: u64,
+    fault_admission_overflow: u64,
     completed: u64,
     retained_pending: u64,
     unresolved_replaced: u64,
@@ -164,6 +197,9 @@ struct Row {
 impl Row {
     const EMPTY: Self = Self {
         owner: None, active: None, pending: None, last_return: None,
+        active_fault: None,
+        completed_fault_open_gap_100ns: 0, completed_fault_gap_100ns: 0,
+        fault_admission_overflow: 0,
         completed: 0, retained_pending: 0, unresolved_replaced: 0,
         total_gap_100ns: 0, longest_gap: None, unindexed_calls: 0,
         counters: [Counter::EMPTY; SSN_CAP],
@@ -180,6 +216,10 @@ impl Row {
             owner, completed: self.completed, retained_pending: self.retained_pending,
             unresolved_replaced: self.unresolved_replaced,
             total_gap_100ns: self.total_gap_100ns,
+            completed_fault_gap_100ns: self.completed_fault_gap_100ns,
+            residual_gap_100ns: self.total_gap_100ns.saturating_sub(self.completed_fault_gap_100ns),
+            unresolved_faults: u64::from(self.active_fault.is_some()),
+            fault_admission_overflow: self.fault_admission_overflow,
             max_gap_100ns: self.longest_gap.map_or(0, LongestGap::duration_100ns),
             longest_gap: self.longest_gap,
             last_return_age_100ns: self.last_return.map(|last| now.saturating_sub(last.at_100ns)),
@@ -258,11 +298,12 @@ fn top_transition_pairs<const TOP: usize>(pairs: &[PairCounter; PAIR_CAP])
 pub struct InstallerSyscallSpans<const N: usize, const TOP: usize> {
     rows: [Row; N],
     activation_overflow: u64,
+    next_fault_sequence: u64,
 }
 
 impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
     pub const fn new() -> Self {
-        Self { rows: [Row::EMPTY; N], activation_overflow: 0 }
+        Self { rows: [Row::EMPTY; N], activation_overflow: 0, next_fault_sequence: 0 }
     }
 
     pub fn activate(&mut self, owner: SpanOwner) -> bool {
@@ -297,16 +338,63 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
         true
     }
 
+    /// Admit at most one unresolved fault per exact thread. A full observation never
+    /// replaces an uncertain interval or grants authority from a numeric Reply alone.
+    pub fn fault_enter(&mut self, owner: SpanOwner, reply: u64,
+        now_100ns: u64) -> Option<InstallerFaultTicket> {
+        let row = self.rows.iter_mut().find(|row| row.owner == Some(owner))?;
+        if reply == 0 || row.active_fault.is_some() {
+            row.fault_admission_overflow = row.fault_admission_overflow.saturating_add(1);
+            return None;
+        }
+        let Some(sequence) = self.next_fault_sequence.checked_add(1) else {
+            row.fault_admission_overflow = row.fault_admission_overflow.saturating_add(1);
+            return None;
+        };
+        self.next_fault_sequence = sequence;
+        let ticket = InstallerFaultTicket { owner, reply, sequence };
+        row.active_fault = Some(ActiveFault {
+            ticket, entered_at_100ns: now_100ns, crossed_next_entry: false,
+        });
+        Some(ticket)
+    }
+
+    /// Record only an acknowledged completion of the exact admitted fault. Time remains
+    /// provisional until the next table entry closes the containing between-call gap.
+    pub fn fault_reply_accepted(&mut self, ticket: InstallerFaultTicket,
+        now_100ns: u64) -> bool {
+        let Some(row) = self.rows.iter_mut().find(|row| row.owner == Some(ticket.owner)) else {
+            return false;
+        };
+        let Some(active) = row.active_fault.filter(|fault| fault.ticket == ticket) else {
+            return false;
+        };
+        if now_100ns < active.entered_at_100ns { return false; }
+        if let Some(last) = row.last_return.filter(|_| !active.crossed_next_entry) {
+            let overlap_start = active.entered_at_100ns.max(last.at_100ns);
+            row.completed_fault_open_gap_100ns = row.completed_fault_open_gap_100ns
+                .saturating_add(now_100ns.saturating_sub(overlap_start));
+        }
+        row.active_fault = None;
+        true
+    }
+
     pub fn begin(&mut self, owner: SpanOwner, ssn: u32, now: u64) -> bool {
         let Some(row) = self.rows.iter_mut().find(|row| row.owner == Some(owner)) else {
             return false;
         };
+        if let Some(fault) = row.active_fault.as_mut() {
+            fault.crossed_next_entry = true;
+        }
         if row.active.is_some() || row.pending.take().is_some() {
             row.unresolved_replaced = row.unresolved_replaced.saturating_add(1);
         }
         if let Some(last) = row.last_return.take() {
             let gap = now.saturating_sub(last.at_100ns);
             row.total_gap_100ns = row.total_gap_100ns.saturating_add(gap);
+            row.completed_fault_gap_100ns = row.completed_fault_gap_100ns
+                .saturating_add(row.completed_fault_open_gap_100ns.min(gap));
+            row.completed_fault_open_gap_100ns = 0;
             row.observe_transition_pair(last.ssn, ssn, gap);
             if row.longest_gap.is_none_or(|prior| gap > prior.duration_100ns()) {
                 row.longest_gap = Some(LongestGap {
@@ -584,5 +672,102 @@ mod tests {
         assert_eq!(snapshot.untracked_transition_gaps, 1);
         assert_eq!(snapshot.untracked_transition_gap_100ns, 9);
         assert_eq!(snapshot.total_gap_100ns, (PAIR_CAP as u64 + 1) * 9);
+    }
+
+    #[test]
+    fn accepted_fault_time_is_intersected_with_the_exact_between_syscall_gap() {
+        let mut ledger = InstallerSyscallSpans::<1, 2>::new();
+        assert!(ledger.activate(A));
+
+        assert!(ledger.begin(A, 113, 100)); // NtMapViewOfSection.
+        assert!(ledger.return_from_dispatch(A, 113, 0, 200));
+        let fault = ledger.fault_enter(A, 71, 250).unwrap();
+        assert!(ledger.fault_reply_accepted(fault, 350));
+        assert!(ledger.begin(A, 277, 500)); // NtUnmapViewOfSection.
+
+        let snapshot = ledger.snapshot(A, 500).unwrap();
+        assert_eq!(snapshot.top[0].map(|total| total.ssn), Some(113));
+        assert_eq!(snapshot.top[0].map(|total| total.total_100ns), Some(100));
+        assert_eq!(snapshot.total_gap_100ns, 300);
+        assert_eq!(snapshot.completed_fault_gap_100ns, 100);
+        assert_eq!(snapshot.residual_gap_100ns, 200);
+        assert_eq!(snapshot.unresolved_faults, 0);
+        // The 100 ticks of native dispatch and 300 ticks of between-call time partition
+        // the 400-tick observation. The fault is a subset of the gap, not extra time.
+        assert_eq!(
+            snapshot.top[0].unwrap().total_100ns
+                + snapshot.completed_fault_gap_100ns + snapshot.residual_gap_100ns,
+            400,
+        );
+    }
+
+    #[test]
+    fn fault_ticket_rejects_pending_and_reused_reply_across_exact_lifetimes() {
+        let mut ledger = InstallerSyscallSpans::<1, 2>::new();
+        assert!(ledger.activate(A));
+        assert!(ledger.begin(A, 27, 100)); // NtClose.
+        assert!(ledger.return_from_dispatch(A, 27, 0, 150));
+
+        let first = ledger.fault_enter(A, 71, 200).unwrap();
+        let pending = ledger.snapshot(A, 250).unwrap();
+        assert_eq!(pending.unresolved_faults, 1);
+        assert_eq!(pending.completed_fault_gap_100ns, 0);
+
+        assert!(ledger.fault_reply_accepted(first, 260));
+        let reused = ledger.fault_enter(A, 71, 300).unwrap();
+        assert_ne!(first, reused); // The numeric Reply may be recycled for this same thread.
+        assert!(!ledger.fault_reply_accepted(first, 350));
+        assert_eq!(ledger.snapshot(A, 350).unwrap().unresolved_faults, 1);
+        assert!(ledger.fault_reply_accepted(reused, 360));
+        assert!(!ledger.fault_reply_accepted(reused, 370));
+        assert!(ledger.begin(A, 277, 400));
+        let snapshot = ledger.snapshot(A, 400).unwrap();
+        assert_eq!(snapshot.total_gap_100ns, 250);
+        assert_eq!(snapshot.completed_fault_gap_100ns, 120);
+        assert_eq!(snapshot.residual_gap_100ns, 130);
+        assert_eq!(snapshot.unresolved_faults, 0);
+
+        assert!(ledger.return_from_dispatch(A, 277, 0, 410));
+        let stale = ledger.fault_enter(A, 71, 420).unwrap();
+        let newer = SpanOwner { process_generation: A.process_generation + 1, ..A };
+        assert!(ledger.activate(newer));
+        assert!(ledger.begin(newer, 27, 1_000));
+        assert!(ledger.return_from_dispatch(newer, 27, 0, 1_050));
+        let current = ledger.fault_enter(newer, 71, 1_100).unwrap();
+        assert!(!ledger.fault_reply_accepted(stale, 1_150));
+        assert_eq!(ledger.snapshot(newer, 1_150).unwrap().unresolved_faults, 1);
+        assert!(ledger.fault_reply_accepted(current, 1_200));
+        assert!(ledger.begin(newer, 277, 1_300));
+        let snapshot = ledger.snapshot(newer, 1_300).unwrap();
+        assert_eq!(snapshot.completed_fault_gap_100ns, 100);
+        assert_eq!(snapshot.residual_gap_100ns, 150);
+        assert_eq!(ledger.snapshot(A, 1_300), None);
+    }
+
+    #[test]
+    fn unresolved_fault_crossing_the_next_entry_never_charges_a_later_gap() {
+        let mut ledger = InstallerSyscallSpans::<1, 2>::new();
+        assert!(ledger.activate(A));
+        assert!(ledger.begin(A, 27, 100));
+        assert!(ledger.return_from_dispatch(A, 27, 0, 150));
+        let fault = ledger.fault_enter(A, 71, 200).unwrap();
+        assert!(ledger.fault_enter(A, 72, 250).is_none());
+        assert_eq!(ledger.snapshot(A, 250).unwrap().fault_admission_overflow, 1);
+
+        assert!(ledger.begin(A, 277, 300)); // Original Reply is still unresolved.
+        let pending = ledger.snapshot(A, 300).unwrap();
+        assert_eq!(pending.total_gap_100ns, 150);
+        assert_eq!(pending.completed_fault_gap_100ns, 0);
+        assert_eq!(pending.residual_gap_100ns, 150);
+        assert_eq!(pending.unresolved_faults, 1);
+
+        assert!(ledger.return_from_dispatch(A, 277, 0, 320));
+        assert!(ledger.fault_reply_accepted(fault, 350));
+        assert!(ledger.begin(A, 113, 400));
+        let closed = ledger.snapshot(A, 400).unwrap();
+        assert_eq!(closed.total_gap_100ns, 230);
+        assert_eq!(closed.completed_fault_gap_100ns, 0);
+        assert_eq!(closed.residual_gap_100ns, 230);
+        assert_eq!(closed.unresolved_faults, 0);
     }
 }

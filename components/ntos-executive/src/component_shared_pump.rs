@@ -929,8 +929,8 @@ unsafe fn parked_dispatch_wait_yield(
             Some(crate::win32k_glue::ServiceWaitYield { route, dispatch, reply, token })
         }
         nt_component_suspension::ParkedDispatchReceive::Continue => {
-            if parked.is_some() && PumpReceiveScope::enclosed() {
-                trace_enclosed_dispatch_wait(route, dispatch);
+            if let Some(wait) = parked.filter(|_| PumpReceiveScope::enclosed()) {
+                trace_enclosed_dispatch_wait(ch, route, dispatch, wait);
             }
             None
         }
@@ -938,12 +938,23 @@ unsafe fn parked_dispatch_wait_yield(
 }
 
 /// One live shared receive on this executor's stack (see `ExecutorLocal::receive_depth`).
-struct PumpReceiveScope;
+struct PumpReceiveScope {
+    trace_index: Option<usize>,
+}
 
 impl PumpReceiveScope {
-    fn enter() -> Self {
-        crate::executor::local().receive_depth.fetch_add(1, Ordering::AcqRel);
-        Self
+    fn enter(ch: &PumpChannel, route: PeerRoute) -> Self {
+        let local = crate::executor::local();
+        let depth = local.receive_depth.fetch_add(1, Ordering::AcqRel);
+        let trace_index = usize::try_from(depth).ok()
+            .filter(|index| *index < crate::executor::RECEIVE_TRACE_DEPTH);
+        if let Some(index) = trace_index {
+            let frame = &local.receive_trace[index];
+            frame.tcb.store(ch.tcb, Ordering::Relaxed);
+            frame.reply.store(ch.reply_cap, Ordering::Relaxed);
+            frame.route.store(route.badge(), Ordering::Release);
+        }
+        Self { trace_index }
     }
 
     /// Called from inside a receive: another pump's receive encloses it.
@@ -954,23 +965,93 @@ impl PumpReceiveScope {
 
 impl Drop for PumpReceiveScope {
     fn drop(&mut self) {
-        crate::executor::local().receive_depth.fetch_sub(1, Ordering::AcqRel);
+        let local = crate::executor::local();
+        if let Some(index) = self.trace_index {
+            local.receive_trace[index].route.store(0, Ordering::Release);
+        }
+        local.receive_depth.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 /// Bounded evidence that a parked File dispatch kept receiving because another pump's receive
 /// encloses it: its own receive services the wake (#420, #427 A).
-fn trace_enclosed_dispatch_wait(route: PeerRoute, dispatch: nt_component_suspension::LaneDispatchIdentity) {
+unsafe fn trace_enclosed_dispatch_wait(
+    ch: &PumpChannel,
+    route: PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    parked: (u64, u64),
+) {
     static TRACED: AtomicU64 = AtomicU64::new(0);
     let n = TRACED.fetch_add(1, Ordering::Relaxed) + 1;
     if n > 16 && !n.is_power_of_two() { return; }
-    crate::print_str(b"[parked-dispatch] stage=enclosed n/route/lane/epoch/depth=");
+    crate::print_str(b"[parked-dispatch] stage=enclosed n/route/lane/epoch/depth/reply/token/tcb/cap/lane-gen=");
     for value in [n, route.badge(), u64::from(dispatch.lane().index), dispatch.epoch(),
-        crate::executor::local().receive_depth.load(Ordering::Relaxed)] {
+        crate::executor::local().receive_depth.load(Ordering::Relaxed),
+        parked.0, parked.1, ch.tcb, ch.reply_cap, dispatch.lane().generation] {
         crate::print_str(b"/");
         crate::print_u64(value);
     }
     crate::print_str(b"\n");
+    let local = crate::executor::local();
+    let depth = local.receive_depth.load(Ordering::Acquire);
+    for (index, frame) in local.receive_trace.iter().enumerate().take(depth as usize) {
+        let frame_route = frame.route.load(Ordering::Acquire);
+        if frame_route == 0 { continue; }
+        let tcb = frame.tcb.load(Ordering::Relaxed);
+        let reply = frame.reply.load(Ordering::Relaxed);
+        if frame.route.load(Ordering::Acquire) != frame_route { continue; }
+        crate::print_str(b"[parked-dispatch-stack] sample/depth/route/tcb/reply=");
+        for value in [n, index as u64 + 1, frame_route, tcb, reply] {
+            crate::print_str(b"/"); crate::print_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
+    let running = runtime::hold_snapshot().running;
+    crate::print_str(b"[parked-dispatch-owner] sample/running-route/lane/lane-gen/epoch/reply/tcb=");
+    for value in [n,
+        running.and_then(|row| row.route).map_or(0, |route| route.badge()),
+        running.map_or(0, |row| u64::from(row.lane.index)),
+        running.map_or(0, |row| row.lane.generation),
+        running.and_then(|row| row.dispatch).map_or(0, |dispatch| dispatch.epoch()),
+        running.and_then(|row| row.binding).map_or(0, |binding| binding.reply_object),
+        running.and_then(|row| row.physical).map_or(0, |source| source.tcb)] {
+        crate::print_str(b"/");
+        crate::print_u64(value);
+    }
+    crate::print_str(b"\n");
+    trace_enclosed_receive_candidates(n);
+}
+
+/// These copied active receive rows identify the enclosing candidate without following a
+/// component mapping. A row is diagnostic context, never authority to resume its Reply.
+fn trace_enclosed_receive_candidates(sample: u64) {
+    for (index, slot) in ACTIVE_IRP_SNAPSHOTS.iter().enumerate() {
+        let sequence = slot.sequence.load(Ordering::Acquire);
+        if sequence == 0 || sequence == SNAPSHOT_CLAIMED { continue; }
+        let values = [slot.route.load(Ordering::Relaxed), slot.tcb.load(Ordering::Relaxed),
+            slot.reply.load(Ordering::Relaxed), slot.source_irp.load(Ordering::Relaxed),
+            slot.major.load(Ordering::Relaxed), slot.minor.load(Ordering::Relaxed)];
+        if slot.sequence.load(Ordering::Acquire) != sequence { continue; }
+        crate::print_str(b"[parked-dispatch-receive] sample/kind/slot/sequence/route/tcb/reply/irp/major/minor=");
+        for value in [sample, 1, index as u64, sequence].into_iter().chain(values) {
+            crate::print_str(b"/"); crate::print_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
+    for (index, slot) in ACTIVE_SYSCALL_SNAPSHOTS.iter().enumerate() {
+        let sequence = slot.sequence.load(Ordering::Acquire);
+        if sequence == 0 || sequence == SNAPSHOT_CLAIMED { continue; }
+        let values = [slot.route.load(Ordering::Relaxed),
+            slot.lane_index.load(Ordering::Relaxed), slot.lane_generation.load(Ordering::Relaxed),
+            slot.tcb.load(Ordering::Relaxed), slot.reply.load(Ordering::Relaxed),
+            slot.ssn.load(Ordering::Relaxed)];
+        if slot.sequence.load(Ordering::Acquire) != sequence { continue; }
+        crate::print_str(b"[parked-dispatch-receive] sample/kind/slot/sequence/route/lane/lane-gen/tcb/reply/ssn=");
+        for value in [sample, 2, index as u64, sequence].into_iter().chain(values) {
+            crate::print_str(b"/"); crate::print_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
 }
 
 static PARKED_DISPATCH_YIELDS: AtomicU64 = AtomicU64::new(0);
@@ -992,7 +1073,7 @@ pub(super) unsafe fn receive(
     ch: &PumpChannel, route: PeerRoute, retained_seh: bool, serviced_scheduler_yield: bool,
 ) -> PumpMessage {
     let census_scope = ReceiveCensusScope::enter(ch, route, retained_seh);
-    let _receive_scope = PumpReceiveScope::enter();
+    let _receive_scope = PumpReceiveScope::enter(ch, route);
     // A retained exception walk and an ordinary syscall channel without kernel IRQ yield cannot
     // return a scheduler continuation. Give already-latched work one isolated pass here instead.
     let inline_irq_checkpoint =

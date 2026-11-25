@@ -13,19 +13,23 @@ import threading
 import time
 
 if __package__:
-    from .ci_kvm_cursor import prove_cursor_position, prove_selected_icon
+    from .ci_kvm_cursor import prove_cursor_position
     from .ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script, screenshot_name
     from .ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
                                      read_run_state, request_quit)
     from .ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
-    from .ci_kvm_visual_proof import VisualProof, prove_ready_prompt, prove_ver_result
+    from .ci_kvm_visual_proof import (VisualProof, prove_command_prompt_search_result,
+                                      prove_ready_prompt, prove_start_menu_search_box,
+                                      prove_ver_result)
 else:
-    from ci_kvm_cursor import prove_cursor_position, prove_selected_icon
+    from ci_kvm_cursor import prove_cursor_position
     from ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script, screenshot_name
     from ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
                                     read_run_state, request_quit)
     from ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
-    from ci_kvm_visual_proof import VisualProof, prove_ready_prompt, prove_ver_result
+    from ci_kvm_visual_proof import (VisualProof, prove_command_prompt_search_result,
+                                    prove_ready_prompt, prove_start_menu_search_box,
+                                    prove_ver_result)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -584,6 +588,69 @@ def read_cpu_state():
     return state
 
 
+def user_register_identity(registers):
+    """Identify a running user CPU and its address space from one QMP snapshot."""
+    if "CPL=3" not in registers or "HLT=0" not in registers:
+        return None
+    values = {}
+    for name in ("RIP", "RSP", "CR3"):
+        match = re.search(rf"\b{name}=([0-9a-fA-F]+)", registers)
+        if match is None:
+            return None
+        values[name] = int(match.group(1), 16)
+    gs = re.search(r"^GS\s*=\s*[0-9a-fA-F]+\s+([0-9a-fA-F]+)", registers,
+                   re.MULTILINE)
+    if gs is None:
+        return None
+    values["GS"] = int(gs.group(1), 16)
+    return values
+
+
+def read_user_execution_context(registers):
+    """Retain bounded live bytes, stack and TEB identity for a running user CPU.
+
+    A second register snapshot tells the reader whether the sampled addresses still
+    belonged to the same instruction, stack and address space after the QMP reads.
+    """
+    identity = user_register_identity(registers)
+    if identity is None:
+        return None
+    rip, rsp, gs = (identity[name] for name in ("RIP", "RSP", "GS"))
+    commands = (
+        ("code_bytes", f"x /64bx 0x{max(0, rip - 32):x}"),
+        ("instruction", f"x /16i 0x{rip:x}"),
+        ("stack", f"x /32gx 0x{rsp:x}"),
+        ("teb_client_id", f"x /2gx 0x{gs + 0x40:x}"),
+        ("registers_after", "info registers"),
+    )
+    result = {"registers_before": registers, "cpu_index": 0}
+    try:
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(3)
+            connection.connect(str(QMP_SOCKET))
+            with connection.makefile("rwb", buffering=0) as stream:
+                greeting = json.loads(stream.readline())
+                if "QMP" not in greeting:
+                    raise RuntimeError("QMP greeting missing")
+                stream.write(b'{"execute":"qmp_capabilities","id":"capabilities"}\n')
+                qmp_reply(stream, "capabilities")
+                for name, line in commands:
+                    command_id = name.replace("_", "-")
+                    command = {"execute": "human-monitor-command",
+                               "arguments": {"command-line": line, "cpu-index": 0},
+                               "id": command_id}
+                    stream.write((json.dumps(command) + "\n").encode())
+                    try:
+                        result[name] = qmp_reply(stream, command_id)["return"]
+                    except (OSError, RuntimeError, ValueError, KeyError) as error:
+                        result.setdefault("errors", {})[name] = str(error)
+    except (OSError, RuntimeError, ValueError, KeyError) as error:
+        result["error"] = str(error)
+    result["coherent"] = (user_register_identity(result.get("registers_after", ""))
+                          == identity)
+    return result
+
+
 def read_interrupt_state():
     """Read PIC, IRQ and per-vCPU LAPIC state without changing guest execution."""
     state = {"lapic": {}}
@@ -806,6 +873,8 @@ def published_storahci_abars(serial):
 def capture_stall_state(path=STALL_STATE):
     """Keep CPU, interrupt-controller and AHCI evidence at a proof frontier or stall."""
     state = read_cpu_state()
+    if context := read_user_execution_context(state.get("registers", {}).get("0", "")):
+        state["user_execution"] = context
     state["interrupts"] = read_interrupt_state()
     # Every published AHCI BAR is evidence: a boot may enumerate multiple controllers,
     # and the last one in the serial log need not own the mounted volume.
@@ -966,13 +1035,11 @@ def main():
         interaction = seal_detector = None
         desktop_sealed = False
         if interaction_script is not None:
-            checks = {"command-prompt": lambda name: prove_ready_prompt(ROOT / name)}
-            selected_step = next((step for step in interaction_script.steps
-                                  if step.name == "command-prompt-selected"), None)
-            if selected_step is not None:
-                target = selected_step.actions[0][1]
-                checks["command-prompt-selected"] = lambda name: prove_selected_icon(
-                    ROOT / interaction.cursor_receipts[-1]["file"], ROOT / name, target)
+            checks = {
+                "start-menu": lambda name: prove_start_menu_search_box(ROOT / name),
+                "command-prompt-search": lambda name: prove_command_prompt_search_result(ROOT / name),
+                "command-prompt": lambda name: prove_ready_prompt(ROOT / name),
+            }
             interaction = InteractionRunner(
                 interaction_script, send_input_batches,
                 lambda name: capture_framebuffer(ROOT / name), INTERACTION_LOG,

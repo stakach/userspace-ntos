@@ -259,6 +259,7 @@ mod win32k_shared_page_authority;
 pub(crate) use win32k_glue::*;
 pub(crate) use win32k_session_runtime::*;
 mod driver_launch;
+mod hosted_page_cache;
 mod debug_filter_shared;
 mod hosted_debug_filter_process;
 mod hosted_driver_assertion;
@@ -13651,6 +13652,7 @@ enum HostedDevnodeGrantKind {
 
 struct HostedDevnodeGrant {
     kind: HostedDevnodeGrantKind,
+    bus_owned_root_proof: Option<driver_launch::HostedBusOwnedRootPublicationProof>,
     raw_resource_list: alloc::vec::Vec<u8>,
     translated_resource_list: alloc::vec::Vec<u8>,
     mmio_phys: u64,
@@ -14052,6 +14054,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
             dev: grant.device.dev,
             func: grant.device.func,
         },
+        bus_owned_root_proof: None,
         raw_resource_list: grant.raw_resource_list,
         translated_resource_list: grant.translated_resource_list,
         mmio_phys: memory.map(|memory| memory.start).unwrap_or(0),
@@ -14219,6 +14222,7 @@ unsafe fn grant_hosted_platform_devnode_resources(
     )?;
     Ok(Some(HostedDevnodeGrant {
         kind: HostedDevnodeGrantKind::RootBus,
+        bus_owned_root_proof: None,
         raw_resource_list: grant.raw_resource_list,
         translated_resource_list: grant.translated_resource_list,
         mmio_phys: translated_memory
@@ -14329,6 +14333,7 @@ unsafe fn grant_hosted_acpi_child_devnode_resources(
     }
     Ok(Some(HostedDevnodeGrant {
         kind: HostedDevnodeGrantKind::AcpiChild,
+        bus_owned_root_proof: None,
         raw_resource_list: resources.raw_resources,
         translated_resource_list: translated,
         mmio_phys: 0,
@@ -14352,6 +14357,7 @@ unsafe fn grant_hosted_devnode_resources(
             }
             Ok(Some(HostedDevnodeGrant {
                 kind: HostedDevnodeGrantKind::RootBus,
+                bus_owned_root_proof: None,
                 raw_resource_list: resources.raw_resources,
                 translated_resource_list: resources.translated_resources,
                 mmio_phys: 0,
@@ -14372,6 +14378,7 @@ unsafe fn grant_hosted_devnode_resources(
             }
             Ok(Some(HostedDevnodeGrant {
                 kind: HostedDevnodeGrantKind::RootBus,
+                bus_owned_root_proof: Some(resources.publication_proof()),
                 raw_resource_list: resources.snapshot.raw_resources,
                 translated_resource_list: resources.translated_resources,
                 mmio_phys: 0,
@@ -15639,6 +15646,26 @@ impl RingChannel<'_> {
 
 /// The Object Manager transport wrapper.
 struct ObChan<'a>(RingChannel<'a>);
+static OB_DIRECTORY_TRACE_REQUEST: AtomicU64 = AtomicU64::new(0);
+static OB_DIRECTORY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The ring request is the exact owned effect. Do not inspect mutable ingress ownership from
+/// this channel callback; the enclosing receive trace reports that context at its own boundary.
+fn trace_ob_owned_directory(
+    channel: &RingChannel<'_>, request_id: u64, opcode: u16, stage: &[u8],
+    poll: u64, terminal: bool,
+) {
+    print_str(b"[ob-owned-directory] stage="); print_str(stage);
+    print_str(b" request/opcode/poll/terminal/active/parked/capture/next=");
+    for value in [request_id, u64::from(opcode), poll, u64::from(terminal),
+        channel.completion_inbox.active_request().unwrap_or(0),
+        u64::from(channel.completion_inbox.has_parked_owned()),
+        u64::from(channel.owned_capture.is_some()), channel.next_id] {
+        print_str(b"/"); print_u64(value);
+    }
+    print_str(b"\n");
+}
+
 impl nt_object_client::Backend for ObChan<'_> {
     fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> ObReply {
         let (status, _flags, information, detail0, detail1) = self.0.raw(opcode, in_buf, out_buf);
@@ -15672,6 +15699,16 @@ impl nt_object_client::OwnedBackend for ObChan<'_> {
                 print_str(b"[ob-owned-submit] pending id=");
                 print_u64(request_id);
                 print_str(b"\n");
+                if matches!(opcode,
+                    nt_object_abi::opcode::OB_OP_CREATE_DIRECTORY_HANDLE
+                    | nt_object_abi::opcode::OB_OP_OPEN_DIRECTORY_HANDLE)
+                {
+                    let sample = OB_DIRECTORY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if sample <= 16 || sample.is_power_of_two() {
+                        OB_DIRECTORY_TRACE_REQUEST.store(request_id, Ordering::Release);
+                        trace_ob_owned_directory(&self.0, request_id, opcode, b"submit", 0, false);
+                    }
+                }
                 nt_object_client::OwnedCall::Indeterminate(request_id)
             }
         }
@@ -15700,6 +15737,16 @@ impl nt_object_client::OwnedBackend for ObChan<'_> {
             print_str(b" terminal=");
             print_u64(u64::from(result.is_some()));
             print_str(b"\n");
+        }
+        if OB_DIRECTORY_TRACE_REQUEST.load(Ordering::Acquire) == request_id {
+            if sequence <= 8 || sequence.is_power_of_two() || result.is_some() {
+                trace_ob_owned_directory(&self.0, request_id, 0, b"poll", sequence, result.is_some());
+            }
+            if result.is_some() {
+                let _ = OB_DIRECTORY_TRACE_REQUEST.compare_exchange(
+                    request_id, 0, Ordering::AcqRel, Ordering::Relaxed,
+                );
+            }
         }
         result
     }
@@ -22543,36 +22590,119 @@ pub(crate) fn owned_driver_launch_spec_from_live_config_binding(
     })
 }
 
+static PNP_EXISTING_DEVICE_LOOKUP_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) unsafe fn live_config_existing_device_launch_spec(
     instance_id: &str,
     max_start: u32,
+    trace_start_failure: bool,
 ) -> Result<DriverServiceLaunchSpec, i32> {
-    let mut enum_path = alloc::string::String::from(nt_config_manager::ENUM_PATH);
-    enum_path
-        .try_reserve_exact(instance_id.len().saturating_add(1))
-        .map_err(|_| 0xC000_009Au32 as i32)?;
-    enum_path.push('\\');
-    enum_path.push_str(instance_id);
-    let (value_type, service_data) =
-        config_manager_query_value_owned(&enum_path, "Service").map_err(|error| error.status)?;
-    if value_type != nt_hive_core::RegistryValueType::Sz as u32 {
-        return Err(0xC000_000Du32 as i32);
+    let mut branch: &'static [u8] = b"enum-path-alloc";
+    let mut service_query: Option<Result<u32, i32>> = None;
+    let mut service_name = alloc::string::String::new();
+    let mut service_decoded = false;
+    let mut binding_status: Option<i32> = None;
+    let mut conversion: Option<bool> = None;
+    let result = (|| -> Result<DriverServiceLaunchSpec, i32> {
+        let mut enum_path = alloc::string::String::from(nt_config_manager::ENUM_PATH);
+        enum_path
+            .try_reserve_exact(instance_id.len().saturating_add(1))
+            .map_err(|_| 0xC000_009Au32 as i32)?;
+        enum_path.push('\\');
+        enum_path.push_str(instance_id);
+
+        branch = b"enum-service-query";
+        let (value_type, service_data) = match unsafe { config_manager_query_value_owned(&enum_path, "Service") } {
+            Ok(value) => value,
+            Err(error) => {
+                service_query = Some(Err(error.status));
+                return Err(error.status);
+            }
+        };
+        service_query = Some(Ok(value_type));
+        branch = b"enum-service-type";
+        if value_type != nt_hive_core::RegistryValueType::Sz as u32 {
+            return Err(0xC000_000Du32 as i32);
+        }
+        branch = b"enum-service-decode";
+        let service_bytes = registry_utf16_ascii_vec(&service_data)
+            .ok_or(0xC000_0034u32 as i32)?;
+        branch = b"enum-service-utf8";
+        service_name = alloc::string::String::from_utf8(service_bytes)
+            .map_err(|_| 0xC000_0034u32 as i32)?;
+        service_decoded = true;
+
+        branch = b"service-binding";
+        let binding = match unsafe { config_manager_query_driver_service(&service_name) } {
+            Ok(binding) => {
+                binding_status = Some(0);
+                binding
+            }
+            Err(status) => {
+                binding_status = Some(status);
+                return Err(status);
+            }
+        };
+        branch = b"launch-conversion";
+        let spec = owned_driver_launch_spec_from_live_config_binding(binding, max_start);
+        conversion = Some(spec.is_some());
+        let mut spec = spec.ok_or(0xC000_0034u32 as i32)?;
+        branch = b"binding-devnode";
+        let index = spec
+            .devnodes
+            .iter()
+            .position(|devnode| devnode.instance_id.eq_ignore_ascii_case(instance_id))
+            .ok_or(0xC000_0225u32 as i32)?;
+        let devnode = spec.devnodes.swap_remove(index);
+        spec.devnodes.clear();
+        spec.devnodes.push(devnode);
+        Ok(spec)
+    })();
+    if let (true, Err(status)) = (trace_start_failure, &result) {
+        if PNP_EXISTING_DEVICE_LOOKUP_FAILURE_TRACE_N.fetch_add(1, Ordering::Relaxed) < 32 {
+            print_str(b"[pnp-start-lookup-failure] instance=");
+            print_str(instance_id.as_bytes());
+            print_str(b" branch=");
+            print_str(branch);
+            print_str(b" status=0x");
+            print_hex_u64(*status as u32 as u64);
+            print_str(b" service-query=");
+            match service_query {
+                None => print_str(b"not-run"),
+                Some(Ok(value_type)) => {
+                    print_str(b"ok/type-0x");
+                    print_hex_u64(value_type as u64);
+                }
+                Some(Err(query_status)) => {
+                    print_str(b"error-0x");
+                    print_hex_u64(query_status as u32 as u64);
+                }
+            }
+            print_str(b" service-name=");
+            if service_decoded {
+                print_str(service_name.as_bytes());
+            } else {
+                print_str(b"unavailable");
+            }
+            print_str(b" binding=");
+            match binding_status {
+                None => print_str(b"not-run"),
+                Some(0) => print_str(b"ok"),
+                Some(status) => {
+                    print_str(b"error-0x");
+                    print_hex_u64(status as u32 as u64);
+                }
+            }
+            print_str(b" conversion=");
+            match conversion {
+                None => print_str(b"not-run"),
+                Some(true) => print_str(b"ok"),
+                Some(false) => print_str(b"failed"),
+            }
+            print_str(b"\n");
+        }
     }
-    let service_bytes = registry_utf16_ascii_vec(&service_data).ok_or(0xC000_0034u32 as i32)?;
-    let service_name =
-        alloc::string::String::from_utf8(service_bytes).map_err(|_| 0xC000_0034u32 as i32)?;
-    let binding = config_manager_query_driver_service(&service_name)?;
-    let mut spec = owned_driver_launch_spec_from_live_config_binding(binding, max_start)
-        .ok_or(0xC000_0034u32 as i32)?;
-    let index = spec
-        .devnodes
-        .iter()
-        .position(|devnode| devnode.instance_id.eq_ignore_ascii_case(instance_id))
-        .ok_or(0xC000_0225u32 as i32)?;
-    let devnode = spec.devnodes.swap_remove(index);
-    spec.devnodes.clear();
-    spec.devnodes.push(devnode);
-    Ok(spec)
+    result
 }
 
 #[derive(Clone, Copy, Default)]
@@ -30155,10 +30285,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 map_ok = true;
                 let mut page = 0u64;
                 while page < run.pages {
-                    if page_map(
+                    if page_map_r(
                         run.base + page,
                         FB_VADDR + page * 0x1000,
-                        RW_NX,
+                        hosted_page_cache::page_map_rights(
+                            RW_NX,
+                            nt_pnp_context::resource_mapping::MappingCache::Uncached,
+                        ),
                         CAP_INIT_THREAD_VSPACE,
                     ) != 0
                     {

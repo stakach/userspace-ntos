@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use crate::{
     FatDirectoryRecord, FatPathError, FatPathGeometry, FatPathLookup, FatPathProgress,
     FatPathRequest, FatRangeLookup, FatRangeProgress, FatRangeRequest,
+    MountedSectorError,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +27,7 @@ pub enum OverlayPrepareError {
     WrongClaim,
     ParentMissing,
     ParentNotDirectory,
+    Provider(nt_status::NtStatus),
     Fat(FatPathError),
 }
 
@@ -251,13 +253,14 @@ impl<P> OverlayPreparations<P> {
     pub fn complete_sector(
         &mut self,
         claim: OverlaySectorClaim,
-        sector: Result<&[u8; 512], FatPathError>,
+        sector: Result<&[u8; 512], MountedSectorError>,
     ) -> Result<OverlayPrepareProgress, OverlayPrepareError> {
         let entry = self.exact_claim_mut(claim)?;
         let mut next = None;
         match (&mut entry.phase, claim.request) {
             (Phase::Parent(cursor), OverlaySectorRequest::Parent(request)) => {
-                let progress = sector.and_then(|bytes| cursor.feed(request, bytes));
+                let progress = sector.and_then(|bytes| cursor.feed(request, bytes)
+                    .map_err(MountedSectorError::Fat));
                 match progress {
                     Ok(FatPathProgress::Pending) => {}
                     Ok(FatPathProgress::Found) => match cursor.take_found() {
@@ -279,16 +282,17 @@ impl<P> OverlayPreparations<P> {
                     Ok(FatPathProgress::NotFound) => {
                         next = Some(Phase::Ready(Err(OverlayPrepareError::ParentMissing)))
                     }
-                    Err(error) => next = Some(Phase::Ready(Err(map_fat_error(error)))),
+                    Err(error) => next = Some(Phase::Ready(Err(map_sector_error(error)))),
                 }
             }
             (Phase::Contents(cursor), OverlaySectorRequest::Contents(request)) => {
                 let progress =
-                    sector.and_then(|bytes| cursor.feed(request, bytes, &mut entry.contents));
+                    sector.and_then(|bytes| cursor.feed(request, bytes, &mut entry.contents)
+                        .map_err(MountedSectorError::Fat));
                 match progress {
                     Ok(FatRangeProgress::Pending) => {}
                     Ok(FatRangeProgress::Complete) => next = Some(Phase::Ready(Ok(()))),
-                    Err(error) => next = Some(Phase::Ready(Err(map_fat_error(error)))),
+                    Err(error) => next = Some(Phase::Ready(Err(map_sector_error(error)))),
                 }
             }
             _ => return Err(OverlayPrepareError::WrongClaim),
@@ -369,6 +373,13 @@ fn map_fat_error(error: FatPathError) -> OverlayPrepareError {
     match error {
         FatPathError::NoCapacity => OverlayPrepareError::NoCapacity,
         _ => OverlayPrepareError::Fat(error),
+    }
+}
+
+fn map_sector_error(error: MountedSectorError) -> OverlayPrepareError {
+    match error {
+        MountedSectorError::Provider(status) => OverlayPrepareError::Provider(status),
+        MountedSectorError::Fat(error) => map_fat_error(error),
     }
 }
 
@@ -602,7 +613,7 @@ mod tests {
             .unwrap();
         let claim = queue.claim_next().unwrap();
         assert_eq!(
-            queue.complete_sector(claim, Err(FatPathError::Corrupt)),
+            queue.complete_sector(claim, Err(FatPathError::Corrupt.into())),
             Ok(OverlayPrepareProgress::Ready)
         );
         assert!(!queue.has_claimable_sector());
@@ -611,5 +622,26 @@ mod tests {
             queue.take_ready_for(3, 7).unwrap().result,
             Err(OverlayPrepareError::Fat(FatPathError::Corrupt))
         ));
+    }
+
+    #[test]
+    fn authenticated_overlay_sector_failure_retains_provider_status() {
+        let mut queue = OverlayPreparations::new();
+        queue.capture(4, 7, 31, geometry(), 2, None,
+            OverlayCopyPlan::Contents { first_cluster: 2, length: 1 }).unwrap();
+        let claim = queue.claim_next().unwrap();
+        let failure = MountedSectorError::Provider(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+        assert_eq!(queue.complete_sector(OverlaySectorClaim { mount: 8, ..claim }, Err(failure)),
+            Err(OverlayPrepareError::WrongClaim));
+        assert_eq!(queue.complete_sector(claim, Err(failure)), Ok(OverlayPrepareProgress::Ready));
+        assert_eq!(queue.complete_sector(claim, Err(failure)), Err(OverlayPrepareError::WrongClaim));
+        assert!(!queue.has_claimable_sector());
+        let resolved = queue.take_ready_for(4, 7).unwrap();
+        assert!(matches!(resolved.result, Err(OverlayPrepareError::Provider(status))
+            if status == nt_status::NtStatus::INSUFFICIENT_RESOURCES));
+        queue.restore_ready(resolved).unwrap();
+        assert!(matches!(queue.take_ready_for(4, 7).unwrap().result,
+            Err(OverlayPrepareError::Provider(status))
+            if status == nt_status::NtStatus::INSUFFICIENT_RESOURCES));
     }
 }

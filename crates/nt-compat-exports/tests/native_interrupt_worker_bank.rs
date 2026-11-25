@@ -12,6 +12,9 @@ fn interrupt_connection_and_retirement_use_the_calling_lanes_resource_bank() {
         .find("\n/// `PDMA_ADAPTER IoGetDmaAdapter")
         .expect("native interrupt adapter boundary");
     let ex = include_str!("../../../components/ntos-executive/src/hosted_driver_interrupt_ex.rs");
+    let publication = include_str!(
+        "../../../components/ntos-executive/src/hosted_device_publication_decision.rs"
+    );
     let adapter = |body: &str| {
         // The host does not support the guest ABI or fixed component VA. Resolve only those
         // two deployment details, so every bank read/write remains from the real adapters.
@@ -19,7 +22,7 @@ fn interrupt_connection_and_retirement_use_the_calling_lanes_resource_bank() {
             .replace("FSD_SHARED_VADDR", "primary_bank()")
     };
     let fixture = format!(
-        "{SUPPORT}\n{}\n{}\n{CASES}",
+        "{SUPPORT}\nmod hosted_device_publication_decision {{\n{publication}\n}}\n{}\n{}\n{CASES}",
         adapter(&source[start..start + end]),
         adapter(
             &ex.replace("//! Driver-local", "/// Driver-local")
@@ -98,6 +101,7 @@ static PRIMARY: AtomicU64 = AtomicU64::new(0);
 static CURRENT: AtomicU64 = AtomicU64::new(0);
 static PROJECTION: AtomicU64 = AtomicU64::new(0);
 static ROOT_CALLS: AtomicU64 = AtomicU64::new(0);
+static LAST_DISCONNECT: AtomicU64 = AtomicU64::new(0);
 
 fn primary_bank() -> u64 { PRIMARY.load(Ordering::Relaxed) }
 fn hosted_component_resource_shared_va() -> u64 { CURRENT.load(Ordering::Relaxed) }
@@ -117,7 +121,7 @@ fn call_on4(_: u64, op: u64, object: u64, _: u64, _: u64) -> (u64, u64, u64, u64
             (0, 0, 99, 7, 0)
         }
         HOSTED_INTERRUPT_OP_DISCONNECT => {
-            assert_eq!(unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64) }, object);
+            LAST_DISCONNECT.store(object, Ordering::Relaxed);
             (0, 0, 0, 0, 0)
         }
         _ => panic!("unexpected interrupt service"),
@@ -133,6 +137,20 @@ fn clear_dpc_diagnostics(sh: u64) {
 
 mod provider_bugcheck {
     pub unsafe fn report(_: u32, _: [u64; 4]) -> ! { panic!("unexpected bugcheck") }
+}
+
+fn worker_disconnect_keeps_a_siblings_newer_shared_interrupt() {
+    let mut worker = Box::new([0u64; 16]);
+    CURRENT.store(worker.as_mut_ptr() as u64, Ordering::Relaxed);
+    let keyboard = 0x1000_e803_a10_u64;
+    let mouse = 0x1000_e803_960_u64;
+    worker[(SH_RESOURCE_INTERRUPT_OBJECT / 8) as usize] = mouse;
+    worker[(SH_RESOURCE_INTERRUPT_ID / 8) as usize] = 12;
+    LAST_DISCONNECT.store(0, Ordering::Relaxed);
+    s_io_disconnect_interrupt(keyboard);
+    assert_eq!(LAST_DISCONNECT.load(Ordering::Relaxed), keyboard);
+    assert_eq!(worker[(SH_RESOURCE_INTERRUPT_OBJECT / 8) as usize], mouse);
+    assert_eq!(worker[(SH_RESOURCE_INTERRUPT_ID / 8) as usize], 12);
 }
 "#;
 
@@ -197,5 +215,6 @@ fn worker_connect_disconnect_and_line_based_ex_stay_in_the_worker_bank() {
     s_io_disconnect_interrupt_ex(disconnect.as_ptr() as u64);
     assert_eq!(worker[(SH_RESOURCE_INTERRUPT_OBJECT / 8) as usize], 0);
     assert_eq!(*primary, primary_before);
+    worker_disconnect_keeps_a_siblings_newer_shared_interrupt();
 }
 "#;

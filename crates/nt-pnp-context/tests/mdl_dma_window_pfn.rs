@@ -7,7 +7,9 @@
 
 use nt_mdl::pfn::{populate, PfnError};
 use nt_pnp_context::{
-    resource_mapping::{Admission, MappingDomain, MappingKey, MappingOwner, ResourceMappingTable},
+    resource_mapping::{
+        Admission, MappingCache, MappingDomain, MappingKey, MappingOwner, ResourceMappingTable,
+    },
     ContextRegistry,
 };
 
@@ -40,7 +42,7 @@ fn window() -> ResourceMappingTable {
             physical_page,
             source_cap: 0x900 + index as u64,
             rights: 3,
-            attributes: 0,
+            cache: MappingCache::WriteBack,
         };
         let Admission::New(receipt) = table.prepare(key, owner).unwrap() else {
             panic!()

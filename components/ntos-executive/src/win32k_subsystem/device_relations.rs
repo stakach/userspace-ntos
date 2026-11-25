@@ -6,6 +6,9 @@ pub(super) extern "win64" fn synchronous_invalidate(
     device_object: u64,
     relation_type: u32,
 ) -> i32 {
+    unsafe {
+        trace_video_init_import(b"invalidate-enter", device_object, relation_type as u64, 0, 0);
+    }
     let (words, raw, out1, out2, out3) = unsafe {
         crate::driver_launch::call_on4_raw(
             (W32_REGISTRY_LABEL << 12) | 4,
@@ -27,6 +30,11 @@ pub(super) extern "win64" fn synchronous_invalidate(
                 [W32_REGISTRY_LABEL, WIN32K_REGISTRY_OP_SYNC_INVALIDATE_RELATIONS, words, raw],
             );
         }
+    }
+    unsafe {
+        trace_video_init_import(
+            b"invalidate-return", device_object, relation_type as u64, raw as u32 as u64, 0,
+        );
     }
     raw as u32 as i32
 }

@@ -1330,6 +1330,39 @@ pub const SSN_NT_USER_INITIALIZE: u64 = 0x10FA;
 /// does `ObReferenceObjectByHandle(hPowerRequestEvent, *ExEventObjectType)`; the dispatch loop
 /// materializes real typed `Event` objects for the two event-handle args (see `dispatch_loop`).
 pub const SSN_NT_USER_INITIALIZE_REAL: u64 = 0x125A;
+
+/// A bounded native receipt for the video imports reached by real NtUserInitialize.
+/// The shared dispatch identity and attached client distinguish a returned child call
+/// from a later, unrelated video request without changing the provider result.
+static VIDEO_INIT_IMPORT_TRACES: AtomicU64 = AtomicU64::new(0);
+unsafe fn trace_video_init_import(
+    phase: &[u8], device: u64, selector: u64, status: u64, information: u64,
+) -> bool {
+    if read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64)
+        != SSN_NT_USER_INITIALIZE_REAL
+    {
+        return false;
+    }
+    if VIDEO_INIT_IMPORT_TRACES.fetch_add(1, Ordering::Relaxed) >= 256 {
+        return false;
+    }
+    let frame = (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
+    let dispatch = read_volatile(core::ptr::addr_of!((*frame).header.dispatch_id));
+    let ids = current_lane_ids();
+    print_str(b"[win32k-init-video] phase="); print_str(phase);
+    print_str(b" dispatch/client/pid/tid/device/selector/status/info=");
+    for value in [
+        dispatch,
+        ids.client_pi.load(Ordering::Relaxed),
+        ids.process_id.load(Ordering::Relaxed),
+        ids.thread_id.load(Ordering::Relaxed),
+        device, selector, status, information,
+    ] {
+        print_str(b"/"); print_hex_u64(value);
+    }
+    print_str(b"\n");
+    true
+}
 const SSN_GDI_CREATE_COMPATIBLE_BITMAP: u64 = 0x104A;
 const SSN_GDI_CREATE_COMPATIBLE_DC: u64 = 0x1054;
 const SSN_GDI_CREATE_BITMAP: u64 = 0x106C;

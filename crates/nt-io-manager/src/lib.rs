@@ -241,6 +241,7 @@ pub use detached_external_power::{PreparedExternalPowerIrp, ExternalPowerRejecti
     ExternalPowerFinishResult, ExternalPowerCompletionInvocation,
     ExternalPowerCompletionReturn, ExternalPowerTerminalReceipt};
 pub use file::{CreateOptions, FileRecord, FileState, ShareAccess};
+pub use open::{InternalOpenProgress, RetainedInternalOpen};
 pub use file_mode::FileModeState;
 pub use file_information::{
     query_information_contract, set_information_access_granted, set_information_contract,

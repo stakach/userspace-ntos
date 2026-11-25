@@ -29,11 +29,13 @@ mod installer_fault_receipt;
 mod primary_alias_activation;
 mod native_block_stage_sample;
 mod native_cache_claim_drain;
+mod mounted_completion_pass;
 mod retained_system_fold_phase;
 mod driver_load_receipt;
 mod dxg_registration;
 mod contiguous_ram;
 mod provider_export_worker;
+pub mod retained_dispatch_context;
 mod ordinary_irp_lane;
 pub use ordinary_irp_lane::{
     in_flight_caller_reply, parks_file_caller, DispatchProgress, InFlightCallers, InFlightReply,
@@ -47,6 +49,7 @@ mod connect_submit;
 pub use connect_submit::{ConnectStageEnd, ConnectSubmitNext, ConnectSubmitStage};
 mod caller_marshal;
 mod gop_bar_projection;
+mod mmio_request;
 mod hosted_driver_thread_object;
 mod hosted_current_thread_kpcr;
 mod hosted_event_projection;
@@ -67,7 +70,7 @@ pub use win32k_bulk_stage::{
 };
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
-pub use installer_syscall_span::{CensusEpochGate, InstallerSyscallSpans, LongestGap, SpanOwner, SpanSample, SpanSnapshot, SsnTotal, TransitionPairTotal};
+pub use installer_syscall_span::{CensusEpochGate, InstallerFaultTicket, InstallerSyscallSpans, LongestGap, SpanOwner, SpanSample, SpanSnapshot, SsnTotal, TransitionPairTotal};
 pub use installer_fault_receipt::{InstallerFaultReceipt, InstallerFaultReceipts};
 pub use primary_alias_activation::{
     classify_alias_registration_status, AliasRetryDisposition,
@@ -121,6 +124,9 @@ pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderW
     hosted_provider_worker_admissible};
 pub use gop_bar_projection::{GopBarProjection, GopLegacyVgaPortAuthority,
     GopPciBarAuthority};
+pub use mmio_request::{MmioRequest, MmioRequestAuthority, MmioRequestBacking, MmioRequestError,
+    MmioRequestLedger, MmioRequestOwner, MmioRequestPhase, MmioRequestReceipt,
+    PoolOwnedRamSource};
 pub use hosted_driver_thread_object::{HostedDriverThreadObjectKey,
     HostedDriverThreadObjectRecord};
 pub use hosted_current_thread_kpcr::HostedCurrentThreadKpcr;
@@ -182,6 +188,7 @@ pub use hosted_install_pipe_diagnostic::{is_install_pipe_name, InstallChildIdent
 pub use native_block_stage_sample::{NativeBlockStageObservation, NativeBlockStageOwner, NativeBlockStageSample,
     NativeBlockStageSampler};
 pub use native_cache_claim_drain::{drain_cached_claims, CacheClaimStep};
+pub use mounted_completion_pass::service_mounted_around_io_pump;
 pub use retained_system_fold_phase::RetainedSystemFoldPhase;
 
 pub const PAGE_SIZE: u64 = 0x1000;

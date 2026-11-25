@@ -575,6 +575,33 @@ impl CmMutationBeginAttempts {
         mount: SystemHiveMount,
         current_generation: u64,
     ) -> Result<(), i32> {
+        self.retry_acknowledged_revision_journal(attempt, mount, current_generation, None)
+    }
+
+    /// Retry only after the caller has reread every input that determines its mutation journal.
+    /// The replacement is encoded before the attempt changes, so allocation or encoding failure
+    /// leaves the exact acknowledged refusal and its continuation available for later retry.
+    pub fn retry_acknowledged_revision_with_mutations<C>(
+        &mut self,
+        attempt: &mut CmMutationBeginAttempt<C>,
+        mount: SystemHiveMount,
+        current_generation: u64,
+        mutations: &[SystemHiveMutation<'_>],
+    ) -> Result<(), i32> {
+        let journal = encode_hive_mutation_journal(mutations)?;
+        u32::try_from(journal.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        self.retry_acknowledged_revision_journal(
+            attempt, mount, current_generation, Some(journal),
+        )
+    }
+
+    fn retry_acknowledged_revision_journal<C>(
+        &mut self,
+        attempt: &mut CmMutationBeginAttempt<C>,
+        mount: SystemHiveMount,
+        current_generation: u64,
+        replacement_journal: Option<Vec<u8>>,
+    ) -> Result<(), i32> {
         self.validate(attempt)?;
         if attempt.inflight.is_some()
             || !attempt.acknowledged
@@ -593,6 +620,9 @@ impl CmMutationBeginAttempts {
         let slot = &mut self.slots[attempt.identity.slot as usize];
         slot.sequence = next;
         attempt.identity.sequence = next;
+        if let Some(journal) = replacement_journal {
+            attempt.journal = journal;
+        }
         attempt.expected_generation = current_generation;
         attempt.epoch = 0;
         attempt.submitted = false;

@@ -14,7 +14,13 @@ pub struct InstallerFaultReceipt {
 }
 
 pub struct InstallerFaultReceipts<const N: usize> {
-    rows: [Option<InstallerFaultReceipt>; N],
+    rows: [Option<StoredFault>; N],
+}
+
+#[derive(Clone, Copy)]
+struct StoredFault {
+    receipt: InstallerFaultReceipt,
+    claimed: bool,
 }
 
 impl<const N: usize> InstallerFaultReceipts<N> {
@@ -23,28 +29,44 @@ impl<const N: usize> InstallerFaultReceipts<N> {
     /// A full table refuses a new owner instead of evicting an unresolved fault.
     pub fn record(&mut self, receipt: InstallerFaultReceipt) -> bool {
         if let Some(row) = self.rows.iter_mut().find(|row| {
-            row.is_some_and(|old| old.owner == receipt.owner)
+            row.is_some_and(|old| old.receipt.owner == receipt.owner)
         }) {
-            *row = Some(receipt);
+            *row = Some(StoredFault { receipt, claimed: false });
             return true;
         }
         if let Some(row) = self.rows.iter_mut().find(|row| row.is_none()) {
-            *row = Some(receipt);
+            *row = Some(StoredFault { receipt, claimed: false });
             return true;
         }
         false
     }
 
     pub fn latest(&self, owner: SpanOwner, badge: u64) -> Option<InstallerFaultReceipt> {
-        self.rows.iter().flatten().copied().find(|row| {
-            row.owner == owner && row.badge == badge
+        self.rows.iter().flatten().map(|row| row.receipt).find(|receipt| {
+            receipt.owner == owner && receipt.badge == badge
         })
+    }
+
+    /// Claim an ingress witness once, after its exact routed worker and Reply are parked.
+    /// Keep the receipt readable for the live gap sampler while its worker is pending.
+    /// A matching numeric Reply without the same owner, badge and fault page is insufficient.
+    pub fn claim_exact(&mut self, owner: SpanOwner, badge: u64, reply: u64,
+        page: u64) -> Option<InstallerFaultReceipt> {
+        let row = self.rows.iter_mut().flatten().find(|row| {
+            let receipt = row.receipt;
+            !row.claimed && receipt.owner == owner && receipt.badge == badge
+                && receipt.reply == reply && receipt.fault_addr & !0xfff == page
+        })?;
+        row.claimed = true;
+        Some(row.receipt)
     }
 
     pub fn retire(&mut self, owner: SpanOwner) {
         if let Some(row) = self.rows.iter_mut().find(|row| {
-            row.is_some_and(|old| old.owner == owner)
-        }) { *row = None; }
+            row.is_some_and(|old| old.receipt.owner == owner)
+        }) {
+            *row = None;
+        }
     }
 }
 
@@ -77,5 +99,22 @@ mod tests {
         rows.retire(owner(1));
         assert!(rows.record(receipt(3, 0x4000)));
         assert_eq!(rows.latest(owner(1), 42), None);
+    }
+
+    #[test]
+    fn routed_worker_claim_consumes_only_the_exact_fault_ingress() {
+        let mut rows = InstallerFaultReceipts::<1>::new();
+        let expected = receipt(1, 0x3123);
+        assert!(rows.record(expected));
+        assert_eq!(rows.claim_exact(owner(2), 42, 71, 0x3000), None);
+        assert_eq!(rows.claim_exact(owner(1), 43, 71, 0x3000), None);
+        assert_eq!(rows.claim_exact(owner(1), 42, 72, 0x3000), None);
+        assert_eq!(rows.claim_exact(owner(1), 42, 71, 0x4000), None);
+        assert_eq!(rows.claim_exact(owner(1), 42, 71, 0x3000), Some(expected));
+        assert_eq!(rows.latest(owner(1), 42), Some(expected));
+        assert_eq!(rows.claim_exact(owner(1), 42, 71, 0x3000), None);
+        let next = receipt(1, 0x4123);
+        assert!(rows.record(next));
+        assert_eq!(rows.claim_exact(owner(1), 42, 71, 0x4000), Some(next));
     }
 }

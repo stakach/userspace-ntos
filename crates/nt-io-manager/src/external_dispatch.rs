@@ -588,9 +588,10 @@ impl<P> IoManager<P> {
     }
 
     /// Enter an exact prepared PnP IRP. This consumes the preparation token and performs no payload
-    /// allocation. Any violated invariant or backend transport error retains the IRP as
-    /// `Indeterminate`; only a genuine synchronous return reclaims it here. A foreign manager is
-    /// rejected before examining any IRP and returns the preparation unchanged.
+    /// allocation. A certified, unentered `DEVICE_BUSY` returns the exact preparation for retry.
+    /// Any violated invariant or uncertain backend transport retains the IRP as `Indeterminate`;
+    /// only a genuine synchronous return reclaims it here. A foreign manager is rejected before
+    /// examining any IRP and returns the preparation unchanged.
     /// This legacy combined adapter still borrows the manager across backend execution and drops
     /// nonterminal payload storage. Native reentrant adapters must use the detached owned API.
     pub fn dispatch_prepared_external_pnp(
@@ -604,13 +605,13 @@ impl<P> IoManager<P> {
                 prepared,
             });
         }
-        Ok(self.dispatch_owned_external_pnp(prepared))
+        self.dispatch_owned_external_pnp(prepared)
     }
 
     fn dispatch_owned_external_pnp(
         &mut self,
         mut prepared: PreparedExternalPnpIrp,
-    ) -> ExternalPnpDispatchResult {
+    ) -> Result<ExternalPnpDispatchResult, PreparedExternalPnpRejection> {
         let irp_id = prepared.irp_id;
         let valid = self.irp(irp_id).is_some_and(|irp| {
             irp.origin_major == nt_io_abi::major::IRP_MJ_PNP
@@ -642,27 +643,36 @@ impl<P> IoManager<P> {
                 .is_some_and(|irp| irp.transition(IrpState::Dispatched))
         {
             self.mark_external_pnp_indeterminate(irp_id);
-            return ExternalPnpDispatchResult::Indeterminate {
+            return Ok(ExternalPnpDispatchResult::Indeterminate {
                 irp_id,
                 transport_status: NtStatus::INVALID_PARAMETER,
-            };
+            });
         }
-        let current_driver_id = match self
+        let (current_driver_id, location) = match self
             .irp(irp_id)
-            .and_then(|irp| irp.current_stack())
-            .map(|stack| stack.driver_id)
+            .and_then(|irp| irp.current_stack().map(|stack| (stack.driver_id, irp.current_location)))
         {
-            Some(driver_id) => driver_id,
+            Some(identity) => identity,
             None => {
                 self.mark_external_pnp_indeterminate(irp_id);
-                return ExternalPnpDispatchResult::Indeterminate {
+                return Ok(ExternalPnpDispatchResult::Indeterminate {
                     irp_id,
                     transport_status: NtStatus::INVALID_PARAMETER,
-                };
+                });
             }
         };
         let outcome = self.dispatch_pnp_to_driver(current_driver_id, irp_id, &mut prepared.payload);
-        self.reconcile_external_pnp(prepared, outcome)
+        if matches!(outcome, PnpBackendDispatch::NotDispatched { status: NtStatus::DEVICE_BUSY })
+            && self.irp_mut(irp_id).is_some_and(|irp| {
+                irp.restore_prepared_pnp_after_no_entry(location)
+            })
+        {
+            return Err(PreparedExternalPnpRejection {
+                status: NtStatus::DEVICE_BUSY,
+                prepared,
+            });
+        }
+        Ok(self.reconcile_external_pnp(prepared, outcome))
     }
 
     fn reconcile_external_pnp(

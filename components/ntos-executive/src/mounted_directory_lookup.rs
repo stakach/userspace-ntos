@@ -1,7 +1,7 @@
 //! Retained mounted directory snapshot lookup; native entry and completion live outside dispatch.
 
 use alloc::vec::Vec;
-use nt_fs::{DirectoryEntry, FatDirectoryLookup, FatDirectoryProgress, FatPathError, FatPathRequest};
+use nt_fs::{DirectoryEntry, FatDirectoryLookup, FatDirectoryProgress, FatPathRequest, MountedSectorError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DirectoryLookupError { Invalid, Duplicate, NoCapacity, WrongClaim }
@@ -17,7 +17,7 @@ pub(crate) struct ResolvedDirectory<P> {
     pub irp: u64,
     pub mount: u64,
     pub payload: P,
-    pub result: Result<Vec<DirectoryEntry>, FatPathError>,
+    pub result: Result<Vec<DirectoryEntry>, MountedSectorError>,
     lookup: FatDirectoryLookup,
 }
 
@@ -27,7 +27,7 @@ struct Entry<P> {
     payload: Option<P>,
     lookup: FatDirectoryLookup,
     claimed: Option<FatPathRequest>,
-    result: Option<Result<Vec<DirectoryEntry>, FatPathError>>,
+    result: Option<Result<Vec<DirectoryEntry>, MountedSectorError>>,
 }
 
 pub(crate) struct DirectoryLookupQueue<P> { entries: Vec<Entry<P>> }
@@ -77,7 +77,7 @@ impl<P> DirectoryLookupQueue<P> {
     }
 
     pub fn complete(&mut self, claim: DirectorySectorClaim,
-        sector: Result<&[u8; 512], FatPathError>)
+        sector: Result<&[u8; 512], MountedSectorError>)
         -> Result<FatDirectoryProgress, DirectoryLookupError>
     {
         let entry = self.entries.iter_mut().find(|entry| entry.irp == claim.irp
@@ -86,7 +86,7 @@ impl<P> DirectoryLookupQueue<P> {
             return Err(DirectoryLookupError::WrongClaim);
         }
         let result = match sector {
-            Ok(bytes) => entry.lookup.feed(claim.request, bytes),
+            Ok(bytes) => entry.lookup.feed(claim.request, bytes).map_err(MountedSectorError::Fat),
             Err(error) => Err(error),
         };
         entry.claimed = None;
@@ -176,5 +176,24 @@ mod tests {
         assert!(queue.has_outstanding(), "a refused handoff retains the exact IRP");
         assert_eq!(queue.take_resolved().unwrap().irp, 0x294);
         assert!(!queue.has_outstanding());
+    }
+
+    #[test]
+    fn authenticated_directory_failure_retains_provider_status_and_claim() {
+        let geometry = FatPathGeometry { fat_start_sector: 1, data_start_sector: 10,
+            total_sectors: 1000, sectors_per_cluster: 1 };
+        let mut queue = DirectoryLookupQueue::new();
+        queue.capture(0x295, 7, 41, FatDirectoryLookup::new(geometry, 2).unwrap()).unwrap();
+        let claim = queue.claim_next().unwrap();
+        let failure = MountedSectorError::Provider(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+        assert_eq!(queue.complete(DirectorySectorClaim { irp: 0x296, ..claim }, Err(failure)),
+            Err(DirectoryLookupError::WrongClaim));
+        assert_eq!(queue.complete(claim, Err(failure)), Ok(FatDirectoryProgress::Complete));
+        assert_eq!(queue.complete(claim, Err(failure)), Err(DirectoryLookupError::WrongClaim));
+        let resolved = queue.take_resolved().unwrap();
+        assert_eq!(resolved.result, Err(failure));
+        queue.restore_resolved(resolved).unwrap();
+        assert_eq!(queue.take_resolved().unwrap().result, Err(failure));
+        assert!(queue.claim_next().is_none());
     }
 }

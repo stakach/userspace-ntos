@@ -35,6 +35,12 @@ impl CutoverPhase {
     pub const fn admit_video_create(self) -> bool {
         matches!(self, Self::Boot | Self::NativePublished)
     }
+
+    /// A retained CREATE may settle through cutover; only its initial issue needs
+    /// writable-route admission. The native drain must wait for that exact owner.
+    pub const fn admit_video_route_progress(self, entered_create: bool) -> bool {
+        entered_create || self.admit_video_create()
+    }
 }
 
 /// A new drain must wait for every entered FILTER/START and synchronous video CREATE.
@@ -92,6 +98,23 @@ mod tests {
         assert!(!CutoverPhase::NativeUnpublished.admit_video_create());
         assert!(!CutoverPhase::Unavailable.admit_video_create());
         assert!(CutoverPhase::NativePublished.admit_video_create());
+    }
+
+    #[test]
+    fn entered_video_create_settles_when_new_create_is_refused() {
+        for phase in [
+            CutoverPhase::Draining,
+            CutoverPhase::NativeUnpublished,
+            CutoverPhase::Unavailable,
+        ] {
+            assert!(!phase.admit_video_route_progress(false));
+            assert!(
+                phase.admit_video_route_progress(true),
+                "the retained CREATE must be observed without issuing another CREATE"
+            );
+        }
+        assert!(CutoverPhase::Boot.admit_video_route_progress(false));
+        assert!(CutoverPhase::NativePublished.admit_video_route_progress(false));
     }
 
     #[test]

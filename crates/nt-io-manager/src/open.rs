@@ -44,6 +44,32 @@ enum DriverInstallKind {
     Peer,
 }
 
+/// A CREATE whose exact File, handle, and IRP remain privately owned until its
+/// terminal backend completion has been acknowledged. This ticket is move-only.
+#[derive(Debug)]
+#[must_use = "poll or retain this exact internal CREATE owner"]
+pub struct RetainedInternalOpen {
+    manager: u64,
+    client: ClientId,
+    handle: HandleValue,
+    file_id: FileId,
+    device_id: DeviceId,
+    file_object_id: ObjectId,
+    irp_id: IrpId,
+    acknowledged_status: Option<NtStatus>,
+    handle_closed: bool,
+}
+
+/// The handle becomes usable only in `Ready(Ok(..))`. Pending and fenced results
+/// transfer the same owner back to the caller without replaying CREATE.
+#[derive(Debug)]
+#[must_use = "consume the published File or retain its pending owner"]
+pub enum InternalOpenProgress {
+    Ready(Result<(HandleValue, FileId, DeviceId, ObjectId), NtStatus>),
+    Pending(RetainedInternalOpen),
+    Fenced(RetainedInternalOpen, NtStatus),
+}
+
 #[cfg(test)]
 mod open_with_details_tests {
     extern crate std;
@@ -421,6 +447,224 @@ mod open_with_details_tests {
         assert!(io.irp(irp).is_some(), "pending CREATE retains its canonical IRP");
         assert_eq!(acks.get(), 0);
         assert_eq!(io.port().live_handle_count(), 0);
+    }
+
+    struct DelayedInternalOpenBackend {
+        creates: Rc<Cell<usize>>,
+        cancels: Rc<Cell<usize>>,
+        acks: Rc<Cell<usize>>,
+        reject_ack: Rc<Cell<bool>>,
+        irps: Rc<RefCell<Vec<IrpId>>>,
+    }
+
+    impl DriverDispatchBackend for DelayedInternalOpenBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            if irp.major == major::IRP_MJ_CREATE {
+                self.creates.set(self.creates.get() + 1);
+                self.irps.borrow_mut().push(irp.irp_id);
+                Ok(DispatchOutcome::Pending)
+            } else {
+                Ok(DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                })
+            }
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            self.cancels.set(self.cancels.get() + 1);
+            Ok(())
+        }
+
+        fn acknowledge_completion(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            self.acks.set(self.acks.get() + 1);
+            if self.reject_ack.get() {
+                Err(NtStatus::UNSUCCESSFUL)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct DelayedInternalOpenHarness {
+        io: IoManager<MockObjectPort>,
+        client: ClientId,
+        driver: DriverId,
+        device: DeviceId,
+        path: NtPath,
+        creates: Rc<Cell<usize>>,
+        cancels: Rc<Cell<usize>>,
+        acks: Rc<Cell<usize>>,
+        reject_ack: Rc<Cell<bool>>,
+        irps: Rc<RefCell<Vec<IrpId>>>,
+    }
+
+    impl DelayedInternalOpenHarness {
+        fn new() -> Self {
+            let mut io = IoManager::new(MockObjectPort::new());
+            let client = io.register_client();
+            let creates = Rc::new(Cell::new(0));
+            let cancels = Rc::new(Cell::new(0));
+            let acks = Rc::new(Cell::new(0));
+            let reject_ack = Rc::new(Cell::new(false));
+            let irps = Rc::new(RefCell::new(Vec::new()));
+            let driver = io.create_driver(
+                &path(r"\Driver\DelayedInternalOpen"),
+                Box::new(DelayedInternalOpenBackend {
+                    creates: creates.clone(), cancels: cancels.clone(), acks: acks.clone(),
+                    reject_ack: reject_ack.clone(), irps: irps.clone(),
+                }),
+            ).unwrap();
+            let path = path(r"\Device\DelayedInternalOpen");
+            let device = io.create_device(
+                driver, Some(&path), DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(), DeviceFlags::BUFFERED_IO, 0,
+            ).unwrap();
+            Self { io, client, driver, device, path, creates, cancels, acks, reject_ack, irps }
+        }
+
+        fn begin(&mut self) -> RetainedInternalOpen {
+            match self.io.begin_retained_internal_open(
+                self.client, &self.path, AccessMask::GENERIC_READ,
+                ShareAccess::READ, CreateOptions::NON_DIRECTORY_FILE, 1,
+            ) {
+                Ok(InternalOpenProgress::Pending(owner)) => owner,
+                other => panic!("unfinished CREATE must retain its exact owner: {other:?}"),
+            }
+        }
+
+        fn complete(&mut self, irp_id: IrpId, status: NtStatus) {
+            assert!(self.io.publish_driver_completion(
+                self.driver,
+                DriverCompletion { irp_id, status, information: 0, file_context: Some(0xC0DE) },
+            ));
+        }
+    }
+
+    #[test]
+    fn retained_internal_open_waits_for_exact_create_and_ack_without_replay() {
+        let mut h = DelayedInternalOpenHarness::new();
+        let owner = h.begin();
+        let irp = h.irps.borrow()[0];
+        assert_eq!(h.creates.get(), 1);
+        assert_eq!(h.cancels.get(), 0, "pending open must not cancel its own CREATE");
+        assert_eq!(h.acks.get(), 0);
+        let owner = match h.io.poll_retained_internal_open(owner) {
+            InternalOpenProgress::Pending(owner) => owner,
+            other => panic!("unfinished CREATE cannot publish a handle: {other:?}"),
+        };
+        h.complete(irp, NtStatus::SUCCESS);
+        let (handle, file, device, object) = match h.io.poll_retained_internal_open(owner) {
+            InternalOpenProgress::Ready(Ok(details)) => details,
+            other => panic!("exact terminal CREATE and ACK must publish one handle: {other:?}"),
+        };
+        assert_eq!(device, h.device);
+        assert_eq!(h.io.file(file).unwrap().object_id, object);
+        assert_eq!(h.io.file(file).unwrap().state, FileState::Open);
+        assert_eq!(h.io.file(file).unwrap().driver_context, Some(0xC0DE));
+        assert!(h.io.irp(irp).is_none());
+        assert_eq!((h.creates.get(), h.cancels.get(), h.acks.get()), (1, 0, 1));
+        h.io.close(h.client, handle).unwrap();
+    }
+
+    #[test]
+    fn retained_internal_open_terminal_failure_closes_exact_unpublished_handle() {
+        let mut h = DelayedInternalOpenHarness::new();
+        let owner = h.begin();
+        let irp = h.irps.borrow()[0];
+        h.complete(irp, NtStatus::ACCESS_DENIED);
+        assert!(matches!(h.io.poll_retained_internal_open(owner),
+            InternalOpenProgress::Ready(Err(NtStatus::ACCESS_DENIED))));
+        assert_eq!((h.creates.get(), h.cancels.get(), h.acks.get()), (1, 0, 1));
+        assert_eq!(h.io.port().live_handle_count(), 0);
+        assert!(h.io.irp(irp).is_none());
+    }
+
+    #[test]
+    fn retained_internal_open_ack_rejection_preserves_owner_and_handle() {
+        let mut h = DelayedInternalOpenHarness::new();
+        let owner = h.begin();
+        let irp = h.irps.borrow()[0];
+        h.complete(irp, NtStatus::SUCCESS);
+        h.reject_ack.set(true);
+        let owner = match h.io.poll_retained_internal_open(owner) {
+            InternalOpenProgress::Fenced(owner, NtStatus::UNSUCCESSFUL) => owner,
+            other => panic!("ACK uncertainty must retain the original open: {other:?}"),
+        };
+        assert!(h.io.completed_irp(irp).is_some());
+        assert_eq!(h.io.port().live_handle_count(), 1);
+        h.reject_ack.set(false);
+        let (handle, _, _, _) = match h.io.poll_retained_internal_open(owner) {
+            InternalOpenProgress::Ready(Ok(details)) => details,
+            other => panic!("same owner must settle after exact ACK: {other:?}"),
+        };
+        assert_eq!((h.creates.get(), h.cancels.get(), h.acks.get()), (1, 0, 2));
+        h.io.close(h.client, handle).unwrap();
+    }
+
+    #[test]
+    fn retained_internal_open_ignores_foreign_ready_create() {
+        let mut h = DelayedInternalOpenHarness::new();
+        let target = h.begin();
+        let other = h.begin();
+        let irps = h.irps.borrow().clone();
+        assert_eq!(irps.len(), 2);
+        h.complete(irps[1], NtStatus::SUCCESS);
+        let target = match h.io.poll_retained_internal_open(target) {
+            InternalOpenProgress::Pending(owner) => owner,
+            other => panic!("foreign completion cannot settle target: {other:?}"),
+        };
+        assert!(h.io.completed_irp(irps[1]).is_some());
+        assert_eq!(h.acks.get(), 0);
+        h.complete(irps[0], NtStatus::SUCCESS);
+        let (target_handle, target_file, _, _) = match h.io.poll_retained_internal_open(target) {
+            InternalOpenProgress::Ready(Ok(details)) => details,
+            other => panic!("target must settle on its own completion: {other:?}"),
+        };
+        let (other_handle, other_file, _, _) = match h.io.poll_retained_internal_open(other) {
+            InternalOpenProgress::Ready(Ok(details)) => details,
+            other => panic!("foreign owner must retain its own completion: {other:?}"),
+        };
+        assert_ne!(target_file, other_file);
+        assert_eq!((h.creates.get(), h.cancels.get(), h.acks.get()), (2, 0, 2));
+        h.io.close(h.client, target_handle).unwrap();
+        h.io.close(h.client, other_handle).unwrap();
+    }
+
+    #[test]
+    fn retained_internal_open_rejects_foreign_manager_despite_numeric_collisions() {
+        let mut original = DelayedInternalOpenHarness::new();
+        let mut foreign = DelayedInternalOpenHarness::new();
+        let owner = original.begin();
+        let foreign_owner = foreign.begin();
+        assert_eq!(owner.irp_id, foreign_owner.irp_id);
+        assert_eq!(owner.file_id, foreign_owner.file_id);
+        assert_eq!(owner.handle, foreign_owner.handle);
+        assert_ne!(owner.manager, foreign_owner.manager);
+        let owner = match foreign.io.poll_retained_internal_open(owner) {
+            InternalOpenProgress::Fenced(owner, NtStatus::INVALID_HANDLE) => owner,
+            other => panic!("foreign manager cannot collect an equal-numbered CREATE: {other:?}"),
+        };
+        assert_eq!((foreign.acks.get(), foreign.cancels.get()), (0, 0));
+        let original_irp = original.irps.borrow()[0];
+        original.complete(original_irp, NtStatus::SUCCESS);
+        let (handle, _, _, _) = match original.io.poll_retained_internal_open(owner) {
+            InternalOpenProgress::Ready(Ok(details)) => details,
+            other => panic!("original manager must retain its exact CREATE: {other:?}"),
+        };
+        original.io.close(original.client, handle).unwrap();
+        let foreign_irp = foreign.irps.borrow()[0];
+        foreign.complete(foreign_irp, NtStatus::SUCCESS);
+        let (handle, _, _, _) = match foreign.io.poll_retained_internal_open(foreign_owner) {
+            InternalOpenProgress::Ready(Ok(details)) => details,
+            other => panic!("foreign manager's own CREATE must remain live: {other:?}"),
+        };
+        foreign.io.close(foreign.client, handle).unwrap();
     }
 
     #[test]
@@ -934,6 +1178,103 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.port.delete_symbolic_link(link)
     }
 
+    /// Begin an internal File open that can retain an unfinished CREATE for later settlement.
+    /// A pending result must own the original IRP and unpublished handle; a caller must never
+    /// issue another CREATE just to observe the first one's completion.
+    pub fn begin_retained_internal_open(
+        &mut self,
+        client: ClientId,
+        path: &NtPath,
+        desired_access: AccessMask,
+        share_access: ShareAccess,
+        create_options: CreateOptions,
+        create_disposition: u32,
+    ) -> Result<InternalOpenProgress, NtStatus> {
+        let manager = self.ensure_ownership_identity()?;
+        self.open_inner(
+            client, path, desired_access, share_access, create_options, create_disposition,
+            Some(manager),
+        )
+    }
+
+    /// Observe only the exact retained CREATE. Rejection keeps ownership for a later retry.
+    pub fn poll_retained_internal_open(
+        &mut self,
+        mut owner: RetainedInternalOpen,
+    ) -> InternalOpenProgress {
+        if owner.manager == 0 || owner.manager != self.ownership_identity() {
+            return InternalOpenProgress::Fenced(owner, NtStatus::INVALID_HANDLE);
+        }
+        if owner.acknowledged_status.is_none() {
+            let Some(irp) = self.irp(owner.irp_id) else {
+                return InternalOpenProgress::Fenced(owner, NtStatus::INVALID_HANDLE);
+            };
+            if irp.client_id != owner.client
+                || irp.file_id != Some(owner.file_id)
+                || irp.origin_device_id != owner.device_id
+                || irp.origin_major != major::IRP_MJ_CREATE
+                || self.file(owner.file_id).is_none_or(|file| {
+                    file.client_id != owner.client
+                        || file.device_id != owner.device_id
+                        || file.object_id != owner.file_object_id
+                })
+            {
+                return InternalOpenProgress::Fenced(owner, NtStatus::INVALID_HANDLE);
+            }
+            match self.port.reference_file_by_handle(
+                owner.client, owner.handle, AccessMask::empty(),
+            ) {
+                Ok(object) if object == owner.file_object_id => {}
+                Ok(_) => return InternalOpenProgress::Fenced(owner, NtStatus::INVALID_HANDLE),
+                Err(status) => return InternalOpenProgress::Fenced(owner, status),
+            }
+            let Some(completed) = self.completed_irp(owner.irp_id) else {
+                return InternalOpenProgress::Pending(owner);
+            };
+            if completed.id != owner.irp_id
+                || completed.client_id != owner.client
+                || completed.file_id != Some(owner.file_id)
+                || completed.device_id != owner.device_id
+                || completed.major != major::IRP_MJ_CREATE
+            {
+                return InternalOpenProgress::Fenced(owner, NtStatus::INVALID_HANDLE);
+            }
+            let opens = crate::file::create_terminal_opens_file(completed.status);
+            let expected_state = if opens { FileState::Open } else { FileState::Closed };
+            if self.file(owner.file_id).is_none_or(|file| file.state != expected_state) {
+                return InternalOpenProgress::Fenced(owner, NtStatus::INVALID_HANDLE);
+            }
+            if let Err(status) = self.acknowledge_completed_irp_strict(owner.irp_id) {
+                return InternalOpenProgress::Fenced(owner, status);
+            }
+            owner.acknowledged_status = Some(completed.status);
+        }
+        let status = owner.acknowledged_status.expect("retained CREATE must be acknowledged");
+        if crate::file::create_terminal_opens_file(status) {
+            match self.reference_open_file_details(owner.client, owner.handle, AccessMask::empty()) {
+                Ok((file, device, object))
+                    if (file, device, object)
+                        == (owner.file_id, owner.device_id, owner.file_object_id) =>
+                {
+                    InternalOpenProgress::Ready(Ok((owner.handle, file, device, object)))
+                }
+                Ok(_) => InternalOpenProgress::Fenced(owner, NtStatus::INVALID_HANDLE),
+                Err(status) => InternalOpenProgress::Fenced(owner, status),
+            }
+        } else {
+            if !owner.handle_closed {
+                if let Err(close_status) = self.port.close_handle(owner.client, owner.handle) {
+                    return InternalOpenProgress::Fenced(owner, close_status);
+                }
+                owner.handle_closed = true;
+            }
+            match self.release_external_file(owner.client, owner.file_id) {
+                Ok(()) => InternalOpenProgress::Ready(Err(status)),
+                Err(release_status) => InternalOpenProgress::Fenced(owner, release_status),
+            }
+        }
+    }
+
     /// Open a device File and resolve the exact File, Device and Object Manager identities.
     /// A failed post-open lookup closes the transient handle before reporting the failure.
     pub fn open_with_details(
@@ -975,6 +1316,27 @@ impl<P: ObjectManagerPort> IoManager<P> {
         create_options: CreateOptions,
         create_disposition: u32,
     ) -> Result<HandleValue, NtStatus> {
+        match self.open_inner(
+            client, path, desired_access, share_access, create_options, create_disposition, None,
+        )? {
+            InternalOpenProgress::Ready(Ok((handle, _, _, _))) => Ok(handle),
+            InternalOpenProgress::Ready(Err(status)) => Err(status),
+            InternalOpenProgress::Pending(_) | InternalOpenProgress::Fenced(_, _) => {
+                unreachable!("synchronous CREATE must never transfer a retained open")
+            }
+        }
+    }
+
+    fn open_inner(
+        &mut self,
+        client: ClientId,
+        path: &NtPath,
+        desired_access: AccessMask,
+        share_access: ShareAccess,
+        create_options: CreateOptions,
+        create_disposition: u32,
+        retained_manager: Option<u64>,
+    ) -> Result<InternalOpenProgress, NtStatus> {
         // 1. Resolve the Device object (the OM follows symbolic links).
         let device_object = self.port.open_device_object(path)?;
         let device_id = self
@@ -1056,6 +1418,17 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 return Err(status);
             }
         };
+        let retained_owner = || RetainedInternalOpen {
+            manager: retained_manager.expect("only retained opens construct a ticket"),
+            client,
+            handle,
+            file_id,
+            device_id,
+            file_object_id: file_object,
+            irp_id,
+            acknowledged_status: None,
+            handle_closed: false,
+        };
         // Reentrant IoCompleteRequest may finish CREATE inside dispatch. Reserve the fallback
         // retirement slot before that native effect so an ACK failure can never orphan its IRP.
         if let Err(status) = self.reserve_manager_owned_irp_slot() {
@@ -1093,6 +1466,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 assert_eq!(completed.client_id, client);
                 assert_eq!(completed.major, major::IRP_MJ_CREATE);
                 let status = completed.status;
+                if retained_manager.is_some() {
+                    return Ok(self.poll_retained_internal_open(retained_owner()));
+                }
                 if let Err(ack_status) = self.acknowledge_completed_irp_strict(irp_id) {
                     self.claim_manager_owned_irp(client, irp_id)
                         .expect("pre-reserved CREATE retirement owner disappeared");
@@ -1114,12 +1490,17 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 if crate::file::create_terminal_opens_file(status)
                     && self.file(file_id).is_some_and(|file| file.state == FileState::Open)
                 {
-                    return Ok(handle);
+                    return Ok(InternalOpenProgress::Ready(Ok((
+                        handle, file_id, device_id, file_object,
+                    ))));
                 }
                 self.port.close_handle(client, handle)
                     .expect("failed CREATE handle could not close after ACK");
                 self.release_external_file(client, file_id)?;
-                return Err(status);
+                return Ok(InternalOpenProgress::Ready(Err(status)));
+            }
+            if retained_manager.is_some() {
+                return Ok(InternalOpenProgress::Pending(retained_owner()));
             }
             if let Some(file) = self.file_mut(file_id) {
                 file.transition(FileState::ClosePending);
@@ -1146,7 +1527,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 file.driver_context = file_context;
                 file.transition(FileState::Open);
                 self.free_irp(irp_id);
-                Ok(handle)
+                Ok(InternalOpenProgress::Ready(Ok((
+                    handle, file_id, device_id, file_object,
+                ))))
             }
             Ok(DispatchOutcome::Completed { status, .. }) => {
                 self.cleanup_failed_open(client, file_id, handle, irp_id)?;
@@ -1159,6 +1542,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
             Ok(DispatchOutcome::Pending) => {
                 if let Some(irp) = self.irp_mut(irp_id) {
                     irp.transition(IrpState::Pending);
+                }
+                if retained_manager.is_some() {
+                    return Ok(InternalOpenProgress::Pending(retained_owner()));
                 }
                 if let Some(file) = self.file_mut(file_id) {
                     file.transition(FileState::ClosePending);

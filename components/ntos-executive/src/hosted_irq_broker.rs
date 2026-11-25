@@ -1964,6 +1964,50 @@ impl HostedIrqRootSession {
         service_result(status, None)
     }
 
+    unsafe fn mmio_request_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if command.service_id != FSD_SERVICE_MMIO_REQUEST_LABEL
+            || command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.argument_count != 4
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let root_dpc_grant = self.dpc_grant.is_some_and(|(identity, grant)| {
+            identity == lane.identity && grant == command.grant
+        });
+        let binding = if root_dpc_grant {
+            self.dpc_resource.and_then(|resource| {
+                hosted_dpc_binding_for_resource(resource, lane.projection_instance)
+            })
+        } else if lane_has_connection_grant(lane, command.grant) {
+            connection_for_service(lane, command)
+                .ok()
+                .map(|connection| connection.binding)
+        } else {
+            // A provider dependency grant has no authority over a particular MMIO device.
+            None
+        };
+        let Some(binding) = binding else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let (status, value) = hosted_mmio_broker::request_for_binding(
+            binding,
+            command.arguments[0],
+            command.arguments[1],
+            command.arguments[2],
+            command.arguments[3],
+        );
+        service_result(status, (status == STATUS_SUCCESS && command.arguments[0] == 1)
+            .then_some(value))
+    }
+
     unsafe fn execute_service(
         &mut self,
         lane_index: usize,
@@ -2024,6 +2068,9 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::PciConfig => {
                 self.pci_config_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::MmioRequest => {
+                self.mmio_request_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::CurrentIdentity => {
                 self.current_identity_service(lane_index, command)

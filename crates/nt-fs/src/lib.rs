@@ -30,6 +30,7 @@ mod fat_sector_cache;
 mod fat_volume_fsctl;
 mod installed_metadata_sector_cache;
 mod installed_metadata_read_through_fence;
+mod mounted_sector_error;
 mod mounted_installed_read;
 mod file_backing;
 mod file_mode;
@@ -83,6 +84,7 @@ pub use installed_metadata_sector_cache::InstalledMetadataSectorCache;
 pub use installed_metadata_read_through_fence::{
     InstalledMetadataReadThroughFence, PhysicalSectorRange, PossibleScsiEffect,
 };
+pub use mounted_sector_error::MountedSectorError;
 pub use mounted_installed_read::{ReadCompletions, ReadError, ReadSectorClaim};
 pub use file_backing::FileBacking;
 pub use file_mode::FileModeState;

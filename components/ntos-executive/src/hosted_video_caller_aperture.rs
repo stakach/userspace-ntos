@@ -445,11 +445,15 @@ unsafe fn build(
             .begin_map()
             .expect("aperture map effect claim");
         let (_, va) = (*row).transaction.plan().page(index as u64).unwrap();
-        let rights = if (*row).transaction.plan().identity().writable {
+        let access = if (*row).transaction.plan().identity().writable {
             RW_NX
         } else {
             RO_NX
         };
+        let rights = crate::hosted_page_cache::page_map_rights(
+            access,
+            nt_pnp_context::resource_mapping::MappingCache::Uncached,
+        );
         (*row).stage = b"map-frame";
         let error = page_map_r(cap, va, rights, (*row).vspace.cap);
         (*row)

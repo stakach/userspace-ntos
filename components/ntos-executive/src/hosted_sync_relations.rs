@@ -9,6 +9,7 @@ struct Work {
     token: u64,
     actor: NativeThreadProcessReference,
     ticket: Option<nt_pnp_manager::SyncDeviceRelationTicket>,
+    invalidation_sequence: u64,
     terminal: Option<nt_status::NtStatus>,
     admitting: bool,
     reply_entered: bool,
@@ -16,6 +17,26 @@ struct Work {
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
+
+fn trace_sync_relation_owner(phase: &[u8], work: &Work, status: Option<nt_status::NtStatus>) {
+    static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+    if TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 96 { return; }
+    let identity = work.route.identity();
+    print_str(b"[win32k-sync-relation-owner] phase=");
+    print_str(phase);
+    print_str(b" domain/generation/executor/lane/generation/dispatch/reply/token/sequence=");
+    for value in [
+        identity.domain, identity.domain_generation, identity.executor,
+        identity.lane.index as u64, identity.lane.generation,
+        work.dispatch.epoch(), work.reply, work.token, work.invalidation_sequence,
+    ] {
+        print_str(b"/"); print_hex_u64(value);
+    }
+    if let Some(status) = status {
+        print_str(b" status=0x"); print_hex(status.raw() as u32);
+    }
+    print_str(b"\n");
+}
 
 pub(crate) unsafe fn submit(
     channel: &crate::spawn_hosts::PumpChannel,
@@ -100,6 +121,7 @@ pub(crate) unsafe fn submit(
         token,
         actor,
         ticket: None,
+        invalidation_sequence: 0,
         terminal: None,
         admitting: true,
         reply_entered: false,
@@ -130,8 +152,15 @@ pub(crate) unsafe fn submit(
         .as_mut()
         .expect("parked synchronous relation owner");
     match enqueue_hosted_sync_device_relations(endpoint, parent) {
-        Ok(ticket) => work.ticket = Some(ticket),
-        Err(status) => work.terminal = Some(status),
+        Ok((ticket, sequence)) => {
+            work.ticket = Some(ticket);
+            work.invalidation_sequence = sequence;
+            trace_sync_relation_owner(b"submit", work, None);
+        }
+        Err(status) => {
+            work.terminal = Some(status);
+            trace_sync_relation_owner(b"submit-refused", work, Some(status));
+        }
     }
     work.admitting = false;
     None
@@ -157,6 +186,7 @@ impl Work {
                             .expect("terminal synchronous relation ticket"),
                     );
                     self.ticket = None;
+                    trace_sync_relation_owner(b"terminal", self, self.terminal);
                 }
                 Ok(None) => return false,
                 Err(_) => panic!("synchronous relation lost its exact ticket"),
@@ -189,6 +219,7 @@ impl Work {
             return true;
         } else {
             self.reply_entered = true;
+            trace_sync_relation_owner(b"reply-enter", self, self.terminal);
             let _ = runtime::wake_registry_service(
                 self.route,
                 self.dispatch,
@@ -209,6 +240,7 @@ impl Work {
                 return false;
             }
         }
+        trace_sync_relation_owner(b"reply-settled", self, self.terminal);
         runtime::retire_stopped_acknowledged_retained_service(
             self.route,
             self.dispatch,

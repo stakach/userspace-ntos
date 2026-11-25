@@ -1363,6 +1363,13 @@ pub(super) fn retire_allocation(
     let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
         return (STATUS_INVALID_HANDLE, 0, 0);
     };
+    // Refuse before prepare_driver_free changes a registered source-IRP row. The common
+    // low-level free repeats this fence for every internal retirement path.
+    if op == 3 && unsafe {
+        hosted_mmio_broker::hosted_pool_owned_mmio::has_source_rows(inst, component_address)
+    } {
+        return (nt_status::NtStatus::DEVICE_BUSY.raw(), 0, 0);
+    }
     if unsafe { caller_graph_protects_current_member_unlocked(inst, domain, component_address) } {
         return (nt_status::NtStatus::PENDING.raw(), 0, 0);
     }

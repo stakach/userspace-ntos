@@ -14,4 +14,4 @@
 
 mod local;
 
-pub(crate) use local::{local, TransientLane, REPLY_MAIN_SLOT};
+pub(crate) use local::{local, TransientLane, REPLY_MAIN_SLOT, RECEIVE_TRACE_DEPTH};

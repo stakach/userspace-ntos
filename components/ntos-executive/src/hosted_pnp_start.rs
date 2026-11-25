@@ -228,6 +228,7 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     pending_video_publication: Option<(
         usize,
         DeferredVideoOwner<driver_launch::HostedVideoPublicationIdentity>,
+        bool,
     )>,
     pending_bus_relation_devnode: Option<usize>,
     bootstrap_required_bus_pdos: Vec<usize>,
@@ -762,14 +763,29 @@ impl OwnedHostedPnpStartBatch {
                 .expect("video candidate lost its registered device binding");
             if crate::boot_storage_dma_handoff::native_storage_cutover_phase().admit_video_create() {
                 let instance_id = &self.spec.devnodes[devnode_index].instance_id;
-                try_publish_hosted_video_route(
+                if try_publish_hosted_video_route(
                     device_id, &self.spec.service_name, instance_id, &mut self.report,
-                );
+                ) == crate::video_device::VideoPublicationProgress::Pending {
+                    assert!(self.pending_video_publication.is_none());
+                    self.pending_video_publication = Some((
+                        devnode_index, DeferredVideoOwner::new(identity), true,
+                    ));
+                    return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                }
             } else {
                 assert!(self.pending_video_publication.is_none());
-                self.pending_video_publication = Some((devnode_index, DeferredVideoOwner::new(identity)));
+                self.pending_video_publication = Some((
+                    devnode_index, DeferredVideoOwner::new(identity), false,
+                ));
             }
         }
+        self.enqueue_initial_bus_relations(device_id)
+    }
+
+    unsafe fn enqueue_initial_bus_relations(
+        &mut self,
+        device_id: u64,
+    ) -> OwnedHostedPnpStartProgress {
         match driver_launch::enqueue_hosted_initial_bus_relations(device_id) {
             Ok(refresh) => {
                 self.pending_relations = Some(refresh);
@@ -1076,22 +1092,34 @@ impl OwnedHostedPnpStartBatch {
                 }
                 continue;
             }
-            if let Some((devnode_index, owner)) = self.pending_video_publication {
-                if !crate::boot_storage_dma_handoff::native_storage_cutover_phase().admit_video_create() {
+            if let Some((devnode_index, owner, enqueue_relations_after_publish)) = self.pending_video_publication {
+                let device_id = owner.identity().device_id;
+                let retained_open = crate::video_device::video_publication_pending_for(device_id);
+                if !crate::boot_storage_dma_handoff::native_storage_cutover_phase()
+                    .admit_video_route_progress(retained_open)
+                {
                     return OwnedHostedPnpStartProgress::AwaitingCompletion;
                 }
-                self.pending_video_publication = None;
-                let device_id = owner.identity().device_id;
-                if !owner.matches_current(driver_launch::hosted_video_publication_identity(device_id))
-                    || !driver_launch::hosted_video_publication_identity_is_live(owner.identity())
-                {
+                if !retained_open && (!owner.matches_current(driver_launch::hosted_video_publication_identity(device_id))
+                    || !driver_launch::hosted_video_publication_identity_is_live(owner.identity())) {
+                    self.pending_video_publication = None;
                     remember_error(&mut self.report, nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    if enqueue_relations_after_publish {
+                        return self.enqueue_initial_bus_relations(device_id);
+                    }
                     continue;
                 }
                 let instance_id = &self.spec.devnodes[devnode_index].instance_id;
-                try_publish_hosted_video_route(
+                let progress = try_publish_hosted_video_route(
                     device_id, &self.spec.service_name, instance_id, &mut self.report,
                 );
+                if progress == crate::video_device::VideoPublicationProgress::Pending {
+                    return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                }
+                self.pending_video_publication = None;
+                if enqueue_relations_after_publish {
+                    return self.enqueue_initial_bus_relations(device_id);
+                }
                 continue;
             }
             if let Some(pending) = self.pending_filter_admission.take() {
@@ -3197,6 +3225,7 @@ unsafe fn start_filtered_devnode(
                     device_id,
                     &grant.raw_resource_list,
                     &grant.translated_resource_list,
+                    grant.bus_owned_root_proof,
                 ),
                 Err(status) => {
                     trace_canonical_start_failure(b"assignment", device_id, status);
@@ -3210,7 +3239,7 @@ unsafe fn start_filtered_devnode(
         }
         Ok(None) => {
             match driver_launch::commit_hosted_device_resource_assignment(device_id, &[], &[]) {
-                Ok(()) => canonical_start_status(device_id, &[], &[]),
+                Ok(()) => canonical_start_status(device_id, &[], &[], None),
                 Err(status) => {
                     trace_canonical_start_failure(b"empty-assignment", device_id, status);
                     CanonicalStartDisposition::Terminal {
@@ -3301,11 +3330,13 @@ unsafe fn canonical_start_status(
     device_id: u64,
     raw_resource_list: &[u8],
     translated_resource_list: &[u8],
+    bus_owned_root_proof: Option<driver_launch::HostedBusOwnedRootPublicationProof>,
 ) -> CanonicalStartDisposition {
     match driver_launch::start_hosted_device_canonical(
         device_id,
         raw_resource_list,
         translated_resource_list,
+        bus_owned_root_proof,
     ) {
         Ok(driver_launch::HostedPnpStartOutcome::Started { receipt }) => {
             CanonicalStartDisposition::Terminal {
@@ -3556,26 +3587,31 @@ unsafe fn try_publish_hosted_video_route(
     service_name: &str,
     instance_id: &str,
     report: &mut HostedPnpStartReport,
-) {
+) -> crate::video_device::VideoPublicationProgress {
     let _observation = VideoRouteObservation::enter(device_id);
+    if crate::video_device::video_publication_pending_for(device_id) {
+        let progress = crate::video_device::resume_hosted_video_device_route(device_id);
+        record_video_route_publication(progress, device_id, service_name, instance_id, report);
+        return progress;
+    }
     if crate::current_win32k_provider_domain().is_none() {
-        return;
+        return crate::video_device::VideoPublicationProgress::Failed;
     }
     VIDEO_ROUTE_STAGE.store(2, core::sync::atomic::Ordering::Release);
     if !driver_launch::hosted_device_video_port_initialized(device_id) {
-        return;
+        return crate::video_device::VideoPublicationProgress::Failed;
     }
     VIDEO_ROUTE_STAGE.store(3, core::sync::atomic::Ordering::Release);
     report.video_route_attempted_count += 1;
     let Some(_route) = driver_launch::hosted_video_route_info(device_id) else {
         remember_error(report, nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         print_hosted_video_route_published(service_name, instance_id, device_id, false);
-        return;
+        return crate::video_device::VideoPublicationProgress::Failed;
     };
     let Some(service_registry_path) = hosted_display_service_registry_path(service_name) else {
         remember_error(report, nt_status::NtStatus::INVALID_PARAMETER);
         print_hosted_video_route_published(service_name, instance_id, device_id, false);
-        return;
+        return crate::video_device::VideoPublicationProgress::Failed;
     };
     VIDEO_ROUTE_STAGE.store(4, core::sync::atomic::Ordering::Release);
     let published = crate::video_device::publish_hosted_video_device_route(
@@ -3586,6 +3622,21 @@ unsafe fn try_publish_hosted_video_route(
         },
     );
     VIDEO_ROUTE_STAGE.store(5, core::sync::atomic::Ordering::Release);
+    record_video_route_publication(published, device_id, service_name, instance_id, report);
+    published
+}
+
+fn record_video_route_publication(
+    progress: crate::video_device::VideoPublicationProgress,
+    device_id: u64,
+    service_name: &str,
+    instance_id: &str,
+    report: &mut HostedPnpStartReport,
+) {
+    if progress == crate::video_device::VideoPublicationProgress::Pending {
+        return;
+    }
+    let published = progress == crate::video_device::VideoPublicationProgress::Published;
     report.video_route_published |= published;
     if published {
         report.video_route_published_count += 1;

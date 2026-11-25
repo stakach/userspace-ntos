@@ -505,6 +505,18 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
                 if !accept_inline(nonce, token, status, information) {
                     crate::provider_bugcheck::report(0xc4, [W32_SOURCE_PNP_LABEL, irp, token, 21]);
                 }
+                if trace_video_init_import(
+                    b"relation-terminal", device, irp, status as u64, information,
+                ) {
+                    print_str(b"[source-pnp-origin] terminal nonce/ticket/generation/device/irp/relation/token/status/info=");
+                    for value in [
+                        nonce, request.source_ticket_serial, request.native_allocation_generation,
+                        device, irp, request.relation_allocation_va, token, status as u64, information,
+                    ] {
+                        print_str(b"/"); print_hex_u64(value);
+                    }
+                    print_str(b"\n");
+                }
                 status as i32
             }
             Err(_)

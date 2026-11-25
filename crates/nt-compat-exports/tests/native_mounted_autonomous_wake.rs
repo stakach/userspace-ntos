@@ -129,13 +129,17 @@ fn native_settlement_services_resolved_backend_before_receive() {
     assert!(after_native[..end].contains("driver_launch::service_pending_file_backends()"),
         "physical settlement must revisit resolved mounted backends once");
 
-    let pump = &SERVICE[SERVICE.find("unsafe fn pump_hosted_io_and_redrive_driver_starts(")
-        .expect("outer hosted I/O pump")..];
-    let native = pump.find("let native_blocks = service_mounted_native_blocks_and_redrive_backends()")
+    let pump = function_body(SERVICE, "unsafe fn pump_hosted_io_and_redrive_driver_starts(");
+    let coordinator = pump.find("nt_hosted_runtime::service_mounted_around_io_pump(")
+        .expect("bounded native service and completion-pump ordering");
+    let callbacks = &pump[coordinator..];
+    let native = callbacks.find("service_mounted_native_blocks_and_redrive_backends()")
         .expect("shared native settlement and backend pass");
-    let after_native = &pump[native..];
-    let completion = after_native.find("driver_launch::pump_hosted_io_completions()")
+    let completion = callbacks.find("driver_launch::pump_hosted_io_completions()")
         .expect("hosted completion pump");
-    assert!(completion > 0, "hosted completions must follow native settlement");
+    let pending = callbacks.find("driver_launch::mounted_native_physical_irp_pending,")
+        .expect("retained physical owner gates the follow-on pass");
+    assert!(native < completion && completion < pending,
+        "native settlement precedes completion publication and one owned follow-on probe");
 }
 

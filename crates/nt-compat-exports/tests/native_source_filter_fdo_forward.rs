@@ -131,7 +131,7 @@ fn inline_accepted_pdo_filter_reply_explicitly_clears_ack_token_register() {
 fn synchronous_class_start_uses_exact_cross_domain_fdo_forward() {
     let driver = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
     let native = &driver[driver
-        .find("extern \"win64\" fn s_iof_call_driver(")
+        .find("unsafe fn s_iof_call_driver_with_entry(")
         .unwrap()..];
     let start = &native[native
         .find("if forwarded_minor == nt_pnp_abi::IRP_MN_START_DEVICE as u64")

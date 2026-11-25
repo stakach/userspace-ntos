@@ -365,17 +365,17 @@ impl SectorClaim {
         }
     }
 
-    fn complete(self, bytes: Result<&[u8], nt_fs::FatPathError>) {
+    fn complete(self, bytes: Result<&[u8], nt_fs::MountedSectorError>) {
         match self {
             Self::Create(c) => {
                 let sector = bytes.and_then(|bytes| <&[u8; 512]>::try_from(bytes)
-                    .map_err(|_| nt_fs::FatPathError::Corrupt));
-                crate::mounted_volume::complete_mounted_create_sector(c, sector)
+                    .map_err(|_| nt_fs::MountedSectorError::Fat(nt_fs::FatPathError::Corrupt)));
+                let _lookup_result = crate::mounted_volume::complete_mounted_create_sector(c, sector)
                     .expect("entered CREATE sector claim lost");
             }
             Self::Overlay(c) => {
                 let sector = bytes.and_then(|bytes| <&[u8; 512]>::try_from(bytes)
-                    .map_err(|_| nt_fs::FatPathError::Corrupt));
+                    .map_err(|_| nt_fs::MountedSectorError::Fat(nt_fs::FatPathError::Corrupt)));
                 crate::mounted_volume::complete_mounted_overlay_sector(c, sector)
                     .expect("entered overlay sector claim lost");
             }
@@ -385,19 +385,21 @@ impl SectorClaim {
             }
             Self::Directory(c) => {
                 let sector = bytes.and_then(|bytes| <&[u8; 512]>::try_from(bytes)
-                    .map_err(|_| nt_fs::FatPathError::Corrupt));
+                    .map_err(|_| nt_fs::MountedSectorError::Fat(nt_fs::FatPathError::Corrupt)));
                 crate::mounted_volume::complete_mounted_directory_sector(c, sector)
                     .expect("entered DIRECTORY sector claim lost");
             }
         }
     }
 
-    fn complete_physical(self, bytes: Result<&[u8], nt_fs::FatPathError>) {
+    fn complete_physical(self, bytes: Result<&[u8], nt_fs::MountedSectorError>) {
         match self {
             Self::Create(c) => {
                 let sector = bytes.and_then(|bytes| <&[u8; 512]>::try_from(bytes)
-                    .map_err(|_| nt_fs::FatPathError::Corrupt));
-                crate::mounted_volume::complete_physical_mounted_create_sector(c, sector)
+                    .map_err(|_| nt_fs::MountedSectorError::Fat(nt_fs::FatPathError::Corrupt)));
+                // The inner FAT error is retained for File IRP delivery; only an invalid
+                // claim is an ownership violation here.
+                let _lookup_result = crate::mounted_volume::complete_physical_mounted_create_sector(c, sector)
                     .expect("settled physical CREATE sector claim lost");
             }
             Self::Directory(c) => {
@@ -468,7 +470,7 @@ impl WorkClaim {
 
     fn refuse_unentered(self, status: nt_status::NtStatus) {
         match self {
-            Self::Sector(claim) => claim.complete(Err(nt_fs::FatPathError::Corrupt)),
+            Self::Sector(claim) => claim.complete(Err(nt_fs::MountedSectorError::Provider(status))),
             Self::Snapshot(claim) => unsafe {
                 crate::writable_fs::native_snapshot_io::refuse_unentered_native_snapshot_io(claim, status)
             }.expect("refused unentered snapshot claim lost"),
@@ -477,7 +479,7 @@ impl WorkClaim {
 
     fn complete(self, result: Result<&[u8], nt_status::NtStatus>) {
         match self {
-            Self::Sector(claim) => claim.complete(result.map_err(|_| nt_fs::FatPathError::Corrupt)),
+            Self::Sector(claim) => claim.complete(result.map_err(nt_fs::MountedSectorError::Provider)),
             Self::Snapshot(claim) => {
                 use crate::writable_fs::native_snapshot_io::SnapshotCompletion;
                 let owner_kind = claim.owner_kind();
@@ -503,7 +505,7 @@ impl WorkClaim {
 
     fn complete_physical(self, result: Result<&[u8], nt_status::NtStatus>) {
         match self {
-            Self::Sector(claim) => claim.complete_physical(result.map_err(|_| nt_fs::FatPathError::Corrupt)),
+            Self::Sector(claim) => claim.complete_physical(result.map_err(nt_fs::MountedSectorError::Provider)),
             claim => claim.complete(result),
         }
     }
@@ -511,7 +513,7 @@ impl WorkClaim {
     fn complete_cached(self, bytes: &[u8; 512]) {
         match self {
             Self::Sector(SectorClaim::Create(claim)) => {
-                crate::mounted_volume::complete_cached_mounted_create_sector(claim, bytes)
+                let _lookup_result = crate::mounted_volume::complete_cached_mounted_create_sector(claim, bytes)
                     .expect("copied exact CREATE sector claim lost");
             }
             Self::Sector(SectorClaim::Directory(claim)) => {

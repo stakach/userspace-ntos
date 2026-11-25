@@ -9,7 +9,11 @@ use super::*;
 use nt_hosted_runtime::{ContiguousRamLayout, ContiguousRamOwner, ContiguousRamPrepareTable,
     ContiguousRamReceipt, ContiguousRamRequest, ContiguousRamLeaseBank,
     ContiguousRamLeaseSource, ContiguousRamPublishedMapping, ContiguousRamProjectedMapping,
-    ContiguousRamCachePolicy};
+    ContiguousRamCachePolicy, MmioRequestError};
+
+#[path = "hosted_contiguous_owned_requests.rs"]
+mod hosted_contiguous_owned_requests;
+use hosted_contiguous_owned_requests::HostedContiguousOwnedRequests;
 
 const PAGE: u64 = 4096;
 const MAX_CHILD_BYTES: u64 = 64 << 20;
@@ -73,6 +77,7 @@ pub(super) struct VideoProjectionPin {
     pub(super) provider_page_base: u64,
     pub(super) pages: u64,
     pub(super) frame_slot_base: u64,
+    pub(super) cache: ContiguousRamCachePolicy,
     pub(super) generation: u64,
     held: bool,
 }
@@ -82,6 +87,9 @@ static mut PREPARED: ContiguousRamPrepareTable = ContiguousRamPrepareTable::new(
 static mut LEASES: ContiguousRamLeaseBank = ContiguousRamLeaseBank::new();
 static mut ALLOCATIONS: Vec<Allocation> = Vec::new();
 static mut PROJECTIONS: Vec<Projection> = Vec::new();
+// This is the same per-call state machine as assigned MMIO, held under this broker's lock.
+static mut OWNED_MAP_REQUESTS: HostedContiguousOwnedRequests =
+    HostedContiguousOwnedRequests::new();
 
 struct BrokerGuard;
 impl Drop for BrokerGuard {
@@ -411,6 +419,10 @@ pub(super) unsafe fn pin_video_projection(
         source.slot == row.source_slot && source.child == row.source_child
             && source.owner == row.mapping.producer() && published_mapping(source).is_some()
     })?;
+    let cache = ContiguousRamCachePolicy::for_nt_type(source.cache)?;
+    if row.mapping.virtual_address(consumer, physical, length, source.cache)? != address {
+        return None;
+    }
     let first_frame = first_physical_page.checked_sub(source.physical_start)? / PAGE;
     if first_frame.checked_add(pages)? > source.frames
         || last_physical > source.physical_start.checked_add(source.length)?
@@ -420,7 +432,7 @@ pub(super) unsafe fn pin_video_projection(
     row.video_pins = row.video_pins.checked_add(1)?;
     Some(VideoProjectionPin {
         projection_index: index, consumer, source_child: source.child,
-        provider_page_base, pages, frame_slot_base,
+        provider_page_base, pages, frame_slot_base, cache,
         generation: source.child, held: true,
     })
 }
@@ -450,7 +462,8 @@ unsafe fn map_physical(consumer: ContiguousRamOwner, inst: DriverInstance,
         let Some(mapping) = published_mapping(source) else { continue; };
         if !mapping.contains_physical(source.owner, physical, length, cache) { continue; }
         if source.owner == consumer {
-            return mapping.virtual_address(consumer, physical, length, cache);
+            let receipts = &mut *core::ptr::addr_of_mut!(OWNED_MAP_REQUESTS);
+            return receipts.map(consumer, source.child, mapping, physical, length, cache).ok();
         }
         let Some(source_inst) = instance(source.owner.instance) else { continue; };
         if owner(source.owner.instance, source_inst) != Some(source.owner) { continue; }
@@ -548,6 +561,22 @@ unsafe fn retire_projection(row: &mut Projection) -> bool {
 
 unsafe fn unmap_physical(consumer: ContiguousRamOwner, address: u64, length: u64,
     cache: u64) -> i32 {
+    if cache == 0 {
+        let source = (&*core::ptr::addr_of!(ALLOCATIONS)).iter().find(|row| {
+            row.owner == consumer && published_mapping(row).is_some()
+                && address >= row.address
+                && row.address.checked_add(row.length)
+                    .is_some_and(|end| address < end)
+        });
+        if let Some(source) = source {
+            let receipts = &mut *core::ptr::addr_of_mut!(OWNED_MAP_REQUESTS);
+            return match receipts.unmap(consumer, source.child, address, length) {
+                Ok(()) => STATUS_SUCCESS,
+                Err(MmioRequestError::Unavailable) => STATUS_DEVICE_BUSY,
+                Err(_) => STATUS_NOT_FOUND,
+            };
+        }
+    }
     let rows = &mut *core::ptr::addr_of_mut!(PROJECTIONS);
     let Some(row) = rows.iter_mut().find(|row| row.consumer == consumer
         && row.phase == ProjectionPhase::Ready && row.address == address
@@ -608,6 +637,8 @@ unsafe fn free(owner: ContiguousRamOwner, address: u64, length: u64, cache: u64)
         || cache != u64::MAX && cache != row.cache as u64 {
         return STATUS_INVALID_PARAMETER;
     }
+    if (&*core::ptr::addr_of!(OWNED_MAP_REQUESTS))
+        .has_source_rows(owner, row.child) { return STATUS_DEVICE_BUSY; }
     if (&*core::ptr::addr_of!(PROJECTIONS)).iter().any(|projection| {
         projection.source_slot == row.slot && projection.source_child == row.child
             && projection.mapping.producer() == row.owner && projection.video_pins != 0
@@ -634,6 +665,9 @@ unsafe fn free(owner: ContiguousRamOwner, address: u64, length: u64, cache: u64)
 pub(super) unsafe fn retire_instance(instance: usize, inst: DriverInstance) -> bool {
     let Some(owner) = owner(instance, inst) else { return false; };
     let _guard = lock();
+    if (&*core::ptr::addr_of!(ALLOCATIONS)).iter().any(|row| row.owner == owner
+        && !row.available && (&*core::ptr::addr_of!(OWNED_MAP_REQUESTS))
+            .has_source_rows(owner, row.child)) { return false; }
     (&mut *core::ptr::addr_of_mut!(PREPARED)).retire_owner(owner);
     for row in (&mut *core::ptr::addr_of_mut!(PROJECTIONS)).iter_mut()
         .filter(|row| row.consumer == owner && row.phase != ProjectionPhase::Retired) {

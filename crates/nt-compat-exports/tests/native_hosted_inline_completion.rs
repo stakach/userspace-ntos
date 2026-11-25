@@ -54,7 +54,7 @@ fn inline_ack_accepts_exact_caller_completion_without_driver_free_intent() {
 #[test]
 fn inline_driver_free_uses_claim_derived_completion_owner() {
     let file = source("driver_launch.rs");
-    let functions = calls(&file, "s_iof_call_driver");
+    let functions = calls(&file, "s_iof_call_driver_with_entry");
     assert!(functions.iter().any(|name| name == "complete_hosted_irp_with_owner"),
         "inline completion must consume a typed successful-claim owner receipt");
     assert!(!functions.iter().any(|name| name == "s_io_free_irp"),

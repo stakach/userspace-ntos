@@ -139,6 +139,8 @@ struct Row {
     queue_not_admitted: bool,
     /// [`LANE_EPOCH`] when it was last refused; it is retried only after a lane has freed.
     admission_epoch: u64,
+    /// Diagnostic first sighting of this row's queue, independent of later retries.
+    queue_trace_emitted: bool,
 }
 
 /// Counts dispatches refused admission with nothing entered, for callers that retry them
@@ -615,6 +617,7 @@ fn reserve(
         phase_major: 0,
         queue_not_admitted: false,
         admission_epoch: 0,
+        queue_trace_emitted: false,
     });
     Ok(id)
 }
@@ -2212,6 +2215,38 @@ fn trace_file_return_probe_status(
     print_str(b"\n");
 }
 
+/// Bounded per-instance observation of ordinary File terminal and ACK ownership (#481).
+/// Stages: 1 terminal publish attempt, 2 published, 3 publish refused;
+/// 4 synchronous terminal retired, 5 retirement refused; 6 ACK attempt,
+/// 7 ACK retired without backend, 8 backend ACK retired, 9 backend ACK retained.
+fn trace_file_terminal_ack(stage: u64, id: u64, irp: IrpId,
+    status: Option<nt_status::NtStatus>) {
+    let owner = row(id);
+    if owner.irp_id != Some(irp) { return; }
+    static COUNT: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+    let instance = owner.primary_driver
+        .and_then(|driver| instance_by_driver_id(driver.raw()))
+        .map_or(usize::MAX, |(index, _)| index);
+    let Some(counter) = COUNT.get(instance) else { return; };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() { return; }
+    let flight = match owner.flight {
+        Flight::Preparing => 1, Flight::QueuedDispatch => 2, Flight::Dispatch => 3,
+        Flight::PumpSuspended => 4, Flight::PumpReturned => 5, Flight::Copy => 6,
+        Flight::Cancel => 7, Flight::Acknowledge => 8, Flight::Idle => 9,
+        Flight::Blocked => 10,
+    };
+    print_str(b"[file-terminal-ack] n/instance/row/irp/major/stage/flight/completion/receipt/status=");
+    print_u64(n); print_str(b"/"); print_u64(instance as u64); print_str(b"/");
+    print_u64(id); print_str(b"/"); print_hex_u64(irp.raw()); print_str(b"/");
+    print_hex_u64(owner.phase_major as u64); print_str(b"/"); print_u64(stage);
+    print_str(b"/"); print_u64(flight); print_str(b"/");
+    print_u64(u64::from(owner.completion.is_some())); print_str(b"/");
+    print_u64(u64::from(owner.terminal_receipt.is_some())); print_str(b"/");
+    print_hex_u64(status.map_or(0, |status| status.raw() as u32 as u64));
+    print_str(b"\n");
+}
+
 /// What a dispatch does when no hosted lane can admit its IRP yet (#427).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Admission {
@@ -2255,7 +2290,53 @@ fn trace_irp_queue(stage: usize, id: u64, major: u8) {
 }
 
 /// Retain a not-admitted preparation; nothing was entered, so it may be begun again.
-fn queue_unadmitted(id: u64, prepared: PreparedExternalFileIrp) {
+#[repr(u64)]
+enum QueueReason {
+    OlderQueuedIrp = 1,
+    NoLane = 2,
+    RedriveNoLane = 3,
+}
+
+/// First refusal per exact File row, including the route state that a sparse global queue
+/// counter cannot preserve once an unrelated driver has filled its print budget (#481).
+fn trace_initial_queue(id: u64, major: u8, reason: QueueReason) {
+    let owner = row(id);
+    if owner.queue_trace_emitted { return; }
+    owner.queue_trace_emitted = true;
+    let (driver, irp) = (owner.primary_driver, owner.irp_id);
+    let Some(instance) = driver.and_then(|driver| instance_by_driver_id(driver.raw()))
+        .map(|(index, _)| index) else { return; };
+    static COUNT: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+    let Some(counter) = COUNT.get(instance) else { return; };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 16 && !n.is_power_of_two() { return; }
+    let (primary_ready, primary_parked) =
+        match hosted_ingress_sources::primary_route(instance) {
+            Some(route) => {
+                let ready = match unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route) } {
+                    Ok(true) => 1, Ok(false) => 2, Err(_) => 3,
+                };
+                (ready, u64::from(unsafe {
+                    crate::spawn_hosts::shared_ingress::owner::runtime::primary_dispatch_parked(route)
+                }))
+            }
+            None => (0, 0),
+        };
+    let (phase, route, claim_idle, worker) = unsafe {
+        hosted_class_irp_lane::ordinary_admission_snapshot(instance)
+    };
+    print_str(b"[file-first-queue] n/instance/row/irp/major/reason/primary-ready/parked/worker-phase/route/claim-idle/worker=");
+    print_u64(n); print_str(b"/"); print_u64(instance as u64); print_str(b"/");
+    print_u64(id); print_str(b"/"); print_hex_u64(irp.map_or(0, |irp| irp.raw()));
+    print_str(b"/"); print_hex_u64(major as u64); print_str(b"/");
+    print_u64(reason as u64); print_str(b"/"); print_u64(primary_ready); print_str(b"/");
+    print_u64(primary_parked); print_str(b"/"); print_u64(phase); print_str(b"/");
+    print_u64(route); print_str(b"/"); print_u64(claim_idle); print_str(b"/");
+    print_u64(worker); print_str(b"\n");
+}
+
+fn queue_unadmitted(id: u64, prepared: PreparedExternalFileIrp, reason: QueueReason) {
+    trace_initial_queue(id, prepared.projection().major, reason);
     trace_irp_queue(0, id, prepared.projection().major);
     let row = row(id);
     row.payload = Some(Payload::Prepared(prepared));
@@ -2382,7 +2463,7 @@ fn dispatch_with_port_connect<Yield>(
     if row(id).queue_not_admitted && queued_ahead(id) {
         // An older IRP for this driver still waits for a lane; never overtake it.
         let irp_id = prepared.irp_id();
-        queue_unadmitted(id, prepared);
+        queue_unadmitted(id, prepared, QueueReason::OlderQueuedIrp);
         return Ok(DispatchResult::Outstanding { irp_id });
     }
     // This exact retained stack is the last Executive-side point before a disk provider may
@@ -2462,7 +2543,7 @@ fn settle_returned_dispatch(
                 return Ok(DispatchResult::Outstanding { irp_id });
             }
             if row(id).queue_not_admitted {
-                queue_unadmitted(id, prepared);
+                queue_unadmitted(id, prepared, QueueReason::NoLane);
                 return Ok(DispatchResult::Outstanding { irp_id });
             }
             // This caller re-prepares a busy refusal itself.
@@ -2545,18 +2626,21 @@ fn take_deferred(id: u64) -> bool {
 fn publish_terminal(
     id: u64, irp_id: IrpId, terminal: ExternalFileIrpTerminal,
 ) -> Result<(), nt_status::NtStatus> {
+    trace_file_terminal_ack(1, id, irp_id, None);
     match io_manager_mut().queue_external_file_irp_terminal(terminal, row(id).output_capture) {
         Ok(completion) => {
             row(id).completion = Some(*completion.completion());
             keep(id, Payload::Completion(completion));
             crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
             trace_plain_pump(b"published", irp_id);
+            trace_file_terminal_ack(2, id, irp_id, None);
             Ok(())
         }
         Err(rejection) => {
             let (status, terminal) = rejection.into_parts();
             block(id, Payload::Terminal(terminal), status);
             trace_plain_pump(b"unpublished", irp_id);
+            trace_file_terminal_ack(3, id, irp_id, Some(status));
             Err(status)
         }
     }
@@ -2573,6 +2657,7 @@ fn retire_returned_terminal(
             assert!(io_manager_mut().accepts_external_file_irp_receipt(&receipt));
             row(id).terminal_receipt = Some(receipt);
             row(id).settled_buffers = Some(buffers);
+            trace_file_terminal_ack(4, id, irp_id, None);
             let mut retired = match remove(id) {
                 Ok(retired) => {
                     trace_file_return_probe(79, irp_id);
@@ -2598,6 +2683,7 @@ fn retire_returned_terminal(
             let (status, terminal) = rejection.into_parts();
             block(id, Payload::Terminal(terminal), status);
             trace_file_return_probe_status(81, irp_id, Some(status));
+            trace_file_terminal_ack(5, id, irp_id, Some(status));
             DispatchResult::Outstanding { irp_id }
         }
     }
@@ -2850,7 +2936,7 @@ fn redrive_queued(id: u64) -> QueuedReadRedriveOutcome {
         }
         ExternalFileIrpResult::NotAdmitted { prepared } => {
             // Still no free lane: nothing was entered, so it waits for the next lane change.
-            queue_unadmitted(id, prepared);
+            queue_unadmitted(id, prepared, QueueReason::RedriveNoLane);
             QueuedReadRedriveOutcome::Retained(nt_status::NtStatus::DEVICE_BUSY)
         }
         ExternalFileIrpResult::Returned(terminal) => match publish_terminal(id, irp_id, terminal) {
@@ -3086,6 +3172,7 @@ pub(super) fn acknowledge_port_connect(irp_id: IrpId) -> Result<[u8; 16], nt_sta
 fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    trace_file_terminal_ack(6, id, irp_id, None);
     ensure_completion(id)?;
     if monotonic_time_100ns() < row(id).retry_after {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
@@ -3133,6 +3220,7 @@ fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_
                 }
                 row(id).terminal_receipt = Some(receipt);
                 row(id).settled_buffers = Some(buffers);
+                trace_file_terminal_ack(7, id, irp_id, None);
                 let mut retired = remove(id)?;
                 return retired.settled_buffers.take()
                     .ok_or(nt_status::NtStatus::INVALID_PARAMETER);
@@ -3169,6 +3257,7 @@ fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_
                     assert!(receipt.backend_acknowledged());
                     row(id).terminal_receipt = Some(receipt);
                     row(id).settled_buffers = Some(buffers);
+                    trace_file_terminal_ack(8, id, irp_id, None);
                     let mut retired = remove(id)?;
                     return Ok(retired.settled_buffers.take()
                         .expect("acknowledged File buffers missing"));
@@ -3206,6 +3295,7 @@ fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_
             assert!(io_manager_mut().accepts_external_file_irp_receipt(&receipt));
             row(id).terminal_receipt = Some(receipt);
             row(id).settled_buffers = Some(buffers);
+            trace_file_terminal_ack(8, id, irp_id, None);
             let mut retired = remove(id)?;
             Ok(retired.settled_buffers.take()
                 .expect("acknowledged File buffers missing"))
@@ -3213,6 +3303,7 @@ fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_
         Err(rejection) => {
             let (status, returned) = rejection.into_parts();
             retry_later(id, Payload::Acknowledgement(returned), status);
+            trace_file_terminal_ack(9, id, irp_id, Some(status));
             Err(status)
         }
     }

@@ -336,3 +336,65 @@ fn video_pool_alias_cannot_take_the_assigned_framebuffer_aperture() {
         "the exact BAR span must fit below the win32k pool boundary"
     );
 }
+
+#[test]
+fn framebuffer_bar_uses_uncached_rights_for_root_and_caller_page_maps() {
+    struct RootFramebufferMap {
+        call: Option<String>,
+        rights: Option<Wiring>,
+    }
+    impl<'ast> Visit<'ast> for RootFramebufferMap {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let map_call = match &*call.func {
+                Expr::Path(path) => path.path.segments.last().map(|part| part.ident.to_string()),
+                _ => None,
+            };
+            if matches!(map_call.as_deref(), Some("page_map" | "page_map_r")) {
+                let target = call.args.iter().nth(1).expect("PageMap target");
+                let mut target_facts = Wiring::default();
+                target_facts.visit_expr(target);
+                if target_facts.paths.iter().any(|path| path == "FB_VADDR") {
+                    self.call = map_call;
+                    let mut rights = Wiring::default();
+                    rights.visit_expr(call.args.iter().nth(2).unwrap());
+                    self.rights = Some(rights);
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+
+    let root = source("main.rs");
+    let mut framebuffer = RootFramebufferMap { call: None, rights: None };
+    framebuffer.visit_item_fn(&function(&root, "_start"));
+    assert_eq!(framebuffer.call.as_deref(), Some("page_map_r"),
+        "the root framebuffer BAR map must acknowledge the native PageMap effect");
+    let rights = framebuffer.rights.expect("root framebuffer PageMap rights");
+    assert!(rights.calls.iter().any(|call| call.ends_with("page_map_rights"))
+        && rights.paths.iter().any(|path| path == "Uncached"),
+        "root framebuffer BAR must use the shared strong-UC rights policy");
+
+    struct CallerRights(Option<Wiring>);
+    impl<'ast> Visit<'ast> for CallerRights {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if matches!(&local.pat, Pat::Ident(ident) if ident.ident == "rights") {
+                if let Some(init) = &local.init {
+                    let mut facts = Wiring::default();
+                    facts.visit_expr(&init.expr);
+                    self.0 = Some(facts);
+                }
+            }
+            syn::visit::visit_local(self, local);
+        }
+    }
+    let caller = source("hosted_video_caller_aperture.rs");
+    let build = function(&caller, "build");
+    assert!(wiring(&build).calls.iter().any(|call| call == "page_map_r"),
+        "caller framebuffer aperture must use checked PageMap");
+    let mut caller_rights = CallerRights(None);
+    caller_rights.visit_item_fn(&build);
+    let rights = caller_rights.0.expect("caller framebuffer PageMap rights");
+    assert!(rights.calls.iter().any(|call| call.ends_with("page_map_rights"))
+        && rights.paths.iter().any(|path| path == "Uncached"),
+        "caller framebuffer BAR must use the shared strong-UC rights policy");
+}

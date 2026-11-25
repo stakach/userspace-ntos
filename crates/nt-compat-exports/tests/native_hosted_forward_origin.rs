@@ -131,7 +131,7 @@ fn source_pending_return_does_not_inline_complete_its_irp() {
         }
     }
     let mut pending = PendingBranch::default();
-    pending.visit_block(function(&source, "s_iof_call_driver"));
+    pending.visit_block(function(&source, "s_iof_call_driver_with_entry"));
     assert!(
         pending.found,
         "forwarded Pending needs an explicit exact arm branch before inline completion"

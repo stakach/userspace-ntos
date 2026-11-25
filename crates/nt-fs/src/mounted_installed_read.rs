@@ -4,7 +4,7 @@
 //! A borrowed dispatch buffer cannot survive native SCSI transport entry.
 
 use alloc::vec::Vec;
-use crate::{checked_partition_lba, BlockOperation, FatPathError, FatPathGeometry, FatRangeLookup, FatRangeProgress, FatRangeRequest, FatRangeRequestKind, FatVerifiedChain, STATUS_DATA_ERROR};
+use crate::{checked_partition_lba, BlockOperation, FatPathError, FatPathGeometry, FatRangeLookup, FatRangeProgress, FatRangeRequest, FatRangeRequestKind, FatVerifiedChain, MountedSectorError, STATUS_DATA_ERROR};
 
 // The installed layer is immutable for this mount generation. A larger file remains readable
 // when a bounded chain index stops growing; the cursor resumes from its longest proven prefix.
@@ -203,7 +203,7 @@ impl ReadCompletions {
     }
 
     pub fn complete_sectors(&mut self, claim: ReadSectorClaim,
-        sectors: Result<&[u8], FatPathError>) -> Result<FatRangeProgress, ReadError>
+        sectors: Result<&[u8], MountedSectorError>) -> Result<FatRangeProgress, ReadError>
     {
         let entry = self.entries.iter_mut()
             .find(|entry| entry.irp == claim.irp && entry.mount == claim.mount
@@ -216,12 +216,13 @@ impl ReadCompletions {
                 let cursor = entry.cursor.as_mut().ok_or(ReadError::WrongClaim)?;
                 if claim.sectors == 1 {
                     cursor.feed(claim.request, bytes.try_into().expect("exact sector length"),
-                        &mut entry.output)
+                        &mut entry.output).map_err(MountedSectorError::Fat)
                 } else {
                     cursor.feed_contiguous_data(claim.request, bytes, &mut entry.output)
+                        .map_err(MountedSectorError::Fat)
                 }
             }
-            Ok(_) => Err(FatPathError::WrongRequest),
+            Ok(_) => Err(MountedSectorError::Fat(FatPathError::WrongRequest)),
             Err(error) => Err(error),
         };
         entry.claimed = None;
@@ -232,8 +233,8 @@ impl ReadCompletions {
                 Ok(FatRangeProgress::Complete)
             }
             Ok(FatRangeProgress::Pending) => Ok(FatRangeProgress::Pending),
-            Err(_) => {
-                entry.terminal = Some((STATUS_DATA_ERROR as i32, 0));
+            Err(error) => {
+                entry.terminal = Some((error.status().raw(), 0));
                 entry.position_committed = true;
                 Ok(FatRangeProgress::Complete)
             }
@@ -439,6 +440,26 @@ mod tests {
         assert_eq!(reads.refuse_unentered(claim, STATUS_DATA_ERROR as i32),
             Err(ReadError::WrongClaim));
         reads.ack(0x51).unwrap();
+        assert!(!reads.has_outstanding());
+    }
+
+    #[test]
+    fn entered_read_preserves_authenticated_provider_failure_until_ack() {
+        let mut reads = ReadCompletions::new();
+        let geometry = FatPathGeometry { fat_start_sector: 1, data_start_sector: 2,
+            total_sectors: 18, sectors_per_cluster: 1 };
+        reads.capture_range(0x52, 7, 9, geometry, 2, 0, 512, None).unwrap();
+        let claim = reads.claim_next_bounded(1).unwrap();
+        let failure = MountedSectorError::Provider(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+        assert_eq!(reads.complete_sectors(ReadSectorClaim { generation: claim.generation + 1, ..claim },
+            Err(failure)), Err(ReadError::WrongClaim));
+        assert_eq!(reads.complete_sectors(claim, Err(failure)), Ok(FatRangeProgress::Complete));
+        assert_eq!(reads.complete_sectors(claim, Err(failure)), Err(ReadError::WrongClaim));
+        assert!(reads.claim_next().is_none());
+        assert_eq!(reads.next_completion(), Some((0x52,
+            nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw(), 0)));
+        assert_eq!(reads.next_completion(), None);
+        reads.ack(0x52).unwrap();
         assert!(!reads.has_outstanding());
     }
 

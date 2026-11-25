@@ -71,8 +71,12 @@ fn constant<'a>(source: &'a str, name: &str) -> &'a str {
 
 const PORTS: &str = r#"
 use std::ptr::{read_volatile, write_unaligned, write_volatile};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-const HOSTED_DMA_COMMON_ALIGNMENT: u64 = 64;
+fn print_str(_text: &[u8]) {}
+fn print_hex_u64(_value: u64) {}
+
+const HOSTED_DMA_COMMON_ALIGNMENT: u64 = 0x1000;
 const HOSTED_DMA_RECORD_KIND_COMMON: u64 = 1;
 const SH_DMA_REQUESTED_LEN: u64 = 0;
 const SH_DMA_ALLOCATED_VA: u64 = 8;
@@ -80,7 +84,7 @@ const SH_DMA_ALLOCATED_LOGICAL: u64 = 16;
 const SH_DMA_ALLOC_RECORD_COUNT: u64 = 24;
 const SH_DMA_ALLOC_CURSOR: u64 = 32;
 const SH_DMA_ALLOC_RECORDS: u64 = 512;
-const SH_DMA_ALLOC_RECORD_SIZE: u64 = 128;
+const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x48;
 const SH_DMA_ALLOC_RECORD_LOGICAL: u64 = 0;
 const SH_DMA_ALLOC_RECORD_LEN: u64 = 8;
 const SH_DMA_ALLOC_RECORD_VA: u64 = 16;
@@ -89,6 +93,7 @@ const SH_DMA_ALLOC_RECORD_SOURCE_VA: u64 = 32;
 const SH_DMA_ALLOC_RECORD_FLAGS: u64 = 40;
 const SH_DMA_ALLOC_RECORD_MAP_REGISTER: u64 = 48;
 const SH_DMA_ALLOC_RECORD_ADAPTER_ID: u64 = 56;
+const SH_DMA_ALLOC_RECORD_PENDING_EXTENT: u64 = 64;
 const FSD_SERVICE_DMA_ADAPTER_LABEL: u64 = 1;
 const HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER: u64 = 16;
 const HOSTED_DMA_SERVICE_OPERATION_SHIFT: u64 = 56;
@@ -128,14 +133,31 @@ fn dma_adapter_metadata(adapter: u64) -> Option<HostedDmaAdapterMetadata> {
 fn first_free_dma_allocation_record(base: u64) -> Option<u64> {
     for index in 0..2 {
         let record = base + SH_DMA_ALLOC_RECORDS + index * SH_DMA_ALLOC_RECORD_SIZE;
-        if unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64) } == 0 {
+        if unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64) } == 0 {
             return Some(record);
         }
     }
     None
 }
 fn begin_dma_allocation_record(record: u64) {
-    unsafe { write_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *mut u64, DMA_RECORD_RESERVED) }
+    let prior = unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64) };
+    dma_record_store(record, SH_DMA_ALLOC_RECORD_LEN, DMA_RECORD_RESERVED);
+    if prior != DMA_RECORD_RESERVED {
+        dma_record_store(record, SH_DMA_ALLOC_RECORD_PENDING_EXTENT, prior);
+    }
+}
+fn reserve_dma_allocation_pending_extent(record: u64, length: u64) {
+    assert!(length != 0 && length != DMA_RECORD_RESERVED);
+    assert_eq!(unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64) }, DMA_RECORD_RESERVED);
+    dma_record_store(record, SH_DMA_ALLOC_RECORD_PENDING_EXTENT, length);
+}
+fn clear_dma_allocation_record(record: u64) {
+    for offset in [SH_DMA_ALLOC_RECORD_LOGICAL, SH_DMA_ALLOC_RECORD_LEN,
+        SH_DMA_ALLOC_RECORD_VA, SH_DMA_ALLOC_RECORD_KIND,
+        SH_DMA_ALLOC_RECORD_SOURCE_VA, SH_DMA_ALLOC_RECORD_MAP_REGISTER,
+        SH_DMA_ALLOC_RECORD_ADAPTER_ID, SH_DMA_ALLOC_RECORD_PENDING_EXTENT] {
+        dma_record_store(record, offset, 0);
+    }
 }
 fn dma_record_store(record: u64, offset: u64, value: u64) {
     unsafe { write_volatile((record + offset) as *mut u64, value) }
@@ -146,12 +168,18 @@ fn publish_dma_allocation_record(record: u64, length: u64, _direction: u64) {
 fn dma_root_conflict_next(_adapter: u64, _logical: u64, _length: u64) -> Result<Option<u64>, ()> {
     Ok(None)
 }
-fn call_on5(_label: u64, adapter: u64, operation: u64, logical: u64, va: u64, length: u64) -> (u64, u64, u64, u64, u64) {
+fn call_on5_raw(_label: u64, adapter: u64, operation: u64, logical: u64, va: u64, length: u64) -> (u64, u64, u64, u64, u64) {
     assert_eq!(adapter, 7);
     assert_eq!(operation, HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT);
     assert!(logical >= 0x1000 && logical + length <= 0x1000 + unsafe { GRANT_LEN });
     assert_eq!(va, 0x4000_0000 + logical - 0x1000);
-    (0, STATUS_SUCCESS as u64, logical, 0, 0)
+    assert!((0..2).any(|index| {
+        let row = unsafe { FSD_SHARED_VADDR } + SH_DMA_ALLOC_RECORDS + index * SH_DMA_ALLOC_RECORD_SIZE;
+        (unsafe { read_volatile((row + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64) }) == logical
+            && (unsafe { read_volatile((row + SH_DMA_ALLOC_RECORD_LEN) as *const u64) }) == DMA_RECORD_RESERVED
+            && (unsafe { read_volatile((row + SH_DMA_ALLOC_RECORD_PENDING_EXTENT) as *const u64) }) == length
+    }), "native allocation must reserve its exact extent before root IPC");
+    (4, STATUS_SUCCESS as u64, logical, 0, 0)
 }
 fn align_up(value: u64, alignment: u64) -> Option<u64> {
     value.checked_add(alignment - 1).map(|v| v & !(alignment - 1))
@@ -163,7 +191,11 @@ fn dma_allocation_range_overlaps(base: u64, adapter_id: u64, grant_logical: u64,
         let logical = unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64) };
         if logical == 0 || unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *const u64) } != adapter_id { continue; }
         let prior_offset = logical.checked_sub(grant_logical)?;
-        let prior_len = unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64) };
+        let mut prior_len = unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64) };
+        if prior_len == DMA_RECORD_RESERVED {
+            prior_len = unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_PENDING_EXTENT) as *const u64) };
+            if prior_len == 0 { return Some(u64::MAX); }
+        }
         let prior_end = prior_offset.checked_add(prior_len)?;
         if offset < prior_end && prior_offset < end { return Some(prior_end); }
     }

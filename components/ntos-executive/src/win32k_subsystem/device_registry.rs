@@ -13,6 +13,29 @@ pub(super) extern "win64" fn open_device_registry_key(
     handle_out: *mut u64,
 ) -> i32 {
     unsafe {
+        trace_video_init_import(b"registry-enter", device_object, key_type as u64, 0, 0);
+        let status = open_device_registry_key_inner(
+            device_object, key_type, desired_access, handle_out,
+        );
+        let handle = if status == 0 && !handle_out.is_null() {
+            read_unaligned(handle_out)
+        } else {
+            0
+        };
+        trace_video_init_import(
+            b"registry-return", device_object, key_type as u64, status as u32 as u64, handle,
+        );
+        status
+    }
+}
+
+unsafe fn open_device_registry_key_inner(
+    device_object: u64,
+    key_type: u32,
+    desired_access: u32,
+    handle_out: *mut u64,
+) -> i32 {
+    unsafe {
         if handle_out.is_null() {
             return STATUS_ACCESS_VIOLATION_I32;
         }

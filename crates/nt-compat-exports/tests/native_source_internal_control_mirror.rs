@@ -3,7 +3,7 @@ const LAUNCH: &str = include_str!("../../../components/ntos-executive/src/driver
 #[test]
 fn foreign_device_mirror_with_empty_major_function_routes_internal_control() {
     let dispatch = LAUNCH
-        .split("extern \"win64\" fn s_iof_call_driver(")
+        .split("unsafe fn s_iof_call_driver_with_entry(")
         .nth(1)
         .expect("hosted IofCallDriver");
     let empty_handler = dispatch

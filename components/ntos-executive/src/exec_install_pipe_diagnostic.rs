@@ -41,6 +41,77 @@ fn trace_device(observation: &nt_hosted_runtime::InstallPipeObservation) {
 }
 
 impl ExecNtHandler {
+    /// Root-turn snapshot after an exact installer child terminal. The Process Manager and
+    /// waiter table remain authoritative; this diagnostic only copies their live identities.
+    pub(crate) fn print_install_pipe_parent_wait_census(&self, now_100ns: u64) {
+        let Some(terminal) = self.install_pipe_diagnostic.last_terminal() else { return; };
+        let counts = self.install_pipe_diagnostic.counts();
+        let owner = self.pi_for_pid(terminal.pipe.owner_pid).and_then(|pi| {
+            if self.pm_pid_for_pi(pi) != Some(terminal.pipe.owner_pid)
+                || self.hosted_process_generation(pi) != Some(terminal.pipe.owner_generation)
+            { return None; }
+            Some((pi, self.capture_process_identity(pi)?))
+        });
+        print_str(b"[pnp-install-parent-census] terminal-count/child-pid/gen/owner-pid/gen/pi-plus-one/server-file/status=");
+        for (index, value) in [
+            counts.terminal,
+            u64::from(terminal.child.pid), terminal.child.generation,
+            u64::from(terminal.pipe.owner_pid), terminal.pipe.owner_generation,
+            owner.map_or(0, |(pi, _)| pi as u64 + 1),
+            terminal.pipe.file_id, u64::from(terminal.exit_status),
+        ].into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
+        let Some((owner_pi, owner_identity)) = owner else { return; };
+        let mut matching = 0usize;
+        for slot in 0..crate::object_waiter_len() {
+            let Some((wait_identity, record)) = crate::object_waiter_record(slot) else { continue; };
+            if record.pi != owner_pi || record.caller.process() != owner_identity { continue; }
+            matching += 1;
+            if matching > 8 { continue; }
+            print_str(b"[pnp-install-parent-wait] pi/tid/tgen/seq/claimed/reply-cap/reply-sent/count/all/age-ms=");
+            for (index, value) in [
+                record.pi as u64, record.tid, record.caller.thread().generation(),
+                record.sequence, u64::from(crate::object_waiter_is_claimed(wait_identity)),
+                record.reply_cap, u64::from(record.reply_sent),
+                u64::from(record.count), u64::from(record.wait_all),
+                record.latency.parked_age_100ns(now_100ns).unwrap_or(0) / 10_000,
+            ].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b" objects=");
+            for object in &record.objects[..(record.count as usize).min(4)] {
+                print_hex_u64(object.raw());
+                print_str(b",");
+            }
+            let first = record.objects[0];
+            print_str(b" first-kind/id/ready=");
+            print_u64(first.kind());
+            print_str(b"/");
+            print_u64(first.id());
+            print_str(b"/");
+            print_u64(u64::from(self.wait_object_ready_for(first, record.tid)));
+            if first.kind() == WaitObject::KIND_DISPATCHER {
+                if let Some(entry) = self.obj_ns.get(first.id() as usize)
+                    .filter(|entry| entry.is_live())
+                {
+                    print_str(b" name=\"");
+                    print_sanitized_ascii(entry.name(), 48);
+                    print_str(b"\"");
+                }
+            }
+            print_str(b"\n");
+        }
+        print_str(b"[pnp-install-parent-wait] matching/shown=");
+        print_u64(matching as u64);
+        print_str(b"/");
+        print_u64(matching.min(8) as u64);
+        print_str(b"\n");
+    }
+
     pub(crate) fn rpc_op6_client_key(
         &self, pi: usize, file_id: u64,
     ) -> Option<nt_hosted_runtime::RpcClientKey> {
