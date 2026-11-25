@@ -237,12 +237,16 @@ pub(super) unsafe fn fold_system_wal_native() -> Result<bool, u32> {
         return Err(snapshot_storage::BUSY);
     }
     let lease = snapshot_storage::acquire()?;
-    let manifest = snapshot_storage::cached_wal_manifest(&lease).map_err(block)?;
-    let prepared = crate::config_manager_prepare_system_hive_checkpoint()
-        .map_err(|status| status as u32)?;
-    if prepared.is_none() && SYSTEM_WAL_FOLD_REQUIRED.load(Ordering::Acquire) {
-        return Err(block(nt_fs::STATUS_DATA_ERROR));
-    }
+    let manifest = snapshot_storage::cached_wal_manifest(&lease).map_err(|status| {
+        block(report_fold_failure(b"cached-manifest-native", status))
+    })?;
+    let prepared = if SYSTEM_WAL_FOLD_REQUIRED.load(Ordering::Acquire) {
+        Some(crate::config_manager_prepare_system_hive_checkpoint_for_restored_wal()
+            .map_err(|status| status as u32)?)
+    } else {
+        crate::config_manager_prepare_system_hive_checkpoint()
+            .map_err(|status| status as u32)?
+    };
     if prepared.is_none() && manifest.base_serial == manifest.high_water_serial {
         return Ok(false);
     }

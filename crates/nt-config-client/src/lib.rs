@@ -2330,12 +2330,33 @@ impl<B: Backend> ConfigClient<B> {
         &mut self,
         expected_generation: u64,
     ) -> Result<Option<PreparedSystemHiveCheckpoint>, i32> {
+        self.prepare_system_hive_checkpoint_with_operation(
+            expected_generation, hive_checkpoint_transfer::BEGIN,
+        )
+    }
+
+    /// Capture the exact composed SYSTEM image for a volume fold whose verified restored WAL
+    /// suffix predates this CM mount. A clean CM dirty set does not remove that durable demand.
+    pub fn prepare_system_hive_checkpoint_for_restored_wal(
+        &mut self,
+        expected_generation: u64,
+    ) -> Result<PreparedSystemHiveCheckpoint, i32> {
+        self.prepare_system_hive_checkpoint_with_operation(
+            expected_generation, hive_checkpoint_transfer::BEGIN_RESTORED_WAL_FOLD,
+        )?.ok_or(STATUS_INVALID_PARAMETER)
+    }
+
+    fn prepare_system_hive_checkpoint_with_operation(
+        &mut self,
+        expected_generation: u64,
+        begin_operation: u16,
+    ) -> Result<Option<PreparedSystemHiveCheckpoint>, i32> {
         if expected_generation == 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let mut chunk = [0u8; CM_HIVE_CHECKPOINT_CHUNK_BYTES];
         let begin = self.hive_checkpoint_call(
-            hive_checkpoint_transfer::BEGIN,
+            begin_operation,
             0,
             expected_generation,
             0,

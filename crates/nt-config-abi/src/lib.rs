@@ -260,6 +260,9 @@ pub mod hive_checkpoint_transfer {
     /// Acknowledge that the complete image atomically replaced its durable primary and log.
     pub const ACK: u16 = 3;
     pub const ABORT: u16 = 4;
+    /// The volume owner verified a restored SYSTEM WAL suffix and needs its exact composed CM
+    /// image folded into both snapshot slots, even if CM has no new dirty sequence this boot.
+    pub const BEGIN_RESTORED_WAL_FOLD: u16 = 5;
 }
 
 /// Operation encoded in one [`CmHiveMutationRecord`].
