@@ -7,9 +7,13 @@ use nt_fs::{AsyncSnapshotCommit, AsyncSnapshotIoKind, AsyncSnapshotRequest};
 type Commit = AsyncSnapshotCommit<snapshot_capture::CapturedSnapshot>;
 
 enum Work {
-    Rechecking { id: u64 },
+    Rechecking { id: u64, started_ticks: u64, start_after_print: bool, trace: bool },
     Committing {
         id: u64,
+        started_ticks: u64,
+        start_after_print: bool,
+        trace: bool,
+        write_sectors: u64,
         lease: snapshot_storage::Lease,
         token: nt_fs::RegistryWalContinuation,
         commit: Commit,
@@ -23,6 +27,23 @@ enum Work {
 }
 
 static mut WORK: Option<Work> = None;
+static CHECKPOINT_MEASURES: AtomicU64 = AtomicU64::new(0);
+static CHECKPOINT_MEASURE_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn reserve_trace() -> bool {
+    const LIMIT: u64 = 2048;
+    CHECKPOINT_MEASURES.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        |used| (used < LIMIT).then_some(used + 1)).is_ok()
+}
+
+fn trace_started(id: u64, epoch: u64, trace: bool) {
+    if trace {
+        print_str(b"[writable-fs-checkpoint-measure] begin id/epoch=");
+        print_u64(id); print_str(b"/"); print_u64(epoch); print_str(b"\n");
+    } else if !CHECKPOINT_MEASURE_LIMIT_REPORTED.swap(true, Ordering::AcqRel) {
+        print_str(b"[writable-fs-checkpoint-measure] trace-limit-exhausted=2048\n");
+    }
+}
 
 pub(super) unsafe fn print_quiesce_owner() {
     let work = (&*core::ptr::addr_of!(WORK)).as_ref();
@@ -34,7 +55,7 @@ pub(super) unsafe fn print_quiesce_owner() {
         Some(Work::Done { .. }) => b"done",
     });
     let (id, lease, entered, failed) = match work {
-        Some(Work::Rechecking { id }) => (*id, false, false, false),
+        Some(Work::Rechecking { id, .. }) => (*id, false, false, false),
         Some(Work::Committing { id, entered, failed, .. }) =>
             (*id, true, *entered, *failed),
         Some(Work::Done { .. }) | None => (0, false, false, false),
@@ -49,7 +70,7 @@ pub(super) unsafe fn print_quiesce_owner() {
 pub(super) unsafe fn progress() -> super::CheckpointProgress {
     match (&*core::ptr::addr_of!(WORK)).as_ref() {
         None => (0, 0, 0),
-        Some(Work::Rechecking { id }) => (1, *id, 0),
+        Some(Work::Rechecking { id, .. }) => (1, *id, 0),
         Some(Work::Committing { id, settled, .. }) => (2, *id, *settled),
         Some(Work::Done { generation, .. }) => (3, *generation, 0),
     }
@@ -68,8 +89,10 @@ fn block(status: u32) -> u32 {
 unsafe fn advance_recheck() -> Result<(), u32> {
     let _durable = crate::allocator::enter_durable();
     let slot = &mut *core::ptr::addr_of_mut!(WORK);
-    let Some(Work::Rechecking { id }) = slot.as_ref() else { return Ok(()); };
-    let id = *id;
+    let Some(Work::Rechecking { id, started_ticks, start_after_print, trace }) = slot.as_ref()
+        else { return Ok(()); };
+    let (id, started_ticks, start_after_print, trace) =
+        (*id, *started_ticks, *start_after_print, *trace);
     let Some((lease, token, proof)) = snapshot_storage::take_rechecked_wal_continuation(id)?
         else { return Err(snapshot_storage::BUSY); };
     let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
@@ -106,8 +129,8 @@ unsafe fn advance_recheck() -> Result<(), u32> {
     };
     commit.set_max_batch_sectors(crate::driver_launch::native_storage_transfer_sectors())
         .expect("a fresh snapshot commit has no request in flight");
-    *slot = Some(Work::Committing { id, lease, token,
-        commit, bytes, entered: false, failed: false, settled: 0 });
+    *slot = Some(Work::Committing { id, started_ticks, start_after_print, trace, write_sectors: 0,
+        lease, token, commit, bytes, entered: false, failed: false, settled: 0 });
     Ok(())
 }
 
@@ -139,14 +162,26 @@ pub(super) unsafe fn checkpoint_dirty_native() -> Result<bool, u32> {
     let id = snapshot_storage::begin_wal_continuation_recheck()?;
     WRITABLE_FS_SNAPSHOT_DIRTY.store(false, Ordering::Release);
     super::note_checkpoint_begun();
-    *slot = Some(Work::Rechecking { id });
+    let started_ticks = crate::disk_census_ticks();
+    let epoch = super::checkpoint_epochs().0;
+    let trace = reserve_trace();
+    *slot = Some(Work::Rechecking { id, started_ticks, start_after_print: false, trace });
+    trace_started(id, epoch, trace);
+    if let Some(Work::Rechecking { id: retained_id, started_ticks,
+        start_after_print, .. }) = (&mut *core::ptr::addr_of_mut!(WORK)).as_mut()
+    {
+        if *retained_id == id {
+            *started_ticks = crate::disk_census_ticks();
+            *start_after_print = true;
+        }
+    }
     Err(snapshot_storage::BUSY)
 }
 
 /// The header recheck this checkpoint is waiting on, while it is rechecking.
 pub(super) unsafe fn recheck_id() -> Option<u64> {
     match (&*core::ptr::addr_of!(WORK)).as_ref() {
-        Some(Work::Rechecking { id }) => Some(*id),
+        Some(Work::Rechecking { id, .. }) => Some(*id),
         _ => None,
     }
 }
@@ -160,7 +195,7 @@ pub(super) unsafe fn holds_reserve() -> bool {
 /// This checkpoint holds the snapshot reserve and has work only the outer owner may claim.
 pub(super) unsafe fn outer_io_queued() -> bool {
     match (&*core::ptr::addr_of!(WORK)).as_ref() {
-        Some(Work::Rechecking { id }) => snapshot_storage::header_outer_io_queued(*id),
+        Some(Work::Rechecking { id, .. }) => snapshot_storage::header_outer_io_queued(*id),
         Some(Work::Committing { commit, entered, failed, .. }) =>
             !*entered && !*failed && commit.pending().is_none() && !commit.is_done(),
         Some(Work::Done { .. }) | None => false,
@@ -246,7 +281,8 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
 {
     use super::native_snapshot_io::SnapshotCompletion;
     let slot = &mut *core::ptr::addr_of_mut!(WORK);
-    let Some(Work::Committing { id, commit, entered, failed, settled, .. }) = slot.as_mut()
+    let Some(Work::Committing { id, lease, commit, entered, failed, settled,
+        write_sectors, .. }) = slot.as_mut()
         else { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); };
     if *id != ticket.id || !*entered || *failed || commit.pending() != Some(ticket.request) {
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
@@ -261,10 +297,17 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
         *failed = true;
         return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DEVICE_NOT_READY)));
     }
+    if ticket.request.kind == AsyncSnapshotIoKind::Write {
+        let sector_size = lease.sector_size();
+        *write_sectors = write_sectors.saturating_add(
+            (ticket.request.bytes / sector_size) as u64);
+    }
     *entered = false;
     *settled += 1;
     if !commit.is_done() { return Ok(SnapshotCompletion::Settled); }
-    let Some(Work::Committing { lease, token, commit, bytes, .. }) = slot.take()
+    let Some(Work::Committing { lease, token, commit, bytes, started_ticks,
+        start_after_print, trace,
+        write_sectors, .. }) = slot.take()
         else { unreachable!() };
     // Every cursor completion above came from exact native provider terminal + ACK.
     let (generation, pair) = match unsafe { commit.finish_with_paired_proof() } {
@@ -291,5 +334,16 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
     drop(lease);
     super::note_checkpoint_published();
     *slot = Some(Work::Done { generation, bytes });
+    // Rechecking was installed before its begin print. A matching owner refreshes its clock
+    // afterward; a reentrant owner retains the earlier safe clock and reports that fact.
+    let elapsed_ticks = crate::disk_census_ticks().wrapping_sub(started_ticks);
+    if trace {
+        print_str(b"[writable-fs-checkpoint-measure] published id/generation/bytes/write-sectors/elapsed-tsc/start-after-begin-print=");
+        for value in [ticket.id, generation, bytes as u64, write_sectors, elapsed_ticks,
+            u64::from(start_after_print)] {
+            print_str(b"/"); print_u64(value);
+        }
+        print_str(b"\n");
+    }
     Ok(SnapshotCompletion::Settled)
 }

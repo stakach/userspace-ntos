@@ -4842,18 +4842,18 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
 fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
     use crate::volume_checkpoint_deferral::Outcome;
     use crate::volume_lazy_flush::episode_traced;
-    let caller_required = nt_handler.writable_fs_commit_required;
+    let required_at_entry = nt_handler.writable_fs_commit_required;
     owe_lazy_volume_checkpoint(nt_handler);
-    let checkpoint_status = match publish_required_dirty_volume(nt_handler) {
+    let checkpoint_status = match publish_required_dirty_volume(nt_handler, required_at_entry) {
         Ok(status) => status,
         Err(status) => return status,
     };
-    // NT's lazy writer leaves a deferred flush dirty for its next scan; only a caller waiting
-    // for durability, or a mount an uncertain write has blocked, turns a refusal into a fault.
+    // NT's lazy writer leaves a deferred flush dirty for its next scan. A requirement already
+    // present at entry, or a mount blocked by an uncertain write, turns refusal into a fault.
     let retry_lazily = |nt_handler: &mut ExecNtHandler, status: u32| {
         use crate::volume_lazy_flush::{classify_failed_checkpoint, FailedCheckpoint};
         let lazy_only = classify_failed_checkpoint(
-            caller_required,
+            required_at_entry,
             crate::writable_fs::system_wal_fold_blocked(),
         ) == FailedCheckpoint::RetryLazily;
         if lazy_only {
@@ -4919,6 +4919,8 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
 /// Open interval of the lazy volume flush, as [`crate::volume_lazy_flush::LazyFlush`] raw.
 /// The lazy flush owed the checkpoint now in flight; its publication is traced as lazy.
 static VOLUME_LAZY_FLUSH_OWED: AtomicBool = AtomicBool::new(false);
+static CHECKPOINT_TRIGGER_MEASURES: AtomicU64 = AtomicU64::new(0);
+static CHECKPOINT_TRIGGER_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
 static VOLUME_LAZY_FLUSH: AtomicU64 =
     AtomicU64::new(crate::volume_lazy_flush::LazyFlush::new().into_raw());
 
@@ -4951,9 +4953,11 @@ pub(crate) fn volume_lazy_flush_deadline() -> Option<u64> {
 }
 
 /// Preserve dirty-state and commit requirements until the volume snapshot is durable.
-fn publish_required_dirty_volume(nt_handler: &mut ExecNtHandler) -> Result<u32, u32> {
+fn publish_required_dirty_volume(nt_handler: &mut ExecNtHandler,
+    required_at_entry: bool) -> Result<u32, u32> {
     let writable_fs_mount_dirty = crate::writable_fs::take_mount_dirty();
     let writable_fs_runtime_dirty = crate::writable_fs::take_runtime_dirty();
+    let handler_dirty = nt_handler.writable_fs_dirty;
     let writable_fs_touched =
         nt_handler.writable_fs_dirty || writable_fs_mount_dirty || writable_fs_runtime_dirty;
     let mut checkpoint_status = nt_fs::STATUS_SUCCESS;
@@ -4967,11 +4971,40 @@ fn publish_required_dirty_volume(nt_handler: &mut ExecNtHandler) -> Result<u32, 
             }
         }
         if nt_handler.writable_fs_commit_required {
+            let lazy_owed = VOLUME_LAZY_FLUSH_OWED.load(Ordering::Acquire);
+            let begun_before = crate::writable_fs::checkpoint_epochs().0;
             let checkpoint_result = {
                 let _transient = allocator::enter_transient();
                 let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
                 unsafe { crate::writable_fs::checkpoint_dirty_volume() }
             };
+            let begun_after = crate::writable_fs::checkpoint_epochs().0;
+            if begun_after != begun_before {
+                const LIMIT: u64 = 2048;
+                if CHECKPOINT_TRIGGER_MEASURES.fetch_update(Ordering::AcqRel,
+                    Ordering::Acquire, |used| (used < LIMIT).then_some(used + 1)).is_ok()
+                {
+                    // The required bit may come from a prior lazy retry or a caller.
+                    // These flags identify the service boundary, not a unique mutator.
+                    // Cumulative operation counters let a log compare each checkpoint with
+                    // the previous one without claiming a mixed interval was hive-only.
+                    print_str(b"[writable-fs-checkpoint-trigger] epoch/required-at-entry/lazy-owed/handler-dirty/mount-dirty/runtime-dirty/hive-boot/hive-dynamic/create/read/write/set-info=");
+                    for value in [begun_after, u64::from(required_at_entry),
+                        u64::from(lazy_owed), u64::from(handler_dirty),
+                        u64::from(writable_fs_mount_dirty), u64::from(writable_fs_runtime_dirty),
+                        REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.load(Ordering::Relaxed),
+                        REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS.load(Ordering::Relaxed),
+                        crate::writable_fs::OVERLAY_CREATES.load(Ordering::Relaxed),
+                        crate::writable_fs::OVERLAY_READS.load(Ordering::Relaxed),
+                        crate::writable_fs::OVERLAY_WRITES.load(Ordering::Relaxed),
+                        crate::writable_fs::OVERLAY_SET_INFO.load(Ordering::Relaxed)] {
+                        print_str(b"/"); print_u64(value);
+                    }
+                    print_str(b"\n");
+                } else if !CHECKPOINT_TRIGGER_LIMIT_REPORTED.swap(true, Ordering::AcqRel) {
+                    print_str(b"[writable-fs-checkpoint-trigger] trace-limit-exhausted=2048\n");
+                }
+            }
             checkpoint_status = checkpoint_result.err().unwrap_or(nt_fs::STATUS_SUCCESS);
             if checkpoint_status == nt_fs::STATUS_SUCCESS {
                 if checkpoint_result == Ok(true) {
