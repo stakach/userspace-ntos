@@ -7,6 +7,9 @@ use crate::file_delta_wal_payload::{
     decode_file_delta_wal_payload, FileDeltaWalPayload, FileDeltaWalPayloadError,
     FILE_DELTA_MAGIC,
 };
+use crate::file_create_wal_payload::{
+    decode_file_create_wal_payload, FileCreateWalPayload, FILE_CREATE_MAGIC,
+};
 
 const SYSTEM_MAGIC: &[u8; 8] = b"CMWAL001";
 const SYSTEM_HIVE_LOG_MAGIC: &[u8; 4] = b"HLR1";
@@ -73,6 +76,7 @@ pub enum VolumeWalPayload<'a> {
     System(&'a [u8]),
     HiveLog(HiveLogWalPayload<'a>),
     FileDelta(FileDeltaWalPayload<'a>),
+    FileCreate(FileCreateWalPayload<'a>),
 }
 
 pub(crate) fn validate_hive_log(record: HiveLogWalPayload<'_>) -> Result<(), VolumeWalPayloadError> {
@@ -126,6 +130,9 @@ pub fn decode_volume_wal_payload(bytes: &[u8]) -> Result<VolumeWalPayload<'_>, V
         return decode_file_delta_wal_payload(bytes)
             .map(VolumeWalPayload::FileDelta)
             .map_err(VolumeWalPayloadError::from);
+    }
+    if bytes.starts_with(FILE_CREATE_MAGIC) {
+        return decode_file_create_wal_payload(bytes).map(VolumeWalPayload::FileCreate);
     }
     if !bytes.starts_with(HIVE_LOG_MAGIC) {
         return Err(VolumeWalPayloadError::UnknownKind);

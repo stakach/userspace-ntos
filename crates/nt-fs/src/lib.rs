@@ -58,6 +58,8 @@ mod registry_wal_store;
 mod hive_wal_publication;
 mod volume_wal_payload;
 mod file_delta_wal_payload;
+mod file_create_wal_payload;
+mod volume_wal_sequence;
 #[cfg(test)]
 mod snapshot_test_device;
 mod status;
@@ -155,6 +157,9 @@ pub use file_delta_wal_payload::{
     changed_file_delta_extents, decode_file_delta_wal_payload, encode_file_delta_wal_payload,
     FileDeltaExtent, FileDeltaRecord, FileDeltaReplayCursor, FileDeltaWalPayload,
     FileDeltaWalPayloadError, FileDeltaWalReplayError, FILE_DELTA_BLOCK_BYTES,
+};
+pub use file_create_wal_payload::{
+    decode_file_create_wal_payload, encode_file_create_wal_payload, FileCreateWalPayload,
 };
 mod snapshot_baseline_repair;
 pub use snapshot_baseline_repair::WalSnapshotBaselineRepair;

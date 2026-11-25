@@ -1750,6 +1750,10 @@ fn verified_boot_log(
                         _ => nt_fs::STATUS_DATA_ERROR,
                     }))?;
             }
+            // The namespace producer and its boot admission are not yet native-owned.
+            nt_fs::VolumeWalPayload::FileCreate(_) => {
+                return Err(BootSystemRestoreError::Snapshot(nt_fs::STATUS_DATA_ERROR));
+            }
         }
     }
     let wal_suffix = first_sequence.zip(last_sequence).map(|(first_sequence, last_sequence)| {

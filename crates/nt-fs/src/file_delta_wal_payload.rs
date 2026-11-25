@@ -8,6 +8,7 @@
 //! producer remains disabled until its durable ownership contract is complete.
 
 use alloc::vec::Vec;
+pub use crate::volume_wal_sequence::VolumeWalReplayCursor as FileDeltaReplayCursor;
 
 pub(crate) const FILE_DELTA_MAGIC: &[u8; 8] = b"NTFDLT01";
 const HEADER_BYTES: usize = 48;
@@ -87,30 +88,6 @@ impl<'a> FileDeltaWalPayload<'a> {
             consumed += len;
             FileDeltaExtent { offset, bytes }
         })
-    }
-}
-
-/// Admits file deltas only in their recorded order. The first record of a replayed suffix
-/// sets the position, because an earlier prefix may already be folded into the snapshot.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FileDeltaReplayCursor {
-    last: Option<u64>,
-}
-
-impl FileDeltaReplayCursor {
-    pub fn new() -> Self { Self::default() }
-
-    pub fn last_applied(&self) -> Option<u64> { self.last }
-
-    pub(crate) fn admits(&self, sequence: u64) -> bool {
-        match self.last {
-            None => sequence != 0,
-            Some(last) => last.checked_add(1) == Some(sequence),
-        }
-    }
-
-    pub(crate) fn advance(&mut self, sequence: u64) {
-        self.last = Some(sequence);
     }
 }
 
