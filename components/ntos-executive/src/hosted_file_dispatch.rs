@@ -258,6 +258,34 @@ enum FileExecuteProgress {
     ChildWorkYield(FileDispatchContinuation),
 }
 
+/// The native proof's exact invocation can still return a certain no-entry result. Keep its
+/// canonical IRP and the rejecting adapter boundary visible until #511 is resolved.
+fn trace_scsi_proof_invoke_refusal(
+    stage: &[u8], projection: &IrpProjection, instance: usize,
+    route_instance: Option<usize>, status: nt_status::NtStatus,
+) {
+    let IoParameters::Scsi(parameters) = &projection.parameters else { return; };
+    let Some(active) = (unsafe { pending_scsi_proof_slot() }) else { return; };
+    if active.irp_id != Some(projection.irp_id)
+        || active.authority.child_pdo != projection.device_id.raw()
+    { return; }
+    static TRACED: AtomicU64 = AtomicU64::new(0);
+    if TRACED.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+        |used| (used < 16).then_some(used + 1)).is_err()
+    { return; }
+    print_str(b"[native-disk-proof-invoke] stage="); print_str(stage);
+    print_str(b" irp/pdo/driver/instance/route/provider/cookie/generation/status=");
+    print_u64(projection.irp_id.raw()); print_str(b"/");
+    print_u64(projection.device_id.raw()); print_str(b"/");
+    print_u64(projection.driver_id.raw()); print_str(b"/");
+    print_u64(instance as u64); print_str(b"/");
+    print_u64(route_instance.map_or(u64::MAX, |route| route as u64));
+    print_str(b"/"); print_u64(parameters.route.provider.domain_id.raw());
+    print_str(b"/"); print_u64(parameters.route.provider.cookie);
+    print_str(b"/"); print_u64(parameters.route.relation_generation);
+    print_str(b"/"); print_hex(status.raw() as u32); print_str(b"\n");
+}
+
 /// An owned File caller's invocation: a pump that stops unfinished stays with the caller's
 /// File row as a continuation, which a later root boundary resumes (#420).
 pub(super) fn invoke_retaining(
@@ -901,18 +929,25 @@ fn prepare_dispatch_request(
 ) -> Result<(IrpDispatchRequest, usize, DriverInstance, u64), nt_status::NtStatus> {
     let mut request = hosted_irp_dispatch_request(
         instance_index, projection, input_len, output_len,
-    )?;
+    ).map_err(|status| {
+        trace_scsi_proof_invoke_refusal(b"encode-request", projection,
+            instance_index, None, status);
+        status
+    })?;
     if capture == ExternalFileIrpOutputCapture::BufferedDeviceControlCapacity {
         request._reserved0 = nt_io_abi::IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY;
         if !nt_io_abi::valid_buffered_output_capacity_dispatch(&request) {
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
     }
+    let route = hosted_driver_device_route_by_device_id_for_irp(
+        projection.device_id.raw(), Some(projection.irp_id),
+    );
     let Some((route_instance, route_inst, device_object)) =
-        hosted_driver_device_route_by_device_id_for_irp(
-            projection.device_id.raw(), Some(projection.irp_id),
-        ).filter(|(index, _, _)| *index == instance_index)
+        route.filter(|(index, _, _)| *index == instance_index)
     else {
+        trace_scsi_proof_invoke_refusal(b"resolve-route", projection, instance_index,
+            route.map(|(index, _, _)| index), nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
     Ok((request, route_instance, route_inst, device_object))
@@ -991,6 +1026,8 @@ fn execute_retaining(
     let mut tail = ExecuteTail::none(instance_index, projection.irp_id.raw(), projection.major,
         route_instance, route_inst);
     if let Err(status) = tail.reserve_scsi_data(&request, projection) {
+        trace_scsi_proof_invoke_refusal(b"reserve-dma", projection, instance_index,
+            Some(route_instance), status);
         return FileExecuteProgress::Returned(HostedIrpTransportResult::NotDispatched { status });
     }
     let progress = unsafe {
@@ -1011,8 +1048,13 @@ fn execute_retaining(
         )
     };
     match progress {
-        HostedIrpDispatchProgress::Returned(result) =>
-            FileExecuteProgress::Returned(tail.finish(result)),
+        HostedIrpDispatchProgress::Returned(result) => {
+            if let Some(HostedIrpTransportResult::NotDispatched { status }) = result {
+                trace_scsi_proof_invoke_refusal(b"native-not-dispatched", projection,
+                    instance_index, Some(route_instance), status);
+            }
+            FileExecuteProgress::Returned(tail.finish(result))
+        }
         HostedIrpDispatchProgress::ChildWorkYield(native) =>
             FileExecuteProgress::ChildWorkYield(FileDispatchContinuation {
                 native, instance_index, capture, mode: FilePumpMode::Retained,
