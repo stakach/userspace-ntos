@@ -283,10 +283,25 @@ fn done_retires_the_executor_and_a_reused_slot_gets_a_new_generation() {
 fn unknown_and_stale_handles_are_refused() {
     let root = Root::new(2, 1);
     let known = root.executors[0];
-    let beyond = ExecutorHandle { index: 1, generation: known.generation() };
-    let stale = ExecutorHandle { index: 0, generation: known.generation() + 1 };
+    let beyond = ExecutorHandle { index: 1, ..known };
+    let stale = ExecutorHandle { generation: known.generation() + 1, ..known };
     assert_eq!(root.table.state(beyond), Err(ExecutorError::NotFound));
     assert_eq!(root.table.state(stale), Err(ExecutorError::StaleGeneration));
+}
+
+#[test]
+fn another_tables_handle_cannot_name_this_tables_executor() {
+    let first = Root::new(1, 1);
+    let second = Root::new(1, 1);
+    let first_handle = first.executors[0];
+    let second_handle = second.executors[0];
+
+    // Both tables start with slot zero, generation one. Slot coordinates alone are not
+    // authority to inspect or route to an executor owned by another table.
+    assert_eq!(first_handle.index(), second_handle.index());
+    assert_eq!(first_handle.generation(), second_handle.generation());
+    assert_eq!(first.table.state(second_handle), Err(ExecutorError::WrongTable));
+    assert_eq!(second.table.state(first_handle), Err(ExecutorError::WrongTable));
 }
 
 #[test]
@@ -365,7 +380,9 @@ fn another_tables_run_cannot_yield_this_tables_running_executor() {
     let run = root.resume(Unrouted);
     let foreign = other.resume(Unrouted);
     // Both tables issued the same slot and generation; only the table identity differs.
-    assert_eq!(foreign.executor(), run.executor());
+    assert_eq!(foreign.executor().index(), run.executor().index());
+    assert_eq!(foreign.executor().generation(), run.executor().generation());
+    assert_ne!(foreign.executor(), run.executor());
 
     let (error, foreign) = root.table.accept_yield(foreign, Idle).unwrap_err();
     assert_eq!(error, ExecutorError::WrongTable);
