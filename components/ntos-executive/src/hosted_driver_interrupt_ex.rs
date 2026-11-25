@@ -67,14 +67,7 @@ pub(super) extern "win64" fn s_io_connect_interrupt_ex(parameters: u64) -> i32 {
         return STATUS_INVALID_PARAMETER;
     };
     let version: u32 = unsafe { field(parameters, 0) };
-    let sh = unsafe { hosted_component_resource_shared_va() };
     let pdo: u64 = full_field!(fields, pdo, u64);
-    let granted_pdo = unsafe {
-        read_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *const u64)
-    };
-    if pdo != 0 && pdo != granted_pdo {
-        return STATUS_INVALID_PARAMETER;
-    }
     match version {
         CONNECT_FULLY_SPECIFIED | CONNECT_FULLY_SPECIFIED_GROUP => {
             let group: u16 = if version == CONNECT_FULLY_SPECIFIED_GROUP {
@@ -86,7 +79,7 @@ pub(super) extern "win64" fn s_io_connect_interrupt_ex(parameters: u64) -> i32 {
                 // The hosted grant exposes one 64-bit processor group only.
                 return STATUS_NOT_SUPPORTED;
             }
-            s_io_connect_interrupt(
+            s_io_connect_interrupt_selected(
                 full_field!(fields, interrupt_object_out, u64) as *mut u64,
                 full_field!(fields, service_routine, u64),
                 full_field!(fields, service_context, u64),
@@ -98,40 +91,31 @@ pub(super) extern "win64" fn s_io_connect_interrupt_ex(parameters: u64) -> i32 {
                 full_field!(fields, share_vector, u8),
                 full_field!(fields, affinity, u64),
                 full_field!(fields, floating_save, u8),
+                pdo,
+                false,
             )
         }
         CONNECT_LINE_BASED => {
-            if pdo == 0 || granted_pdo == 0 {
+            if pdo == 0 {
                 return STATUS_INVALID_PARAMETER;
             }
-            let vector = unsafe {
-                read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32)
-            };
-            let affinity = unsafe {
-                read_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64)
-            };
-            let policy = unsafe {
-                read_volatile((sh + SH_RESOURCE_INTERRUPT_POLICY) as *const u64)
-            };
-            let irql = policy as u8;
+            // The line-based union ends after FloatingSave; it has no ShareVector
+            // field. Root supplies sharing policy from the selected PDO grant.
             let requested_sync_irql: u8 = full_field!(fields, synchronize_irql, u8);
-            let synchronize_irql = if requested_sync_irql == 0 {
-                irql
-            } else {
-                requested_sync_irql
-            };
-            s_io_connect_interrupt(
+            s_io_connect_interrupt_selected(
                 full_field!(fields, interrupt_object_out, u64) as *mut u64,
                 full_field!(fields, service_routine, u64),
                 full_field!(fields, service_context, u64),
                 full_field!(fields, spin_lock, u64),
-                vector,
-                irql,
-                synchronize_irql,
-                ((policy >> 8) & 0xff) as u32,
-                ((policy >> 16) & 0xff) as u8,
-                if affinity == 0 { 1 } else { affinity },
+                0,
+                0,
+                requested_sync_irql,
+                0,
+                0,
+                0,
                 full_field!(fields, floating_save, u8),
+                pdo,
+                true,
             )
         }
         _ => STATUS_NOT_SUPPORTED,
@@ -148,21 +132,11 @@ pub(super) extern "win64" fn s_io_disconnect_interrupt_ex(parameters: u64) {
     if !matches!(version, CONNECT_FULLY_SPECIFIED | CONNECT_LINE_BASED | CONNECT_FULLY_SPECIFIED_GROUP) {
         unsafe { crate::provider_bugcheck::report(0xc4, [0x49524458, parameters, version as u64, 1]) }
     }
-    let sh = unsafe { hosted_component_resource_shared_va() };
     let connection: u64 = unsafe { field(parameters, 8) };
     if connection == 0 {
         return;
     }
-    let active = unsafe {
-        read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64)
-    };
-    if connection != active {
-        unsafe { crate::provider_bugcheck::report(0xc4, [0x49524458, connection, active, 2]) }
-    }
-    s_io_disconnect_interrupt(connection);
-    if unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64) }
-        == connection
-    {
+    if !disconnect_hosted_interrupt(connection) {
         unsafe { crate::provider_bugcheck::report(0xc4, [0x49524458, connection, version as u64, 3]) }
     }
 }

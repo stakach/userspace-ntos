@@ -19,14 +19,21 @@ mod interrupt_projection;
 
 pub(super) unsafe fn provision_interrupt_projection(
     inst: DriverInstance, binding: HostedDeviceBinding,
+    grant: HostedInterruptGrantIdentity,
 ) -> Result<(u64, u64), nt_status::NtStatus> {
-    interrupt_projection::provision(inst, binding)
+    interrupt_projection::provision(inst, binding, grant)
 }
 
 pub(super) unsafe fn validate_interrupt_projection(
     inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
 ) -> Result<(), nt_status::NtStatus> {
     interrupt_projection::validate(inst, binding, address)
+}
+
+pub(super) unsafe fn prepared_interrupt_projection_owner(
+    inst: DriverInstance, address: u64,
+) -> Result<(HostedDeviceBinding, HostedInterruptGrantIdentity, u64), nt_status::NtStatus> {
+    interrupt_projection::prepared_owner(inst, address)
 }
 
 pub(super) unsafe fn has_live_interrupt_projection_for_binding(

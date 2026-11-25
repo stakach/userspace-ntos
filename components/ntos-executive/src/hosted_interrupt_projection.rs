@@ -5,6 +5,7 @@ use super::*;
 struct Projection {
     instance: DriverInstance,
     binding: HostedDeviceBinding,
+    grant: HostedInterruptGrantIdentity,
     allocation: SourcePoolAllocationIdentity,
     phase: ProjectionPhase,
 }
@@ -61,6 +62,29 @@ pub(super) unsafe fn has_live_for_binding(
     Ok(found)
 }
 
+/// Recover the provisioned owner from the exact physical allocation, never from the lane bank.
+/// EffectStarted is intentionally not connectable again after an uncertain native effect.
+pub(super) unsafe fn prepared_owner(
+    inst: DriverInstance,
+    address: u64,
+) -> Result<(HostedDeviceBinding, HostedInterruptGrantIdentity, u64), nt_status::NtStatus> {
+    let _catalog = lock();
+    let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    let mut found = None;
+    for row in projections().iter().filter(|row| {
+        same_arena(row.instance, inst) && row.allocation.component_address == address
+    }) {
+        if found.is_some() || row.phase != ProjectionPhase::Prepared
+            || allocation(inst, address)? != row.allocation
+        {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        found = Some((row.binding, row.grant, row.allocation.pool_generation));
+    }
+    found.ok_or(nt_status::NtStatus::INVALID_HANDLE)
+}
+
 fn row_index(inst: DriverInstance, binding: HostedDeviceBinding, address: u64) -> Option<usize> {
     projections().iter().position(|row| {
         same_arena(row.instance, inst)
@@ -73,6 +97,7 @@ fn row_index(inst: DriverInstance, binding: HostedDeviceBinding, address: u64) -
 pub(super) unsafe fn provision(
     inst: DriverInstance,
     binding: HostedDeviceBinding,
+    grant: HostedInterruptGrantIdentity,
 ) -> Result<(u64, u64), nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let _catalog = lock();
@@ -85,12 +110,9 @@ pub(super) unsafe fn provision(
         if !same_arena(row.instance, inst) {
             return Err(nt_status::NtStatus::ACCESS_DENIED);
         }
-        return if row.phase == ProjectionPhase::Prepared
-            && allocation(inst, row.allocation.component_address)? == row.allocation {
-            Ok((row.allocation.component_address, row.allocation.pool_generation))
-        } else {
-            Err(nt_status::NtStatus::DEVICE_BUSY)
-        };
+        // The pointer may already have escaped. A repeated PROVISION must not replay or
+        // reuse it, even if the first reply was lost before CONNECT.
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     projections().try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
@@ -101,13 +123,13 @@ pub(super) unsafe fn provision(
     let exec = inst.exec_pool_va + address - FSD_POOL_VADDR;
     core::ptr::write_bytes(exec as *mut u8, 0, HOSTED_KINTERRUPT_SIZE as usize);
     projections().push(Projection {
-        instance: inst, binding, allocation: identity,
+        instance: inst, binding, grant, allocation: identity,
         phase: ProjectionPhase::Prepared,
     });
     Ok((address, identity.pool_generation))
 }
 
-/// Shared bytes can describe the callback, but never prove this projection's ownership.
+/// The allocation catalog, not driver-writable projection bytes, proves ownership.
 pub(super) unsafe fn validate(
     inst: DriverInstance,
     binding: HostedDeviceBinding,
@@ -126,7 +148,7 @@ pub(super) unsafe fn validate(
 }
 
 /// Record the first uncertain canonical effect before invoking the resource manager or IRQ
-/// installer. A replayed PROVISION can return only a still-Prepared row.
+/// installer. A repeated PROVISION is refused even while a row is Prepared.
 pub(super) unsafe fn mark_effect_started(
     inst: DriverInstance,
     binding: HostedDeviceBinding,

@@ -10,6 +10,11 @@ extern crate alloc;
 
 mod hosted_irq_arena;
 mod hosted_irq_bank;
+mod interrupt_grant_selection;
+pub use interrupt_grant_selection::{
+    select_interrupt_grant, InterruptGrant, InterruptGrantRequest, InterruptGrantScope,
+    InterruptGrantSelectionError,
+};
 mod hosted_irq_cr8_source;
 mod hosted_irq_call_stack;
 mod badge_census;

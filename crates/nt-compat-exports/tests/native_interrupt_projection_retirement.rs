@@ -39,7 +39,7 @@ fn assert_no_direct_pool_free(name: &str, explanation: &str) {
 #[test]
 fn disconnect_interrupt_retires_captured_projection_identity() {
     assert_no_direct_pool_free(
-        "s_io_disconnect_interrupt",
+        "disconnect_hosted_interrupt",
         "a driver can overwrite the shared active interrupt pointer; broker success for a \
          connection does not make that mutable pointer the exact allocation to free",
     );
@@ -76,7 +76,7 @@ fn replacing_a_retiring_interrupt_tombstones_its_old_projection_after_canonical_
         }
     }
     let mut replacement = Replacement(Vec::new());
-    replacement.visit_block(function(&source, "publish_hosted_interrupt_connection_from_shared"));
+    replacement.visit_block(function(&source, "publish_hosted_interrupt_connection_from_projection"));
     let position = |name: &str| replacement.0.iter().position(|call| call == name)
         .unwrap_or_else(|| panic!("replacement must call {name}"));
     assert!(position("admit_interrupt_projection_canonical_retirement")
@@ -93,7 +93,7 @@ fn replacing_a_retiring_interrupt_tombstones_its_old_projection_after_canonical_
 #[test]
 fn definite_interrupt_connect_refusals_tombstone_the_escaped_projection() {
     let source = syn::parse_file(DRIVER).expect("native driver source parses");
-    let body = function(&source, "publish_hosted_interrupt_connection_from_shared");
+    let body = function(&source, "publish_hosted_interrupt_connection_from_projection");
     struct Calls(Vec<String>);
     impl<'ast> Visit<'ast> for Calls {
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
