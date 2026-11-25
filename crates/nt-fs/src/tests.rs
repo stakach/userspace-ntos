@@ -4697,6 +4697,54 @@ fn setup_creates_and_saves_the_default_profile_hive_on_a_volume_without_one() {
     assert_eq!(nt_hive_core::image_root_subkey_count_if_valid(saved), Ok(1));
 }
 
+/// A replace target must survive if a different entry's short name blocks the source move.
+#[test]
+fn replacement_rename_short_name_collision_preserves_both_entries() {
+    const SOURCE: &str = r"\??\C:\source\old.dat";
+    const REPLACED: &str = r"\??\C:\target\new.dat";
+    const CONFLICT: &str = r"\??\C:\target\old~1.dat";
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(SOURCE, b"source"));
+    assert!(fs.provision_file(REPLACED, b"replaced"));
+    assert!(fs.provision_file(CONFLICT, b"other"));
+    let source = fs.zw_create_file(
+        SOURCE, DELETE | SYNCHRONIZE, 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
+    );
+    assert_eq!(source.status, STATUS_SUCCESS);
+    let source_id = fs.query_metadata(SOURCE).unwrap().file_id;
+    let replaced_id = fs.query_metadata(REPLACED).unwrap().file_id;
+    let short: alloc::vec::Vec<u16> = "OLD~1.DAT".encode_utf16().collect();
+    let mut information = alloc::vec![0u8; 4 + short.len() * 2];
+    information[..4].copy_from_slice(&((short.len() * 2) as u32).to_le_bytes());
+    for (index, unit) in short.iter().copied().enumerate() {
+        information[4 + index * 2..6 + index * 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    assert_eq!(
+        fs.zw_set_information_file(source.handle, FILE_SHORT_NAME_INFORMATION, &information),
+        STATUS_SUCCESS
+    );
+    let before = fs.export_volume_snapshot().unwrap();
+    let target: alloc::vec::Vec<u8> = r"\target\new.dat"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+
+    assert_eq!(
+        fs.zw_rename_file(source.handle, FileRenameRoot::VolumeRoot, &target, true),
+        STATUS_OBJECT_NAME_COLLISION
+    );
+    assert_eq!(fs.export_volume_snapshot().unwrap(), before);
+    assert_eq!(fs.query_metadata(SOURCE).unwrap().file_id, source_id);
+    assert_eq!(fs.query_metadata(REPLACED).unwrap().file_id, replaced_id);
+    assert_eq!(fs.file_bytes(SOURCE), Some(&b"source"[..]));
+    assert_eq!(fs.file_bytes(REPLACED), Some(&b"replaced"[..]));
+    assert_eq!(fs.file_bytes(CONFLICT), Some(&b"other"[..]));
+    assert_eq!(fs.zw_query_opened_name(source.handle).as_deref(), Some(r"\source\old.dat"));
+    assert_eq!(fs.zw_close(source.handle), STATUS_SUCCESS);
+}
+
 /// `MoveFileExW` renames through the File it opened, to a full volume path. These are the
 /// statuses FASTFAT's `FileRenameInformation` returns for each shape of target.
 #[test]
