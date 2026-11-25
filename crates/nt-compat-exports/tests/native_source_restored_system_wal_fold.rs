@@ -18,7 +18,7 @@ fn restored_system_wal_can_fold_a_clean_composed_cm_generation() {
         "boot");
     run_admission(native,
         "    let manifest = snapshot_storage::cached_wal_manifest(&lease)",
-        "    let id = snapshot_storage::begin_wal_continuation_recheck_with_lease(lease)?;",
+        "    let mount = *lease.identity();",
         "native");
 }
 
