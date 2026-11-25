@@ -307,7 +307,7 @@ pub(crate) static CONFIG_SOURCE_SOFTWARE_HIVE_OK: AtomicU64 = AtomicU64::new(0);
 static mut EXEC_WRITABLE_FS: Option<nt_fs::FileSystem> = None;
 static WRITABLE_FS_MOUNT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_RUNTIME_DIRTY: AtomicBool = AtomicBool::new(false);
-static WRITABLE_FS_SNAPSHOT_DIRTY: AtomicBool = AtomicBool::new(false);
+static SNAPSHOT_PUBLICATION: nt_fs::SnapshotPublicationState = nt_fs::SnapshotPublicationState::new();
 static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
 // A v2 fold may advance the global WAL base only after any SYSTEM suffix is represented by
 // an exact CM checkpoint image. Boot replay can leave such a suffix even before a new mutation.
@@ -333,12 +333,12 @@ pub(crate) unsafe fn storage_path() -> crate::volume_lazy_flush::StoragePath {
 
 /// Volume bytes that no begun checkpoint captures. The service loop publishes them lazily.
 pub(crate) fn snapshot_publication_owed() -> bool {
-    WRITABLE_FS_SNAPSHOT_DIRTY.load(Ordering::Acquire)
+    SNAPSHOT_PUBLICATION.is_dirty()
 }
 
 /// Terminal service-loop evidence only; observing this flag must not checkpoint it.
 pub(crate) fn snapshot_dirty_for_diagnostics() -> bool {
-    WRITABLE_FS_SNAPSHOT_DIRTY.load(Ordering::Acquire)
+    SNAPSHOT_PUBLICATION.is_dirty()
 }
 /// The mounted filesystem's durable snapshot format, recorded before it is published.
 /// Generic checkpoints preserve this format; CM mutations use the v2 WAL when mounted.
@@ -357,7 +357,7 @@ pub(crate) fn system_wal_fold_blocked() -> bool {
 }
 
 pub(crate) fn block_uncertain_snapshot_reserve() {
-    WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+    SNAPSHOT_PUBLICATION.mark_dirty();
     WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
 }
 
@@ -379,10 +379,6 @@ pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORE_GENERATION: AtomicU64 = AtomicU64
 pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_EMPTY_MOUNTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_COMMITS: AtomicU64 = AtomicU64::new(0);
-/// Volume checkpoints begun: each cleared the dirty bit and captures the volume afterwards.
-static WRITABLE_FS_CHECKPOINTS_BEGUN: AtomicU64 = AtomicU64::new(0);
-/// The `WRITABLE_FS_CHECKPOINTS_BEGUN` count of the latest checkpoint to publish.
-static WRITABLE_FS_CHECKPOINT_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -480,7 +476,7 @@ fn mark_runtime_dirty() {
 
 fn mark_snapshot_dirty() {
     mark_runtime_dirty();
-    WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+    SNAPSHOT_PUBLICATION.mark_dirty();
 }
 
 fn create_information_changes_volume(information: u32) -> bool {
@@ -822,7 +818,7 @@ where
     }
     let mut lease = snapshot_storage::acquire()
         .map_err(|status| report_quiesce_proof_failure(b"reserve-acquire", status))?;
-    if WRITABLE_FS_SNAPSHOT_DIRTY.load(Ordering::Acquire) {
+    if SNAPSHOT_PUBLICATION.is_dirty() {
         return Err(report_quiesce_proof_failure(b"snapshot-dirty", snapshot_storage::BUSY));
     }
     verify_hives().map_err(|status| report_quiesce_proof_failure(b"hive-proof", status))?;
@@ -879,21 +875,17 @@ pub(crate) fn reserve_progress() -> ReserveProgress {
 /// publish. A checkpoint captures the volume after it begins, so bytes written when `begun`
 /// was `n` are durable once `published` exceeds `n`.
 pub(crate) fn checkpoint_epochs() -> (u64, u64) {
-    (
-        WRITABLE_FS_CHECKPOINTS_BEGUN.load(Ordering::Acquire),
-        WRITABLE_FS_CHECKPOINT_PUBLISHED.load(Ordering::Acquire),
-    )
+    SNAPSHOT_PUBLICATION.epochs()
 }
 
 /// A checkpoint cleared the dirty bit and will capture the volume.
 fn note_checkpoint_begun() {
-    WRITABLE_FS_CHECKPOINTS_BEGUN.fetch_add(1, Ordering::AcqRel);
+    SNAPSHOT_PUBLICATION.record_begun();
 }
 
 /// The one checkpoint in flight published. Only one runs at a time, so it is the latest begun.
 fn note_checkpoint_published() {
-    WRITABLE_FS_CHECKPOINT_PUBLISHED
-        .store(WRITABLE_FS_CHECKPOINTS_BEGUN.load(Ordering::Acquire), Ordering::Release);
+    SNAPSHOT_PUBLICATION.publish_current();
 }
 
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
@@ -915,7 +907,16 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
     // Even a clean observation needs exclusion: another owner may have cleared the bit but not
     // yet finished its barrier. Refusal cannot consume dirty state or authorize caller completion.
     let mut dev = snapshot_storage::acquire()?;
-    if !WRITABLE_FS_SNAPSHOT_DIRTY.swap(false, Ordering::AcqRel) {
+    if wal_format && SNAPSHOT_PUBLICATION.is_dirty() {
+        let manifest = snapshot_storage::peek_wal_continuation(&mut dev).map_err(|status| {
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            status
+        })?;
+        if !manifest.ordinary_checkpoint_ready() {
+            return Err(snapshot_storage::BUSY);
+        }
+    }
+    if !SNAPSHOT_PUBLICATION.take_dirty() {
         return Ok(false);
     }
     note_checkpoint_begun();
@@ -936,7 +937,7 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
         match snapshot_storage::take_wal_continuation(&mut dev) {
             Ok((token, pair, manifest)) => (Some(manifest), Some((token, pair))),
             Err(status) => {
-                WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+                SNAPSHOT_PUBLICATION.mark_dirty();
                 WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
                 return Err(status);
             }
@@ -948,7 +949,7 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
     // the live tree could produce different length or CRC after the first payload sectors land.
     let captured_image = if wal_format {
         let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
-            WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+            SNAPSHOT_PUBLICATION.mark_dirty();
             return Err(restore_unwritten_checkpoint_authority(
                 dev, authority, nt_fs::STATUS_INVALID_HANDLE,
             ));
@@ -956,7 +957,7 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
         match snapshot_capture::CapturedSnapshot::capture(&dev, fs) {
             Ok(image) => Some(image),
             Err(status) => {
-                WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+                SNAPSHOT_PUBLICATION.mark_dirty();
                 return Err(restore_unwritten_checkpoint_authority(dev, authority, status));
             }
         }
@@ -973,7 +974,7 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
                 let pair = match dev.store().verify_paired_wal_snapshot(&mut dev) {
                     Ok(pair) if pair.anchor() == token.anchor() => pair,
                     Ok(_) => {
-                        WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+                        SNAPSHOT_PUBLICATION.mark_dirty();
                         WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
                         core::mem::forget(token);
                         core::mem::forget(old_pair);
@@ -981,7 +982,7 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
                         return Err(nt_fs::STATUS_DATA_ERROR);
                     }
                     Err(error) => {
-                        WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+                        SNAPSHOT_PUBLICATION.mark_dirty();
                         WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
                         core::mem::forget(token);
                         core::mem::forget(old_pair);
@@ -991,7 +992,7 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
                 };
                 drop(old_pair);
                 if let Err((status, token, pair)) = snapshot_storage::install_wal_continuation(&dev, token, pair) {
-                    WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+                    SNAPSHOT_PUBLICATION.mark_dirty();
                     WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
                     core::mem::forget(token);
                     core::mem::forget(pair);
@@ -1022,11 +1023,11 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
             Ok(true)
         }
         Err(SnapshotCommitFailure::Unentered(status)) => {
-            WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+            SNAPSHOT_PUBLICATION.mark_dirty();
             Err(restore_unwritten_checkpoint_authority(dev, authority, status))
         }
         Err(SnapshotCommitFailure::Entered(status)) => {
-            WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+            SNAPSHOT_PUBLICATION.mark_dirty();
             WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
             // Either snapshot format can have changed a slot before reporting failure.
             // Retain the physical reserve and let boot recovery choose the durable image.
@@ -1750,8 +1751,9 @@ fn verified_boot_log(
                         _ => nt_fs::STATUS_DATA_ERROR,
                     }))?;
             }
-            // The namespace producer and its boot admission are not yet native-owned.
-            nt_fs::VolumeWalPayload::FileCreate(_) => {
+            // No native owner can produce or admit namespace records yet.
+            nt_fs::VolumeWalPayload::FileCreate(_)
+            | nt_fs::VolumeWalPayload::FileRename(_) => {
                 return Err(BootSystemRestoreError::Snapshot(nt_fs::STATUS_DATA_ERROR));
             }
         }

@@ -4844,9 +4844,31 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
     use crate::volume_lazy_flush::episode_traced;
     let required_at_entry = nt_handler.writable_fs_commit_required;
     owe_lazy_volume_checkpoint(nt_handler);
-    let checkpoint_status = match publish_required_dirty_volume(nt_handler, required_at_entry) {
-        Ok(status) => status,
-        Err(status) => return status,
+    // An ordinary snapshot must not capture post-WAL namespace or CM state while preserving
+    // the old replay base. The fold owns both snapshot slots and stages CM's SYSTEM image.
+    // Required publication bypasses the background cadence; its Reply remains owed while a
+    // native fold has retained I/O. The checkpoint admission below independently rechecks the
+    // physical manifest under its reserve before writing any slot.
+    let fold_status = if nt_handler.writable_fs_commit_required
+        && SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire) != 0
+        && !crate::writable_fs::legacy_snapshot_writes_allowed()
+        && unsafe { crate::writable_fs::storage_path() }.serves_checkpoint()
+    {
+        let _transient = allocator::enter_transient();
+        let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
+        unsafe { crate::writable_fs::fold_system_wal_if_dirty() }.err()
+    } else {
+        None
+    };
+    let checkpoint_status = if let Some(status) = fold_status {
+        nt_handler.writable_fs_dirty = true;
+        nt_handler.writable_fs_commit_required = true;
+        status
+    } else {
+        match publish_required_dirty_volume(nt_handler, required_at_entry) {
+            Ok(status) => status,
+            Err(status) => return status,
+        }
     };
     // NT's lazy writer leaves a deferred flush dirty for its next scan. A requirement already
     // present at entry, or a mount blocked by an uncertain write, turns refusal into a fault.
@@ -4865,7 +4887,7 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
         lazy_only
     };
     match nt_handler.volume_checkpoint_deferral.observe(
-        checkpoint_status, crate::writable_fs::checkpoint_progress, monotonic_time_100ns,
+        checkpoint_status, crate::writable_fs::reserve_progress, monotonic_time_100ns,
     ) {
         Outcome::Settled { episode, deferrals, waited_100ns } => {
             let lazy = VOLUME_LAZY_FLUSH_OWED.swap(false, Ordering::AcqRel);

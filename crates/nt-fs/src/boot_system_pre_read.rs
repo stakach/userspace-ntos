@@ -1,18 +1,19 @@
 //! Replay targets for the selected WAL suffix after boot has copied SYSTEM and SYSTEM.LOG.
 //!
 //! Persisted file identities, not paths or a new snapshot lookup, identify the two images
-//! already handed to the Config Manager. The owner also preserves file-delta sequence order
+//! already handed to the Config Manager. The owner also preserves volume-mutation sequence order
 //! across interleaved SYSTEM and other-hive records.
 
 use crate::{
-    FileDeltaReplayCursor, FileDeltaWalPayload, FileDeltaWalReplayError, FileSystem,
-    FileCreateWalPayload, HiveLogWalPayload, HiveLogWalReplay, HiveLogWalReplayError,
+    FileDeltaWalPayload, FileDeltaWalReplayError, FileSystem, FileCreateWalPayload,
+    FileRenameWalPayload, HiveLogWalPayload, HiveLogWalReplay, HiveLogWalReplayError,
 };
+use crate::volume_wal_sequence::VolumeWalReplayCursor;
 
 pub struct BootSystemPreRead {
     system_primary_id: Option<u64>,
     system_log_id: Option<u64>,
-    file_delta_cursor: FileDeltaReplayCursor,
+    file_delta_cursor: VolumeWalReplayCursor,
 }
 
 impl BootSystemPreRead {
@@ -21,7 +22,7 @@ impl BootSystemPreRead {
         Self {
             system_primary_id: fs.existing_file_id(system_primary_path),
             system_log_id: fs.existing_file_id(system_log_path),
-            file_delta_cursor: FileDeltaReplayCursor::new(),
+            file_delta_cursor: VolumeWalReplayCursor::new(),
         }
     }
 
@@ -60,6 +61,24 @@ impl BootSystemPreRead {
             return Err(FileDeltaWalReplayError::ProtectedTarget);
         }
         fs.replay_file_create_wal_payload(&mut self.file_delta_cursor, payload)
+    }
+
+    pub fn replay_file_rename(
+        &mut self,
+        fs: &mut FileSystem,
+        payload: FileRenameWalPayload<'_>,
+    ) -> Result<(), FileDeltaWalReplayError> {
+        if self.is_pre_read(payload.source_file_id)
+            || self.is_pre_read(payload.replaced_file_id)
+            || fs.existing_file_id(payload.source_path).is_some_and(|id| self.is_pre_read(id))
+            || fs.existing_file_id(payload.target_path).is_some_and(|id| self.is_pre_read(id))
+            || [self.system_primary_id, self.system_log_id].into_iter().flatten().any(|id| {
+                fs.source_subtree_contains_file_id(payload.source_path, id)
+            })
+        {
+            return Err(FileDeltaWalReplayError::ProtectedTarget);
+        }
+        fs.replay_file_rename_wal_payload(&mut self.file_delta_cursor, payload)
     }
 }
 

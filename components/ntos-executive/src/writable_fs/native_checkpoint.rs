@@ -8,6 +8,9 @@ type Commit = AsyncSnapshotCommit<snapshot_capture::CapturedSnapshot>;
 
 enum Work {
     Rechecking { id: u64, started_ticks: u64, start_after_print: bool, trace: bool },
+    /// The exact header read was refused before entry and restored its original WAL proof.
+    /// The outer I/O pump may see the refusal first; retain it for the service boundary.
+    NoEffectRefused { id: u64, status: u32 },
     Committing {
         id: u64,
         started_ticks: u64,
@@ -51,11 +54,13 @@ pub(super) unsafe fn print_quiesce_owner() {
     print_str(match work {
         None => b"absent",
         Some(Work::Rechecking { .. }) => b"rechecking",
+        Some(Work::NoEffectRefused { .. }) => b"no-effect-refused",
         Some(Work::Committing { .. }) => b"committing",
         Some(Work::Done { .. }) => b"done",
     });
     let (id, lease, entered, failed) = match work {
         Some(Work::Rechecking { id, .. }) => (*id, false, false, false),
+        Some(Work::NoEffectRefused { id, .. }) => (*id, false, false, false),
         Some(Work::Committing { id, entered, failed, .. }) =>
             (*id, true, *entered, *failed),
         Some(Work::Done { .. }) | None => (0, false, false, false),
@@ -64,6 +69,9 @@ pub(super) unsafe fn print_quiesce_owner() {
     print_str(b" local-lease="); print_u64(u64::from(lease));
     print_str(b" entered="); print_u64(u64::from(entered));
     print_str(b" failed="); print_u64(u64::from(failed));
+    if let Some(Work::NoEffectRefused { status, .. }) = work {
+        print_str(b" refusal=0x"); print_hex(*status);
+    }
     print_str(b"\n");
 }
 
@@ -71,6 +79,7 @@ pub(super) unsafe fn progress() -> super::CheckpointProgress {
     match (&*core::ptr::addr_of!(WORK)).as_ref() {
         None => (0, 0, 0),
         Some(Work::Rechecking { id, .. }) => (1, *id, 0),
+        Some(Work::NoEffectRefused { id, .. }) => (4, *id, 0),
         Some(Work::Committing { id, settled, .. }) => (2, *id, *settled),
         Some(Work::Done { generation, .. }) => (3, *generation, 0),
     }
@@ -93,10 +102,38 @@ unsafe fn advance_recheck() -> Result<(), u32> {
         else { return Ok(()); };
     let (id, started_ticks, start_after_print, trace) =
         (*id, *started_ticks, *start_after_print, *trace);
-    let Some((lease, token, proof)) = snapshot_storage::take_rechecked_wal_continuation(id)?
-        else { return Err(snapshot_storage::BUSY); };
+    let (lease, token, proof) = match snapshot_storage::take_rechecked_wal_continuation(id) {
+        Ok(Some(parts)) => parts,
+        Ok(None) => return Err(snapshot_storage::BUSY),
+        Err(status) => {
+            if snapshot_storage::recheck_was_aborted_no_effect(id) {
+                SNAPSHOT_PUBLICATION.abort_unwritten_checkpoint();
+                // The header owner restored its exact WAL proof and released the lease before
+                // reporting this refusal. Keep one receipt for the service boundary even if
+                // the outer I/O pump encountered it first; no new owner may hide the refusal.
+                if matches!(slot.as_ref(), Some(Work::Rechecking { id: current, .. }) if *current == id) {
+                    *slot = Some(Work::NoEffectRefused { id, status });
+                    print_str(b"[writable-fs-checkpoint] no-effect-header-refusal id/status=");
+                    print_u64(id); print_str(b"/0x"); print_hex(status); print_str(b"\n");
+                }
+            } else {
+                // A failed entered read or inconsistent proof may still own the reserve. Keep
+                // the work slot and forbid a new publisher until recovery establishes state.
+                SNAPSHOT_PUBLICATION.mark_dirty();
+                block(status);
+            }
+            return Err(status);
+        }
+    };
+    if !proof.manifest().ordinary_checkpoint_ready() {
+        SNAPSHOT_PUBLICATION.mark_dirty();
+        let status = super::restore_unwritten_checkpoint_authority(lease,
+            Some((token, proof.into_pair())), snapshot_storage::BUSY);
+        *slot = None;
+        return Err(status);
+    }
     let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
-        WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+        SNAPSHOT_PUBLICATION.mark_dirty();
         let status = super::restore_unwritten_checkpoint_authority(lease,
             Some((token, proof.into_pair())), nt_fs::STATUS_INVALID_HANDLE);
         *slot = None;
@@ -105,7 +142,7 @@ unsafe fn advance_recheck() -> Result<(), u32> {
     let image = match snapshot_capture::CapturedSnapshot::capture(&lease, fs) {
         Ok(image) => image,
         Err(status) => {
-            WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+            SNAPSHOT_PUBLICATION.mark_dirty();
             let status = super::restore_unwritten_checkpoint_authority(lease,
                 Some((token, proof.into_pair())), status);
             *slot = None;
@@ -120,7 +157,7 @@ unsafe fn advance_recheck() -> Result<(), u32> {
     let mut commit = match AsyncSnapshotCommit::new_from_rechecked_pair(image, manifest, proof) {
         Ok(commit) => commit,
         Err((error, _image, proof)) => {
-            WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+            SNAPSHOT_PUBLICATION.mark_dirty();
             let status = super::restore_unwritten_checkpoint_authority(lease,
                 Some((token, proof.into_pair())), snapshot_store_error_status(error));
             *slot = None;
@@ -142,6 +179,13 @@ pub(super) unsafe fn checkpoint_dirty_native() -> Result<bool, u32> {
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }
     let slot = &mut *core::ptr::addr_of_mut!(WORK);
+    if let Some(Work::NoEffectRefused { status, .. }) = slot.as_ref() {
+        let status = *status;
+        // Permanent local refusals are delivered exactly once before a fresh attempt. BUSY
+        // never reaches this state: the header owner retains its request and ID for retry.
+        *slot = None;
+        return Err(status);
+    }
     if matches!(slot.as_ref(), Some(Work::Done { .. })) {
         let Some(Work::Done { generation, bytes }) = slot.take() else { unreachable!() };
         WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -154,13 +198,21 @@ pub(super) unsafe fn checkpoint_dirty_native() -> Result<bool, u32> {
         return Err(snapshot_storage::BUSY);
     }
     // Clean observations still acquire the exact reserve as a durability exclusion barrier.
-    if !WRITABLE_FS_SNAPSHOT_DIRTY.load(Ordering::Acquire) {
+    if !SNAPSHOT_PUBLICATION.is_dirty() {
         let lease = snapshot_storage::acquire()?;
         drop(lease);
         return Ok(false);
     }
-    let id = snapshot_storage::begin_wal_continuation_recheck()?;
-    WRITABLE_FS_SNAPSHOT_DIRTY.store(false, Ordering::Release);
+    // The ordinary image retains its selected replay base. If the WAL has advanced, the
+    // two-slot fold must first publish an image with that prefix applied. Keep the dirty bit
+    // and continuation intact while the service owner arranges that fold.
+    let lease = snapshot_storage::acquire()?;
+    let manifest = snapshot_storage::cached_wal_manifest(&lease).map_err(block)?;
+    if !manifest.ordinary_checkpoint_ready() {
+        return Err(snapshot_storage::BUSY);
+    }
+    let id = snapshot_storage::begin_wal_continuation_recheck_with_lease(lease)?;
+    SNAPSHOT_PUBLICATION.clear_dirty();
     super::note_checkpoint_begun();
     let started_ticks = crate::disk_census_ticks();
     let epoch = super::checkpoint_epochs().0;
@@ -198,7 +250,7 @@ pub(super) unsafe fn outer_io_queued() -> bool {
         Some(Work::Rechecking { id, .. }) => snapshot_storage::header_outer_io_queued(*id),
         Some(Work::Committing { commit, entered, failed, .. }) =>
             !*entered && !*failed && commit.pending().is_none() && !commit.is_done(),
-        Some(Work::Done { .. }) | None => false,
+        Some(Work::NoEffectRefused { .. } | Work::Done { .. }) | None => false,
     }
 }
 

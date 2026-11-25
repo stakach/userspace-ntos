@@ -40,6 +40,9 @@ mod file_delta_replay;
 #[path = "file_create_replay.rs"]
 mod file_create_replay;
 
+#[path = "file_rename_replay.rs"]
+mod file_rename_replay;
+
 #[path = "optional_file.rs"]
 mod optional_file;
 
@@ -548,6 +551,7 @@ struct PreparedRename {
     same_entry: bool,
     folded_name: String,
     created_name: String,
+    moved_short_name: Option<(FileShortName, String)>,
 }
 
 /// An in-memory file system (spec §12) — the v0.1 `NtFileSystemRuntime`.
@@ -2263,6 +2267,20 @@ impl MemFs {
         leaf: &str,
         replace_if_exists: bool,
     ) -> Result<PreparedRename, u32> {
+        self.prepare_rename_into_parent_with_short_name(
+            source, source_entry, target_parent, leaf, replace_if_exists, None,
+        )
+    }
+
+    fn prepare_rename_into_parent_with_short_name(
+        &mut self,
+        source: u64,
+        source_entry: u64,
+        target_parent: u64,
+        leaf: &str,
+        replace_if_exists: bool,
+        moved_short_name: Option<FileShortName>,
+    ) -> Result<PreparedRename, u32> {
         if source == 0 || leaf.is_empty() || leaf == "." || leaf == ".." || leaf.contains('\\') {
             return Err(STATUS_INVALID_PARAMETER);
         }
@@ -2311,11 +2329,23 @@ impl MemFs {
             .and_then(|node| node.children.get(source_index))
             .map(|entry| entry.folded_short_name.as_str())
             .unwrap_or_default();
-        if source_parent != target_parent
-            && !source_short_name.is_empty()
+        let moved_short_name = moved_short_name.map(|name| {
+            let mut folded = String::new();
+            folded.try_reserve_exact(MAX_SHORT_NAME * 4)
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            for unit in core::char::decode_utf16(name.units().iter().copied()) {
+                folded.push(unit.map_err(|_| STATUS_INVALID_PARAMETER)?);
+            }
+            folded.make_ascii_lowercase();
+            Ok::<_, u32>((name, folded))
+        }).transpose()?;
+        let effective_short_name = moved_short_name.as_ref()
+            .map_or(source_short_name, |(_, folded)| folded.as_str());
+        if (source_parent != target_parent || moved_short_name.is_some())
+            && !effective_short_name.is_empty()
             && self.namespace_conflicts(
                 target_parent,
-                &source_short_name,
+                effective_short_name,
                 source_entry,
                 existing.map_or(0, |(entry, _)| entry),
             )
@@ -2357,7 +2387,7 @@ impl MemFs {
             source, source_entry, source_parent, source_index, target_parent,
             replacement_entry: existing.filter(|(entry, _)| *entry != source_entry)
                 .map(|(entry, _)| entry),
-            source_is_dir, same_entry, folded_name, created_name,
+            source_is_dir, same_entry, folded_name, created_name, moved_short_name,
         })
     }
 
@@ -2365,6 +2395,7 @@ impl MemFs {
         let PreparedRename {
             source, source_entry, source_parent, source_index, target_parent,
             replacement_entry, source_is_dir, same_entry, folded_name, created_name,
+            moved_short_name,
         } = plan;
         if same_entry {
             let Some(entry) = self.node_mut(target_parent)
@@ -2374,6 +2405,10 @@ impl MemFs {
             };
             entry.folded_name = folded_name;
             entry.created_name = created_name;
+            if let Some((short, folded)) = moved_short_name {
+                entry.short_name = short;
+                entry.folded_short_name = folded;
+            }
             return STATUS_SUCCESS;
         }
         if let Some(existing_entry) = replacement_entry {
@@ -2405,6 +2440,10 @@ impl MemFs {
         };
         entry.folded_name = folded_name;
         entry.created_name = created_name;
+        if let Some((short, folded)) = moved_short_name {
+            entry.short_name = short;
+            entry.folded_short_name = folded;
+        }
         parent_node.children.push(entry);
         STATUS_SUCCESS
     }
@@ -2634,6 +2673,44 @@ impl MemFs {
     /// Resolve a volume-relative path to a node id.
     fn lookup(&self, path: &str) -> Option<u64> {
         self.lookup_entry_from(0, path).map(|(node, _)| node)
+    }
+
+    /// Include every hard-link entry to the protected file, not just its opened name. Directory
+    /// parents have one entry each, so their parent chain identifies a moved subtree.
+    fn subtree_contains_file_id(&self, ancestor: u64, file_id: u64) -> bool {
+        let Some(ancestor_node) = self.node(ancestor) else {
+            return false;
+        };
+        if ancestor_node.file_id == file_id {
+            return true;
+        }
+        if !ancestor_node.is_dir {
+            return false;
+        }
+        for (parent, node) in self.nodes.iter().enumerate() {
+            let Some(node) = node.as_ref().filter(|node| node.is_dir) else {
+                continue;
+            };
+            if !node.children.iter().any(|entry| {
+                self.node(entry.node_id).is_some_and(|child| child.file_id == file_id)
+            }) {
+                continue;
+            }
+            let mut current = parent as u64;
+            for _ in 0..self.nodes.len() {
+                if current == ancestor {
+                    return true;
+                }
+                if current == 0 {
+                    break;
+                }
+                let Some(directory) = self.node(current) else {
+                    break;
+                };
+                current = directory.parent;
+            }
+        }
+        false
     }
 
     fn lookup_entry_from(&self, start: u64, path: &str) -> Option<(u64, u64)> {
@@ -5539,6 +5616,14 @@ impl FileSystem {
     pub fn existing_file_id(&self, path: &str) -> Option<u64> {
         self.query_metadata(path).filter(|metadata| !metadata.is_directory)
             .map(|metadata| metadata.file_id)
+    }
+
+    pub(crate) fn source_subtree_contains_file_id(&self, path: &str, file_id: u64) -> bool {
+        let Some(rel) = self.to_relative(&normalize_separators(path)) else {
+            return false;
+        };
+        self.volume.lookup(&rel)
+            .is_some_and(|node| self.volume.subtree_contains_file_id(node, file_id))
     }
 
     /// Retain the exact log node and name while an anchored WAL suffix refers to its bytes.

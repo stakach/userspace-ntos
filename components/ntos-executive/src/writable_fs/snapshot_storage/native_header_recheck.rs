@@ -193,6 +193,12 @@ pub(crate) unsafe fn release_unentered_storage_io(ticket: SnapshotStorageTicket)
 pub(crate) unsafe fn refuse_unentered_storage_io(
     ticket: SnapshotStorageTicket, status: nt_status::NtStatus,
 ) -> Result<(), u32> {
+    if status.0 as u32 == BUSY {
+        // BUSY is a retry, not a permanent local refusal. Keep the same header owner, ID,
+        // reserve and paired proof so repeated admission pressure cannot look like progress
+        // to the service deferral by minting fresh checkpoint IDs.
+        return release_unentered_storage_io(ticket);
+    }
     let owner = (&mut *core::ptr::addr_of_mut!(PENDING_HEADER)).as_mut()
         .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
     let HeaderState::Running(recheck) = &mut owner.state else {

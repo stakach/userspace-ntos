@@ -30,7 +30,7 @@ pub enum FileDeltaWalPayloadError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileDeltaWalReplayError {
-    /// The record does not directly follow the previous file delta of this WAL incarnation.
+    /// The record does not directly follow the previous volume mutation of this WAL incarnation.
     OutOfOrder,
     MissingFile,
     ForeignIdentity,
@@ -50,7 +50,7 @@ pub struct FileDeltaExtent<'a> {
 /// Producer view of one delta, before encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileDeltaRecord<'a> {
-    /// 1-based position among the file deltas of the current WAL incarnation.
+    /// 1-based position among the volume mutations of the current WAL incarnation.
     pub sequence: u64,
     pub file_id: u64,
     pub path: &'a str,

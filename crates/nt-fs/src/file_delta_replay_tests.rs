@@ -7,8 +7,9 @@ use crate::file_delta_wal_payload::{
 };
 use crate::snapshot_test_device::CachedDisk;
 use crate::{
-    decode_volume_wal_payload, encode_file_create_wal_payload, encode_hive_log_wal_payload,
-    BootSystemPreRead, FileCreateWalPayload, FileSystem, HiveLogWalPayload, MemFs,
+    decode_volume_wal_payload, encode_file_create_wal_payload, encode_file_rename_wal_payload,
+    encode_hive_log_wal_payload, BootSystemPreRead, FileCreateWalPayload, FileRenameWalPayload,
+    FileSystem, HiveLogWalPayload, MemFs,
     RegistryWal, RegistryWalError, RegistryWalState, VolumeWalPayload,
 };
 
@@ -243,6 +244,307 @@ fn create_then_delta_replays_from_both_intermediate_snapshot_positions() {
         assert!(restored.provision_file(sibling, b""));
         assert_eq!(restored.existing_file_id(sibling), live.existing_file_id(sibling));
     }
+}
+
+/// LiberNT's SaveDefaultUserHive retries RegSaveKeyExW after replacing an existing .bak with
+/// MoveFileExW. A content-only or create-only WAL cannot reconstruct that namespace mutation.
+#[test]
+fn installer_backup_rename_requires_a_committed_namespace_record() {
+    const PROFILE: &str = r"\??\C:\Users\Default";
+    const SOURCE: &str = r"\??\C:\Users\Default\ntuser.dat";
+    const BACKUP: &str = r"\??\C:\Users\Default\ntuser.bak";
+    const SIBLING: &str = r"\??\C:\Users\Default\next.dat";
+
+    let mut live = FileSystem::new(MemFs::new());
+    assert!(live.provision_file(SOURCE, b"old default hive"));
+    assert!(live.provision_file(BACKUP, b"superseded backup"));
+    let opened = live.zw_create_file(
+        SOURCE,
+        crate::DELETE | crate::SYNCHRONIZE,
+        0,
+        crate::FILE_SHARE_READ | crate::FILE_SHARE_WRITE | crate::FILE_SHARE_DELETE,
+        crate::FILE_OPEN,
+        crate::FILE_OPEN_FOR_BACKUP_INTENT,
+    );
+    assert_eq!(opened.status, crate::STATUS_SUCCESS);
+    let old_source = live.query_metadata(SOURCE).unwrap();
+    let old_backup = live.query_metadata(BACKUP).unwrap();
+    // The selected snapshot can predate a short-name update carried by this rename record.
+    let before_rename = live.export_volume_snapshot().unwrap();
+    let short: Vec<u16> = "NTUSER~1.DAT".encode_utf16().collect();
+    let mut short_information = vec![0u8; 4 + short.len() * 2];
+    short_information[..4].copy_from_slice(&((short.len() * 2) as u32).to_le_bytes());
+    for (index, unit) in short.iter().copied().enumerate() {
+        short_information[4 + index * 2..6 + index * 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    assert_eq!(live.zw_set_information_file(
+        opened.handle, crate::FILE_SHORT_NAME_INFORMATION, &short_information,
+    ), crate::STATUS_SUCCESS);
+    let mut target = Vec::new();
+    for unit in r"\Users\Default\ntuser.bak".encode_utf16() {
+        target.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert_eq!(
+        live.zw_rename_file(opened.handle, crate::FileRenameRoot::VolumeRoot, &target, true),
+        crate::STATUS_SUCCESS,
+    );
+    let moved_short_name = live.zw_query_short_name(opened.handle).unwrap();
+    assert_eq!(live.zw_close(opened.handle), crate::STATUS_SUCCESS);
+    let moved = live.query_metadata(BACKUP).unwrap();
+    assert_eq!(moved.file_id, old_source.file_id);
+    assert_ne!(moved.file_id, old_backup.file_id);
+    assert_eq!(live.file_bytes_owned(SOURCE), None);
+    let after_rename = live.export_volume_snapshot().unwrap();
+    let rename = encode_file_rename_wal_payload(FileRenameWalPayload {
+        sequence: 1,
+        source_file_id: old_source.file_id,
+        source_parent_file_id: live.query_metadata(PROFILE).unwrap().file_id,
+        target_parent_file_id: live.query_metadata(PROFILE).unwrap().file_id,
+        replaced_file_id: old_backup.file_id,
+        source_path: SOURCE,
+        target_path: BACKUP,
+        moved_short_name,
+        change_time: moved.change_time,
+    }).unwrap();
+
+    let new_source = live.zw_create_file(
+        SOURCE, crate::FILE_WRITE_DATA, crate::FILE_ATTRIBUTE_HIDDEN, 0,
+        crate::FILE_CREATE, crate::FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(new_source.status, crate::STATUS_SUCCESS);
+    let creation = encode_file_create_wal_payload(creation_record(&live, 2, SOURCE, PROFILE)).unwrap();
+    let after_create = live.export_volume_snapshot().unwrap();
+    assert_eq!(live.zw_write_file(new_source.handle, None, b"new default hive"), (crate::STATUS_SUCCESS, 16));
+    assert_eq!(live.zw_close(new_source.handle), crate::STATUS_SUCCESS);
+    let after_write = live.export_volume_snapshot().unwrap();
+    let new_metadata = live.query_metadata(SOURCE).unwrap();
+    let new_bytes = live.file_bytes_owned(SOURCE).unwrap();
+    let extents = changed_file_delta_extents(&[], &new_bytes).unwrap();
+    let data = encode_file_delta_wal_payload(FileDeltaRecord {
+        sequence: 3, file_id: new_metadata.file_id, path: SOURCE,
+        end_of_file: new_bytes.len() as u64, extents: &extents,
+    }).unwrap();
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(64), INCARNATION).unwrap();
+    append(&mut wal, &rename);
+    append(&mut wal, &creation);
+    append(&mut wal, &data);
+    let wal = recover_after_power_cut(wal.into_device().unwrap());
+    assert_eq!(wal.records().len(), 3);
+
+    assert!(live.provision_file(SIBLING, b""));
+    for (snapshot, suffix_start) in [
+        (&before_rename, 0usize),
+        (&after_rename, 1),
+        (&after_create, 2),
+        (&after_write, 3),
+    ] {
+        // An anchored WAL can include records already folded into a later snapshot.
+        for start in [suffix_start, 0] {
+            let mut restored = FileSystem::from_volume_snapshot(snapshot).unwrap();
+            let mut replay = BootSystemPreRead::new(
+                &restored,
+                r"\??\C:\ReactOS\System32\Config\SYSTEM",
+                r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG",
+            );
+            for record in &wal.records()[start..] {
+                match decode_volume_wal_payload(&record.payload).unwrap() {
+                    VolumeWalPayload::FileRename(payload) => {
+                        assert_eq!(replay.replay_file_rename(&mut restored, payload), Ok(()));
+                    }
+                    VolumeWalPayload::FileCreate(payload) => {
+                        assert_eq!(replay.replay_file_create(&mut restored, payload), Ok(()));
+                    }
+                    VolumeWalPayload::FileDelta(payload) => {
+                        assert_eq!(replay.replay_file_delta(&mut restored, payload), Ok(()));
+                    }
+                    other => panic!("committed payload routed as {other:?}"),
+                }
+            }
+            assert_eq!(restored.file_bytes_owned(BACKUP), Some(b"old default hive".to_vec()));
+            assert_eq!(restored.query_metadata(BACKUP), Some(moved));
+            let backed = restored.zw_create_file(
+                BACKUP, crate::FILE_READ_DATA, 0,
+                crate::FILE_SHARE_READ | crate::FILE_SHARE_WRITE | crate::FILE_SHARE_DELETE,
+                crate::FILE_OPEN, crate::FILE_NON_DIRECTORY_FILE,
+            );
+            assert_eq!(backed.status, crate::STATUS_SUCCESS);
+            assert_eq!(restored.zw_query_short_name(backed.handle), Some(moved_short_name));
+            assert_eq!(restored.zw_close(backed.handle), crate::STATUS_SUCCESS);
+            assert_eq!(restored.file_bytes_owned(SOURCE), Some(new_bytes.clone()));
+            assert_eq!(restored.query_metadata(SOURCE).unwrap().file_id, new_metadata.file_id);
+            assert!(restored.provision_file(SIBLING, b""));
+            assert_eq!(restored.existing_file_id(SIBLING), live.existing_file_id(SIBLING));
+        }
+    }
+}
+
+#[test]
+fn two_renames_replay_only_the_suffix_after_the_selected_snapshot_base() {
+    const PARENT: &str = r"\??\C:\Users\Default";
+    const A: &str = r"\??\C:\Users\Default\a.dat";
+    const B: &str = r"\??\C:\Users\Default\b.dat";
+    const C: &str = r"\??\C:\Users\Default\c.dat";
+    let mut live = FileSystem::new(MemFs::new());
+    for (path, bytes) in [(A, b"source".as_slice()), (B, b"old b".as_slice()),
+        (C, b"old c".as_slice())]
+    {
+        assert!(live.provision_file(path, bytes));
+    }
+    let parent_id = live.query_metadata(PARENT).unwrap().file_id;
+    let source_id = live.existing_file_id(A).unwrap();
+    let replaced_b = live.existing_file_id(B).unwrap();
+    let replaced_c = live.existing_file_id(C).unwrap();
+    let snapshots = [live.export_volume_snapshot().unwrap()];
+    let opened = live.zw_create_file(
+        A, crate::DELETE | crate::SYNCHRONIZE, 0,
+        crate::FILE_SHARE_READ | crate::FILE_SHARE_WRITE | crate::FILE_SHARE_DELETE,
+        crate::FILE_OPEN, crate::FILE_OPEN_FOR_BACKUP_INTENT,
+    );
+    assert_eq!(opened.status, crate::STATUS_SUCCESS);
+    let target_bytes = |path: &str| -> Vec<u8> {
+        path.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    };
+    assert_eq!(live.zw_rename_file(
+        opened.handle, crate::FileRenameRoot::VolumeRoot,
+        &target_bytes(r"\Users\Default\b.dat"), true,
+    ), crate::STATUS_SUCCESS);
+    let after_b = live.export_volume_snapshot().unwrap();
+    let first = encode_file_rename_wal_payload(FileRenameWalPayload {
+        sequence: 1,
+        source_file_id: source_id,
+        source_parent_file_id: parent_id,
+        target_parent_file_id: parent_id,
+        replaced_file_id: replaced_b,
+        source_path: A,
+        target_path: B,
+        moved_short_name: crate::FileShortName::EMPTY,
+        change_time: live.query_metadata(B).unwrap().change_time,
+    }).unwrap();
+    assert_eq!(live.zw_rename_file(
+        opened.handle, crate::FileRenameRoot::VolumeRoot,
+        &target_bytes(r"\Users\Default\c.dat"), true,
+    ), crate::STATUS_SUCCESS);
+    assert_eq!(live.zw_close(opened.handle), crate::STATUS_SUCCESS);
+    let after_c = live.export_volume_snapshot().unwrap();
+    let second = encode_file_rename_wal_payload(FileRenameWalPayload {
+        sequence: 2,
+        source_file_id: source_id,
+        source_parent_file_id: parent_id,
+        target_parent_file_id: parent_id,
+        replaced_file_id: replaced_c,
+        source_path: B,
+        target_path: C,
+        moved_short_name: crate::FileShortName::EMPTY,
+        change_time: live.query_metadata(C).unwrap().change_time,
+    }).unwrap();
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(64), INCARNATION).unwrap();
+    append(&mut wal, &first);
+    append(&mut wal, &second);
+    let wal = recover_after_power_cut(wal.into_device().unwrap());
+    assert_eq!(wal.records().len(), 2);
+
+    // The authenticated snapshot header supplies base_serial; native recovery slices the
+    // physical WAL at that serial. It never replays A→B over the snapshot already holding C.
+    for (snapshot, base_serial) in [
+        (&snapshots[0], 0usize), (&after_b, 1), (&after_c, 2),
+    ] {
+        let mut restored = FileSystem::from_volume_snapshot(snapshot).unwrap();
+        let mut replay = BootSystemPreRead::new(
+            &restored,
+            r"\??\C:\ReactOS\System32\Config\SYSTEM",
+            r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG",
+        );
+        for record in &wal.records()[base_serial..] {
+            let VolumeWalPayload::FileRename(payload) =
+                decode_volume_wal_payload(&record.payload).unwrap()
+            else {
+                panic!("rename chain must retain typed WAL order");
+            };
+            assert_eq!(replay.replay_file_rename(&mut restored, payload), Ok(()));
+        }
+        assert_eq!(restored.existing_file_id(A), None);
+        assert_eq!(restored.existing_file_id(B), None);
+        assert_eq!(restored.existing_file_id(C), Some(source_id));
+        assert_eq!(restored.file_bytes_owned(C), Some(b"source".to_vec()));
+    }
+}
+
+#[test]
+fn rename_replay_refuses_foreign_identity_and_sequence_gap_without_advancing() {
+    const SOURCE: &str = r"\??\C:\Users\Default\ntuser.dat";
+    const BACKUP: &str = r"\??\C:\Users\Default\ntuser.bak";
+    const PARENT: &str = r"\??\C:\Users\Default";
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(SOURCE, b"old source"));
+    assert!(fs.provision_file(BACKUP, b"old backup"));
+    let before = fs.export_volume_snapshot().unwrap();
+    let source_id = fs.existing_file_id(SOURCE).unwrap();
+    let backup_id = fs.existing_file_id(BACKUP).unwrap();
+    let parent_id = fs.query_metadata(PARENT).unwrap().file_id;
+    let record = FileRenameWalPayload {
+        sequence: 1,
+        source_file_id: source_id,
+        source_parent_file_id: parent_id,
+        target_parent_file_id: parent_id,
+        replaced_file_id: backup_id,
+        source_path: SOURCE,
+        target_path: BACKUP,
+        moved_short_name: crate::FileShortName::EMPTY,
+        change_time: fs.query_metadata(BACKUP).unwrap().change_time + 1,
+    };
+    let mut cursor = FileDeltaReplayCursor::new();
+    for foreign in [
+        FileRenameWalPayload { source_file_id: source_id + 100, ..record },
+        FileRenameWalPayload { source_parent_file_id: parent_id + 100, ..record },
+        FileRenameWalPayload { target_parent_file_id: parent_id + 100, ..record },
+        FileRenameWalPayload { replaced_file_id: backup_id + 100, ..record },
+    ] {
+        assert_eq!(fs.replay_file_rename_wal_payload(&mut cursor, foreign),
+            Err(FileDeltaWalReplayError::ForeignIdentity));
+        assert_eq!(cursor.last_applied(), None);
+        assert_eq!(fs.export_volume_snapshot().unwrap(), before);
+    }
+    assert_eq!(fs.replay_file_rename_wal_payload(&mut cursor, record), Ok(()));
+    let moved = fs.export_volume_snapshot().unwrap();
+    assert_eq!(fs.existing_file_id(BACKUP), Some(source_id));
+    assert_eq!(fs.replay_file_rename_wal_payload(
+        &mut cursor, FileRenameWalPayload { sequence: 3, ..record }),
+        Err(FileDeltaWalReplayError::OutOfOrder));
+    assert_eq!(cursor.last_applied(), Some(1));
+    assert_eq!(fs.export_volume_snapshot().unwrap(), moved);
+    assert_eq!(fs.replay_file_rename_wal_payload(
+        &mut cursor, FileRenameWalPayload { sequence: 2, ..record }), Ok(()));
+    assert_eq!(cursor.last_applied(), Some(2));
+    assert_eq!(fs.export_volume_snapshot().unwrap(), moved);
+}
+
+#[test]
+fn uncommitted_rename_is_not_recovered_after_power_cut() {
+    const SOURCE: &str = r"\??\C:\Users\Default\ntuser.dat";
+    const BACKUP: &str = r"\??\C:\Users\Default\ntuser.bak";
+    const PARENT: &str = r"\??\C:\Users\Default";
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(SOURCE, b"old source"));
+    assert!(fs.provision_file(BACKUP, b"old backup"));
+    let parent = fs.query_metadata(PARENT).unwrap().file_id;
+    let record = encode_file_rename_wal_payload(FileRenameWalPayload {
+        sequence: 1,
+        source_file_id: fs.existing_file_id(SOURCE).unwrap(),
+        source_parent_file_id: parent,
+        target_parent_file_id: parent,
+        replaced_file_id: fs.existing_file_id(BACKUP).unwrap(),
+        source_path: SOURCE,
+        target_path: BACKUP,
+        moved_short_name: crate::FileShortName::EMPTY,
+        change_time: fs.query_metadata(BACKUP).unwrap().change_time + 1,
+    }).unwrap();
+    let before = fs.export_volume_snapshot().unwrap();
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(64), INCARNATION).unwrap();
+    wal.begin(record).unwrap();
+    wal.prepare().unwrap();
+    let recovered = recover_after_power_cut(wal.into_device_for_test());
+    assert!(recovered.records().is_empty());
+    assert_eq!(fs.export_volume_snapshot().unwrap(), before);
 }
 
 #[test]
@@ -561,6 +863,9 @@ fn replay_recovered(wal: &RegistryWal<CachedDisk>, fs: &mut FileSystem) -> Resul
             }
             VolumeWalPayload::FileCreate(payload) => {
                 fs.replay_file_create_wal_payload(&mut cursor, payload)?;
+            }
+            VolumeWalPayload::FileRename(payload) => {
+                fs.replay_file_rename_wal_payload(&mut cursor, payload)?;
             }
         }
     }

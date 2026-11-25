@@ -161,6 +161,124 @@ fn generic_v2_checkpoint_uses_selected_base_and_both_exact_anchor_copies() {
     assert_eq!(restored.anchor.serial, 1);
 }
 
+fn anchored_rename_wal(with_system: bool) -> (SnapshotBlockStore, CachedDisk) {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::with_sectors(32);
+    for _ in 0..2 {
+        store.commit_next_with_wal_manifest(&mut disk, b"A", base()).unwrap();
+    }
+    let pair = store.verify_paired_wal_snapshot(&mut disk).unwrap();
+    let range = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let mut wal = RegistryWal::recover(range, 77).unwrap();
+    for (sequence, source, target) in [
+        (1, r"\??\C:\A", r"\??\C:\B"),
+        (2, r"\??\C:\B", r"\??\C:\C"),
+    ] {
+        let payload = crate::encode_file_rename_wal_payload(crate::FileRenameWalPayload {
+            sequence, source_file_id: 41, source_parent_file_id: 1,
+            target_parent_file_id: 1, replaced_file_id: 0,
+            source_path: source, target_path: target,
+            moved_short_name: crate::FileShortName::EMPTY, change_time: sequence,
+        }).unwrap();
+        wal.begin(payload).unwrap();
+        wal.prepare().unwrap();
+        wal.commit().unwrap();
+    }
+    if with_system {
+        wal.begin(b"CMWAL001 system-change".to_vec()).unwrap();
+        wal.prepare().unwrap();
+        wal.commit().unwrap();
+    }
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let mut update = WalSnapshotAnchorUpdate::admit_verified_wal_pair(store, verified, pair)
+        .ok().unwrap();
+    update.advance().unwrap();
+    let (disk, _token, _pair) = update.into_continuation_and_pair().ok().unwrap();
+    (store, disk)
+}
+
+#[test]
+fn ordinary_checkpoint_refuses_post_wal_image_with_old_replay_base_before_write() {
+    let (store, mut disk) = anchored_rename_wal(false);
+    let manifest = store.current_wal_checkpoint_manifest(&mut disk).unwrap();
+    assert_eq!(manifest.base_serial, 0);
+    assert_eq!(manifest.high_water_serial, 2);
+    disk.events.clear();
+    if manifest.ordinary_checkpoint_ready() {
+        store.commit_next_with_wal_manifest(&mut disk, b"C", manifest).unwrap();
+    }
+    assert!(!disk.events.iter().any(|event| matches!(event, Event::Write(_))),
+        "ordinary publication must defer to the two-slot fold before touching a slot");
+    disk.power_cut();
+    let selected = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    assert_eq!(selected.snapshot.payload, b"A");
+    assert_eq!(selected.selected_base_serial, 0);
+    assert_eq!(selected.anchor.serial, 2);
+}
+
+#[test]
+fn folded_rename_and_system_wal_recover_at_both_first_header_power_cuts() {
+    for with_system in [false, true] {
+        let expected_serial = if with_system { 3 } else { 2 };
+        for after_first_header in [false, true] {
+            let (store, mut disk) = anchored_rename_wal(with_system);
+            let old = store.current_wal_checkpoint_manifest(&mut disk).unwrap();
+            assert_eq!((old.base_serial, old.high_water_serial), (0, expected_serial));
+            assert!(!old.ordinary_checkpoint_ready());
+            let folded = WalSnapshotManifest {
+                base_serial: old.high_water_serial,
+                ..old
+            };
+            disk.events.clear();
+            if after_first_header {
+                store.commit_next_with_wal_manifest(&mut disk, b"C", folded).unwrap();
+                // The first header is durable; cut power before touching the other slot.
+                assert!(disk.events.iter().any(|event| matches!(event, Event::Write(0))));
+            } else {
+                // Payload and barrier may land, but the first new header must not.
+                disk.fail_event = Some(3);
+                assert_eq!(store.commit_next_with_wal_manifest(&mut disk, b"C", folded),
+                    Err(SnapshotBlockStoreError::Io));
+                assert_eq!(disk.events.last(), Some(&Event::Write(0)),
+                    "the first header write was attempted but did not take effect");
+            }
+            disk.power_cut();
+            let selected = store.read_latest_wal(&mut disk).unwrap().unwrap();
+            assert_eq!(selected.anchor.serial, expected_serial);
+            let range = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+            let wal = RegistryWal::recover(range, 77).unwrap();
+            assert_eq!(selected.verify_recovered_wal(&wal), Ok(()));
+            let suffix = &wal.records()[selected.selected_base_serial as usize..];
+            if after_first_header {
+                assert_eq!(selected.snapshot.payload, b"C");
+                assert_eq!(selected.selected_base_serial, expected_serial);
+                assert!(suffix.is_empty());
+            } else {
+                assert_eq!(selected.snapshot.payload, b"A");
+                assert_eq!(selected.selected_base_serial, 0);
+                assert_eq!(suffix.len(), expected_serial as usize);
+                assert!(suffix[0].payload.starts_with(b"NTFRNM01"));
+                assert!(suffix[1].payload.starts_with(b"NTFRNM01"));
+            }
+            if with_system {
+                let snapshot_log: &[u8] = if after_first_header {
+                    b"base-CMWAL001 system-change"
+                } else {
+                    b"base-"
+                };
+                assert_eq!(selected.verified_boot_system_log(snapshot_log, &wal),
+                    Ok(b"base-CMWAL001 system-change".to_vec()));
+                if after_first_header {
+                    // Advancing the base without staging CM's image would silently omit this
+                    // committed SYSTEM record, even though the namespace snapshot is C.
+                    assert_eq!(selected.verified_boot_system_log(b"base-", &wal),
+                        Ok(b"base-".to_vec()));
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn generic_v2_checkpoint_refuses_partial_anchor_and_legacy_pair_before_write() {
     let (store, mut disk) = two_v2_slots();
