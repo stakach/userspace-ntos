@@ -630,8 +630,23 @@ pub(super) struct PendingSchedulerYield {
     dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
 }
 
+/// Observational continuation stage. The retained ticket is still owned by PendingSchedulerYield;
+/// a different value means the owner made progress and may receive one more bounded drive.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum PendingSchedulerProgress {
+    Service,
+    Restore(crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket),
+}
+
 impl PendingSchedulerYield {
     pub(super) const fn retryable(&self) -> bool { self.entered.step.retryable() }
+    pub(super) fn retry_progress(&self) -> Option<PendingSchedulerProgress> {
+        match self.entered.step {
+            SchedulerYieldStep::Service => Some(PendingSchedulerProgress::Service),
+            SchedulerYieldStep::Restore(ticket) => Some(PendingSchedulerProgress::Restore(ticket)),
+            SchedulerYieldStep::Receive | SchedulerYieldStep::Quarantined(_) => None,
+        }
+    }
     /// The park was refused, so the lane was never held and still executes.
     const fn lane_running(&self) -> bool {
         matches!(self.entered.step, SchedulerYieldStep::Service)

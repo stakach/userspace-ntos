@@ -16,6 +16,7 @@ use nt_video_miniport::{find_adapter_start, FindAdapterPump, FindAdapterStart};
 pub(super) struct Kept {
     pump: component_scheduler::HostedPumpRestore,
     index: usize,
+    domain: HostedDomainIdentity,
     device_id: u64,
     shared_va: u64,
     device_context: DeviceDispatchContextOwner,
@@ -27,12 +28,12 @@ impl Kept {
     /// Resume once from the root boundary. `Err` is a pump that has not returned yet.
     pub(super) unsafe fn resume(self) -> Result<HostedIrpTransportResult, Self> {
         if !self.retryable() { return Err(self); }
-        let Self { pump, index, device_id, shared_va, device_context } = self;
+        let Self { pump, index, domain, device_id, shared_va, device_context } = self;
         let device_context = match device_context.resume() {
             Ok(owner) => owner,
             Err((status, owner)) => {
                 trace(b"context-resume-refused", device_id, status.raw() as u32);
-                return Err(Self { pump, index, device_id, shared_va, device_context: owner });
+                return Err(Self { pump, index, domain, device_id, shared_va, device_context: owner });
             }
         };
         // Another device may have projected resources onto this instance while FindAdapter
@@ -53,11 +54,11 @@ impl Kept {
                 Ok(owner) | Err((_, owner)) => owner,
             };
             trace(b"context-projection-refused", device_id, status.raw() as u32);
-            return Err(Self { pump, index, device_id, shared_va, device_context });
+            return Err(Self { pump, index, domain, device_id, shared_va, device_context });
         }
         answer(Self {
             pump: component_scheduler::retry_child_work(pump),
-            index, device_id, shared_va, device_context,
+            index, domain, device_id, shared_va, device_context,
         })
     }
 }
@@ -74,6 +75,9 @@ pub(super) unsafe fn dispatch(
         HostedIrpTransportResult::NotDispatched { status });
     let sh = inst.exec_shared_va;
     let device_id = binding.device_id;
+    let Some(domain) = instance_domain_identity(inst) else {
+        return not_dispatched(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    };
     if !hosted_instance_video_port_initialized(inst) {
         return not_dispatched(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -177,7 +181,7 @@ pub(super) unsafe fn dispatch(
     let pump = component_scheduler::service_continuation::settle_for_file_owner(
         component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller));
     match answer(Kept {
-        pump, index, device_id, shared_va: sh,
+        pump, index, domain, device_id, shared_va: sh,
         device_context: DeviceDispatchContextOwner::active(context),
     }) {
         Ok(result) => BackendDispatch::Returned(result),
@@ -209,11 +213,11 @@ unsafe fn answer(kept: Kept) -> Result<HostedIrpTransportResult, Kept> {
     let start = find_adapter_start(outcome);
     if start != FindAdapterStart::Pending {
         // Whatever FindAdapter did, the lane may be free once its pump stopped (#427).
-        hosted_file_owners::lane_freed();
+        hosted_file_owners::lane_freed(kept.index, kept.domain);
     }
     match start {
         FindAdapterStart::Pending => {
-            let Kept { pump, index, device_id, shared_va, device_context } = kept;
+            let Kept { pump, index, domain, device_id, shared_va, device_context } = kept;
             let device_context = match device_context.suspend() {
                 Ok(owner) => owner,
                 Err((status, owner)) => {
@@ -221,7 +225,7 @@ unsafe fn answer(kept: Kept) -> Result<HostedIrpTransportResult, Kept> {
                     owner
                 }
             };
-            Err(Kept { pump, index, device_id, shared_va, device_context })
+            Err(Kept { pump, index, domain, device_id, shared_va, device_context })
         }
         FindAdapterStart::Quarantined => {
             let Kept { index, device_id, .. } = kept;

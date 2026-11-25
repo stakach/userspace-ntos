@@ -66663,6 +66663,8 @@ pub(crate) struct DriverInstance {
     pub hosted_domain_id: u64,
     pub hosted_domain_cookie: u64,
     pub driver_id: u64,
+    /// Native worker-claim release hint for queued File IRPs of this instance lifetime.
+    pub file_worker_epoch: u64,
     /// Claimed by the root from the harness before any foreign DriverEntry code runs.
     pub provisional_driver_object: u64,
     pub driver_object: u64,
@@ -66714,6 +66716,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     hosted_domain_id: 0,
     hosted_domain_cookie: 0,
     driver_id: 0,
+    file_worker_epoch: 0,
     provisional_driver_object: 0,
     driver_object: 0,
     driver_unload: 0,
@@ -67812,6 +67815,15 @@ fn register_instance(dc: &DriverComponent, published_claim: u64) {
     } else {
         0
     };
+    let file_worker_epoch = if t[dc.instance].used
+        && t[dc.instance].driver_id == dc.driver_id
+        && t[dc.instance].hosted_domain_id == dc.hosted_domain_id
+        && t[dc.instance].hosted_domain_cookie == dc.hosted_domain_cookie
+    {
+        t[dc.instance].file_worker_epoch
+    } else {
+        0
+    };
     let (debug_filter_map_cap, debug_filter_copy_state, debug_filter_map_established) = if t[dc.instance].used
         && t[dc.instance].pml4 == dc.pml4
         && t[dc.instance].hosted_domain_id == dc.hosted_domain_id
@@ -67860,6 +67872,7 @@ fn register_instance(dc: &DriverComponent, published_claim: u64) {
         hosted_domain_id: dc.hosted_domain_id,
         hosted_domain_cookie: dc.hosted_domain_cookie,
         driver_id: dc.driver_id,
+        file_worker_epoch,
         provisional_driver_object: published_claim,
         driver_object: dc.drvobj,
         driver_unload: dc.driver_unload,

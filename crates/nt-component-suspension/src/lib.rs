@@ -445,6 +445,12 @@ struct LaneSlot<C, R, T> {
     lane: Option<Lane<C, R, T>>,
 }
 
+struct DomainIdleEpoch {
+    domain: u64,
+    generation: u64,
+    epoch: u64,
+}
+
 /// Owns the physical execution lanes for one shared-state component.
 ///
 /// The table serializes component execution while allowing independent lanes to retain physical
@@ -458,6 +464,8 @@ pub struct ComponentSuspensionLanes<C, R, T = ()> {
     /// Advanced each time a lane becomes admissible (Idle), so work queued for a lane is
     /// retried on exactly that event (#427).
     idle_epoch: u64,
+    /// Shared lanes in one physical domain wake only work owned by that domain.
+    domain_idle_epochs: Vec<DomainIdleEpoch>,
 }
 
 pub struct ComponentSuspensionStack<C, R> {
@@ -801,6 +809,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             max_depth_per_lane,
             running: None,
             idle_epoch: 0,
+            domain_idle_epochs: Vec::new(),
         }
     }
 
@@ -945,7 +954,17 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         {
             return Err(LaneError::Busy);
         }
-        Ok(slot.lane.take().unwrap().binding)
+        let released = slot.lane.take().unwrap();
+        if let Some(route) = released.shared_peer {
+            let identity = route.identity();
+            if !self.slots.iter().any(|slot| slot.lane.as_ref().and_then(|lane| lane.shared_peer)
+                .is_some_and(|peer| peer.identity().domain == identity.domain
+                    && peer.identity().domain_generation == identity.domain_generation)) {
+                self.domain_idle_epochs.retain(|row| row.domain != identity.domain
+                    || row.generation != identity.domain_generation);
+            }
+        }
+        Ok(released.binding)
     }
 
     pub fn binding(&self, handle: LaneHandle) -> Result<LaneBinding, LaneError> {
@@ -1141,7 +1160,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         lane.phase = LanePhase::Idle;
         lane.dispatch = None;
         self.running = None;
-        self.lane_became_idle();
+        self.lane_became_idle(handle);
         Ok(())
     }
 
@@ -1150,8 +1169,24 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         self.idle_epoch
     }
 
-    pub(crate) fn lane_became_idle(&mut self) {
+    /// Scheduling hint for one exact hosted-domain lifetime.
+    pub fn idle_epoch_for_domain(&self, domain: u64, generation: u64) -> Option<u64> {
+        self.domain_idle_epochs.iter()
+            .find(|row| row.domain == domain && row.generation == generation)
+            .map(|row| row.epoch)
+    }
+
+    pub(crate) fn lane_became_idle(&mut self, handle: LaneHandle) {
         self.idle_epoch = self.idle_epoch.wrapping_add(1);
+        let Some(route) = self.lane(handle).ok().and_then(|lane| lane.shared_peer) else {
+            return;
+        };
+        let identity = route.identity();
+        let row = self.domain_idle_epochs.iter_mut()
+            .find(|row| row.domain == identity.domain
+                && row.generation == identity.domain_generation)
+            .expect("registered shared lane has a domain epoch");
+        row.epoch = row.epoch.wrapping_add(1);
     }
 
     /// Park a running lane in an external continuation such as a user-mode callback.

@@ -3,6 +3,7 @@
 use super::*;
 use crate::print_str;
 use crate::service_sec_image::{ComponentLanes, COMPONENT_SUSPENSIONS};
+use nt_io_manager::HostedDomainIdentity;
 use nt_component_suspension::{
     IngressReplyObservation, LaneDispatchIdentity, PeerAdmissionFence, PeerInstallationPhase,
     PeerRetirementEffect,
@@ -172,6 +173,12 @@ pub(crate) unsafe fn root_idle_receive_after_child_yield(
 /// Advanced each time a hosted lane becomes admissible again (#427).
 pub(crate) unsafe fn lane_idle_epoch() -> u64 {
     lanes().idle_epoch()
+}
+
+/// Scheduling hint for one physical hosted-domain lifetime. Admission still validates the
+/// published route and its canonical Reply binding.
+pub(crate) unsafe fn lane_idle_epoch_for_domain(domain: HostedDomainIdentity) -> Option<u64> {
+    lanes().idle_epoch_for_domain(domain.domain_id.raw(), domain.cookie)
 }
 
 unsafe fn lanes() -> &'static mut ComponentLanes {

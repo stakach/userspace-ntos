@@ -189,7 +189,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         }
         self.lane_mut(handle).map_err(StartupError::Lane)?.phase = LanePhase::Idle;
         self.running = None;
-        self.lane_became_idle();
+        self.lane_became_idle(handle);
         Ok(())
     }
 }

@@ -139,11 +139,22 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                 return Err(PeerLaneError::Peer(PeerError::WrongPhase));
             }
         }
+        let new_domain = !self.domain_idle_epochs.iter().any(|row|
+            row.domain == domain && row.generation == domain_generation);
+        if new_domain {
+            self.domain_idle_epochs.try_reserve(1)
+                .map_err(|_| PeerLaneError::Lane(LaneError::NoCapacity))?;
+        }
         let lane = self
             .allocate_with_phase(binding, LanePhase::Staged, true)
             .map_err(PeerLaneError::Lane)?;
         match peers.stage_lane(domain, domain_generation, self, lane) {
             Ok(registration) => {
+                if new_domain {
+                    self.domain_idle_epochs.push(crate::DomainIdleEpoch {
+                        domain, generation: domain_generation, epoch: 0,
+                    });
+                }
                 self.slots[lane.index as usize]
                     .lane
                     .as_mut()

@@ -124,20 +124,25 @@ pub struct QueuedIrp {
     pub driver: u64,
     /// The lane epoch at which it was last refused.
     pub refused_at: u64,
+    /// Current epoch of this IRP's exact driver instance, or None if its authority retired.
+    pub current_epoch: Option<u64>,
+    /// An exact-instance readiness transition or one owed startup continuation can retry now.
+    pub wake_without_epoch: bool,
     /// A cancel or abandon is queued; it completes without entry and needs no lane.
     pub cancel_queued: bool,
 }
 
-/// The queued IRPs to move now, in order: every one whose cancel is queued, and, once a lane
-/// has freed since its refusal, only the oldest waiting IRP of each driver, so none overtakes an
-/// earlier one and nothing is retried while no lane has changed.
-pub fn queued_admission_candidates(queue: &[QueuedIrp], epoch: u64) -> alloc::vec::Vec<u64> {
+/// The queued IRPs to move now, in order: every queued cancellation, and only the oldest
+/// waiting IRP of each driver after its own lane changed or an owned readiness/startup wake.
+/// A retired authority receives one owned disposition probe; absence is not a periodic wake.
+pub fn queued_admission_candidates(queue: &[QueuedIrp]) -> alloc::vec::Vec<u64> {
     let mut candidates = alloc::vec::Vec::new();
     for irp in queue {
         let oldest = queue.iter()
             .filter(|other| other.driver == irp.driver && !other.cancel_queued)
             .all(|other| other.id >= irp.id);
-        if irp.cancel_queued || (oldest && irp.refused_at != epoch) {
+        if irp.cancel_queued || (oldest && (irp.wake_without_epoch
+            || irp.current_epoch.is_some_and(|epoch| epoch != irp.refused_at))) {
             candidates.push(irp.id);
         }
     }

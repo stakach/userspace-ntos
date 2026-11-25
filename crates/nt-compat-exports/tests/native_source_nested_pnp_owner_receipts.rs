@@ -55,6 +55,6 @@ fn nested_file_owner_receipts_recheck_live_authority_and_canonical_irp() {
     assert!(trace.contains("owner.irp_id != Some(irp)"));
     assert!(trace.contains("authority.live()"));
     assert!(trace.contains("owner.flight") && trace.contains("owner.payload"));
-    assert!(trace.contains("owner.admission_epoch") && trace.contains("owner.retry_after"));
+    assert!(trace.contains("owner.retry_after"));
     assert!(trace.contains("owner.plain_pump") && trace.contains("owner.terminal_receipt"));
 }

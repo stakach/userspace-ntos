@@ -114,7 +114,7 @@ impl IngressReceiver<ReceivedMessage> {
         lane.dispatch = None;
         lane.bootstrap_dispatch = None;
         lanes.running = None;
-        lanes.lane_became_idle();
+        lanes.lane_became_idle(dispatch.lane());
         Ok(())
     }
 }

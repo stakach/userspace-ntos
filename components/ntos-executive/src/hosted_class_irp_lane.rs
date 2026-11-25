@@ -459,6 +459,26 @@ pub(super) unsafe fn ordinary_admission_snapshot(instance_index: usize) -> (u64,
         u64::from(worker(instance_index, row.ordinal).is_some()))
 }
 
+/// Read-only readiness of this exact instance's existing dispatch worker. `prepare` still owns
+/// startup and the final provider admission.
+pub(super) unsafe fn ordinary_ready(instance_index: usize) -> bool {
+    let Some(index) = index_for(instance_index) else { return false; };
+    let row = &(&*core::ptr::addr_of!(LANES))[index];
+    row.phase == Phase::Ready && row.current_irp.admits_new()
+        && row.route.is_some_and(|route|
+            matches!(runtime::ready_for_admission(route), Ok(true)))
+}
+
+/// A retained worker startup needs one owned retry even without a lane-idle event.
+pub(super) unsafe fn startup_retry_progress(
+    instance_index: usize,
+) -> Option<component_scheduler::PendingSchedulerProgress> {
+    index_for(instance_index).and_then(|index| {
+        (&*core::ptr::addr_of!(LANES))[index].startup_yield.as_ref()
+            .and_then(component_scheduler::PendingSchedulerYield::retry_progress)
+    })
+}
+
 pub(super) unsafe fn select_callback(instance_index: usize) -> Option<Selection> {
     select(instance_index, SelectionPurpose::Callback)
 }
@@ -837,7 +857,7 @@ pub(super) unsafe fn release_irp(instance_index: usize, irp: u64) {
     if let Some(index) = index_for(instance_index) {
         let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
         if row.phase == Phase::Ready && row.current_irp.release(irp) {
-            hosted_file_owners::lane_freed();
+            hosted_file_owners::lane_freed(instance_index, row.domain);
         }
     }
 }
