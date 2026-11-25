@@ -102,6 +102,7 @@ static MAP_REPLY_INFO: AtomicU64 = AtomicU64::new(4);
 static MAP_DETAIL0: AtomicU64 = AtomicU64::new(0);
 static MAP_DETAIL1: AtomicU64 = AtomicU64::new(0);
 static GRANT_VA: AtomicU64 = AtomicU64::new(0x4000_0000);
+static HOSTED_DMA_MAP_PUBLISHED_COUNT: AtomicU64 = AtomicU64::new(0);
 static mut FSD_SHARED_VADDR: u64 = 0;
 
 struct HostedDmaAllocationGuard;
@@ -135,6 +136,9 @@ unsafe fn trace_hosted_dma_sg(
     _: &[u8], _: &[u8], _: i32, _: u64, _: u64, _: u64,
     _: u32, _: u64, _: u64, _: u64,
 ) {}
+unsafe fn trace_dma_record_exhaustion(_: u64, _: u64) {
+    panic!("this fixture has a free DMA record; exhaustion is unexpected");
+}
 unsafe fn call_on5_raw(
     _: u64, adapter: u64, operation: u64, address: u64, backing: u64, length: u64,
 ) -> (u64, u64, u64, u64, u64) {
@@ -262,6 +266,7 @@ fn setup() -> ([u64; 48], [u64; 4]) {
     MAP_REPLY_INFO.store(4, Ordering::Relaxed);
     MAP_DETAIL0.store(0, Ordering::Relaxed);
     MAP_DETAIL1.store(0, Ordering::Relaxed);
+    HOSTED_DMA_MAP_PUBLISHED_COUNT.store(0, Ordering::Relaxed);
     GRANT_VA.store(0x4000_0000, Ordering::Relaxed);
     let mut shared = [0u64; 48];
     unsafe { FSD_SHARED_VADDR = shared.as_mut_ptr() as u64; }
@@ -307,6 +312,7 @@ fn uncertain_map_keeps_token_claim_and_cannot_replay_provider_effect() {
     let map = token.as_ptr() as u64;
     assert_eq!(s_dma_map_transfer(7, 17, map, 0x5000_0000, &mut length, 0), 0);
     assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 1);
+    assert_eq!(HOSTED_DMA_MAP_PUBLISHED_COUNT.load(Ordering::Relaxed), 0);
     assert_eq!(unsafe { dma_record_load(FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORDS,
         SH_DMA_ALLOC_RECORD_LEN) }, u64::MAX, "claim must precede uncertain IPC");
     assert_eq!(unsafe { dma_record_load(FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORDS,
@@ -411,6 +417,7 @@ fn authenticated_mapping_publishes_exact_bounce_record() {
     assert_eq!(length, 64);
     assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 1);
     assert_eq!(&grant[..64], &[0u8; 64]);
+    assert_eq!(HOSTED_DMA_MAP_PUBLISHED_COUNT.load(Ordering::Relaxed), 1);
     assert_published_map(unsafe { FSD_SHARED_VADDR } + SH_DMA_ALLOC_RECORDS,
         map, 0x1000, grant.as_ptr() as u64);
     assert!(!LOCKED.load(Ordering::Acquire));
@@ -431,6 +438,7 @@ fn definite_conflict_advances_once_and_publishes_next_exact_mapping() {
     assert_eq!(length, 64);
     assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 2,
         "the rejected candidate must be sent only once");
+    assert_eq!(HOSTED_DMA_MAP_PUBLISHED_COUNT.load(Ordering::Relaxed), 1);
     assert_eq!(&grant[..64], &[0xA5u8; 64]);
     assert_eq!(&grant[0x1000..0x1040], &[0u8; 64]);
     assert_published_map(unsafe { FSD_SHARED_VADDR } + SH_DMA_ALLOC_RECORDS,

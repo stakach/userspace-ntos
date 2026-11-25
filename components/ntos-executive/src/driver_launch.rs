@@ -1983,6 +1983,18 @@ static HOSTED_DMA_SG_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_DMA_SG_TRACE_CAP: u64 = 16;
 static HOSTED_DMA_SG_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_DMA_SG_FAILURE_TRACE_CAP: u64 = 16;
+static HOSTED_DMA_RECORD_EXHAUSTION_TRACED: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_MAP_PUBLISHED_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_PUT_SG_ENTER_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_PUT_SG_QUERY_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_PUT_SG_RESERVE_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_PUT_SG_RETIRED_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_PUT_SG_RETIRE_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_FREE_MAP_RETIRED_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_FREE_MAP_NO_EFFECT_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_FREE_MAP_UNCERTAIN_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_RECORD_CLEARED_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_RETIRE_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DMA_EIGHT_BYTE_READ_SG_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DMA_PRIVATE_POOL_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_DMA_PRIVATE_POOL_FAILURE_CAP: u64 = 4;
@@ -12412,6 +12424,95 @@ unsafe fn first_free_dma_allocation_record(sh: u64) -> Option<u64> {
     None
 }
 
+/// A single bounded receipt at record exhaustion. The allocation guard is held by the caller,
+/// so every sampled row and the high-water count belong to one consistent ownership state.
+unsafe fn trace_dma_record_exhaustion(sh: u64, adapter_id: u64) {
+    if HOSTED_DMA_RECORD_EXHAUSTION_TRACED.fetch_add(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+    let count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    let capacity = dma_allocation_record_capacity(sh);
+    let mut free = 0u64;
+    let mut reserved = 0u64;
+    let mut published = 0u64;
+    let mut common = 0u64;
+    let mut map = 0u64;
+    let mut coherent = 0u64;
+    let mut same_adapter = 0u64;
+    let mut same_reserved = 0u64;
+    let mut same_logical_zero = 0u64;
+    let mut samples = [0u64; 4];
+    let mut sample_count = 0usize;
+    let mut index = 0u64;
+    while index < count.min(capacity) {
+        let Some(record) = dma_allocation_record(sh, index) else { break };
+        let length = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
+        let owner = dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID);
+        match length {
+            0 => free += 1,
+            DMA_RECORD_RESERVED => reserved += 1,
+            _ => published += 1,
+        }
+        match dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND) {
+            HOSTED_DMA_RECORD_KIND_COMMON => common += 1,
+            HOSTED_DMA_RECORD_KIND_MAP_TRANSFER => map += 1,
+            HOSTED_DMA_RECORD_KIND_COHERENT_MAP => coherent += 1,
+            _ => {},
+        }
+        if owner == adapter_id && length != 0 {
+            same_adapter += 1;
+            same_reserved += u64::from(length == DMA_RECORD_RESERVED);
+            same_logical_zero += u64::from(
+                dma_record_load(record, SH_DMA_ALLOC_RECORD_LOGICAL) == 0,
+            );
+            if sample_count < 3 {
+                samples[sample_count] = index;
+                sample_count += 1;
+            }
+            samples[3] = index;
+        }
+        index += 1;
+    }
+    print_str(b"[dma-record-exhaustion] adapter/count/cap/free/reserved/published/common/map/coherent/same/same-reserved/same-logical-zero=");
+    for value in [adapter_id, count, capacity, free, reserved, published, common, map,
+        coherent, same_adapter, same_reserved, same_logical_zero] {
+        print_u64(value);
+        print_str(b"/");
+    }
+    print_str(b"\n[dma-record-lifecycle] map-published/put-enter/query-failed/reserve-failed/retired/retire-failed/free-retired/free-no-effect/free-uncertain/records-cleared=");
+    for counter in [&HOSTED_DMA_MAP_PUBLISHED_COUNT, &HOSTED_DMA_PUT_SG_ENTER_COUNT,
+        &HOSTED_DMA_PUT_SG_QUERY_FAILED_COUNT, &HOSTED_DMA_PUT_SG_RESERVE_FAILED_COUNT,
+        &HOSTED_DMA_PUT_SG_RETIRED_COUNT, &HOSTED_DMA_PUT_SG_RETIRE_FAILED_COUNT,
+        &HOSTED_DMA_FREE_MAP_RETIRED_COUNT, &HOSTED_DMA_FREE_MAP_NO_EFFECT_COUNT,
+        &HOSTED_DMA_FREE_MAP_UNCERTAIN_COUNT, &HOSTED_DMA_RECORD_CLEARED_COUNT] {
+        print_u64(counter.load(Ordering::Relaxed));
+        print_str(b"/");
+    }
+    print_str(b"\n");
+    let mut sample_index = 0usize;
+    while sample_index < 4 {
+        if sample_index >= sample_count && sample_index != 3 { sample_index += 1; continue; }
+        if sample_index == 3 && same_adapter == 0 { break; }
+        let sample = samples[sample_index];
+        let Some(record) = dma_allocation_record(sh, sample) else { break };
+        print_str(b"[dma-record-sample] index/kind/length/extent/logical/token/source/flags=");
+        print_u64(sample);
+        for field in [SH_DMA_ALLOC_RECORD_KIND, SH_DMA_ALLOC_RECORD_LEN] {
+            print_str(b"/");
+            print_u64(dma_record_load(record, field));
+        }
+        print_str(b"/");
+        print_u64(dma_shared_record(record).pending_extent());
+        for field in [SH_DMA_ALLOC_RECORD_LOGICAL, SH_DMA_ALLOC_RECORD_MAP_REGISTER,
+            SH_DMA_ALLOC_RECORD_SOURCE_VA, SH_DMA_ALLOC_RECORD_FLAGS] {
+            print_str(b"/");
+            print_hex64(dma_record_load(record, field));
+        }
+        print_str(b"\n");
+        sample_index += 1;
+    }
+}
+
 unsafe fn dma_adapter_blob_id(adapter: u64) -> Option<u64> {
     if adapter == 0
         || read_unaligned((adapter + HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET) as *const u64)
@@ -12992,6 +13093,19 @@ enum DmaMapRetirement {
     Uncertain,
 }
 
+fn trace_dma_retire_failure(phase: &[u8], status: i32, token: u64) {
+    if HOSTED_DMA_RETIRE_FAILURE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return;
+    }
+    print_str(b"[dma-retire-failed] phase/status/token=");
+    print_str(phase);
+    print_str(b"/");
+    print_hex(status as u32);
+    print_str(b"/");
+    print_hex64(token);
+    print_str(b"\n");
+}
+
 unsafe fn dma_retire_map_token(adapter: u64, map: u64) -> DmaMapRetirement {
     if let Some((_, identity, _, _, grant)) = hosted_irq_lane_context() {
         let metadata = dma_adapter_metadata(adapter)
@@ -13061,8 +13175,11 @@ unsafe fn dma_retire_sg_list(adapter: u64, list: u64) -> bool {
             arguments,
         });
         if result.faulted || result.value_count != 0 || result.status != STATUS_SUCCESS {
+            HOSTED_DMA_PUT_SG_RETIRE_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
+            trace_dma_retire_failure(b"irq-put-sg", result.status, list);
             hosted_irq_lane_protocol_fault(lease_id);
         }
+        HOSTED_DMA_PUT_SG_RETIRED_COUNT.fetch_add(1, Ordering::Relaxed);
         return true;
     }
     let (_label, status, _, _, _) = call_on5(
@@ -13071,7 +13188,14 @@ unsafe fn dma_retire_sg_list(adapter: u64, list: u64) -> bool {
         HOSTED_DMA_SERVICE_PUT_SG << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
         list, 0, 0,
     );
-    status as u32 as i32 == STATUS_SUCCESS
+    if status as u32 as i32 == STATUS_SUCCESS {
+        HOSTED_DMA_PUT_SG_RETIRED_COUNT.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        HOSTED_DMA_PUT_SG_RETIRE_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
+        trace_dma_retire_failure(b"put-sg", status as u32 as i32, list);
+        false
+    }
 }
 
 unsafe fn dma_query_sg_members(adapter: u64, list: u64) -> Option<(u64, u64)> {
@@ -13192,6 +13316,7 @@ unsafe fn dma_clear_records_for_map(map_register_base: u64) {
                 | HOSTED_DMA_RECORD_KIND_COHERENT_MAP) && token == map_register_base
                 && dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) == adapter_id {
                 clear_dma_allocation_record(record);
+                HOSTED_DMA_RECORD_CLEARED_COUNT.fetch_add(1, Ordering::Relaxed);
             }
         }
         i += 1;
@@ -13224,16 +13349,20 @@ unsafe fn dma_retire_claimed_map(adapter: u64, map_register_base: u64) {
     // the allocation guard, so only a verified result may reopen the local claim.
     match dma_retire_map_token(adapter, map_register_base) {
         DmaMapRetirement::Retired => {
+            HOSTED_DMA_FREE_MAP_RETIRED_COUNT.fetch_add(1, Ordering::Relaxed);
             let _allocation_guard = HostedDmaAllocationGuard::acquire();
             dma_clear_records_for_map(map_register_base);
         }
         DmaMapRetirement::NoEffect => {
+            HOSTED_DMA_FREE_MAP_NO_EFFECT_COUNT.fetch_add(1, Ordering::Relaxed);
             let _allocation_guard = HostedDmaAllocationGuard::acquire();
             // A stale token with no published mapping acquired only the sentinel. A foreign
             // or ambiguous owner may still have active rows; keep those rows reserved.
             dma_clear_token_only_retirement_claim(map_register_base);
         }
-        DmaMapRetirement::Uncertain => {}
+        DmaMapRetirement::Uncertain => {
+            HOSTED_DMA_FREE_MAP_UNCERTAIN_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -13414,6 +13543,7 @@ extern "win64" fn s_dma_map_transfer(
                 }
                 Some(record)
             } else {
+                trace_dma_record_exhaustion(FSD_SHARED_VADDR, metadata.adapter_id);
                 None
             }
         };
@@ -13504,6 +13634,7 @@ extern "win64" fn s_dma_map_transfer(
                 let _allocation_guard = HostedDmaAllocationGuard::acquire();
                 publish_dma_allocation_record(record, mapped_len,
                     if write_to_device != 0 { HOSTED_DMA_RECORD_FLAG_WRITE_TO_DEVICE } else { 0 });
+                HOSTED_DMA_MAP_PUBLISHED_COUNT.fetch_add(1, Ordering::Relaxed);
             }
             write_unaligned(length, mapped_len as u32);
             return logical as i64;
@@ -13686,6 +13817,7 @@ extern "win64" fn s_dma_map_transfer(
             let _allocation_guard = HostedDmaAllocationGuard::acquire();
             publish_dma_allocation_record(record, mapped_len,
                 if write_to_device != 0 { HOSTED_DMA_RECORD_FLAG_WRITE_TO_DEVICE } else { 0 });
+            HOSTED_DMA_MAP_PUBLISHED_COUNT.fetch_add(1, Ordering::Relaxed);
             let cursor = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *const u64);
             let end = offset + mapped_len;
             if end > cursor {
@@ -14177,8 +14309,12 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         if scatter_gather == 0 {
             return;
         }
+        HOSTED_DMA_PUT_SG_ENTER_COUNT.fetch_add(1, Ordering::Relaxed);
         let Some((map_register, sg_context)) = dma_query_sg_members(adapter, scatter_gather)
-        else { return; };
+        else {
+            HOSTED_DMA_PUT_SG_QUERY_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
         let mdl = read_unaligned((sg_context + HOSTED_SG_CONTEXT_MDL) as *const u64);
         let current_va = read_unaligned((sg_context + HOSTED_SG_CONTEXT_CURRENT_VA) as *const u64);
         let length = read_unaligned((sg_context + HOSTED_SG_CONTEXT_LENGTH) as *const u32);
@@ -14192,6 +14328,7 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         // Mark every local mapping for this token before an external effect. A duplicate PutSG
         // sees the reservation and cannot replay an uncertain provider retirement.
         if !dma_reserve_sg_records(map_register) {
+            HOSTED_DMA_PUT_SG_RESERVE_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let _ =

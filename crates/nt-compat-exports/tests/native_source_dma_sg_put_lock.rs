@@ -69,6 +69,9 @@ static RETIRE_SUCCEEDS: AtomicBool = AtomicBool::new(false);
 static QUERIES: AtomicUsize = AtomicUsize::new(0);
 static RETIRES: AtomicUsize = AtomicUsize::new(0);
 static CLEARS: AtomicUsize = AtomicUsize::new(0);
+static HOSTED_DMA_PUT_SG_ENTER_COUNT: AtomicUsize = AtomicUsize::new(0);
+static HOSTED_DMA_PUT_SG_QUERY_FAILED_COUNT: AtomicUsize = AtomicUsize::new(0);
+static HOSTED_DMA_PUT_SG_RESERVE_FAILED_COUNT: AtomicUsize = AtomicUsize::new(0);
 static mut CONTEXT: [u64; 8] = [0; 8];
 
 struct HostedDmaAllocationGuard;
@@ -121,6 +124,9 @@ fn reset() {
     QUERIES.store(0, Ordering::Relaxed);
     RETIRES.store(0, Ordering::Relaxed);
     CLEARS.store(0, Ordering::Relaxed);
+    HOSTED_DMA_PUT_SG_ENTER_COUNT.store(0, Ordering::Relaxed);
+    HOSTED_DMA_PUT_SG_QUERY_FAILED_COUNT.store(0, Ordering::Relaxed);
+    HOSTED_DMA_PUT_SG_RESERVE_FAILED_COUNT.store(0, Ordering::Relaxed);
     unsafe {
         CONTEXT[2] = 17; // MDL
         CONTEXT[3] = 23; // current VA
@@ -136,12 +142,16 @@ fn uncertain_retirement_keeps_the_claim_and_refuses_replay() {
     assert_eq!(QUERIES.load(Ordering::Relaxed), 1);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
     assert_eq!(CLEARS.load(Ordering::Relaxed), 0);
+    assert_eq!(HOSTED_DMA_PUT_SG_ENTER_COUNT.load(Ordering::Relaxed), 1);
+    assert_eq!(HOSTED_DMA_PUT_SG_QUERY_FAILED_COUNT.load(Ordering::Relaxed), 0);
     assert!(RESERVED.load(Ordering::Acquire));
     assert!(!LOCKED.load(Ordering::Acquire));
 
     // A second entry cannot replay the uncertain provider effect.
     s_dma_put_scatter_gather_list(7, 11, 0);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
+    assert_eq!(HOSTED_DMA_PUT_SG_ENTER_COUNT.load(Ordering::Relaxed), 2);
+    assert_eq!(HOSTED_DMA_PUT_SG_RESERVE_FAILED_COUNT.load(Ordering::Relaxed), 1);
     assert!(RESERVED.load(Ordering::Acquire));
 }
 
@@ -153,6 +163,8 @@ fn successful_retirement_clears_its_claim_once() {
     assert_eq!(QUERIES.load(Ordering::Relaxed), 1);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
     assert_eq!(CLEARS.load(Ordering::Relaxed), 1);
+    assert_eq!(HOSTED_DMA_PUT_SG_ENTER_COUNT.load(Ordering::Relaxed), 1);
+    assert_eq!(HOSTED_DMA_PUT_SG_RESERVE_FAILED_COUNT.load(Ordering::Relaxed), 0);
     assert!(!RESERVED.load(Ordering::Acquire));
     assert!(!LOCKED.load(Ordering::Acquire));
 }

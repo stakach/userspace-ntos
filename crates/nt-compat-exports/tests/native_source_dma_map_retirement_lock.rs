@@ -75,7 +75,11 @@ fn map_retirement_releases_guard_and_keeps_uncertain_claims() {
 
 const PORTS: &str = r#"
 use std::ptr::{read_unaligned, read_volatile, write_volatile};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+fn print_str(_: &[u8]) {}
+fn print_hex(_: u32) {}
+fn print_hex64(_: u64) {}
 
 const HOSTED_DMA_RECORD_KIND_MAP_TRANSFER: u64 = 2;
 const HOSTED_DMA_RECORD_KIND_COHERENT_MAP: u64 = 3;
@@ -106,6 +110,11 @@ static RETIRE_SUCCEEDS: AtomicBool = AtomicBool::new(false);
 static REPLY_VALID: AtomicBool = AtomicBool::new(true);
 static ACTION: AtomicU32 = AtomicU32::new(2);
 static RETIRES: AtomicUsize = AtomicUsize::new(0);
+static HOSTED_DMA_RETIRE_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_RECORD_CLEARED_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_FREE_MAP_RETIRED_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_FREE_MAP_NO_EFFECT_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DMA_FREE_MAP_UNCERTAIN_COUNT: AtomicU64 = AtomicU64::new(0);
 static mut FSD_SHARED_VADDR: u64 = 0;
 static mut TOKEN: [u64; 4] = [HOSTED_DMA_MAP_REGISTER_SIGNATURE, 1, 7, 0];
 
@@ -225,6 +234,11 @@ fn setup() -> Vec<u64> {
     REPLY_VALID.store(true, Ordering::Release);
     ACTION.store(2, Ordering::Release);
     RETIRES.store(0, Ordering::Relaxed);
+    HOSTED_DMA_RETIRE_FAILURE_TRACE_COUNT.store(0, Ordering::Relaxed);
+    HOSTED_DMA_RECORD_CLEARED_COUNT.store(0, Ordering::Relaxed);
+    HOSTED_DMA_FREE_MAP_RETIRED_COUNT.store(0, Ordering::Relaxed);
+    HOSTED_DMA_FREE_MAP_NO_EFFECT_COUNT.store(0, Ordering::Relaxed);
+    HOSTED_DMA_FREE_MAP_UNCERTAIN_COUNT.store(0, Ordering::Relaxed);
     let mut shared = vec![0u64; 64];
     unsafe { FSD_SHARED_VADDR = shared.as_mut_ptr() as u64; }
     shared
@@ -255,6 +269,7 @@ fn direct_free_with_no_mapping_claims_token_before_uncertain_retirement() {
         0, "a token-only retirement has no mapped extent");
     s_dma_free_map_registers(7, token(), 1);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1, "uncertain effect was replayed");
+    assert_eq!(HOSTED_DMA_FREE_MAP_UNCERTAIN_COUNT.load(Ordering::Relaxed), 1);
     assert!(!LOCKED.load(Ordering::Acquire));
 }
 
@@ -274,6 +289,7 @@ fn malformed_success_does_not_clear_or_replay_claim() {
         64, "an uncertain retirement must keep its exact published extent");
     s_dma_free_map_registers(7, token(), 1);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1, "malformed receipt replayed retirement");
+    assert_eq!(HOSTED_DMA_FREE_MAP_UNCERTAIN_COUNT.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -288,6 +304,8 @@ fn authenticated_free_clears_exact_published_mapping_once() {
     assert_eq!(unsafe { dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER) }, 0);
     assert_eq!(unsafe { dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) }, 0);
     assert_eq!(unsafe { dma_record_load(record, SH_DMA_ALLOC_RECORD_PENDING_EXTENT) }, 0);
+    assert_eq!(HOSTED_DMA_FREE_MAP_RETIRED_COUNT.load(Ordering::Relaxed), 1);
+    assert_eq!(HOSTED_DMA_RECORD_CLEARED_COUNT.load(Ordering::Relaxed), 1);
     s_dma_free_map_registers(7, token(), 1);
     assert!(RETIRES.load(Ordering::Relaxed) <= 2,
         "stale token retried retirement beyond the authenticated no-effect");

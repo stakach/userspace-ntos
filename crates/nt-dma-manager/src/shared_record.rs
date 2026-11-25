@@ -75,6 +75,11 @@ impl SharedDmaRecord {
         self.field(offset).load(Ordering::SeqCst)
     }
 
+    /// Extent retained while the record is reserved for an uncertain native effect.
+    pub fn pending_extent(&self) -> u64 {
+        self.pending_extent.load(Ordering::SeqCst)
+    }
+
     /// Only the provider's allocation guard may mutate a record. `length` is the commit
     /// marker: mutation starts with `begin` and ends with `publish` or `clear`.
     pub fn store(&self, offset: u64, value: u64) {
