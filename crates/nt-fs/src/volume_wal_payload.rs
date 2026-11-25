@@ -50,6 +50,8 @@ pub enum HiveLogWalReplayError {
     InvalidPayload,
     MissingFile,
     ForeignIdentity,
+    /// The record targets a boot image already copied for SYSTEM restoration.
+    ProtectedTarget,
     UnexpectedLength,
     ContradictoryBytes,
     OutOfMemory,

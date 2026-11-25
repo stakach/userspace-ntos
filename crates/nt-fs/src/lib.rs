@@ -13,6 +13,7 @@ extern crate alloc;
 
 mod byte_lock;
 mod boot_paths;
+mod boot_system_pre_read;
 mod boot_volume_links;
 mod async_block_route;
 mod bounded_read;
@@ -65,6 +66,7 @@ mod volume_open_route;
 
 pub use byte_lock::*;
 pub use boot_paths::*;
+pub use boot_system_pre_read::BootSystemPreRead;
 pub use boot_volume_links::*;
 pub use async_block_route::*;
 pub use bounded_read::published_file_size;
