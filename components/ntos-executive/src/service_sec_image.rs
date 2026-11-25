@@ -13639,12 +13639,6 @@ unsafe fn pending_pnp_operation_transfer(
         badge: nt_handler.current_badge,
         reply_cap: stolen,
     });
-    if let OwnedPendingPnpOperation::RawStart(start) = &operation {
-        let (call, pdo, provider_irp) = start.trace_identity();
-        crate::hosted_raw_pdo_start::trace_raw_start(
-            call, pdo, provider_irp, b"caller-reply-parked", None, None,
-        );
-    }
     nt_handler
         .pending_pnp_operations
         .publish(reservation, PendingPnpOperation { operation, reservation, reply })
@@ -13658,23 +13652,7 @@ unsafe fn pending_driver_start_reply_owner(
     badge: u64,
     status: u32,
 ) -> bool {
-    pending_driver_start_reply_owner_traced(nt_handler, cap, badge, status, None)
-}
-
-unsafe fn pending_driver_start_reply_owner_traced(
-    nt_handler: &mut ExecNtHandler,
-    cap: u64,
-    badge: u64,
-    status: u32,
-    raw_trace: Option<(u64, u64, u64)>,
-) -> bool {
     let delivered = reply_parked_syscall(cap, status as u64);
-    if let Some((call, pdo, provider_irp)) = raw_trace {
-        let phase: &[u8] = if delivered { b"caller-reply-delivered" } else { b"caller-reply-rejected" };
-        crate::hosted_raw_pdo_start::trace_raw_start(
-            call, pdo, provider_irp, phase, Some(status), None,
-        );
-    }
     assert!(delivered, "driver START retains uncertain Reply completion");
     release_reply_pool_cap(cap);
     thread_wait_state_clear_badge_ready(nt_handler, badge);
@@ -15256,17 +15234,9 @@ unsafe fn settle_pending_raw_start(
     slot: usize,
     progress: RawPdoStartProgress,
 ) -> u64 {
-    let (call, pdo, provider_irp) = match nt_handler.pending_pnp_operations.get(slot) {
-        Some(PendingPnpOperation { operation: OwnedPendingPnpOperation::RawStart(start), .. }) =>
-            start.trace_identity(),
-        _ => unreachable!("raw START settlement lost its exact owner"),
-    };
     match progress {
         RawPdoStartProgress::Awaiting => 0,
         RawPdoStartProgress::NotEntered { request, status } => {
-            crate::hosted_raw_pdo_start::trace_raw_start(
-                call, pdo, provider_irp, b"pending-not-entered", Some(status), None,
-            );
             let mut pending = nt_handler.pending_pnp_operations.take(slot)
                 .expect("proven unentered raw START lost its continuation");
             if let Some(request) = request {
@@ -15277,8 +15247,8 @@ unsafe fn settle_pending_raw_start(
                 };
                 result.expect("unentered raw START lost its exact request");
                 if let Some(reply) = pending.reply.take() {
-                    let delivered = pending_driver_start_reply_owner_traced(
-                        nt_handler, reply.reply_cap, reply.badge, status, Some((call, pdo, provider_irp)),
+                    let delivered = pending_driver_start_reply_owner(
+                        nt_handler, reply.reply_cap, reply.badge, status,
                     );
                     record_pending_start_reply(nt_handler, request, status, delivered);
                     return 1;
@@ -15288,17 +15258,14 @@ unsafe fn settle_pending_raw_start(
             0
         }
         RawPdoStartProgress::Complete { request, receipt, status } => {
-            crate::hosted_raw_pdo_start::trace_raw_start(
-                call, pdo, provider_irp, b"pending-lifecycle-terminal", Some(status), None,
-            );
             let mut pending = nt_handler.pending_pnp_operations.take(slot)
                 .expect("completed raw START lost its continuation");
             if let Some(request) = request {
                 nt_handler.pnp_start_device_calls.complete_lifecycle(request, receipt, status)
                     .expect("raw START lifecycle lost its exact request");
                 if let Some(reply) = pending.reply.take() {
-                    let delivered = pending_driver_start_reply_owner_traced(
-                        nt_handler, reply.reply_cap, reply.badge, status, Some((call, pdo, provider_irp)),
+                    let delivered = pending_driver_start_reply_owner(
+                        nt_handler, reply.reply_cap, reply.badge, status,
                     );
                     record_pending_start_reply(nt_handler, request, status, delivered);
                     return 1;
@@ -15308,17 +15275,14 @@ unsafe fn settle_pending_raw_start(
             0
         }
         RawPdoStartProgress::OwnershipLost { request, irp_id, status } => {
-            crate::hosted_raw_pdo_start::trace_raw_start(
-                call, pdo, provider_irp, b"pending-ownership-lost", Some(status), None,
-            );
             nt_handler.pnp_start_device_calls
                 .complete_ownership_lost(request, irp_id, None, status)
                 .expect("uncertain raw START lost its exact request");
             let reply = nt_handler.pending_pnp_operations.get_mut(slot)
                 .and_then(|pending| pending.reply.take());
             if let Some(reply) = reply {
-                let delivered = pending_driver_start_reply_owner_traced(
-                    nt_handler, reply.reply_cap, reply.badge, status, Some((call, pdo, provider_irp)),
+                let delivered = pending_driver_start_reply_owner(
+                    nt_handler, reply.reply_cap, reply.badge, status,
                 );
                 record_pending_start_reply(nt_handler, request, status, delivered);
                 return 1;
@@ -15326,9 +15290,6 @@ unsafe fn settle_pending_raw_start(
             0
         }
         RawPdoStartProgress::Released => {
-            crate::hosted_raw_pdo_start::trace_raw_start(
-                call, pdo, provider_irp, b"retained-owner-released", None, None,
-            );
             let pending = nt_handler.pending_pnp_operations.take(slot)
                 .expect("released raw START lost its continuation");
             assert!(pending.reply.is_none(), "released raw START retained a caller Reply");

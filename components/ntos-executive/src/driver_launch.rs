@@ -55578,51 +55578,10 @@ unsafe fn hosted_accepted_pdo_physical_provider(
 }
 
 unsafe fn advance_hosted_accepted_pdo_provider(
-    owner: HostedAcceptedPdoProviderOwner,
-) -> HostedAcceptedPdoProviderOwner {
-    advance_hosted_accepted_pdo_provider_traced(owner, None)
-}
-
-#[derive(Clone, Copy)]
-struct RawPdoStartTrace {
-    call: u64,
-    pdo: u64,
-    provider_irp: u64,
-}
-
-fn accepted_pdo_provider_stage_name(stage: &HostedAcceptedPdoProviderStage) -> &'static [u8] {
-    match stage {
-        HostedAcceptedPdoProviderStage::Prepared(_) => b"provider-prepared",
-        HostedAcceptedPdoProviderStage::Return(_) => b"provider-return",
-        HostedAcceptedPdoProviderStage::Retained(_) => b"provider-retained",
-        HostedAcceptedPdoProviderStage::CompletionReturn(_) => b"provider-completion-return",
-        HostedAcceptedPdoProviderStage::Terminal(_) => b"provider-terminal",
-        HostedAcceptedPdoProviderStage::Discarded(_) => b"provider-discarded",
-        HostedAcceptedPdoProviderStage::Ready { .. } => b"provider-ready-lower",
-        HostedAcceptedPdoProviderStage::ReadyDirect { .. } => b"provider-receipt-ready",
-        HostedAcceptedPdoProviderStage::Indeterminate(_) => b"provider-discard-retired",
-    }
-}
-
-unsafe fn advance_hosted_accepted_pdo_provider_traced(
     mut owner: HostedAcceptedPdoProviderOwner,
-    raw_trace: Option<RawPdoStartTrace>,
 ) -> HostedAcceptedPdoProviderOwner {
-    let before = accepted_pdo_provider_stage_name(&owner.stage);
     owner.stage =
-        advance_hosted_accepted_pdo_provider_stage(owner.stage, owner.mode, &mut owner.physical, &mut owner.lease, raw_trace);
-    let after = accepted_pdo_provider_stage_name(&owner.stage);
-    if let Some(trace) = raw_trace {
-        if before != after {
-            crate::hosted_raw_pdo_start::trace_raw_start(
-                trace.call, trace.pdo, trace.provider_irp, after, None, None,
-            );
-        } else {
-            crate::hosted_raw_pdo_start::trace_raw_start_once(
-                trace.call, trace.pdo, trace.provider_irp, 4, after,
-            );
-        }
-    }
+        advance_hosted_accepted_pdo_provider_stage(owner.stage, owner.mode, &mut owner.physical, &mut owner.lease);
     owner
 }
 
@@ -55647,7 +55606,6 @@ unsafe fn advance_hosted_accepted_pdo_provider_stage(
     mode: HostedAcceptedPdoProviderMode,
     physical: &mut Option<HostedPnpPhysicalProvider>,
     lease: &mut Option<HostedProviderDependencyDispatchLease>,
-    raw_trace: Option<RawPdoStartTrace>,
 ) -> HostedAcceptedPdoProviderStage {
     use nt_pnp_manager::{AcceptedPdoPnpDiscard, AcceptedPdoPnpResult};
     match stage {
@@ -55850,17 +55808,7 @@ unsafe fn advance_hosted_accepted_pdo_provider_stage(
                 return HostedAcceptedPdoProviderStage::Terminal(terminal);
             }
             if terminal.acknowledge_provider(io_manager_mut()).is_err() {
-                if let Some(trace) = raw_trace {
-                    crate::hosted_raw_pdo_start::trace_raw_start_once(
-                        trace.call, trace.pdo, trace.provider_irp, 0, b"provider-ack-rejected",
-                    );
-                }
                 return HostedAcceptedPdoProviderStage::Terminal(terminal);
-            }
-            if let Some(trace) = raw_trace {
-                crate::hosted_raw_pdo_start::trace_raw_start_once(
-                    trace.call, trace.pdo, trace.provider_irp, 1, b"provider-ack-complete",
-                );
             }
             let identity = terminal.identity();
             match mode {
@@ -55873,15 +55821,7 @@ unsafe fn advance_hosted_accepted_pdo_provider_stage(
                         Ok(receipt) => {
                             HostedAcceptedPdoProviderStage::ReadyDirect { identity, receipt }
                         }
-                        Err((_, terminal)) => {
-                            if let Some(trace) = raw_trace {
-                                crate::hosted_raw_pdo_start::trace_raw_start_once(
-                                    trace.call, trace.pdo, trace.provider_irp, 2,
-                                    b"provider-receipt-retire-rejected",
-                                );
-                            }
-                            HostedAcceptedPdoProviderStage::Terminal(terminal)
-                        }
+                        Err((_, terminal)) => HostedAcceptedPdoProviderStage::Terminal(terminal),
                     }
                 }
             }
@@ -56160,8 +56100,6 @@ impl HostedRawPdoStartTerminal {
 
 pub(crate) unsafe fn advance_hosted_raw_pdo_start(
     owner: HostedAcceptedPdoProviderOwner,
-    trace_call: u64,
-    pdo: u64,
 ) -> HostedRawPdoStartProgress {
     if owner.direct_provider_irp().is_none() {
         return HostedRawPdoStartProgress::Indeterminate {
@@ -56169,10 +56107,7 @@ pub(crate) unsafe fn advance_hosted_raw_pdo_start(
             owner,
         };
     }
-    let raw_trace = owner.direct_provider_irp().map(|provider_irp| RawPdoStartTrace {
-        call: trace_call, pdo, provider_irp: provider_irp.raw(),
-    });
-    let owner = advance_hosted_accepted_pdo_provider_traced(owner, raw_trace);
+    let owner = advance_hosted_accepted_pdo_provider(owner);
     match owner {
         HostedAcceptedPdoProviderOwner {
             stage: HostedAcceptedPdoProviderStage::ReadyDirect { identity, receipt },

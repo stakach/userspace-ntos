@@ -45,36 +45,14 @@ extern crate self as nt_status;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
-// Serial output is outside this executable owner's behavioral contract.
-fn print_str(_: &[u8]) {}
-fn print_u64(_: u64) {}
-fn print_hex_u64(_: u64) {}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IrpId(u64);
 impl IrpId { pub fn raw(self) -> u64 { self.0 } }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PnpDispatchToken(u64);
-pub struct PnpDispatchIdentity {
-    pub devnode_id: u64,
-    pub devnode_generation: u64,
-    pub dispatch_generation: u64,
-    pub canonical_irp_id: u64,
-}
-impl PnpDispatchToken {
-    pub fn identity(&self) -> PnpDispatchIdentity {
-        PnpDispatchIdentity {
-            devnode_id: self.0,
-            devnode_generation: 1,
-            dispatch_generation: 1,
-            canonical_irp_id: self.0,
-        }
-    }
-}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StartDeviceRequestIdentity(u64);
-impl StartDeviceRequestIdentity { pub fn sequence(self) -> u64 { self.0 } }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StartDeviceLifecycleReceipt(u64);
 pub struct PnpError;
@@ -138,11 +116,7 @@ mod driver_launch {
     }
     pub fn advance_hosted_raw_pdo_start(
         mut owner: HostedAcceptedPdoProviderOwner,
-        trace_call: u64,
-        pdo: u64,
     ) -> HostedRawPdoStartProgress {
-        assert_eq!(trace_call, 9);
-        assert_eq!(pdo, 17);
         match owner.steps.pop_front().unwrap_or(Step::Awaiting) {
             Step::Awaiting => HostedRawPdoStartProgress::Awaiting(owner),
             Step::Ready => HostedRawPdoStartProgress::Ready(
