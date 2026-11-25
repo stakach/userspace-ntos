@@ -15,6 +15,7 @@ mod accepted_pdo_direct_filter_edge;
 mod accepted_pdo_pnp;
 mod existing_device_start_service;
 pub use existing_device_start_service::*;
+mod raw_pdo_start_resources;
 mod accepted_pdo_provider;
 mod bus_properties;
 mod bus_relations;
@@ -2572,7 +2573,7 @@ impl PnpManager {
         &mut self,
         token: &PnpDispatchToken,
         fdo_device_id: u64,
-        io_receipt: nt_io_manager::ExternalPnpTerminalReceipt,
+        io_receipt: &nt_io_manager::ExternalPnpTerminalReceipt,
     ) -> Result<StartDeviceLifecycleReceipt, PnpError> {
         let io_identity = StartDeviceIoTerminalIdentity {
             irp_id: io_receipt.irp_id().raw(),
@@ -2585,6 +2586,15 @@ impl PnpManager {
             start_status: io_receipt.status().raw() as u32,
         };
         self.complete_start_device_dispatch_identity(token, fdo_device_id, io_identity)
+    }
+
+    fn start_completion_matches_stack(devnode: &Devnode, fdo_device_id: u64) -> bool {
+        devnode.fdo_object_id == fdo_device_id
+            || (devnode.fdo_object_id == 0
+                && fdo_device_id == devnode.pdo_object_id
+                && devnode.pdo_properties.as_ref()
+                    .and_then(|properties| properties.capabilities.as_ref())
+                    .is_some_and(|capabilities| capabilities.raw_device_ok))
     }
 
     fn complete_start_device_dispatch_identity(
@@ -2623,12 +2633,7 @@ impl PnpManager {
             || pending.canonical_irp_id != identity.canonical_irp_id
             || pending.minor != PnpMinor::StartDevice
             || pending_devnode.pdo_object_id != pdo_device_id
-            || (pending_devnode.fdo_object_id != fdo_device_id
-                && !(pending_devnode.fdo_object_id == 0
-                    && fdo_device_id == pdo_device_id
-                    && pending_devnode.pdo_properties.as_ref()
-                        .and_then(|properties| properties.capabilities.as_ref())
-                        .is_some_and(|capabilities| capabilities.raw_device_ok)))
+            || !Self::start_completion_matches_stack(pending_devnode, fdo_device_id)
             || (pending_devnode.fdo_object_id == 0 && completion_device_id != pdo_device_id)
         {
             return Err(PnpError::StaleDispatch);
@@ -2646,12 +2651,7 @@ impl PnpManager {
             || devnode.pending_dispatch.is_some()
             || devnode.state != expected_state
             || devnode.pdo_object_id != pdo_device_id
-            || (devnode.fdo_object_id != fdo_device_id
-                && !(devnode.fdo_object_id == 0
-                    && fdo_device_id == pdo_device_id
-                    && devnode.pdo_properties.as_ref()
-                        .and_then(|properties| properties.capabilities.as_ref())
-                        .is_some_and(|capabilities| capabilities.raw_device_ok)))
+            || !Self::start_completion_matches_stack(devnode, fdo_device_id)
         {
             return Err(PnpError::StaleDispatch);
         }
@@ -2677,7 +2677,7 @@ impl PnpManager {
             .is_some_and(|devnode| {
                 devnode.generation == receipt.dispatch.devnode_generation
                     && devnode.pdo_object_id == receipt.pdo_device_id
-                    && devnode.fdo_object_id == receipt.fdo_device_id
+                    && Self::start_completion_matches_stack(devnode, receipt.fdo_device_id)
                     && devnode
                         .instance_id
                         .as_deref()

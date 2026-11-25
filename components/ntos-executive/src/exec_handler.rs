@@ -19495,6 +19495,74 @@ impl ExecNtHandler {
         }
     }
 
+    /// A service-less RawDeviceOK node has no function stack. Its direct PDO IRP is the
+    /// canonical START authority, retained with the request through provider ACK and PnP commit.
+    unsafe fn start_hosted_raw_pdo(
+        &mut self,
+        instance: &str,
+        request: nt_pnp_manager::StartDeviceRequestIdentity,
+    ) -> u32 {
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
+            return self.pnp_complete_start_without_irp(request, STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let reservation = match self.pending_pnp_operations.reserve() {
+            Ok(reservation) => reservation,
+            Err(_) => return self.pnp_complete_start_without_irp(request, STATUS_INSUFFICIENT_RESOURCES),
+        };
+        let (pdo, owner) = match driver_launch::prepare_hosted_raw_pdo_start_for_instance(instance) {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                self.pending_pnp_operations.cancel(reservation)
+                    .expect("unentered raw START lost its reservation");
+                return self.pnp_complete_start_without_irp(request, status.raw() as u32);
+            }
+        };
+        let provider_irp = owner.direct_provider_irp()
+            .expect("prepared raw START lost its canonical provider IRP");
+        let mut start = match driver_launch::begin_hosted_raw_pdo_start_dispatch(pdo, provider_irp) {
+            Ok(token) => OwnedHostedRawPdoStart::new(pdo, owner, token, request),
+            Err(status) => OwnedHostedRawPdoStart::without_token(
+                pdo, owner, request, status.raw() as u32,
+            ),
+        };
+        match start.drive() {
+            RawPdoStartProgress::Awaiting => {
+                self.pnp_start_device_calls.mark_pending(request)
+                    .expect("parked raw START request lost its synchronous owner");
+                self.pending_pnp_operation_transfer = Some(PendingPnpOperationTransfer {
+                    operation: OwnedPendingPnpOperation::RawStart(start),
+                    reservation,
+                });
+                nt_status::NtStatus::PENDING.raw() as u32
+            }
+            RawPdoStartProgress::NotEntered { request: ended, status } => {
+                self.pending_pnp_operations.cancel(reservation)
+                    .expect("proven unentered raw START lost its reservation");
+                assert_eq!(ended, Some(request), "raw START lost its exact request");
+                self.pnp_complete_start_without_irp(request, status)
+            }
+            RawPdoStartProgress::Complete { request: ended, receipt, status } => {
+                self.pending_pnp_operations.cancel(reservation)
+                    .expect("completed raw START lost its reservation");
+                assert_eq!(ended, Some(request), "raw START completed another request");
+                self.pnp_complete_start_lifecycle(request, receipt, status)
+            }
+            RawPdoStartProgress::OwnershipLost { request: lost, irp_id, status } => {
+                assert_eq!(lost, request, "uncertain raw START lost its exact request");
+                self.pnp_complete_start_ownership_lost(request, irp_id, None, status);
+                self.pending_pnp_operations.publish(reservation, PendingPnpOperation {
+                    operation: OwnedPendingPnpOperation::RawStart(start),
+                    reservation,
+                    reply: None,
+                }).expect("uncertain raw START lost its retained provider owner");
+                status
+            }
+            RawPdoStartProgress::Released => {
+                unreachable!("a new raw START cannot release before its first decision")
+            }
+        }
+    }
+
     unsafe fn pnp_control_start_device(&mut self, buffer: u64, buffer_len: usize) -> u32 {
         if buffer == 0 || buffer_len < PNP_CONTROL_DEVICE_CONTROL_LEN {
             return STATUS_INVALID_PARAMETER;
@@ -19535,9 +19603,12 @@ impl ExecNtHandler {
             nt_pnp_manager::ExistingDeviceStartDisposition::RequiresAction => {}
         }
 
-        let spec = match live_config_existing_device_launch_spec(&instance, SERVICE_DEMAND_START, true) {
+        let spec = match live_config_existing_device_start_service(&instance, SERVICE_DEMAND_START, true) {
             Ok(spec) => spec,
-            Err(status) => {
+            Err(nt_pnp_manager::ExistingDeviceStartServiceError::MissingService) => {
+                return self.start_hosted_raw_pdo(&instance, request);
+            }
+            Err(nt_pnp_manager::ExistingDeviceStartServiceError::Failure(status)) => {
                 if PNP_START_LOOKUP_CONTEXT_TRACE_N.fetch_add(1, Ordering::Relaxed) < 32 {
                     print_str(b"[pnp-start-lookup-context] call=");
                     print_u64(request.sequence());

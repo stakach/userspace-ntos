@@ -246,6 +246,8 @@ pub(crate) use hosted_interrupt_authority::*;
 pub(crate) use hosted_pnp_context::*;
 mod hosted_pnp_start;
 pub(crate) use hosted_pnp_start::*;
+mod hosted_raw_pdo_start;
+pub(crate) use hosted_raw_pdo_start::*;
 mod selftests;
 mod shared_ingress_selftest;
 mod bootstrap_receive;
@@ -16185,19 +16187,6 @@ pub(crate) unsafe fn config_manager_set_value(
     Ok(())
 }
 
-pub(crate) unsafe fn config_manager_query_value_owned(
-    key_path: &str,
-    name: &str,
-) -> Result<(u32, alloc::vec::Vec<u8>), nt_config_client::QueryError> {
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(nt_config_client::QueryError {
-            status: CONFIG_STATUS_DEVICE_NOT_READY,
-            required_len: 0,
-        })?;
-    client.query_value_owned(key_path, name)
-}
-
 pub(crate) unsafe fn config_manager_query_device_property(
     instance: &str,
     property: u32,
@@ -22597,75 +22586,114 @@ pub(crate) unsafe fn live_config_existing_device_launch_spec(
     max_start: u32,
     trace_start_failure: bool,
 ) -> Result<DriverServiceLaunchSpec, i32> {
+    live_config_existing_device_start_service(instance_id, max_start, trace_start_failure)
+        .map_err(|error| match error {
+            nt_pnp_manager::ExistingDeviceStartServiceError::MissingService =>
+                CONFIG_STATUS_OBJECT_NAME_NOT_FOUND,
+            nt_pnp_manager::ExistingDeviceStartServiceError::Failure(status) => status,
+        })
+}
+
+pub(crate) unsafe fn live_config_existing_device_start_service(
+    instance_id: &str,
+    max_start: u32,
+    trace_start_failure: bool,
+) -> Result<DriverServiceLaunchSpec, nt_pnp_manager::ExistingDeviceStartServiceError> {
+    use nt_pnp_manager::ExistingDeviceStartServiceError as ServiceError;
     let mut branch: &'static [u8] = b"enum-path-alloc";
     let mut service_query: Option<Result<u32, i32>> = None;
     let mut service_name = alloc::string::String::new();
     let mut service_decoded = false;
     let mut binding_status: Option<i32> = None;
     let mut conversion: Option<bool> = None;
-    let result = (|| -> Result<DriverServiceLaunchSpec, i32> {
+    let result = (|| -> Result<DriverServiceLaunchSpec, ServiceError> {
         let mut enum_path = alloc::string::String::from(nt_config_manager::ENUM_PATH);
         enum_path
             .try_reserve_exact(instance_id.len().saturating_add(1))
-            .map_err(|_| 0xC000_009Au32 as i32)?;
+            .map_err(|_| ServiceError::Failure(0xC000_009Au32 as i32))?;
         enum_path.push('\\');
         enum_path.push_str(instance_id);
 
-        branch = b"enum-service-query";
-        let (value_type, service_data) = match unsafe { config_manager_query_value_owned(&enum_path, "Service") } {
-            Ok(value) => value,
-            Err(error) => {
-                service_query = Some(Err(error.status));
-                return Err(error.status);
+        branch = b"enum-key-open";
+        let opened = unsafe { config_manager_open_system_hive_key(&enum_path) };
+        let enum_key = opened.as_ref().map(|key| key.lease).map_err(|status| *status);
+        let lookup = (|| -> Result<DriverServiceLaunchSpec, ServiceError> {
+            if enum_key.is_ok() {
+                branch = b"enum-service-query";
             }
-        };
-        service_query = Some(Ok(value_type));
-        branch = b"enum-service-type";
-        if value_type != nt_hive_core::RegistryValueType::Sz as u32 {
-            return Err(0xC000_000Du32 as i32);
-        }
-        branch = b"enum-service-decode";
-        let service_bytes = registry_utf16_ascii_vec(&service_data)
-            .ok_or(0xC000_0034u32 as i32)?;
-        branch = b"enum-service-utf8";
-        service_name = alloc::string::String::from_utf8(service_bytes)
-            .map_err(|_| 0xC000_0034u32 as i32)?;
-        service_decoded = true;
+            let service = nt_pnp_manager::resolve_existing_device_start_service(
+                enum_key,
+                |key| {
+                    let value = unsafe {
+                        config_manager_query_leased_system_hive_value(key, "Service")
+                    };
+                    service_query = Some(
+                        value.as_ref().map(|value| value.value_type).map_err(|status| *status),
+                    );
+                    value
+                },
+                Ok::<_, i32>,
+            )?;
+            branch = b"enum-service-type";
+            if service.value_type != nt_hive_core::RegistryValueType::Sz as u32 {
+                return Err(ServiceError::Failure(0xC000_000Du32 as i32));
+            }
+            branch = b"enum-service-decode";
+            let service_bytes = registry_utf16_ascii_vec(&service.data)
+                .ok_or(ServiceError::Failure(0xC000_0034u32 as i32))?;
+            branch = b"enum-service-utf8";
+            service_name = alloc::string::String::from_utf8(service_bytes)
+                .map_err(|_| ServiceError::Failure(0xC000_0034u32 as i32))?;
+            service_decoded = true;
 
-        branch = b"service-binding";
-        let binding = match unsafe { config_manager_query_driver_service(&service_name) } {
-            Ok(binding) => {
-                binding_status = Some(0);
-                binding
+            branch = b"service-binding";
+            let binding = match unsafe { config_manager_query_driver_service(&service_name) } {
+                Ok(binding) => {
+                    binding_status = Some(0);
+                    binding
+                }
+                Err(status) => {
+                    binding_status = Some(status);
+                    return Err(ServiceError::Failure(status));
+                }
+            };
+            branch = b"launch-conversion";
+            let spec = owned_driver_launch_spec_from_live_config_binding(binding, max_start);
+            conversion = Some(spec.is_some());
+            let mut spec = spec.ok_or(ServiceError::Failure(0xC000_0034u32 as i32))?;
+            branch = b"binding-devnode";
+            let index = spec
+                .devnodes
+                .iter()
+                .position(|devnode| devnode.instance_id.eq_ignore_ascii_case(instance_id))
+                .ok_or(ServiceError::Failure(0xC000_0225u32 as i32))?;
+            let devnode = spec.devnodes.swap_remove(index);
+            spec.devnodes.clear();
+            spec.devnodes.push(devnode);
+            Ok(spec)
+        })();
+        if let Ok(opened) = opened {
+            // An uncertain close keeps its CM owner in the retirement journal. Fail closed
+            // rather than starting a PDO from a lookup whose key lease did not settle.
+            if let Err(status) = unsafe { config_manager_retire_system_hive_key(opened.lease) } {
+                branch = b"enum-key-retire";
+                return Err(ServiceError::Failure(status));
             }
-            Err(status) => {
-                binding_status = Some(status);
-                return Err(status);
-            }
-        };
-        branch = b"launch-conversion";
-        let spec = owned_driver_launch_spec_from_live_config_binding(binding, max_start);
-        conversion = Some(spec.is_some());
-        let mut spec = spec.ok_or(0xC000_0034u32 as i32)?;
-        branch = b"binding-devnode";
-        let index = spec
-            .devnodes
-            .iter()
-            .position(|devnode| devnode.instance_id.eq_ignore_ascii_case(instance_id))
-            .ok_or(0xC000_0225u32 as i32)?;
-        let devnode = spec.devnodes.swap_remove(index);
-        spec.devnodes.clear();
-        spec.devnodes.push(devnode);
-        Ok(spec)
+        }
+        lookup
     })();
-    if let (true, Err(status)) = (trace_start_failure, &result) {
+    if let (true, Err(error)) = (trace_start_failure, &result) {
+        let status = match *error {
+            ServiceError::MissingService => CONFIG_STATUS_OBJECT_NAME_NOT_FOUND,
+            ServiceError::Failure(status) => status,
+        };
         if PNP_EXISTING_DEVICE_LOOKUP_FAILURE_TRACE_N.fetch_add(1, Ordering::Relaxed) < 32 {
             print_str(b"[pnp-start-lookup-failure] instance=");
             print_str(instance_id.as_bytes());
             print_str(b" branch=");
             print_str(branch);
             print_str(b" status=0x");
-            print_hex_u64(*status as u32 as u64);
+            print_hex_u64(status as u32 as u64);
             print_str(b" service-query=");
             match service_query {
                 None => print_str(b"not-run"),
@@ -25322,12 +25350,14 @@ struct PendingDriverStart {
 enum OwnedPendingPnpOperation {
     Rebalance(OwnedHostedPnpRebalance),
     Removal(OwnedHostedPnpRemoval),
+    RawStart(OwnedHostedRawPdoStart),
 }
 
 enum OwnedPendingPnpOperationProgress {
     AwaitingCompletion,
     Complete(u32),
     OwnershipLost(u32),
+    RawStart(RawPdoStartProgress),
 }
 
 impl OwnedPendingPnpOperation {
@@ -25361,6 +25391,9 @@ impl OwnedPendingPnpOperation {
                     OwnedPendingPnpOperationProgress::OwnershipLost(failure.status.raw() as u32)
                 }
             },
+            Self::RawStart(start) => {
+                OwnedPendingPnpOperationProgress::RawStart(unsafe { start.drive() })
+            }
         }
     }
 
@@ -25368,6 +25401,7 @@ impl OwnedPendingPnpOperation {
         match self {
             Self::Rebalance(batch) => batch.needs_completion_redrive(),
             Self::Removal(batch) => batch.needs_completion_redrive(),
+            Self::RawStart(start) => start.needs_completion_redrive(),
         }
     }
 }
