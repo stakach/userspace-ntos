@@ -34,7 +34,9 @@ mod installer_fault_receipt;
 mod primary_alias_activation;
 mod native_block_stage_sample;
 mod hosted_dma_grant;
-pub use hosted_dma_grant::{dma_grant_after_bank_refresh, DmaGrantEvidence};
+pub use hosted_dma_grant::{
+    dma_grant_after_adapter_acquire, dma_grant_after_bank_refresh, DmaGrantEvidence,
+};
 mod native_cache_claim_drain;
 mod mounted_completion_pass;
 mod retained_system_fold_phase;

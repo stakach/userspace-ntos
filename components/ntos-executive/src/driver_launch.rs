@@ -69584,7 +69584,13 @@ pub(crate) fn service_hosted_driver_dma_adapter(
     {
         return (STATUS_INSUFFICIENT_RESOURCES, 0, 0, 0);
     }
-    let Some(state) = (unsafe { hosted_device_resource_state_by_device_id(binding.device_id) }) else {
+    let Some(state) = (unsafe { hosted_device_resource_state_by_device_id(binding.device_id) })
+        .filter(|state| {
+            state.driver_id == binding.driver_id
+                && state.instance == binding.instance
+                && state.projection_domain == binding.projection_domain
+                && state.pdo_object == binding.pdo_object
+        }) else {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     };
     let Some(context_lease) = state.pnp_context_lease else {
@@ -69707,7 +69713,15 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         };
         let Some(current) = (unsafe { hosted_device_resource_states_mut() })
             .iter_mut()
-            .find(|current| current.device_id == binding.device_id)
+            .find(|current| {
+                current.device_id == binding.device_id
+                    && current.driver_id == binding.driver_id
+                    && current.instance == binding.instance
+                    && current.projection_domain == binding.projection_domain
+                    && current.pdo_object == binding.pdo_object
+                    && current.pnp_context_lease == Some(context_lease)
+                    && current.dma_frame_base == 0
+            })
         else {
             if unsafe {
                 crate::pnp::release_pci_command_for_resources(
@@ -69737,6 +69751,21 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             unsafe { rollback_created_hosted_dma_adapter(binding, adapter) };
             return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         };
+        let canonical_grant = nt_hosted_runtime::dma_grant_after_adapter_acquire(
+            nt_hosted_runtime::DmaGrantEvidence {
+                va: current.evidence.dma_common_va,
+                len: current.evidence.dma_common_len,
+                logical: current.evidence.dma_common_logical,
+            },
+            nt_hosted_runtime::DmaGrantEvidence {
+                va: window.dma_va,
+                len: window.dma_len,
+                logical: window.dma_logical,
+            },
+        );
+        current.evidence.dma_common_va = canonical_grant.va;
+        current.evidence.dma_common_len = canonical_grant.len;
+        current.evidence.dma_common_logical = canonical_grant.logical;
         current.dma_broker_va = window.dma_seed_va;
         current.dma_frame_base = window.dma_frame_base;
         current.dma_pages = window.dma_pages;
