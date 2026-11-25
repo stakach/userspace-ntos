@@ -76,6 +76,75 @@ fn malformed_successful_sector_packet_keeps_distinct_failure_origin() {
     );
 }
 
+/// The terminal-data fixture below establishes that an authenticated failing SCSI terminal
+/// yields Provider(0xc000009a). Exercise that exact typed result through the real installed
+/// READ owner. Its completion tuple is consumed by the mounted File IRP backend.
+#[test]
+fn authenticated_physical_failure_reaches_mounted_read_completion() {
+    use nt_fs::{
+        FatPathGeometry, FatRangeProgress, MountedSectorError, ReadCompletions, ReadError,
+        ReadSectorClaim,
+    };
+    use nt_status::NtStatus;
+
+    let mut reads = ReadCompletions::new();
+    let geometry = FatPathGeometry {
+        fat_start_sector: 1,
+        data_start_sector: 2,
+        total_sectors: 18,
+        sectors_per_cluster: 1,
+    };
+    let irp = 0x52;
+    reads
+        .capture_range(irp, 7, 9, geometry, 2, 0, 512, None)
+        .expect("capture one installed File READ");
+    let claim = reads
+        .claim_next_bounded(1)
+        .expect("exact physical sector claim");
+    assert_eq!((claim.irp, claim.mount, claim.file), (irp, 7, 9));
+    assert_eq!(reads.next_completion(), None);
+    assert_eq!(reads.ack(irp), Err(ReadError::NotPublished));
+
+    let failure = MountedSectorError::Provider(NtStatus::INSUFFICIENT_RESOURCES);
+    assert_eq!(
+        reads.complete_sectors(
+            ReadSectorClaim {
+                generation: claim.generation + 1,
+                ..claim
+            },
+            Err(failure)
+        ),
+        Err(ReadError::WrongClaim)
+    );
+    assert_eq!(reads.next_completion(), None);
+    assert_eq!(
+        reads.complete_sectors(claim, Err(failure)),
+        Ok(FatRangeProgress::Complete)
+    );
+    assert_eq!(
+        reads.complete_sectors(claim, Err(failure)),
+        Err(ReadError::WrongClaim)
+    );
+
+    assert_eq!(
+        reads.next_completion(),
+        Some((irp, NtStatus::INSUFFICIENT_RESOURCES.raw(), 0))
+    );
+    assert_eq!(
+        reads.next_completion(),
+        None,
+        "File IRP completion publishes once"
+    );
+    assert!(
+        reads.has_outstanding(),
+        "File IRP owner remains retained until ACK"
+    );
+    assert_eq!(reads.ack(irp + 1), Err(ReadError::WrongIdentity));
+    assert!(reads.has_outstanding());
+    reads.ack(irp).expect("exact File IRP ACK");
+    assert!(!reads.has_outstanding());
+}
+
 const PREFIX: &str = r#"
 #![allow(dead_code)]
 use std::cell::RefCell;
