@@ -58,6 +58,7 @@ mod registry_wal_store;
 mod hive_wal_publication;
 mod volume_wal_payload;
 mod file_delta_wal_payload;
+mod volume_wal_sequence;
 #[cfg(test)]
 mod snapshot_test_device;
 mod status;
