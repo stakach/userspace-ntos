@@ -10,6 +10,9 @@ use crate::{FatPathError, STATUS_DATA_ERROR};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MountedSectorError {
     Provider(NtStatus),
+    /// The native completion packet failed local transport validation after a successful
+    /// provider status. It is not an authenticated failure returned by the device.
+    Transport,
     Fat(FatPathError),
 }
 
@@ -17,6 +20,7 @@ impl MountedSectorError {
     pub const fn status(self) -> NtStatus {
         match self {
             Self::Provider(status) => status,
+            Self::Transport => NtStatus(STATUS_DATA_ERROR as i32),
             Self::Fat(FatPathError::NoCapacity) => NtStatus::INSUFFICIENT_RESOURCES,
             Self::Fat(_) => NtStatus(STATUS_DATA_ERROR as i32),
         }
@@ -35,6 +39,7 @@ mod tests {
     fn provider_failure_survives_and_fat_corruption_is_data_error() {
         assert_eq!(MountedSectorError::Provider(NtStatus::INSUFFICIENT_RESOURCES).status(),
             NtStatus::INSUFFICIENT_RESOURCES);
+        assert_eq!(MountedSectorError::Transport.status(), NtStatus(STATUS_DATA_ERROR as i32));
         assert_eq!(MountedSectorError::Fat(FatPathError::NoCapacity).status(),
             NtStatus::INSUFFICIENT_RESOURCES);
         assert_eq!(MountedSectorError::Fat(FatPathError::Corrupt).status(),
