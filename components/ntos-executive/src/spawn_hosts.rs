@@ -1646,6 +1646,10 @@ pub(crate) fn print_active_irp_receive_census() {
     shared_pump::print_active_irp_receive_census();
 }
 
+pub(crate) fn active_pnp_start_receive() -> bool {
+    shared_pump::active_pnp_start_receive()
+}
+
 pub(crate) fn print_active_syscall_receive_census() {
     shared_pump::print_active_syscall_receive_census();
 }

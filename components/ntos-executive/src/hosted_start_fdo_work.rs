@@ -74,6 +74,15 @@ fn trace_start_fdo(work: &Work, phase: &[u8], provider_irp: IrpId) {
     print_u64(work.lower.device_id().raw());
     print_str(b" devnode=");
     print_u64(work.devnode);
+    // Captured at this root-owned Work transition. A nested provider pump must not inspect
+    // WORK to infer a terminal or Reply owner from its copied receive stack.
+    print_str(b" source-raw=");
+    print_hex_u64(work.source.source_irp_address());
+    print_str(b" route/executor-tcb/reply/epoch/token/lower-instance=");
+    for value in [work.route.badge(), work.route.identity().executor, work.reply,
+        work.dispatch.epoch(), work.token, work.lower_instance as u64] {
+        print_str(b"/"); print_u64(value);
+    }
     print_str(b"\n");
 }
 
