@@ -6,11 +6,11 @@ pub enum ExistingDeviceStartServiceError {
     Failure(i32),
 }
 
-/// Resolve the Service value by an already opened exact Enum key ID. Once the value exists,
+/// Resolve the Service value through an already opened exact Enum key. Once the value exists,
 /// every failure in decoding or launching its configured service remains a service failure.
-pub fn resolve_existing_device_start_service<T, U>(
-    enum_key: Result<u64, i32>,
-    read_service: impl FnOnce(u64) -> Result<T, i32>,
+pub fn resolve_existing_device_start_service<K, T, U>(
+    enum_key: Result<K, i32>,
+    read_service: impl FnOnce(K) -> Result<T, i32>,
     configured_launch: impl FnOnce(T) -> Result<U, i32>,
 ) -> Result<U, ExistingDeviceStartServiceError> {
     let key = enum_key.map_err(ExistingDeviceStartServiceError::Failure)?;
@@ -40,7 +40,7 @@ mod tests {
         assert_eq!(absent, Err(ExistingDeviceStartServiceError::MissingService));
 
         let missing_key = resolve_existing_device_start_service(
-            Err(NAME_NOT_FOUND),
+            Err::<u64, i32>(NAME_NOT_FOUND),
             |_| Ok::<_, i32>("FixedButton"),
             |_| Ok::<_, i32>(()),
         );
