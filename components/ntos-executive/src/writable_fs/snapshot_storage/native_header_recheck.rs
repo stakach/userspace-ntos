@@ -96,22 +96,37 @@ pub(crate) unsafe fn begin_wal_continuation_recheck() -> Result<u64, u32> {
 /// Fold admission first holds this lease while CM chooses the matching checkpoint generation.
 /// Transfer that same physical owner into native header recheck without an exclusion gap.
 pub(crate) unsafe fn begin_wal_continuation_recheck_with_lease(lease: Lease) -> Result<u64, u32> {
-    if (&*core::ptr::addr_of!(PENDING_HEADER)).is_some() { return Err(BUSY); }
-    let mount = checked_mount(&lease)?;
+    begin_wal_continuation_recheck_returning_lease(lease).map_err(|(status, _lease)| status)
+}
+
+/// A fold has already retained CM's exact checkpoint token. Return its unentered reserve on
+/// refusal so that token can remain owned while the next timer boundary retries admission.
+pub(crate) unsafe fn begin_wal_continuation_recheck_returning_lease(
+    lease: Lease,
+) -> Result<u64, (u32, Lease)> {
+    if (&*core::ptr::addr_of!(PENDING_HEADER)).is_some() { return Err((BUSY, lease)); }
+    let mount = match checked_mount(&lease) {
+        Ok(mount) => mount,
+        Err(status) => return Err((status, lease)),
+    };
     let slot = &mut *core::ptr::addr_of_mut!(WAL_CONTINUATION);
-    let Some(cached) = slot.as_ref() else { return Err(nt_fs::STATUS_DEVICE_NOT_READY); };
+    let Some(cached) = slot.as_ref() else {
+        return Err((nt_fs::STATUS_DEVICE_NOT_READY, lease));
+    };
     if cached.mount != mount || cached.token.anchor() != cached.pair.anchor() {
-        return Err(nt_fs::STATUS_DATA_ERROR);
+        return Err((nt_fs::STATUS_DATA_ERROR, lease));
     }
     let id = *core::ptr::addr_of!(NEXT_HEADER_ID);
-    let next = id.checked_add(1).ok_or(nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
+    let Some(next) = id.checked_add(1) else {
+        return Err((nt_fs::STATUS_INSUFFICIENT_RESOURCES, lease));
+    };
     let cached = slot.take().expect("checked mounted continuation");
     let recheck = match nt_fs::AsyncSnapshotHeaderRecheck::new(
         lease.store(), cached.pair, lease.sector_size(), lease.sector_count()) {
         Ok(owner) => owner,
         Err((error, pair)) => {
             *slot = Some(MountedWalContinuation { mount, token: cached.token, pair });
-            return Err(super::super::snapshot_store_error_status(error));
+            return Err((super::super::snapshot_store_error_status(error), lease));
         }
     };
     *core::ptr::addr_of_mut!(NEXT_HEADER_ID) = next;

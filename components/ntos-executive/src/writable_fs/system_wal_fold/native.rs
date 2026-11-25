@@ -2,6 +2,7 @@
 
 use super::*;
 use alloc::vec::Vec;
+use nt_memory_manager::SectionMountId;
 use nt_fs::{AsyncSnapshotCommit, AsyncSnapshotIoKind, AsyncSnapshotRequest,
     AsyncWalEpochRollover};
 
@@ -63,6 +64,12 @@ struct Active {
 }
 
 enum StalledState {
+    Admission {
+        _lease: Option<snapshot_storage::Lease>,
+        _prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
+        _mount: SectionMountId,
+        _manifest: nt_fs::WalSnapshotManifest,
+    },
     BeforeCommit {
         _lease: snapshot_storage::Lease,
         _token: nt_fs::RegistryWalContinuation,
@@ -80,8 +87,17 @@ enum StalledState {
 }
 
 enum Work {
+    /// No header read entered. CM's prepared image remains single-flight while a timer-only
+    /// retry reacquires this same mounted reserve and validates its latest WAL proof.
+    AdmissionPending {
+        prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
+        manifest: nt_fs::WalSnapshotManifest,
+        mount: SectionMountId,
+        retry_after_100ns: u64,
+        last_status: u32,
+    },
     Rechecking { id: u64, prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
-        manifest: nt_fs::WalSnapshotManifest, started_ticks: u64,
+        manifest: nt_fs::WalSnapshotManifest, mount: SectionMountId, started_ticks: u64,
         start_after_print: bool, trace: bool },
     Active(Active),
     // A local contradiction retains every move-only owner until boot recovery.
@@ -89,6 +105,7 @@ enum Work {
 }
 
 static mut WORK: Option<Work> = None;
+const ADMISSION_RETRY_100NS: u64 = 5 * 10_000_000;
 static FOLD_MEASURES: AtomicU64 = AtomicU64::new(0);
 static FOLD_MEASURE_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
 
@@ -115,11 +132,13 @@ pub(super) unsafe fn print_quiesce_owner() {
     print_str(b"[quiesce-native-fold] phase=");
     print_str(match work {
         None => b"absent",
+        Some(Work::AdmissionPending { .. }) => b"admission-pending",
         Some(Work::Rechecking { .. }) => b"rechecking",
         Some(Work::Active(_)) => b"active",
         Some(Work::Stalled(_)) => b"stalled",
     });
     let (id, lease, entered, failed) = match work {
+        Some(Work::AdmissionPending { .. }) => (0, false, false, false),
         Some(Work::Rechecking { id, .. }) => (*id, false, false, false),
         Some(Work::Active(active)) =>
             (active.id, true, active.entered, active.failed),
@@ -130,6 +149,9 @@ pub(super) unsafe fn print_quiesce_owner() {
     print_str(b" local-lease="); print_u64(u64::from(lease));
     print_str(b" entered="); print_u64(u64::from(entered));
     print_str(b" failed="); print_u64(u64::from(failed));
+    if let Some(Work::AdmissionPending { last_status, .. }) = work {
+        print_str(b" admission-refusal=0x"); print_hex(*last_status);
+    }
     print_str(b"\n");
 }
 
@@ -164,7 +186,13 @@ unsafe fn advance_recheck() -> Result<(), u32> {
         Ok(None) => return Err(snapshot_storage::BUSY),
         Err(status) => {
             if snapshot_storage::recheck_was_aborted_no_effect(id) {
-                let _ = slot.take();
+                let Some(Work::Rechecking { prepared, manifest, mount, .. }) = slot.take()
+                    else { unreachable!() };
+                *slot = Some(Work::AdmissionPending { prepared, manifest, mount,
+                    retry_after_100ns: crate::monotonic_time_100ns()
+                        .saturating_add(ADMISSION_RETRY_100NS),
+                    last_status: status });
+                return Err(snapshot_storage::BUSY);
             }
             return Err(status);
         }
@@ -225,12 +253,119 @@ unsafe fn advance_recheck() -> Result<(), u32> {
     Ok(())
 }
 
+/// Only a timer service boundary calls this after a no-effect refusal. An ordinary native I/O
+/// pump sees AdmissionPending as inert and cannot mint a fresh header owner on every pass.
+unsafe fn retry_pending_admission() -> Result<bool, u32> {
+    let slot = &mut *core::ptr::addr_of_mut!(WORK);
+    let Some(Work::AdmissionPending { retry_after_100ns, .. }) = slot.as_ref() else {
+        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+    };
+    if crate::monotonic_time_100ns() < *retry_after_100ns {
+        return Err(snapshot_storage::BUSY);
+    }
+    let Some(Work::AdmissionPending { prepared, manifest, mount, .. }) = slot.take()
+        else { unreachable!() };
+    let lease = match snapshot_storage::acquire() {
+        Ok(lease) => lease,
+        Err(status) if status == snapshot_storage::BUSY => {
+            *slot = Some(Work::AdmissionPending { prepared, manifest, mount,
+                retry_after_100ns: crate::monotonic_time_100ns()
+                    .saturating_add(ADMISSION_RETRY_100NS), last_status: status });
+            return Err(snapshot_storage::BUSY);
+        }
+        Err(status) => {
+            *slot = Some(Work::Stalled(StalledState::Admission {
+                _lease: None, _prepared: prepared, _mount: mount, _manifest: manifest,
+            }));
+            return Err(block(status));
+        }
+    };
+    if *lease.identity() != mount {
+        *slot = Some(Work::Stalled(StalledState::Admission {
+            _lease: Some(lease), _prepared: prepared, _mount: mount, _manifest: manifest,
+        }));
+        return Err(block(nt_fs::STATUS_DATA_ERROR));
+    }
+    let observed = match snapshot_storage::cached_wal_manifest(&lease) {
+        Ok(observed) => observed,
+        Err(status) => {
+            *slot = Some(Work::Stalled(StalledState::Admission {
+                _lease: Some(lease), _prepared: prepared, _mount: mount, _manifest: manifest,
+            }));
+            return Err(block(status));
+        }
+    };
+    // Non-SYSTEM hive records may have extended this same verified WAL while the reserve was
+    // released. CM's retained preparation excludes new SYSTEM mutations; accept only a
+    // monotonically extended suffix in the same incarnation and replay base.
+    if observed.incarnation != manifest.incarnation
+        || observed.base_serial != manifest.base_serial
+        || observed.high_water_serial < manifest.high_water_serial
+        || observed.high_water_end_lba < manifest.high_water_end_lba
+        || (observed.high_water_serial == manifest.high_water_serial
+            && observed.high_water_end_lba != manifest.high_water_end_lba)
+    {
+        *slot = Some(Work::Stalled(StalledState::Admission {
+            _lease: Some(lease), _prepared: prepared, _mount: mount, _manifest: manifest,
+        }));
+        return Err(block(nt_fs::STATUS_DATA_ERROR));
+    }
+    Err(begin_recheck_with_prepared(lease, prepared, observed, mount))
+}
+
+unsafe fn begin_recheck_with_prepared(
+    lease: snapshot_storage::Lease,
+    prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
+    manifest: nt_fs::WalSnapshotManifest,
+    mount: SectionMountId,
+) -> u32 {
+    let slot = &mut *core::ptr::addr_of_mut!(WORK);
+    let id = match snapshot_storage::begin_wal_continuation_recheck_returning_lease(lease) {
+        Ok(id) => id,
+        Err((status, lease)) if status == snapshot_storage::BUSY
+            || status == nt_fs::STATUS_INSUFFICIENT_RESOURCES =>
+        {
+            drop(lease);
+            *slot = Some(Work::AdmissionPending { prepared, manifest, mount,
+                retry_after_100ns: crate::monotonic_time_100ns()
+                    .saturating_add(ADMISSION_RETRY_100NS), last_status: status });
+            return snapshot_storage::BUSY;
+        }
+        Err((status, lease)) => {
+            *slot = Some(Work::Stalled(StalledState::Admission {
+                _lease: Some(lease), _prepared: prepared, _mount: mount, _manifest: manifest,
+            }));
+            return block(status);
+        }
+    };
+    let started_ticks = crate::disk_census_ticks();
+    let trace = reserve_trace();
+    *slot = Some(Work::Rechecking {
+        id, prepared, manifest, mount, started_ticks, start_after_print: false, trace,
+    });
+    trace_started(id, manifest, trace);
+    if let Some(Work::Rechecking { id: retained_id, started_ticks,
+        start_after_print, .. }) = (&mut *core::ptr::addr_of_mut!(WORK)).as_mut()
+    {
+        if *retained_id == id {
+            *started_ticks = crate::disk_census_ticks();
+            *start_after_print = true;
+        }
+    }
+    mark_runtime_dirty();
+    snapshot_storage::BUSY
+}
+
 pub(super) unsafe fn fold_system_wal_native() -> Result<bool, u32> {
     let _durable = crate::allocator::enter_durable();
     if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_none()
         || legacy_snapshot_writes_allowed()
         || WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    }
+    if matches!((&*core::ptr::addr_of!(WORK)).as_ref(),
+        Some(Work::AdmissionPending { .. })) {
+        return retry_pending_admission();
     }
     if (&*core::ptr::addr_of!(WORK)).is_some() {
         advance_recheck()?;
@@ -250,23 +385,8 @@ pub(super) unsafe fn fold_system_wal_native() -> Result<bool, u32> {
     if prepared.is_none() && manifest.base_serial == manifest.high_water_serial {
         return Ok(false);
     }
-    let id = snapshot_storage::begin_wal_continuation_recheck_with_lease(lease)?;
-    let started_ticks = crate::disk_census_ticks();
-    let trace = reserve_trace();
-    *core::ptr::addr_of_mut!(WORK) = Some(Work::Rechecking {
-        id, prepared, manifest, started_ticks, start_after_print: false, trace,
-    });
-    trace_started(id, manifest, trace);
-    if let Some(Work::Rechecking { id: retained_id, started_ticks,
-        start_after_print, .. }) = (&mut *core::ptr::addr_of_mut!(WORK)).as_mut()
-    {
-        if *retained_id == id {
-            *started_ticks = crate::disk_census_ticks();
-            *start_after_print = true;
-        }
-    }
-    mark_runtime_dirty();
-    Err(snapshot_storage::BUSY)
+    let mount = *lease.identity();
+    Err(begin_recheck_with_prepared(lease, prepared, manifest, mount))
 }
 
 /// The header recheck this fold is waiting on, while it is rechecking.
@@ -291,7 +411,7 @@ pub(crate) unsafe fn outer_io_queued() -> bool {
             && active.cursor.as_ref().is_some_and(|cursor| {
                 cursor.pending().is_none() && !cursor.is_done()
             }),
-        Some(Work::Stalled(_)) | None => false,
+        Some(Work::AdmissionPending { .. } | Work::Stalled(_)) | None => false,
     }
 }
 
