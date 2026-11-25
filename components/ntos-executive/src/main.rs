@@ -3206,6 +3206,8 @@ const DELAY_TIMER_SOURCE_KERNEL_YIELD_RETRY: u64 = 52;
 const DELAY_TIMER_SOURCE_ALPC_TIMEOUT: u64 = 53;
 /// A kept backend pump returned while a row's copy or ACK waited for it (#420).
 const DELAY_TIMER_SOURCE_COMPLETION_RETRY: u64 = 54;
+/// Exact terminal installer NtClose return, observed once after 500 ms if still open.
+const DELAY_TIMER_SOURCE_INSTALLER_CLOSE_GAP: u64 = 55;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -18002,6 +18004,7 @@ unsafe fn delay_timer_drain_due_work(
         + timer_retry_wake_due(now_100ns)
         + service_sec_image::root_add_device_retry_wake_due(now_100ns)
         + timer_deadline::queued_work_receive_poll_wake_due(now_100ns)
+        + installer_child_span_census::consume_due_gap_deadlines(now_100ns)
         + service_sec_image::primary_alias_retry_wake_due(now_100ns)
         + hosted_spawn_uncertainty::wake_due(queue, handler, now_100ns)
         + service_sec_image::component_resume::wake_due(&handler.pm, now_100ns)

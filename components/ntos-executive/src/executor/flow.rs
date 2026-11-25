@@ -322,6 +322,7 @@ pub(super) unsafe fn mark_wait_parked(
         && !crate::mounted_volume::mounted_directory_outstanding()
         && !driver_launch::mounted_native_physical_irp_pending()
         && crate::registry_mutation_work::next_deadline().is_none()
+        && !installer_child_span_census::has_pending_gap_observation()
         && crate::mutable_hive_mutation_work::next_deadline().is_none()
         && crate::section_metadata_work::next_deadline().is_none()
         && crate::process_image_snapshot_work::next_deadline().is_none()
