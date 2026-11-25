@@ -5,7 +5,7 @@ use crate::*;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_hosted_runtime::{CensusEpochGate, InstallerFaultReceipt, InstallerFaultReceipts,
     InstallerFaultTicket,
-    InstallerSyscallSpans, SpanOwner};
+    InstallerSyscallSpans, RuntimeSample, SpanOwner};
 use core::fmt::Write;
 
 const ROWS: usize = 8;
@@ -16,6 +16,9 @@ const GAP_SCAN_INTERVAL_100NS: u64 = 10_000_000;
 const GAP_REPEAT_INTERVAL_100NS: u64 = 5 * 10_000_000;
 const GAP_SAMPLES_PER_RETURN: u8 = 3;
 const GAP_SAMPLES_TOTAL: u64 = 64;
+const RUNTIME_READ_LIMIT: u64 = 8192;
+const RUNTIME_FINAL_LIMIT: u64 = 64;
+const SSN_NT_CLOSE: u32 = 27;
 
 #[derive(Clone, Copy)]
 struct GapSampleRecord {
@@ -26,6 +29,10 @@ struct GapSampleRecord {
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static NEXT_GAP_SCAN_100NS: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_READS_USED: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_READS_REFUSED: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_FINALS_USED: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_FINALS_REFUSED: AtomicU64 = AtomicU64::new(0);
 static mut CENSUS_GATE: CensusEpochGate = CensusEpochGate::new(CENSUS_LIMIT);
 static mut SPANS: InstallerSyscallSpans<ROWS, TOP> = InstallerSyscallSpans::new();
 static mut FAULTS: InstallerFaultReceipts<ROWS> = InstallerFaultReceipts::new();
@@ -70,6 +77,32 @@ fn exact_owner(handler: &ExecNtHandler, pi: usize, tid: u64, badge: u64) -> Opti
         thread_id: tid, thread_generation: lifetime.generation() })
 }
 
+/// Read a cumulative SC counter without changing the hosted thread or its scheduling context.
+/// A failed or changed identity leaves the containing wall interval unclassified.
+fn runtime_sample(handler: &ExecNtHandler, owner: SpanOwner, badge: u64) -> Option<RuntimeSample> {
+    if exact_owner(handler, owner.process_index, owner.thread_id, badge) != Some(owner) {
+        return None;
+    }
+    let binding = handler.thread_runtime.executable_by_tid(owner.thread_id)?.binding();
+    if binding.pi != owner.process_index || binding.badge != badge { return None; }
+    let sched_context = handler.observed_sched_context_for_binding(binding).filter(|sc| *sc != 0)?;
+    if RUNTIME_READS_USED.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        |used| (used < RUNTIME_READ_LIMIT).then_some(used + 1)).is_err() {
+        RUNTIME_READS_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let read = {
+        let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+        sel4_rt::sched_context_read_runtime(sched_context).ok()?
+    };
+    if exact_owner(handler, owner.process_index, owner.thread_id, badge) != Some(owner)
+        || handler.observed_sched_context_for_binding(binding) != Some(sched_context) {
+        return None;
+    }
+    Some(RuntimeSample { sched_context, bound_us: read.bound_time_us,
+        donated_us: read.donated_time_us })
+}
+
 fn retire_stale(handler: &ExecNtHandler) {
     let mut stale = [None; ROWS];
     {
@@ -84,6 +117,30 @@ fn retire_stale(handler: &ExecNtHandler) {
     }
     let ledger = unsafe { &mut *core::ptr::addr_of_mut!(SPANS) };
     for owner in stale.into_iter().flatten() {
+        // Children can finish between periodic passes. Emit their final value-only
+        // totals before exact-generation retirement discards the row.
+        if RUNTIME_FINALS_USED.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |used| (used < RUNTIME_FINAL_LIMIT).then_some(used + 1)).is_ok() {
+            if let Some(snapshot) = ledger.snapshot(owner, monotonic_time_100ns()) {
+                let runtime = snapshot.close_unmap;
+                print_str(b"[installer-child-close-unmap-final] pi/pgen/tid/tgen/pairs/classified/wall-ms/fault-ms/bound-us/donated-us/unclassified-ms/read-fail/context-change/counter-regress=");
+                for (index, value) in [owner.process_index as u64, owner.process_generation,
+                    owner.thread_id, owner.thread_generation, runtime.pairs,
+                    runtime.classified, runtime.wall_100ns / 10_000,
+                    runtime.fault_100ns / 10_000, runtime.bound_us, runtime.donated_us,
+                    runtime.unclassified_100ns / 10_000, runtime.failed_read,
+                    runtime.changed_context, runtime.counter_regression]
+                    .into_iter().enumerate() {
+                    if index != 0 { print_str(b"/"); }
+                    print_u64(value);
+                }
+                print_str(b"\n");
+            }
+        } else if RUNTIME_FINALS_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 {
+            print_str(b"[installer-child-close-unmap-final] summary-limit-reached=");
+            print_u64(RUNTIME_FINAL_LIMIT);
+            print_str(b"\n");
+        }
         let _ = ledger.retire(owner);
         unsafe { (&mut *core::ptr::addr_of_mut!(FAULTS)).retire(owner); }
     }
@@ -160,8 +217,14 @@ pub(crate) fn begin(handler: &ExecNtHandler, pi: usize, tid: u64,
     badge: u64, ssn: u32) -> Option<SpanOwner> {
     if !ACTIVE.load(Ordering::Acquire) { return None; }
     let owner = exact_owner(handler, pi, tid, badge)?;
-    unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)).begin(
-        owner, ssn, monotonic_time_100ns()).then_some(owner) }
+    // Timestamp the table entry before diagnostic IPC so read cost is not
+    // charged to the guest's return-to-entry wall interval.
+    let now = monotonic_time_100ns();
+    let needs_runtime = unsafe { (&*core::ptr::addr_of!(SPANS)) }
+        .needs_runtime_sample(owner, ssn);
+    let runtime = if needs_runtime { runtime_sample(handler, owner, badge) } else { None };
+    unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)).begin_with_runtime(
+        owner, ssn, now, runtime).then_some(owner) }
 }
 
 pub(crate) fn returned(handler: &ExecNtHandler, owner: Option<SpanOwner>,
@@ -170,8 +233,14 @@ pub(crate) fn returned(handler: &ExecNtHandler, owner: Option<SpanOwner>,
     if exact_owner(handler, owner.process_index, owner.thread_id, badge) != Some(owner) {
         return;
     }
-    let _ = unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)).return_from_dispatch(
-        owner, ssn, status, monotonic_time_100ns()) };
+    let now = monotonic_time_100ns();
+    let returned = unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)).return_from_dispatch(
+        owner, ssn, status, now) };
+    if returned && ssn == SSN_NT_CLOSE && status != nt_user_callback::STATUS_PENDING as u32 {
+        let runtime = runtime_sample(handler, owner, badge);
+        let _ = unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)) }
+            .record_close_runtime(owner, now, runtime);
+    }
 }
 
 /// Claim before the native debug reads; nested observations cannot repeat an uncertain read.
@@ -326,9 +395,9 @@ pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
 /// Only table dispatch is covered; retained pending owners have no terminal timestamp here.
 pub(crate) fn print_census(handler: &ExecNtHandler) {
     if !ACTIVE.load(Ordering::Acquire) { return; }
+    retire_stale(handler);
     let epoch = CENSUS_PERIODIC_DUMPS.load(Ordering::Relaxed);
     if !unsafe { (&mut *core::ptr::addr_of_mut!(CENSUS_GATE)).admit(epoch) } { return; }
-    retire_stale(handler);
     let now = monotonic_time_100ns();
     let ledger = unsafe { &*core::ptr::addr_of!(SPANS) };
     for owner in ledger.owners() {
@@ -398,6 +467,16 @@ pub(crate) fn print_census(handler: &ExecNtHandler) {
         print_u64(snapshot.residual_gap_100ns / 10_000); print_str(b"/");
         print_u64(snapshot.unresolved_faults); print_str(b"/");
         print_u64(snapshot.fault_admission_overflow);
+        print_str(b" close-unmap/pairs/classified/wall-ms/fault-ms/bound-us/donated-us/unclassified-ms/read-fail/context-change/counter-regress=");
+        let runtime = snapshot.close_unmap;
+        for (index, value) in [runtime.pairs, runtime.classified,
+            runtime.wall_100ns / 10_000, runtime.fault_100ns / 10_000,
+            runtime.bound_us, runtime.donated_us,
+            runtime.unclassified_100ns / 10_000, runtime.failed_read,
+            runtime.changed_context, runtime.counter_regression].into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
         // This exact return-to-next-entry interval belongs to the pi/generation/tid above.
         // It excludes pending dispatch returns, whose terminal time is not observed here.
         print_str(b" longest-gap/present/from-ssn/from-status/to-ssn/from-at-100ns/to-at-100ns=");
@@ -418,5 +497,11 @@ pub(crate) fn print_census(handler: &ExecNtHandler) {
     if ledger.activation_overflow() != 0 {
         print_str(b"[installer-child-span] activation-overflow=");
         print_u64(ledger.activation_overflow()); print_str(b"\n");
+    }
+    let refused = RUNTIME_READS_REFUSED.load(Ordering::Relaxed);
+    if refused != 0 {
+        print_str(b"[installer-child-span] runtime-reads-used/refused=");
+        print_u64(RUNTIME_READS_USED.load(Ordering::Relaxed)); print_str(b"/");
+        print_u64(refused); print_str(b"\n");
     }
 }

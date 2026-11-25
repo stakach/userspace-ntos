@@ -3,6 +3,8 @@
 const SSN_CAP: usize = 512;
 const PAIR_CAP: usize = 128;
 const STATUS_PENDING: u32 = 0x103;
+const SSN_NT_CLOSE: u32 = 27;
+const SSN_NT_UNMAP_VIEW_OF_SECTION: u32 = 277;
 
 /// One diagnostic sample per completed periodic census epoch after activation.
 /// The current epoch is primed without consuming the bounded sample budget.
@@ -97,6 +99,61 @@ pub struct LongestGap {
     pub to_at_100ns: u64,
 }
 
+/// Cumulative, capability-scoped runtime read for one exact hosted thread.
+/// The scheduling-context cap is part of the observation identity, not authority to act.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeSample {
+    pub sched_context: u64,
+    pub bound_us: u64,
+    pub donated_us: u64,
+}
+
+/// Closed Close→Unmap intervals. Runtime and fault totals are separate observations;
+/// donated execution may overlap an acknowledged fault and must not be subtracted twice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CloseUnmapRuntimeTotals {
+    pub pairs: u64,
+    pub classified: u64,
+    pub wall_100ns: u64,
+    pub fault_100ns: u64,
+    pub bound_us: u64,
+    pub donated_us: u64,
+    pub unclassified_100ns: u64,
+    pub failed_read: u64,
+    pub changed_context: u64,
+    pub counter_regression: u64,
+}
+
+impl CloseUnmapRuntimeTotals {
+    const EMPTY: Self = Self { pairs: 0, classified: 0, wall_100ns: 0,
+        fault_100ns: 0, bound_us: 0, donated_us: 0, unclassified_100ns: 0,
+        failed_read: 0, changed_context: 0, counter_regression: 0 };
+
+    fn observe(&mut self, gap: u64, fault: u64,
+        returned: Option<RuntimeSample>, entered: Option<RuntimeSample>) {
+        self.pairs = self.pairs.saturating_add(1);
+        self.wall_100ns = self.wall_100ns.saturating_add(gap);
+        self.fault_100ns = self.fault_100ns.saturating_add(fault);
+        match (returned, entered) {
+            (Some(start), Some(end)) if start.sched_context != end.sched_context => {
+                self.changed_context = self.changed_context.saturating_add(1);
+            }
+            (Some(start), Some(end)) if end.bound_us < start.bound_us
+                || end.donated_us < start.donated_us => {
+                self.counter_regression = self.counter_regression.saturating_add(1);
+            }
+            (Some(start), Some(end)) if start.sched_context != 0 => {
+                self.classified = self.classified.saturating_add(1);
+                self.bound_us = self.bound_us.saturating_add(end.bound_us - start.bound_us);
+                self.donated_us = self.donated_us.saturating_add(end.donated_us - start.donated_us);
+                return;
+            }
+            _ => { self.failed_read = self.failed_read.saturating_add(1); }
+        }
+        self.unclassified_100ns = self.unclassified_100ns.saturating_add(gap);
+    }
+}
+
 impl LongestGap {
     pub fn duration_100ns(self) -> u64 {
         self.to_at_100ns.saturating_sub(self.from_at_100ns)
@@ -120,6 +177,7 @@ pub struct SpanSnapshot<const TOP: usize> {
     pub fault_admission_overflow: u64,
     pub max_gap_100ns: u64,
     pub longest_gap: Option<LongestGap>,
+    pub close_unmap: CloseUnmapRuntimeTotals,
     pub last_return_age_100ns: Option<u64>,
     pub active: Option<SpanSample>,
     pub pending: Option<SpanSample>,
@@ -144,6 +202,9 @@ struct ActiveSpan { ssn: u32, at_100ns: u64 }
 
 #[derive(Clone, Copy)]
 struct LastReturn { ssn: u32, status: u32, at_100ns: u64 }
+
+#[derive(Clone, Copy)]
+struct CloseReturnRuntime { at_100ns: u64, sample: Option<RuntimeSample> }
 
 #[derive(Clone, Copy)]
 struct ActiveFault {
@@ -177,6 +238,8 @@ struct Row {
     active: Option<ActiveSpan>,
     pending: Option<ActiveSpan>,
     last_return: Option<LastReturn>,
+    close_return_runtime: Option<CloseReturnRuntime>,
+    close_unmap: CloseUnmapRuntimeTotals,
     active_fault: Option<ActiveFault>,
     completed_fault_open_gap_100ns: u64,
     completed_fault_gap_100ns: u64,
@@ -197,6 +260,7 @@ struct Row {
 impl Row {
     const EMPTY: Self = Self {
         owner: None, active: None, pending: None, last_return: None,
+        close_return_runtime: None, close_unmap: CloseUnmapRuntimeTotals::EMPTY,
         active_fault: None,
         completed_fault_open_gap_100ns: 0, completed_fault_gap_100ns: 0,
         fault_admission_overflow: 0,
@@ -221,7 +285,7 @@ impl Row {
             unresolved_faults: u64::from(self.active_fault.is_some()),
             fault_admission_overflow: self.fault_admission_overflow,
             max_gap_100ns: self.longest_gap.map_or(0, LongestGap::duration_100ns),
-            longest_gap: self.longest_gap,
+            longest_gap: self.longest_gap, close_unmap: self.close_unmap,
             last_return_age_100ns: self.last_return.map(|last| now.saturating_sub(last.at_100ns)),
             active: self.active.map(|span| SpanSample { ssn: span.ssn,
                 age_100ns: now.saturating_sub(span.at_100ns) }),
@@ -380,6 +444,12 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
     }
 
     pub fn begin(&mut self, owner: SpanOwner, ssn: u32, now: u64) -> bool {
+        self.begin_with_runtime(owner, ssn, now, None)
+    }
+
+    /// The runtime sample is optional: a failed observation never changes the wall/fault gap.
+    pub fn begin_with_runtime(&mut self, owner: SpanOwner, ssn: u32, now: u64,
+        runtime: Option<RuntimeSample>) -> bool {
         let Some(row) = self.rows.iter_mut().find(|row| row.owner == Some(owner)) else {
             return false;
         };
@@ -391,9 +461,16 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
         }
         if let Some(last) = row.last_return.take() {
             let gap = now.saturating_sub(last.at_100ns);
+            let fault = row.completed_fault_open_gap_100ns.min(gap);
+            let close_runtime = row.close_return_runtime.take()
+                .filter(|observed| observed.at_100ns == last.at_100ns);
+            if last.ssn == SSN_NT_CLOSE && ssn == SSN_NT_UNMAP_VIEW_OF_SECTION {
+                row.close_unmap.observe(gap, fault,
+                    close_runtime.and_then(|observed| observed.sample), runtime);
+            }
             row.total_gap_100ns = row.total_gap_100ns.saturating_add(gap);
             row.completed_fault_gap_100ns = row.completed_fault_gap_100ns
-                .saturating_add(row.completed_fault_open_gap_100ns.min(gap));
+                .saturating_add(fault);
             row.completed_fault_open_gap_100ns = 0;
             row.observe_transition_pair(last.ssn, ssn, gap);
             if row.longest_gap.is_none_or(|prior| gap > prior.duration_100ns()) {
@@ -410,7 +487,31 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
                 }
             }
         }
+        row.close_return_runtime = None;
         row.active = Some(ActiveSpan { ssn, at_100ns: now });
+        true
+    }
+
+    /// A runtime read is needed only at the next Unmap entry after an observed Close.
+    pub fn needs_runtime_sample(&self, owner: SpanOwner, ssn: u32) -> bool {
+        if ssn != SSN_NT_UNMAP_VIEW_OF_SECTION { return false; }
+        self.rows.iter().find(|row| row.owner == Some(owner)).is_some_and(|row| {
+            row.last_return.is_some_and(|last| last.ssn == SSN_NT_CLOSE
+                && row.close_return_runtime.is_some_and(|observed|
+                    observed.at_100ns == last.at_100ns && observed.sample.is_some()))
+        })
+    }
+
+    /// Attach a read to the exact nonpending Close return that opened this gap.
+    pub fn record_close_runtime(&mut self, owner: SpanOwner, at_100ns: u64,
+        sample: Option<RuntimeSample>) -> bool {
+        let Some(row) = self.rows.iter_mut().find(|row| row.owner == Some(owner)) else {
+            return false;
+        };
+        if !row.last_return.is_some_and(|last| last.ssn == SSN_NT_CLOSE
+            && last.status != STATUS_PENDING && last.at_100ns == at_100ns)
+            || row.close_return_runtime.is_some() { return false; }
+        row.close_return_runtime = Some(CloseReturnRuntime { at_100ns, sample });
         true
     }
 
@@ -424,6 +525,7 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
             return false;
         };
         row.active = None;
+        row.close_return_runtime = None;
         if status == STATUS_PENDING {
             row.retained_pending = row.retained_pending.saturating_add(1);
             row.pending = Some(active);
@@ -533,6 +635,133 @@ mod tests {
         assert_eq!(ledger.snapshot(other_thread, 20_000), None);
         assert!(ledger.retire(recycled_thread));
         assert_eq!(ledger.snapshot(recycled_thread, 20_000), None);
+    }
+
+    #[test]
+    fn close_unmap_runtime_requires_exact_owner_and_scheduling_context() {
+        const CLOSE: u32 = 27;
+        const UNMAP: u32 = 277;
+        let mut ledger = InstallerSyscallSpans::<2, 2>::new();
+        assert!(ledger.activate(A));
+        assert!(ledger.begin(A, CLOSE, 100));
+        assert!(ledger.return_from_dispatch(A, CLOSE, 0, 200));
+        assert!(ledger.record_close_runtime(A, 200, Some(RuntimeSample {
+            sched_context: 71, bound_us: 10, donated_us: 20,
+        })));
+        assert!(ledger.needs_runtime_sample(A, UNMAP));
+        assert!(ledger.begin_with_runtime(A, UNMAP, 500, Some(RuntimeSample {
+            sched_context: 71, bound_us: 110, donated_us: 70,
+        })));
+        let first = ledger.snapshot(A, 500).unwrap();
+        assert_eq!(first.total_gap_100ns, 300);
+        assert_eq!(first.close_unmap.wall_100ns, 300);
+        assert_eq!(first.close_unmap.classified, 1);
+        assert_eq!(first.close_unmap.bound_us, 100);
+        assert_eq!(first.close_unmap.donated_us, 50);
+        assert_eq!(first.close_unmap.unclassified_100ns, 0);
+
+        assert!(ledger.return_from_dispatch(A, UNMAP, 0, 510));
+        assert!(ledger.begin(A, CLOSE, 600));
+        assert!(ledger.return_from_dispatch(A, CLOSE, 0, 610));
+        assert!(ledger.record_close_runtime(A, 610, Some(RuntimeSample {
+            sched_context: 71, bound_us: 120, donated_us: 75,
+        })));
+        assert!(ledger.begin_with_runtime(A, UNMAP, 910, Some(RuntimeSample {
+            sched_context: 72, bound_us: 200, donated_us: 100,
+        })));
+        let changed = ledger.snapshot(A, 910).unwrap();
+        assert_eq!(changed.close_unmap.wall_100ns, 600);
+        assert_eq!(changed.close_unmap.classified, 1);
+        assert_eq!(changed.close_unmap.unclassified_100ns, 300);
+        assert_eq!(changed.close_unmap.changed_context, 1);
+        assert_eq!(changed.close_unmap.bound_us, 100);
+
+        assert!(ledger.return_from_dispatch(A, UNMAP, 0, 920));
+        assert!(ledger.begin(A, CLOSE, 930));
+        assert!(ledger.return_from_dispatch(A, CLOSE, 0, 940));
+        assert!(ledger.record_close_runtime(A, 940, None));
+        assert!(!ledger.needs_runtime_sample(A, UNMAP));
+        assert!(ledger.begin_with_runtime(A, UNMAP, 1240, None));
+        let failed = ledger.snapshot(A, 1240).unwrap();
+        assert_eq!(failed.close_unmap.wall_100ns, 900);
+        assert_eq!(failed.close_unmap.unclassified_100ns, 600);
+        assert_eq!(failed.close_unmap.failed_read, 1);
+        assert_eq!(failed.close_unmap.bound_us, 100);
+
+        assert!(ledger.return_from_dispatch(A, UNMAP, 0, 1250));
+        assert!(ledger.begin(A, CLOSE, 1260));
+        assert!(ledger.return_from_dispatch(A, CLOSE, 0, 1270));
+        assert!(ledger.record_close_runtime(A, 1270, Some(RuntimeSample {
+            sched_context: 71, bound_us: 300, donated_us: 200,
+        })));
+        assert!(ledger.needs_runtime_sample(A, UNMAP));
+        assert!(ledger.begin_with_runtime(A, UNMAP, 1570, None));
+        let failed_entry = ledger.snapshot(A, 1570).unwrap();
+        assert_eq!(failed_entry.close_unmap.wall_100ns, 1200);
+        assert_eq!(failed_entry.close_unmap.unclassified_100ns, 900);
+        assert_eq!(failed_entry.close_unmap.failed_read, 2);
+        assert_eq!(failed_entry.close_unmap.bound_us, 100);
+
+        let next = SpanOwner { process_generation: A.process_generation + 1, ..A };
+        assert!(ledger.activate(next));
+        assert!(!ledger.needs_runtime_sample(next, UNMAP));
+        assert_eq!(ledger.snapshot(next, 1300).unwrap().close_unmap.wall_100ns, 0);
+    }
+
+    #[test]
+    fn pending_close_opens_no_gap_and_unacknowledged_fault_adds_no_fault_time() {
+        const CLOSE: u32 = 27;
+        const UNMAP: u32 = 277;
+        let mut ledger = InstallerSyscallSpans::<1, 1>::new();
+        assert!(ledger.activate(A));
+        assert!(ledger.begin(A, CLOSE, 100));
+        assert!(ledger.return_from_dispatch(A, CLOSE, STATUS_PENDING, 200));
+        assert!(!ledger.record_close_runtime(A, 200, Some(RuntimeSample {
+            sched_context: 71, bound_us: 1, donated_us: 1,
+        })));
+        assert!(!ledger.needs_runtime_sample(A, UNMAP));
+        assert!(ledger.begin_with_runtime(A, UNMAP, 500, None));
+        assert_eq!(ledger.snapshot(A, 500).unwrap().close_unmap.wall_100ns, 0);
+
+        assert!(ledger.return_from_dispatch(A, UNMAP, 0, 510));
+        assert!(ledger.begin(A, CLOSE, 600));
+        assert!(ledger.return_from_dispatch(A, CLOSE, 0, 610));
+        assert!(ledger.record_close_runtime(A, 610, Some(RuntimeSample {
+            sched_context: 71, bound_us: 10, donated_us: 10,
+        })));
+        let ticket = ledger.fault_enter(A, 83, 700).unwrap();
+        assert!(ledger.begin_with_runtime(A, UNMAP, 900, Some(RuntimeSample {
+            sched_context: 71, bound_us: 20, donated_us: 20,
+        })));
+        let snapshot = ledger.snapshot(A, 900).unwrap();
+        assert_eq!(snapshot.close_unmap.wall_100ns, 290);
+        assert_eq!(snapshot.close_unmap.fault_100ns, 0);
+        assert_eq!(snapshot.unresolved_faults, 1);
+        assert_eq!(snapshot.close_unmap.classified, 1);
+        assert!(!ledger.fault_reply_accepted(ticket, 650));
+    }
+
+    #[test]
+    fn close_unmap_runtime_does_not_replace_acknowledged_fault_or_wall_time() {
+        let mut ledger = InstallerSyscallSpans::<1, 1>::new();
+        assert!(ledger.activate(A));
+        assert!(ledger.begin(A, SSN_NT_CLOSE, 100));
+        assert!(ledger.return_from_dispatch(A, SSN_NT_CLOSE, 0, 200));
+        assert!(ledger.record_close_runtime(A, 200, Some(RuntimeSample {
+            sched_context: 71, bound_us: 10, donated_us: 20,
+        })));
+        let ticket = ledger.fault_enter(A, 83, 250).unwrap();
+        assert!(ledger.fault_reply_accepted(ticket, 300));
+        assert!(ledger.begin_with_runtime(A, SSN_NT_UNMAP_VIEW_OF_SECTION, 500,
+            Some(RuntimeSample { sched_context: 71, bound_us: 100, donated_us: 80 })));
+        let snapshot = ledger.snapshot(A, 500).unwrap();
+        assert_eq!(snapshot.total_gap_100ns, 300);
+        assert_eq!(snapshot.completed_fault_gap_100ns, 50);
+        assert_eq!(snapshot.residual_gap_100ns, 250);
+        assert_eq!(snapshot.close_unmap.wall_100ns, 300);
+        assert_eq!(snapshot.close_unmap.fault_100ns, 50);
+        assert_eq!(snapshot.close_unmap.bound_us, 90);
+        assert_eq!(snapshot.close_unmap.donated_us, 60);
     }
 
     #[test]
