@@ -78,6 +78,20 @@ pub(crate) unsafe fn begin_boot_hive_journal(path: &str, record: &[u8]) -> Resul
         .try_reserve_exact(record.len())
         .map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
     owned.extend_from_slice(record);
+    if baseline_needs_checkpoint(&path)? {
+        // A new log needs an ordinary snapshot before its first WAL append. That snapshot
+        // cannot retain an older replay base while another hive or namespace record is
+        // anchored beyond it. Fold the shared suffix before admitting this provisional log.
+        // The lease is only a read-only preflight; the fold re-acquires and owns exact proof.
+        let mut lease = snapshot_storage::acquire()?;
+        let manifest = snapshot_storage::peek_wal_continuation(&mut lease)?;
+        drop(lease);
+        if !manifest.ordinary_checkpoint_ready() {
+            fold_system_wal_if_dirty()?;
+        }
+    }
+    // The fold may have retired cached WAL records. Inspect and protect the exact current
+    // log only afterward, before publishing a JOURNAL owner or entering any new WAL effect.
     let baseline = inspect_baseline(&path, &owned)?;
     let new_log_len = baseline
         .length

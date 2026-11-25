@@ -75,6 +75,9 @@ fn clone_path(path: &str) -> Result<alloc::string::String, u32> {
 }
 
 unsafe fn inspect_baseline(path: &str, record: &[u8]) -> Result<Baseline, u32> {
+    // Classify before creating a missing stream. A prior anchored suffix still names its
+    // original file, so replacing that file cannot silently establish a new baseline.
+    let needs_checkpoint = baseline_needs_checkpoint(path)?;
     let fs = writable_fs()?;
     if fs.existing_file_id(path).is_none() {
         let created = fs.zw_create_file(path, nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE,
@@ -87,20 +90,34 @@ unsafe fn inspect_baseline(path: &str, record: &[u8]) -> Result<Baseline, u32> {
     let fs = writable_fs()?;
     let file_id = fs.existing_file_id(path).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     let length = fs.file_len(path).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-    let entry = baselines().iter().find(|entry| entry.path == path);
-    if let Some(entry) = entry {
-        if entry.has_wal_records && (entry.file_id != file_id || length < entry.expected_len) {
-            return Err(block(nt_fs::STATUS_DATA_ERROR));
-        }
-        if entry.has_wal_records && entry.file_id == file_id && entry.expected_len == length {
-            let (_, last_sequence) = nt_hive_core::complete_log_sequence_span_from(
-                record, entry.last_sequence).map_err(semantic_error)?;
-            return Ok(Baseline { file_id, length, last_sequence, needs_checkpoint: false });
-        }
+    if !needs_checkpoint {
+        let entry = baselines().iter().find(|entry| entry.path == path)
+            .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+        let (_, last_sequence) = nt_hive_core::complete_log_sequence_span_from(
+            record, entry.last_sequence).map_err(semantic_error)?;
+        return Ok(Baseline { file_id, length, last_sequence, needs_checkpoint: false });
     }
     // A new or externally changed stream needs an immutable snapshot before WAL writes.
     mark_snapshot_dirty();
     Ok(Baseline { file_id, length, last_sequence: 0, needs_checkpoint: true })
+}
+
+/// Read-only preflight for a log's next record. Reuse is valid only for the exact file and
+/// length still named by an anchored suffix; every other log needs a fresh durable baseline.
+unsafe fn baseline_needs_checkpoint(path: &str) -> Result<bool, u32> {
+    let fs = writable_fs()?;
+    let file_id = fs.existing_file_id(path);
+    let length = file_id.and_then(|_| fs.file_len(path));
+    let Some(entry) = baselines().iter().find(|entry| entry.path == path) else {
+        return Ok(true);
+    };
+    if !entry.has_wal_records {
+        return Ok(true);
+    }
+    if file_id != Some(entry.file_id) || length.is_none_or(|len| len < entry.expected_len) {
+        return Err(block(nt_fs::STATUS_DATA_ERROR));
+    }
+    Ok(length != Some(entry.expected_len))
 }
 
 unsafe fn finish_baseline(path: &str, record: &[u8], baseline: &mut Baseline) -> Result<(), u32> {
