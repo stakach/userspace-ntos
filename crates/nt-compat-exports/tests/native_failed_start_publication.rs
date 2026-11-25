@@ -53,7 +53,7 @@ fn failed_start_keeps_lifecycle_receipt_and_original_driver_error() {
         "unsafe fn finish_hosted_start_publication(",
     );
     for required in [
-        "complete_start_device_dispatch(token, fdo_device_id, io_receipt)",
+        "complete_start_device_dispatch(token, fdo_device_id, &io_receipt)",
         "nt_pnp_manager::DeviceState::Failed",
         ".start_receipt = Some(receipt)",
     ] {

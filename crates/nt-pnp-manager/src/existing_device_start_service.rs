@@ -54,4 +54,28 @@ mod tests {
         assert_eq!(configured_but_broken,
             Err(ExistingDeviceStartServiceError::Failure(NAME_NOT_FOUND)));
     }
+
+    #[test]
+    fn configured_service_keeps_its_named_launch_and_other_query_errors_do_not_become_raw() {
+        let configured = resolve_existing_device_start_service(
+            Ok(23),
+            |key| {
+                assert_eq!(key, 23);
+                Ok::<_, i32>("DiskClass")
+            },
+            |service| {
+                assert_eq!(service, "DiskClass");
+                Ok::<_, i32>("named function stack")
+            },
+        );
+        assert_eq!(configured, Ok("named function stack"));
+
+        let access_denied = 0xC000_0022u32 as i32;
+        let refused = resolve_existing_device_start_service(
+            Ok(23),
+            |_| Err::<&str, _>(access_denied),
+            |_| Ok::<_, i32>("unreachable"),
+        );
+        assert_eq!(refused, Err(ExistingDeviceStartServiceError::Failure(access_denied)));
+    }
 }

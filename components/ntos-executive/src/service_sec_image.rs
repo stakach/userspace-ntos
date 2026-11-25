@@ -14353,7 +14353,7 @@ fn ready_flat_root_add_device(
                 RootAddDeviceOwner::PnpRebalance(pending.reservation),
                 batch.flat_root_add_device_readiness(),
             )),
-            OwnedPendingPnpOperation::Removal(_) => None,
+            OwnedPendingPnpOperation::Removal(_) | OwnedPendingPnpOperation::RawStart(_) => None,
         });
     nt_driver_start::select_add_device_row(driver_starts.chain(rebalances))
 }
@@ -14397,7 +14397,7 @@ fn print_root_add_device_owner(handler: &ExecNtHandler, owner: RootAddDeviceOwne
                 .and_then(|pending| match &pending.operation {
                     OwnedPendingPnpOperation::Rebalance(batch) =>
                         Some(batch.next_devnode_identity()),
-                    OwnedPendingPnpOperation::Removal(_) => None,
+                    OwnedPendingPnpOperation::Removal(_) | OwnedPendingPnpOperation::RawStart(_) => None,
                 }),
         ),
     };
@@ -14420,7 +14420,7 @@ fn root_add_device_still_parked(handler: &ExecNtHandler, owner: RootAddDeviceOwn
         RootAddDeviceOwner::PnpRebalance(reservation) => handler.pending_pnp_operations
             .get_exact(reservation).is_some_and(|pending| match &pending.operation {
                 OwnedPendingPnpOperation::Rebalance(batch) => batch.add_device_wait_stage(),
-                OwnedPendingPnpOperation::Removal(_) => false,
+                OwnedPendingPnpOperation::Removal(_) | OwnedPendingPnpOperation::RawStart(_) => false,
             }),
     }
 }
@@ -14448,7 +14448,7 @@ fn root_add_device_retry_without_new_child(
             .get_exact(reservation).is_some_and(|pending| match &pending.operation {
                 OwnedPendingPnpOperation::Rebalance(batch) =>
                     batch.retry_add_device_without_new_child(),
-                OwnedPendingPnpOperation::Removal(_) => false,
+                OwnedPendingPnpOperation::Removal(_) | OwnedPendingPnpOperation::RawStart(_) => false,
             }),
     }
 }
@@ -14461,7 +14461,7 @@ fn root_add_device_probe_bits(handler: &ExecNtHandler, owner: RootAddDeviceOwner
         RootAddDeviceOwner::PnpRebalance(reservation) => handler.pending_pnp_operations
             .get_exact(reservation).map_or(0, |pending| match &pending.operation {
                 OwnedPendingPnpOperation::Rebalance(batch) => batch.root_add_device_probe_bits(),
-                OwnedPendingPnpOperation::Removal(_) => 0,
+                OwnedPendingPnpOperation::Removal(_) | OwnedPendingPnpOperation::RawStart(_) => 0,
             }),
     }
 }
@@ -14477,7 +14477,7 @@ fn root_add_device_needs_child_step(
             .get_exact(reservation).is_some_and(|pending| match &pending.operation {
                 OwnedPendingPnpOperation::Rebalance(batch) =>
                     batch.needs_add_device_child_step(),
-                OwnedPendingPnpOperation::Removal(_) => false,
+                OwnedPendingPnpOperation::Removal(_) | OwnedPendingPnpOperation::RawStart(_) => false,
             }),
     }
 }
@@ -14498,7 +14498,7 @@ unsafe fn fail_uncertain_root_add_device(
             .and_then(|pending| match &mut pending.operation {
                 OwnedPendingPnpOperation::Rebalance(batch) =>
                     batch.fail_uncertain_add_device().map(alloc::string::String::from),
-                OwnedPendingPnpOperation::Removal(_) => None,
+                OwnedPendingPnpOperation::Removal(_) | OwnedPendingPnpOperation::RawStart(_) => None,
             }),
     };
     let Some(instance) = instance else { return false };
@@ -15229,6 +15229,75 @@ unsafe fn pending_pnp_operation_redrive_flat_root_selected(
     pending_pnp_operation_redrive_selected(nt_handler, Some(reservation), true)
 }
 
+unsafe fn settle_pending_raw_start(
+    nt_handler: &mut ExecNtHandler,
+    slot: usize,
+    progress: RawPdoStartProgress,
+) -> u64 {
+    match progress {
+        RawPdoStartProgress::Awaiting => 0,
+        RawPdoStartProgress::NotEntered { request, status } => {
+            let mut pending = nt_handler.pending_pnp_operations.take(slot)
+                .expect("proven unentered raw START lost its continuation");
+            if let Some(request) = request {
+                let result = if status == 0 {
+                    nt_handler.pnp_start_device_calls.complete_protocol_without_start_irp(request, status)
+                } else {
+                    nt_handler.pnp_start_device_calls.complete_without_start_irp(request, status)
+                };
+                result.expect("unentered raw START lost its exact request");
+                if let Some(reply) = pending.reply.take() {
+                    let delivered = pending_driver_start_reply_owner(
+                        nt_handler, reply.reply_cap, reply.badge, status,
+                    );
+                    record_pending_start_reply(nt_handler, request, status, delivered);
+                    return 1;
+                }
+            }
+            assert!(pending.reply.is_none(), "raw START reply survived its request");
+            0
+        }
+        RawPdoStartProgress::Complete { request, receipt, status } => {
+            let mut pending = nt_handler.pending_pnp_operations.take(slot)
+                .expect("completed raw START lost its continuation");
+            if let Some(request) = request {
+                nt_handler.pnp_start_device_calls.complete_lifecycle(request, receipt, status)
+                    .expect("raw START lifecycle lost its exact request");
+                if let Some(reply) = pending.reply.take() {
+                    let delivered = pending_driver_start_reply_owner(
+                        nt_handler, reply.reply_cap, reply.badge, status,
+                    );
+                    record_pending_start_reply(nt_handler, request, status, delivered);
+                    return 1;
+                }
+            }
+            assert!(pending.reply.is_none(), "raw START reply survived its request");
+            0
+        }
+        RawPdoStartProgress::OwnershipLost { request, irp_id, status } => {
+            nt_handler.pnp_start_device_calls
+                .complete_ownership_lost(request, irp_id, None, status)
+                .expect("uncertain raw START lost its exact request");
+            let reply = nt_handler.pending_pnp_operations.get_mut(slot)
+                .and_then(|pending| pending.reply.take());
+            if let Some(reply) = reply {
+                let delivered = pending_driver_start_reply_owner(
+                    nt_handler, reply.reply_cap, reply.badge, status,
+                );
+                record_pending_start_reply(nt_handler, request, status, delivered);
+                return 1;
+            }
+            0
+        }
+        RawPdoStartProgress::Released => {
+            let pending = nt_handler.pending_pnp_operations.take(slot)
+                .expect("released raw START lost its continuation");
+            assert!(pending.reply.is_none(), "released raw START retained a caller Reply");
+            0
+        }
+    }
+}
+
 unsafe fn pending_pnp_operation_redrive_selected(
     nt_handler: &mut ExecNtHandler,
     selected: Option<nt_driver_start::PendingOperationReservation>,
@@ -15260,7 +15329,7 @@ unsafe fn pending_pnp_operation_redrive_selected(
                                 OwnedPendingPnpOperationProgress::OwnershipLost(
                                     failure.status.raw() as u32),
                         },
-                    OwnedPendingPnpOperation::Removal(_) =>
+                    OwnedPendingPnpOperation::Removal(_) | OwnedPendingPnpOperation::RawStart(_) =>
                         unreachable!("flat root AddDevice selected removal"),
                 }
             } else {
@@ -15298,6 +15367,11 @@ unsafe fn pending_pnp_operation_redrive_selected(
                     );
                     completed = completed.saturating_add(1);
                 }
+            }
+            OwnedPendingPnpOperationProgress::RawStart(progress) => {
+                completed = completed.saturating_add(
+                    settle_pending_raw_start(nt_handler, slot, progress),
+                );
             }
         }
     }
@@ -15685,13 +15759,21 @@ pub(crate) unsafe fn pending_driver_start_abandon_thread(
         if !matches {
             continue;
         }
-        let reply = nt_handler
-            .pending_pnp_operations
-            .get_mut(slot)
-            .expect("PnP operation owner disappeared during abandonment")
-            .reply
-            .take()
-            .expect("PnP operation reply disappeared during abandonment");
+        let (reply, raw_request) = {
+            let pending = nt_handler.pending_pnp_operations.get_mut(slot)
+                .expect("PnP operation owner disappeared during abandonment");
+            let request = match &mut pending.operation {
+                OwnedPendingPnpOperation::RawStart(start) => start.abandon_request(),
+                OwnedPendingPnpOperation::Rebalance(_) | OwnedPendingPnpOperation::Removal(_) => None,
+            };
+            let reply = pending.reply.take()
+                .expect("PnP operation reply disappeared during abandonment");
+            (reply, request)
+        };
+        if let Some(request) = raw_request {
+            nt_handler.pnp_start_device_calls.abandon(request)
+                .expect("abandoned raw START reply lost its exact request");
+        }
         let cap = reply.reply_cap;
         let cancelled = cancel_parked_reply_transport(cap);
         if cancelled {

@@ -55437,13 +55437,24 @@ enum HostedAcceptedPdoProviderStage {
         status: nt_status::NtStatus,
         identity: nt_pnp_manager::AcceptedPdoPnpIdentity,
     },
+    ReadyDirect {
+        identity: nt_pnp_manager::AcceptedPdoPnpIdentity,
+        receipt: nt_io_manager::ExternalPnpTerminalReceipt,
+    },
     Indeterminate(nt_status::NtStatus),
 }
 
-struct HostedAcceptedPdoProviderOwner {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HostedAcceptedPdoProviderMode {
+    Lower,
+    Direct { provider_irp: IrpId },
+}
+
+pub(crate) struct HostedAcceptedPdoProviderOwner {
     stage: HostedAcceptedPdoProviderStage,
     physical: Option<HostedPnpPhysicalProvider>,
     lease: Option<HostedProviderDependencyDispatchLease>,
+    mode: HostedAcceptedPdoProviderMode,
 }
 
 impl HostedAcceptedPdoProviderOwner {
@@ -55452,6 +55463,17 @@ impl HostedAcceptedPdoProviderOwner {
             stage: HostedAcceptedPdoProviderStage::Prepared(prepared),
             physical: None,
             lease: None,
+            mode: HostedAcceptedPdoProviderMode::Lower,
+        }
+    }
+
+    fn prepared_direct(prepared: nt_pnp_manager::PreparedAcceptedPdoPnp) -> Self {
+        let provider_irp = prepared.provider_irp();
+        Self {
+            stage: HostedAcceptedPdoProviderStage::Prepared(prepared),
+            physical: None,
+            lease: None,
+            mode: HostedAcceptedPdoProviderMode::Direct { provider_irp },
         }
     }
 }
@@ -55517,12 +55539,29 @@ unsafe fn advance_hosted_accepted_pdo_provider(
     mut owner: HostedAcceptedPdoProviderOwner,
 ) -> HostedAcceptedPdoProviderOwner {
     owner.stage =
-        advance_hosted_accepted_pdo_provider_stage(owner.stage, &mut owner.physical, &mut owner.lease);
+        advance_hosted_accepted_pdo_provider_stage(owner.stage, owner.mode, &mut owner.physical, &mut owner.lease);
     owner
+}
+
+fn hosted_accepted_provider_irp_matches(
+    mode: HostedAcceptedPdoProviderMode,
+    expected_provider_irp: IrpId,
+    observed_irp: IrpId,
+    outer_irp: IrpId,
+) -> bool {
+    match mode {
+        HostedAcceptedPdoProviderMode::Lower => {
+            observed_irp == expected_provider_irp && observed_irp != outer_irp
+        }
+        HostedAcceptedPdoProviderMode::Direct { provider_irp } => {
+            provider_irp == expected_provider_irp && observed_irp == provider_irp
+        }
+    }
 }
 
 unsafe fn advance_hosted_accepted_pdo_provider_stage(
     stage: HostedAcceptedPdoProviderStage,
+    mode: HostedAcceptedPdoProviderMode,
     physical: &mut Option<HostedPnpPhysicalProvider>,
     lease: &mut Option<HostedProviderDependencyDispatchLease>,
 ) -> HostedAcceptedPdoProviderStage {
@@ -55530,6 +55569,10 @@ unsafe fn advance_hosted_accepted_pdo_provider_stage(
     match stage {
         HostedAcceptedPdoProviderStage::Prepared(prepared) => {
             let identity = prepared.identity();
+            let expected_provider_irp = prepared.provider_irp();
+            if matches!(mode, HostedAcceptedPdoProviderMode::Direct { provider_irp } if provider_irp != expected_provider_irp) {
+                return HostedAcceptedPdoProviderStage::Prepared(prepared);
+            }
             if physical.is_none() {
                 let Some((captured, captured_lease)) =
                     hosted_accepted_pdo_physical_provider(identity, prepared.provider_irp())
@@ -55580,7 +55623,9 @@ unsafe fn advance_hosted_accepted_pdo_provider_stage(
                 if !inst.ready
                     || instance_domain_identity(inst) != Some(identity.provider.provider().domain())
                     || projection.device_id != identity.pdo
-                    || projection.irp_id == identity.outer_irp
+                    || !hosted_accepted_provider_irp_matches(
+                        mode, expected_provider_irp, projection.irp_id, identity.outer_irp,
+                    )
                     || physical.is_none_or(|route| {
                         route.dependent_instance != index
                             || route.dependent_driver_id != projection.driver_id
@@ -55714,13 +55759,29 @@ unsafe fn advance_hosted_accepted_pdo_provider_stage(
             Err(rejection) => HostedAcceptedPdoProviderStage::CompletionReturn(rejection.into_returned()),
         },
         HostedAcceptedPdoProviderStage::Terminal(mut terminal) => {
+            if matches!(mode, HostedAcceptedPdoProviderMode::Direct { provider_irp }
+                if terminal.provider_irp() != provider_irp)
+            {
+                // A mismatched terminal cannot release the canonical direct START owner.
+                return HostedAcceptedPdoProviderStage::Terminal(terminal);
+            }
             if terminal.acknowledge_provider(io_manager_mut()).is_err() {
                 return HostedAcceptedPdoProviderStage::Terminal(terminal);
             }
             let identity = terminal.identity();
-            match terminal.retire(io_manager_mut()) {
-                Ok(status) => HostedAcceptedPdoProviderStage::Ready { status, identity },
-                Err((_, terminal)) => HostedAcceptedPdoProviderStage::Terminal(terminal),
+            match mode {
+                HostedAcceptedPdoProviderMode::Lower => match terminal.retire(io_manager_mut()) {
+                    Ok(status) => HostedAcceptedPdoProviderStage::Ready { status, identity },
+                    Err((_, terminal)) => HostedAcceptedPdoProviderStage::Terminal(terminal),
+                },
+                HostedAcceptedPdoProviderMode::Direct { .. } => {
+                    match terminal.retire_with_receipt(io_manager_mut()) {
+                        Ok(receipt) => {
+                            HostedAcceptedPdoProviderStage::ReadyDirect { identity, receipt }
+                        }
+                        Err((_, terminal)) => HostedAcceptedPdoProviderStage::Terminal(terminal),
+                    }
+                }
             }
         }
         HostedAcceptedPdoProviderStage::Discarded(discarded) => {
@@ -55812,18 +55873,7 @@ unsafe fn prepare_hosted_video_provider_start(
     if !hosted_video_foreign_pci_pdo(binding)? {
         return Ok(None);
     }
-    let raw_len = u32::try_from(raw.len()).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
-    let translated_len = u32::try_from(translated.len()).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(
-            raw.len()
-                .checked_add(translated.len())
-                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
-        )
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    payload.extend_from_slice(raw);
-    payload.extend_from_slice(translated);
+    let (raw_len, translated_len, payload) = hosted_pnp_start_resource_payload(raw, translated)?;
     nt_pnp_manager::PreparedAcceptedPdoPnp::start(
         hosted_pnp_manager_mut(),
         hosted_bus_relations(),
@@ -55840,6 +55890,264 @@ unsafe fn prepare_hosted_video_provider_start(
     .map(HostedAcceptedPdoProviderOwner::prepared)
     .map(Some)
     .map_err(hosted_accepted_pdo_provider_status)
+}
+
+fn hosted_pnp_start_resource_payload(
+    raw: &[u8],
+    translated: &[u8],
+) -> Result<(u32, u32, Vec<u8>), nt_status::NtStatus> {
+    let raw_len = u32::try_from(raw.len()).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let translated_len = u32::try_from(translated.len()).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(
+            raw.len()
+                .checked_add(translated.len())
+                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
+        )
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    payload.extend_from_slice(raw);
+    payload.extend_from_slice(translated);
+    Ok((raw_len, translated_len, payload))
+}
+
+pub(crate) unsafe fn prepare_hosted_raw_pdo_start(
+    pdo_device_id: u64,
+    raw: &[u8],
+    translated: &[u8],
+) -> Result<HostedAcceptedPdoProviderOwner, nt_status::NtStatus> {
+    let (raw_len, translated_len, payload) = hosted_pnp_start_resource_payload(raw, translated)?;
+    nt_pnp_manager::PreparedAcceptedPdoPnp::start_direct(
+        hosted_pnp_manager_mut(),
+        hosted_bus_relations(),
+        hosted_accepted_pdo_provider_catalog(),
+        io_manager_mut(),
+        nt_io_manager::DeviceId(pdo_device_id),
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        0,
+        raw_len,
+        translated_len,
+        payload,
+    )
+    .map(HostedAcceptedPdoProviderOwner::prepared_direct)
+    .map_err(hosted_accepted_pdo_provider_status)
+}
+
+/// Admit only the exact live service-less raw PDO with resources already published by its bus.
+/// An unqueried resource property is not evidence that the device has no resources.
+pub(crate) unsafe fn prepare_hosted_raw_pdo_start_for_instance(
+    instance: &str,
+) -> Result<(u64, HostedAcceptedPdoProviderOwner), nt_status::NtStatus> {
+    use nt_pnp_manager::DeviceState;
+    let pnp = hosted_pnp_manager_mut();
+    let devnode = pnp.devnode_for_instance(instance)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let generation = pnp.generation(devnode)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let pdo = pnp.pdo(devnode)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let properties = pnp.enumerated_pdo_properties(pdo)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if !properties.capabilities.as_ref().is_some_and(|capabilities| capabilities.raw_device_ok) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let (published_raw, published_translated) = properties.raw_start_resource_bytes()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    let raw = clone_pnp_resource_list(published_raw)?;
+    let translated = clone_pnp_resource_list(published_translated)?;
+    let raw_for_commit = clone_pnp_resource_list(&raw)?;
+    let translated_for_commit = clone_pnp_resource_list(&translated)?;
+    match pnp.state(devnode) {
+        Some(DeviceState::Enumerated | DeviceState::DeviceStackBuilt) => {
+            pnp.commit_raw_pdo_stack_for_current_relation(hosted_bus_relations(), pdo)
+                .map_err(hosted_pnp_status)?;
+        }
+        Some(DeviceState::ResourcesAssigned) => {}
+        _ => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+    }
+    pnp.commit_resource_assignment_for_current_relation(
+        hosted_bus_relations(), pdo, raw_for_commit, translated_for_commit,
+    ).map_err(hosted_pnp_status)?;
+    if pnp.generation(devnode) != Some(generation)
+        || pnp.devnode_for_instance(instance) != Some(devnode)
+        || pnp.pdo(devnode) != Some(pdo)
+    {
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    }
+    let owner = prepare_hosted_raw_pdo_start(pdo, &raw, &translated)?;
+    Ok((pdo, owner))
+}
+
+pub(crate) unsafe fn begin_hosted_raw_pdo_start_dispatch(
+    pdo: u64,
+    provider_irp: IrpId,
+) -> Result<nt_pnp_manager::PnpDispatchToken, nt_status::NtStatus> {
+    hosted_pnp_manager_mut()
+        .begin_pnp_dispatch(pdo, nt_pnp_manager::PnpMinor::StartDevice, provider_irp.raw())
+        .map_err(hosted_pnp_status)
+}
+
+/// The caller may use this only after the prepared provider IRP was provably discarded.
+pub(crate) unsafe fn abort_hosted_raw_pdo_start_dispatch(
+    token: &nt_pnp_manager::PnpDispatchToken,
+    provider_irp: IrpId,
+) -> Result<(), nt_status::NtStatus> {
+    hosted_pnp_manager_mut()
+        .abort_pnp_dispatch(token, provider_irp.raw())
+        .map(|_| ())
+        .map_err(hosted_pnp_status)
+}
+
+impl HostedAcceptedPdoProviderOwner {
+    pub(crate) fn direct_provider_irp(&self) -> Option<IrpId> {
+        match self.mode {
+            HostedAcceptedPdoProviderMode::Direct { provider_irp } => Some(provider_irp),
+            HostedAcceptedPdoProviderMode::Lower => None,
+        }
+    }
+}
+
+pub(crate) enum HostedRawPdoStartProgress {
+    Awaiting(HostedAcceptedPdoProviderOwner),
+    Ready(HostedRawPdoStartTerminal),
+    /// The prepared IRP was provably discarded before entering a provider.
+    NotEntered {
+        status: nt_status::NtStatus,
+        owner: HostedAcceptedPdoProviderOwner,
+    },
+    Indeterminate {
+        status: nt_status::NtStatus,
+        owner: HostedAcceptedPdoProviderOwner,
+    },
+}
+
+pub(crate) struct HostedRawPdoStartTerminal {
+    identity: nt_pnp_manager::AcceptedPdoPnpIdentity,
+    receipt: nt_io_manager::ExternalPnpTerminalReceipt,
+    _physical: Option<HostedPnpPhysicalProvider>,
+    _lease: Option<HostedProviderDependencyDispatchLease>,
+}
+
+impl HostedRawPdoStartTerminal {
+    pub(crate) fn status(&self) -> nt_status::NtStatus {
+        self.receipt.status()
+    }
+
+    pub(crate) fn identity(&self) -> nt_pnp_manager::AcceptedPdoPnpIdentity {
+        self.identity
+    }
+
+    /// Keep the provider publication pinned until the exact PnP token consumes the terminal.
+    /// A rejected token returns this receipt and its lease for an owned retry or diagnosis.
+    pub(crate) unsafe fn complete(
+        self,
+        token: &nt_pnp_manager::PnpDispatchToken,
+        pdo_device_id: u64,
+    ) -> Result<(nt_pnp_manager::StartDeviceLifecycleReceipt, nt_status::NtStatus),
+        (nt_pnp_manager::PnpError, Self)>
+    {
+        let status = self.receipt.status();
+        match hosted_pnp_manager_mut().complete_start_device_dispatch(
+            token, pdo_device_id, &self.receipt,
+        ) {
+            Ok(lifecycle) => Ok((lifecycle, status)),
+            Err(error) => Err((error, self)),
+        }
+    }
+}
+
+pub(crate) unsafe fn advance_hosted_raw_pdo_start(
+    owner: HostedAcceptedPdoProviderOwner,
+) -> HostedRawPdoStartProgress {
+    if owner.direct_provider_irp().is_none() {
+        return HostedRawPdoStartProgress::Indeterminate {
+            status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            owner,
+        };
+    }
+    let owner = advance_hosted_accepted_pdo_provider(owner);
+    match owner {
+        HostedAcceptedPdoProviderOwner {
+            stage: HostedAcceptedPdoProviderStage::ReadyDirect { identity, receipt },
+            physical,
+            lease,
+            ..
+        } => HostedRawPdoStartProgress::Ready(HostedRawPdoStartTerminal {
+            identity,
+            receipt,
+            _physical: physical,
+            _lease: lease,
+        }),
+        owner => {
+            if let HostedAcceptedPdoProviderStage::Indeterminate(status) = &owner.stage {
+                return HostedRawPdoStartProgress::NotEntered {
+                    status: *status,
+                    owner,
+                };
+            }
+            let status = match &owner.stage {
+                HostedAcceptedPdoProviderStage::Terminal(terminal)
+                    if owner.direct_provider_irp() != Some(terminal.provider_irp()) =>
+                {
+                    Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+                }
+                _ => None,
+            };
+            match status {
+                Some(status) => HostedRawPdoStartProgress::Indeterminate { status, owner },
+                None => HostedRawPdoStartProgress::Awaiting(owner),
+            }
+        }
+    }
+}
+
+pub(crate) enum HostedRawPdoStartDiscard {
+    Retired,
+    Retained(HostedAcceptedPdoProviderOwner),
+}
+
+pub(crate) unsafe fn discard_hosted_raw_pdo_start(
+    owner: HostedAcceptedPdoProviderOwner,
+) -> HostedRawPdoStartDiscard {
+    let HostedAcceptedPdoProviderOwner { stage, physical, lease, mode } = owner;
+    if !matches!(mode, HostedAcceptedPdoProviderMode::Direct { .. }) {
+        return HostedRawPdoStartDiscard::Retained(HostedAcceptedPdoProviderOwner {
+            stage, physical, lease, mode,
+        });
+    }
+    match stage {
+        HostedAcceptedPdoProviderStage::Prepared(prepared) => {
+            match prepared.discard(io_manager_mut()) {
+                nt_pnp_manager::AcceptedPdoPnpDiscard::Retired => HostedRawPdoStartDiscard::Retired,
+                nt_pnp_manager::AcceptedPdoPnpDiscard::NotDiscarded { prepared, .. } => {
+                    HostedRawPdoStartDiscard::Retained(HostedAcceptedPdoProviderOwner {
+                        stage: HostedAcceptedPdoProviderStage::Prepared(prepared),
+                        physical, lease, mode,
+                    })
+                }
+                nt_pnp_manager::AcceptedPdoPnpDiscard::Retained { discarded, .. } => {
+                    HostedRawPdoStartDiscard::Retained(HostedAcceptedPdoProviderOwner {
+                        stage: HostedAcceptedPdoProviderStage::Discarded(discarded),
+                        physical, lease, mode,
+                    })
+                }
+            }
+        }
+        HostedAcceptedPdoProviderStage::Discarded(discarded) => {
+            match discarded.retire(io_manager_mut()) {
+                Ok(()) => HostedRawPdoStartDiscard::Retired,
+                Err((_, discarded)) => HostedRawPdoStartDiscard::Retained(
+                    HostedAcceptedPdoProviderOwner {
+                        stage: HostedAcceptedPdoProviderStage::Discarded(discarded),
+                        physical, lease, mode,
+                    },
+                ),
+            }
+        }
+        stage => HostedRawPdoStartDiscard::Retained(HostedAcceptedPdoProviderOwner {
+            stage, physical, lease, mode,
+        }),
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -59411,6 +59719,11 @@ unsafe fn complete_hosted_pnp_lifecycle(
             )
         };
         if io_receipt.status() != status {
+            hosted_pnp_transactions_mut()
+                .iter_mut()
+                .find(|transaction| transaction.irp_id == irp_id)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+                .terminal_io_receipt = Some(io_receipt);
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         let token = hosted_pnp_transactions_mut()
@@ -59418,9 +59731,19 @@ unsafe fn complete_hosted_pnp_lifecycle(
             .find(|transaction| transaction.irp_id == irp_id)
             .and_then(|transaction| transaction.token.as_ref())
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        let receipt = hosted_pnp_manager_mut()
-            .complete_start_device_dispatch(token, fdo_device_id, io_receipt)
-            .map_err(hosted_pnp_status)?;
+        let receipt = match hosted_pnp_manager_mut()
+            .complete_start_device_dispatch(token, fdo_device_id, &io_receipt)
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                hosted_pnp_transactions_mut()
+                    .iter_mut()
+                    .find(|transaction| transaction.irp_id == irp_id)
+                    .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+                    .terminal_io_receipt = Some(io_receipt);
+                return Err(hosted_pnp_status(error));
+            }
+        };
         let state = if status.is_success() {
             nt_pnp_manager::DeviceState::Started
         } else {
@@ -76595,6 +76918,7 @@ pub(crate) unsafe fn start_hosted_device_canonical(
                             stage: HostedAcceptedPdoProviderStage::Discarded(discarded),
                             physical: None,
                             lease: None,
+                            mode: HostedAcceptedPdoProviderMode::Lower,
                         });
                         transaction.video_outer_prepared = Some(prepared);
                         set_hosted_pnp_indeterminate(irp_id, status)

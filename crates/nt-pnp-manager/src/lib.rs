@@ -15,6 +15,7 @@ mod accepted_pdo_direct_filter_edge;
 mod accepted_pdo_pnp;
 mod existing_device_start_service;
 pub use existing_device_start_service::*;
+mod raw_pdo_start_resources;
 mod accepted_pdo_provider;
 mod bus_properties;
 mod bus_relations;
@@ -2572,7 +2573,7 @@ impl PnpManager {
         &mut self,
         token: &PnpDispatchToken,
         fdo_device_id: u64,
-        io_receipt: nt_io_manager::ExternalPnpTerminalReceipt,
+        io_receipt: &nt_io_manager::ExternalPnpTerminalReceipt,
     ) -> Result<StartDeviceLifecycleReceipt, PnpError> {
         let io_identity = StartDeviceIoTerminalIdentity {
             irp_id: io_receipt.irp_id().raw(),

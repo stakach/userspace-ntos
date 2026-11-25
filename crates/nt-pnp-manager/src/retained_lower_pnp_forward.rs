@@ -1094,7 +1094,7 @@ mod tests {
         assert_eq!(fixture.pnp.state(devnode), Some(crate::DeviceState::StartIrpSent));
         terminal.acknowledge_provider(&mut fixture.io).unwrap();
         let receipt = terminal.retire_with_receipt(&mut fixture.io).unwrap();
-        let lifecycle = fixture.pnp.complete_start_device_dispatch(&token, pdo.raw(), receipt).unwrap();
+        let lifecycle = fixture.pnp.complete_start_device_dispatch(&token, pdo.raw(), &receipt).unwrap();
         assert_eq!(fixture.pnp.state(devnode), Some(crate::DeviceState::Started));
         let instance = fixture.pnp.instance_id(devnode).unwrap();
         assert!(fixture.pnp.start_device_receipt_matches_instance(&lifecycle, instance),
@@ -1148,7 +1148,7 @@ mod tests {
         };
         assert!(terminal.provider_acknowledged());
         let receipt = terminal.retire_with_receipt(&mut fixture.io).unwrap();
-        fixture.pnp.complete_start_device_dispatch(&token, pdo.raw(), receipt).unwrap();
+        fixture.pnp.complete_start_device_dispatch(&token, pdo.raw(), &receipt).unwrap();
         assert_eq!(fixture.pnp.state(devnode), Some(crate::DeviceState::Started));
     }
 
