@@ -1,7 +1,12 @@
 //! Typed payloads within the physical registry WAL. The sector WAL supplies checksums and
-//! durability; this codec only separates legacy SYSTEM records from other hive log appends.
+//! durability; this codec selects legacy SYSTEM records, hive log appends, and file deltas.
 
 use alloc::vec::Vec;
+
+use crate::file_delta_wal_payload::{
+    decode_file_delta_wal_payload, FileDeltaWalPayload, FileDeltaWalPayloadError,
+    FILE_DELTA_MAGIC,
+};
 
 const SYSTEM_MAGIC: &[u8; 8] = b"CMWAL001";
 const SYSTEM_HIVE_LOG_MAGIC: &[u8; 4] = b"HLR1";
@@ -15,7 +20,23 @@ pub enum VolumeWalPayloadError {
     InvalidIdentity,
     InvalidPath,
     InvalidLength,
+    InvalidSequence,
+    InvalidExtent,
     OutOfMemory,
+}
+
+impl From<FileDeltaWalPayloadError> for VolumeWalPayloadError {
+    fn from(error: FileDeltaWalPayloadError) -> Self {
+        match error {
+            FileDeltaWalPayloadError::UnknownKind => Self::UnknownKind,
+            FileDeltaWalPayloadError::InvalidSequence => Self::InvalidSequence,
+            FileDeltaWalPayloadError::InvalidIdentity => Self::InvalidIdentity,
+            FileDeltaWalPayloadError::InvalidPath => Self::InvalidPath,
+            FileDeltaWalPayloadError::InvalidLength => Self::InvalidLength,
+            FileDeltaWalPayloadError::InvalidExtent => Self::InvalidExtent,
+            FileDeltaWalPayloadError::OutOfMemory => Self::OutOfMemory,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +50,8 @@ pub enum HiveLogWalReplayError {
     InvalidPayload,
     MissingFile,
     ForeignIdentity,
+    /// The record targets a boot image already copied for SYSTEM restoration.
+    ProtectedTarget,
     UnexpectedLength,
     ContradictoryBytes,
     OutOfMemory,
@@ -49,6 +72,7 @@ pub enum VolumeWalPayload<'a> {
     /// SYSTEM records retain their exact native hive-log bytes for semantic replay.
     System(&'a [u8]),
     HiveLog(HiveLogWalPayload<'a>),
+    FileDelta(FileDeltaWalPayload<'a>),
 }
 
 pub(crate) fn validate_hive_log(record: HiveLogWalPayload<'_>) -> Result<(), VolumeWalPayloadError> {
@@ -97,6 +121,11 @@ pub fn decode_volume_wal_payload(bytes: &[u8]) -> Result<VolumeWalPayload<'_>, V
     }
     if bytes.starts_with(SYSTEM_MAGIC) || bytes.starts_with(SYSTEM_HIVE_LOG_MAGIC) {
         return Ok(VolumeWalPayload::System(bytes));
+    }
+    if bytes.starts_with(FILE_DELTA_MAGIC) {
+        return decode_file_delta_wal_payload(bytes)
+            .map(VolumeWalPayload::FileDelta)
+            .map_err(VolumeWalPayloadError::from);
     }
     if !bytes.starts_with(HIVE_LOG_MAGIC) {
         return Err(VolumeWalPayloadError::UnknownKind);

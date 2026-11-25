@@ -129,6 +129,18 @@ impl ActiveIrpSnapshot {
 static ACTIVE_IRP_SNAPSHOTS: [ActiveIrpSnapshot; ACTIVE_IRP_SNAPSHOT_SLOTS] =
     [const { ActiveIrpSnapshot::new() }; ACTIVE_IRP_SNAPSHOT_SLOTS];
 
+/// A root-owned service can select a diagnostic receipt while a PnP START receive is live.
+/// The copied receive fields belong to this pump; no File, PnP, or wait-owner heap is read here.
+pub(super) fn active_pnp_start_receive() -> bool {
+    ACTIVE_IRP_SNAPSHOTS.iter().any(|slot| {
+        let sequence = slot.sequence.load(Ordering::Acquire);
+        sequence != 0 && sequence != SNAPSHOT_CLAIMED
+            && slot.major.load(Ordering::Relaxed) == 27
+            && slot.minor.load(Ordering::Relaxed) == 0
+            && slot.sequence.load(Ordering::Acquire) == sequence
+    })
+}
+
 // The nested Syscall receiver can hold the root service loop while timer notifications keep
 // arriving. Copy the exact entered owner and count only non-timer arrivals. The periodic reader
 // never follows a route, touches the shared mapping, or changes receive ownership.
@@ -1028,11 +1040,13 @@ fn trace_enclosed_receive_candidates(sample: u64) {
     for (index, slot) in ACTIVE_IRP_SNAPSHOTS.iter().enumerate() {
         let sequence = slot.sequence.load(Ordering::Acquire);
         if sequence == 0 || sequence == SNAPSHOT_CLAIMED { continue; }
-        let values = [slot.route.load(Ordering::Relaxed), slot.tcb.load(Ordering::Relaxed),
-            slot.reply.load(Ordering::Relaxed), slot.source_irp.load(Ordering::Relaxed),
+        let values = [slot.domain.load(Ordering::Relaxed),
+            slot.cookie.load(Ordering::Relaxed), slot.route.load(Ordering::Relaxed),
+            slot.tcb.load(Ordering::Relaxed), slot.reply.load(Ordering::Relaxed),
+            slot.source_irp.load(Ordering::Relaxed), slot.control_id.load(Ordering::Relaxed),
             slot.major.load(Ordering::Relaxed), slot.minor.load(Ordering::Relaxed)];
         if slot.sequence.load(Ordering::Acquire) != sequence { continue; }
-        crate::print_str(b"[parked-dispatch-receive] sample/kind/slot/sequence/route/tcb/reply/irp/major/minor=");
+        crate::print_str(b"[parked-dispatch-receive] sample/kind/slot/sequence/domain/cookie/route/tcb/reply/irp/control-id/major/minor=");
         for value in [sample, 1, index as u64, sequence].into_iter().chain(values) {
             crate::print_str(b"/"); crate::print_u64(value);
         }

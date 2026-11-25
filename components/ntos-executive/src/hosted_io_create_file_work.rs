@@ -714,7 +714,39 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
                 executing.push(index);
             }
             CURSOR.store(index as u64 + 1, Ordering::Relaxed);
-            let done = match work.advance(handler) {
+            // A selected root-owned CREATE may enter another provider pump before this
+            // function returns. Pair a bounded entry and return receipt to distinguish
+            // that case from work that was never selected under a held PnP START.
+            static NESTED_PNP_CREATE_STEPS: AtomicU64 = AtomicU64::new(0);
+            static NESTED_PNP_CREATE_STEPS_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
+            let active_pnp_start = crate::spawn_hosts::active_pnp_start_receive();
+            let trace = active_pnp_start
+                && NESTED_PNP_CREATE_STEPS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+                    |used| (used < 32).then_some(used + 1)).is_ok();
+            if trace {
+                crate::print_str(b"[nested-pnp-create-step] enter index/device/badge/reply/token/lane/generation/epoch/nested=");
+                for value in [index as u64, work.captured.device_id, work.route.badge(),
+                    work.reply, work.token, work.dispatch.lane().index as u64,
+                    work.dispatch.lane().generation, work.dispatch.epoch(),
+                    nested_ready_only as u64] {
+                    crate::print_str(b"/"); crate::print_u64(value);
+                }
+                crate::print_str(b"\n");
+            } else if active_pnp_start
+                && !NESTED_PNP_CREATE_STEPS_LIMIT_REPORTED.swap(true, Ordering::AcqRel)
+            {
+                crate::print_str(b"[nested-pnp-create-step] trace-limit-exhausted=32\n");
+            }
+            let outcome = work.advance(handler);
+            if trace {
+                crate::print_str(b"[nested-pnp-create-step] return index/done/error=");
+                for value in [index as u64, matches!(outcome, Ok(true)) as u64,
+                    outcome.err().unwrap_or(0) as u64] {
+                    crate::print_str(b"/"); crate::print_u64(value);
+                }
+                crate::print_str(b"\n");
+            }
+            let done = match outcome {
                 Ok(done) => done,
                 Err(_) => false,
             };

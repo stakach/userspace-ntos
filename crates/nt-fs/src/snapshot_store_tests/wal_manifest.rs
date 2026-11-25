@@ -620,9 +620,24 @@ fn boot_system_log_replays_only_suffix_after_selected_snapshot_base() {
     let selected = store.read_latest_wal(&mut disk).unwrap().unwrap();
 
     let mut wal = RegistryWal::recover(CachedDisk::with_sectors(16), 77).unwrap();
+    let file_delta = crate::encode_file_delta_wal_payload(crate::FileDeltaRecord {
+        sequence: 1,
+        file_id: 42,
+        path: r"\??\C:\ReactOS\System32\Config\SOFTWARE",
+        end_of_file: 0,
+        extents: &[],
+    }).unwrap();
+    let hive_log = crate::encode_hive_log_wal_payload(crate::HiveLogWalPayload {
+        file_id: 43,
+        expected_log_len: 0,
+        path: r"\??\C:\ReactOS\System32\Config\SOFTWARE.LOG",
+        record: b"HLR1 other hive mutation",
+    }).unwrap();
     for payload in [
         b"already-in-snapshot".as_slice(),
-        b"new-mutation".as_slice(),
+        b"CMWAL001 new-mutation".as_slice(),
+        hive_log.as_slice(),
+        file_delta.as_slice(),
     ] {
         wal.begin(payload.to_vec()).unwrap();
         wal.prepare().unwrap();
@@ -630,7 +645,14 @@ fn boot_system_log_replays_only_suffix_after_selected_snapshot_base() {
     }
     assert_eq!(
         selected.verified_boot_system_log(b"snapshot-log", &wal),
-        Ok(b"snapshot-lognew-mutation".to_vec())
+        Ok(b"snapshot-logCMWAL001 new-mutation".to_vec())
+    );
+    wal.begin(b"unknown committed kind".to_vec()).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    assert_eq!(
+        selected.verified_boot_system_log(b"snapshot-log", &wal),
+        Err(SnapshotBlockStoreError::Corrupt)
     );
 }
 
@@ -686,14 +708,14 @@ fn streamed_boot_snapshot_metadata_replays_only_verified_wal_suffix() {
     assert_eq!(metadata.generation, 2);
 
     let mut wal = RegistryWal::recover(CachedDisk::with_sectors(16), 77).unwrap();
-    for journal in [b"already-in-snapshot".as_slice(), b"new-mutation".as_slice()] {
+    for journal in [b"already-in-snapshot".as_slice(), b"CMWAL001 new-mutation".as_slice()] {
         wal.begin(journal.to_vec()).unwrap();
         wal.prepare().unwrap();
         wal.commit().unwrap();
     }
     assert_eq!(
         metadata.verified_boot_system_log(b"snapshot-log", &wal),
-        Ok(b"snapshot-lognew-mutation".to_vec())
+        Ok(b"snapshot-logCMWAL001 new-mutation".to_vec())
     );
 }
 

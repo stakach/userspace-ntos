@@ -387,6 +387,8 @@ pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION: AtomicU64 = AtomicU64:
 pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_WRITE_SECTORS: AtomicU64 = AtomicU64::new(0);
+static BOOT_CHECKPOINT_MEASURES: AtomicU64 = AtomicU64::new(0);
+static BOOT_CHECKPOINT_MEASURE_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
 pub(crate) static WRITABLE_FS_BLOB_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_BLOBS_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_BLOB_BYTES_RECLAIMED: AtomicU64 = AtomicU64::new(0);
@@ -917,6 +919,19 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
         return Ok(false);
     }
     note_checkpoint_begun();
+    let begun_epoch = checkpoint_epochs().0;
+    let written_before = WRITABLE_FS_SNAPSHOT_WRITE_SECTORS.load(Ordering::Relaxed);
+    let trace = BOOT_CHECKPOINT_MEASURES.fetch_update(Ordering::AcqRel,
+        Ordering::Acquire, |used| (used < 2048).then_some(used + 1)).is_ok();
+    if trace {
+        print_str(b"[writable-fs-checkpoint-measure] begin boot-source epoch=");
+        print_u64(begun_epoch); print_str(b"\n");
+    } else if !BOOT_CHECKPOINT_MEASURE_LIMIT_REPORTED.swap(true, Ordering::AcqRel) {
+        print_str(b"[writable-fs-checkpoint-measure] boot-source-trace-limit-exhausted=2048\n");
+    }
+    // The synchronous path retains its exclusive reserve in `dev` across this print.
+    // Start after the diagnostic so its serial cost is outside the measured interval.
+    let started_ticks = crate::disk_census_ticks();
     let (wal_manifest, authority) = if wal_format {
         match snapshot_storage::take_wal_continuation(&mut dev) {
             Ok((token, pair, manifest)) => (Some(manifest), Some((token, pair))),
@@ -988,6 +1003,17 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
             WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
+            let elapsed_ticks = crate::disk_census_ticks().wrapping_sub(started_ticks);
+            if trace {
+                print_str(b"[writable-fs-checkpoint-measure] published boot-source epoch/generation/bytes/write-sectors/elapsed-tsc=");
+                for value in [begun_epoch, generation, bytes as u64,
+                    WRITABLE_FS_SNAPSHOT_WRITE_SECTORS.load(Ordering::Relaxed)
+                        .saturating_sub(written_before),
+                    elapsed_ticks] {
+                    print_str(b"/"); print_u64(value);
+                }
+                print_str(b"\n");
+            }
             print_str(b"[writable-fs-snapshot] committed generation=");
             print_u64(generation);
             print_str(b" bytes=");
@@ -1622,6 +1648,7 @@ fn verified_boot_log(
     log: alloc::vec::Vec<u8>,
     lease: snapshot_storage::Lease,
     fs: &mut nt_fs::FileSystem,
+    system_log_path: &str,
 ) -> Result<(alloc::vec::Vec<u8>, Option<nt_hive_regf::BootSystemWalSuffix>, BootSystemReserveOwner), BootSystemRestoreError> {
     let nt_fs::SnapshotReadFormat::Wal { anchor, selected_base_serial } = metadata.format else {
         return Ok((log, None, BootSystemReserveOwner::Legacy(lease)));
@@ -1662,6 +1689,9 @@ fn verified_boot_log(
     let mut first_sequence = None;
     let mut last_sequence = None;
     let mut hive_sequences: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    let mut pre_read = nt_fs::BootSystemPreRead::new(
+        fs, CONFIG_SYSTEM_HIVE_PATH, system_log_path,
+    );
     for record in suffix {
         match nt_fs::decode_volume_wal_payload(&record.payload)
             .map_err(|_| BootSystemRestoreError::Snapshot(nt_fs::STATUS_DATA_ERROR))?
@@ -1700,7 +1730,7 @@ fn verified_boot_log(
                     })?;
                     hive_sequences.push((payload.file_id, last));
                 }
-                fs.replay_hive_log_wal_payload(payload)
+                pre_read.replay_hive_log(fs, payload)
                     .map_err(|error| BootSystemRestoreError::Snapshot(match error {
                         nt_fs::HiveLogWalReplayError::OutOfMemory =>
                             nt_fs::STATUS_INSUFFICIENT_RESOURCES,
@@ -1708,6 +1738,17 @@ fn verified_boot_log(
                     }))?;
                 fs.protect_wal_log(payload.path, payload.file_id)
                     .map_err(BootSystemRestoreError::Snapshot)?;
+            }
+            nt_fs::VolumeWalPayload::FileDelta(payload) => {
+                // Every record in this suffix shares one sequence cursor, even when hive
+                // appends or legacy SYSTEM records occur between file deltas. A failed replay
+                // discards the still-unpublished volume instead of exposing partial changes.
+                pre_read.replay_file_delta(fs, payload)
+                    .map_err(|error| BootSystemRestoreError::Snapshot(match error {
+                        nt_fs::FileDeltaWalReplayError::OutOfMemory =>
+                            nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+                        _ => nt_fs::STATUS_DATA_ERROR,
+                    }))?;
             }
         }
     }
@@ -1762,7 +1803,9 @@ pub(crate) unsafe fn restore_boot_system_persistence(
             let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
             let snapshot_log = owned_file_before_publish(&fs, &log_path, BootSystemRestoreError::LogRead)?
                 .unwrap_or_default();
-            let (log, wal_suffix, lease) = verified_boot_log(metadata, snapshot_log, lease, &mut fs)?;
+            let (log, wal_suffix, lease) = verified_boot_log(
+                metadata, snapshot_log, lease, &mut fs, &log_path,
+            )?;
             SYSTEM_WAL_FOLD_REQUIRED.store(wal_suffix.is_some(), Ordering::Release);
             if primary.is_none() && log.is_empty() {
                 return Err(BootSystemRestoreError::SystemStateMissing);

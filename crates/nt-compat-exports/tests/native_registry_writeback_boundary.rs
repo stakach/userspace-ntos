@@ -56,6 +56,7 @@ fn native_registry_mount_requires_wal_replay_admission() {
 fn native_boot_verifies_wal_suffix_before_publishing_volume_for_cm_import() {
     let source = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
     let fs_source = include_str!("../../nt-fs/src/fs.rs");
+    let replay_source = include_str!("../../nt-fs/src/boot_system_pre_read.rs");
     assert!(
         fs_source.contains("read_latest_streaming_with_metadata(dev,"),
         "boot must decode the selected payload and WAL metadata under one snapshot lease"
@@ -75,7 +76,8 @@ fn native_boot_verifies_wal_suffix_before_publishing_volume_for_cm_import() {
             && boot.contains("complete_log_sequence_span_from(bytes, previous)")
             && boot.contains("hive_wal::validate_first_record(")
             && boot.contains("payload.expected_log_len, payload.record")
-            && boot.contains("fs.replay_hive_log_wal_payload(payload)"),
+            && boot.contains("pre_read.replay_hive_log(fs, payload)")
+            && replay_source.contains("fs.replay_hive_log_wal_payload(payload)"),
         "boot must route mixed records and verify complete contiguous hive journals before publication"
     );
     assert!(boot.contains("fs: Some(fs)"), "boot must retain the unpublished volume");

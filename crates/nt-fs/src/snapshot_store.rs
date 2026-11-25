@@ -355,18 +355,26 @@ fn verified_boot_system_log_suffix<D: SnapshotBlockDevice>(
     verify_recovered_wal_anchor(selected_base_serial, anchor, wal)?;
     let base = usize::try_from(selected_base_serial).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
     let suffix = wal.records().get(base..).ok_or(SnapshotBlockStoreError::Corrupt)?;
-    let total = suffix
-        .iter()
-        .try_fold(snapshot_log.len(), |length, record| {
-            length.checked_add(record.payload.len())
-        })
-        .ok_or(SnapshotBlockStoreError::Corrupt)?;
+    let mut total = snapshot_log.len();
+    for record in suffix {
+        if let crate::VolumeWalPayload::System(bytes) =
+            crate::decode_volume_wal_payload(&record.payload)
+                .map_err(|_| SnapshotBlockStoreError::Corrupt)?
+        {
+            total = total.checked_add(bytes.len()).ok_or(SnapshotBlockStoreError::Corrupt)?;
+        }
+    }
     let mut log = Vec::new();
     log.try_reserve_exact(total)
         .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
     log.extend_from_slice(snapshot_log);
     for record in suffix {
-        log.extend_from_slice(&record.payload);
+        if let crate::VolumeWalPayload::System(bytes) =
+            crate::decode_volume_wal_payload(&record.payload)
+                .map_err(|_| SnapshotBlockStoreError::Corrupt)?
+        {
+            log.extend_from_slice(bytes);
+        }
     }
     Ok(log)
 }

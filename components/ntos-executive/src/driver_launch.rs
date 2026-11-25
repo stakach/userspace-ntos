@@ -17063,6 +17063,7 @@ fn park_hosted_driver_wait(
         wake_status: None,
         delivery: nt_hosted_runtime::HostedEventWaitDelivery::new(),
         reply_retry_at: 0,
+        nested_pnp_trace: false,
     });
     // End the vector borrow before the collector reads the newly published deadline. The
     // original Reply remains canonical until programming and external suspension both succeed.
@@ -17114,6 +17115,31 @@ fn park_hosted_driver_wait(
     } else {
         HOSTED_DRIVER_WAIT_SINGLE_PARKED.fetch_add(1, Ordering::Relaxed);
     }
+    if crate::spawn_hosts::active_pnp_start_receive() {
+        if NESTED_PNP_WAIT_TRACE_ROWS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |used| (used < NESTED_PNP_WAIT_TRACE_LIMIT).then_some(used + 1)).is_ok() {
+            // Only this root-owned service reads the wait ledger. The copied receive selector
+            // does not authorize a Reply or change the canonical waiter.
+            if let Some(waiter) = unsafe { hosted_driver_waiters_mut() }.iter_mut().find(|row| {
+                row.instance == instance && row.sequence == sequence
+                    && row.reply_cap == active_reply_cap && row.thread_handle == thread_handle
+            }) {
+                waiter.nested_pnp_trace = true;
+                trace_nested_pnp_wait(b"parked", waiter, 0);
+            } else {
+                // A missing diagnostic row must not change the committed wait's outcome.
+                print_str(b"[nested-pnp-wait] stage=parked-row-missing route/reply/sequence=");
+                for value in [shared.route.badge(), active_reply_cap, sequence] {
+                    print_str(b"/"); print_u64(value);
+                }
+                print_str(b"\n");
+            }
+        } else if !NESTED_PNP_WAIT_TRACE_LIMIT_REPORTED.swap(true, Ordering::AcqRel) {
+            print_str(b"[nested-pnp-wait] stage=trace-limit-exhausted limit=");
+            print_u64(NESTED_PNP_WAIT_TRACE_LIMIT);
+            print_str(b"\n");
+        }
+    }
     Some(HostedDriverWaitServiceResult::SharedParked {
         route: shared.route, dispatch: shared.dispatch, reply: active_reply_cap, token: shared.token,
     })
@@ -17125,6 +17151,9 @@ unsafe fn reply_hosted_driver_waiter(mut waiter: HostedDriverRawWaiter, status: 
     let thread_handle = waiter.thread_handle;
     let sequence = waiter.sequence;
     let reply = waiter.reply_cap;
+    if waiter.nested_pnp_trace && waiter.wake_status.is_none() {
+        trace_nested_pnp_wait(b"wake-selected", &waiter, status);
+    }
     if status != STATUS_SUCCESS {
         hosted_driver_guarded_mutex::cancel_pending(instance, thread_handle, reply);
         hosted_driver_spin_wait::cancel_pending(instance, thread_handle, reply);
@@ -17181,6 +17210,9 @@ unsafe fn reply_hosted_driver_waiter(mut waiter: HostedDriverRawWaiter, status: 
         })
         .expect("shared wake lost its retained waiter");
     let mut waiter = waiters.remove(index);
+    if waiter.nested_pnp_trace {
+        trace_nested_pnp_wait(b"wake-broker-accepted", &waiter, status);
+    }
     if !(if cancelled { waiter.delivery.cancel(true) }
         else { waiter.delivery.reconcile(true) }) {
         crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, reply, 13]);
@@ -66927,6 +66959,8 @@ struct HostedDriverRawWaiter {
     wake_status: Option<i32>,
     delivery: nt_hosted_runtime::HostedEventWaitDelivery,
     reply_retry_at: u64,
+    /// Observation only. Claimed at a root-owned PnP START wait admission.
+    nested_pnp_trace: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -66934,6 +66968,41 @@ struct HostedDriverSharedWait {
     route: nt_component_suspension::peer_registry::PeerRoute,
     dispatch: nt_component_suspension::LaneDispatchIdentity,
     token: u64,
+}
+
+static NESTED_PNP_WAIT_TRACE_ROWS: AtomicU64 = AtomicU64::new(0);
+static NESTED_PNP_WAIT_TRACE_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
+const NESTED_PNP_WAIT_TRACE_LIMIT: u64 = 64;
+
+/// The wait ledger is root-owned. Emit copied values here, at its own admission/terminal
+/// boundary; an isolated provider pump must never walk this Vec to diagnose its Receive.
+fn trace_nested_pnp_wait(stage: &[u8], waiter: &HostedDriverRawWaiter, status: i32) {
+    print_str(b"[nested-pnp-wait] stage="); print_str(stage);
+    print_str(b" instance="); print_u64(waiter.instance as u64);
+    print_str(b" route/executor-tcb/reply/lane/epoch/token=");
+    for value in [waiter.shared.route.badge(), waiter.shared.route.identity().executor,
+        waiter.reply_cap, u64::from(waiter.shared.dispatch.lane().index),
+        waiter.shared.dispatch.epoch(), waiter.shared.token] {
+        print_str(b"/"); print_u64(value);
+    }
+    print_str(b" thread/owner/sequence=");
+    for value in [waiter.thread_handle, waiter.owner_body, waiter.sequence] {
+        print_str(b"/"); print_u64(value);
+    }
+    print_str(b" objects/count/captured/truncated=");
+    for value in [waiter.objects.len(), waiter.objects.len().min(4),
+        waiter.objects.len().saturating_sub(4)] {
+        print_str(b"/"); print_u64(value as u64);
+    }
+    for object in waiter.objects.iter().take(4) {
+        print_str(b"/"); print_hex64(*object);
+    }
+    print_str(b" deadline/infinite/wake/status=");
+    print_u64(waiter.deadline.monotonic_target(crate::nt_time_snapshot()).unwrap_or(0));
+    print_str(b"/"); print_u64(u64::from(waiter.deadline == nt_kernel_exec::Deadline::Infinite));
+    print_str(b"/"); print_hex(waiter.wake_status.unwrap_or(i32::MIN) as u32);
+    print_str(b"/"); print_hex(status as u32);
+    print_str(b"\n");
 }
 
 static mut HOSTED_DRIVER_THREAD_TABLES: Option<Vec<HostedDriverThreadTable>> = None;

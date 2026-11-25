@@ -2488,6 +2488,40 @@ fn dispatch_with_port_connect<Yield>(
         }
     };
     row(id).flight = Flight::Dispatch;
+    // This root-owned File row is recorded before entering a provider CREATE. The pump's
+    // copied active-IRP receipt supplies the physical route, Reply and component pointer;
+    // no isolated pump follows this Vec or decides a terminal from this observation.
+    if major == 0 && crate::spawn_hosts::active_pnp_start_receive() {
+        static NESTED_PNP_CREATE_ROWS: AtomicU64 = AtomicU64::new(0);
+        static NESTED_PNP_CREATE_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
+        if NESTED_PNP_CREATE_ROWS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |used| (used < 32).then_some(used + 1)).is_ok()
+        {
+            let owner = row(id);
+            print_str(b"[nested-pnp-create-owner] row/irp/device/driver/stack/flight=");
+            for value in [id, irp_id.raw(),
+                owner.primary_device.map_or(0, |device| device.raw()),
+                owner.primary_driver.map_or(0, |driver| driver.raw()),
+                owner.stack.len() as u64, 3] {
+                print_str(b"/"); print_u64(value);
+            }
+            // These saved root-owned entries prove whether this CREATE shares the held
+            // PnP START stack. The primary device and stack length alone do not.
+            print_str(b" members=");
+            for (index, (device, driver)) in owner.stack.iter().take(8).enumerate() {
+                if index != 0 { print_str(b","); }
+                print_u64(index as u64);
+                print_str(b":"); print_u64(device.raw());
+                print_str(b":"); print_u64(driver.raw());
+            }
+            if owner.stack.len() > 8 {
+                print_str(b" truncated="); print_u64((owner.stack.len() - 8) as u64);
+            }
+            print_str(b"\n");
+        } else if !NESTED_PNP_CREATE_LIMIT_REPORTED.swap(true, Ordering::AcqRel) {
+            print_str(b"[nested-pnp-create-owner] trace-limit-exhausted=32\n");
+        }
+    }
     if phase.entered != 0 {
         row(id).phase_major = major;
         phase.identity = Some(nt_hosted_runtime::HostedFileRpcIdentity {
