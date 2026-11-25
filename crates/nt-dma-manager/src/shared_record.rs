@@ -34,6 +34,7 @@ pub struct SharedDmaRecord {
     map_register: AtomicU64,
     adapter_id: AtomicU64,
     pending_extent: AtomicU64,
+    retirement_epoch: AtomicU64,
 }
 
 impl Default for SharedDmaRecord {
@@ -54,6 +55,7 @@ impl SharedDmaRecord {
             map_register: AtomicU64::new(0),
             adapter_id: AtomicU64::new(0),
             pending_extent: AtomicU64::new(0),
+            retirement_epoch: AtomicU64::new(0),
         }
     }
 
@@ -80,6 +82,11 @@ impl SharedDmaRecord {
         self.pending_extent.load(Ordering::SeqCst)
     }
 
+    /// Exact local retirement ownership. Zero means no retirement owns this row.
+    pub fn retirement_epoch(&self) -> u64 {
+        self.retirement_epoch.load(Ordering::SeqCst)
+    }
+
     /// Only the provider's allocation guard may mutate a record. `length` is the commit
     /// marker: mutation starts with `begin` and ends with `publish` or `clear`.
     pub fn store(&self, offset: u64, value: u64) {
@@ -93,6 +100,15 @@ impl SharedDmaRecord {
             // Retiring a published map must keep its exact occupied range reserved.
             self.pending_extent.store(previous, Ordering::SeqCst);
         }
+    }
+
+    /// Reserve a published row before an external retirement effect. The caller must hold the
+    /// provider allocation guard; a lost reply deliberately leaves the epoch and extent owned.
+    pub fn begin_retirement(&self, epoch: u64) {
+        assert_ne!(epoch, 0);
+        assert_eq!(self.retirement_epoch(), 0);
+        self.begin();
+        self.retirement_epoch.store(epoch, Ordering::SeqCst);
     }
 
     /// Record the exact range about to be sent to the root map service. A lost reply retains
@@ -111,6 +127,7 @@ impl SharedDmaRecord {
 
     pub fn publish(&self, length: u64, direction: u64) {
         assert!(length != 0 && length != RESERVED);
+        assert_eq!(self.retirement_epoch(), 0);
         self.next_generation(direction);
         self.length.store(length, Ordering::SeqCst);
     }
@@ -124,6 +141,7 @@ impl SharedDmaRecord {
         self.map_register.store(0, Ordering::SeqCst);
         self.adapter_id.store(0, Ordering::SeqCst);
         self.pending_extent.store(0, Ordering::SeqCst);
+        self.retirement_epoch.store(0, Ordering::SeqCst);
         self.next_generation(0);
         self.length.store(0, Ordering::SeqCst);
     }
@@ -213,7 +231,7 @@ impl SharedDmaRecord {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<SharedDmaRecord>() == 0x48);
+const _: () = assert!(core::mem::size_of::<SharedDmaRecord>() == 0x50);
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, logical) == 0x00);
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, length) == 0x08);
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, va) == 0x10);
@@ -223,6 +241,7 @@ const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, flags) == 0x28);
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, map_register) == 0x30);
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, adapter_id) == 0x38);
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, pending_extent) == 0x40);
+const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, retirement_epoch) == 0x48);
 
 #[cfg(test)]
 mod tests {
@@ -317,5 +336,66 @@ mod tests {
         record.begin();
         assert_eq!(unsafe { record.next_overlapping_offset_locked(1, GRANT, 0x1000, 36) },
             Some(0x1000 + 2056), "retirement retains the published extent");
+    }
+
+    #[test]
+    fn retirement_epoch_exclusively_owns_a_published_row() {
+        let record = SharedDmaRecord::new();
+        record.begin();
+        record.store(0x00, 0x7000);
+        record.store(0x30, 0x1234);
+        record.store(0x38, 7);
+        record.publish(64, 0);
+
+        record.begin_retirement(17);
+        assert_eq!(record.load(0x08), RESERVED);
+        assert_eq!(record.pending_extent(), 64);
+        assert_eq!(record.retirement_epoch(), 17);
+        assert!(std::panic::catch_unwind(|| record.begin_retirement(18)).is_err(),
+            "a second retirement must not replace the first owner's epoch");
+        assert_eq!(record.retirement_epoch(), 17);
+    }
+
+    #[test]
+    fn clear_ends_retirement_and_reuse_gets_a_new_epoch() {
+        let record = SharedDmaRecord::new();
+        record.begin_retirement(21);
+        record.store(0x30, 0x1234);
+        record.store(0x38, 7);
+        record.clear();
+        assert_eq!(record.retirement_epoch(), 0);
+        assert_eq!(record.pending_extent(), 0);
+        assert_eq!(record.load(0x08), 0);
+
+        record.begin();
+        record.store(0x00, 0x8000);
+        record.store(0x30, 0x1234);
+        record.store(0x38, 7);
+        record.publish(128, 1);
+        record.begin_retirement(22);
+        assert_eq!(record.retirement_epoch(), 22);
+        assert_eq!(record.pending_extent(), 128);
+    }
+
+    #[test]
+    fn uncertain_retirement_keeps_epoch_and_exact_overlap_reserved() {
+        const GRANT: u64 = 0x6000;
+        let record = SharedDmaRecord::new();
+        record.begin();
+        record.store(0x00, GRANT + 0x1000);
+        record.store(0x18, 2);
+        record.store(0x30, 0x1234);
+        record.store(0x38, 7);
+        record.publish(64, 0);
+        record.begin_retirement(31);
+
+        // Model a lost provider reply by leaving the claim reserved.
+        assert_eq!(record.retirement_epoch(), 31);
+        assert_eq!(record.load(0x08), RESERVED);
+        assert_eq!(unsafe { record.next_overlapping_offset_locked(7, GRANT, 0, 32) }, None);
+        assert_eq!(unsafe { record.next_overlapping_offset_locked(7, GRANT, 0x1000, 32) },
+            Some(0x1040));
+        assert_eq!(unsafe { record.snapshot_for_relevant_adapter_locked(|id| id == 7) },
+            Err(Busy));
     }
 }

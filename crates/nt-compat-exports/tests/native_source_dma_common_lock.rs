@@ -86,7 +86,7 @@ const SH_DMA_ALLOC_CURSOR: u64 = 0x6A0;
 // 0x1248 handoff base + 0x100 support records + 0x858 export scratch
 // + 0x2820 work queue arena + 0x820 admission metadata.
 const SH_DMA_ALLOC_RECORDS: u64 = 0x4BE0;
-const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x48;
+const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x50;
 const SH_DMA_ALLOC_RECORD_LOGICAL: u64 = 0;
 const SH_DMA_ALLOC_RECORD_LEN: u64 = 8;
 const SH_DMA_ALLOC_RECORD_VA: u64 = 16;
@@ -95,6 +95,7 @@ const SH_DMA_ALLOC_RECORD_SOURCE_VA: u64 = 32;
 const SH_DMA_ALLOC_RECORD_MAP_REGISTER: u64 = 48;
 const SH_DMA_ALLOC_RECORD_ADAPTER_ID: u64 = 56;
 const SH_DMA_ALLOC_RECORD_PENDING_EXTENT: u64 = 64;
+const SH_DMA_ALLOC_RECORD_RETIREMENT_EPOCH: u64 = 72;
 
 mod nt_status {
     pub struct NtStatus;
@@ -203,7 +204,7 @@ unsafe fn publish_dma_allocation_record(record: u64, length: u64, _direction: u6
 }
 unsafe fn clear_dma_allocation_record(record: u64) {
     assert!(LOCKED.load(Ordering::Acquire), "clear needs the guard");
-    for offset in [0, 8, 16, 24, 32, 48, 56, 64] { dma_record_store(record, offset, 0); }
+    for offset in [0, 8, 16, 24, 32, 48, 56, 64, 72] { dma_record_store(record, offset, 0); }
 }
 unsafe fn first_free_dma_allocation_record(_sh: u64) -> Option<u64> {
     (0..2).map(record).find(|&r| dma_record_load(r, SH_DMA_ALLOC_RECORD_LEN) == 0)
