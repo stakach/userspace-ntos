@@ -4511,6 +4511,53 @@ static SYSTEM_WAL_FOLD_DUE: AtomicBool = AtomicBool::new(false);
 static SYSTEM_WAL_FOLD_READY: AtomicBool = AtomicBool::new(false);
 static SYSTEM_WAL_FOLD_RUNNING: AtomicBool = AtomicBool::new(false);
 static SYSTEM_WAL_FOLD_RETRY_100NS: AtomicU64 = AtomicU64::new(0);
+// Keep native-route capacity separate so repeated boot/draining deferrals cannot hide the
+// eventual handoff. After the first 16 receipts, powers of two cover long bounded runs.
+static SYSTEM_WAL_FOLD_PRE_NATIVE_TRACES: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_WAL_FOLD_NATIVE_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// A bounded value-only receipt. The timer and fold owners remain the only scheduling and
+/// admission authority; these independently sampled fields are diagnostic, not a new proof.
+fn trace_system_wal_fold_boundary(stage: &[u8], status: u32, due_at_entry: bool) {
+    if !due_at_entry { return; }
+    use crate::volume_lazy_flush::StoragePath;
+    let path = unsafe { crate::writable_fs::storage_path() };
+    let count = if matches!(path, StoragePath::Native) {
+        &SYSTEM_WAL_FOLD_NATIVE_TRACES
+    } else {
+        &SYSTEM_WAL_FOLD_PRE_NATIVE_TRACES
+    };
+    let Ok(prior) = count.fetch_update(
+        Ordering::AcqRel, Ordering::Acquire,
+        |used| (used < 1024).then_some(used + 1),
+    ) else { return; };
+    let ordinal = prior + 1;
+    if ordinal > 16 && !ordinal.is_power_of_two() { return; }
+    print_str(b"[system-wal-fold-boundary] stage="); print_str(stage);
+    let path_label: &[u8] = match path {
+        StoragePath::Unmounted => b"unmounted",
+        StoragePath::Blocked => b"blocked",
+        StoragePath::Boot => b"boot",
+        StoragePath::Draining => b"draining",
+        StoragePath::Native => b"native",
+    };
+    print_str(b" path="); print_str(path_label);
+    print_str(b" first-dirty/used/capacity/due/ready/running/cm-idle/legacy/restored-required=");
+    for value in [
+        SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire),
+        SYSTEM_WAL_USED_SECTORS.load(Ordering::Acquire),
+        SYSTEM_WAL_CAPACITY_SECTORS.load(Ordering::Acquire),
+        u64::from(SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire)),
+        u64::from(SYSTEM_WAL_FOLD_READY.load(Ordering::Acquire)),
+        u64::from(SYSTEM_WAL_FOLD_RUNNING.load(Ordering::Acquire)),
+        u64::from(crate::config_manager_channel_idle()),
+        u64::from(crate::writable_fs::legacy_snapshot_writes_allowed()),
+        u64::from(crate::writable_fs::system_wal_fold_required_for_diagnostics()),
+    ] {
+        print_str(b"/"); print_u64(value);
+    }
+    print_str(b" status=0x"); print_hex(status); print_str(b"\n");
+}
 
 fn retire_system_wal_fold_demand() {
     SYSTEM_WAL_FOLD_READY.store(false, Ordering::Release);
@@ -4635,15 +4682,18 @@ pub(crate) fn service_due_system_wal_fold() -> Result<bool, u32> {
 /// A busy CM or reserve owner defers this background attempt; a physical uncertainty blocks
 /// the mounted volume and must reach the service loop as a durability refusal.
 fn maybe_fold_system_wal() -> Result<(), u32> {
+    let trace_due = SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire);
     if !unsafe { crate::writable_fs::writable_fs_mounted() }
         || crate::writable_fs::legacy_snapshot_writes_allowed()
     {
+        trace_system_wal_fold_boundary(b"unmounted-or-legacy", 0, trace_due);
         retire_system_wal_fold_demand();
         return Ok(());
     }
     let first_dirty = SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire);
     if first_dirty == 0 {
         // No epoch exists to fold. Retire stale timer demand without publishing a fold ACK.
+        trace_system_wal_fold_boundary(b"no-dirty-epoch", 0, trace_due);
         retire_system_wal_fold_demand();
         return Ok(());
     }
@@ -4653,11 +4703,18 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
         SYSTEM_WAL_CAPACITY_SECTORS.load(Ordering::Acquire),
         monotonic_time_100ns,
     ) else {
+        trace_system_wal_fold_boundary(b"cadence-wait", 0, trace_due);
         return Ok(());
     };
     let _transient = allocator::enter_transient();
     let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
     let result = unsafe { crate::writable_fs::fold_system_wal_if_dirty() };
+    let stage: &[u8] = match result {
+        Ok(true) => b"fold-complete",
+        Ok(false) => b"fold-clean",
+        Err(_) => b"fold-refused",
+    };
+    trace_system_wal_fold_boundary(stage, result.err().unwrap_or(0), trace_due);
     if result.is_ok() {
         SYSTEM_WAL_FOLD_DUE.store(false, Ordering::Release);
         SYSTEM_WAL_FOLD_RETRY_100NS.store(0, Ordering::Release);
@@ -4677,11 +4734,15 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
 }
 
 fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
+    let trace_due = SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire);
+    trace_system_wal_fold_boundary(b"outer-enter", 0, trace_due);
     if let Some(status) = redrive_service_loop_global_work(nt_handler) {
+        trace_system_wal_fold_boundary(b"outer-prework-refused", status, trace_due);
         return status;
     }
     let started = crate::disk_census_ticks();
     let status = checkpoint_service_loop_volume(nt_handler);
+    trace_system_wal_fold_boundary(b"outer-finished", status, trace_due);
     crate::hot_service_latency_census::checkpointed(crate::disk_census_ticks().wrapping_sub(started));
     status
 }
@@ -4843,6 +4904,7 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
     use crate::volume_checkpoint_deferral::Outcome;
     use crate::volume_lazy_flush::episode_traced;
     let required_at_entry = nt_handler.writable_fs_commit_required;
+    let trace_due = SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire);
     owe_lazy_volume_checkpoint(nt_handler);
     // An ordinary snapshot must not capture post-WAL namespace or CM state while preserving
     // the old replay base. The fold owns both snapshot slots and stages CM's SYSTEM image.
@@ -4890,6 +4952,7 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
         checkpoint_status, crate::writable_fs::reserve_progress, monotonic_time_100ns,
     ) {
         Outcome::Settled { episode, deferrals, waited_100ns } => {
+            trace_system_wal_fold_boundary(b"checkpoint-settled", checkpoint_status, trace_due);
             let lazy = VOLUME_LAZY_FLUSH_OWED.swap(false, Ordering::AcqRel);
             if (deferrals != 0 || lazy) && episode_traced(episode) {
                 print_str(b"[writable-fs-snapshot] service-loop checkpoint published episode=");
@@ -4908,6 +4971,9 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
             }
         }
         Outcome::Deferred { episode, first } => {
+            if !first {
+                trace_system_wal_fold_boundary(b"checkpoint-deferred-again", checkpoint_status, trace_due);
+            }
             if first && episode_traced(episode) {
                 print_str(b"[writable-fs-snapshot] service-loop checkpoint deferred episode=");
                 print_u64(episode);
