@@ -16601,6 +16601,19 @@ pub(crate) unsafe fn config_manager_prepare_system_hive_checkpoint(
         .prepare_system_hive_checkpoint(expected_generation)
 }
 
+/// The volume WAL proof, not CM's per-boot dirty count, requires this exact image to be folded.
+pub(crate) unsafe fn config_manager_prepare_system_hive_checkpoint_for_restored_wal(
+) -> Result<nt_config_client::PreparedSystemHiveCheckpoint, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?
+        .prepare_system_hive_checkpoint_for_restored_wal(expected_generation)
+}
+
 pub(crate) unsafe fn config_manager_acknowledge_system_hive_checkpoint(
     prepared: &nt_config_client::PreparedSystemHiveCheckpoint,
 ) -> Result<(), i32> {
