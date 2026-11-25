@@ -70,7 +70,7 @@ pub use win32k_bulk_stage::{
 };
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
-pub use installer_syscall_span::{CensusEpochGate, InstallerFaultTicket, InstallerSyscallSpans, LongestGap, SpanOwner, SpanSample, SpanSnapshot, SsnTotal, TransitionPairTotal};
+pub use installer_syscall_span::{CensusEpochGate, CloseUnmapRuntimeTotals, InstallerFaultTicket, InstallerSyscallSpans, LongestGap, RuntimeSample, SpanOwner, SpanSample, SpanSnapshot, SsnTotal, TransitionPairTotal};
 pub use installer_fault_receipt::{InstallerFaultReceipt, InstallerFaultReceipts};
 pub use primary_alias_activation::{
     classify_alias_registration_status, AliasRetryDisposition,
