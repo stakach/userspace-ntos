@@ -565,8 +565,13 @@ pub(super) unsafe fn syscall_nt_route(
             table_entry.map(|entry| entry.service), res.status,
             elapsed_ticks,
         );
-        installer_child_span_census::returned(
+        let installer_gap_timer_rearm = installer_child_span_census::returned(
             &nt_handler, installer_span, lp.msg.badge, lp.msg.m0 as u32, res.status);
+        if installer_gap_timer_rearm {
+            // The exact Close return is published before selecting the shared one-shot.
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            delay_timer_rearm(&*delay_queue, &nt_handler);
+        }
         sc.result = res.status as u64;
         if lp.msg.m0 == SSN_NT_CREATE_THREAD {
             let caller = nt_handler.thread_runtime.executable_by_tid(current_tid)

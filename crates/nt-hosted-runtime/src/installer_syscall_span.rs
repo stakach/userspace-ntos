@@ -5,6 +5,7 @@ const PAIR_CAP: usize = 128;
 const STATUS_PENDING: u32 = 0x103;
 const SSN_NT_CLOSE: u32 = 27;
 const SSN_NT_UNMAP_VIEW_OF_SECTION: u32 = 277;
+pub const OPEN_CLOSE_GAP_THRESHOLD_100NS: u64 = 5_000_000;
 
 /// One diagnostic sample per completed periodic census epoch after activation.
 /// The current epoch is primed without consuming the bounded sample budget.
@@ -97,6 +98,46 @@ pub struct LongestGap {
     pub to_ssn: u32,
     pub from_at_100ns: u64,
     pub to_at_100ns: u64,
+}
+
+/// An exact terminal NtClose return still awaiting its next table entry. It becomes
+/// a Close→Unmap interval only if that next entry is NtUnmapViewOfSection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenCloseGap {
+    pub owner: SpanOwner,
+    pub from_status: u32,
+    pub return_at_100ns: u64,
+    pub age_100ns: u64,
+}
+
+/// Finite diagnostic claims, independent of the physical timer. Each exact child can
+/// consume at most two samples across distinct Close returns; the array bounds the boot.
+pub struct OpenCloseGapSampleBudget<const N: usize> {
+    records: [Option<(SpanOwner, u64)>; N],
+    used: usize,
+}
+
+impl<const N: usize> OpenCloseGapSampleBudget<N> {
+    pub const fn new() -> Self { Self { records: [None; N], used: 0 } }
+
+    pub fn can_sample(&self, owner: SpanOwner) -> bool {
+        self.used < N && self.records[..self.used].iter()
+            .filter(|record| record.as_ref().is_some_and(|(record_owner, _)| *record_owner == owner))
+            .count() < 2
+    }
+
+    /// Claim before uncertain native reads. A second probe of one return is refused.
+    pub fn claim(&mut self, owner: SpanOwner, return_at_100ns: u64) -> bool {
+        if !self.can_sample(owner) || self.records[..self.used].iter().any(|record|
+            *record == Some((owner, return_at_100ns))) { return false; }
+        self.records[self.used] = Some((owner, return_at_100ns));
+        self.used += 1;
+        true
+    }
+}
+
+impl<const N: usize> Default for OpenCloseGapSampleBudget<N> {
+    fn default() -> Self { Self::new() }
 }
 
 /// Cumulative, capability-scoped runtime read for one exact hosted thread.
@@ -286,6 +327,9 @@ struct Row {
     active: Option<ActiveSpan>,
     pending: Option<ActiveSpan>,
     last_return: Option<LastReturn>,
+    close_probe_deadline_100ns: Option<u64>,
+    close_probe_due: bool,
+    close_probe_armed_for_return: bool,
     close_return_runtime: Option<CloseReturnRuntime>,
     close_unmap: CloseUnmapRuntimeTotals,
     active_fault: Option<ActiveFault>,
@@ -308,6 +352,8 @@ struct Row {
 impl Row {
     const EMPTY: Self = Self {
         owner: None, active: None, pending: None, last_return: None,
+        close_probe_deadline_100ns: None, close_probe_due: false,
+        close_probe_armed_for_return: false,
         close_return_runtime: None, close_unmap: CloseUnmapRuntimeTotals::EMPTY,
         active_fault: None,
         completed_fault_open_gap_100ns: 0, completed_fault_gap_100ns: 0,
@@ -507,6 +553,9 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
         let Some(row) = self.rows.iter_mut().find(|row| row.owner == Some(owner)) else {
             return false;
         };
+        row.close_probe_deadline_100ns = None;
+        row.close_probe_due = false;
+        row.close_probe_armed_for_return = false;
         if let Some(fault) = row.active_fault.as_mut() {
             fault.crossed_next_entry = true;
         }
@@ -587,6 +636,9 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
         };
         row.active = None;
         row.close_return_runtime = None;
+        row.close_probe_deadline_100ns = None;
+        row.close_probe_due = false;
+        row.close_probe_armed_for_return = false;
         if status == STATUS_PENDING {
             row.retained_pending = row.retained_pending.saturating_add(1);
             row.pending = Some(active);
@@ -609,6 +661,89 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
     pub fn snapshot(&self, owner: SpanOwner, now: u64) -> Option<SpanSnapshot<TOP>> {
         self.rows.iter().find(|row| row.owner == Some(owner))
             .map(|row| row.snapshot(owner, now))
+    }
+
+    /// Select only the exact live Close return. Pending dispatches and calls already
+    /// reentered cannot be sampled as an open return-to-next-entry interval.
+    pub fn open_close_gap(&self, owner: SpanOwner, now: u64) -> Option<OpenCloseGap> {
+        let row = self.rows.iter().find(|row| row.owner == Some(owner))?;
+        if row.active.is_some() || row.pending.is_some() { return None; }
+        let last = row.last_return?;
+        if last.ssn != SSN_NT_CLOSE || last.status == STATUS_PENDING { return None; }
+        Some(OpenCloseGap { owner, from_status: last.status,
+            return_at_100ns: last.at_100ns,
+            age_100ns: now.checked_sub(last.at_100ns)? })
+    }
+
+    /// Arm a single observation deadline for the exact terminal Close after the native
+    /// caller has confirmed that the bounded diagnostic still has sample capacity.
+    pub fn arm_open_close_gap_deadline(&mut self, owner: SpanOwner) -> bool {
+        let Some(row) = self.rows.iter_mut().find(|row| row.owner == Some(owner)) else {
+            return false;
+        };
+        if row.active.is_some() || row.pending.is_some()
+            || row.close_probe_armed_for_return { return false; }
+        let Some(last) = row.last_return.filter(|last| last.ssn == SSN_NT_CLOSE
+            && last.status != STATUS_PENDING) else { return false; };
+        let Some(deadline) = last.at_100ns.checked_add(OPEN_CLOSE_GAP_THRESHOLD_100NS)
+            else { return false; };
+        row.close_probe_deadline_100ns = Some(deadline);
+        row.close_probe_due = false;
+        row.close_probe_armed_for_return = true;
+        true
+    }
+
+    pub fn next_open_close_gap_deadline(&self) -> Option<u64> {
+        self.rows.iter().filter_map(|row| row.close_probe_deadline_100ns).min()
+    }
+
+    /// A delivered timer consumes each due owner once. The maintenance owner later claims
+    /// this value-only due marker and revalidates its exact process and thread lifetime.
+    pub fn consume_due_open_close_gap_deadlines(&mut self, now: u64) -> u64 {
+        let mut consumed = 0u64;
+        for row in &mut self.rows {
+            if row.close_probe_deadline_100ns.is_some_and(|deadline| deadline <= now) {
+                row.close_probe_deadline_100ns = None;
+                row.close_probe_due = true;
+                consumed += 1;
+            }
+        }
+        consumed
+    }
+
+    pub fn has_due_open_close_gap(&self) -> bool {
+        self.rows.iter().any(|row| row.close_probe_due)
+    }
+
+    /// Quiesce must retain an already delivered due observation even though its timer
+    /// deadline was consumed and is no longer selected for a second physical wake.
+    pub fn has_pending_gap_observation(&self) -> bool {
+        self.rows.iter().any(|row| row.close_probe_deadline_100ns.is_some()
+            || row.close_probe_due)
+    }
+
+    pub fn is_due_open_close_gap(&self, owner: SpanOwner) -> bool {
+        self.rows.iter().find(|row| row.owner == Some(owner))
+            .is_some_and(|row| row.close_probe_due)
+    }
+
+    pub fn take_due_open_close_gap(&mut self, owner: SpanOwner, now: u64) -> Option<OpenCloseGap> {
+        let gap = self.open_close_gap(owner, now)?;
+        let row = self.rows.iter_mut().find(|row| row.owner == Some(owner))?;
+        if !row.close_probe_due { return None; }
+        row.close_probe_due = false;
+        Some(gap)
+    }
+
+    pub fn cancel_open_close_gap_deadline(&mut self, owner: SpanOwner, return_at: u64) -> bool {
+        let Some(row) = self.rows.iter_mut().find(|row| row.owner == Some(owner)) else {
+            return false;
+        };
+        if !row.last_return.is_some_and(|last| last.ssn == SSN_NT_CLOSE
+            && last.at_100ns == return_at) { return false; }
+        row.close_probe_deadline_100ns = None;
+        row.close_probe_due = false;
+        true
     }
 
     pub fn owners(&self) -> impl Iterator<Item = SpanOwner> + '_ {
@@ -653,6 +788,172 @@ mod tests {
 
     const A: SpanOwner = SpanOwner { process_index: 18, process_generation: 17,
         thread_id: 560, thread_generation: 1 };
+
+    #[test]
+    fn open_close_gap_requires_exact_terminal_close_and_closes_at_next_entry() {
+        let mut ledger = InstallerSyscallSpans::<1, 2>::new();
+        assert!(ledger.activate(A));
+        assert_eq!(ledger.open_close_gap(A, 1_000), None);
+        assert!(ledger.begin(A, SSN_NT_CLOSE, 100));
+        assert_eq!(ledger.open_close_gap(A, 150), None);
+        assert!(ledger.return_from_dispatch(A, SSN_NT_CLOSE, 0xC000_0008, 200));
+        assert_eq!(ledger.open_close_gap(A, 5_000_200), Some(OpenCloseGap {
+            owner: A, from_status: 0xC000_0008, return_at_100ns: 200,
+            age_100ns: 5_000_000,
+        }));
+        assert!(ledger.begin(A, SSN_NT_UNMAP_VIEW_OF_SECTION, 5_000_300));
+        assert_eq!(ledger.open_close_gap(A, 5_000_400), None);
+        assert!(ledger.return_from_dispatch(A, SSN_NT_UNMAP_VIEW_OF_SECTION, 0, 5_000_500));
+        assert_eq!(ledger.open_close_gap(A, 5_000_600), None);
+    }
+
+    #[test]
+    fn open_close_gap_excludes_pending_close_and_retires_exact_generation() {
+        let mut ledger = InstallerSyscallSpans::<1, 2>::new();
+        assert!(ledger.activate(A));
+        assert!(ledger.begin(A, SSN_NT_CLOSE, 100));
+        assert!(ledger.return_from_dispatch(A, SSN_NT_CLOSE, STATUS_PENDING, 200));
+        assert_eq!(ledger.open_close_gap(A, 5_000_200), None);
+        assert!(ledger.begin(A, SSN_NT_CLOSE, 300));
+        assert!(ledger.return_from_dispatch(A, SSN_NT_CLOSE, 0, 400));
+        assert_eq!(ledger.open_close_gap(A, 500).map(|gap| gap.return_at_100ns), Some(400));
+        let next = SpanOwner { thread_generation: A.thread_generation + 1, ..A };
+        assert!(ledger.activate(next));
+        assert_eq!(ledger.open_close_gap(A, 600), None);
+        assert_eq!(ledger.open_close_gap(next, 600), None);
+        assert!(ledger.begin(next, SSN_NT_CLOSE, 700));
+        assert!(ledger.return_from_dispatch(next, SSN_NT_CLOSE, 0, 800));
+        assert!(ledger.retire(next));
+        assert_eq!(ledger.open_close_gap(next, 900), None);
+    }
+
+    #[test]
+    fn terminal_close_deadline_fires_once_and_waits_for_owned_probe() {
+        let mut ledger = InstallerSyscallSpans::<1, 2>::new();
+        assert!(ledger.activate(A));
+        assert!(!ledger.has_pending_gap_observation());
+        assert!(ledger.begin(A, SSN_NT_CLOSE, 100));
+        assert!(ledger.return_from_dispatch(A, SSN_NT_CLOSE, 0, 200));
+        assert!(ledger.arm_open_close_gap_deadline(A));
+        assert!(ledger.has_pending_gap_observation());
+        assert!(!ledger.arm_open_close_gap_deadline(A));
+        let due = 200 + OPEN_CLOSE_GAP_THRESHOLD_100NS;
+        assert_eq!(ledger.next_open_close_gap_deadline(), Some(due));
+        assert_eq!(ledger.consume_due_open_close_gap_deadlines(due - 1), 0);
+        assert_eq!(ledger.next_open_close_gap_deadline(), Some(due));
+        assert_eq!(ledger.consume_due_open_close_gap_deadlines(due), 1);
+        assert_eq!(ledger.next_open_close_gap_deadline(), None);
+        assert!(ledger.has_pending_gap_observation(),
+            "consumed due marker still owns a maintenance observation");
+        assert_eq!(ledger.consume_due_open_close_gap_deadlines(due + 1), 0);
+        assert_eq!(ledger.take_due_open_close_gap(A, due + 1).unwrap().return_at_100ns, 200);
+        assert!(!ledger.has_pending_gap_observation());
+        assert_eq!(ledger.take_due_open_close_gap(A, due + 2), None);
+        assert!(!ledger.arm_open_close_gap_deadline(A));
+    }
+
+    #[test]
+    fn next_entry_pending_close_and_reused_generation_cancel_deadline() {
+        let mut ledger = InstallerSyscallSpans::<2, 2>::new();
+        assert!(ledger.activate(A));
+        assert!(ledger.begin(A, SSN_NT_CLOSE, 100));
+        assert!(ledger.return_from_dispatch(A, SSN_NT_CLOSE, STATUS_PENDING, 200));
+        assert!(!ledger.arm_open_close_gap_deadline(A));
+        assert_eq!(ledger.next_open_close_gap_deadline(), None);
+        assert!(ledger.begin(A, SSN_NT_CLOSE, 300));
+        assert!(ledger.return_from_dispatch(A, SSN_NT_CLOSE, 0, 400));
+        assert!(ledger.arm_open_close_gap_deadline(A));
+        assert!(ledger.begin(A, SSN_NT_UNMAP_VIEW_OF_SECTION, 500));
+        assert_eq!(ledger.next_open_close_gap_deadline(), None);
+        assert_eq!(ledger.consume_due_open_close_gap_deadlines(10_000_000), 0);
+        assert!(ledger.return_from_dispatch(A, SSN_NT_UNMAP_VIEW_OF_SECTION, 0, 600));
+        assert_eq!(ledger.next_open_close_gap_deadline(), None);
+        assert!(ledger.begin(A, SSN_NT_CLOSE, 700));
+        assert!(ledger.return_from_dispatch(A, SSN_NT_CLOSE, 0, 800));
+        assert!(ledger.arm_open_close_gap_deadline(A));
+        let next = SpanOwner { process_generation: A.process_generation + 1, ..A };
+        assert!(ledger.activate(next));
+        assert_eq!(ledger.next_open_close_gap_deadline(), None);
+        assert_eq!(ledger.consume_due_open_close_gap_deadlines(10_000_000), 0);
+        assert_eq!(ledger.take_due_open_close_gap(A, 10_000_000), None);
+    }
+
+    #[test]
+    fn gap_sample_budget_limits_each_exact_owner_and_the_global_boot() {
+        let mut budget = OpenCloseGapSampleBudget::<3>::new();
+        let other = SpanOwner { thread_id: A.thread_id + 1, ..A };
+        assert!(budget.claim(A, 100));
+        assert!(!budget.claim(A, 100));
+        assert!(budget.claim(A, 200));
+        assert!(!budget.can_sample(A));
+        assert!(!budget.claim(A, 300));
+        assert!(budget.can_sample(other));
+        assert!(budget.claim(other, 100));
+        assert!(!budget.can_sample(other)); // The global three-sample limit is exhausted.
+        let newer = SpanOwner { process_generation: A.process_generation + 1, ..A };
+        assert!(!budget.claim(newer, 100));
+
+        let mut generations = OpenCloseGapSampleBudget::<3>::new();
+        assert!(generations.claim(A, 100));
+        assert!(generations.claim(A, 200));
+        assert!(generations.claim(newer, 100));
+    }
+
+    #[test]
+    fn due_deadlines_keep_independent_exact_owners() {
+        let mut ledger = InstallerSyscallSpans::<2, 2>::new();
+        let other = SpanOwner { thread_id: A.thread_id + 1, ..A };
+        assert!(ledger.activate(A));
+        assert!(ledger.activate(other));
+        assert!(ledger.begin(A, SSN_NT_CLOSE, 100));
+        assert!(ledger.return_from_dispatch(A, SSN_NT_CLOSE, 0, 200));
+        assert!(ledger.arm_open_close_gap_deadline(A));
+        assert!(ledger.begin(other, SSN_NT_CLOSE, 300));
+        assert!(ledger.return_from_dispatch(other, SSN_NT_CLOSE, 0, 400));
+        assert!(ledger.arm_open_close_gap_deadline(other));
+        assert_eq!(ledger.next_open_close_gap_deadline(), Some(200 + OPEN_CLOSE_GAP_THRESHOLD_100NS));
+        assert_eq!(ledger.consume_due_open_close_gap_deadlines(200 + OPEN_CLOSE_GAP_THRESHOLD_100NS), 1);
+        assert!(ledger.is_due_open_close_gap(A));
+        assert!(!ledger.is_due_open_close_gap(other));
+        assert_eq!(ledger.next_open_close_gap_deadline(), Some(400 + OPEN_CLOSE_GAP_THRESHOLD_100NS));
+        assert_eq!(ledger.take_due_open_close_gap(A, 200 + OPEN_CLOSE_GAP_THRESHOLD_100NS)
+            .map(|gap| gap.owner), Some(A));
+        assert_eq!(ledger.consume_due_open_close_gap_deadlines(400 + OPEN_CLOSE_GAP_THRESHOLD_100NS), 1);
+        assert_eq!(ledger.take_due_open_close_gap(other, 400 + OPEN_CLOSE_GAP_THRESHOLD_100NS)
+            .map(|gap| gap.owner), Some(other));
+    }
+
+    #[test]
+    fn ingress_claim_cancels_only_matching_open_close_deadline() {
+        let mut ledger = InstallerSyscallSpans::<1, 1>::new();
+        assert!(ledger.activate(A));
+        assert!(ledger.begin(A, SSN_NT_CLOSE, 100));
+        assert!(ledger.return_from_dispatch(A, SSN_NT_CLOSE, 0, 200));
+        assert!(ledger.arm_open_close_gap_deadline(A));
+        assert!(!ledger.cancel_open_close_gap_deadline(A, 199));
+        assert!(ledger.cancel_open_close_gap_deadline(A, 200));
+        assert!(!ledger.arm_open_close_gap_deadline(A));
+        assert_eq!(ledger.next_open_close_gap_deadline(), None);
+        assert_eq!(ledger.consume_due_open_close_gap_deadlines(10_000_000), 0);
+    }
+
+    #[test]
+    fn unavailable_native_identity_after_due_claim_cannot_hold_quiesce() {
+        let mut ledger = InstallerSyscallSpans::<1, 1>::new();
+        assert!(ledger.activate(A));
+        assert!(ledger.begin(A, SSN_NT_CLOSE, 100));
+        assert!(ledger.return_from_dispatch(A, SSN_NT_CLOSE, 0, 200));
+        assert!(ledger.arm_open_close_gap_deadline(A));
+        let due = 200 + OPEN_CLOSE_GAP_THRESHOLD_100NS;
+        assert_eq!(ledger.consume_due_open_close_gap_deadlines(due), 1);
+        assert!(ledger.has_pending_gap_observation());
+        // Native badge/TCB lookup can fail after this value-only maintenance claim.
+        assert!(ledger.take_due_open_close_gap(A, due).is_some());
+        assert!(!ledger.has_pending_gap_observation());
+        assert_eq!(ledger.next_open_close_gap_deadline(), None);
+        // The open gap remains observable if another owned root turn later arrives.
+        assert!(ledger.open_close_gap(A, due + 1).is_some());
+    }
 
     #[test]
     fn pending_dispatch_is_never_counted_as_terminal() {

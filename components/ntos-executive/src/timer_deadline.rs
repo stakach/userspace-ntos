@@ -161,6 +161,8 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
         (owner.root_add_device, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY),
         (owner.root_queued_callback, DELAY_TIMER_SOURCE_ROOT_QUEUED_CALLBACK_RETRY),
         (queued_work_receive_poll_deadline(), DELAY_TIMER_SOURCE_QUEUED_WORK_RECEIVE_POLL),
+        (installer_child_span_census::next_gap_deadline(),
+            DELAY_TIMER_SOURCE_INSTALLER_CLOSE_GAP),
         (owner.primary_alias, DELAY_TIMER_SOURCE_PRIMARY_ALIAS_RETRY),
         (owner.hosted_spawn_abort, DELAY_TIMER_SOURCE_HOSTED_SPAWN_ABORT),
         (
