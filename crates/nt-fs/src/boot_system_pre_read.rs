@@ -34,6 +34,9 @@ impl BootSystemPreRead {
         fs: &mut FileSystem,
         payload: HiveLogWalPayload<'_>,
     ) -> Result<HiveLogWalReplay, HiveLogWalReplayError> {
+        if self.is_pre_read(payload.file_id) {
+            return Err(HiveLogWalReplayError::ProtectedTarget);
+        }
         fs.replay_hive_log_wal_payload(payload)
     }
 
@@ -48,3 +51,7 @@ impl BootSystemPreRead {
         fs.replay_file_delta_wal_payload(&mut self.file_delta_cursor, payload)
     }
 }
+
+#[cfg(test)]
+#[path = "boot_system_pre_read_tests.rs"]
+mod tests;
