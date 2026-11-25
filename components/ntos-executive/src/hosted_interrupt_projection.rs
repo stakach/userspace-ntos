@@ -129,7 +129,7 @@ pub(super) unsafe fn provision(
     Ok((address, identity.pool_generation))
 }
 
-/// Shared bytes can describe the callback, but never prove this projection's ownership.
+/// The allocation catalog, not driver-writable projection bytes, proves ownership.
 pub(super) unsafe fn validate(
     inst: DriverInstance,
     binding: HostedDeviceBinding,
@@ -148,7 +148,7 @@ pub(super) unsafe fn validate(
 }
 
 /// Record the first uncertain canonical effect before invoking the resource manager or IRQ
-/// installer. A replayed PROVISION can return only a still-Prepared row.
+/// installer. A repeated PROVISION is refused even while a row is Prepared.
 pub(super) unsafe fn mark_effect_started(
     inst: DriverInstance,
     binding: HostedDeviceBinding,

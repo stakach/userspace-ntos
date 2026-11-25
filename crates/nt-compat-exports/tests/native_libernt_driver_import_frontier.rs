@@ -42,8 +42,10 @@ fn pinned_acpi_interrupt_ex_uses_the_existing_grant_owned_connection() {
     assert!(source.contains("reg.bind(\n        \"IoConnectInterruptEx\","),
         "generic registry must expose the released ACPI import");
     let adapter = include_str!("../../../components/ntos-executive/src/hosted_driver_interrupt_ex.rs");
-    assert!(adapter.contains("s_io_connect_interrupt(") && adapter.contains("SH_RESOURCE_PDO_OBJECT"),
-        "extended interrupt connection must reach the grant-owned broker path");
+    assert!(adapter.contains("s_io_connect_interrupt_selected(")
+        && source.contains("select_hosted_interrupt_grant(active")
+        && source.contains("prepared_interrupt_projection_owner(inst, interrupt_object)"),
+        "extended interrupt connection must select and retain its exact root-owned grant");
 }
 
 #[test]
@@ -64,8 +66,9 @@ fn pinned_acpi_interrupt_ex_disconnect_retires_the_grant_owned_projection() {
     assert!(source.contains("reg.bind(\n        \"IoDisconnectInterruptEx\","),
         "generic registry must expose the released ACPI disconnect import");
     let adapter = include_str!("../../../components/ntos-executive/src/hosted_driver_interrupt_ex.rs");
-    assert!(adapter.contains("s_io_disconnect_interrupt(") && adapter.contains("s_io_disconnect_interrupt_ex"),
-        "extended disconnect must retire the existing root-owned connection");
+    assert!(adapter.contains("disconnect_hosted_interrupt(connection)")
+        && adapter.contains("s_io_disconnect_interrupt_ex"),
+        "extended disconnect must retire its exact root-owned connection");
 }
 
 #[test]

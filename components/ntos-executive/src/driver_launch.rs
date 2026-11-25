@@ -75401,8 +75401,12 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         state.address_resources =
             [SharedAddressResource::default(); SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize];
         state.address_resources[..resources.len()].copy_from_slice(&resources);
+        // Grant publication is the only place a new assignment may replace the
+        // retained value; ordinary shared-bank refresh must preserve this owner.
+        state.evidence.interrupt_vector = interrupt_vector;
         state.interrupt_line = interrupt_line;
         state.interrupt_irql = interrupt_irql;
+        state.interrupt_affinity = interrupt_affinity;
         state.interrupt_shared = interrupt_shared;
         state.interrupt_latched = interrupt_latched;
         state.interrupt_active_low = interrupt_active_low;
