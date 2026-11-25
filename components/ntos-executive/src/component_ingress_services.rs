@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::{print_hex_u64, print_str};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, PartialEq)]
 enum WaitPhase {
@@ -55,6 +56,8 @@ struct Wait {
     autonomous: bool,
     resume_retry_at: u64,
     semantic_retired: bool,
+    /// A bounded root-owned receipt follows a wait admitted under a PnP START receive.
+    nested_pnp_trace: bool,
 }
 
 impl Wait {
@@ -124,6 +127,47 @@ impl ServiceCompletion {
     }
 }
 static mut WAITS: Vec<Wait> = Vec::new();
+
+static NESTED_PNP_SERVICE_WAIT_ROWS: AtomicU64 = AtomicU64::new(0);
+const NESTED_PNP_SERVICE_WAIT_LIMIT: u64 = 64;
+
+/// Emit only at this wait owner's own transitions. The enclosed pump never reads WAITS
+/// for diagnostic phase information or treats this copied receipt as Reply authority.
+fn trace_nested_pnp_service_wait(stage: &[u8], wait: &Wait) {
+    if !wait.nested_pnp_trace { return; }
+    print_str(b"[nested-pnp-service-wait] stage="); print_str(stage);
+    print_str(b" route/executor/lane/generation/epoch/reply/token=");
+    for value in [wait.route.badge(), wait.route.identity().executor,
+        u64::from(wait.dispatch.lane().index), wait.dispatch.lane().generation,
+        wait.dispatch.epoch(), wait.reply, wait.token] {
+        print_str(b"/"); crate::print_u64(value);
+    }
+    let phase = match wait.phase {
+        WaitPhase::Entering => 0, WaitPhase::Parked => 1,
+        WaitPhase::ReplyEntered => 2, WaitPhase::Acknowledged => 3,
+        WaitPhase::Resumed => 4, WaitPhase::CompletedAcknowledged => 5,
+        WaitPhase::StoppedAcknowledged => 6, WaitPhase::Cancelled => 7,
+        WaitPhase::Finished => 8,
+    };
+    let completion = match wait.completion {
+        None => 0, Some(ServiceCompletion::Status(_)) => 1,
+        Some(ServiceCompletion::HostedForward { .. }) => 2,
+        Some(ServiceCompletion::QueryPath { .. }) => 3,
+        Some(ServiceCompletion::FileCreate(_)) => 4,
+        Some(ServiceCompletion::Registry { .. }) => 5,
+        Some(ServiceCompletion::Directory { .. }) => 6,
+        Some(ServiceCompletion::SectionCreate { .. }) => 7,
+        Some(ServiceCompletion::SectionMap { .. }) => 8,
+        Some(ServiceCompletion::GdiImage { .. }) => 9,
+    };
+    print_str(b" phase/kind/completion/autonomous/retry/retired=");
+    for value in [phase, u64::from(wait.kind == WaitKind::RetainedSemantic), completion,
+        u64::from(wait.autonomous), wait.resume_retry_at,
+        u64::from(wait.semantic_retired)] {
+        print_str(b"/"); crate::print_u64(value);
+    }
+    print_str(b"\n");
+}
 
 /// Read-only diagnostic for an exact retained forward Reply; no wait is claimed or resumed.
 pub(crate) unsafe fn hosted_forward_wait_probe(
@@ -199,6 +243,9 @@ unsafe fn park(route: PeerRoute, token: u64, kind: WaitKind) -> Result<(), Error
         error
     })?;
     let autonomous = matches!(source.kind, PhysicalSourceKind::SystemThread { .. });
+    let nested_pnp_trace = crate::spawn_hosts::active_pnp_start_receive()
+        && NESTED_PNP_SERVICE_WAIT_ROWS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |used| (used < NESTED_PNP_SERVICE_WAIT_LIMIT).then_some(used + 1)).is_ok();
     let waits = &mut *core::ptr::addr_of_mut!(WAITS);
     if token == 0 {
         print_str(b"[retained-park] zero token\n");
@@ -250,6 +297,7 @@ unsafe fn park(route: PeerRoute, token: u64, kind: WaitKind) -> Result<(), Error
             autonomous,
             resume_retry_at: 0,
             semantic_retired: false,
+            nested_pnp_trace,
         });
         waits.len() - 1
     };
@@ -264,6 +312,7 @@ unsafe fn park(route: PeerRoute, token: u64, kind: WaitKind) -> Result<(), Error
         autonomous,
         resume_retry_at: 0,
         semantic_retired: false,
+        nested_pnp_trace,
     };
     if lanes()
         .suspend_running(route.identity().lane, reply, token)
@@ -277,6 +326,7 @@ unsafe fn park(route: PeerRoute, token: u64, kind: WaitKind) -> Result<(), Error
         return Err(Error::Admission);
     }
     waits[index].phase = WaitPhase::Parked;
+    trace_nested_pnp_service_wait(b"parked", &waits[index]);
     Ok(())
 }
 
@@ -610,6 +660,7 @@ unsafe fn wake_service_inner(
         }
         wait.completion = Some(completion);
         wait.phase = WaitPhase::ReplyEntered;
+        trace_nested_pnp_service_wait(b"reply-entered", wait);
     }
     let (info, [m0, m1, m2, m3]) = completion.words();
     let owner = owner();
@@ -642,6 +693,7 @@ unsafe fn wake_service_inner(
     }
     wait.phase = WaitPhase::Acknowledged;
     wait.resume_retry_at = crate::monotonic_time_100ns();
+    trace_nested_pnp_service_wait(b"acknowledged", wait);
     Ok(())
 }
 
