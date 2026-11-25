@@ -249,17 +249,17 @@ fn append(wal: &mut RegistryWal<CachedDisk>, payload: &[u8]) {
     wal.commit().unwrap();
 }
 
-/// Route a recovered WAL the way boot will: existing kinds first, file deltas by their codec.
+/// A recovered file delta must pass the production payload router before its
+/// already tested file replay is allowed to touch the unpublished volume.
 fn replay_recovered(wal: &RegistryWal<CachedDisk>, fs: &mut FileSystem) -> Result<(), FileDeltaWalReplayError> {
     let mut cursor = FileDeltaReplayCursor::new();
     for record in wal.records() {
-        match decode_volume_wal_payload(&record.payload) {
-            Ok(VolumeWalPayload::HiveLog(payload)) => {
+        match decode_volume_wal_payload(&record.payload).expect("committed WAL kind must route") {
+            VolumeWalPayload::HiveLog(payload) => {
                 fs.replay_hive_log_wal_payload(payload).unwrap();
             }
-            Ok(VolumeWalPayload::System(_)) => {}
-            Err(_) => {
-                let payload = decode_file_delta_wal_payload(&record.payload).unwrap();
+            VolumeWalPayload::System(_) => {}
+            VolumeWalPayload::FileDelta(payload) => {
                 fs.replay_file_delta_wal_payload(&mut cursor, payload)?;
             }
         }

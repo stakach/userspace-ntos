@@ -1,5 +1,5 @@
 use super::*;
-use crate::{decode_volume_wal_payload, VolumeWalPayloadError};
+use crate::{decode_volume_wal_payload, VolumeWalPayload, VolumeWalPayloadError};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -145,12 +145,31 @@ fn decoder_rejects_altered_header_fields() {
     assert_eq!(altered(&|b| put_u32(b, runs + 8, 8)), FileDeltaWalPayloadError::InvalidExtent);
 }
 
-/// Dormancy contract for this increment: the live boot router still refuses the new kind,
-/// so no existing volume can be handed a file delta before replay is integrated.
+/// A committed file delta must be selected by the same production router used for
+/// SYSTEM and hive-log records. It cannot be mistaken for either existing kind.
 #[test]
-fn live_volume_wal_router_does_not_route_file_deltas_yet() {
+fn live_volume_wal_router_selects_a_typed_file_delta() {
     let bytes = encode_file_delta_wal_payload(record(&[], 0)).unwrap();
-    assert_eq!(decode_volume_wal_payload(&bytes), Err(VolumeWalPayloadError::UnknownKind));
+    match decode_volume_wal_payload(&bytes) {
+        Ok(VolumeWalPayload::FileDelta(payload)) => {
+            assert_eq!(payload.sequence(), 7);
+            assert_eq!(payload.file_id(), 42);
+            assert_eq!(payload.path(), PATH);
+            assert_eq!(payload.end_of_file(), 0);
+            assert_eq!(payload.extents().count(), 0);
+        }
+        other => panic!("committed file delta was not routed exactly: {other:?}"),
+    }
+    // Routing is not permission to accept malformed payloads. The file-delta
+    // decoder's exact extent/length checks still apply at the same boundary.
+    let truncated = &bytes[..bytes.len() - 1];
+    assert_eq!(decode_volume_wal_payload(truncated), Err(VolumeWalPayloadError::InvalidLength));
+    let mut invalid_sequence = bytes.clone();
+    invalid_sequence[8..16].fill(0);
+    assert_eq!(decode_volume_wal_payload(&invalid_sequence), Err(VolumeWalPayloadError::InvalidSequence));
+    let mut unknown_revision = bytes.clone();
+    unknown_revision[44] = 1;
+    assert_eq!(decode_volume_wal_payload(&unknown_revision), Err(VolumeWalPayloadError::UnknownKind));
 }
 
 #[test]
