@@ -61,7 +61,7 @@ static CURSOR: AtomicU64 = AtomicU64::new(0);
 static START_FDO_TRACE_N: AtomicU64 = AtomicU64::new(0);
 
 fn trace_start_fdo(work: &Work, phase: &[u8], provider_irp: IrpId) {
-    if START_FDO_TRACE_N.fetch_add(1, Ordering::Relaxed) >= 48 {
+    if START_FDO_TRACE_N.fetch_add(1, Ordering::Relaxed) >= 128 {
         return;
     }
     print_str(b"[start-fdo] phase=");
@@ -78,9 +78,25 @@ fn trace_start_fdo(work: &Work, phase: &[u8], provider_irp: IrpId) {
     // WORK to infer a terminal or Reply owner from its copied receive stack.
     print_str(b" source-raw=");
     print_hex_u64(work.source.source_irp_address());
-    print_str(b" route/executor-tcb/reply/epoch/token/lower-instance=");
+    print_str(b" route/executor-tcb/reply/lane/generation/epoch/token/lower-instance/source-index/domain/cookie=");
     for value in [work.route.badge(), work.route.identity().executor, work.reply,
-        work.dispatch.epoch(), work.token, work.lower_instance as u64] {
+        u64::from(work.dispatch.lane().index), work.dispatch.lane().generation,
+        work.dispatch.epoch(), work.token, work.lower_instance as u64,
+        work.source_index as u64, work.source_instance.hosted_domain_id,
+        work.source_instance.hosted_domain_cookie] {
+        print_str(b"/"); print_u64(value);
+    }
+    print_str(b" source-live/prepared/returned/retained/source-witness/ack-return/terminal/reply-entered/source-published/source-marked/terminal-retired/source-released=");
+    for value in [u64::from(instance(work.source_index).is_some_and(|current| {
+            same_instance(current, work.source_instance)
+        })),
+        u64::from(work.prepared.is_some()), u64::from(work.returned.is_some()),
+        u64::from(work.retained.is_some()),
+        u64::from(work.source_completion_witness.is_some()),
+        u64::from(work.ack_return.is_some()), u64::from(work.terminal.is_some()),
+        u64::from(work.reply_entered), u64::from(work.source_published),
+        u64::from(work.source_completion_marked), u64::from(work.terminal_retired),
+        u64::from(work.source_released)] {
         print_str(b"/"); print_u64(value);
     }
     print_str(b"\n");
@@ -440,6 +456,8 @@ impl Work {
         let lower_instance = self.lower_instance;
         let lower = self.lower;
         let physical = self.physical;
+        let provider_irp = invocation.provider_irp();
+        trace_start_fdo(self, b"provider-pre-entry", provider_irp);
         let returned = invocation.invoke(|context, projection| {
             let valid = instance(lower_instance).is_some_and(|inst| {
                 inst.ready
@@ -462,6 +480,7 @@ impl Work {
             }
             outcome
         });
+        trace_start_fdo(self, b"provider-returned", provider_irp);
         match returned.finish(io_manager_mut()) {
             Ok(StartFdoForwardResult::Terminal(terminal)) => {
                 trace_start_fdo(self, b"dispatch-terminal", terminal.provider_irp());
@@ -516,6 +535,7 @@ impl Work {
         let provider_irp = invocation.completion().id;
         let storage_instance = self.physical.storage_instance;
         let provider_domain = self.physical.storage_domain;
+        trace_start_fdo(self, b"ack-pre-entry", provider_irp);
         let returned = invocation.invoke(|_| {
             hosted_file_dispatch::acknowledgement_result(
                 hosted_file_dispatch::control_exact_storage(
@@ -528,6 +548,7 @@ impl Work {
                 ),
             )
         });
+        trace_start_fdo(self, b"ack-returned", provider_irp);
         match returned.finish(io_manager_mut()) {
             Ok(StartFdoForwardResult::Terminal(terminal)) => {
                 trace_start_fdo(self, b"ack-terminal", terminal.provider_irp());

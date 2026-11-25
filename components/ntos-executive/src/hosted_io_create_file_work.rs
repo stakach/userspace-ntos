@@ -55,11 +55,48 @@ struct Work {
     publication_failure: Option<u32>,
     reparse_hops: u8,
     reparse_target: Option<ReparseTarget>,
+    nested_pnp_trace: bool,
+    nested_pnp_trace_count: core::cell::Cell<u8>,
 }
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
+static NESTED_PNP_CREATE_STAGE_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// A retained CREATE is moved into `advance` before its provider can reenter the pump.
+/// This owner emits copied values at entry and settlement; the enclosed pump reads no Work.
+fn trace_nested_pnp_create_stage(work: &Work, stage: &[u8]) {
+    if !work.nested_pnp_trace { return; }
+    let count = work.nested_pnp_trace_count.get();
+    if count >= 8 { return; }
+    work.nested_pnp_trace_count.set(count + 1);
+    let phase = match work.delivery.as_ref().map(ProviderCreateDelivery::phase) {
+        None => 0, Some(Phase::Prepared) => 1, Some(Phase::DispatchEntered) => 2,
+        Some(Phase::AwaitTerminal) => 3, Some(Phase::Terminal) => 4,
+        Some(Phase::HandleBound) => 5, Some(Phase::HandlePublished) => 6,
+        Some(Phase::ReplyEntered) => 7, Some(Phase::ReplyAcknowledged) => 8,
+        Some(Phase::BackendAckEntered) => 9,
+        Some(Phase::BackendAcknowledged) => 10, Some(Phase::Aborted) => 11,
+        Some(Phase::Finished) => 12,
+    };
+    print_str(b"[nested-pnp-create-stage] stage="); print_str(stage);
+    print_str(b" route/executor/lane/generation/epoch/reply/token/device/file/irp=");
+    for value in [work.route.badge(), work.route.identity().executor,
+        u64::from(work.dispatch.lane().index), work.dispatch.lane().generation,
+        work.dispatch.epoch(), work.reply, work.token, work.captured.device_id,
+        work.file_id.unwrap_or(0), work.delivery.as_ref()
+            .and_then(ProviderCreateDelivery::irp).map_or(0, |irp| irp.raw())] {
+        print_str(b"/"); print_u64(value);
+    }
+    print_str(b" phase/terminal/reply-entered/backend-ack/completion-committed=");
+    for value in [phase, u64::from(work.terminal.is_some()),
+        u64::from(work.reply_entered), u64::from(work.backend_ack_entered),
+        u64::from(work.completion_committed)] {
+        print_str(b"/"); print_u64(value);
+    }
+    print_str(b"\n");
+}
 
 fn rejected(status: u32) -> SubmitResult {
     SubmitResult::Ready(IoCreateFileReply::Rejected { status })
@@ -154,6 +191,10 @@ pub(super) unsafe fn submit(
         stop_acknowledged: false,
         preentry_failure: None, publication_failure: None,
         reparse_hops: 0, reparse_target: None,
+        nested_pnp_trace: crate::spawn_hosts::active_pnp_start_receive()
+            && NESTED_PNP_CREATE_STAGE_ROWS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+                |used| (used < 64).then_some(used + 1)).is_ok(),
+        nested_pnp_trace_count: core::cell::Cell::new(0),
     };
     let index = if let Some(index) = slot {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
@@ -274,8 +315,9 @@ impl Work {
         for unit in name { input.extend_from_slice(&unit.to_le_bytes()); }
         input.extend_from_slice(&request.ea);
         let file_id = self.file_id.expect("prepared provider CREATE File");
-        let delivery = self.delivery.as_mut().expect("prepared provider CREATE delivery");
-        delivery.enter_dispatch().expect("one provider CREATE dispatch");
+        self.delivery.as_mut().expect("prepared provider CREATE delivery")
+            .enter_dispatch().expect("one provider CREATE dispatch");
+        trace_nested_pnp_create_stage(self, b"provider-pre-entry");
         let result = dispatch_hosted_file_create_irp_result_exact(
             file_id, request.policy.major, self.captured.caller,
             CreateParameters {
@@ -292,19 +334,22 @@ impl Work {
         );
         match result {
             Ok((_, _, Some(irp), _)) => {
-                delivery.retain_irp(irp).expect("retained provider CREATE IRP");
+                self.delivery.as_mut().unwrap().retain_irp(irp)
+                    .expect("retained provider CREATE IRP");
             }
             Ok((status, information, None, _)) => {
-                delivery.observe_inline_terminal(status as u32, information)
+                self.delivery.as_mut().unwrap().observe_inline_terminal(status as u32, information)
                     .expect("inline provider CREATE terminal");
                 self.terminal = Some((status as u32, information));
             }
             Err(status) => {
-                delivery.abort_not_entered(DispatchNotEnteredProof::ProviderNotEntered)
+                self.delivery.as_mut().unwrap()
+                    .abort_not_entered(DispatchNotEnteredProof::ProviderNotEntered)
                     .expect("pre-entry provider CREATE rejection");
                 self.terminal = Some((status, 0));
             }
         }
+        trace_nested_pnp_create_stage(self, b"provider-returned");
         Ok(())
     }
 
@@ -497,6 +542,9 @@ impl Work {
     }
 
     unsafe fn ack_backend(&mut self) -> Result<(), u32> {
+        if self.delivery.as_ref().and_then(ProviderCreateDelivery::irp).is_some() {
+            trace_nested_pnp_create_stage(self, b"backend-ack-pre-entry");
+        }
         let Some(delivery) = self.delivery.as_mut() else { return Ok(()); };
         if delivery.phase() == Phase::Finished { return Ok(()); }
         let Some(irp) = delivery.irp() else {
@@ -515,6 +563,7 @@ impl Work {
         crate::completion_retry::retried(acknowledge_completed_irp(irp.raw()))?;
         delivery.acknowledge_backend().expect("CREATE backend ACK receipt");
         delivery.finish().expect("CREATE terminal delivery finished");
+        trace_nested_pnp_create_stage(self, b"backend-ack-finished");
         Ok(())
     }
 
@@ -618,6 +667,7 @@ impl Work {
             if phase == Phase::AwaitTerminal {
                 if self.cancelled() { self.cancel_pending(); }
                 if !self.observe_terminal()? { return Ok(false); }
+                trace_nested_pnp_create_stage(self, b"terminal-observed");
             }
             if self.cancelled() { return self.finish_cancelled(handler); }
             let phase = self.delivery.as_ref().unwrap().phase();
@@ -680,6 +730,7 @@ impl Work {
             }
         }
         self.reply_entered = true;
+        trace_nested_pnp_create_stage(self, b"reply-entered");
         // Even on a wrapper error, the physical Reply may have been consumed. The next sweep
         // reconciles its exact acknowledgement bit; it never sends a second Reply.
         let _ = runtime::wake_file_create_service(

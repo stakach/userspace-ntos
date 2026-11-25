@@ -141,6 +141,8 @@ struct Row {
     admission_epoch: u64,
     /// Diagnostic first sighting of this row's queue, independent of later retries.
     queue_trace_emitted: bool,
+    nested_pnp_trace: bool,
+    nested_pnp_trace_count: u8,
 }
 
 /// Counts dispatches refused admission with nothing entered, for callers that retry them
@@ -618,6 +620,8 @@ fn reserve(
         queue_not_admitted: false,
         admission_epoch: 0,
         queue_trace_emitted: false,
+        nested_pnp_trace: false,
+        nested_pnp_trace_count: 0,
     });
     Ok(id)
 }
@@ -787,6 +791,9 @@ fn block(id: u64, payload: Payload, status: nt_status::NtStatus) {
     row.payload = Some(payload);
     row.flight = Flight::Blocked;
     row.blocked_status = Some(status);
+    if let Some(irp) = row.irp_id {
+        trace_nested_pnp_create_owner(3, id, irp);
+    }
 }
 
 fn keep(id: u64, payload: Payload) {
@@ -797,6 +804,7 @@ fn keep(id: u64, payload: Payload) {
     row.retry_after = 0;
     // A held caller's dispatch has returned: pending (Retained) or completed (#427).
     if let Some(irp) = row.irp_id {
+        trace_nested_pnp_create_owner(4, id, irp);
         crate::service_sec_image::hosted_file_dispatch_returned(irp.raw());
     }
 }
@@ -2215,12 +2223,82 @@ fn trace_file_return_probe_status(
     print_str(b"\n");
 }
 
+/// A root-owned CREATE row is moved through File dispatch while the source PnP START
+/// remains entered. Sample only this canonical row at its own transitions, never from
+/// the enclosed provider pump or by matching a copied component pointer.
+fn trace_nested_pnp_create_owner(stage: u64, id: u64, irp: IrpId) {
+    let owner = row(id);
+    if !owner.nested_pnp_trace || owner.irp_id != Some(irp)
+        || owner.phase_major != major::IRP_MJ_CREATE { return; }
+    // Each selected row gets its own bounded receipts, so earlier CREATEs cannot
+    // consume the stalled row's entire diagnostic budget.
+    if owner.nested_pnp_trace_count >= 8 { return; }
+    owner.nested_pnp_trace_count += 1;
+    let flight = match owner.flight {
+        Flight::Preparing => 1, Flight::QueuedDispatch => 2, Flight::Dispatch => 3,
+        Flight::PumpSuspended => 4, Flight::PumpReturned => 5, Flight::Copy => 6,
+        Flight::Cancel => 7, Flight::Acknowledge => 8, Flight::Idle => 9,
+        Flight::Blocked => 10,
+    };
+    let payload = match owner.payload.as_ref() {
+        None => 0, Some(Payload::Prepared(_)) => 1, Some(Payload::NoEntry(_)) => 2,
+        Some(Payload::Returned(_)) => 3, Some(Payload::PumpSuspended(_)) => 4,
+        Some(Payload::HookReturned(_)) => 5, Some(Payload::Retained(_)) => 6,
+        Some(Payload::Completion(_)) => 7, Some(Payload::Acknowledgement(_)) => 8,
+        Some(Payload::Copy(_)) => 9, Some(Payload::Cancel(_)) => 10,
+        Some(Payload::Terminal(_)) => 11,
+    };
+    let pump = match owner.plain_pump.as_ref() {
+        None => 0, Some(nt_hosted_runtime::KeptFilePump::Suspended(_)) => 1,
+        Some(nt_hosted_runtime::KeptFilePump::Returned(_, _)) => 2,
+        Some(nt_hosted_runtime::KeptFilePump::DeferredCompletion) => 3,
+    };
+    let authority = owner.authorities.iter().find(|authority| {
+        owner.primary_driver.is_some_and(|driver| driver.raw() == authority.driver_id)
+    }).or_else(|| owner.authorities.first());
+    let authority_live = !owner.authorities.is_empty()
+        && owner.authorities.iter().all(|authority| authority.live());
+    print_str(b"[nested-pnp-create-owner] stage/row/irp/device/driver/stack/flight/payload/pump/queued/epoch/retry/ready/completion/receipt/blocked=");
+    for value in [stage, id, irp.raw(),
+        owner.primary_device.map_or(0, |device| device.raw()),
+        owner.primary_driver.map_or(0, |driver| driver.raw()),
+        owner.stack.len() as u64, flight, payload, pump,
+        u64::from(owner.queue_not_admitted), owner.admission_epoch,
+        owner.retry_after, u64::from(owner.work_ready),
+        u64::from(owner.completion.is_some()),
+        u64::from(owner.terminal_receipt.is_some()),
+        owner.blocked_status.map_or(0, |status| status.raw() as u32 as u64)] {
+        print_str(b"/"); print_u64(value);
+    }
+    print_str(b" authority-live/instance/domain/cookie/tcb=");
+    for value in [u64::from(authority_live),
+        authority.map_or(0, |authority| authority.instance as u64),
+        authority.map_or(0, |authority| authority.domain.domain_id.raw()),
+        authority.map_or(0, |authority| authority.domain.cookie),
+        authority.map_or(0, |authority| authority.tcb)] {
+        print_str(b"/"); print_u64(value);
+    }
+    if stage == 0 {
+        print_str(b" members=");
+        for (index, (device, driver)) in owner.stack.iter().take(8).enumerate() {
+            if index != 0 { print_str(b","); }
+            print_u64(index as u64); print_str(b":"); print_u64(device.raw());
+            print_str(b":"); print_u64(driver.raw());
+        }
+        if owner.stack.len() > 8 {
+            print_str(b" truncated="); print_u64((owner.stack.len() - 8) as u64);
+        }
+    }
+    print_str(b"\n");
+}
+
 /// Bounded per-instance observation of ordinary File terminal and ACK ownership (#481).
 /// Stages: 1 terminal publish attempt, 2 published, 3 publish refused;
 /// 4 synchronous terminal retired, 5 retirement refused; 6 ACK attempt,
 /// 7 ACK retired without backend, 8 backend ACK retired, 9 backend ACK retained.
 fn trace_file_terminal_ack(stage: u64, id: u64, irp: IrpId,
     status: Option<nt_status::NtStatus>) {
+    trace_nested_pnp_create_owner(stage + 10, id, irp);
     let owner = row(id);
     if owner.irp_id != Some(irp) { return; }
     static COUNT: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
@@ -2343,6 +2421,9 @@ fn queue_unadmitted(id: u64, prepared: PreparedExternalFileIrp, reason: QueueRea
     row.flight = Flight::QueuedDispatch;
     row.blocked_status = None;
     row.admission_epoch = admission_epoch();
+    if let Some(irp) = row.irp_id {
+        trace_nested_pnp_create_owner(5, id, irp);
+    }
 }
 
 fn queued_admissions() -> Vec<nt_hosted_runtime::QueuedIrp> {
@@ -2488,45 +2569,21 @@ fn dispatch_with_port_connect<Yield>(
         }
     };
     row(id).flight = Flight::Dispatch;
-    // This root-owned File row is recorded before entering a provider CREATE. The pump's
-    // copied active-IRP receipt supplies the physical route, Reply and component pointer;
-    // no isolated pump follows this Vec or decides a terminal from this observation.
-    if major == 0 && crate::spawn_hosts::active_pnp_start_receive() {
-        static NESTED_PNP_CREATE_ROWS: AtomicU64 = AtomicU64::new(0);
-        static NESTED_PNP_CREATE_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
-        if NESTED_PNP_CREATE_ROWS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
-            |used| (used < 32).then_some(used + 1)).is_ok()
-        {
-            let owner = row(id);
-            print_str(b"[nested-pnp-create-owner] row/irp/device/driver/stack/flight=");
-            for value in [id, irp_id.raw(),
-                owner.primary_device.map_or(0, |device| device.raw()),
-                owner.primary_driver.map_or(0, |driver| driver.raw()),
-                owner.stack.len() as u64, 3] {
-                print_str(b"/"); print_u64(value);
-            }
-            // These saved root-owned entries prove whether this CREATE shares the held
-            // PnP START stack. The primary device and stack length alone do not.
-            print_str(b" members=");
-            for (index, (device, driver)) in owner.stack.iter().take(8).enumerate() {
-                if index != 0 { print_str(b","); }
-                print_u64(index as u64);
-                print_str(b":"); print_u64(device.raw());
-                print_str(b":"); print_u64(driver.raw());
-            }
-            if owner.stack.len() > 8 {
-                print_str(b" truncated="); print_u64((owner.stack.len() - 8) as u64);
-            }
-            print_str(b"\n");
-        } else if !NESTED_PNP_CREATE_LIMIT_REPORTED.swap(true, Ordering::AcqRel) {
-            print_str(b"[nested-pnp-create-owner] trace-limit-exhausted=32\n");
-        }
-    }
     if phase.entered != 0 {
         row(id).phase_major = major;
         phase.identity = Some(nt_hosted_runtime::HostedFileRpcIdentity {
             irp_id: irp_id.raw(), major,
         });
+    }
+    // Capture the canonical File row at its own entry boundary. `invoke` can reenter
+    // the provider pump before this root-owned function returns.
+    if major == major::IRP_MJ_CREATE && crate::spawn_hosts::active_pnp_start_receive() {
+        static NESTED_PNP_CREATE_ROWS: AtomicU64 = AtomicU64::new(0);
+        row(id).nested_pnp_trace = NESTED_PNP_CREATE_ROWS.fetch_update(
+            Ordering::AcqRel, Ordering::Acquire,
+            |used| (used < 64).then_some(used + 1),
+        ).is_ok();
+        trace_nested_pnp_create_owner(0, id, irp_id);
     }
     if let Some(device) = port_connect_device {
         trace_port_connect_dispatch(2, irp_id, device);
@@ -2535,8 +2592,12 @@ fn dispatch_with_port_connect<Yield>(
     if scsi_phase.started.is_some() { scsi_phase.invoked = Some(crate::disk_census_ticks()); }
     let returned = match invoke(invocation, row(id).caller, policy.output_capture()) {
         Ok(returned) => returned,
-        Err(yielded) => return Err(DispatchFailure::Yield(yielded)),
+        Err(yielded) => {
+            trace_nested_pnp_create_owner(2, id, irp_id);
+            return Err(DispatchFailure::Yield(yielded));
+        }
     };
+    trace_nested_pnp_create_owner(1, id, irp_id);
     if scsi_phase.started.is_some() { scsi_phase.returned = Some(crate::disk_census_ticks()); }
     if phase.entered != 0 {
         phase.returned = crate::disk_census_ticks();
