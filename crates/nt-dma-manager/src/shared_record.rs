@@ -33,6 +33,7 @@ pub struct SharedDmaRecord {
     flags: AtomicU64,
     map_register: AtomicU64,
     adapter_id: AtomicU64,
+    pending_extent: AtomicU64,
 }
 
 impl Default for SharedDmaRecord {
@@ -52,6 +53,7 @@ impl SharedDmaRecord {
             flags: AtomicU64::new(0),
             map_register: AtomicU64::new(0),
             adapter_id: AtomicU64::new(0),
+            pending_extent: AtomicU64::new(0),
         }
     }
 
@@ -81,7 +83,19 @@ impl SharedDmaRecord {
     }
 
     pub fn begin(&self) {
-        self.length.store(RESERVED, Ordering::SeqCst);
+        let previous = self.length.swap(RESERVED, Ordering::SeqCst);
+        if previous != RESERVED {
+            // Retiring a published map must keep its exact occupied range reserved.
+            self.pending_extent.store(previous, Ordering::SeqCst);
+        }
+    }
+
+    /// Record the exact range about to be sent to the root map service. A lost reply retains
+    /// this extent; zero means the attempted range is unknown and blocks the whole grant.
+    pub fn reserve_pending_extent(&self, length: u64) {
+        assert!(length != 0 && length != RESERVED);
+        assert_eq!(self.length.load(Ordering::SeqCst), RESERVED);
+        self.pending_extent.store(length, Ordering::SeqCst);
     }
 
     fn next_generation(&self, direction: u64) {
@@ -104,6 +118,7 @@ impl SharedDmaRecord {
         self.source_va.store(0, Ordering::SeqCst);
         self.map_register.store(0, Ordering::SeqCst);
         self.adapter_id.store(0, Ordering::SeqCst);
+        self.pending_extent.store(0, Ordering::SeqCst);
         self.next_generation(0);
         self.length.store(0, Ordering::SeqCst);
     }
@@ -151,9 +166,49 @@ impl SharedDmaRecord {
         }
         self.snapshot().map(Some)
     }
+
+    /// Return the next grant offset after an overlapping claim. An uncertain range whose
+    /// extent was never recorded blocks the grant until an authenticated effect settles.
+    ///
+    /// # Safety
+    /// The caller must hold the allocation guard shared by every writer of this record.
+    pub unsafe fn next_overlapping_offset_locked(
+        &self,
+        adapter_id: u64,
+        grant_logical: u64,
+        offset: u64,
+        length: u64,
+    ) -> Option<u64> {
+        if self.adapter_id.load(Ordering::SeqCst) != adapter_id {
+            return None;
+        }
+        let logical = self.logical.load(Ordering::SeqCst);
+        let published = self.length.load(Ordering::SeqCst);
+        if logical == 0 || published == 0 {
+            return None;
+        }
+        let extent = if published == RESERVED {
+            self.pending_extent.load(Ordering::SeqCst)
+        } else {
+            published
+        };
+        if extent == 0 || extent == RESERVED {
+            return Some(u64::MAX);
+        }
+        let Some(record_offset) = logical.checked_sub(grant_logical) else {
+            return Some(u64::MAX);
+        };
+        let Some(record_end) = record_offset.checked_add(extent) else {
+            return Some(u64::MAX);
+        };
+        let Some(candidate_end) = offset.checked_add(length) else {
+            return Some(u64::MAX);
+        };
+        (offset < record_end && record_offset < candidate_end).then_some(record_end)
+    }
 }
 
-const _: () = assert!(core::mem::size_of::<SharedDmaRecord>() == 0x40);
+const _: () = assert!(core::mem::size_of::<SharedDmaRecord>() == 0x48);
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, logical) == 0x00);
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, length) == 0x08);
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, va) == 0x10);
@@ -162,6 +217,7 @@ const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, source_va) == 0x20)
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, flags) == 0x28);
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, map_register) == 0x30);
 const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, adapter_id) == 0x38);
+const _: () = assert!(core::mem::offset_of!(SharedDmaRecord, pending_extent) == 0x40);
 
 #[cfg(test)]
 mod tests {
@@ -225,5 +281,36 @@ mod tests {
         assert_eq!(record.load(0x08), RESERVED, "unrelated replay cannot retire the map");
         assert_eq!(unsafe { record.snapshot_for_relevant_adapter_locked(|adapter| adapter == 1) },
             Err(Busy), "the owning device must still wait for an exact settlement");
+    }
+
+    #[test]
+    fn pending_map_extent_blocks_only_its_exact_range_and_not_a_reused_unknown_range() {
+        const GRANT: u64 = 0x6000;
+        let record = SharedDmaRecord::new();
+        record.begin();
+        record.store(0x00, GRANT + 0x1000);
+        record.store(0x18, 2);
+        record.store(0x38, 1);
+        record.reserve_pending_extent(2056);
+
+        // Each inspection holds the same allocation guard as the native writer.
+        assert_eq!(unsafe { record.next_overlapping_offset_locked(1, GRANT, 0, 36) }, None);
+        assert_eq!(unsafe { record.next_overlapping_offset_locked(1, GRANT, 0x1000, 36) },
+            Some(0x1000 + 2056));
+        assert_eq!(unsafe { record.next_overlapping_offset_locked(2, GRANT, 0x1000, 36) }, None);
+        assert_eq!(record.load(0x08), RESERVED, "the uncertain map remains reserved");
+
+        record.clear();
+        record.begin();
+        record.store(0x00, GRANT + 0x1000);
+        record.store(0x18, 2);
+        record.store(0x38, 1);
+        assert_eq!(unsafe { record.next_overlapping_offset_locked(1, GRANT, 0, 36) },
+            Some(u64::MAX), "a reused record cannot inherit the previous exact extent");
+
+        record.publish(2056, 0);
+        record.begin();
+        assert_eq!(unsafe { record.next_overlapping_offset_locked(1, GRANT, 0x1000, 36) },
+            Some(0x1000 + 2056), "retirement retains the published extent");
     }
 }

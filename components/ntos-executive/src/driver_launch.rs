@@ -1175,7 +1175,7 @@ pub const SH_REGISTRY_EXPORT_BUF: u64 = 0x610; // in: ASCII Linkage\Export
 pub const SH_DMA_ALLOC_CURSOR: u64 = 0x6A0; // out: next offset in the granted common-buffer window
 pub const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x6A8; // out: high-water mark in allocation records
 pub const SH_DMA_ALLOC_RECORD_CAPACITY: u64 = 0x6B0; // out: records available in the shared arena
-pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x40;
+pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x48;
 pub const SH_DMA_ALLOC_RECORD_LOGICAL: u64 = 0x00;
 pub const SH_DMA_ALLOC_RECORD_LEN: u64 = 0x08;
 pub const SH_DMA_ALLOC_RECORD_VA: u64 = 0x10;
@@ -1184,6 +1184,7 @@ pub const SH_DMA_ALLOC_RECORD_SOURCE_VA: u64 = 0x20;
 pub const SH_DMA_ALLOC_RECORD_FLAGS: u64 = 0x28;
 pub const SH_DMA_ALLOC_RECORD_MAP_REGISTER: u64 = 0x30;
 pub const SH_DMA_ALLOC_RECORD_ADAPTER_ID: u64 = 0x38;
+pub const SH_DMA_ALLOC_RECORD_PENDING_EXTENT: u64 = 0x40;
 const DMA_RECORD_RESERVED: u64 = nt_dma_manager::shared_record::RESERVED;
 const DMA_RECORD_DIRECTION_MASK: u64 = 1;
 pub const SH_ACTIVE_IRP: u64 = 0x6C0; // out: component VA of the IRP currently inside MajorFunction
@@ -12308,6 +12309,10 @@ unsafe fn publish_dma_allocation_record(record: u64, length: u64, direction: u64
     dma_shared_record(record).publish(length, direction);
 }
 
+unsafe fn reserve_dma_allocation_pending_extent(record: u64, length: u64) {
+    dma_shared_record(record).reserve_pending_extent(length);
+}
+
 unsafe fn dma_shared_record(record: u64) -> &'static nt_dma_manager::shared_record::SharedDmaRecord {
     &*(record as *const nt_dma_manager::shared_record::SharedDmaRecord)
 }
@@ -12352,6 +12357,18 @@ unsafe fn dma_adapter_lease_for_binding(
     })
 }
 
+unsafe fn dma_allocation_record_next_overlap_locked(
+    record: u64,
+    adapter_id: u64,
+    grant_logical: u64,
+    offset: u64,
+    length: u64,
+) -> Option<u64> {
+    dma_shared_record(record).next_overlapping_offset_locked(
+        adapter_id, grant_logical, offset, length,
+    )
+}
+
 unsafe fn dma_allocation_range_overlaps(
     sh: u64,
     adapter_id: u64,
@@ -12359,38 +12376,23 @@ unsafe fn dma_allocation_range_overlaps(
     offset: u64,
     length: u64,
 ) -> Option<u64> {
-    let end = offset.checked_add(length)?;
+    // Callers hold the shared allocation guard while classifying a pending extent.
+    // The high-water count is published before any root effect can start.
     let mut i = 0u64;
     let capacity = dma_allocation_record_capacity(sh);
-    while i < capacity {
-        let record = dma_allocation_record(sh, i)?;
-        let logical = dma_record_load(record, SH_DMA_ALLOC_RECORD_LOGICAL);
-        let record_len = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
-        if dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) == adapter_id
-            && logical != 0 && record_len != 0 {
-            let record_len = if record_len == DMA_RECORD_RESERVED {
-                // A COMMON record stores its exact pending length in MAP_REGISTER until
-                // publication. Other pending kinds retain the conservative full-window block.
-                if dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND)
-                    != HOSTED_DMA_RECORD_KIND_COMMON {
-                    return Some(u64::MAX);
-                }
-                let pending_len = dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER);
-                if pending_len == 0 {
-                    return Some(u64::MAX);
-                }
-                pending_len
-            } else {
-                record_len
-            };
-            let Some(record_offset) = logical.checked_sub(grant_logical) else {
-                i += 1;
-                continue;
-            };
-            let record_end = record_offset.checked_add(record_len)?;
-            if offset < record_end && record_offset < end {
-                return Some(record_end);
-            }
+    let count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    if count > capacity {
+        return Some(u64::MAX);
+    }
+    while i < count {
+        let Some(record) = dma_allocation_record(sh, i) else {
+            return Some(u64::MAX);
+        };
+        if let Some(next_offset) = dma_allocation_record_next_overlap_locked(
+            record,
+            adapter_id, grant_logical, offset, length,
+        ) {
+            return Some(next_offset);
         }
         i += 1;
     }
@@ -12508,10 +12510,9 @@ extern "win64" fn s_dma_allocate_common_buffer(
                 dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, va);
                 dma_record_store(record, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_COMMON);
                 dma_record_store(record, SH_DMA_ALLOC_RECORD_SOURCE_VA, 0);
-                // COMMON has no map-register owner. While RESERVED this field holds the
-                // requested length so local overlap checks protect the exact pending range.
-                dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, requested);
+                dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, 0);
                 dma_record_store(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID, metadata.adapter_id);
+                reserve_dma_allocation_pending_extent(record, requested);
                 let count = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
                 let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS)
                     / SH_DMA_ALLOC_RECORD_SIZE).saturating_add(1);
@@ -12632,7 +12633,6 @@ extern "win64" fn s_dma_free_common_buffer(
                         // Hide this claim from root record replay before asking the manager to
                         // retire it. A failed or lost reply leaves the slot reserved.
                         begin_dma_allocation_record(record);
-                        dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, active_len);
                         matching = Some((record, active_logical, active_len, claim_id));
                         break;
                     }
@@ -13406,6 +13406,7 @@ extern "win64" fn s_dma_map_transfer(
                 dma_record_store(record, SH_DMA_ALLOC_RECORD_SOURCE_VA, source_va);
                 dma_record_store(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER, map_register_base);
                 dma_record_store(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID, metadata.adapter_id);
+                reserve_dma_allocation_pending_extent(record, mapped_len);
                 let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS)
                     / SH_DMA_ALLOC_RECORD_SIZE).saturating_add(1);
                 if used > count {
@@ -13559,13 +13560,17 @@ extern "win64" fn s_dma_map_transfer(
                 );
                 return 0;
             }
-            if let Some(next_offset) = dma_allocation_range_overlaps(
-                FSD_SHARED_VADDR,
-                metadata.adapter_id,
-                metadata.grant_logical,
-                aligned,
-                mapped_len,
-            ) {
+            let local_overlap = {
+                let _allocation_guard = HostedDmaAllocationGuard::acquire();
+                dma_allocation_range_overlaps(
+                    FSD_SHARED_VADDR,
+                    metadata.adapter_id,
+                    metadata.grant_logical,
+                    aligned,
+                    mapped_len,
+                )
+            };
+            if let Some(next_offset) = local_overlap {
                 offset = next_offset;
                 continue;
             }

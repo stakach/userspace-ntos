@@ -80,7 +80,7 @@ const HOSTED_DMA_RECORD_KIND_COHERENT_MAP: u64 = 3;
 const DMA_RECORD_RESERVED: u64 = u64::MAX;
 const HOSTED_DMA_RECORD_FLAG_WRITE_TO_DEVICE: u64 = 1;
 const SH_DMA_ALLOC_RECORDS: u64 = 0x100;
-const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x40;
+const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x48;
 const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x20;
 const SH_DMA_ALLOC_CURSOR: u64 = 0x28;
 const SH_DMA_ALLOC_RECORD_LOGICAL: u64 = 0;
@@ -91,6 +91,7 @@ const SH_DMA_ALLOC_RECORD_SOURCE_VA: u64 = 0x20;
 const SH_DMA_ALLOC_RECORD_FLAGS: u64 = 0x28;
 const SH_DMA_ALLOC_RECORD_MAP_REGISTER: u64 = 0x30;
 const SH_DMA_ALLOC_RECORD_ADAPTER_ID: u64 = 0x38;
+const SH_DMA_ALLOC_RECORD_PENDING_EXTENT: u64 = 0x40;
 
 static LOCKED: AtomicBool = AtomicBool::new(false);
 static ASSERT_PROVIDER_UNLOCKED: AtomicBool = AtomicBool::new(false);
@@ -150,6 +151,11 @@ unsafe fn call_on5_raw(
         }
         HOSTED_DMA_SERVICE_MAP_TRANSFER => {
             assert_eq!(adapter, 7);
+            let row = FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORDS;
+            assert_eq!(dma_record_load(row, SH_DMA_ALLOC_RECORD_LEN), DMA_RECORD_RESERVED);
+            assert_eq!(dma_record_load(row, SH_DMA_ALLOC_RECORD_LOGICAL), address);
+            assert_eq!(dma_record_load(row, SH_DMA_ALLOC_RECORD_PENDING_EXTENT), length,
+                "the exact attempted range must precede the native map effect");
             let attempt = MAP_CALLS.fetch_add(1, Ordering::Relaxed);
             let expected_logical = if CONFLICT_ONCE.load(Ordering::Relaxed) && attempt > 0 {
                 0x2000
@@ -177,6 +183,7 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
     value.checked_add(alignment - 1).map(|n| n & !(alignment - 1))
 }
 unsafe fn dma_allocation_range_overlaps(_: u64, _: u64, _: u64, _: u64, _: u64) -> Option<u64> {
+    assert!(LOCKED.load(Ordering::Acquire), "local overlap scan needs the allocation guard");
     None
 }
 unsafe fn dma_root_conflict_next(_: u64, _: u64, _: u64) -> Result<Option<u64>, i32> {
@@ -199,13 +206,24 @@ unsafe fn dma_record_load(record: u64, offset: u64) -> u64 {
 unsafe fn clear_dma_allocation_record(record: u64) {
     for offset in [SH_DMA_ALLOC_RECORD_LOGICAL, SH_DMA_ALLOC_RECORD_VA,
         SH_DMA_ALLOC_RECORD_KIND, SH_DMA_ALLOC_RECORD_SOURCE_VA,
-        SH_DMA_ALLOC_RECORD_MAP_REGISTER, SH_DMA_ALLOC_RECORD_ADAPTER_ID] {
+        SH_DMA_ALLOC_RECORD_MAP_REGISTER, SH_DMA_ALLOC_RECORD_ADAPTER_ID,
+        SH_DMA_ALLOC_RECORD_PENDING_EXTENT] {
         dma_record_store(record, offset, 0);
     }
     dma_record_store(record, SH_DMA_ALLOC_RECORD_LEN, 0);
 }
 unsafe fn begin_dma_allocation_record(record: u64) {
+    let prior = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
     dma_record_store(record, SH_DMA_ALLOC_RECORD_LEN, u64::MAX);
+    if prior != DMA_RECORD_RESERVED {
+        dma_record_store(record, SH_DMA_ALLOC_RECORD_PENDING_EXTENT, prior);
+    }
+}
+unsafe fn reserve_dma_allocation_pending_extent(record: u64, length: u64) {
+    assert!(LOCKED.load(Ordering::Acquire), "pending extent needs the allocation guard");
+    assert_eq!(dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN), DMA_RECORD_RESERVED);
+    assert!(length != 0 && length != DMA_RECORD_RESERVED);
+    dma_record_store(record, SH_DMA_ALLOC_RECORD_PENDING_EXTENT, length);
 }
 unsafe fn dma_record_store(record: u64, offset: u64, value: u64) {
     write_volatile((record + offset) as *mut u64, value);
@@ -291,6 +309,8 @@ fn uncertain_map_keeps_token_claim_and_cannot_replay_provider_effect() {
     assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 1);
     assert_eq!(unsafe { dma_record_load(FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORDS,
         SH_DMA_ALLOC_RECORD_LEN) }, u64::MAX, "claim must precede uncertain IPC");
+    assert_eq!(unsafe { dma_record_load(FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORDS,
+        SH_DMA_ALLOC_RECORD_PENDING_EXTENT) }, 64);
     length = 64;
     assert_eq!(s_dma_map_transfer(7, 17, map, 0x5000_0000, &mut length, 0), 0);
     assert_eq!(MAP_CALLS.load(Ordering::Relaxed), 1, "uncertain provider effect was replayed");

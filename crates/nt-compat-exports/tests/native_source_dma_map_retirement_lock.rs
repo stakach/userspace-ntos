@@ -91,7 +91,7 @@ const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
 const STATUS_DEVICE_BUSY: i32 = 0x8000_0011u32 as i32;
 const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x20;
 const SH_DMA_ALLOC_RECORDS: u64 = 0x100;
-const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x40;
+const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x48;
 const SH_DMA_ALLOC_RECORD_LOGICAL: u64 = 0x00;
 const SH_DMA_ALLOC_RECORD_LEN: u64 = 0x08;
 const SH_DMA_ALLOC_RECORD_VA: u64 = 0x10;
@@ -99,6 +99,7 @@ const SH_DMA_ALLOC_RECORD_KIND: u64 = 0x18;
 const SH_DMA_ALLOC_RECORD_SOURCE_VA: u64 = 0x20;
 const SH_DMA_ALLOC_RECORD_MAP_REGISTER: u64 = 0x30;
 const SH_DMA_ALLOC_RECORD_ADAPTER_ID: u64 = 0x38;
+const SH_DMA_ALLOC_RECORD_PENDING_EXTENT: u64 = 0x40;
 
 static LOCKED: AtomicBool = AtomicBool::new(false);
 static RETIRE_SUCCEEDS: AtomicBool = AtomicBool::new(false);
@@ -135,13 +136,18 @@ unsafe fn dma_record_store(record: u64, offset: u64, value: u64) {
 }
 unsafe fn begin_dma_allocation_record(record: u64) {
     assert!(LOCKED.load(Ordering::Acquire), "reserve without guard");
+    let prior = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
     dma_record_store(record, SH_DMA_ALLOC_RECORD_LEN, DMA_RECORD_RESERVED);
+    if prior != DMA_RECORD_RESERVED {
+        dma_record_store(record, SH_DMA_ALLOC_RECORD_PENDING_EXTENT, prior);
+    }
 }
 unsafe fn clear_dma_allocation_record(record: u64) {
     assert!(LOCKED.load(Ordering::Acquire), "clear without guard");
     for offset in [SH_DMA_ALLOC_RECORD_LOGICAL, SH_DMA_ALLOC_RECORD_LEN,
         SH_DMA_ALLOC_RECORD_VA, SH_DMA_ALLOC_RECORD_KIND, SH_DMA_ALLOC_RECORD_SOURCE_VA,
-        SH_DMA_ALLOC_RECORD_MAP_REGISTER, SH_DMA_ALLOC_RECORD_ADAPTER_ID] {
+        SH_DMA_ALLOC_RECORD_MAP_REGISTER, SH_DMA_ALLOC_RECORD_ADAPTER_ID,
+        SH_DMA_ALLOC_RECORD_PENDING_EXTENT] {
         dma_record_store(record, offset, 0);
     }
 }
@@ -244,6 +250,9 @@ fn direct_free_with_no_mapping_claims_token_before_uncertain_retirement() {
     assert_eq!(unsafe { dma_record_load(
         dma_allocation_record(FSD_SHARED_VADDR, 0).unwrap(), SH_DMA_ALLOC_RECORD_LEN) },
         DMA_RECORD_RESERVED);
+    assert_eq!(unsafe { dma_record_load(
+        dma_allocation_record(FSD_SHARED_VADDR, 0).unwrap(), SH_DMA_ALLOC_RECORD_PENDING_EXTENT) },
+        0, "a token-only retirement has no mapped extent");
     s_dma_free_map_registers(7, token(), 1);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1, "uncertain effect was replayed");
     assert!(!LOCKED.load(Ordering::Acquire));
@@ -260,6 +269,9 @@ fn malformed_success_does_not_clear_or_replay_claim() {
     assert_eq!(unsafe { dma_record_load(
         dma_allocation_record(FSD_SHARED_VADDR, 0).unwrap(), SH_DMA_ALLOC_RECORD_LEN) },
         DMA_RECORD_RESERVED);
+    assert_eq!(unsafe { dma_record_load(
+        dma_allocation_record(FSD_SHARED_VADDR, 0).unwrap(), SH_DMA_ALLOC_RECORD_PENDING_EXTENT) },
+        64, "an uncertain retirement must keep its exact published extent");
     s_dma_free_map_registers(7, token(), 1);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1, "malformed receipt replayed retirement");
 }
@@ -275,6 +287,7 @@ fn authenticated_free_clears_exact_published_mapping_once() {
     assert_eq!(unsafe { dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN) }, 0);
     assert_eq!(unsafe { dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER) }, 0);
     assert_eq!(unsafe { dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) }, 0);
+    assert_eq!(unsafe { dma_record_load(record, SH_DMA_ALLOC_RECORD_PENDING_EXTENT) }, 0);
     s_dma_free_map_registers(7, token(), 1);
     assert!(RETIRES.load(Ordering::Relaxed) <= 2,
         "stale token retried retirement beyond the authenticated no-effect");

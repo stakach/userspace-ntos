@@ -67,6 +67,7 @@ fn print_hex_u64(_value: u64) {}
 
 const HOSTED_DMA_COMMON_ALIGNMENT: u64 = 0x1000;
 const HOSTED_DMA_RECORD_KIND_COMMON: u64 = 1;
+const HOSTED_DMA_RECORD_KIND_MAP_TRANSFER: u64 = 2;
 const HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER: u64 = 16;
 const HOSTED_DMA_SERVICE_FREE_COMMON_BUFFER: u64 = 12;
 const HOSTED_DMA_SERVICE_OPERATION_SHIFT: u64 = 56;
@@ -85,7 +86,7 @@ const SH_DMA_ALLOC_CURSOR: u64 = 0x6A0;
 // 0x1248 handoff base + 0x100 support records + 0x858 export scratch
 // + 0x2820 work queue arena + 0x820 admission metadata.
 const SH_DMA_ALLOC_RECORDS: u64 = 0x4BE0;
-const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x40;
+const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x48;
 const SH_DMA_ALLOC_RECORD_LOGICAL: u64 = 0;
 const SH_DMA_ALLOC_RECORD_LEN: u64 = 8;
 const SH_DMA_ALLOC_RECORD_VA: u64 = 16;
@@ -93,6 +94,7 @@ const SH_DMA_ALLOC_RECORD_KIND: u64 = 24;
 const SH_DMA_ALLOC_RECORD_SOURCE_VA: u64 = 32;
 const SH_DMA_ALLOC_RECORD_MAP_REGISTER: u64 = 48;
 const SH_DMA_ALLOC_RECORD_ADAPTER_ID: u64 = 56;
+const SH_DMA_ALLOC_RECORD_PENDING_EXTENT: u64 = 64;
 
 mod nt_status {
     pub struct NtStatus;
@@ -166,7 +168,34 @@ unsafe fn dma_record_store(record: u64, offset: u64, value: u64) {
 }
 unsafe fn begin_dma_allocation_record(record: u64) {
     assert!(LOCKED.load(Ordering::Acquire), "reservation needs the guard");
-    dma_record_store(record, SH_DMA_ALLOC_RECORD_LEN, DMA_RECORD_RESERVED)
+    let prior = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
+    dma_record_store(record, SH_DMA_ALLOC_RECORD_LEN, DMA_RECORD_RESERVED);
+    if prior != DMA_RECORD_RESERVED {
+        dma_record_store(record, SH_DMA_ALLOC_RECORD_PENDING_EXTENT, prior);
+    }
+}
+unsafe fn reserve_dma_allocation_pending_extent(record: u64, length: u64) {
+    assert!(LOCKED.load(Ordering::Acquire), "pending range needs the guard");
+    assert_eq!(dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN), DMA_RECORD_RESERVED);
+    assert!(length != 0 && length != DMA_RECORD_RESERVED);
+    dma_record_store(record, SH_DMA_ALLOC_RECORD_PENDING_EXTENT, length);
+}
+unsafe fn dma_allocation_record_next_overlap_locked(
+    record: u64, adapter_id: u64, grant_logical: u64, offset: u64, length: u64,
+) -> Option<u64> {
+    assert!(LOCKED.load(Ordering::Acquire), "overlap classification needs the guard");
+    if dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) != adapter_id { return None; }
+    let logical = dma_record_load(record, SH_DMA_ALLOC_RECORD_LOGICAL);
+    let published = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
+    if logical == 0 || published == 0 { return None; }
+    let extent = if published == DMA_RECORD_RESERVED {
+        dma_record_load(record, SH_DMA_ALLOC_RECORD_PENDING_EXTENT)
+    } else { published };
+    if extent == 0 || extent == DMA_RECORD_RESERVED { return Some(u64::MAX); }
+    let start = logical.checked_sub(grant_logical)?;
+    let end = start.checked_add(extent)?;
+    let candidate_end = offset.checked_add(length)?;
+    (offset < end && start < candidate_end).then_some(end)
 }
 unsafe fn publish_dma_allocation_record(record: u64, length: u64, _direction: u64) {
     assert!(LOCKED.load(Ordering::Acquire), "publication needs the guard");
@@ -174,7 +203,7 @@ unsafe fn publish_dma_allocation_record(record: u64, length: u64, _direction: u6
 }
 unsafe fn clear_dma_allocation_record(record: u64) {
     assert!(LOCKED.load(Ordering::Acquire), "clear needs the guard");
-    for offset in [0, 8, 16, 24, 32, 48, 56] { dma_record_store(record, offset, 0); }
+    for offset in [0, 8, 16, 24, 32, 48, 56, 64] { dma_record_store(record, offset, 0); }
 }
 unsafe fn first_free_dma_allocation_record(_sh: u64) -> Option<u64> {
     (0..2).map(record).find(|&r| dma_record_load(r, SH_DMA_ALLOC_RECORD_LEN) == 0)
@@ -198,7 +227,8 @@ unsafe fn call_on5_raw(
                 && dma_record_load(r, SH_DMA_ALLOC_RECORD_ADAPTER_ID) == metadata.adapter_id
                 && dma_record_load(r, SH_DMA_ALLOC_RECORD_LOGICAL) == logical_or_adapter
                 && dma_record_load(r, SH_DMA_ALLOC_RECORD_VA) == va_or_logical
-                && dma_record_load(r, SH_DMA_ALLOC_RECORD_MAP_REGISTER) == length
+                && dma_record_load(r, SH_DMA_ALLOC_RECORD_MAP_REGISTER) == 0
+                && dma_record_load(r, SH_DMA_ALLOC_RECORD_PENDING_EXTENT) == length
         });
         assert!(pending, "exact local record must be reserved before root registration");
         assert!(read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64) >= 1,
@@ -229,6 +259,61 @@ unsafe fn call_on5_raw(
 "#;
 
 const CASES: &str = r#"
+unsafe fn seed_reserved_map(logical: u64, extent: u64) {
+    let _guard = HostedDmaAllocationGuard::acquire();
+    let row = record(0);
+    begin_dma_allocation_record(row);
+    dma_record_store(row, SH_DMA_ALLOC_RECORD_LOGICAL, logical);
+    dma_record_store(row, SH_DMA_ALLOC_RECORD_VA, 0x4000_0000 + logical - 0x1000);
+    dma_record_store(row, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER);
+    dma_record_store(row, SH_DMA_ALLOC_RECORD_SOURCE_VA, 0x5000_0000);
+    dma_record_store(row, SH_DMA_ALLOC_RECORD_MAP_REGISTER, 0x7000);
+    dma_record_store(row, SH_DMA_ALLOC_RECORD_ADAPTER_ID, 7);
+    if extent != 0 { reserve_dma_allocation_pending_extent(row, extent); }
+    write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, 1);
+}
+
+#[test]
+fn reserved_map_blocks_its_range_without_starving_other_common_allocations() {
+    REGISTER_EFFECTS.store(0, Ordering::Relaxed);
+    REGISTER_REPLY_VALID.store(true, Ordering::Release);
+    REGISTER_SUCCEEDS.store(true, Ordering::Release);
+    REGISTER_FORGED_CONFLICT.store(false, Ordering::Release);
+    let mut shared = vec![0u64; 4096];
+    unsafe {
+        FSD_SHARED_VADDR = shared.as_mut_ptr() as u64;
+        seed_reserved_map(0x2000, 2056);
+    }
+    let mut logical = 0i64;
+    assert_eq!(s_dma_allocate_common_buffer(adapter_address(), 4096, &mut logical, 0),
+        0x4000_0000, "a separate grant slice remains available");
+    assert_eq!(logical, 0x1000);
+    assert_eq!(unsafe { dma_record_load(record(0), SH_DMA_ALLOC_RECORD_LEN) },
+        DMA_RECORD_RESERVED, "allocation must retain the uncertain map");
+    assert_eq!(REGISTER_EFFECTS.load(Ordering::Relaxed), 1);
+
+    let mut overlapping = vec![0u64; 4096];
+    unsafe {
+        FSD_SHARED_VADDR = overlapping.as_mut_ptr() as u64;
+        seed_reserved_map(0x1000, 2056);
+    }
+    assert_eq!(s_dma_allocate_common_buffer(adapter_address(), 4096, &mut logical, 0),
+        0x4000_1000, "an overlapping range must advance past the pending map");
+    assert_eq!(logical, 0x2000);
+    assert_eq!(REGISTER_EFFECTS.load(Ordering::Relaxed), 2);
+
+    let mut unknown = vec![0u64; 4096];
+    unsafe {
+        FSD_SHARED_VADDR = unknown.as_mut_ptr() as u64;
+        seed_reserved_map(0x1000, 0);
+    }
+    assert_eq!(s_dma_allocate_common_buffer(adapter_address(), 4096, &mut logical, 0), 0,
+        "an unknown pending extent must still block the grant");
+    assert_eq!(REGISTER_EFFECTS.load(Ordering::Relaxed), 2,
+        "unknown ownership cannot reach the provider");
+    assert!(!LOCKED.load(Ordering::Acquire));
+}
+
 #[test]
 fn authenticated_conflict_recycles_only_its_unclaimed_slot() {
     let mut shared = vec![0u64; 4096];
