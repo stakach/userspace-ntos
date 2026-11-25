@@ -11,9 +11,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 
-/// One occupant of one executor slot. A reused slot never repeats an earlier generation.
+/// One occupant of one table's executor slot. A reused slot never repeats an earlier generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutorHandle {
+    table: u64,
     index: u32,
     generation: u64,
 }
@@ -198,6 +199,9 @@ impl ExecutorTable {
     }
 
     pub fn state(&self, executor: ExecutorHandle) -> Result<ExecutorState, ExecutorError> {
+        if executor.table != self.id {
+            return Err(ExecutorError::WrongTable);
+        }
         let slot = self.slots.get(executor.index as usize).ok_or(ExecutorError::NotFound)?;
         if slot.generation != executor.generation {
             return Err(ExecutorError::StaleGeneration);
@@ -210,7 +214,7 @@ impl ExecutorTable {
     }
 
     fn handle(&self, index: usize) -> ExecutorHandle {
-        ExecutorHandle { index: index as u32, generation: self.slots[index].generation }
+        ExecutorHandle { table: self.id, index: index as u32, generation: self.slots[index].generation }
     }
 
     fn position(&self, matches: impl Fn(ExecutorState) -> bool) -> Option<usize> {
