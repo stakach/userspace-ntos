@@ -15,8 +15,8 @@ fn map_retirement_releases_guard_and_keeps_uncertain_claims() {
     syn::parse_file(retire).expect("complete map-token retirement");
 
     let helpers_start = source
-        .find("unsafe fn dma_reserve_records_for_map(")
-        .expect("native map-record reservation");
+        .find("static HOSTED_DMA_RETIRE_NEXT_EPOCH:")
+        .expect("native map-record retirement identity");
     let helpers_end = source[helpers_start..]
         .find("\nextern \"win64\" fn s_dma_free_adapter_channel(")
         .expect("following adapter export");
@@ -95,7 +95,7 @@ const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
 const STATUS_DEVICE_BUSY: i32 = 0x8000_0011u32 as i32;
 const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x20;
 const SH_DMA_ALLOC_RECORDS: u64 = 0x100;
-const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x48;
+const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x50;
 const SH_DMA_ALLOC_RECORD_LOGICAL: u64 = 0x00;
 const SH_DMA_ALLOC_RECORD_LEN: u64 = 0x08;
 const SH_DMA_ALLOC_RECORD_VA: u64 = 0x10;
@@ -104,10 +104,13 @@ const SH_DMA_ALLOC_RECORD_SOURCE_VA: u64 = 0x20;
 const SH_DMA_ALLOC_RECORD_MAP_REGISTER: u64 = 0x30;
 const SH_DMA_ALLOC_RECORD_ADAPTER_ID: u64 = 0x38;
 const SH_DMA_ALLOC_RECORD_PENDING_EXTENT: u64 = 0x40;
+const SH_DMA_ALLOC_RECORD_RETIREMENT_EPOCH: u64 = 0x48;
 
 static LOCKED: AtomicBool = AtomicBool::new(false);
 static RETIRE_SUCCEEDS: AtomicBool = AtomicBool::new(false);
 static REPLY_VALID: AtomicBool = AtomicBool::new(true);
+// 0 = no reuse; 1 = different adapter; 2 = same adapter and numeric token.
+static RECYCLE_TOKEN_ON_SUCCESS: AtomicU32 = AtomicU32::new(0);
 static ACTION: AtomicU32 = AtomicU32::new(2);
 static RETIRES: AtomicUsize = AtomicUsize::new(0);
 static HOSTED_DMA_RETIRE_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -143,6 +146,13 @@ unsafe fn dma_record_load(record: u64, offset: u64) -> u64 {
 unsafe fn dma_record_store(record: u64, offset: u64, value: u64) {
     write_volatile((record + offset) as *mut u64, value)
 }
+struct FixtureDmaRecord(u64);
+impl FixtureDmaRecord {
+    fn retirement_epoch(&self) -> u64 {
+        unsafe { dma_record_load(self.0, SH_DMA_ALLOC_RECORD_RETIREMENT_EPOCH) }
+    }
+}
+unsafe fn dma_shared_record(record: u64) -> FixtureDmaRecord { FixtureDmaRecord(record) }
 unsafe fn begin_dma_allocation_record(record: u64) {
     assert!(LOCKED.load(Ordering::Acquire), "reserve without guard");
     let prior = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
@@ -151,12 +161,19 @@ unsafe fn begin_dma_allocation_record(record: u64) {
         dma_record_store(record, SH_DMA_ALLOC_RECORD_PENDING_EXTENT, prior);
     }
 }
+unsafe fn begin_dma_record_retirement(record: u64, epoch: u64) {
+    assert!(LOCKED.load(Ordering::Acquire), "retirement needs guard");
+    assert_ne!(epoch, 0);
+    assert_eq!(dma_shared_record(record).retirement_epoch(), 0);
+    begin_dma_allocation_record(record);
+    dma_record_store(record, SH_DMA_ALLOC_RECORD_RETIREMENT_EPOCH, epoch);
+}
 unsafe fn clear_dma_allocation_record(record: u64) {
     assert!(LOCKED.load(Ordering::Acquire), "clear without guard");
     for offset in [SH_DMA_ALLOC_RECORD_LOGICAL, SH_DMA_ALLOC_RECORD_LEN,
         SH_DMA_ALLOC_RECORD_VA, SH_DMA_ALLOC_RECORD_KIND, SH_DMA_ALLOC_RECORD_SOURCE_VA,
         SH_DMA_ALLOC_RECORD_MAP_REGISTER, SH_DMA_ALLOC_RECORD_ADAPTER_ID,
-        SH_DMA_ALLOC_RECORD_PENDING_EXTENT] {
+        SH_DMA_ALLOC_RECORD_PENDING_EXTENT, SH_DMA_ALLOC_RECORD_RETIREMENT_EPOCH] {
         dma_record_store(record, offset, 0);
     }
 }
@@ -213,6 +230,27 @@ unsafe fn call_on5_raw(
     } else {
         STATUS_DEVICE_BUSY
     };
+    let recycle = RECYCLE_TOKEN_ON_SUCCESS.load(Ordering::Acquire);
+    if status == STATUS_SUCCESS && recycle != 0 {
+        // The root effect may retire the private token before its reply reaches this lane.
+        // Model immediate token reuse and a newly published local projection. A second
+        // case reuses the same adapter ID, so matching that ID cannot identify the
+        // pre-retirement row by itself.
+        let _guard = HostedDmaAllocationGuard::acquire();
+        let new_adapter_id = if recycle == 1 { 8 } else { 7 };
+        TOKEN[2] = new_adapter_id;
+        let foreign = dma_allocation_record(FSD_SHARED_VADDR, 1).unwrap();
+        begin_dma_allocation_record(foreign);
+        dma_record_store(foreign, SH_DMA_ALLOC_RECORD_LOGICAL, 0x2000);
+        dma_record_store(foreign, SH_DMA_ALLOC_RECORD_VA, 0x5000);
+        dma_record_store(foreign, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER);
+        dma_record_store(foreign, SH_DMA_ALLOC_RECORD_SOURCE_VA, 0x6000);
+        dma_record_store(foreign, SH_DMA_ALLOC_RECORD_MAP_REGISTER, map);
+        dma_record_store(foreign, SH_DMA_ALLOC_RECORD_ADAPTER_ID, new_adapter_id);
+        dma_record_store(foreign, SH_DMA_ALLOC_RECORD_PENDING_EXTENT, 64);
+        dma_record_store(foreign, SH_DMA_ALLOC_RECORD_LEN, 64);
+        write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, 2);
+    }
     (reply, status as u32 as u64, 0, 0, 0)
 }
 unsafe fn dma_allocate_map_register_token(adapter: u64, count: u32) -> u64 {
@@ -232,6 +270,7 @@ fn setup() -> Vec<u64> {
     LOCKED.store(false, Ordering::Release);
     RETIRE_SUCCEEDS.store(false, Ordering::Release);
     REPLY_VALID.store(true, Ordering::Release);
+    RECYCLE_TOKEN_ON_SUCCESS.store(0, Ordering::Release);
     ACTION.store(2, Ordering::Release);
     RETIRES.store(0, Ordering::Relaxed);
     HOSTED_DMA_RETIRE_FAILURE_TRACE_COUNT.store(0, Ordering::Relaxed);
@@ -239,6 +278,11 @@ fn setup() -> Vec<u64> {
     HOSTED_DMA_FREE_MAP_RETIRED_COUNT.store(0, Ordering::Relaxed);
     HOSTED_DMA_FREE_MAP_NO_EFFECT_COUNT.store(0, Ordering::Relaxed);
     HOSTED_DMA_FREE_MAP_UNCERTAIN_COUNT.store(0, Ordering::Relaxed);
+    HOSTED_DMA_RETIRE_NEXT_EPOCH.store(0, Ordering::Relaxed);
+    unsafe {
+        TOKEN[0] = HOSTED_DMA_MAP_REGISTER_SIGNATURE;
+        TOKEN[2] = 7;
+    }
     let mut shared = vec![0u64; 64];
     unsafe { FSD_SHARED_VADDR = shared.as_mut_ptr() as u64; }
     shared
@@ -290,6 +334,69 @@ fn malformed_success_does_not_clear_or_replay_claim() {
     s_dma_free_map_registers(7, token(), 1);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1, "malformed receipt replayed retirement");
     assert_eq!(HOSTED_DMA_FREE_MAP_UNCERTAIN_COUNT.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn authenticated_free_uses_pre_retirement_adapter_when_token_bytes_are_recycled() {
+    let _shared = setup();
+    unsafe { seed_active_map(); }
+    RETIRE_SUCCEEDS.store(true, Ordering::Release);
+    RECYCLE_TOKEN_ON_SUCCESS.store(1, Ordering::Release);
+    s_dma_free_map_registers(7, token(), 1);
+
+    assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
+    let old = unsafe { dma_allocation_record(FSD_SHARED_VADDR, 0).unwrap() };
+    let new = unsafe { dma_allocation_record(FSD_SHARED_VADDR, 1).unwrap() };
+    assert_eq!(unsafe { dma_record_load(old, SH_DMA_ALLOC_RECORD_LEN) }, 0,
+        "authenticated retirement must clear the exact pre-effect row, even when token bytes change");
+    assert_eq!(unsafe { dma_record_load(old, SH_DMA_ALLOC_RECORD_PENDING_EXTENT) }, 0);
+    assert_eq!(unsafe { dma_record_load(new, SH_DMA_ALLOC_RECORD_LEN) }, 64,
+        "a newly published row at the recycled token address belongs to a different effect");
+    assert_eq!(unsafe { dma_record_load(new, SH_DMA_ALLOC_RECORD_ADAPTER_ID) }, 8);
+    assert_eq!(HOSTED_DMA_RECORD_CLEARED_COUNT.load(Ordering::Relaxed), 1);
+    assert!(!LOCKED.load(Ordering::Acquire));
+}
+
+#[test]
+fn authenticated_free_keeps_new_row_with_reused_token_and_adapter() {
+    let _shared = setup();
+    unsafe { seed_active_map(); }
+    RETIRE_SUCCEEDS.store(true, Ordering::Release);
+    RECYCLE_TOKEN_ON_SUCCESS.store(2, Ordering::Release);
+    s_dma_free_map_registers(7, token(), 1);
+
+    assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
+    let old = unsafe { dma_allocation_record(FSD_SHARED_VADDR, 0).unwrap() };
+    let new = unsafe { dma_allocation_record(FSD_SHARED_VADDR, 1).unwrap() };
+    assert_eq!(unsafe { dma_record_load(old, SH_DMA_ALLOC_RECORD_LEN) }, 0,
+        "authenticated retirement must clear its original reserved row");
+    assert_eq!(unsafe { dma_record_load(new, SH_DMA_ALLOC_RECORD_LEN) }, 64,
+        "matching the reused token and adapter must not clear a post-effect row");
+    assert_eq!(unsafe { dma_record_load(new, SH_DMA_ALLOC_RECORD_MAP_REGISTER) }, token());
+    assert_eq!(unsafe { dma_record_load(new, SH_DMA_ALLOC_RECORD_ADAPTER_ID) }, 7);
+    assert_eq!(HOSTED_DMA_RECORD_CLEARED_COUNT.load(Ordering::Relaxed), 1);
+    assert!(!LOCKED.load(Ordering::Acquire));
+}
+
+#[test]
+fn uncertain_recycled_token_retains_original_reservation() {
+    let _shared = setup();
+    unsafe { seed_active_map(); }
+    RETIRE_SUCCEEDS.store(true, Ordering::Release);
+    REPLY_VALID.store(false, Ordering::Release);
+    RECYCLE_TOKEN_ON_SUCCESS.store(1, Ordering::Release);
+    s_dma_free_map_registers(7, token(), 1);
+
+    assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
+    let old = unsafe { dma_allocation_record(FSD_SHARED_VADDR, 0).unwrap() };
+    let new = unsafe { dma_allocation_record(FSD_SHARED_VADDR, 1).unwrap() };
+    assert_eq!(unsafe { dma_record_load(old, SH_DMA_ALLOC_RECORD_LEN) }, DMA_RECORD_RESERVED,
+        "an unauthenticated success cannot release the original claim");
+    assert_eq!(unsafe { dma_record_load(old, SH_DMA_ALLOC_RECORD_PENDING_EXTENT) }, 64);
+    assert_eq!(unsafe { dma_record_load(new, SH_DMA_ALLOC_RECORD_LEN) }, 64);
+    assert_eq!(HOSTED_DMA_RECORD_CLEARED_COUNT.load(Ordering::Relaxed), 0);
+    assert_eq!(HOSTED_DMA_FREE_MAP_UNCERTAIN_COUNT.load(Ordering::Relaxed), 1);
+    assert!(!LOCKED.load(Ordering::Acquire));
 }
 
 #[test]

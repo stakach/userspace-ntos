@@ -1175,7 +1175,7 @@ pub const SH_REGISTRY_EXPORT_BUF: u64 = 0x610; // in: ASCII Linkage\Export
 pub const SH_DMA_ALLOC_CURSOR: u64 = 0x6A0; // out: next offset in the granted common-buffer window
 pub const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x6A8; // out: high-water mark in allocation records
 pub const SH_DMA_ALLOC_RECORD_CAPACITY: u64 = 0x6B0; // out: records available in the shared arena
-pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x48;
+pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x50;
 pub const SH_DMA_ALLOC_RECORD_LOGICAL: u64 = 0x00;
 pub const SH_DMA_ALLOC_RECORD_LEN: u64 = 0x08;
 pub const SH_DMA_ALLOC_RECORD_VA: u64 = 0x10;
@@ -12317,6 +12317,10 @@ unsafe fn begin_dma_allocation_record(record: u64) {
     dma_shared_record(record).begin();
 }
 
+unsafe fn begin_dma_record_retirement(record: u64, epoch: u64) {
+    dma_shared_record(record).begin_retirement(epoch);
+}
+
 unsafe fn publish_dma_allocation_record(record: u64, length: u64, direction: u64) {
     dma_shared_record(record).publish(length, direction);
 }
@@ -13236,24 +13240,51 @@ unsafe fn dma_query_sg_members(adapter: u64, list: u64) -> Option<(u64, u64)> {
         .then_some((map, context))
 }
 
-unsafe fn dma_reserve_records_for_map(map_register_base: u64) -> bool {
+// A map token can name arbitrarily many transfer records. Each reservation receives a unique
+// epoch before the external effect, so a recycled token or row cannot inherit old ownership.
+static HOSTED_DMA_RETIRE_NEXT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+struct DmaRetirementClaim {
+    adapter_id: u64,
+    map_register_base: u64,
+    epoch: u64,
+}
+
+impl DmaRetirementClaim {
+    fn new(adapter_id: u64, map_register_base: u64) -> Option<Self> {
+        // Exhaustion must fail closed: wrapping would let a stale uncertain row acquire an
+        // epoch already in use. This is an atomic counter, so no allocation or wait is needed.
+        let previous = HOSTED_DMA_RETIRE_NEXT_EPOCH.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| value.checked_add(1),
+        ).ok()?;
+        Some(Self {
+            adapter_id,
+            map_register_base,
+            epoch: previous + 1,
+        })
+    }
+}
+
+unsafe fn dma_reserve_records_for_map(map_register_base: u64) -> Option<DmaRetirementClaim> {
     if map_register_base == 0 {
-        return false;
+        return None;
     }
     let adapter_id = read_unaligned((map_register_base + 16) as *const u64);
     if adapter_id == 0 {
-        return false;
+        return None;
     }
     let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
     let count = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
     if count > capacity {
-        return false;
+        return None;
     }
     let mut has_active = false;
     let mut i = 0u64;
     while i < capacity {
         let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) else {
-            return false;
+            return None;
         };
         let kind = dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND);
         if matches!(kind, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
@@ -13261,20 +13292,22 @@ unsafe fn dma_reserve_records_for_map(map_register_base: u64) -> bool {
             && dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER) == map_register_base {
             let length = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
             if i >= count || length == DMA_RECORD_RESERVED
-                || dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) != adapter_id {
-                return false;
+                || dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) != adapter_id
+                || dma_shared_record(record).retirement_epoch() != 0 {
+                return None;
             }
             has_active |= length != 0;
         }
         i += 1;
     }
+    let claim = DmaRetirementClaim::new(adapter_id, map_register_base)?;
     if !has_active {
         // The token itself owns a pending retirement even when no mapping was published.
         // Root must see the reservation through the high-water count before the IPC effect.
         let Some(record) = first_free_dma_allocation_record(FSD_SHARED_VADDR) else {
-            return false;
+            return None;
         };
-        begin_dma_allocation_record(record);
+        begin_dma_record_retirement(record, claim.epoch);
         dma_record_store(record, SH_DMA_ALLOC_RECORD_LOGICAL, 0);
         dma_record_store(record, SH_DMA_ALLOC_RECORD_VA, 0);
         dma_record_store(record, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER);
@@ -13286,35 +13319,42 @@ unsafe fn dma_reserve_records_for_map(map_register_base: u64) -> bool {
         if used > count {
             write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, used);
         }
-        return true;
+        return Some(claim);
     }
     i = 0;
     while i < count {
         let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) else {
-            return false;
+            return None;
         };
         let kind = dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND);
         if matches!(kind, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
             | HOSTED_DMA_RECORD_KIND_COHERENT_MAP)
             && dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER) == map_register_base {
-            begin_dma_allocation_record(record);
+            begin_dma_record_retirement(record, claim.epoch);
         }
         i += 1;
     }
-    true
+    Some(claim)
 }
 
-unsafe fn dma_clear_records_for_map(map_register_base: u64) {
-    let adapter_id = read_unaligned((map_register_base + 16) as *const u64);
+unsafe fn dma_retirement_record_is_claimed(claim: &DmaRetirementClaim, record: u64) -> bool {
+    if dma_shared_record(record).retirement_epoch() != claim.epoch
+        || dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN) != DMA_RECORD_RESERVED
+        || dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) != claim.adapter_id
+        || dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER) != claim.map_register_base
+    {
+        return false;
+    }
+    matches!(dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND),
+        HOSTED_DMA_RECORD_KIND_MAP_TRANSFER | HOSTED_DMA_RECORD_KIND_COHERENT_MAP)
+}
+
+unsafe fn dma_clear_records_for_map(claim: &DmaRetirementClaim) {
     let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
     let mut i = 0u64;
     while i < capacity {
         if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
-            let kind = dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND);
-            let token = dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER);
-            if matches!(kind, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
-                | HOSTED_DMA_RECORD_KIND_COHERENT_MAP) && token == map_register_base
-                && dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) == adapter_id {
+            if dma_retirement_record_is_claimed(claim, record) {
                 clear_dma_allocation_record(record);
                 HOSTED_DMA_RECORD_CLEARED_COUNT.fetch_add(1, Ordering::Relaxed);
             }
@@ -13323,20 +13363,18 @@ unsafe fn dma_clear_records_for_map(map_register_base: u64) {
     }
 }
 
-unsafe fn dma_clear_token_only_retirement_claim(map_register_base: u64) {
-    let adapter_id = read_unaligned((map_register_base + 16) as *const u64);
+unsafe fn dma_clear_token_only_retirement_claim(claim: &DmaRetirementClaim) {
     let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
     let mut i = 0u64;
     while i < capacity {
         if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
-            if dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND)
-                == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
-                && dma_record_load(record, SH_DMA_ALLOC_RECORD_MAP_REGISTER) == map_register_base
-                && dma_record_load(record, SH_DMA_ALLOC_RECORD_ADAPTER_ID) == adapter_id
-                && dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN) == DMA_RECORD_RESERVED
+            if dma_retirement_record_is_claimed(claim, record)
+                && dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND)
+                    == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
                 && dma_record_load(record, SH_DMA_ALLOC_RECORD_LOGICAL) == 0
                 && dma_record_load(record, SH_DMA_ALLOC_RECORD_VA) == 0
-                && dma_record_load(record, SH_DMA_ALLOC_RECORD_SOURCE_VA) == 0 {
+                && dma_record_load(record, SH_DMA_ALLOC_RECORD_SOURCE_VA) == 0
+            {
                 clear_dma_allocation_record(record);
             }
         }
@@ -13344,21 +13382,21 @@ unsafe fn dma_clear_token_only_retirement_claim(map_register_base: u64) {
     }
 }
 
-unsafe fn dma_retire_claimed_map(adapter: u64, map_register_base: u64) {
+unsafe fn dma_retire_claimed_map(adapter: u64, claim: DmaRetirementClaim) {
     // The provider call can suspend. The caller has already recorded ownership and dropped
     // the allocation guard, so only a verified result may reopen the local claim.
-    match dma_retire_map_token(adapter, map_register_base) {
+    match dma_retire_map_token(adapter, claim.map_register_base) {
         DmaMapRetirement::Retired => {
             HOSTED_DMA_FREE_MAP_RETIRED_COUNT.fetch_add(1, Ordering::Relaxed);
             let _allocation_guard = HostedDmaAllocationGuard::acquire();
-            dma_clear_records_for_map(map_register_base);
+            dma_clear_records_for_map(&claim);
         }
         DmaMapRetirement::NoEffect => {
             HOSTED_DMA_FREE_MAP_NO_EFFECT_COUNT.fetch_add(1, Ordering::Relaxed);
             let _allocation_guard = HostedDmaAllocationGuard::acquire();
             // A stale token with no published mapping acquired only the sentinel. A foreign
             // or ambiguous owner may still have active rows; keep those rows reserved.
-            dma_clear_token_only_retirement_claim(map_register_base);
+            dma_clear_token_only_retirement_claim(&claim);
         }
         DmaMapRetirement::Uncertain => {
             HOSTED_DMA_FREE_MAP_UNCERTAIN_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -13368,14 +13406,14 @@ unsafe fn dma_retire_claimed_map(adapter: u64, map_register_base: u64) {
 
 // The spin guard protects only the local shared-record transition. A provider service can
 // suspend this lane and reenter DMA from another lane, so it must run after the guard drops.
-unsafe fn dma_reserve_sg_records(map_register_base: u64) -> bool {
+unsafe fn dma_reserve_sg_records(map_register_base: u64) -> Option<DmaRetirementClaim> {
     let _allocation_guard = HostedDmaAllocationGuard::acquire();
     dma_reserve_records_for_map(map_register_base)
 }
 
-unsafe fn dma_clear_retired_sg_records(map_register_base: u64) {
+unsafe fn dma_clear_retired_sg_records(claim: DmaRetirementClaim) {
     let _allocation_guard = HostedDmaAllocationGuard::acquire();
-    dma_clear_records_for_map(map_register_base);
+    dma_clear_records_for_map(&claim);
 }
 
 extern "win64" fn s_dma_allocate_adapter_channel(
@@ -13405,12 +13443,12 @@ extern "win64" fn s_dma_allocate_adapter_channel(
         ) as u32;
         if action == 2 {
             // DeallocateObject: the caller did not retain the map-register token.
-            let reserved = {
+            let claim = {
                 let _allocation_guard = HostedDmaAllocationGuard::acquire();
                 dma_reserve_records_for_map(map_register)
             };
-            if reserved {
-                dma_retire_claimed_map(adapter, map_register);
+            if let Some(claim) = claim {
+                dma_retire_claimed_map(adapter, claim);
             }
         }
         0
@@ -13918,14 +13956,13 @@ extern "win64" fn s_dma_free_map_registers(
         {
             return;
         }
-        let reserved = {
+        let claim = {
             let _allocation_guard = HostedDmaAllocationGuard::acquire();
             dma_reserve_records_for_map(map_register_base)
         };
-        if !reserved {
-            return;
+        if let Some(claim) = claim {
+            dma_retire_claimed_map(adapter, claim);
         }
-        dma_retire_claimed_map(adapter, map_register_base);
     }
 }
 
@@ -14327,14 +14364,14 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         };
         // Mark every local mapping for this token before an external effect. A duplicate PutSG
         // sees the reservation and cannot replay an uncertain provider retirement.
-        if !dma_reserve_sg_records(map_register) {
+        let Some(claim) = dma_reserve_sg_records(map_register) else {
             HOSTED_DMA_PUT_SG_RESERVE_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
             return;
-        }
+        };
         let _ =
             s_dma_flush_adapter_buffers(adapter, mdl, map_register, current_va, length, direction);
         if dma_retire_sg_list(adapter, scatter_gather) {
-            dma_clear_retired_sg_records(map_register);
+            dma_clear_retired_sg_records(claim);
         }
     }
 }
