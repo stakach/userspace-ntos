@@ -65052,6 +65052,17 @@ unsafe fn read_hosted_device_resource_state_from_shared(
             [SharedAddressResource::default(); SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize],
         ));
     let mut evidence = read_hosted_hardware_evidence_from_shared(binding, sh);
+    let grant = nt_hosted_runtime::dma_grant_after_bank_refresh(
+        None,
+        nt_hosted_runtime::DmaGrantEvidence {
+            va: evidence.dma_common_va,
+            len: evidence.dma_common_len,
+            logical: evidence.dma_common_logical,
+        },
+    );
+    evidence.dma_common_va = grant.va;
+    evidence.dma_common_len = grant.len;
+    evidence.dma_common_logical = grant.logical;
     if let Some(previous) = previous_state.filter(|state| state.interrupt_assignment_published) {
         // A sibling FDO may own this lane's mutable bank. Its grant cannot replace the
         // resource-manager assignment retained for this exact device generation.
