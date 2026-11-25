@@ -4,7 +4,7 @@ use alloc::{rc::Rc, vec::Vec};
 use core::num::NonZeroU32;
 use nt_config_abi::CmReply;
 use nt_config_server::{CmIdentitySource, CmServer};
-use nt_hive_core::{encode_image, Hive, HiveKind, RegistryValueType};
+use nt_hive_core::{decode_image, encode_image, Hive, HiveKind, RegistryValueType};
 
 const STALE: i32 = 0xC000_0059u32 as i32;
 
@@ -31,6 +31,32 @@ fn image() -> Vec<u8> {
     crate::tests::secure_fixture_hive(&mut hive);
     hive.finish_clean_import();
     encode_image(&hive)
+}
+
+#[test]
+fn restored_system_wal_fold_prepares_the_exact_clean_cm_generation() {
+    let original = image();
+    let original_hive = decode_image(&original).unwrap();
+    let mut client = client(source());
+    assert_eq!(client.import_system_hive(&original), Ok(1));
+    assert_eq!(client.prepare_system_hive_checkpoint(1), Ok(None));
+
+    let prepared = client.prepare_system_hive_checkpoint_for_restored_wal(1).unwrap();
+    let folded = decode_image(&prepared.image).unwrap();
+    assert_eq!(prepared.mount_generation, 1);
+    assert_eq!(prepared.hive_sequence, original_hive.sequence);
+    assert_eq!(folded.sequence, original_hive.sequence);
+    assert_eq!(prepared.image_generation, original_hive.generation + 1);
+    assert_eq!(folded.generation, prepared.image_generation);
+    assert!(folded.open_key(r"ControlSet001\Services\Stable").is_some());
+
+    // The same token excludes a new checkpoint or mutation until the image is durable.
+    assert_eq!(client.prepare_system_hive_checkpoint(1), Err(STATUS_DEVICE_BUSY));
+    assert_eq!(client.prepare_system_hive_checkpoint_for_restored_wal(2), Err(STALE));
+    // The local fixture stands in for the paired durable publication before this ACK.
+    client.acknowledge_system_hive_checkpoint(&prepared).unwrap();
+    client.acknowledge_system_hive_checkpoint(&prepared).unwrap();
+    assert_eq!(client.prepare_system_hive_checkpoint(1), Ok(None));
 }
 
 #[test]

@@ -146,15 +146,17 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
     let manifest = snapshot_storage::peek_wal_continuation(&mut lease)
         .map_err(|status| {
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-            status
+            report_fold_failure(b"cached-manifest", status)
         })?;
-    let prepared = match crate::config_manager_prepare_system_hive_checkpoint() {
-        Ok(prepared) => prepared,
-        Err(status) => return Err(status as u32),
+    let prepared = if SYSTEM_WAL_FOLD_REQUIRED.load(Ordering::Acquire) {
+        // The restored suffix is durable but CM mounted its composed image clean. Keep CM's
+        // exact generation and ACK token while both snapshot slots acquire that image.
+        Some(crate::config_manager_prepare_system_hive_checkpoint_for_restored_wal()
+            .map_err(|status| status as u32)?)
+    } else {
+        crate::config_manager_prepare_system_hive_checkpoint()
+            .map_err(|status| status as u32)?
     };
-    if prepared.is_none() && SYSTEM_WAL_FOLD_REQUIRED.load(Ordering::Acquire) {
-        return Err(block(nt_fs::STATUS_DATA_ERROR));
-    }
     // Other mutable hives share this physical WAL. Their records also need a two-slot fold
     // before an image checkpoint truncates a sidecar or the epoch is reclaimed.
     if prepared.is_none() && manifest.base_serial == manifest.high_water_serial {

@@ -2323,7 +2323,7 @@ impl CmServer {
         }
 
         match req.operation {
-            hive_checkpoint_transfer::BEGIN => {
+            hive_checkpoint_transfer::BEGIN | hive_checkpoint_transfer::BEGIN_RESTORED_WAL_FOLD => {
                 if req.transfer_token != 0 || req.value_offset != 0 || chunk_capacity == 0 {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 }
@@ -2336,7 +2336,9 @@ impl CmServer {
                     return reply(STATUS_DEVICE_BUSY, current_generation);
                 }
                 let mounted = self.system_hive.as_mut().unwrap();
-                if mounted.hive.dirty_count() == 0 {
+                if mounted.hive.dirty_count() == 0
+                    && req.operation == hive_checkpoint_transfer::BEGIN
+                {
                     return reply_with_info(STATUS_SUCCESS, 0, current_generation, 0);
                 }
                 let hive_sequence = mounted.hive.sequence;
