@@ -48,7 +48,7 @@ fn interrupt_connection_and_retirement_use_the_calling_lanes_resource_bank() {
         "interrupt fixture compile:\n{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let result = Command::new(&binary).output().unwrap();
+    let result = Command::new(&binary).arg("--test-threads=1").output().unwrap();
     assert!(
         result.status.success(),
         "worker interrupt bank regression:\n{}{}",
@@ -102,23 +102,61 @@ static CURRENT: AtomicU64 = AtomicU64::new(0);
 static PROJECTION: AtomicU64 = AtomicU64::new(0);
 static ROOT_CALLS: AtomicU64 = AtomicU64::new(0);
 static LAST_DISCONNECT: AtomicU64 = AtomicU64::new(0);
+static SIBLING_REQUEST_VECTOR: AtomicU64 = AtomicU64::new(0);
+static SIBLING_OWNER_COOKIE: AtomicU64 = AtomicU64::new(1);
+static SIBLING_GENERATION: AtomicU64 = AtomicU64::new(7);
+static LAST_PROVISION_VECTOR: AtomicU64 = AtomicU64::new(0);
 
 fn primary_bank() -> u64 { PRIMARY.load(Ordering::Relaxed) }
 fn hosted_component_resource_shared_va() -> u64 { CURRENT.load(Ordering::Relaxed) }
 
-fn call_on4(_: u64, op: u64, object: u64, _: u64, _: u64) -> (u64, u64, u64, u64, u64) {
+fn call_on4(_: u64, op: u64, object: u64, pdo: u64, _: u64) -> (u64, u64, u64, u64, u64) {
     ROOT_CALLS.fetch_add(1, Ordering::Relaxed);
     let sh = hosted_component_resource_shared_va();
     match op {
-        HOSTED_INTERRUPT_OP_PROVISION => (0, 0, PROJECTION.load(Ordering::Relaxed), 7, 0),
+        HOSTED_INTERRUPT_OP_PROVISION => {
+            LAST_PROVISION_VECTOR.store(object, Ordering::Relaxed);
+            let sibling = SIBLING_REQUEST_VECTOR.load(Ordering::Relaxed);
+            if sibling != 0 && (object != sibling
+                || SIBLING_OWNER_COOKIE.load(Ordering::Relaxed) != 1
+                || SIBLING_GENERATION.load(Ordering::Relaxed) != 7)
+            {
+                return (0, STATUS_INVALID_PARAMETER as u32 as u64, 0, 0, 0);
+            }
+            let current = unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32) };
+            if sibling == 0 && object != 0 && object as u32 != current {
+                return (0, STATUS_INVALID_PARAMETER as u32 as u64, 0, 0, 0);
+            }
+            if object == 0 {
+                let granted_pdo = unsafe { read_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *const u64) };
+                if pdo == 0 || pdo != granted_pdo {
+                    return (0, STATUS_INVALID_PARAMETER as u32 as u64, 0, 0, 0);
+                }
+                let projection = PROJECTION.load(Ordering::Relaxed);
+                unsafe {
+                    write_unaligned((projection + HOSTED_KINTERRUPT_VECTOR) as *mut u32, current);
+                    write_unaligned((projection + HOSTED_KINTERRUPT_IRQL) as *mut u8, 5);
+                    write_unaligned((projection + HOSTED_KINTERRUPT_MODE) as *mut u8, 0);
+                    write_unaligned((projection + HOSTED_KINTERRUPT_SHARE) as *mut u8, 1);
+                    write_unaligned((projection + HOSTED_KINTERRUPT_AFFINITY) as *mut u64, 1);
+                }
+            }
+            (0, 0, PROJECTION.load(Ordering::Relaxed), 7, 0)
+        }
         HOSTED_INTERRUPT_OP_CONNECT => {
             let projected = unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64) };
-            let routine = unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64) };
-            let context = unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *const u64) };
-            assert_eq!((object, projected, routine, context),
-                (PROJECTION.load(Ordering::Relaxed), object, 0x1234, 0x5678),
-                "component must stage the worker's callback in its own bank before CONNECT");
-            (0, 0, 99, 7, 0)
+            let vector = unsafe { read_volatile((object + HOSTED_KINTERRUPT_VECTOR) as *const u32) };
+            let routine = unsafe { read_volatile((object + HOSTED_KINTERRUPT_ROUTINE) as *const u64) };
+            let context = unsafe { read_volatile((object + HOSTED_KINTERRUPT_CONTEXT) as *const u64) };
+            assert_eq!((object, routine, context),
+                (PROJECTION.load(Ordering::Relaxed), 0x1234, 0x5678),
+                "the exact projection must carry the callback before CONNECT");
+            if vector == unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32) } {
+                assert_eq!(projected, object, "current grant may be reflected in its bank");
+            } else {
+                assert_ne!(projected, object, "a sibling must not replace the current bank owner");
+            }
+            (0, 0, if vector == 11 { 98 } else { 99 }, 7, 0)
         }
         HOSTED_INTERRUPT_OP_DISCONNECT => {
             LAST_DISCONNECT.store(object, Ordering::Relaxed);
@@ -157,6 +195,7 @@ fn worker_disconnect_keeps_a_siblings_newer_shared_interrupt() {
 const CASES: &str = r#"
 #[test]
 fn worker_connect_disconnect_and_line_based_ex_stay_in_the_worker_bank() {
+    SIBLING_REQUEST_VECTOR.store(0, Ordering::Relaxed);
     let mut primary = Box::new([0u64; 16]);
     let mut worker = Box::new([0u64; 16]);
     let mut projection = Box::new([0u64; 16]);
@@ -188,8 +227,8 @@ fn worker_connect_disconnect_and_line_based_ex_stay_in_the_worker_bank() {
     let mut rejected = 0u64;
     assert_eq!(s_io_connect_interrupt(&mut rejected, 0x1234, 0x5678, 0,
         0x40, 5, 5, 0, 1, 1, 0), STATUS_INVALID_PARAMETER);
-    assert_eq!(ROOT_CALLS.load(Ordering::Relaxed), calls,
-        "a request mismatched with the worker grant must stop before PROVISION");
+    assert_eq!(ROOT_CALLS.load(Ordering::Relaxed), calls + 1,
+        "a foreign vector must be refused by root's canonical grant selector");
     assert_eq!(*primary, primary_before);
 
     s_io_disconnect_interrupt(connected);
@@ -203,7 +242,9 @@ fn worker_connect_disconnect_and_line_based_ex_stay_in_the_worker_bank() {
         fields: FullySpecified {
             pdo: 222, interrupt_object_out: (&mut line_connected as *mut u64) as u64,
             service_routine: 0x1234, service_context: 0x5678, spin_lock: 0,
-            synchronize_irql: 0, floating_save: 0, share_vector: 0,
+            // This byte lies beyond the real line-based union. It must not be read
+            // as the fully-specified variant's ShareVector input.
+            synchronize_irql: 0, floating_save: 0, share_vector: 0xff,
             vector: 0, irql: 0, mode: 0, affinity: 0, group: 0,
         },
     };
@@ -216,5 +257,83 @@ fn worker_connect_disconnect_and_line_based_ex_stay_in_the_worker_bank() {
     assert_eq!(worker[(SH_RESOURCE_INTERRUPT_OBJECT / 8) as usize], 0);
     assert_eq!(*primary, primary_before);
     worker_disconnect_keeps_a_siblings_newer_shared_interrupt();
+}
+
+#[test]
+fn one_start_callback_connects_both_exact_sibling_interrupts() {
+    let mut bank = Box::new([0u64; 16]);
+    let mut mouse_projection = Box::new([0u64; 16]);
+    let mut keyboard_projection = Box::new([0u64; 16]);
+    PRIMARY.store(bank.as_mut_ptr() as u64, Ordering::Relaxed);
+    CURRENT.store(bank.as_mut_ptr() as u64, Ordering::Relaxed);
+    bank[(SH_RESOURCE_PDO_OBJECT / 8) as usize] = 222;
+    // The keyboard grant was published after the mouse grant. ReactOS i8042prt's
+    // StartProcedure connects both sibling interrupts before this callback returns.
+    bank[(SH_RESOURCE_INTERRUPT_VECTOR / 8) as usize] = 12;
+    bank[(SH_RESOURCE_INTERRUPT_AFFINITY / 8) as usize] = 1;
+    bank[(SH_RESOURCE_INTERRUPT_POLICY / 8) as usize] = 5 | (1 << 16);
+    SIBLING_REQUEST_VECTOR.store(0, Ordering::Relaxed);
+    SIBLING_OWNER_COOKIE.store(1, Ordering::Relaxed);
+    SIBLING_GENERATION.store(7, Ordering::Relaxed);
+    ROOT_CALLS.store(0, Ordering::Relaxed);
+    PROJECTION.store(keyboard_projection.as_mut_ptr() as u64, Ordering::Relaxed);
+
+    let mut keyboard = 0u64;
+    assert_eq!(s_io_connect_interrupt(&mut keyboard, 0x1234, 0x5678, 0,
+        12, 5, 5, 0, 1, 1, 0), STATUS_SUCCESS);
+    assert_eq!(keyboard, keyboard_projection.as_mut_ptr() as u64);
+    assert_eq!(keyboard_projection[(HOSTED_KINTERRUPT_VECTOR / 8) as usize], 12);
+    assert_eq!(keyboard_projection[(HOSTED_KINTERRUPT_ID / 8) as usize], 99);
+
+    // The mouse's retained resource owner is live in this same driver domain,
+    // although the callback's mutable bank still advertises the keyboard vector.
+    PROJECTION.store(mouse_projection.as_mut_ptr() as u64, Ordering::Relaxed);
+    SIBLING_REQUEST_VECTOR.store(11, Ordering::Relaxed);
+    LAST_PROVISION_VECTOR.store(0, Ordering::Relaxed);
+    let calls = ROOT_CALLS.load(Ordering::Relaxed);
+    let mut mouse = 0u64;
+    assert_eq!(s_io_connect_interrupt(&mut mouse, 0x1234, 0x5678, 0,
+        11, 5, 5, 0, 1, 1, 0), STATUS_SUCCESS,
+        "a live same-driver sibling grant must be selectable within one Start callback");
+    assert!(ROOT_CALLS.load(Ordering::Relaxed) >= calls + 2,
+        "the second connection must reach exact root provision and connect");
+    assert_eq!(LAST_PROVISION_VECTOR.load(Ordering::Relaxed), 11,
+        "root must receive the requested vector to select its exact sibling owner");
+    assert_eq!(mouse, mouse_projection.as_mut_ptr() as u64);
+    assert_eq!(mouse_projection[(HOSTED_KINTERRUPT_VECTOR / 8) as usize], 11);
+    assert_eq!(mouse_projection[(HOSTED_KINTERRUPT_ID / 8) as usize], 98);
+    assert_eq!(keyboard_projection[(HOSTED_KINTERRUPT_ID / 8) as usize], 99,
+        "connecting a sibling must retain the first exact connection");
+    assert_eq!(bank[(SH_RESOURCE_INTERRUPT_OBJECT / 8) as usize], keyboard,
+        "the mutable bank still mirrors the keyboard connection");
+    let disconnect_mouse = [CONNECT_LINE_BASED as u64, mouse];
+    s_io_disconnect_interrupt_ex(disconnect_mouse.as_ptr() as u64);
+    assert_eq!(LAST_DISCONNECT.load(Ordering::Relaxed), mouse,
+        "IoDisconnectInterruptEx must retire its exact projection");
+    assert_eq!(bank[(SH_RESOURCE_INTERRUPT_OBJECT / 8) as usize], keyboard,
+        "sibling retirement must preserve the bank's different connection");
+}
+
+#[test]
+fn sibling_connection_refuses_foreign_vector_domain_and_generation() {
+    let mut bank = Box::new([0u64; 16]);
+    let mut projection = Box::new([0u64; 16]);
+    PRIMARY.store(bank.as_mut_ptr() as u64, Ordering::Relaxed);
+    CURRENT.store(bank.as_mut_ptr() as u64, Ordering::Relaxed);
+    PROJECTION.store(projection.as_mut_ptr() as u64, Ordering::Relaxed);
+    bank[(SH_RESOURCE_INTERRUPT_VECTOR / 8) as usize] = 12;
+    bank[(SH_RESOURCE_INTERRUPT_AFFINITY / 8) as usize] = 1;
+    bank[(SH_RESOURCE_INTERRUPT_POLICY / 8) as usize] = 5 | (1 << 16);
+    SIBLING_REQUEST_VECTOR.store(11, Ordering::Relaxed);
+    for (vector, cookie, generation) in [(13, 1, 7), (11, 2, 7), (11, 1, 8)] {
+        SIBLING_OWNER_COOKIE.store(cookie, Ordering::Relaxed);
+        SIBLING_GENERATION.store(generation, Ordering::Relaxed);
+        let mut denied = 0u64;
+        assert_ne!(s_io_connect_interrupt(&mut denied, 0x1234, 0x5678, 0,
+            vector, 5, 5, 0, 1, 1, 0), STATUS_SUCCESS);
+        assert_eq!(denied, 0, "refusal must not publish an interrupt object");
+        assert_eq!(projection[(HOSTED_KINTERRUPT_ID / 8) as usize], 0,
+            "refusal must not bind a projection");
+    }
 }
 "#;
