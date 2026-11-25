@@ -42,7 +42,16 @@ fn map_retirement_releases_guard_and_keeps_uncertain_claims() {
         1,
     );
 
-    let fixture = format!("{PORTS}\n{retire}\n{helpers}\n{free}\n{CASES}");
+    let lookup_start = source
+        .find("unsafe fn dma_find_map_record(")
+        .expect("native active map lookup");
+    let lookup_end = source[lookup_start..]
+        .find("\nextern \"win64\" fn s_dma_flush_adapter_buffers(")
+        .expect("following native DMA flush");
+    let lookup = &source[lookup_start..lookup_start + lookup_end];
+    syn::parse_file(lookup).expect("complete active map lookup");
+
+    let fixture = format!("{PORTS}\n{retire}\n{lookup}\n{helpers}\n{free}\n{CASES}");
     let directory = std::env::temp_dir().join(format!(
         "nt-native-dma-map-retirement-{}",
         std::process::id()
