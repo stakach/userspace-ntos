@@ -807,6 +807,10 @@ fn capture_route(id: u64, prepared: &PreparedExternalFileIrp) -> Result<(), nt_s
         .iter()
         .any(|authority| authority.driver_id == prepared.route().driver_id().raw())
     {
+        trace_scsi_proof_refusal(b"route-authority",
+            ExternalFileIrpDispatchPolicy::ScsiAtDevice,
+            prepared.route().device_id(), Some(prepared.irp_id()),
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     row(id).stack = stack;
@@ -836,6 +840,9 @@ fn capture_projection_registration(
             .device(device)
             .is_none_or(|record| record.driver_id != driver)
     {
+        trace_scsi_proof_refusal(b"projection-driver",
+            ExternalFileIrpDispatchPolicy::ScsiAtDevice, device, Some(exact_irp),
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let address = if let Some(binding) = hosted_device_binding_by_device_id(device.raw()) {
@@ -844,6 +851,9 @@ fn capture_projection_registration(
             || binding.projection_instance != physical.instance
             || binding.projection_domain != physical.domain
         {
+            trace_scsi_proof_refusal(b"projection-binding",
+                ExternalFileIrpDispatchPolicy::ScsiAtDevice, device, Some(exact_irp),
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST);
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         binding.device_object
@@ -856,23 +866,41 @@ fn capture_projection_registration(
             unsafe { hosted_provider_child_registration(device, physical.domain,
                 Some(exact_irp)) }
                 .filter(|registration| registration.device_id() == device)
-                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+                .ok_or_else(|| {
+                    trace_scsi_proof_refusal(b"projection-precommit-child",
+                        ExternalFileIrpDispatchPolicy::ScsiAtDevice, device, Some(exact_irp),
+                        nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    nt_status::NtStatus::INVALID_DEVICE_REQUEST
+                })?
                 .address()
         } else {
             // Direct hosted devices use the canonical domain/address publication, not a guessed PDO.
             io_manager_mut()
                 .hosted_device_address_by_identity(physical.domain, device)
-                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+                .ok_or_else(|| {
+                    trace_scsi_proof_refusal(b"projection-direct-address",
+                        ExternalFileIrpDispatchPolicy::ScsiAtDevice, device, Some(exact_irp),
+                        nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    nt_status::NtStatus::INVALID_DEVICE_REQUEST
+                })?
         }
     };
     let registration = io_manager_mut()
         .hosted_device_pointer_registration(physical.domain, address)
         .filter(|registration| registration.device_id() == device)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        .ok_or_else(|| {
+            trace_scsi_proof_refusal(b"projection-registration",
+                ExternalFileIrpDispatchPolicy::ScsiAtDevice, device, Some(exact_irp),
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST
+        })?;
     let inst = instance(physical.instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     if !physical.live()
         || hosted_device_allocations::registration(inst, address) != Ok(Some(registration))
     {
+        trace_scsi_proof_refusal(b"projection-allocation",
+            ExternalFileIrpDispatchPolicy::ScsiAtDevice, device, Some(exact_irp),
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     Ok(registration)
@@ -2671,6 +2699,26 @@ pub(super) fn redrive_queued_dispatches() -> usize {
         .count()
 }
 
+/// A precommit native disk proof has no entered IRP until all these checks pass. Keep
+/// a bounded, value-only refusal receipt so a certain failure cannot be mistaken for
+/// a failed SRB completion or a later mount problem.
+fn trace_scsi_proof_refusal(
+    stage: &[u8], policy: ExternalFileIrpDispatchPolicy,
+    device: nt_io_manager::DeviceId, irp: Option<IrpId>, status: nt_status::NtStatus,
+) {
+    if policy != ExternalFileIrpDispatchPolicy::ScsiAtDevice
+        || unsafe { pending_scsi_proof_slot() }.is_none()
+    { return; }
+    static TRACED: AtomicU64 = AtomicU64::new(0);
+    if TRACED.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+        |used| (used < 16).then_some(used + 1)).is_err()
+    { return; }
+    print_str(b"[native-disk-proof-pre-dispatch] stage="); print_str(stage);
+    print_str(b" device/irp/status="); print_u64(device.raw());
+    print_str(b"/"); print_u64(irp.map_or(0, IrpId::raw));
+    print_str(b"/0x"); print_hex(status.raw() as u32); print_str(b"\n");
+}
+
 fn dispatch_with_port_connect<Yield>(
     caller: nt_process::native_handle::NativeHandleCaller,
     request: ExternalFileIrpRequest,
@@ -2686,6 +2734,7 @@ fn dispatch_with_port_connect<Yield>(
     ) -> Result<ExternalFileIrpReturn, Yield>,
 ) -> Result<DispatchResult, DispatchFailure<Yield>> {
     let major = request.major;
+    let target_device = request.device_id;
     let mut phase = FileRpcPhaseGuard::new(major);
     let mut scsi_phase = ScsiRpcPhaseGuard::new(major, policy);
     let _durable = crate::allocator::enter_durable();
@@ -2698,7 +2747,10 @@ fn dispatch_with_port_connect<Yield>(
         Ok(bytes)
     };
     let buffers = ExternalFileIrpBuffers::new(copy(input)?, copy(initial_output)?);
-    let id = reserve(caller, policy.output_capture())?;
+    let id = reserve(caller, policy.output_capture()).map_err(|status| {
+        trace_scsi_proof_refusal(b"reserve", policy, target_device, None, status);
+        status
+    })?;
     if let Some(device) = port_connect_device {
         trace_port_connect_dispatch(0, IrpId(0), device);
     }
@@ -2706,15 +2758,20 @@ fn dispatch_with_port_connect<Yield>(
     let prepared = match preparation {
         Ok(prepared) => prepared,
         Err(status) => {
+            trace_scsi_proof_refusal(b"prepare", policy, target_device, None, status);
             remove(id)?;
             return Err(DispatchFailure::Status(status));
         }
     };
     if let Err(status) = unsafe { bind_pending_scsi_proof_irp(policy, &prepared) } {
+        trace_scsi_proof_refusal(b"bind-proof", policy, target_device,
+            Some(prepared.irp_id()), status);
         discard(id, prepared)?;
         return Err(DispatchFailure::Status(status));
     }
     if let Err(status) = capture_route(id, &prepared) {
+        trace_scsi_proof_refusal(b"capture-route", policy, target_device,
+            Some(prepared.irp_id()), status);
         discard(id, prepared)?;
         return Err(DispatchFailure::Status(status));
     }
@@ -2744,6 +2801,8 @@ fn dispatch_with_port_connect<Yield>(
         Ok(invocation) => invocation,
         Err(rejection) => {
             let (status, prepared) = rejection.into_parts();
+            trace_scsi_proof_refusal(b"begin", policy, target_device,
+                Some(prepared.irp_id()), status);
             discard(id, prepared)?;
             return Err(DispatchFailure::Status(status));
         }
