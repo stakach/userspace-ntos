@@ -19502,16 +19502,25 @@ impl ExecNtHandler {
         instance: &str,
         request: nt_pnp_manager::StartDeviceRequestIdentity,
     ) -> u32 {
+        crate::hosted_raw_pdo_start::trace_raw_start_admission(request.sequence(), instance);
         if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
+            crate::hosted_raw_pdo_start::trace_raw_start(request.sequence(), 0, 0,
+                b"reply-capacity-rejected", Some(STATUS_INSUFFICIENT_RESOURCES), None);
             return self.pnp_complete_start_without_irp(request, STATUS_INSUFFICIENT_RESOURCES);
         }
         let reservation = match self.pending_pnp_operations.reserve() {
             Ok(reservation) => reservation,
-            Err(_) => return self.pnp_complete_start_without_irp(request, STATUS_INSUFFICIENT_RESOURCES),
+            Err(_) => {
+                crate::hosted_raw_pdo_start::trace_raw_start(request.sequence(), 0, 0,
+                    b"pending-capacity-rejected", Some(STATUS_INSUFFICIENT_RESOURCES), None);
+                return self.pnp_complete_start_without_irp(request, STATUS_INSUFFICIENT_RESOURCES);
+            }
         };
         let (pdo, owner) = match driver_launch::prepare_hosted_raw_pdo_start_for_instance(instance) {
             Ok(prepared) => prepared,
             Err(status) => {
+                crate::hosted_raw_pdo_start::trace_raw_start(request.sequence(), 0, 0,
+                    b"prepare-rejected", Some(status.raw() as u32), None);
                 self.pending_pnp_operations.cancel(reservation)
                     .expect("unentered raw START lost its reservation");
                 return self.pnp_complete_start_without_irp(request, status.raw() as u32);
@@ -19519,14 +19528,26 @@ impl ExecNtHandler {
         };
         let provider_irp = owner.direct_provider_irp()
             .expect("prepared raw START lost its canonical provider IRP");
+        crate::hosted_raw_pdo_start::trace_raw_start(request.sequence(), pdo,
+            provider_irp.raw(), b"provider-prepared", None, None);
         let mut start = match driver_launch::begin_hosted_raw_pdo_start_dispatch(pdo, provider_irp) {
-            Ok(token) => OwnedHostedRawPdoStart::new(pdo, owner, token, request),
-            Err(status) => OwnedHostedRawPdoStart::without_token(
-                pdo, owner, request, status.raw() as u32,
-            ),
+            Ok(token) => {
+                crate::hosted_raw_pdo_start::trace_raw_start(request.sequence(), pdo,
+                    provider_irp.raw(), b"pnp-token-begun", None, Some(&token));
+                OwnedHostedRawPdoStart::new(pdo, owner, token, request)
+            }
+            Err(status) => {
+                crate::hosted_raw_pdo_start::trace_raw_start(request.sequence(), pdo,
+                    provider_irp.raw(), b"pnp-token-rejected", Some(status.raw() as u32), None);
+                OwnedHostedRawPdoStart::without_token(
+                    pdo, owner, request, status.raw() as u32,
+                )
+            }
         };
         match start.drive() {
             RawPdoStartProgress::Awaiting => {
+                crate::hosted_raw_pdo_start::trace_raw_start(request.sequence(), pdo,
+                    provider_irp.raw(), b"first-drive-awaiting", None, None);
                 self.pnp_start_device_calls.mark_pending(request)
                     .expect("parked raw START request lost its synchronous owner");
                 self.pending_pnp_operation_transfer = Some(PendingPnpOperationTransfer {
@@ -19536,18 +19557,24 @@ impl ExecNtHandler {
                 nt_status::NtStatus::PENDING.raw() as u32
             }
             RawPdoStartProgress::NotEntered { request: ended, status } => {
+                crate::hosted_raw_pdo_start::trace_raw_start(request.sequence(), pdo,
+                    provider_irp.raw(), b"first-drive-not-entered", Some(status), None);
                 self.pending_pnp_operations.cancel(reservation)
                     .expect("proven unentered raw START lost its reservation");
                 assert_eq!(ended, Some(request), "raw START lost its exact request");
                 self.pnp_complete_start_without_irp(request, status)
             }
             RawPdoStartProgress::Complete { request: ended, receipt, status } => {
+                crate::hosted_raw_pdo_start::trace_raw_start(request.sequence(), pdo,
+                    provider_irp.raw(), b"first-drive-complete", Some(status), None);
                 self.pending_pnp_operations.cancel(reservation)
                     .expect("completed raw START lost its reservation");
                 assert_eq!(ended, Some(request), "raw START completed another request");
                 self.pnp_complete_start_lifecycle(request, receipt, status)
             }
             RawPdoStartProgress::OwnershipLost { request: lost, irp_id, status } => {
+                crate::hosted_raw_pdo_start::trace_raw_start(request.sequence(), pdo,
+                    provider_irp.raw(), b"first-drive-ownership-lost", Some(status), None);
                 assert_eq!(lost, request, "uncertain raw START lost its exact request");
                 self.pnp_complete_start_ownership_lost(request, irp_id, None, status);
                 self.pending_pnp_operations.publish(reservation, PendingPnpOperation {
