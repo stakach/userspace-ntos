@@ -7,13 +7,16 @@ use crate::file_delta_wal_payload::{
 };
 use crate::snapshot_test_device::CachedDisk;
 use crate::{
-    decode_volume_wal_payload, encode_hive_log_wal_payload, FileSystem, HiveLogWalPayload, MemFs,
+    decode_volume_wal_payload, encode_file_create_wal_payload, encode_hive_log_wal_payload,
+    BootSystemPreRead, FileCreateWalPayload, FileSystem, HiveLogWalPayload, MemFs,
     RegistryWal, RegistryWalError, RegistryWalState, VolumeWalPayload,
 };
 
 const FILE: &str = r"\??\C:\ReactOS\System32\Config\SOFTWARE";
 const DIRECTORY: &str = r"\??\C:\ReactOS\System32\Config";
 const LOG: &str = r"\??\C:\ReactOS\System32\Config\SOFTWARE.LOG";
+const CREATED_DIRECTORY: &str = r"\??\C:\ReactOS\System32\Config\NewDirectory";
+const CREATED_CHILD: &str = r"\??\C:\ReactOS\System32\Config\NewDirectory\Child";
 
 fn volume_with(bytes: &[u8]) -> FileSystem {
     let mut fs = FileSystem::new(MemFs::new());
@@ -27,6 +30,29 @@ fn contents(fs: &FileSystem) -> Vec<u8> {
 
 fn restored_copy(fs: &FileSystem) -> FileSystem {
     FileSystem::from_volume_snapshot(&fs.export_volume_snapshot().unwrap()).unwrap()
+}
+
+fn creation_record<'a>(
+    fs: &FileSystem,
+    sequence: u64,
+    path: &'a str,
+    parent: &str,
+) -> FileCreateWalPayload<'a> {
+    let metadata = fs.query_metadata(path).unwrap();
+    FileCreateWalPayload {
+        sequence,
+        file_id: metadata.file_id,
+        parent_file_id: fs.query_metadata(parent).unwrap().file_id,
+        path,
+        attributes: metadata.attributes,
+        is_directory: metadata.is_directory,
+        times: [
+            metadata.creation_time,
+            metadata.last_access_time,
+            metadata.last_write_time,
+            metadata.change_time,
+        ],
+    }
 }
 
 fn encoded(fs: &FileSystem, sequence: u64, end_of_file: u64, extents: &[FileDeltaExtent<'_>]) -> Vec<u8> {
@@ -86,6 +112,277 @@ fn replayed_volume_survives_a_snapshot_round_trip() {
     expected.resize(3000, 0);
     assert_eq!(contents(&fs), expected);
     assert_eq!(contents(&restored_copy(&fs)), expected);
+}
+
+/// A committed creation must precede its content delta when the selected snapshot predates both.
+#[test]
+fn committed_delta_recovers_a_new_file_and_its_metadata_from_an_older_snapshot() {
+    let mut live = FileSystem::new(MemFs::new());
+    assert!(live.provision_directory(DIRECTORY));
+    let base = live.export_volume_snapshot().unwrap();
+    let created = live.zw_create_file(
+        FILE, crate::FILE_WRITE_DATA, crate::FILE_ATTRIBUTE_HIDDEN, 0,
+        crate::FILE_CREATE, crate::FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(created.status, crate::STATUS_SUCCESS);
+    let created_metadata = live.query_metadata(FILE).unwrap();
+    assert_eq!(live.zw_write_file(created.handle, None, b"new hive"), (crate::STATUS_SUCCESS, 8));
+    assert_eq!(live.zw_close(created.handle), crate::STATUS_SUCCESS);
+    let written_metadata = live.query_metadata(FILE).unwrap();
+    let contents = live.file_bytes_owned(FILE).unwrap();
+    let extents = changed_file_delta_extents(&[], &contents).unwrap();
+    let creation = encode_file_create_wal_payload(FileCreateWalPayload {
+        sequence: 1,
+        file_id: created_metadata.file_id,
+        parent_file_id: live.query_metadata(DIRECTORY).unwrap().file_id,
+        path: FILE,
+        attributes: created_metadata.attributes,
+        is_directory: false,
+        times: [created_metadata.creation_time, created_metadata.last_access_time,
+            created_metadata.last_write_time, created_metadata.change_time],
+    }).unwrap();
+    let encoded = encode_file_delta_wal_payload(FileDeltaRecord {
+        sequence: 2,
+        file_id: written_metadata.file_id,
+        path: FILE,
+        end_of_file: contents.len() as u64,
+        extents: &extents,
+    }).unwrap();
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(64), INCARNATION).unwrap();
+    append(&mut wal, &creation);
+    append(&mut wal, &encoded);
+    let wal = recover_after_power_cut(wal.into_device().unwrap());
+
+    let mut restored = FileSystem::from_volume_snapshot(&base).unwrap();
+    assert_eq!(
+        restored.query_metadata(DIRECTORY).unwrap().file_id,
+        live.query_metadata(DIRECTORY).unwrap().file_id,
+    );
+    let mut replay = BootSystemPreRead::new(
+        &restored,
+        r"\??\C:\ReactOS\System32\Config\SYSTEM",
+        r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG",
+    );
+    assert_eq!(wal.records().len(), 2);
+    for record in wal.records() {
+        match decode_volume_wal_payload(&record.payload).unwrap() {
+            VolumeWalPayload::FileCreate(payload) => {
+                assert_eq!(replay.replay_file_create(&mut restored, payload), Ok(()));
+            }
+            VolumeWalPayload::FileDelta(payload) => {
+                assert_eq!(replay.replay_file_delta(&mut restored, payload), Ok(()));
+            }
+            other => panic!("committed payload routed as {other:?}"),
+        }
+    }
+    assert_eq!(restored.file_bytes_owned(FILE), Some(contents));
+    let recovered_metadata = restored.query_metadata(FILE).unwrap();
+    assert_eq!(recovered_metadata.file_id, created_metadata.file_id);
+    assert_eq!(recovered_metadata.attributes, created_metadata.attributes);
+    assert_eq!(recovered_metadata.is_directory, created_metadata.is_directory);
+    assert_eq!(recovered_metadata.creation_time, created_metadata.creation_time);
+    assert_eq!(recovered_metadata.end_of_file, written_metadata.end_of_file);
+    assert_eq!(recovered_metadata.valid_data_length, written_metadata.valid_data_length);
+    assert_eq!(recovered_metadata.allocation_size, written_metadata.allocation_size);
+    // FileDelta records contain bytes and EOF, not the final write/change timestamps.
+    let sibling = r"\??\C:\ReactOS\System32\Config\NEXT";
+    assert!(live.provision_file(sibling, b""));
+    assert!(restored.provision_file(sibling, b""));
+    assert_eq!(restored.existing_file_id(sibling), live.existing_file_id(sibling));
+}
+
+#[test]
+fn create_then_delta_replays_from_both_intermediate_snapshot_positions() {
+    let mut live = FileSystem::new(MemFs::new());
+    assert!(live.provision_directory(DIRECTORY));
+    let opened = live.zw_create_file(
+        FILE, crate::FILE_WRITE_DATA, crate::FILE_ATTRIBUTE_HIDDEN, 0,
+        crate::FILE_CREATE, crate::FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(opened.status, crate::STATUS_SUCCESS);
+    let creation = encode_file_create_wal_payload(creation_record(&live, 1, FILE, DIRECTORY)).unwrap();
+    let after_create = live.export_volume_snapshot().unwrap();
+    assert_eq!(live.zw_write_file(opened.handle, None, b"later bytes"), (crate::STATUS_SUCCESS, 11));
+    assert_eq!(live.zw_close(opened.handle), crate::STATUS_SUCCESS);
+    let bytes = live.file_bytes_owned(FILE).unwrap();
+    let extents = changed_file_delta_extents(&[], &bytes).unwrap();
+    let delta = encode_file_delta_wal_payload(FileDeltaRecord {
+        sequence: 2, file_id: live.existing_file_id(FILE).unwrap(), path: FILE,
+        end_of_file: bytes.len() as u64, extents: &extents,
+    }).unwrap();
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(64), INCARNATION).unwrap();
+    append(&mut wal, &creation);
+    append(&mut wal, &delta);
+    let wal = recover_after_power_cut(wal.into_device().unwrap());
+    assert_eq!(wal.records().len(), 2);
+
+    // A later snapshot can already include the creation. Replay must not allocate another ID
+    // whether it sees only the remaining suffix or the full anchored WAL.
+    let sibling = r"\??\C:\ReactOS\System32\Config\After";
+    assert!(live.provision_file(sibling, b""));
+    for suffix_start in [0, 1] {
+        let mut restored = FileSystem::from_volume_snapshot(&after_create).unwrap();
+        let mut replay = BootSystemPreRead::new(
+            &restored,
+            r"\??\C:\ReactOS\System32\Config\SYSTEM",
+            r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG",
+        );
+        for record in &wal.records()[suffix_start..] {
+            match decode_volume_wal_payload(&record.payload).unwrap() {
+                VolumeWalPayload::FileCreate(payload) => {
+                    assert_eq!(replay.replay_file_create(&mut restored, payload), Ok(()));
+                }
+                VolumeWalPayload::FileDelta(payload) => {
+                    assert_eq!(replay.replay_file_delta(&mut restored, payload), Ok(()));
+                }
+                other => panic!("committed payload routed as {other:?}"),
+            }
+        }
+        assert_eq!(restored.file_bytes_owned(FILE), Some(bytes.clone()));
+        assert_eq!(restored.query_metadata(FILE).unwrap().file_id, live.query_metadata(FILE).unwrap().file_id);
+        assert!(restored.provision_file(sibling, b""));
+        assert_eq!(restored.existing_file_id(sibling), live.existing_file_id(sibling));
+    }
+}
+
+#[test]
+fn directory_creation_must_replay_before_its_child_creation() {
+    let mut live = FileSystem::new(MemFs::new());
+    assert!(live.provision_directory(DIRECTORY));
+    let base = live.export_volume_snapshot().unwrap();
+    let directory = live.zw_create_file(
+        CREATED_DIRECTORY, crate::FILE_READ_DATA, crate::FILE_ATTRIBUTE_DIRECTORY, 0,
+        crate::FILE_CREATE, crate::FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(directory.status, crate::STATUS_SUCCESS);
+    assert_eq!(live.zw_close(directory.handle), crate::STATUS_SUCCESS);
+    let child = live.zw_create_file(
+        CREATED_CHILD, crate::FILE_WRITE_DATA, crate::FILE_ATTRIBUTE_HIDDEN, 0,
+        crate::FILE_CREATE, crate::FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(child.status, crate::STATUS_SUCCESS);
+    assert_eq!(live.zw_close(child.handle), crate::STATUS_SUCCESS);
+    let directory_record = encode_file_create_wal_payload(
+        creation_record(&live, 1, CREATED_DIRECTORY, DIRECTORY),
+    ).unwrap();
+    let child_record = encode_file_create_wal_payload(
+        creation_record(&live, 2, CREATED_CHILD, CREATED_DIRECTORY),
+    ).unwrap();
+    let directory_payload = crate::decode_file_create_wal_payload(&directory_record).unwrap();
+    let child_payload = crate::decode_file_create_wal_payload(&child_record).unwrap();
+    let mut restored = FileSystem::from_volume_snapshot(&base).unwrap();
+    let mut replay = BootSystemPreRead::new(
+        &restored,
+        r"\??\C:\ReactOS\System32\Config\SYSTEM",
+        r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG",
+    );
+    assert_eq!(
+        replay.replay_file_create(&mut restored, child_payload),
+        Err(FileDeltaWalReplayError::MissingFile),
+    );
+    assert_eq!(restored.query_metadata(CREATED_CHILD), None);
+    assert_eq!(replay.replay_file_create(&mut restored, directory_payload), Ok(()));
+    assert_eq!(replay.replay_file_create(&mut restored, child_payload), Ok(()));
+    for path in [CREATED_DIRECTORY, CREATED_CHILD] {
+        let expected = live.query_metadata(path).unwrap();
+        let actual = restored.query_metadata(path).unwrap();
+        assert_eq!(actual.file_id, expected.file_id);
+        assert_eq!(actual.attributes, expected.attributes);
+        assert_eq!(actual.is_directory, expected.is_directory);
+    }
+    let sibling = r"\??\C:\ReactOS\System32\Config\Next";
+    assert!(live.provision_file(sibling, b""));
+    assert!(restored.provision_file(sibling, b""));
+    assert_eq!(restored.existing_file_id(sibling), live.existing_file_id(sibling));
+}
+
+#[test]
+fn create_replay_rejects_foreign_parent_identity_and_sequence_gaps() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(DIRECTORY));
+    let parent_file_id = fs.query_metadata(DIRECTORY).unwrap().file_id;
+    let record = FileCreateWalPayload {
+        sequence: 4, file_id: parent_file_id + 1, parent_file_id, path: FILE,
+        attributes: crate::FILE_ATTRIBUTE_HIDDEN, is_directory: false, times: [11, 12, 13, 14],
+    };
+    let mut cursor = FileDeltaReplayCursor::new();
+    let foreign = FileCreateWalPayload { parent_file_id: parent_file_id + 1, ..record };
+    assert_eq!(
+        fs.replay_file_create_wal_payload(&mut cursor, foreign),
+        Err(FileDeltaWalReplayError::ForeignIdentity),
+    );
+    assert_eq!(fs.existing_file_id(FILE), None);
+    assert_eq!(cursor.last_applied(), None);
+    let gap = FileCreateWalPayload { file_id: record.file_id + 1, ..record };
+    assert_eq!(
+        fs.replay_file_create_wal_payload(&mut cursor, gap),
+        Err(FileDeltaWalReplayError::ForeignIdentity),
+    );
+    assert_eq!(fs.existing_file_id(FILE), None);
+    assert_eq!(cursor.last_applied(), None);
+    assert_eq!(fs.replay_file_create_wal_payload(&mut cursor, record), Ok(()));
+    assert_eq!(fs.existing_file_id(FILE), Some(record.file_id));
+    assert_eq!(fs.query_metadata(FILE).unwrap().attributes, crate::FILE_ATTRIBUTE_HIDDEN);
+    let metadata = fs.query_metadata(FILE);
+    assert_eq!(
+        fs.replay_file_create_wal_payload(&mut cursor, FileCreateWalPayload { sequence: 6, ..record }),
+        Err(FileDeltaWalReplayError::OutOfOrder),
+    );
+    assert_eq!(
+        fs.replay_file_create_wal_payload(&mut cursor, record),
+        Err(FileDeltaWalReplayError::OutOfOrder),
+    );
+    assert_eq!(fs.query_metadata(FILE), metadata);
+    assert_eq!(cursor.last_applied(), Some(4));
+}
+
+#[test]
+fn create_replay_allows_a_sibling_of_a_protected_log_but_refuses_the_log_itself() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(DIRECTORY));
+    assert!(fs.provision_file(LOG, b"anchored log"));
+    let parent_file_id = fs.query_metadata(DIRECTORY).unwrap().file_id;
+    let log_file_id = fs.existing_file_id(LOG).unwrap();
+    fs.protect_wal_log(LOG, log_file_id).unwrap();
+    let mut cursor = FileDeltaReplayCursor::new();
+    let sibling = FileCreateWalPayload {
+        sequence: 1, file_id: log_file_id + 1, parent_file_id, path: FILE,
+        attributes: crate::FILE_ATTRIBUTE_HIDDEN, is_directory: false, times: [0; 4],
+    };
+    assert_eq!(fs.replay_file_create_wal_payload(&mut cursor, sibling), Ok(()));
+    assert_eq!(fs.existing_file_id(FILE), Some(sibling.file_id));
+    let protected = FileCreateWalPayload {
+        sequence: 2, file_id: log_file_id, parent_file_id, path: LOG,
+        attributes: fs.query_metadata(LOG).unwrap().attributes,
+        is_directory: false, times: [0; 4],
+    };
+    assert_eq!(
+        fs.replay_file_create_wal_payload(&mut cursor, protected),
+        Err(FileDeltaWalReplayError::ProtectedTarget),
+    );
+    assert_eq!(fs.file_bytes_owned(LOG), Some(b"anchored log".to_vec()));
+    assert_eq!(cursor.last_applied(), Some(1));
+}
+
+#[test]
+fn uncommitted_create_record_does_not_materialize_a_name_after_power_cut() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(DIRECTORY));
+    let record = encode_file_create_wal_payload(FileCreateWalPayload {
+        sequence: 1,
+        file_id: fs.query_metadata(DIRECTORY).unwrap().file_id + 1,
+        parent_file_id: fs.query_metadata(DIRECTORY).unwrap().file_id,
+        path: FILE,
+        attributes: crate::FILE_ATTRIBUTE_HIDDEN,
+        is_directory: false,
+        times: [0; 4],
+    }).unwrap();
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(64), INCARNATION).unwrap();
+    wal.begin(record).unwrap();
+    wal.prepare().unwrap();
+    let wal = recover_after_power_cut(wal.into_device_for_test());
+    assert!(wal.records().is_empty());
+    assert_eq!(fs.existing_file_id(FILE), None);
 }
 
 #[test]
@@ -261,6 +558,9 @@ fn replay_recovered(wal: &RegistryWal<CachedDisk>, fs: &mut FileSystem) -> Resul
             VolumeWalPayload::System(_) => {}
             VolumeWalPayload::FileDelta(payload) => {
                 fs.replay_file_delta_wal_payload(&mut cursor, payload)?;
+            }
+            VolumeWalPayload::FileCreate(payload) => {
+                fs.replay_file_create_wal_payload(&mut cursor, payload)?;
             }
         }
     }

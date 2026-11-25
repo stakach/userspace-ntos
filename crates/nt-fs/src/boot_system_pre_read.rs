@@ -6,7 +6,7 @@
 
 use crate::{
     FileDeltaReplayCursor, FileDeltaWalPayload, FileDeltaWalReplayError, FileSystem,
-    HiveLogWalPayload, HiveLogWalReplay, HiveLogWalReplayError,
+    FileCreateWalPayload, HiveLogWalPayload, HiveLogWalReplay, HiveLogWalReplayError,
 };
 
 pub struct BootSystemPreRead {
@@ -49,6 +49,17 @@ impl BootSystemPreRead {
             return Err(FileDeltaWalReplayError::ProtectedTarget);
         }
         fs.replay_file_delta_wal_payload(&mut self.file_delta_cursor, payload)
+    }
+
+    pub fn replay_file_create(
+        &mut self,
+        fs: &mut FileSystem,
+        payload: FileCreateWalPayload<'_>,
+    ) -> Result<(), FileDeltaWalReplayError> {
+        if self.is_pre_read(payload.file_id) {
+            return Err(FileDeltaWalReplayError::ProtectedTarget);
+        }
+        fs.replay_file_create_wal_payload(&mut self.file_delta_cursor, payload)
     }
 }
 
