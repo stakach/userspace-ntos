@@ -65052,8 +65052,25 @@ unsafe fn read_hosted_device_resource_state_from_shared(
             [SharedAddressResource::default(); SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize],
         ));
     let mut evidence = read_hosted_hardware_evidence_from_shared(binding, sh);
+    // The first grant refresh reads the PnP window from this bank. Once the root records
+    // its physical DMA grant, a later callback may use another lane's mutable bank.
+    // Retain the exact device's grant until revocation or a new PnP lease resets the row.
+    let retained_dma = previous_state.filter(|state| {
+        state.driver_id == binding.driver_id
+            && state.instance == binding.instance
+            && state.projection_domain == binding.projection_domain
+            && state.pdo_object == binding.pdo_object
+            && state.pnp_context_lease.is_some()
+            && state.dma_frame_base != 0
+            && state.dma_pages != 0
+            && state.dma_broker_va != 0
+    }).map(|state| nt_hosted_runtime::DmaGrantEvidence {
+        va: state.evidence.dma_common_va,
+        len: state.evidence.dma_common_len,
+        logical: state.evidence.dma_common_logical,
+    });
     let grant = nt_hosted_runtime::dma_grant_after_bank_refresh(
-        None,
+        retained_dma,
         nt_hosted_runtime::DmaGrantEvidence {
             va: evidence.dma_common_va,
             len: evidence.dma_common_len,
