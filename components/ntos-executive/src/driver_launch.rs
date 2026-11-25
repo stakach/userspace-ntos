@@ -13272,7 +13272,14 @@ unsafe fn dma_reserve_records_for_map(map_register_base: u64) -> Option<DmaRetir
         return None;
     }
     let adapter_id = read_unaligned((map_register_base + 16) as *const u64);
-    if adapter_id == 0 {
+    dma_reserve_records_for_map_owner(adapter_id, map_register_base)
+}
+
+unsafe fn dma_reserve_records_for_map_owner(
+    adapter_id: u64,
+    map_register_base: u64,
+) -> Option<DmaRetirementClaim> {
+    if adapter_id == 0 || map_register_base == 0 {
         return None;
     }
     let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
@@ -13406,9 +13413,42 @@ unsafe fn dma_retire_claimed_map(adapter: u64, claim: DmaRetirementClaim) {
 
 // The spin guard protects only the local shared-record transition. A provider service can
 // suspend this lane and reenter DMA from another lane, so it must run after the guard drops.
-unsafe fn dma_reserve_sg_records(map_register_base: u64) -> Option<DmaRetirementClaim> {
+unsafe fn dma_reserve_sg_records(
+    adapter: u64,
+    map_register_base: u64,
+    current_va: u64,
+    length: u32,
+    write_to_device: u8,
+) -> Option<DmaSgFlushPlan> {
     let _allocation_guard = HostedDmaAllocationGuard::acquire();
-    dma_reserve_records_for_map(map_register_base)
+    let metadata = dma_adapter_metadata(adapter)?;
+    if map_register_base == 0 || current_va == 0 || length == 0 {
+        return None;
+    }
+    let record = dma_find_map_record(metadata.adapter_id, map_register_base, current_va)?;
+    let mapped_len = dma_record_load(record, SH_DMA_ALLOC_RECORD_LEN);
+    let source_va = dma_record_load(record, SH_DMA_ALLOC_RECORD_SOURCE_VA);
+    let bounce_va = dma_record_load(record, SH_DMA_ALLOC_RECORD_VA);
+    if u64::from(length) > mapped_len || source_va == 0 || bounce_va == 0 {
+        return None;
+    }
+    let copyback = match dma_record_load(record, SH_DMA_ALLOC_RECORD_KIND) {
+        HOSTED_DMA_RECORD_KIND_MAP_TRANSFER => {
+            (write_to_device == 0 && source_va != bounce_va)
+                .then_some((source_va, bounce_va, u64::from(length)))
+        }
+        HOSTED_DMA_RECORD_KIND_COHERENT_MAP if source_va == bounce_va => None,
+        _ => return None,
+    };
+    let claim = dma_reserve_records_for_map_owner(metadata.adapter_id, map_register_base)?;
+    Some(DmaSgFlushPlan { claim, copyback })
+}
+
+// A transient copyback plan is captured from the live row before reservation hides it from
+// ordinary FlushAdapterBuffers calls. The reserved epoch remains the authoritative owner.
+struct DmaSgFlushPlan {
+    claim: DmaRetirementClaim,
+    copyback: Option<(u64, u64, u64)>,
 }
 
 unsafe fn dma_clear_retired_sg_records(claim: DmaRetirementClaim) {
@@ -14352,7 +14392,6 @@ extern "win64" fn s_dma_put_scatter_gather_list(
             HOSTED_DMA_PUT_SG_QUERY_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        let mdl = read_unaligned((sg_context + HOSTED_SG_CONTEXT_MDL) as *const u64);
         let current_va = read_unaligned((sg_context + HOSTED_SG_CONTEXT_CURRENT_VA) as *const u64);
         let length = read_unaligned((sg_context + HOSTED_SG_CONTEXT_LENGTH) as *const u32);
         let stored_write_to_device =
@@ -14364,14 +14403,17 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         };
         // Mark every local mapping for this token before an external effect. A duplicate PutSG
         // sees the reservation and cannot replay an uncertain provider retirement.
-        let Some(claim) = dma_reserve_sg_records(map_register) else {
+        let Some(plan) = dma_reserve_sg_records(
+            adapter, map_register, current_va, length, direction,
+        ) else {
             HOSTED_DMA_PUT_SG_RESERVE_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        let _ =
-            s_dma_flush_adapter_buffers(adapter, mdl, map_register, current_va, length, direction);
+        if let Some((source_va, bounce_va, copy_len)) = plan.copyback {
+            dma_copy_bytes(source_va, bounce_va, copy_len);
+        }
         if dma_retire_sg_list(adapter, scatter_gather) {
-            dma_clear_retired_sg_records(claim);
+            dma_clear_retired_sg_records(plan.claim);
         }
     }
 }
