@@ -1,9 +1,9 @@
-//! Execute the native PutScatterGatherList body with a provider that checks lock ownership.
+//! Execute native SG flush and PutScatterGatherList bodies with exact record ownership.
 
 use std::process::Command;
 
 #[test]
-fn put_sg_never_holds_allocation_spin_guard_across_provider_effects() {
+fn put_sg_preserves_copyback_and_releases_guard_before_provider_effects() {
     let source = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
     let start = source
         .find("extern \"win64\" fn s_dma_put_scatter_gather_list(")
@@ -34,7 +34,28 @@ fn put_sg_never_holds_allocation_spin_guard_across_provider_effects() {
         .expect("following native export");
     let helpers = &source[helpers_start..helpers_start + helpers_end];
     syn::parse_file(helpers).expect("complete short SG record transitions");
-    let fixture = format!("{PORTS}\n{claim_helpers}\n{helpers}\n{host_body}\n{CASES}");
+    let copy_start = source
+        .find("unsafe fn dma_copy_bytes(")
+        .expect("native DMA byte copy");
+    let copy_end = source[copy_start..]
+        .find("\nunsafe fn dma_allocate_private_graph(")
+        .expect("following private DMA graph allocation");
+    let copy = &source[copy_start..copy_start + copy_end];
+    syn::parse_file(copy).expect("complete native DMA byte copy");
+    let flush_start = source
+        .find("unsafe fn dma_find_map_record(")
+        .expect("native active map lookup");
+    let flush_end = source[flush_start..]
+        .find("\nextern \"win64\" fn s_dma_free_map_registers(")
+        .expect("following native FreeMapRegisters");
+    let flush = &source[flush_start..flush_start + flush_end];
+    syn::parse_file(flush).expect("complete native DMA flush and map lookup");
+    let flush = flush.replacen(
+        "extern \"win64\" fn s_dma_flush_adapter_buffers(",
+        "fn s_dma_flush_adapter_buffers(",
+        1,
+    );
+    let fixture = format!("{PORTS}\n{copy}\n{flush}\n{claim_helpers}\n{helpers}\n{host_body}\n{CASES}");
     let directory =
         std::env::temp_dir().join(format!("nt-native-dma-sg-put-lock-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
@@ -69,6 +90,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const HOSTED_DMA_RECORD_KIND_MAP_TRANSFER: u64 = 2;
 const HOSTED_DMA_RECORD_KIND_COHERENT_MAP: u64 = 3;
+const HOSTED_DMA_MAP_REGISTER_SIGNATURE: u64 = 0x4D41_5052_4547_3031;
 const DMA_RECORD_RESERVED: u64 = u64::MAX;
 const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x20;
 const SH_DMA_ALLOC_RECORDS: u64 = 0x100;
@@ -111,6 +133,10 @@ impl Drop for HostedDmaAllocationGuard {
     fn drop(&mut self) { LOCKED.store(false, Ordering::Release); }
 }
 fn token() -> u64 { core::ptr::addr_of!(TOKEN) as u64 }
+struct HostedDmaAdapterMetadata { adapter_id: u64 }
+unsafe fn dma_adapter_metadata(adapter: u64) -> Option<HostedDmaAdapterMetadata> {
+    (adapter == 7).then_some(HostedDmaAdapterMetadata { adapter_id: 7 })
+}
 unsafe fn dma_allocation_record_capacity(_: u64) -> u64 { 2 }
 unsafe fn dma_allocation_record(sh: u64, index: u64) -> Option<u64> {
     (index < 2).then_some(sh + SH_DMA_ALLOC_RECORDS + index * SH_DMA_ALLOC_RECORD_SIZE)
@@ -162,12 +188,6 @@ unsafe fn dma_query_sg_members(adapter: u64, list: u64) -> Option<(u64, u64)> {
     QUERIES.fetch_add(1, Ordering::Relaxed);
     Some((token(), core::ptr::addr_of!(CONTEXT) as u64))
 }
-unsafe fn s_dma_flush_adapter_buffers(
-    adapter: u64, mdl: u64, map: u64, va: u64, length: u32, direction: u8,
-) -> u8 {
-    assert_eq!((adapter, mdl, map, va, length, direction), (7, 17, token(), 23, 31, 1));
-    1
-}
 unsafe fn dma_retire_sg_list(adapter: u64, list: u64) -> bool {
     assert!(!LOCKED.load(Ordering::Acquire), "provider retirement under spin guard");
     assert_eq!((adapter, list), (7, 11));
@@ -200,7 +220,13 @@ unsafe fn dma_retire_sg_list(adapter: u64, list: u64) -> bool {
 "#;
 
 const CASES: &str = r#"
-fn reset() -> Vec<u64> {
+struct FixtureMemory {
+    _shared: Vec<u64>,
+    source: Vec<u8>,
+    bounce: Vec<u8>,
+}
+
+fn reset_with(kind: u64, write_to_device: u8) -> FixtureMemory {
     LOCKED.store(false, Ordering::Release);
     RETIRE_SUCCEEDS.store(false, Ordering::Release);
     INVALIDATE_ON_LAST_ALIAS.store(false, Ordering::Release);
@@ -213,30 +239,41 @@ fn reset() -> Vec<u64> {
     HOSTED_DMA_PUT_SG_QUERY_FAILED_COUNT.store(0, Ordering::Relaxed);
     HOSTED_DMA_PUT_SG_RESERVE_FAILED_COUNT.store(0, Ordering::Relaxed);
     let mut shared = vec![0u64; 64];
+    let source = vec![0x11u8; 64];
+    let bounce = vec![0xA5u8; 64];
+    let source_va = if kind == HOSTED_DMA_RECORD_KIND_COHERENT_MAP {
+        bounce.as_ptr() as u64
+    } else {
+        source.as_ptr() as u64
+    };
     unsafe {
         FSD_SHARED_VADDR = shared.as_mut_ptr() as u64;
         TOKEN[0] = 0x4D41_5052_4547_3031;
         TOKEN[2] = 7;
         CONTEXT[2] = 17; // MDL
-        CONTEXT[3] = 23; // current VA
+        CONTEXT[3] = source_va; // exact current VA
         CONTEXT[4] = 31; // length
-        CONTEXT[5] = 1;  // write to device
+        CONTEXT[5] = write_to_device as u64;
         let row = dma_allocation_record(FSD_SHARED_VADDR, 0).unwrap();
         dma_record_store(row, SH_DMA_ALLOC_RECORD_LOGICAL, 0x1000);
         dma_record_store(row, SH_DMA_ALLOC_RECORD_LEN, 64);
-        dma_record_store(row, SH_DMA_ALLOC_RECORD_VA, 0x4000);
-        dma_record_store(row, SH_DMA_ALLOC_RECORD_KIND, HOSTED_DMA_RECORD_KIND_MAP_TRANSFER);
-        dma_record_store(row, SH_DMA_ALLOC_RECORD_SOURCE_VA, 0x5000);
+        dma_record_store(row, SH_DMA_ALLOC_RECORD_VA, bounce.as_ptr() as u64);
+        dma_record_store(row, SH_DMA_ALLOC_RECORD_KIND, kind);
+        dma_record_store(row, SH_DMA_ALLOC_RECORD_SOURCE_VA, source_va);
         dma_record_store(row, SH_DMA_ALLOC_RECORD_MAP_REGISTER, token());
         dma_record_store(row, SH_DMA_ALLOC_RECORD_ADAPTER_ID, 7);
         write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, 1);
     }
-    shared
+    FixtureMemory { _shared: shared, source, bounce }
+}
+
+fn reset() -> FixtureMemory {
+    reset_with(HOSTED_DMA_RECORD_KIND_MAP_TRANSFER, 1)
 }
 
 #[test]
 fn uncertain_retirement_keeps_the_claim_and_refuses_replay() {
-    let _shared = reset();
+    let mut memory = reset_with(HOSTED_DMA_RECORD_KIND_MAP_TRANSFER, 0);
     s_dma_put_scatter_gather_list(7, 11, 0);
     assert_eq!(QUERIES.load(Ordering::Relaxed), 1);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
@@ -250,11 +287,52 @@ fn uncertain_retirement_keeps_the_claim_and_refuses_replay() {
     assert!(!LOCKED.load(Ordering::Acquire));
 
     // A second entry cannot replay the uncertain provider effect.
+    let source_after_first = memory.source.clone();
+    memory.bounce.fill(0x5A);
     s_dma_put_scatter_gather_list(7, 11, 0);
     assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
     assert_eq!(HOSTED_DMA_PUT_SG_ENTER_COUNT.load(Ordering::Relaxed), 2);
     assert_eq!(HOSTED_DMA_PUT_SG_RESERVE_FAILED_COUNT.load(Ordering::Relaxed), 1);
     assert_eq!(unsafe { dma_record_load(row, SH_DMA_ALLOC_RECORD_LEN) }, DMA_RECORD_RESERVED);
+    assert_eq!(memory.source, source_after_first,
+        "duplicate PutSG must not copy bytes after an uncertain retirement");
+}
+
+#[test]
+fn device_to_memory_put_copies_exact_bounce_bytes_before_retirement() {
+    let mut memory = reset_with(HOSTED_DMA_RECORD_KIND_MAP_TRANSFER, 0);
+    let source_va = memory.source.as_ptr() as u64;
+    assert_eq!(s_dma_flush_adapter_buffers(7, 17, token(), source_va, 31, 0), 1,
+        "the production flush must find a published active map");
+    assert_eq!(&memory.source[..31], &memory.bounce[..31]);
+    memory.source.fill(0x11);
+
+    RETIRE_SUCCEEDS.store(true, Ordering::Release);
+    s_dma_put_scatter_gather_list(7, 11, 0);
+
+    assert_eq!(&memory.source[..31], &memory.bounce[..31],
+        "PutSG must copy the completed device bytes before retiring its exact map");
+    assert_eq!(memory.source[31], 0x11, "copyback must respect the requested length");
+    assert_eq!(RETIRES.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn write_to_device_and_coherent_maps_do_not_copy_back() {
+    let write_memory = reset();
+    let source_va = write_memory.source.as_ptr() as u64;
+    assert_eq!(s_dma_flush_adapter_buffers(7, 17, token(), source_va, 31, 1), 1);
+    RETIRE_SUCCEEDS.store(true, Ordering::Release);
+    s_dma_put_scatter_gather_list(7, 11, 1);
+    assert!(write_memory.source.iter().all(|byte| *byte == 0x11));
+    assert!(write_memory.bounce.iter().all(|byte| *byte == 0xA5));
+
+    let coherent_memory = reset_with(HOSTED_DMA_RECORD_KIND_COHERENT_MAP, 0);
+    let coherent_va = coherent_memory.bounce.as_ptr() as u64;
+    assert_eq!(s_dma_flush_adapter_buffers(7, 17, token(), coherent_va, 31, 0), 1);
+    RETIRE_SUCCEEDS.store(true, Ordering::Release);
+    s_dma_put_scatter_gather_list(7, 11, 0);
+    assert!(coherent_memory.source.iter().all(|byte| *byte == 0x11));
+    assert!(coherent_memory.bounce.iter().all(|byte| *byte == 0xA5));
 }
 
 #[test]
