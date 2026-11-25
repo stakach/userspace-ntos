@@ -108,6 +108,18 @@ pub struct RuntimeSample {
     pub donated_us: u64,
 }
 
+/// Independent reads at one exact table boundary. A failed read of either SC must not
+/// discard the other observation; both remain diagnostic and confer no scheduling authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PairedRuntimeSample {
+    pub child: Option<RuntimeSample>,
+    pub root: Option<RuntimeSample>,
+}
+
+impl PairedRuntimeSample {
+    fn has_any(self) -> bool { self.child.is_some() || self.root.is_some() }
+}
+
 /// Closed Close→Unmap intervals. Runtime and fault totals are separate observations;
 /// donated execution may overlap an acknowledged fault and must not be subtracted twice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,35 +134,71 @@ pub struct CloseUnmapRuntimeTotals {
     pub failed_read: u64,
     pub changed_context: u64,
     pub counter_regression: u64,
+    /// Root SC bound time is a lower bound for root TCB execution: a hosted caller can
+    /// donate another SC to the root. It must not be subtracted from child or fault time.
+    pub root_classified: u64,
+    pub root_bound_us: u64,
+    pub root_donated_us: u64,
+    pub root_unclassified_100ns: u64,
+    pub root_failed_read: u64,
+    pub root_changed_context: u64,
+    pub root_counter_regression: u64,
 }
 
 impl CloseUnmapRuntimeTotals {
     const EMPTY: Self = Self { pairs: 0, classified: 0, wall_100ns: 0,
         fault_100ns: 0, bound_us: 0, donated_us: 0, unclassified_100ns: 0,
-        failed_read: 0, changed_context: 0, counter_regression: 0 };
+        failed_read: 0, changed_context: 0, counter_regression: 0,
+        root_classified: 0, root_bound_us: 0, root_donated_us: 0,
+        root_unclassified_100ns: 0, root_failed_read: 0,
+        root_changed_context: 0, root_counter_regression: 0 };
 
     fn observe(&mut self, gap: u64, fault: u64,
-        returned: Option<RuntimeSample>, entered: Option<RuntimeSample>) {
+        returned: PairedRuntimeSample, entered: PairedRuntimeSample) {
         self.pairs = self.pairs.saturating_add(1);
         self.wall_100ns = self.wall_100ns.saturating_add(gap);
         self.fault_100ns = self.fault_100ns.saturating_add(fault);
-        match (returned, entered) {
+        let child_classified = match (returned.child, entered.child) {
             (Some(start), Some(end)) if start.sched_context != end.sched_context => {
                 self.changed_context = self.changed_context.saturating_add(1);
+                false
             }
             (Some(start), Some(end)) if end.bound_us < start.bound_us
                 || end.donated_us < start.donated_us => {
                 self.counter_regression = self.counter_regression.saturating_add(1);
+                false
             }
             (Some(start), Some(end)) if start.sched_context != 0 => {
                 self.classified = self.classified.saturating_add(1);
                 self.bound_us = self.bound_us.saturating_add(end.bound_us - start.bound_us);
                 self.donated_us = self.donated_us.saturating_add(end.donated_us - start.donated_us);
+                true
+            }
+            _ => {
+                self.failed_read = self.failed_read.saturating_add(1);
+                false
+            }
+        };
+        if !child_classified {
+            self.unclassified_100ns = self.unclassified_100ns.saturating_add(gap);
+        }
+        match (returned.root, entered.root) {
+            (Some(start), Some(end)) if start.sched_context != end.sched_context => {
+                self.root_changed_context = self.root_changed_context.saturating_add(1);
+            }
+            (Some(start), Some(end)) if end.bound_us < start.bound_us
+                || end.donated_us < start.donated_us => {
+                self.root_counter_regression = self.root_counter_regression.saturating_add(1);
+            }
+            (Some(start), Some(end)) if start.sched_context != 0 => {
+                self.root_classified = self.root_classified.saturating_add(1);
+                self.root_bound_us = self.root_bound_us.saturating_add(end.bound_us - start.bound_us);
+                self.root_donated_us = self.root_donated_us.saturating_add(end.donated_us - start.donated_us);
                 return;
             }
-            _ => { self.failed_read = self.failed_read.saturating_add(1); }
+            _ => { self.root_failed_read = self.root_failed_read.saturating_add(1); }
         }
-        self.unclassified_100ns = self.unclassified_100ns.saturating_add(gap);
+        self.root_unclassified_100ns = self.root_unclassified_100ns.saturating_add(gap);
     }
 }
 
@@ -204,7 +252,7 @@ struct ActiveSpan { ssn: u32, at_100ns: u64 }
 struct LastReturn { ssn: u32, status: u32, at_100ns: u64 }
 
 #[derive(Clone, Copy)]
-struct CloseReturnRuntime { at_100ns: u64, sample: Option<RuntimeSample> }
+struct CloseReturnRuntime { at_100ns: u64, sample: PairedRuntimeSample }
 
 #[derive(Clone, Copy)]
 struct ActiveFault {
@@ -450,6 +498,12 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
     /// The runtime sample is optional: a failed observation never changes the wall/fault gap.
     pub fn begin_with_runtime(&mut self, owner: SpanOwner, ssn: u32, now: u64,
         runtime: Option<RuntimeSample>) -> bool {
+        self.begin_with_pair_runtime(owner, ssn, now,
+            PairedRuntimeSample { child: runtime, root: None })
+    }
+
+    pub fn begin_with_pair_runtime(&mut self, owner: SpanOwner, ssn: u32, now: u64,
+        runtime: PairedRuntimeSample) -> bool {
         let Some(row) = self.rows.iter_mut().find(|row| row.owner == Some(owner)) else {
             return false;
         };
@@ -466,7 +520,8 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
                 .filter(|observed| observed.at_100ns == last.at_100ns);
             if last.ssn == SSN_NT_CLOSE && ssn == SSN_NT_UNMAP_VIEW_OF_SECTION {
                 row.close_unmap.observe(gap, fault,
-                    close_runtime.and_then(|observed| observed.sample), runtime);
+                    close_runtime.map_or(PairedRuntimeSample::default(), |observed| observed.sample),
+                    runtime);
             }
             row.total_gap_100ns = row.total_gap_100ns.saturating_add(gap);
             row.completed_fault_gap_100ns = row.completed_fault_gap_100ns
@@ -498,13 +553,19 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
         self.rows.iter().find(|row| row.owner == Some(owner)).is_some_and(|row| {
             row.last_return.is_some_and(|last| last.ssn == SSN_NT_CLOSE
                 && row.close_return_runtime.is_some_and(|observed|
-                    observed.at_100ns == last.at_100ns && observed.sample.is_some()))
+                    observed.at_100ns == last.at_100ns && observed.sample.has_any()))
         })
     }
 
     /// Attach a read to the exact nonpending Close return that opened this gap.
     pub fn record_close_runtime(&mut self, owner: SpanOwner, at_100ns: u64,
         sample: Option<RuntimeSample>) -> bool {
+        self.record_close_pair_runtime(owner, at_100ns,
+            PairedRuntimeSample { child: sample, root: None })
+    }
+
+    pub fn record_close_pair_runtime(&mut self, owner: SpanOwner, at_100ns: u64,
+        sample: PairedRuntimeSample) -> bool {
         let Some(row) = self.rows.iter_mut().find(|row| row.owner == Some(owner)) else {
             return false;
         };
@@ -706,6 +767,64 @@ mod tests {
         assert!(ledger.activate(next));
         assert!(!ledger.needs_runtime_sample(next, UNMAP));
         assert_eq!(ledger.snapshot(next, 1300).unwrap().close_unmap.wall_100ns, 0);
+    }
+
+    #[test]
+    fn close_unmap_root_and_child_reads_classify_independently() {
+        const CLOSE: u32 = 27;
+        const UNMAP: u32 = 277;
+        let sample = |sc, bound_us, donated_us| RuntimeSample {
+            sched_context: sc, bound_us, donated_us,
+        };
+        let mut ledger = InstallerSyscallSpans::<1, 1>::new();
+        assert!(ledger.activate(A));
+
+        assert!(ledger.begin(A, CLOSE, 100));
+        assert!(ledger.return_from_dispatch(A, CLOSE, 0, 200));
+        assert!(ledger.record_close_pair_runtime(A, 200, PairedRuntimeSample {
+            child: None, root: Some(sample(14, 1_000, 100)),
+        }));
+        assert!(ledger.needs_runtime_sample(A, UNMAP));
+        assert!(ledger.begin_with_pair_runtime(A, UNMAP, 500, PairedRuntimeSample {
+            child: None, root: Some(sample(14, 1_250, 130)),
+        }));
+        let first = ledger.snapshot(A, 500).unwrap().close_unmap;
+        assert_eq!((first.classified, first.failed_read, first.unclassified_100ns), (0, 1, 300));
+        assert_eq!((first.root_classified, first.root_bound_us, first.root_donated_us),
+            (1, 250, 30));
+        assert_eq!(first.root_unclassified_100ns, 0);
+
+        assert!(ledger.return_from_dispatch(A, UNMAP, 0, 510));
+        assert!(ledger.begin(A, CLOSE, 600));
+        assert!(ledger.return_from_dispatch(A, CLOSE, 0, 610));
+        assert!(ledger.record_close_pair_runtime(A, 610, PairedRuntimeSample {
+            child: Some(sample(71, 10, 20)), root: None,
+        }));
+        assert!(ledger.begin_with_pair_runtime(A, UNMAP, 910, PairedRuntimeSample {
+            child: Some(sample(71, 110, 70)), root: Some(sample(14, 1_500, 140)),
+        }));
+        let second = ledger.snapshot(A, 910).unwrap().close_unmap;
+        assert_eq!((second.classified, second.bound_us, second.donated_us), (1, 100, 50));
+        assert_eq!((second.root_classified, second.root_failed_read,
+            second.root_unclassified_100ns), (1, 1, 300));
+
+        assert!(ledger.return_from_dispatch(A, UNMAP, 0, 920));
+        assert!(ledger.begin(A, CLOSE, 930));
+        assert!(ledger.return_from_dispatch(A, CLOSE, 0, 940));
+        assert!(ledger.record_close_pair_runtime(A, 940, PairedRuntimeSample {
+            child: Some(sample(71, 200, 100)), root: Some(sample(14, 1_600, 200)),
+        }));
+        assert!(ledger.begin_with_pair_runtime(A, UNMAP, 1240, PairedRuntimeSample {
+            child: Some(sample(72, 300, 150)), root: Some(sample(14, 1_590, 210)),
+        }));
+        let third = ledger.snapshot(A, 1240).unwrap().close_unmap;
+        assert_eq!((third.pairs, third.wall_100ns, third.changed_context), (3, 900, 1));
+        assert_eq!((third.root_classified, third.root_counter_regression,
+            third.root_unclassified_100ns), (1, 1, 600));
+
+        let next = SpanOwner { process_generation: A.process_generation + 1, ..A };
+        assert!(ledger.activate(next));
+        assert_eq!(ledger.snapshot(next, 1240).unwrap().close_unmap.pairs, 0);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::*;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_hosted_runtime::{CensusEpochGate, InstallerFaultReceipt, InstallerFaultReceipts,
     InstallerFaultTicket,
-    InstallerSyscallSpans, RuntimeSample, SpanOwner};
+    InstallerSyscallSpans, PairedRuntimeSample, RuntimeSample, SpanOwner};
 use core::fmt::Write;
 
 const ROWS: usize = 8;
@@ -19,6 +19,8 @@ const GAP_SAMPLES_TOTAL: u64 = 64;
 const RUNTIME_READ_LIMIT: u64 = 8192;
 const RUNTIME_FINAL_LIMIT: u64 = 64;
 const SSN_NT_CLOSE: u32 = 27;
+// rust-micro publishes the boot rootserver's bound SC at the canonical init cap slot.
+const ROOT_SCHED_CONTEXT_CAP: u64 = 14;
 
 #[derive(Clone, Copy)]
 struct GapSampleRecord {
@@ -79,28 +81,40 @@ fn exact_owner(handler: &ExecNtHandler, pi: usize, tid: u64, badge: u64) -> Opti
 
 /// Read a cumulative SC counter without changing the hosted thread or its scheduling context.
 /// A failed or changed identity leaves the containing wall interval unclassified.
-fn runtime_sample(handler: &ExecNtHandler, owner: SpanOwner, badge: u64) -> Option<RuntimeSample> {
-    if exact_owner(handler, owner.process_index, owner.thread_id, badge) != Some(owner) {
-        return None;
-    }
-    let binding = handler.thread_runtime.executable_by_tid(owner.thread_id)?.binding();
-    if binding.pi != owner.process_index || binding.badge != badge { return None; }
-    let sched_context = handler.observed_sched_context_for_binding(binding).filter(|sc| *sc != 0)?;
+fn read_sched_runtime(sched_context: u64) -> Option<RuntimeSample> {
     if RUNTIME_READS_USED.fetch_update(Ordering::AcqRel, Ordering::Acquire,
         |used| (used < RUNTIME_READ_LIMIT).then_some(used + 1)).is_err() {
         RUNTIME_READS_REFUSED.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let read = {
-        let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
-        sel4_rt::sched_context_read_runtime(sched_context).ok()?
-    };
-    if exact_owner(handler, owner.process_index, owner.thread_id, badge) != Some(owner)
-        || handler.observed_sched_context_for_binding(binding) != Some(sched_context) {
-        return None;
-    }
+    let read = sel4_rt::sched_context_read_runtime(sched_context).ok()?;
     Some(RuntimeSample { sched_context, bound_us: read.bound_time_us,
         donated_us: read.donated_time_us })
+}
+
+fn runtime_sample(handler: &ExecNtHandler, owner: SpanOwner, badge: u64) -> PairedRuntimeSample {
+    if exact_owner(handler, owner.process_index, owner.thread_id, badge) != Some(owner) {
+        return PairedRuntimeSample::default();
+    }
+    let Some(binding) = handler.thread_runtime.executable_by_tid(owner.thread_id)
+        .map(|runtime| runtime.binding()) else { return PairedRuntimeSample::default() };
+    if binding.pi != owner.process_index || binding.badge != badge {
+        return PairedRuntimeSample::default();
+    }
+    let observed_sched_context = handler.observed_sched_context_for_binding(binding);
+    let sched_context = observed_sched_context.filter(|sc| *sc != 0);
+    let sample = {
+        let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+        PairedRuntimeSample {
+            child: sched_context.and_then(read_sched_runtime),
+            root: read_sched_runtime(ROOT_SCHED_CONTEXT_CAP),
+        }
+    };
+    if exact_owner(handler, owner.process_index, owner.thread_id, badge) != Some(owner)
+        || handler.observed_sched_context_for_binding(binding) != observed_sched_context {
+        return PairedRuntimeSample::default();
+    }
+    sample
 }
 
 fn retire_stale(handler: &ExecNtHandler) {
@@ -131,6 +145,14 @@ fn retire_stale(handler: &ExecNtHandler) {
                     runtime.unclassified_100ns / 10_000, runtime.failed_read,
                     runtime.changed_context, runtime.counter_regression]
                     .into_iter().enumerate() {
+                    if index != 0 { print_str(b"/"); }
+                    print_u64(value);
+                }
+                print_str(b" root-sc-lower-bound/classified/bound-us/donated-us/unclassified-ms/read-fail/context-change/counter-regress=");
+                for (index, value) in [runtime.root_classified, runtime.root_bound_us,
+                    runtime.root_donated_us, runtime.root_unclassified_100ns / 10_000,
+                    runtime.root_failed_read, runtime.root_changed_context,
+                    runtime.root_counter_regression].into_iter().enumerate() {
                     if index != 0 { print_str(b"/"); }
                     print_u64(value);
                 }
@@ -222,8 +244,9 @@ pub(crate) fn begin(handler: &ExecNtHandler, pi: usize, tid: u64,
     let now = monotonic_time_100ns();
     let needs_runtime = unsafe { (&*core::ptr::addr_of!(SPANS)) }
         .needs_runtime_sample(owner, ssn);
-    let runtime = if needs_runtime { runtime_sample(handler, owner, badge) } else { None };
-    unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)).begin_with_runtime(
+    let runtime = if needs_runtime { runtime_sample(handler, owner, badge) }
+        else { PairedRuntimeSample::default() };
+    unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)).begin_with_pair_runtime(
         owner, ssn, now, runtime).then_some(owner) }
 }
 
@@ -239,7 +262,7 @@ pub(crate) fn returned(handler: &ExecNtHandler, owner: Option<SpanOwner>,
     if returned && ssn == SSN_NT_CLOSE && status != nt_user_callback::STATUS_PENDING as u32 {
         let runtime = runtime_sample(handler, owner, badge);
         let _ = unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)) }
-            .record_close_runtime(owner, now, runtime);
+            .record_close_pair_runtime(owner, now, runtime);
     }
 }
 
@@ -298,6 +321,7 @@ pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
         let Some(tcb) = handler.hosted_thread_tcb_for_badge(badge).filter(|tcb| *tcb > 1)
             else { continue; };
         if !claim_gap_sample(owner, return_at, now) { continue; }
+        let runtime = runtime_sample(handler, owner, badge);
 
         // Copy value-only root/worker records before debug IPC can nest into a provider pump.
         let fault = unsafe { (&*core::ptr::addr_of!(FAULTS)).latest(owner, badge) };
@@ -349,6 +373,28 @@ pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
                 print_str(b" rsp="); print_hex_u64(regs[1]);
                 print_str(b" rdx="); print_hex_u64(regs[nt_user_callback::USER_CONTEXT_RDX]);
                 print_str(b" rsi="); print_hex_u64(regs[nt_user_callback::USER_CONTEXT_RSI]);
+            }
+            print_str(b" priority/affinity/domain/current-domain/queue-top/direct-handoff=");
+            for (index, value) in [state[win32k_glue::TCB_DBG_PRIORITY],
+                state[win32k_glue::TCB_DBG_AFFINITY],
+                state[win32k_glue::TCB_DBG_DOMAIN],
+                state[win32k_glue::TCB_DBG_CURRENT_DOMAIN],
+                state[win32k_glue::TCB_DBG_QUEUE_TOP_PRIORITY],
+                state[win32k_glue::TCB_DBG_DIRECT_HANDOFF]].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b" sc-read/child-valid/cap/bound-us/donated-us/root-valid/cap/bound-us/donated-us=");
+            for (index, value) in [u64::from(runtime.child.is_some()),
+                runtime.child.map_or(0, |sample| sample.sched_context),
+                runtime.child.map_or(0, |sample| sample.bound_us),
+                runtime.child.map_or(0, |sample| sample.donated_us),
+                u64::from(runtime.root.is_some()),
+                runtime.root.map_or(0, |sample| sample.sched_context),
+                runtime.root.map_or(0, |sample| sample.bound_us),
+                runtime.root.map_or(0, |sample| sample.donated_us)].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
             }
             print_str(b"\n");
             if state[win32k_glue::TCB_DBG_PENDING_FAULT] == 6 {
@@ -474,6 +520,14 @@ pub(crate) fn print_census(handler: &ExecNtHandler) {
             runtime.bound_us, runtime.donated_us,
             runtime.unclassified_100ns / 10_000, runtime.failed_read,
             runtime.changed_context, runtime.counter_regression].into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b" root-sc-lower-bound/classified/bound-us/donated-us/unclassified-ms/read-fail/context-change/counter-regress=");
+        for (index, value) in [runtime.root_classified, runtime.root_bound_us,
+            runtime.root_donated_us, runtime.root_unclassified_100ns / 10_000,
+            runtime.root_failed_read, runtime.root_changed_context,
+            runtime.root_counter_regression].into_iter().enumerate() {
             if index != 0 { print_str(b"/"); }
             print_u64(value);
         }
