@@ -69737,6 +69737,21 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             unsafe { rollback_created_hosted_dma_adapter(binding, adapter) };
             return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         };
+        let canonical_grant = nt_hosted_runtime::dma_grant_after_adapter_acquire(
+            nt_hosted_runtime::DmaGrantEvidence {
+                va: current.evidence.dma_common_va,
+                len: current.evidence.dma_common_len,
+                logical: current.evidence.dma_common_logical,
+            },
+            nt_hosted_runtime::DmaGrantEvidence {
+                va: window.dma_va,
+                len: window.dma_len,
+                logical: window.dma_logical,
+            },
+        );
+        current.evidence.dma_common_va = canonical_grant.va;
+        current.evidence.dma_common_len = canonical_grant.len;
+        current.evidence.dma_common_logical = canonical_grant.logical;
         current.dma_broker_va = window.dma_seed_va;
         current.dma_frame_base = window.dma_frame_base;
         current.dma_pages = window.dma_pages;

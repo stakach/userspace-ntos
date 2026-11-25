@@ -17,6 +17,15 @@ pub fn dma_grant_after_bank_refresh(
     retained.unwrap_or(shared)
 }
 
+/// Select the canonical evidence when the first adapter request publishes an authenticated
+/// PnP window. This keeps publication policy beside the later shared-bank refresh policy.
+pub fn dma_grant_after_adapter_acquire(
+    previous: DmaGrantEvidence,
+    _authenticated_window: DmaGrantEvidence,
+) -> DmaGrantEvidence {
+    previous
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
