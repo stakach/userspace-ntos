@@ -1899,6 +1899,7 @@ fn status(raw: u32) -> NtStatus {
 fn overlay_prepare_status(error: nt_fs::OverlayPrepareError) -> NtStatus {
     match error {
         nt_fs::OverlayPrepareError::Provider(status) => status,
+        nt_fs::OverlayPrepareError::Transport => status(nt_fs::STATUS_DATA_ERROR),
         nt_fs::OverlayPrepareError::NoCapacity => NtStatus::INSUFFICIENT_RESOURCES,
         nt_fs::OverlayPrepareError::ParentMissing => NtStatus::OBJECT_PATH_NOT_FOUND,
         nt_fs::OverlayPrepareError::ParentNotDirectory => status(nt_fs::STATUS_NOT_A_DIRECTORY),

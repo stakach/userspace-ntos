@@ -28,6 +28,7 @@ pub enum OverlayPrepareError {
     ParentMissing,
     ParentNotDirectory,
     Provider(nt_status::NtStatus),
+    Transport,
     Fat(FatPathError),
 }
 
@@ -379,6 +380,7 @@ fn map_fat_error(error: FatPathError) -> OverlayPrepareError {
 fn map_sector_error(error: MountedSectorError) -> OverlayPrepareError {
     match error {
         MountedSectorError::Provider(status) => OverlayPrepareError::Provider(status),
+        MountedSectorError::Transport => OverlayPrepareError::Transport,
         MountedSectorError::Fat(error) => map_fat_error(error),
     }
 }
@@ -643,5 +645,21 @@ mod tests {
         assert!(matches!(queue.take_ready_for(4, 7).unwrap().result,
             Err(OverlayPrepareError::Provider(status))
             if status == nt_status::NtStatus::INSUFFICIENT_RESOURCES));
+    }
+
+    #[test]
+    fn malformed_overlay_sector_completion_retains_transport_origin() {
+        let mut queue = OverlayPreparations::new();
+        queue.capture(5, 7, 32, geometry(), 2, None,
+            OverlayCopyPlan::Contents { first_cluster: 2, length: 1 }).unwrap();
+        let claim = queue.claim_next().unwrap();
+        assert_eq!(queue.complete_sector(OverlaySectorClaim { mount: 8, ..claim },
+            Err(MountedSectorError::Transport)), Err(OverlayPrepareError::WrongClaim));
+        assert_eq!(queue.complete_sector(claim, Err(MountedSectorError::Transport)),
+            Ok(OverlayPrepareProgress::Ready));
+        assert_eq!(queue.complete_sector(claim, Err(MountedSectorError::Transport)),
+            Err(OverlayPrepareError::WrongClaim));
+        assert!(matches!(queue.take_ready_for(5, 7).unwrap().result,
+            Err(OverlayPrepareError::Transport)));
     }
 }
