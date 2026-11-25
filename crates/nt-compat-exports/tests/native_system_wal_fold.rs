@@ -76,12 +76,12 @@ fn uncertain_fold_keeps_owner_and_dirty_state_for_boot_recovery() {
     let fold = source("writable_fs/system_wal_fold.rs");
     let native = source("writable_fs/system_wal_fold/native.rs");
     assert!(fold.contains("WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED"));
-    assert!(fold.contains("WRITABLE_FS_SNAPSHOT_DIRTY"));
+    assert!(fold.contains("SNAPSHOT_PUBLICATION.fail_fold()"));
     assert!(fold.contains("FOLD_WORK"));
     assert!(fold.contains("core::mem::forget") || fold.contains("Phase::Blocked"),
         "uncertain effects cannot drop the exact lease");
     assert!(native.contains("Work::Stalled") && native.contains("active.failed = true")
-        && native.contains("mark_snapshot_dirty()"),
+        && native.contains("block(nt_fs::STATUS_DEVICE_NOT_READY)"),
         "native uncertainty must retain the exact lease and leave dirty work visible");
 
     let writable = source("writable_fs.rs");
