@@ -356,6 +356,10 @@ pub(crate) fn system_wal_fold_blocked() -> bool {
     WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire)
 }
 
+pub(crate) fn system_wal_fold_required_for_diagnostics() -> bool {
+    SYSTEM_WAL_FOLD_REQUIRED.load(Ordering::Acquire)
+}
+
 pub(crate) fn block_uncertain_snapshot_reserve() {
     SNAPSHOT_PUBLICATION.mark_dirty();
     WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);

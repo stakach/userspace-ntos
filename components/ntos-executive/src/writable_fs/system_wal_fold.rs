@@ -27,6 +27,32 @@ type Phase = nt_hosted_runtime::RetainedSystemFoldPhase;
 // An uncertain physical fold remains here until restart and boot recovery. CM retains the exact
 // ACK result, so an uncertain ACK may be retried with this preparation and without replaying I/O.
 static mut FOLD_WORK: Option<FoldWork> = None;
+static FOLD_ADMISSION_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// Record the admitted manifest and CM preparation before a clean pair can return without
+/// starting a fold. This never acquires a lease or asks CM for a second observation.
+fn trace_fold_admission(
+    route: &[u8], manifest: &nt_fs::WalSnapshotManifest,
+    restored_required: bool, prepared: Option<bool>, status: u32,
+) {
+    if FOLD_ADMISSION_TRACES.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        |used| (used < 16).then_some(used + 1)).is_err() {
+        return;
+    }
+    print_str(b"[system-wal-fold-admission] route="); print_str(route);
+    print_str(b" base/high/restored-required=");
+    for value in [manifest.base_serial, manifest.high_water_serial,
+        u64::from(restored_required)] {
+        print_str(b"/"); print_u64(value);
+    }
+    let cm_state: &[u8] = match prepared {
+        Some(true) => b"prepared",
+        Some(false) => b"clean",
+        None => b"refused",
+    };
+    print_str(b" cm="); print_str(cm_state);
+    print_str(b" status=0x"); print_hex(status); print_str(b"\n");
+}
 
 /// One terminal observation; do not enter CM or the physical reserve while Receive is gone.
 pub(crate) unsafe fn print_quiesce_owner() {
@@ -148,15 +174,19 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
             report_fold_failure(b"cached-manifest", status)
         })?;
-    let prepared = if SYSTEM_WAL_FOLD_REQUIRED.load(Ordering::Acquire) {
+    let restored_required = SYSTEM_WAL_FOLD_REQUIRED.load(Ordering::Acquire);
+    let prepared_result = if restored_required {
         // The restored suffix is durable but CM mounted its composed image clean. Keep CM's
         // exact generation and ACK token while both snapshot slots acquire that image.
-        Some(crate::config_manager_prepare_system_hive_checkpoint_for_restored_wal()
-            .map_err(|status| status as u32)?)
+        crate::config_manager_prepare_system_hive_checkpoint_for_restored_wal().map(Some)
     } else {
         crate::config_manager_prepare_system_hive_checkpoint()
-            .map_err(|status| status as u32)?
     };
+    let prepared = prepared_result.map_err(|status| {
+        trace_fold_admission(b"boot", &manifest, restored_required, None, status as u32);
+        status as u32
+    })?;
+    trace_fold_admission(b"boot", &manifest, restored_required, Some(prepared.is_some()), 0);
     // Other mutable hives share this physical WAL. Their records also need a two-slot fold
     // before an image checkpoint truncates a sidecar or the epoch is reclaimed.
     if prepared.is_none() && manifest.base_serial == manifest.high_water_serial {

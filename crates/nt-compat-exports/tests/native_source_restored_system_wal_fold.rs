@@ -90,6 +90,7 @@ fn block(status: u32) -> u32 {
     status
 }
 fn report_fold_failure(_: &[u8], status: u32) -> u32 { status }
+fn trace_fold_admission<T>(_: &[u8], _: &T, _: bool, _: Option<bool>, _: u32) {}
 fn reset(system_suffix: bool, fence_valid: bool, cm_dirty: bool) {
     SYSTEM_WAL_FOLD_REQUIRED.store(system_suffix, Ordering::Release);
     WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(false, Ordering::Release);

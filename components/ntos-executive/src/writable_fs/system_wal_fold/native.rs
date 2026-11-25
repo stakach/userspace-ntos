@@ -375,13 +375,17 @@ pub(super) unsafe fn fold_system_wal_native() -> Result<bool, u32> {
     let manifest = snapshot_storage::cached_wal_manifest(&lease).map_err(|status| {
         block(report_fold_failure(b"cached-manifest-native", status))
     })?;
-    let prepared = if SYSTEM_WAL_FOLD_REQUIRED.load(Ordering::Acquire) {
-        Some(crate::config_manager_prepare_system_hive_checkpoint_for_restored_wal()
-            .map_err(|status| status as u32)?)
+    let restored_required = SYSTEM_WAL_FOLD_REQUIRED.load(Ordering::Acquire);
+    let prepared_result = if restored_required {
+        crate::config_manager_prepare_system_hive_checkpoint_for_restored_wal().map(Some)
     } else {
         crate::config_manager_prepare_system_hive_checkpoint()
-            .map_err(|status| status as u32)?
     };
+    let prepared = prepared_result.map_err(|status| {
+        trace_fold_admission(b"native", &manifest, restored_required, None, status as u32);
+        status as u32
+    })?;
+    trace_fold_admission(b"native", &manifest, restored_required, Some(prepared.is_some()), 0);
     if prepared.is_none() && manifest.base_serial == manifest.high_water_serial {
         return Ok(false);
     }
