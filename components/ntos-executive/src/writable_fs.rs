@@ -1622,6 +1622,7 @@ fn verified_boot_log(
     log: alloc::vec::Vec<u8>,
     lease: snapshot_storage::Lease,
     fs: &mut nt_fs::FileSystem,
+    system_log_path: &str,
 ) -> Result<(alloc::vec::Vec<u8>, Option<nt_hive_regf::BootSystemWalSuffix>, BootSystemReserveOwner), BootSystemRestoreError> {
     let nt_fs::SnapshotReadFormat::Wal { anchor, selected_base_serial } = metadata.format else {
         return Ok((log, None, BootSystemReserveOwner::Legacy(lease)));
@@ -1662,6 +1663,11 @@ fn verified_boot_log(
     let mut first_sequence = None;
     let mut last_sequence = None;
     let mut hive_sequences: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    let mut file_delta_cursor = nt_fs::FileDeltaReplayCursor::new();
+    // SYSTEM is restored through the primary and its native hive log below. Its image and
+    // sidecar must not also change through generic file deltas after those bytes were read.
+    let system_hive_file_id = fs.existing_file_id(CONFIG_SYSTEM_HIVE_PATH);
+    let system_log_file_id = fs.existing_file_id(system_log_path);
     for record in suffix {
         match nt_fs::decode_volume_wal_payload(&record.payload)
             .map_err(|_| BootSystemRestoreError::Snapshot(nt_fs::STATUS_DATA_ERROR))?
@@ -1708,6 +1714,22 @@ fn verified_boot_log(
                     }))?;
                 fs.protect_wal_log(payload.path, payload.file_id)
                     .map_err(BootSystemRestoreError::Snapshot)?;
+            }
+            nt_fs::VolumeWalPayload::FileDelta(payload) => {
+                if Some(payload.file_id()) == system_hive_file_id
+                    || Some(payload.file_id()) == system_log_file_id
+                {
+                    return Err(BootSystemRestoreError::Snapshot(nt_fs::STATUS_DATA_ERROR));
+                }
+                // Every record in this suffix shares one sequence cursor, even when hive
+                // appends or legacy SYSTEM records occur between file deltas. A failed replay
+                // discards the still-unpublished volume instead of exposing partial changes.
+                fs.replay_file_delta_wal_payload(&mut file_delta_cursor, payload)
+                    .map_err(|error| BootSystemRestoreError::Snapshot(match error {
+                        nt_fs::FileDeltaWalReplayError::OutOfMemory =>
+                            nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+                        _ => nt_fs::STATUS_DATA_ERROR,
+                    }))?;
             }
         }
     }
@@ -1762,7 +1784,9 @@ pub(crate) unsafe fn restore_boot_system_persistence(
             let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
             let snapshot_log = owned_file_before_publish(&fs, &log_path, BootSystemRestoreError::LogRead)?
                 .unwrap_or_default();
-            let (log, wal_suffix, lease) = verified_boot_log(metadata, snapshot_log, lease, &mut fs)?;
+            let (log, wal_suffix, lease) = verified_boot_log(
+                metadata, snapshot_log, lease, &mut fs, &log_path,
+            )?;
             SYSTEM_WAL_FOLD_REQUIRED.store(wal_suffix.is_some(), Ordering::Release);
             if primary.is_none() && log.is_empty() {
                 return Err(BootSystemRestoreError::SystemStateMissing);

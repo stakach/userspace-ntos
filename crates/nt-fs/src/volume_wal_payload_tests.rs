@@ -21,15 +21,25 @@ fn hive_log_payload_round_trips_exact_identity_offset_path_and_bytes() {
 }
 
 #[test]
-fn mixed_system_and_hive_log_payloads_remain_distinct_in_wal_order() {
+fn mixed_system_hive_log_and_file_delta_payloads_remain_distinct_in_wal_order() {
     let system_a = b"CMWAL001 first SYSTEM mutation";
     let hive = encode_hive_log_wal_payload(hive_record()).unwrap();
+    let delta = crate::encode_file_delta_wal_payload(crate::FileDeltaRecord {
+        sequence: 1,
+        file_id: 43,
+        path: r"\??\C:\ReactOS\System32\Config\SOFTWARE",
+        end_of_file: 4,
+        extents: &[crate::FileDeltaExtent { offset: 0, bytes: b"data" }],
+    }).unwrap();
     let system_b = b"CMWAL001 second SYSTEM mutation";
-    let records: [&[u8]; 3] = [system_a, &hive, system_b];
+    let records: [&[u8]; 4] = [system_a, &hive, &delta, system_b];
     let decoded = records.map(|bytes| decode_volume_wal_payload(bytes).unwrap());
     assert_eq!(decoded[0], VolumeWalPayload::System(system_a));
     assert_eq!(decoded[1], VolumeWalPayload::HiveLog(hive_record()));
-    assert_eq!(decoded[2], VolumeWalPayload::System(system_b));
+    assert_eq!(decoded[2], VolumeWalPayload::FileDelta(
+        crate::decode_file_delta_wal_payload(&delta).unwrap(),
+    ));
+    assert_eq!(decoded[3], VolumeWalPayload::System(system_b));
 }
 
 #[test]

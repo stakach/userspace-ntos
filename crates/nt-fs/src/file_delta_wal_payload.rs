@@ -4,11 +4,12 @@
 //!
 //! Records are absolute. Replaying a whole ordered suffix over a snapshot that already holds
 //! some of its records converges on the same bytes, so no "previous length" is recorded.
-//! Dormant: no native producer or boot replay routes this kind yet.
+//! The boot reader replays this kind into its unpublished restored volume. The native
+//! producer remains disabled until its durable ownership contract is complete.
 
 use alloc::vec::Vec;
 
-const FILE_DELTA_MAGIC: &[u8; 8] = b"NTFDLT01";
+pub(crate) const FILE_DELTA_MAGIC: &[u8; 8] = b"NTFDLT01";
 const HEADER_BYTES: usize = 48;
 const RUN_ENTRY_BYTES: usize = 12;
 
