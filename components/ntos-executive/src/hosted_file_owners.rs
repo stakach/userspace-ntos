@@ -2505,6 +2505,18 @@ fn dispatch_with_port_connect<Yield>(
                 owner.stack.len() as u64, 3] {
                 print_str(b"/"); print_u64(value);
             }
+            // These saved root-owned entries prove whether this CREATE shares the held
+            // PnP START stack. The primary device and stack length alone do not.
+            print_str(b" members=");
+            for (index, (device, driver)) in owner.stack.iter().take(8).enumerate() {
+                if index != 0 { print_str(b","); }
+                print_u64(index as u64);
+                print_str(b":"); print_u64(device.raw());
+                print_str(b":"); print_u64(driver.raw());
+            }
+            if owner.stack.len() > 8 {
+                print_str(b" truncated="); print_u64((owner.stack.len() - 8) as u64);
+            }
             print_str(b"\n");
         } else if !NESTED_PNP_CREATE_LIMIT_REPORTED.swap(true, Ordering::AcqRel) {
             print_str(b"[nested-pnp-create-owner] trace-limit-exhausted=32\n");
