@@ -200,6 +200,7 @@ unsafe fn advance_recheck() -> Result<(), u32> {
     if let Err(status) = stage_prepared_checkpoint(&mut staged, &prepared) {
         return Err(stall_before_commit(slot, lease, token, proof, prepared, None, status));
     }
+    SNAPSHOT_PUBLICATION.begin_fold_capture();
     let image = match snapshot_capture::CapturedSnapshot::capture(&lease, &staged) {
         Ok(image) => image,
         Err(status) => {
@@ -260,7 +261,7 @@ pub(super) unsafe fn fold_system_wal_native() -> Result<bool, u32> {
             *start_after_print = true;
         }
     }
-    mark_snapshot_dirty();
+    mark_runtime_dirty();
     Err(snapshot_storage::BUSY)
 }
 

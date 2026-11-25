@@ -237,6 +237,12 @@ pub struct WalSnapshotAnchor {
 }
 
 impl WalSnapshotManifest {
+    /// An ordinary checkpoint may retain the selected replay base only when no committed WAL
+    /// effect remains outside that base. Folding has a separate, two-slot publication owner.
+    pub fn ordinary_checkpoint_ready(self) -> bool {
+        self.base_serial == self.high_water_serial
+    }
+
     fn anchor(self) -> WalSnapshotAnchor {
         WalSnapshotAnchor {
             incarnation: self.incarnation,

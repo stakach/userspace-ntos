@@ -114,15 +114,41 @@ fn folded_hive_log_cache_requires_a_new_baseline_before_reuse() {
     let cache = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal.rs");
     let fold = source_block(cache, "pub(super) unsafe fn note_volume_wal_folded(");
     let baseline = source_block(cache, "unsafe fn inspect_baseline(");
+    let classify = source_block(cache, "unsafe fn baseline_needs_checkpoint(");
     let finish = source_block(cache, "unsafe fn finish_baseline(");
     assert!(fold.contains("baseline.has_wal_records = false"));
-    assert!(baseline.contains(
-        "entry.has_wal_records && entry.file_id == file_id && entry.expected_len == length"
-    ), "a fold releases write protection, so file ID and length cannot authenticate cached bytes");
+    assert!(classify.contains("!entry.has_wal_records")
+        && classify.contains("file_id != Some(entry.file_id)")
+        && classify.contains("length.is_none_or(|len| len < entry.expected_len)")
+        && classify.contains("length != Some(entry.expected_len)"),
+        "a fold releases write protection, so only an exact anchored log can reuse its baseline");
     assert!(baseline.contains("mark_snapshot_dirty()")
         && source.contains("native_checkpoint::checkpoint_dirty_native()")
         && finish.contains("validate_first_record(fs, path"),
         "the first append after a fold must checkpoint and verify a fresh durable baseline");
+}
+
+#[test]
+fn boot_hive_log_baseline_folds_an_older_wal_suffix_before_ordinary_checkpoint() {
+    let boot = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal_boot.rs");
+    let cache = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal.rs");
+    let admission = source_block(boot, "pub(crate) unsafe fn begin_boot_hive_journal(");
+    let prepare = source_block(boot, "pub(crate) unsafe fn prepare_boot_hive_journal(");
+    let classify = admission.find("if baseline_needs_checkpoint(&path)? {")
+        .expect("read-only baseline preflight");
+    let fold = admission.find("fold_system_wal_if_dirty()")
+        .expect("older shared WAL suffix must be folded before a fresh baseline");
+    let inspect = admission.find("inspect_baseline(&path, &owned)")
+        .expect("re-inspect the exact log after folding");
+    let protect = admission.find("protect_wal_log(&path, baseline.file_id)")
+        .expect("protect the exact post-fold log");
+    assert!(classify < fold && fold < inspect && inspect < protect,
+        "a fold must run before provisional journal or log protection, then recheck the baseline");
+    assert!(admission.contains("if !manifest.ordinary_checkpoint_ready() {")
+        && cache.contains("unsafe fn baseline_needs_checkpoint("),
+        "only a new/changed log with an older shared WAL suffix needs a fold");
+    assert!(prepare.contains("checkpoint_dirty_volume()?"),
+        "the new log still needs ordinary publication after the older suffix is folded");
 }
 
 #[test]

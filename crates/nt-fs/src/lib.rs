@@ -52,6 +52,7 @@ mod disk_signature;
 mod path;
 mod query;
 mod snapshot_store;
+mod snapshot_publication;
 mod snapshot_reserve;
 mod snapshot_region;
 mod registry_wal_store;
@@ -59,6 +60,7 @@ mod hive_wal_publication;
 mod volume_wal_payload;
 mod file_delta_wal_payload;
 mod file_create_wal_payload;
+mod file_rename_wal_payload;
 mod volume_wal_sequence;
 #[cfg(test)]
 mod snapshot_test_device;
@@ -143,6 +145,7 @@ pub use snapshot_store::{
     WalSnapshotAnchorUpdate, WalSnapshotEpochRollover, WalSnapshotManifest, VerifiedPairedWalSnapshot,
 };
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
+pub use snapshot_publication::SnapshotPublicationState;
 pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};
 pub use registry_wal_store::{AsyncWalIoKind, AsyncWalIoRequest, AsyncWalRefusal, RegistryWal, RegistryWalContinuation, RegistryWalError, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
 pub use hive_wal_publication::{
@@ -161,6 +164,10 @@ pub use file_delta_wal_payload::{
 pub use file_create_wal_payload::{
     decode_file_create_wal_payload, encode_file_create_wal_payload, FileCreateWalPayload,
 };
+pub use file_rename_wal_payload::{
+    decode_file_rename_wal_payload, encode_file_rename_wal_payload, FileRenameWalPayload,
+};
+pub use volume_wal_sequence::VolumeWalReplayCursor;
 mod snapshot_baseline_repair;
 pub use snapshot_baseline_repair::WalSnapshotBaselineRepair;
 pub use status::*;

@@ -1,5 +1,5 @@
 //! Typed payloads within the physical registry WAL. The sector WAL supplies checksums and
-//! durability; this codec selects legacy SYSTEM records, hive log appends, and file deltas.
+//! durability; this codec selects legacy SYSTEM records and typed volume mutations.
 
 use alloc::vec::Vec;
 
@@ -9,6 +9,9 @@ use crate::file_delta_wal_payload::{
 };
 use crate::file_create_wal_payload::{
     decode_file_create_wal_payload, FileCreateWalPayload, FILE_CREATE_MAGIC,
+};
+use crate::file_rename_wal_payload::{
+    decode_file_rename_wal_payload, FileRenameWalPayload, FILE_RENAME_MAGIC,
 };
 
 const SYSTEM_MAGIC: &[u8; 8] = b"CMWAL001";
@@ -77,6 +80,7 @@ pub enum VolumeWalPayload<'a> {
     HiveLog(HiveLogWalPayload<'a>),
     FileDelta(FileDeltaWalPayload<'a>),
     FileCreate(FileCreateWalPayload<'a>),
+    FileRename(FileRenameWalPayload<'a>),
 }
 
 pub(crate) fn validate_hive_log(record: HiveLogWalPayload<'_>) -> Result<(), VolumeWalPayloadError> {
@@ -133,6 +137,9 @@ pub fn decode_volume_wal_payload(bytes: &[u8]) -> Result<VolumeWalPayload<'_>, V
     }
     if bytes.starts_with(FILE_CREATE_MAGIC) {
         return decode_file_create_wal_payload(bytes).map(VolumeWalPayload::FileCreate);
+    }
+    if bytes.starts_with(FILE_RENAME_MAGIC) {
+        return decode_file_rename_wal_payload(bytes).map(VolumeWalPayload::FileRename);
     }
     if !bytes.starts_with(HIVE_LOG_MAGIC) {
         return Err(VolumeWalPayloadError::UnknownKind);

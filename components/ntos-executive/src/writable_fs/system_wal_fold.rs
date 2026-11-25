@@ -92,7 +92,7 @@ impl SnapshotBlockDevice for FoldLease<'_> {
 }
 
 fn block(status: u32) -> u32 {
-    WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+    SNAPSHOT_PUBLICATION.fail_fold();
     WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
     WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
     status
@@ -181,7 +181,7 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
     if let Some(status) = refused {
         return Err(block(status));
     }
-    mark_snapshot_dirty();
+    mark_runtime_dirty();
 
     let result = fold_retained(store, manifest);
     if let Err(status) = result {
@@ -213,6 +213,7 @@ unsafe fn fold_retained(
     };
     // Both folded slots must contain the same CM image. Capture before the first disk write so
     // native I/O reentry cannot change the live tree between CRC and payload serialization.
+    SNAPSHOT_PUBLICATION.begin_fold_capture();
     let snapshot = snapshot_capture::CapturedSnapshot::capture(&work.lease, fs)
         .map_err(|status| report_fold_failure(b"capture", status))?;
     let snapshot_bytes = snapshot.as_slice();
@@ -378,6 +379,7 @@ unsafe fn install_retained() -> Result<bool, u32> {
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
         .release_wal_log_protection_after_fold();
     hive_wal::note_volume_wal_folded();
+    SNAPSHOT_PUBLICATION.complete_fold();
     *core::ptr::addr_of_mut!(FOLD_WORK) = None;
     SYSTEM_WAL_FOLD_REQUIRED.store(false, Ordering::Release);
     crate::service_sec_image::note_system_wal_fold_complete();

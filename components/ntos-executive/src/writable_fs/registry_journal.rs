@@ -107,7 +107,7 @@ impl<C> Journal<C> {
                     WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
                     WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
                 }
-                WRITABLE_FS_SNAPSHOT_DIRTY.store(false, Ordering::Release);
+                SNAPSHOT_PUBLICATION.clear_dirty();
                 restore(filesystem);
                 drop(device);
                 Ok(context)
@@ -120,7 +120,7 @@ impl<C> Journal<C> {
         let _durable = crate::allocator::enter_durable();
         match self.storage.release_rolled_back() {
             Ok((filesystem, device, context)) => {
-                WRITABLE_FS_SNAPSHOT_DIRTY.store(false, Ordering::Release);
+                SNAPSHOT_PUBLICATION.clear_dirty();
                 restore(filesystem);
                 drop(device);
                 Ok(context)
