@@ -47,6 +47,10 @@ impl Cursor {
 
 struct Active {
     id: u64,
+    started_ticks: u64,
+    start_after_print: bool,
+    trace: bool,
+    write_sectors: u64,
     prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
     lease: snapshot_storage::Lease,
     token: nt_fs::RegistryWalContinuation,
@@ -77,13 +81,34 @@ enum StalledState {
 
 enum Work {
     Rechecking { id: u64, prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
-        manifest: nt_fs::WalSnapshotManifest },
+        manifest: nt_fs::WalSnapshotManifest, started_ticks: u64,
+        start_after_print: bool, trace: bool },
     Active(Active),
     // A local contradiction retains every move-only owner until boot recovery.
     Stalled(StalledState),
 }
 
 static mut WORK: Option<Work> = None;
+static FOLD_MEASURES: AtomicU64 = AtomicU64::new(0);
+static FOLD_MEASURE_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn reserve_trace() -> bool {
+    const LIMIT: u64 = 512;
+    FOLD_MEASURES.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        |used| (used < LIMIT).then_some(used + 1)).is_ok()
+}
+
+fn trace_started(id: u64, manifest: nt_fs::WalSnapshotManifest, trace: bool) {
+    if trace {
+        print_str(b"[writable-fs-fold-measure] begin id/base/high-water=");
+        for value in [id, manifest.base_serial, manifest.high_water_serial] {
+            print_str(b"/"); print_u64(value);
+        }
+        print_str(b"\n");
+    } else if !FOLD_MEASURE_LIMIT_REPORTED.swap(true, Ordering::AcqRel) {
+        print_str(b"[writable-fs-fold-measure] trace-limit-exhausted=512\n");
+    }
+}
 
 pub(super) unsafe fn print_quiesce_owner() {
     let work = (&*core::ptr::addr_of!(WORK)).as_ref();
@@ -144,7 +169,8 @@ unsafe fn advance_recheck() -> Result<(), u32> {
             return Err(status);
         }
     };
-    let Some(Work::Rechecking { prepared, manifest, .. }) = slot.take()
+    let Some(Work::Rechecking { prepared, manifest, started_ticks,
+        start_after_print, trace, .. }) = slot.take()
         else { unreachable!() };
     if proof.manifest() != manifest || proof.anchor() != token.anchor() {
         return Err(stall_before_commit(slot, lease, token, proof, prepared, None,
@@ -191,8 +217,10 @@ unsafe fn advance_recheck() -> Result<(), u32> {
     };
     commit.set_max_batch_sectors(crate::driver_launch::native_storage_transfer_sectors())
         .expect("a fresh snapshot commit has no request in flight");
-    *slot = Some(Work::Active(Active { id, prepared, lease, token, old_pair: None,
-        manifest, bytes, cursor: Some(Cursor::First(commit)), entered: false, failed: false }));
+    *slot = Some(Work::Active(Active { id, started_ticks, start_after_print,
+        trace, write_sectors: 0,
+        prepared, lease, token, old_pair: None, manifest, bytes,
+        cursor: Some(Cursor::First(commit)), entered: false, failed: false }));
     Ok(())
 }
 
@@ -218,7 +246,20 @@ pub(super) unsafe fn fold_system_wal_native() -> Result<bool, u32> {
         return Ok(false);
     }
     let id = snapshot_storage::begin_wal_continuation_recheck_with_lease(lease)?;
-    *core::ptr::addr_of_mut!(WORK) = Some(Work::Rechecking { id, prepared, manifest });
+    let started_ticks = crate::disk_census_ticks();
+    let trace = reserve_trace();
+    *core::ptr::addr_of_mut!(WORK) = Some(Work::Rechecking {
+        id, prepared, manifest, started_ticks, start_after_print: false, trace,
+    });
+    trace_started(id, manifest, trace);
+    if let Some(Work::Rechecking { id: retained_id, started_ticks,
+        start_after_print, .. }) = (&mut *core::ptr::addr_of_mut!(WORK)).as_mut()
+    {
+        if *retained_id == id {
+            *started_ticks = crate::disk_census_ticks();
+            *start_after_print = true;
+        }
+    }
     mark_snapshot_dirty();
     Err(snapshot_storage::BUSY)
 }
@@ -345,6 +386,11 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
         active.failed = true;
         return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DEVICE_NOT_READY)));
     }
+    if ticket.request.kind == AsyncSnapshotIoKind::Write {
+        let sector_size = active.lease.sector_size();
+        active.write_sectors = active.write_sectors
+            .saturating_add((ticket.request.bytes / sector_size) as u64);
+    }
     active.entered = false;
     if !active.cursor.as_ref().expect("active fold cursor").is_done() { return Ok(SnapshotCompletion::Settled); }
     let Some(Work::Active(mut active)) = slot.take() else { unreachable!() };
@@ -457,6 +503,11 @@ unsafe fn publish_ready(active: Active,
     next: Option<nt_fs::RegistryWalContinuation>,
     pair: nt_fs::VerifiedPairedWalSnapshot,
 ) {
+    let trace = active.trace;
+    let (id, bytes, write_sectors, started_ticks, start_after_print, rollover) = (
+        active.id, active.bytes as u64, active.write_sectors,
+        active.started_ticks, active.start_after_print, u64::from(next.is_some()),
+    );
     let old = if next.is_none() { Some(active.token) } else { None };
     *core::ptr::addr_of_mut!(FOLD_WORK) = Some(FoldWork {
         prepared: active.prepared, lease: active.lease,
@@ -464,4 +515,18 @@ unsafe fn publish_ready(active: Active,
         next_continuation: next, next_pair: Some(pair),
         publish_prepared_after_ack: true, phase: Phase::Acknowledging,
     });
+    // The owner was installed before its begin receipt. A matching owner refreshed its clock
+    // afterward; reentrant work retained the earlier safe clock. The end is after FOLD_WORK
+    // owns the CM ACK and before this completion receipt prints.
+    let elapsed_ticks = crate::disk_census_ticks().wrapping_sub(started_ticks);
+    if trace {
+        // Header recheck, private FS capture, CM staging, native writes, both paired proofs,
+        // and an optional rollover are complete. FOLD_WORK still retains the CM ACK.
+        print_str(b"[writable-fs-fold-measure] pre-ack-finished id/bytes/write-sectors/pre-ack-elapsed-tsc/start-after-begin-print/rollover=");
+        for value in [id, bytes, write_sectors, elapsed_ticks,
+            u64::from(start_after_print), rollover] {
+            print_str(b"/"); print_u64(value);
+        }
+        print_str(b"\n");
+    }
 }
