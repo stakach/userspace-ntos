@@ -321,8 +321,9 @@ impl FileSystem {
             }
         };
         if let PreparedCreate::Existing { node, information, .. } = &plan {
-            if self.reserved_replacement_node(*node)
-                && (*information != FILE_OPENED || options & FILE_DELETE_ON_CLOSE != 0)
+            if (self.reserved_replacement_node(*node) && *information != FILE_OPENED)
+                || (options & FILE_DELETE_ON_CLOSE != 0
+                    && self.reserved_replacement_subtree(*node))
             {
                 return CreateResult {
                     status: STATUS_ACCESS_DENIED,

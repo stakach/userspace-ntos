@@ -4,7 +4,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{STATUS_DATA_ERROR, STATUS_DISK_FULL, STATUS_INSUFFICIENT_RESOURCES};
+use crate::{STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_DISK_FULL,
+    STATUS_INSUFFICIENT_RESOURCES};
 
 static NEXT_BUDGET_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -29,6 +30,7 @@ pub(super) enum SnapshotReservationKind { Append, Replacement }
 struct ReservationCharge {
     id: u64,
     remaining: usize,
+    relative_path: String,
     file_id: Option<u64>,
     kind: SnapshotReservationKind,
 }
@@ -89,6 +91,12 @@ impl SnapshotBudget {
         create_charge: usize, append_charge: usize, kind: SnapshotReservationKind,
         replacement_base_cost: usize,
     ) -> Result<SnapshotCapacityReservation, u32> {
+        if self.reservations.iter().any(|row| {
+            row.relative_path.eq_ignore_ascii_case(&relative_path)
+                || (file_id.is_some() && row.file_id == file_id)
+        }) {
+            return Err(STATUS_ACCESS_DENIED);
+        }
         let charge = create_charge.checked_add(append_charge).ok_or(STATUS_DATA_ERROR)?;
         let reserved = self.reserved_total.checked_add(charge).ok_or(STATUS_DATA_ERROR)?;
         if self.encoded_len.checked_add(reserved).is_none_or(|used| used > self.capacity) {
@@ -97,10 +105,16 @@ impl SnapshotBudget {
         let next_id = self.next_id.checked_add(1).ok_or(STATUS_DATA_ERROR)?;
         self.reservations.try_reserve_exact(1)
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let mut row_path = String::new();
+        row_path.try_reserve_exact(relative_path.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        row_path.push_str(&relative_path);
         let id = self.next_id;
         self.next_id = next_id;
         self.reserved_total = reserved;
-        self.reservations.push(ReservationCharge { id, remaining: charge, file_id, kind });
+        self.reservations.push(ReservationCharge {
+            id, remaining: charge, relative_path: row_path, file_id, kind,
+        });
         Ok(SnapshotCapacityReservation {
             generation: self.generation, id, relative_path, file_id, bytes_len,
             create_charge, append_charge, kind, replacement_base_cost,
@@ -181,6 +195,12 @@ impl SnapshotBudget {
     pub(super) fn replacement_targets(&self, file_id: u64) -> bool {
         self.reservations.iter().any(|row| {
             row.kind == SnapshotReservationKind::Replacement && row.file_id == Some(file_id)
+        })
+    }
+
+    pub(super) fn replacement_file_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.reservations.iter().filter_map(|row| {
+            (row.kind == SnapshotReservationKind::Replacement).then_some(row.file_id).flatten()
         })
     }
 

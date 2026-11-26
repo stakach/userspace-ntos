@@ -376,3 +376,56 @@ fn snapshot_capacity_rejects_overlapping_tokens_for_one_file_identity() {
     fs.cancel_snapshot_reservation(append).map_err(|(status, _)| status).unwrap();
     assert_eq!(fs.export_volume_snapshot().unwrap(), before);
 }
+
+#[test]
+fn snapshot_capacity_copy_from_adjacent_immutable_ranges_matches_serialized_extents() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(r"\??\C:\source", b"abcdef"));
+    let source = fs.zw_create_file(r"\??\C:\source", FILE_READ_DATA,
+        0, 0, FILE_OPEN, FILE_NON_DIRECTORY_FILE);
+    let target = fs.zw_create_file(r"\??\C:\target", FILE_WRITE_DATA,
+        0, 0, FILE_CREATE, FILE_NON_DIRECTORY_FILE);
+    assert_eq!((source.status, target.status), (STATUS_SUCCESS, STATUS_SUCCESS));
+    let before = fs.export_volume_snapshot().unwrap();
+    fs.set_snapshot_payload_capacity(before.len() + 1024).unwrap();
+
+    let (status, first) = fs.zw_read_file(source.handle, Some(0), 3);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(fs.zw_write_file(target.handle, Some(0), &first), (STATUS_SUCCESS, 3));
+    let (status, second) = fs.zw_read_file(source.handle, Some(3), 3);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(fs.zw_write_file(target.handle, Some(3), &second), (STATUS_SUCCESS, 3));
+    let actual = fs.export_volume_snapshot().unwrap().len();
+    assert_eq!(fs.snapshot_payload_encoded_len(), Ok(actual));
+}
+
+#[test]
+fn snapshot_future_replacement_fences_ancestor_directory_rename() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(r"\??\C:\Config\SYSTEM", b"old"));
+    let directory = fs.zw_create_file(r"\??\C:\Config", DELETE | SYNCHRONIZE,
+        0, 0, FILE_OPEN, FILE_DIRECTORY_FILE);
+    assert_eq!(directory.status, STATUS_SUCCESS);
+    let before = fs.export_volume_snapshot().unwrap();
+    fs.set_snapshot_payload_capacity(before.len() + 64).unwrap();
+    let token = fs.reserve_snapshot_replacement_by_path(r"\??\C:\Config\SYSTEM", 4).unwrap();
+    assert_eq!(fs.zw_rename_file(directory.handle, FileRenameRoot::VolumeRoot,
+        &capacity_utf16(r"\Moved"), false), STATUS_ACCESS_DENIED);
+    assert_eq!(fs.export_volume_snapshot().unwrap(), before);
+    fs.cancel_snapshot_reservation(token).map_err(|(status, _)| status).unwrap();
+}
+
+#[test]
+fn snapshot_capacity_one_absent_path_has_one_reservation_owner() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let path = r"\??\C:\SOFTWARE.LOG";
+    let before = fs.export_volume_snapshot().unwrap();
+    fs.set_snapshot_payload_capacity(before.len() + 1024).unwrap();
+    let first = fs.reserve_snapshot_append_by_path(path, 16).unwrap();
+    assert!(matches!(fs.reserve_snapshot_append_by_path(r"\??\c:\software.log", 16),
+        Err(STATUS_ACCESS_DENIED)));
+    fs.cancel_snapshot_reservation(first).map_err(|(status, _)| status).unwrap();
+    let retried = fs.reserve_snapshot_append_by_path(path, 16).unwrap();
+    fs.cancel_snapshot_reservation(retried).map_err(|(status, _)| status).unwrap();
+    assert_eq!(fs.export_volume_snapshot().unwrap(), before);
+}

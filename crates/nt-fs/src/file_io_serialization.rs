@@ -300,7 +300,7 @@ impl FileSystem {
         let object = self.handles[index].as_ref().unwrap();
         let entry_id = object.entry_id;
         if object.requests_delete() && (self.wal_protected_subtree(object.node_id)
-            || self.reserved_replacement_node(object.node_id)) {
+            || self.reserved_replacement_subtree(object.node_id)) {
             return Err(STATUS_ACCESS_DENIED);
         }
         let delete_due = self.delete_due_at_cleanup(index);

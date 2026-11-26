@@ -3515,7 +3515,7 @@ impl MemFs {
                     if extents.try_reserve_exact(1).is_err() {
                         return 0;
                     }
-                    extents.push(extent);
+                    Self::push_extent_merged(extents, extent);
                     return bytes.len();
                 }
                 FileData::Bytes(data) if data.is_empty() => {
@@ -4271,6 +4271,14 @@ impl FileSystem {
         })
     }
 
+    fn reserved_replacement_subtree(&self, node_id: u64) -> bool {
+        self.snapshot_budget.as_ref().is_some_and(|budget| {
+            budget.replacement_file_ids().any(|file_id| {
+                self.volume.subtree_contains_file_id(node_id, file_id)
+            })
+        })
+    }
+
     /// Project a provisioning transaction before creating any parent or replacing file bytes.
     /// Existing components use their serialized names, including long names reached by aliases.
     fn project_provision_relative(&self, relative: &[u8], file: Option<&[u8]>)
@@ -4862,7 +4870,7 @@ impl FileSystem {
         else {
             return STATUS_INVALID_HANDLE;
         };
-        if self.wal_protected_subtree(source) || self.reserved_replacement_node(source) {
+        if self.wal_protected_subtree(source) || self.reserved_replacement_subtree(source) {
             return STATUS_ACCESS_DENIED;
         }
         if target.is_empty() || self.to_relative(target).is_some() {
@@ -5059,7 +5067,7 @@ impl FileSystem {
         else {
             return STATUS_INVALID_HANDLE;
         };
-        if self.wal_protected_subtree(source) || self.reserved_replacement_node(source) {
+        if self.wal_protected_subtree(source) || self.reserved_replacement_subtree(source) {
             return STATUS_ACCESS_DENIED;
         }
         if target.is_empty() || self.to_relative(target).is_some() {
@@ -6052,7 +6060,7 @@ impl FileSystem {
             return STATUS_INVALID_HANDLE;
         };
         let node_id = obj.node_id;
-        if (self.wal_protected_subtree(node_id) || self.reserved_replacement_node(node_id))
+        if (self.wal_protected_subtree(node_id) || self.reserved_replacement_subtree(node_id))
             && matches!(class,
                 FILE_DISPOSITION_INFORMATION | FILE_DISPOSITION_INFORMATION_EX
                 | FILE_END_OF_FILE_INFORMATION | FILE_ALLOCATION_INFORMATION
