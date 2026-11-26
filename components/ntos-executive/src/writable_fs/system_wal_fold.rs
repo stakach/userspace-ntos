@@ -11,6 +11,7 @@ use nt_fs::SnapshotBlockDevice;
 pub(crate) mod native;
 
 struct FoldWork {
+    capture_epoch: Option<nt_fs::SnapshotCaptureEpoch<'static>>,
     prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
     lease: snapshot_storage::Lease,
     old_continuation: Option<nt_fs::RegistryWalContinuation>,
@@ -206,6 +207,7 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
         Err(_) => (None, None),
     };
     *core::ptr::addr_of_mut!(FOLD_WORK) = Some(FoldWork {
+        capture_epoch: None,
         prepared, lease, old_continuation, old_pair, next_continuation: None,
         next_pair: None, publish_prepared_after_ack: false,
         phase: Phase::Folding,
@@ -245,7 +247,8 @@ unsafe fn fold_retained(
     };
     // Both folded slots must contain the same CM image. Capture before the first disk write so
     // native I/O reentry cannot change the live tree between CRC and payload serialization.
-    SNAPSHOT_PUBLICATION.begin_fold_capture();
+    work.capture_epoch = Some(SNAPSHOT_PUBLICATION.begin_fold_capture()
+        .map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?);
     let snapshot = snapshot_capture::CapturedSnapshot::capture(&work.lease, fs)
         .map_err(|status| report_fold_failure(b"capture", status))?;
     let snapshot_bytes = snapshot.as_slice();
@@ -411,7 +414,11 @@ unsafe fn install_retained() -> Result<bool, u32> {
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
         .release_wal_log_protection_after_fold();
     hive_wal::note_volume_wal_folded();
-    SNAPSHOT_PUBLICATION.complete_fold();
+    let capture_epoch = work.capture_epoch.take().ok_or(nt_fs::STATUS_DATA_ERROR)?;
+    if capture_epoch.publish().is_err() {
+        work.phase = Phase::Failed;
+        return Err(block(nt_fs::STATUS_DATA_ERROR));
+    }
     *core::ptr::addr_of_mut!(FOLD_WORK) = None;
     SYSTEM_WAL_FOLD_REQUIRED.store(false, Ordering::Release);
     crate::service_sec_image::note_system_wal_fold_complete();

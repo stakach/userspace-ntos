@@ -7,11 +7,13 @@ use nt_fs::{AsyncSnapshotCommit, AsyncSnapshotIoKind, AsyncSnapshotRequest};
 type Commit = AsyncSnapshotCommit<snapshot_capture::CapturedSnapshot>;
 
 enum Work {
-    Rechecking { id: u64, started_ticks: u64, start_after_print: bool, trace: bool },
+    Rechecking { id: u64, started_ticks: u64, start_after_print: bool, trace: bool,
+        capture_epoch: nt_fs::SnapshotCaptureEpoch<'static> },
     /// The exact header read was refused before entry and restored its original WAL proof.
     /// The outer I/O pump may see the refusal first; retain it for the service boundary.
     NoEffectRefused { id: u64, status: u32 },
     Committing {
+        capture_epoch: nt_fs::SnapshotCaptureEpoch<'static>,
         id: u64,
         started_ticks: u64,
         start_after_print: bool,
@@ -98,7 +100,7 @@ fn block(status: u32) -> u32 {
 unsafe fn advance_recheck() -> Result<(), u32> {
     let _durable = crate::allocator::enter_durable();
     let slot = &mut *core::ptr::addr_of_mut!(WORK);
-    let Some(Work::Rechecking { id, started_ticks, start_after_print, trace }) = slot.as_ref()
+    let Some(Work::Rechecking { id, started_ticks, start_after_print, trace, .. }) = slot.as_ref()
         else { return Ok(()); };
     let (id, started_ticks, start_after_print, trace) =
         (*id, *started_ticks, *start_after_print, *trace);
@@ -166,8 +168,9 @@ unsafe fn advance_recheck() -> Result<(), u32> {
     };
     commit.set_max_batch_sectors(crate::driver_launch::native_storage_transfer_sectors())
         .expect("a fresh snapshot commit has no request in flight");
+    let Some(Work::Rechecking { capture_epoch, .. }) = slot.take() else { unreachable!() };
     *slot = Some(Work::Committing { id, started_ticks, start_after_print, trace, write_sectors: 0,
-        lease, token, commit, bytes, entered: false, failed: false, settled: 0 });
+        capture_epoch, lease, token, commit, bytes, entered: false, failed: false, settled: 0 });
     Ok(())
 }
 
@@ -214,13 +217,15 @@ pub(super) unsafe fn checkpoint_dirty_native() -> Result<bool, u32> {
     if !manifest.ordinary_checkpoint_ready() {
         return Err(snapshot_storage::BUSY);
     }
+    let capture_epoch = SNAPSHOT_PUBLICATION.begin_dirty_capture()
+        .map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?
+        .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
     let id = snapshot_storage::begin_wal_continuation_recheck_with_lease(lease)?;
-    SNAPSHOT_PUBLICATION.clear_dirty();
-    super::note_checkpoint_begun();
     let started_ticks = crate::disk_census_ticks();
     let epoch = super::checkpoint_epochs().0;
     let trace = reserve_trace();
-    *slot = Some(Work::Rechecking { id, started_ticks, start_after_print: false, trace });
+    *slot = Some(Work::Rechecking { id, started_ticks, start_after_print: false, trace,
+        capture_epoch });
     trace_started(id, epoch, trace);
     if let Some(Work::Rechecking { id: retained_id, started_ticks,
         start_after_print, .. }) = (&mut *core::ptr::addr_of_mut!(WORK)).as_mut()
@@ -360,7 +365,7 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
     *entered = false;
     *settled += 1;
     if !commit.is_done() { return Ok(SnapshotCompletion::Settled); }
-    let Some(Work::Committing { lease, token, commit, bytes, started_ticks,
+    let Some(Work::Committing { capture_epoch, lease, token, commit, bytes, started_ticks,
         start_after_print, trace,
         write_sectors, .. }) = slot.take()
         else { unreachable!() };
@@ -386,8 +391,11 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
         core::mem::forget(pair);
         return Ok(SnapshotCompletion::Failed(block(status)));
     }
+    if capture_epoch.publish().is_err() {
+        core::mem::forget(lease);
+        return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DATA_ERROR)));
+    }
     drop(lease);
-    super::note_checkpoint_published();
     *slot = Some(Work::Done { generation, bytes });
     // Rechecking was installed before its begin print. A matching owner refreshes its clock
     // afterward; a reentrant owner retains the earlier safe clock and reports that fact.
