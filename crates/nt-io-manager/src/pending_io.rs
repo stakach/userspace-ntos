@@ -550,8 +550,33 @@ impl PendingFileIoTable {
         {
             return None;
         }
+        self.settle_owned_set_terminal(identity.slot, status)
+    }
+
+    /// Only the move-only prepared Basic owner may call this after an exact physical terminal.
+    /// Keep this private to the sidecar so a copied delivery row cannot manufacture completion.
+    pub(crate) fn commit_owned_basic_terminal_exact(
+        &mut self,
+        identity: PendingFileIoIdentity,
+        irp_id: u64,
+        status: u32,
+    ) -> Option<()> {
+        let pending = self.get_exact(identity)?;
+        if pending.irp_id != irp_id
+            || !matches!(pending.operation, PendingFileIoOperation::OwnedBasicPreflight(_))
+            || pending.delivery_state != 0
+            || status == nt_status::NtStatus::PENDING.raw() as u32
+            || self.apc_owned_slot(identity.slot)
+            || self.delivery_attempts[identity.slot] != 0
+        {
+            return None;
+        }
+        self.settle_owned_set_terminal(identity.slot, status)
+    }
+
+    fn settle_owned_set_terminal(&mut self, slot: usize, status: u32) -> Option<()> {
         let policy = crate::SetInformationCompletionPolicy::immediate_driver();
-        let row = self.slots[identity.slot].as_mut()?;
+        let row = self.slots[slot].as_mut()?;
         if !policy.publishes_iosb(status) {
             row.iosb_va = 0;
         }

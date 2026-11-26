@@ -42,6 +42,7 @@ fn park_row(table: &mut PendingFileIoTable) -> (PendingFileIoIdentity, u64) {
         iosb_va: 0x2000,
         reply_cap: 41,
         reply_required: true,
+        signal_file: true,
         completion_port_suppressed: true,
         event_obj_idx: u64::MAX,
         ..PendingFileIo::default()
@@ -110,6 +111,27 @@ fn pre_entry_cancellation_returns_the_file_and_keeps_delivery_owned_by_the_row()
 }
 
 #[test]
+fn returning_a_known_basic_terminal_also_settles_its_exact_delivery_row() {
+    let (fs, handle, input) = prepared();
+    let mut pending = PendingFileIoTable::new();
+    let (identity, irp_id) = park_row(&mut pending);
+    let drops = Rc::new(Cell::new(0));
+    let mut owners = PendingBasicPreparedTable::new();
+    let owner = PendingBasicPreparedOwner::prepare(&fs, handle, input,
+        FileReference(Rc::clone(&drops))).ok().unwrap();
+    owners.park_exact(&pending, identity, irp_id, owner).ok().unwrap();
+    let claim = owners.claim_exact(&pending, identity, irp_id).unwrap();
+
+    let terminal = owners.commit_owned_basic_exact(&mut pending, claim, STATUS_SUCCESS).ok().unwrap();
+    assert_eq!(pending.get_exact(identity).unwrap().owned_terminal_result(),
+        Some((STATUS_SUCCESS, 0)), "returning the move-only owner must settle the same row");
+    assert!(pending.get_exact(identity).unwrap().signal_file);
+    assert_eq!(drops.get(), 0);
+    drop(terminal);
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
 fn crossed_table_and_duplicate_park_cannot_take_or_drop_the_original_file() {
     let (fs, handle, input) = prepared();
     let mut pending = PendingFileIoTable::new();
@@ -134,14 +156,47 @@ fn crossed_table_and_duplicate_park_cannot_take_or_drop_the_original_file() {
             FileReference(Rc::clone(&drops))).ok().unwrap()).is_ok());
     let claim = owners.claim_exact(&pending, identity, irp_id).unwrap();
     assert!(peer.claimed_exact(&pending, &claim).is_none());
-    let claim = peer.take_terminal_exact(&pending, claim).err().unwrap();
-    let owner = owners.take_terminal_exact(&pending, claim).ok().unwrap();
+    let claim = peer.commit_owned_basic_exact(&mut pending, claim, STATUS_SUCCESS).err().unwrap();
+    assert_eq!(pending.get_exact(identity).unwrap().owned_terminal_result(), None);
+    let owner = owners.commit_owned_basic_exact(&mut pending, claim, STATUS_SUCCESS).ok().unwrap();
     assert_eq!(owner.input(), &input);
     assert_eq!(owners.len(), 0);
     assert_eq!(drops.get(), 1);
     drop(owner);
     assert_eq!(drops.get(), 2);
     assert_eq!(peer.len(), 1);
+}
+
+#[test]
+fn uncertain_basic_owner_survives_refusal_until_its_exact_terminal() {
+    let (fs, handle, input) = prepared();
+    let mut pending = PendingFileIoTable::new();
+    let (identity, irp_id) = park_row(&mut pending);
+    let drops = Rc::new(Cell::new(0));
+    let mut owners = PendingBasicPreparedTable::new();
+    let owner = PendingBasicPreparedOwner::prepare(&fs, handle, input,
+        FileReference(Rc::clone(&drops))).ok().unwrap();
+    owners.park_exact(&pending, identity, irp_id, owner).ok().unwrap();
+    let claim = owners.claim_exact(&pending, identity, irp_id).unwrap();
+    owners.mark_uncertain_exact(&pending, &claim).unwrap();
+
+    let claim = owners.commit_owned_basic_exact(&mut pending, claim,
+        nt_status::NtStatus::PENDING.raw() as u32).err().unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_eq!(drops.get(), 0);
+    assert_eq!(pending.get_exact(identity).unwrap().owned_terminal_result(), None);
+    assert!(owners.cancel_unentered_exact(&mut pending, identity, irp_id).is_none());
+
+    let terminal = owners.commit_owned_basic_exact(&mut pending, claim,
+        nt_fs::STATUS_INVALID_PARAMETER).ok().unwrap();
+    assert_eq!(pending.get_exact(identity).unwrap().owned_terminal_result(),
+        Some((nt_fs::STATUS_INVALID_PARAMETER, 0)));
+    assert_eq!(pending.get_exact(identity).unwrap().iosb_va, 0);
+    assert!(!pending.get_exact(identity).unwrap().signal_file);
+    assert_eq!(owners.len(), 0);
+    assert_eq!(drops.get(), 0);
+    drop(terminal);
+    assert_eq!(drops.get(), 1);
 }
 
 #[test]
