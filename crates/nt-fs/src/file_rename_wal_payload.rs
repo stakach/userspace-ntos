@@ -7,7 +7,7 @@ use crate::{parse_short_name_information, FileShortName, VolumeWalPayloadError, 
 pub(crate) const FILE_RENAME_MAGIC: &[u8; 8] = b"NTFRNM01";
 const HEADER_BYTES: usize = 72 + MAX_SHORT_NAME * 2;
 
-/// Zero `replaced_file_id` means the destination name was absent before the move.
+/// Zero `replaced_file_id` means the destination had no distinct entry to replace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileRenameWalPayload<'a> {
     pub sequence: u64,
@@ -36,7 +36,7 @@ pub(crate) fn validate(record: FileRenameWalPayload<'_>) -> Result<(), VolumeWal
         return Err(VolumeWalPayloadError::InvalidIdentity);
     }
     if !valid_path(record.source_path) || !valid_path(record.target_path)
-        || record.source_path.eq_ignore_ascii_case(record.target_path)
+        || record.source_path == record.target_path
     {
         return Err(VolumeWalPayloadError::InvalidPath);
     }
