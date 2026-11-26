@@ -79,6 +79,11 @@ pub use file_io_serialization::{FileCleanupEffects, FileIoState};
 mod snapshot_journal;
 pub use snapshot_journal::*;
 
+#[path = "snapshot_capacity.rs"]
+mod snapshot_capacity;
+use snapshot_capacity::{SnapshotBudget, SnapshotReservationKind};
+pub use snapshot_capacity::SnapshotCapacityReservation;
+
 /// A MemFs node (spec §12.3). File data and attributes belong to this shared identity; directory
 /// entries own names. Directories retain their single parent for `..`, while regular files may have
 /// any number of entries and a corresponding link count.
@@ -94,6 +99,8 @@ const MEMFS_SNAPSHOT_VERSION_V6: u16 = 6;
 const MEMFS_SNAPSHOT_VERSION: u16 = 7;
 const MEMFS_SNAPSHOT_HEADER_LEN: usize = 32;
 const SNAP_SHORT_NAME_STORAGE_LEN: usize = 1 + MAX_SHORT_NAME * 2;
+const SNAP_RECORD_FIXED_LEN: usize = 77 + SNAP_SHORT_NAME_STORAGE_LEN;
+const SNAP_EXTENT_HEADER_LEN: usize = 1 + 8;
 const MEMFS_ALLOCATION_UNIT: u64 = 0x1000;
 const SNAP_REC_DIR: u8 = 1;
 const SNAP_REC_FILE: u8 = 2;
@@ -134,6 +141,7 @@ pub enum MemFsSnapshotError {
     InvalidRecord,
     InvalidPath,
     NameCollision,
+    OutOfSpace,
     OutOfMemory,
 }
 
@@ -405,6 +413,7 @@ impl<'a, S: SnapshotPayloadReader> SnapshotStreamReader<'a, S> {
 fn snapshot_error_to_store_error(err: MemFsSnapshotError) -> SnapshotBlockStoreError {
     match err {
         MemFsSnapshotError::OutOfMemory => SnapshotBlockStoreError::OutOfMemory,
+        MemFsSnapshotError::OutOfSpace => SnapshotBlockStoreError::OutOfSpace,
         MemFsSnapshotError::BadMagic
         | MemFsSnapshotError::BadChecksum
         | MemFsSnapshotError::Truncated
@@ -560,6 +569,19 @@ struct PreparedRename {
     folded_name: String,
     created_name: String,
     moved_short_name: Option<(FileShortName, String)>,
+}
+
+/// A fully allocated directory entry, ready to attach without a fallible operation.
+struct PreparedInsertEntry {
+    parent: u64,
+    node_id: u64,
+    next_link_count: u32,
+    entry: MemFsDirEntry,
+}
+
+enum PreparedLink {
+    Unchanged,
+    Add { insertion: PreparedInsertEntry, replacement_entry: Option<u64> },
 }
 
 /// An in-memory file system (spec §12) — the v0.1 `NtFileSystemRuntime`.
@@ -845,18 +867,20 @@ impl MemFs {
         Ok(out)
     }
 
-    /// Replace a caller-owned capture with the exact current snapshot, retaining its allocation
-    /// for later captures. The caller must keep these bytes immutable through physical commit.
-    pub fn write_snapshot_into(&self, out: &mut Vec<u8>) -> Result<(), MemFsSnapshotError> {
+    /// Exact byte length of the current serialized snapshot, including its format header.
+    pub fn snapshot_encoded_len(&self) -> Result<usize, MemFsSnapshotError> {
+        self.measure_snapshot(&mut String::new()).map(|(_, total_len)| total_len)
+    }
+
+    fn measure_snapshot(&self, path: &mut String) -> Result<(u32, usize), MemFsSnapshotError> {
         let root = self.node(0).ok_or(MemFsSnapshotError::InvalidRecord)?;
         let mut record_count = 1u32;
-        let mut path = String::new();
         let mut measured_files = Vec::new();
         let payload_len = self
             .snapshot_record_len("", root, false, FileShortName::EMPTY)?
             .checked_add(self.measure_snapshot_children(
                 0,
-                &mut path,
+                path,
                 &mut measured_files,
                 &mut record_count,
             )?)
@@ -865,6 +889,16 @@ impl MemFs {
         let total_len = MEMFS_SNAPSHOT_HEADER_LEN
             .checked_add(payload_len)
             .ok_or(MemFsSnapshotError::InvalidRecord)?;
+        Ok((record_count, total_len))
+    }
+
+    /// Replace a caller-owned capture with the exact current snapshot, retaining its allocation
+    /// for later captures. The caller must keep these bytes immutable through physical commit.
+    pub fn write_snapshot_into(&self, out: &mut Vec<u8>) -> Result<(), MemFsSnapshotError> {
+        let mut path = String::new();
+        let (record_count, total_len) = self.measure_snapshot(&mut path)?;
+        let root = self.node(0).ok_or(MemFsSnapshotError::InvalidRecord)?;
+        let payload_len = total_len - MEMFS_SNAPSHOT_HEADER_LEN;
         out.clear();
         if out.capacity() < total_len {
             // The capture is empty, so release it before reserving: the old block can then
@@ -1514,17 +1548,8 @@ impl MemFs {
         if !valid_short_name(short_name.units()) {
             return Err(MemFsSnapshotError::InvalidRecord);
         }
-        1usize
-            .checked_add(4)
-            .and_then(|n| n.checked_add(4))
-            .and_then(|n| n.checked_add(8))
-            .and_then(|n| n.checked_add(32))
-            .and_then(|n| n.checked_add(8))
-            .and_then(|n| n.checked_add(8))
-            .and_then(|n| n.checked_add(8))
-            .and_then(|n| n.checked_add(4))
-            .and_then(|n| n.checked_add(SNAP_SHORT_NAME_STORAGE_LEN))
-            .and_then(|n| n.checked_add(path_len as usize))
+        SNAP_RECORD_FIXED_LEN
+            .checked_add(path_len as usize)
             .and_then(|n| n.checked_add(data_len))
             .ok_or(MemFsSnapshotError::InvalidRecord)
     }
@@ -1691,7 +1716,7 @@ impl MemFs {
             FileData::Bytes(bytes) => {
                 if !bytes.is_empty() {
                     total = total
-                        .checked_add(1 + 8)
+                        .checked_add(SNAP_EXTENT_HEADER_LEN)
                         .and_then(|n| n.checked_add(bytes.len()))
                         .ok_or(MemFsSnapshotError::InvalidRecord)?;
                 }
@@ -1714,13 +1739,104 @@ impl MemFs {
                         extent.len
                     };
                     total = total
-                        .checked_add(1 + 8)
+                        .checked_add(SNAP_EXTENT_HEADER_LEN)
                         .and_then(|n| n.checked_add(data_len))
                         .ok_or(MemFsSnapshotError::InvalidRecord)?;
                 }
             }
         }
         Ok(total)
+    }
+
+    fn projected_extents_encoded_len(extents: &[FileExtent])
+        -> Result<usize, MemFsSnapshotError>
+    {
+        extents.iter().filter(|extent| extent.len != 0).try_fold(0usize, |total, extent| {
+            total.checked_add(SNAP_EXTENT_HEADER_LEN)
+                .and_then(|len| len.checked_add(
+                    if extent.blob == ZERO_EXTENT_BLOB { 0 } else { extent.len }
+                ))
+                .ok_or(MemFsSnapshotError::InvalidRecord)
+        })
+    }
+
+    fn live_file_data_encoded_len(&self, id: u64) -> Result<usize, MemFsSnapshotError> {
+        let node = self.node(id).ok_or(MemFsSnapshotError::InvalidRecord)?;
+        if node.is_dir || node.link_count == 0 {
+            return Ok(0);
+        }
+        Self::snapshot_file_data_encoded_len(&self.blobs, &node.data)
+    }
+
+    fn data_encoded_len_after_truncate(data: &FileData, length: usize)
+        -> Result<usize, MemFsSnapshotError>
+    {
+        match data {
+            FileData::Bytes(_) => {
+                if length == 0 { Ok(0) } else {
+                    length.checked_add(9).ok_or(MemFsSnapshotError::InvalidRecord)
+                }
+            }
+            FileData::Extents(extents) => {
+                let mut remaining = length;
+                let mut cost = 0usize;
+                for extent in extents {
+                    let kept = remaining.min(extent.len);
+                    if kept == 0 { break; }
+                    cost = cost.checked_add(9)
+                        .and_then(|len| len.checked_add(
+                            if extent.blob == ZERO_EXTENT_BLOB { 0 } else { kept }
+                        ))
+                        .ok_or(MemFsSnapshotError::InvalidRecord)?;
+                    remaining -= kept;
+                }
+                if remaining != 0 { return Err(MemFsSnapshotError::InvalidRecord); }
+                Ok(cost)
+            }
+        }
+    }
+
+    fn projected_end_of_file_data_cost(&self, id: u64, requested: u64)
+        -> Result<usize, u32>
+    {
+        let node = self.node(id).ok_or(STATUS_INVALID_HANDLE)?;
+        if node.is_dir { return Err(STATUS_INVALID_DEVICE_REQUEST); }
+        if requested > i64::MAX as u64 { return Err(STATUS_INVALID_PARAMETER); }
+        let length = usize::try_from(requested).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let current = node.data.len(&self.blobs);
+        if length <= current {
+            return Self::data_encoded_len_after_truncate(&node.data, length)
+                .map_err(|_| STATUS_DATA_ERROR);
+        }
+        let old = Self::snapshot_file_data_encoded_len(&self.blobs, &node.data)
+            .map_err(|_| STATUS_DATA_ERROR)?;
+        let adds_zero_record = match &node.data {
+            FileData::Bytes(_) => true,
+            FileData::Extents(extents) => extents.last()
+                .is_none_or(|extent| extent.blob != ZERO_EXTENT_BLOB),
+        };
+        old.checked_add(if adds_zero_record { 9 } else { 0 })
+            .ok_or(STATUS_DATA_ERROR)
+    }
+
+    fn projected_allocation_data_cost(&self, id: u64, requested: u64)
+        -> Result<usize, u32>
+    {
+        let node = self.node(id).ok_or(STATUS_INVALID_HANDLE)?;
+        if node.is_dir { return Err(STATUS_INVALID_DEVICE_REQUEST); }
+        if requested > i64::MAX as u64 { return Err(STATUS_INVALID_PARAMETER); }
+        if allocation_size_for_eof(requested) < requested {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let length = usize::try_from(requested).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let current = node.data.len(&self.blobs);
+        if length < current {
+            Self::data_encoded_len_after_truncate(&node.data, length)
+                .map_err(|_| STATUS_DATA_ERROR)
+        } else {
+            Self::snapshot_file_data_encoded_len(&self.blobs, &node.data)
+                .map_err(|_| STATUS_DATA_ERROR)
+        }
     }
 
     fn write_snapshot_file_data(
@@ -2065,28 +2181,42 @@ impl MemFs {
             .map(|entry| entry.node_id)
     }
 
-    fn allocate_entry_id(&mut self) -> Result<u64, u32> {
-        let id = self.next_entry_id;
-        self.next_entry_id = self
-            .next_entry_id
-            .checked_add(1)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        Ok(id)
+    fn insert_entry(&mut self, parent: u64, name: &str, node_id: u64) -> Result<u64, u32> {
+        let plan = self.prepare_insert_entry(parent, name, node_id, None)?;
+        Ok(self.apply_insert_entry(plan))
     }
 
-    fn insert_entry(&mut self, parent: u64, name: &str, node_id: u64) -> Result<u64, u32> {
+    fn prepare_insert_entry(
+        &mut self,
+        parent: u64,
+        name: &str,
+        node_id: u64,
+        allowed_replacement: Option<u64>,
+    ) -> Result<PreparedInsertEntry, u32> {
         if name.is_empty() || name == "." || name == ".." || name.contains('\\') {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let Some(link_count) = self.node(node_id).map(|node| node.link_count) else {
             return Err(STATUS_OBJECT_NAME_NOT_FOUND);
         };
-        if self.child_entry(parent, name).is_some() {
+        if self.child_entry(parent, name)
+            .is_some_and(|entry| Some(entry.id) != allowed_replacement)
+        {
             return Err(STATUS_OBJECT_NAME_COLLISION);
         }
         let next_link_count = link_count
             .checked_add(1)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        self.next_entry_id.checked_add(1).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let mut folded_name = String::new();
+        folded_name.try_reserve_exact(name.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        folded_name.push_str(name);
+        folded_name.make_ascii_lowercase();
+        let mut created_name = String::new();
+        created_name.try_reserve_exact(name.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        created_name.push_str(name);
         let Some(parent_node) = self.node_mut(parent) else {
             return Err(STATUS_OBJECT_PATH_NOT_FOUND);
         };
@@ -2096,17 +2226,24 @@ impl MemFs {
         if parent_node.children.try_reserve_exact(1).is_err() {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
-        let entry_id = self.allocate_entry_id()?;
-        self.node_mut(parent).unwrap().children.push(MemFsDirEntry {
-            id: entry_id,
-            folded_name: fold(name),
-            created_name: String::from(name),
+        Ok(PreparedInsertEntry { parent, node_id, next_link_count,
+            entry: MemFsDirEntry {
+            id: self.next_entry_id,
+            folded_name,
+            created_name,
             folded_short_name: String::new(),
             short_name: FileShortName::EMPTY,
             node_id,
-        });
-        self.node_mut(node_id).unwrap().link_count = next_link_count;
-        Ok(entry_id)
+        } })
+    }
+
+    fn apply_insert_entry(&mut self, plan: PreparedInsertEntry) -> u64 {
+        let entry_id = plan.entry.id;
+        self.next_entry_id += 1;
+        self.node_mut(plan.parent).expect("prepared entry parent").children.push(plan.entry);
+        self.node_mut(plan.node_id).expect("prepared entry node").link_count =
+            plan.next_link_count;
+        entry_id
     }
 
     fn create_child_with_entry(&mut self, parent: u64, name: &str, is_dir: bool) -> (u64, u64) {
@@ -2248,22 +2385,6 @@ impl MemFs {
                 .is_some_and(|node| node.link_count == 0 && node.children.is_empty())
         {
             self.nodes[node_id as usize] = None;
-        }
-    }
-
-    fn rename_into_parent(
-        &mut self,
-        source: u64,
-        source_entry: u64,
-        target_parent: u64,
-        leaf: &str,
-        replace_if_exists: bool,
-    ) -> u32 {
-        match self.prepare_rename_into_parent(
-            source, source_entry, target_parent, leaf, replace_if_exists,
-        ) {
-            Ok(plan) => self.apply_rename_into_parent(plan),
-            Err(status) => status,
         }
     }
 
@@ -2474,150 +2595,130 @@ impl MemFs {
             .map(|entry| entry.node_id)
     }
 
-    fn rename_relative(
+    fn prepare_rename_relative(
         &mut self,
         source: u64,
         source_entry: u64,
+        start: Option<u64>,
         target_path: &str,
         replace_if_exists: bool,
-    ) -> u32 {
+    ) -> Result<PreparedRename, u32> {
         let Some((parent_path, leaf)) = Self::parent_and_leaf_relative(target_path) else {
-            return STATUS_INVALID_PARAMETER;
+            return Err(STATUS_INVALID_PARAMETER);
         };
-        let Some(parent) = self.lookup(parent_path) else {
-            return STATUS_OBJECT_PATH_NOT_FOUND;
+        let parent = match start {
+            Some(root) => self.lookup_from(root, parent_path),
+            None => self.lookup(parent_path),
         };
-        self.rename_into_parent(source, source_entry, parent, leaf, replace_if_exists)
+        let parent = parent.ok_or(STATUS_OBJECT_PATH_NOT_FOUND)?;
+        self.prepare_rename_into_parent(source, source_entry, parent, leaf, replace_if_exists)
     }
 
-    fn rename_relative_to_dir(
-        &mut self,
-        source: u64,
-        source_entry: u64,
-        root: u64,
-        target_path: &str,
-        replace_if_exists: bool,
-    ) -> u32 {
-        let Some((parent_path, leaf)) = Self::parent_and_leaf_relative(target_path) else {
-            return STATUS_INVALID_PARAMETER;
-        };
-        let Some(parent) = self.lookup_from(root, parent_path) else {
-            return STATUS_OBJECT_PATH_NOT_FOUND;
-        };
-        self.rename_into_parent(source, source_entry, parent, leaf, replace_if_exists)
-    }
-
-    fn rename_relative_to_source_parent(
-        &mut self,
-        source: u64,
-        source_entry: u64,
-        target_path: &str,
-        replace_if_exists: bool,
-    ) -> u32 {
-        let Some((parent, _, entry_node)) = self.entry_location(source_entry) else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
-        if entry_node != source {
-            return STATUS_INVALID_HANDLE;
+    fn subtree_snapshot_entry_count(&self, root: u64) -> Result<usize, u32> {
+        let node = self.node(root).ok_or(STATUS_DATA_ERROR)?;
+        if !node.is_dir { return Ok(1); }
+        let mut stack = Vec::new();
+        stack.try_reserve_exact(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        stack.push(root);
+        let mut count = 1usize;
+        while let Some(directory) = stack.pop() {
+            let node = self.node(directory).ok_or(STATUS_DATA_ERROR)?;
+            for entry in &node.children {
+                count = count.checked_add(1).ok_or(STATUS_DATA_ERROR)?;
+                if self.node(entry.node_id).ok_or(STATUS_DATA_ERROR)?.is_dir {
+                    stack.try_reserve_exact(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                    stack.push(entry.node_id);
+                }
+            }
         }
-        self.rename_relative_to_dir(source, source_entry, parent, target_path, replace_if_exists)
+        Ok(count)
     }
 
-    fn link_into_parent(
+    fn prepare_link_into_parent(
         &mut self,
         source: u64,
         target_parent: u64,
         leaf: &str,
         replace_if_exists: bool,
-    ) -> u32 {
+    ) -> Result<PreparedLink, u32> {
         if source == 0 || leaf.is_empty() || leaf == "." || leaf == ".." || leaf.contains('\\') {
-            return STATUS_INVALID_PARAMETER;
+            return Err(STATUS_INVALID_PARAMETER);
         }
         let Some(source_node) = self.node(source) else {
-            return STATUS_INVALID_HANDLE;
+            return Err(STATUS_INVALID_HANDLE);
         };
         if source_node.is_dir {
-            return STATUS_INVALID_PARAMETER;
+            return Err(STATUS_INVALID_PARAMETER);
         }
         let Some(parent) = self.node(target_parent) else {
-            return STATUS_OBJECT_PATH_NOT_FOUND;
+            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
         };
         if !parent.is_dir {
-            return STATUS_NOT_A_DIRECTORY;
+            return Err(STATUS_NOT_A_DIRECTORY);
         }
         let namespace_entry = self.child_entry(target_parent, leaf).map(|entry| entry.id);
         let existing = self
             .child_long_entry(target_parent, leaf)
             .map(|entry| (entry.id, entry.node_id));
         if existing.is_none() && namespace_entry.is_some() {
-            return STATUS_OBJECT_NAME_COLLISION;
+            return Err(STATUS_OBJECT_NAME_COLLISION);
         }
-        if let Some((existing_entry, existing_node)) = existing {
+        let replacement_entry = if let Some((existing_entry, existing_node)) = existing {
             if existing_node == source {
-                return STATUS_SUCCESS;
+                return Ok(PreparedLink::Unchanged);
             }
             if !replace_if_exists {
-                return STATUS_OBJECT_NAME_COLLISION;
+                return Err(STATUS_OBJECT_NAME_COLLISION);
             }
             if self.next_entry_id.checked_add(1).is_none() || source_node.link_count == u32::MAX {
-                return STATUS_INSUFFICIENT_RESOURCES;
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
             }
             if self.node(existing_node).is_some_and(|node| node.is_dir) {
-                return STATUS_ACCESS_DENIED;
+                return Err(STATUS_ACCESS_DENIED);
             }
-            if let Err(status) = self.unlink_entry(existing_entry) {
-                return status;
-            }
+            Some(existing_entry)
         } else if self.next_entry_id.checked_add(1).is_none() || source_node.link_count == u32::MAX
         {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        match self.insert_entry(target_parent, leaf, source) {
-            Ok(_) => STATUS_SUCCESS,
-            Err(status) => status,
-        }
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        } else { None };
+        let insertion = self.prepare_insert_entry(
+            target_parent, leaf, source, replacement_entry,
+        )?;
+        Ok(PreparedLink::Add { insertion, replacement_entry })
     }
 
-    fn link_relative(&mut self, source: u64, target_path: &str, replace_if_exists: bool) -> u32 {
-        let Some((parent_path, leaf)) = Self::parent_and_leaf_relative(target_path) else {
-            return STATUS_INVALID_PARAMETER;
-        };
-        let Some(parent) = self.lookup(parent_path) else {
-            return STATUS_OBJECT_PATH_NOT_FOUND;
-        };
-        self.link_into_parent(source, parent, leaf, replace_if_exists)
-    }
-
-    fn link_relative_to_dir(
+    fn prepare_link_relative(
         &mut self,
         source: u64,
-        root: u64,
+        start: Option<u64>,
         target_path: &str,
         replace_if_exists: bool,
-    ) -> u32 {
+    ) -> Result<PreparedLink, u32> {
         let Some((parent_path, leaf)) = Self::parent_and_leaf_relative(target_path) else {
-            return STATUS_INVALID_PARAMETER;
+            return Err(STATUS_INVALID_PARAMETER);
         };
-        let Some(parent) = self.lookup_from(root, parent_path) else {
-            return STATUS_OBJECT_PATH_NOT_FOUND;
+        let parent = match start {
+            Some(root) => self.lookup_from(root, parent_path),
+            None => self.lookup(parent_path),
         };
-        self.link_into_parent(source, parent, leaf, replace_if_exists)
+        let parent = parent.ok_or(STATUS_OBJECT_PATH_NOT_FOUND)?;
+        self.prepare_link_into_parent(source, parent, leaf, replace_if_exists)
     }
 
-    fn link_relative_to_source_parent(
+    fn apply_link(
         &mut self,
-        source: u64,
-        source_entry: u64,
-        target_path: &str,
-        replace_if_exists: bool,
+        plan: PreparedLink,
     ) -> u32 {
-        let Some((parent, _, entry_node)) = self.entry_location(source_entry) else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+        let PreparedLink::Add { insertion, replacement_entry } = plan else {
+            return STATUS_SUCCESS;
         };
-        if entry_node != source {
-            return STATUS_INVALID_HANDLE;
+        if let Some(entry) = replacement_entry {
+            if let Err(status) = self.unlink_entry(entry) {
+                return status;
+            }
         }
-        self.link_relative_to_dir(source, parent, target_path, replace_if_exists)
+        self.apply_insert_entry(insertion);
+        STATUS_SUCCESS
     }
 
     fn can_mark_delete_pending(&self, id: u64, ignore_readonly: bool) -> u32 {
@@ -2794,23 +2895,6 @@ impl MemFs {
             Some(index) => Some((&trimmed[..index], &trimmed[index + 1..])),
             None => Some((&[], trimmed)),
         }
-    }
-
-    fn create(
-        &mut self,
-        rel_path: &str,
-        disposition: u32,
-        options: u32,
-        file_attributes: u32,
-    ) -> Result<(u64, u64, u32), u32> {
-        let plan = self.prepare_create(
-            rel_path,
-            disposition,
-            options,
-            file_attributes,
-            &mut file_create::CreateAllocator::default(),
-        )?;
-        Ok(self.apply_create(plan))
     }
 
     /// Query a volume-relative path's attributes WITHOUT opening a handle — the
@@ -3222,13 +3306,13 @@ impl MemFs {
         if node.is_dir {
             return false;
         }
-        let Some(blob) = self.intern_blob(bytes) else {
-            return false;
-        };
         let mut extents = Vec::new();
         if extents.try_reserve_exact(1).is_err() {
             return false;
         }
+        let Some(blob) = self.intern_blob(bytes) else {
+            return false;
+        };
         extents.push(FileExtent {
             blob,
             offset: 0,
@@ -3303,6 +3387,56 @@ impl MemFs {
         }
     }
 
+    fn projected_write_data_cost(
+        &self, id: u64, offset: u64, bytes: &[u8], recent_read: Option<FileExtent>,
+    ) -> Result<usize, u32> {
+        let node = self.node(id).ok_or(STATUS_INVALID_HANDLE)?;
+        if node.is_dir { return Err(STATUS_INVALID_DEVICE_REQUEST); }
+        let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let end = start.checked_add(bytes.len()).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let current_len = node.data.len(&self.blobs);
+        let old_cost = Self::snapshot_file_data_encoded_len(&self.blobs, &node.data)
+            .map_err(|_| STATUS_DATA_ERROR)?;
+        if bytes.is_empty() { return Ok(old_cost); }
+
+        if let FileData::Extents(extents) = &node.data {
+            if extents.iter().any(|extent| extent.blob == ZERO_EXTENT_BLOB) {
+                let reused = self.matching_immutable_read(bytes, recent_read)
+                    .or_else(|| self.blobs.iter().position(|blob| blob.as_slice() == bytes)
+                        .map(|blob| FileExtent { blob, offset: 0, len: bytes.len() }));
+                let blob = match reused {
+                    Some(extent) => extent,
+                    None => FileExtent { blob: self.blobs.len(), offset: 0, len: bytes.len() },
+                };
+                let next = Self::plan_spliced_extents(extents, start, blob)
+                    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+                return Self::projected_extents_encoded_len(&next)
+                    .map_err(|_| STATUS_DATA_ERROR);
+            }
+            if start == current_len {
+                if let Some(copied) = self.matching_immutable_read(bytes, recent_read) {
+                    let merged = extents.last().is_some_and(|last| {
+                        last.blob == copied.blob
+                            && last.blob != ZERO_EXTENT_BLOB
+                            && last.offset.checked_add(last.len) == Some(copied.offset)
+                    });
+                    return old_cost.checked_add(if merged { 0 } else { SNAP_EXTENT_HEADER_LEN })
+                        .and_then(|len| len.checked_add(bytes.len()))
+                        .ok_or(STATUS_DATA_ERROR);
+                }
+            }
+        } else if matches!(&node.data, FileData::Bytes(data) if data.is_empty())
+            && start == current_len
+            && self.matching_immutable_read(bytes, recent_read).is_some()
+        {
+            return SNAP_EXTENT_HEADER_LEN.checked_add(bytes.len())
+                .ok_or(STATUS_DATA_ERROR);
+        }
+
+        SNAP_EXTENT_HEADER_LEN.checked_add(current_len.max(end))
+            .ok_or(STATUS_DATA_ERROR)
+    }
+
     fn write_at(
         &mut self,
         id: u64,
@@ -3330,14 +3464,21 @@ impl MemFs {
                 if extents.iter().any(|extent| extent.blob == ZERO_EXTENT_BLOB)
         );
         if sparse_extent_backed {
-            let Some(extent) = self.extent_for_bytes(bytes, recent_read) else {
+            let reused = self.matching_immutable_read(bytes, recent_read)
+                .or_else(|| self.blobs.iter().position(|blob| blob.as_slice() == bytes)
+                    .map(|blob| FileExtent { blob, offset: 0, len: bytes.len() }));
+            let pending_blob = reused.is_none();
+            let extent = reused.unwrap_or(FileExtent {
+                blob: self.blobs.len(), offset: 0, len: bytes.len(),
+            });
+            let Some(node) = self.node(id) else { return 0; };
+            let FileData::Extents(old) = &node.data else { return 0; };
+            let Some(next) = Self::plan_spliced_extents(old, start, extent) else { return 0; };
+            if pending_blob && self.intern_blob(bytes) != Some(extent.blob) {
                 return 0;
-            };
-            return if self.splice_write_extent(id, start, extent) {
-                bytes.len()
-            } else {
-                0
-            };
+            }
+            self.node_mut(id).expect("prepared sparse write node").data = FileData::Extents(next);
+            return bytes.len();
         }
         let can_append_extent = matches!(&node.data, FileData::Extents(_))
             || matches!(&node.data, FileData::Bytes(data) if data.is_empty());
@@ -3407,113 +3548,65 @@ impl MemFs {
         }
         appended.extend_from_slice(bytes);
 
-        let data = {
-            let Some(node) = self.node_mut(id) else {
-                return 0;
-            };
-            core::mem::replace(&mut node.data, FileData::Extents(Vec::new()))
-        };
-
-        let mut extents = match data {
-            FileData::Extents(mut extents) => {
-                if extents.try_reserve_exact(1).is_err() {
-                    if let Some(node) = self.node_mut(id) {
-                        node.data = FileData::Extents(extents);
-                    }
-                    return 0;
-                }
-                extents
-            }
+        // Prepare every allocation before moving the old bytes or publishing the new blob.
+        // In particular, a failed blob reserve must leave a Bytes-backed file intact.
+        let mut converted = match &node.data {
             FileData::Bytes(existing) => {
-                let existing_len = existing.len();
-                let extent_count = usize::from(existing_len != 0) + 1;
                 let mut extents = Vec::new();
-                if extents.try_reserve_exact(extent_count).is_err() {
-                    if let Some(node) = self.node_mut(id) {
-                        node.data = FileData::Bytes(existing);
-                    }
+                if extents.try_reserve_exact(usize::from(!existing.is_empty()) + 1).is_err() {
                     return 0;
                 }
-                if existing_len != 0 {
-                    if self.blobs.try_reserve_exact(1).is_err() {
-                        if let Some(node) = self.node_mut(id) {
-                            node.data = FileData::Bytes(existing);
-                        }
-                        return 0;
-                    }
-                    let blob = self.blobs.len();
-                    self.blobs.push(existing);
-                    extents.push(FileExtent {
-                        blob,
-                        offset: 0,
-                        len: existing_len,
-                    });
-                }
-                extents
+                Some(extents)
             }
+            FileData::Extents(_) => None,
         };
-
-        if self.blobs.try_reserve_exact(1).is_err() {
-            if let Some(node) = self.node_mut(id) {
-                node.data = FileData::Extents(extents);
+        if converted.is_none() {
+            let Some(node) = self.node_mut(id) else { return 0; };
+            let FileData::Extents(extents) = &mut node.data else { return 0; };
+            if extents.try_reserve_exact(1).is_err() {
+                return 0;
             }
+        }
+        let old_bytes_need_blob = self.node(id).is_some_and(|node| {
+            matches!(&node.data, FileData::Bytes(existing) if !existing.is_empty())
+        });
+        if self.blobs.try_reserve_exact(usize::from(old_bytes_need_blob) + 1).is_err() {
             return 0;
+        }
+
+        if let Some(mut extents) = converted.take() {
+            let old = core::mem::replace(
+                &mut self.node_mut(id).expect("prepared append node").data,
+                FileData::Extents(Vec::new()),
+            );
+            let FileData::Bytes(existing) = old else { unreachable!("prepared Bytes append") };
+            if !existing.is_empty() {
+                let len = existing.len();
+                let blob = self.blobs.len();
+                self.blobs.push(existing);
+                extents.push(FileExtent { blob, offset: 0, len });
+            }
+            self.node_mut(id).expect("prepared append node").data = FileData::Extents(extents);
         }
         let blob = self.blobs.len();
         self.blobs.push(appended);
-        Self::push_extent_merged(
-            &mut extents,
-            FileExtent {
-                blob,
-                offset: 0,
-                len: bytes.len(),
-            },
-        );
-        let Some(node) = self.node_mut(id) else {
-            return 0;
-        };
-        node.data = FileData::Extents(extents);
+        let FileData::Extents(extents) =
+            &mut self.node_mut(id).expect("prepared append node").data
+        else { unreachable!("prepared append extents") };
+        Self::push_extent_merged(extents, FileExtent { blob, offset: 0, len: bytes.len() });
         bytes.len()
     }
 
-    fn extent_for_bytes(
-        &mut self,
-        bytes: &[u8],
-        recent_read: Option<FileExtent>,
-    ) -> Option<FileExtent> {
-        self.matching_immutable_read(bytes, recent_read).or_else(|| {
-            let blob = self.intern_blob(bytes)?;
-            Some(FileExtent {
-                blob,
-                offset: 0,
-                len: bytes.len(),
-            })
-        })
-    }
-
-    fn splice_write_extent(&mut self, id: u64, start: usize, write: FileExtent) -> bool {
+    fn plan_spliced_extents(
+        old_extents: &[FileExtent], start: usize, write: FileExtent,
+    ) -> Option<Vec<FileExtent>> {
         let Some(write_end) = start.checked_add(write.len) else {
-            return false;
-        };
-        let old_extents = {
-            let Some(node) = self.node_mut(id) else {
-                return false;
-            };
-            match core::mem::replace(&mut node.data, FileData::Extents(Vec::new())) {
-                FileData::Extents(extents) => extents,
-                other => {
-                    node.data = other;
-                    return false;
-                }
-            }
+            return None;
         };
         let old_len = old_extents.iter().map(|extent| extent.len).sum::<usize>();
         let mut next = Vec::new();
         if next.try_reserve_exact(old_extents.len() + 3).is_err() {
-            if let Some(node) = self.node_mut(id) {
-                node.data = FileData::Extents(old_extents);
-            }
-            return false;
+            return None;
         }
 
         let mut cursor = 0usize;
@@ -3521,10 +3614,7 @@ impl MemFs {
         for extent in old_extents.iter().copied() {
             let extent_start = cursor;
             let Some(extent_end) = cursor.checked_add(extent.len) else {
-                if let Some(node) = self.node_mut(id) {
-                    node.data = FileData::Extents(old_extents);
-                }
-                return false;
+                return None;
             };
             cursor = extent_end;
 
@@ -3571,11 +3661,7 @@ impl MemFs {
             Self::push_extent_merged(&mut next, write);
         }
 
-        let Some(node) = self.node_mut(id) else {
-            return false;
-        };
-        node.data = FileData::Extents(next);
-        true
+        Some(next)
     }
 
     fn intern_blob(&mut self, bytes: &[u8]) -> Option<usize> {
@@ -4076,6 +4162,7 @@ pub fn parse_file_basic_information_attributes(data: &[u8]) -> Result<u32, u32> 
 /// exposing the Zw* native file APIs (spec §8-§9).
 pub struct FileSystem {
     volume: MemFs,
+    snapshot_budget: Option<SnapshotBudget>,
     /// Last exact immutable range returned to a caller. Consumed by the next write after an
     /// exact byte comparison, so unrelated writes never search provisioned file contents.
     recent_immutable_read: Option<FileExtent>,
@@ -4104,6 +4191,7 @@ impl FileSystem {
     pub fn new(volume: MemFs) -> Self {
         FileSystem {
             volume,
+            snapshot_budget: None,
             recent_immutable_read: None,
             mounts: MountManager::new(),
             handles: Vec::new(),
@@ -4114,6 +4202,255 @@ impl FileSystem {
             #[cfg(test)]
             create_fail_at: None,
         }
+    }
+
+    /// Configure the mounted snapshot slot's maximum encoded volume image length.
+    pub fn set_snapshot_payload_capacity(&mut self, capacity: usize) -> Result<(), u32> {
+        if let Some(existing) = &self.snapshot_budget {
+            return if existing.capacity() == capacity {
+                Ok(())
+            } else {
+                Err(STATUS_INVALID_DEVICE_REQUEST)
+            };
+        }
+        let encoded_len = self.volume.snapshot_encoded_len()
+            .map_err(|_| STATUS_DATA_ERROR)?;
+        self.snapshot_budget = Some(SnapshotBudget::new(encoded_len, capacity)?);
+        Ok(())
+    }
+
+    pub fn snapshot_payload_capacity(&self) -> Option<usize> {
+        self.snapshot_budget.as_ref().map(SnapshotBudget::capacity)
+    }
+
+    /// Current exact encoded volume length. A configured mounted volume maintains this as a
+    /// mutation ledger, so callers need not traverse the tree on each admission.
+    pub fn snapshot_payload_encoded_len(&self) -> Result<usize, u32> {
+        match &self.snapshot_budget {
+            Some(budget) => Ok(budget.encoded_len()),
+            None => self.volume.snapshot_encoded_len().map_err(|_| STATUS_DATA_ERROR),
+        }
+    }
+
+    /// After all anchored boot WAL records have replayed into a private volume, measure the
+    /// resulting tree once and authenticate its capacity before publishing it as the live mount.
+    /// The caller must reserve future folds only after this reconciliation.
+    pub fn reconcile_unpublished_replay_snapshot(&mut self) -> Result<usize, u32> {
+        let actual = self.volume.snapshot_encoded_len().map_err(|_| STATUS_DATA_ERROR)?;
+        let budget = self.snapshot_budget.as_mut().ok_or(STATUS_DEVICE_NOT_READY)?;
+        budget.reconcile_unpublished_replay(actual)?;
+        Ok(actual)
+    }
+
+    fn reserved_replacement_node(&self, node_id: u64) -> bool {
+        self.volume.node(node_id).is_some_and(|node| {
+            self.snapshot_budget.as_ref().is_some_and(|budget| {
+                budget.replacement_targets(node.file_id)
+            })
+        })
+    }
+
+    /// Project a provisioning transaction before creating any parent or replacing file bytes.
+    /// Existing components use their serialized names, including long names reached by aliases.
+    fn project_provision_relative(&self, relative: &[u8], file: Option<&[u8]>)
+        -> Result<Option<usize>, u32>
+    {
+        let Some(budget) = &self.snapshot_budget else { return Ok(None); };
+        let (parents, leaf) = if file.is_some() {
+            let (parent, leaf) = MemFs::parent_and_leaf_bytes(relative)
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+            (parent, Some(leaf))
+        } else { (relative, None) };
+        let mut parent = 0;
+        let mut path_len = 0usize;
+        let mut growth = 0usize;
+        for component in parents.split(|byte| *byte == b'\\').filter(|part| !part.is_empty()) {
+            let name = core::str::from_utf8(component).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            if name == "." || name == ".." { return Err(STATUS_INVALID_PARAMETER); }
+            if let Some((node, entry)) = self.volume.lookup_folded_entry_from(parent, component) {
+                if !self.volume.is_dir(node) { return Err(STATUS_OBJECT_PATH_NOT_FOUND); }
+                path_len = self.volume.opened_name(entry)
+                    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?
+                    .trim_start_matches('\\').len();
+                parent = node;
+            } else {
+                path_len = path_len.checked_add(usize::from(path_len != 0))
+                    .and_then(|len| len.checked_add(name.len())).ok_or(STATUS_DATA_ERROR)?;
+                growth = growth.checked_add(SNAP_RECORD_FIXED_LEN)
+                    .and_then(|len| len.checked_add(path_len)).ok_or(STATUS_DATA_ERROR)?;
+                // An absent parent has no node ID; all remaining components are necessarily new.
+                parent = u64::MAX;
+            }
+        }
+        let mut old_data = 0usize;
+        if let (Some(bytes), Some(leaf)) = (file, leaf) {
+            let name = core::str::from_utf8(leaf).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            if name.is_empty() || name == "." || name == ".." { return Err(STATUS_INVALID_PARAMETER); }
+            if parent != u64::MAX {
+                if let Some(id) = self.volume.child_folded_bytes(parent, leaf) {
+                    if self.volume.is_dir(id) { return Err(STATUS_FILE_IS_A_DIRECTORY); }
+                    if self.reserved_replacement_node(id) { return Err(STATUS_ACCESS_DENIED); }
+                    old_data = self.volume.live_file_data_encoded_len(id)
+                        .map_err(|_| STATUS_DATA_ERROR)?;
+                } else {
+                    let leaf_len = path_len.checked_add(usize::from(path_len != 0))
+                        .and_then(|len| len.checked_add(name.len()))
+                        .ok_or(STATUS_DATA_ERROR)?;
+                    growth = growth.checked_add(SNAP_RECORD_FIXED_LEN)
+                        .and_then(|len| len.checked_add(leaf_len))
+                        .ok_or(STATUS_DATA_ERROR)?;
+                }
+            } else {
+                let leaf_len = path_len.checked_add(1)
+                    .and_then(|len| len.checked_add(name.len())).ok_or(STATUS_DATA_ERROR)?;
+                growth = growth.checked_add(SNAP_RECORD_FIXED_LEN)
+                    .and_then(|len| len.checked_add(leaf_len))
+                    .ok_or(STATUS_DATA_ERROR)?;
+            }
+            if !bytes.is_empty() {
+                growth = growth.checked_add(SNAP_EXTENT_HEADER_LEN)
+                    .and_then(|len| len.checked_add(bytes.len())).ok_or(STATUS_DATA_ERROR)?;
+            }
+        }
+        budget.project(old_data, growth).map(Some)
+    }
+
+    fn project_snapshot_data_cost(&self, id: u64, next_data_cost: usize)
+        -> Result<Option<usize>, u32>
+    {
+        let Some(budget) = &self.snapshot_budget else { return Ok(None); };
+        if self.reserved_replacement_node(id) { return Err(STATUS_ACCESS_DENIED); }
+        let old_data_cost = self.volume.live_file_data_encoded_len(id)
+            .map_err(|_| STATUS_DATA_ERROR)?;
+        let node = self.volume.node(id).ok_or(STATUS_DATA_ERROR)?;
+        let next_data_cost = if node.link_count == 0 { 0 } else { next_data_cost };
+        budget.project(old_data_cost, next_data_cost).map(Some)
+    }
+
+    fn project_snapshot_append(&self, id: u64, bytes: usize) -> Result<Option<usize>, u32> {
+        if self.snapshot_budget.is_none() || bytes == 0 { return Ok(None); }
+        let old = self.volume.live_file_data_encoded_len(id)
+            .map_err(|_| STATUS_DATA_ERROR)?;
+        let next = old.checked_add(9).and_then(|n| n.checked_add(bytes))
+            .ok_or(STATUS_DATA_ERROR)?;
+        self.project_snapshot_data_cost(id, next)
+    }
+
+    fn publish_snapshot_size(&mut self, next: Option<usize>) {
+        if let Some(next) = next {
+            self.snapshot_budget.as_mut().expect("projected snapshot budget").publish(next);
+        }
+    }
+
+    /// Reserve an entire future append, including an absent file's directory entry. The
+    /// reservation remains charged inside this FileSystem if its move-only token is lost.
+    pub fn reserve_snapshot_append_by_path(
+        &mut self, path: &str, bytes_len: usize,
+    ) -> Result<SnapshotCapacityReservation, u32> {
+        let rel = self.to_relative(&normalize_separators(path))
+            .ok_or(STATUS_OBJECT_PATH_NOT_FOUND)?;
+        let mut allocator = file_create::CreateAllocator::default();
+        let plan = self.volume.prepare_create(
+            &rel, FILE_OPEN_IF, FILE_NON_DIRECTORY_FILE, 0, &mut allocator,
+        )?;
+        let (file_id, create_charge) = match &plan {
+            file_create::PreparedCreate::Existing { node, .. } => {
+                let node = self.volume.node(*node).ok_or(STATUS_DATA_ERROR)?;
+                if node.is_dir { return Err(STATUS_FILE_IS_A_DIRECTORY); }
+                (Some(node.file_id), 0)
+            }
+            file_create::PreparedCreate::New { .. } => {
+                let name = self.volume.create_opened_name(&plan, &mut allocator)?;
+                let record = SNAP_RECORD_FIXED_LEN
+                    .checked_add(name.trim_start_matches('\\').len())
+                    .ok_or(STATUS_DATA_ERROR)?;
+                (None, record)
+            }
+        };
+        let append_charge = if bytes_len == 0 { 0 } else {
+            SNAP_EXTENT_HEADER_LEN.checked_add(bytes_len).ok_or(STATUS_DATA_ERROR)?
+        };
+        let budget = self.snapshot_budget.as_mut().ok_or(STATUS_DEVICE_NOT_READY)?;
+        budget.reserve_append(rel, file_id, bytes_len, create_charge, append_charge)
+    }
+
+    /// Retain the peak growth for an owned replacement of an existing file. Other files,
+    /// including a companion journal, remain present in the projected intermediate snapshot.
+    pub fn reserve_snapshot_replacement_by_path(
+        &mut self, path: &str, new_bytes_len: usize,
+    ) -> Result<SnapshotCapacityReservation, u32> {
+        let rel = self.to_relative(&normalize_separators(path))
+            .ok_or(STATUS_OBJECT_PATH_NOT_FOUND)?;
+        let node_id = self.volume.lookup(&rel).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let node = self.volume.node(node_id).ok_or(STATUS_DATA_ERROR)?;
+        if node.is_dir { return Err(STATUS_FILE_IS_A_DIRECTORY); }
+        if self.handles.iter().flatten().any(|object| {
+            object.node_id == node_id && object.requests_delete()
+        }) {
+            return Err(STATUS_DELETE_PENDING);
+        }
+        let file_id = node.file_id;
+        let old = self.volume.live_file_data_encoded_len(node_id)
+            .map_err(|_| STATUS_DATA_ERROR)?;
+        let new = if new_bytes_len == 0 { 0 } else {
+            SNAP_EXTENT_HEADER_LEN.checked_add(new_bytes_len).ok_or(STATUS_DATA_ERROR)?
+        };
+        let charge = new.saturating_sub(old);
+        let budget = self.snapshot_budget.as_mut().ok_or(STATUS_DEVICE_NOT_READY)?;
+        budget.reserve_replacement(rel, file_id, new_bytes_len, old, charge)
+    }
+
+    /// Atomically replace a future projection while preserving the same reservation identity.
+    /// Failure returns the original token and keeps its earlier capacity charge intact.
+    pub fn update_snapshot_replacement_projection(
+        &mut self, mut token: SnapshotCapacityReservation, new_bytes_len: usize,
+    ) -> Result<SnapshotCapacityReservation, (u32, SnapshotCapacityReservation)> {
+        if token.kind != SnapshotReservationKind::Replacement {
+            return Err((STATUS_INVALID_PARAMETER, token));
+        }
+        let Some(node_id) = self.volume.lookup(&token.relative_path) else {
+            return Err((STATUS_OBJECT_NAME_NOT_FOUND, token));
+        };
+        let Some(node) = self.volume.node(node_id) else {
+            return Err((STATUS_DATA_ERROR, token));
+        };
+        if Some(node.file_id) != token.file_id || node.is_dir {
+            return Err((STATUS_DATA_ERROR, token));
+        }
+        let old = match self.volume.live_file_data_encoded_len(node_id) {
+            Ok(old) => old,
+            Err(_) => return Err((STATUS_DATA_ERROR, token)),
+        };
+        if old != token.replacement_base_cost {
+            return Err((STATUS_DATA_ERROR, token));
+        }
+        let new = if new_bytes_len == 0 { 0 } else {
+            match SNAP_EXTENT_HEADER_LEN.checked_add(new_bytes_len) {
+                Some(new) => new,
+                None => return Err((STATUS_DATA_ERROR, token)),
+            }
+        };
+        let charge = new.saturating_sub(old);
+        let Some(budget) = self.snapshot_budget.as_mut() else {
+            return Err((STATUS_DEVICE_NOT_READY, token));
+        };
+        if let Err(status) = budget.update_replacement(&token, charge) {
+            return Err((status, token));
+        }
+        token.bytes_len = new_bytes_len;
+        token.append_charge = charge;
+        Ok(token)
+    }
+
+    /// Release only the unconsumed charge after an exact, proven no-effect abort.
+    pub fn cancel_snapshot_reservation(
+        &mut self, token: SnapshotCapacityReservation,
+    ) -> Result<(), (u32, SnapshotCapacityReservation)> {
+        let Some(budget) = self.snapshot_budget.as_mut() else {
+            return Err((STATUS_DEVICE_NOT_READY, token));
+        };
+        if !budget.owns(&token) { return Err((STATUS_DATA_ERROR, token)); }
+        budget.cancel(&token).map_err(|status| (status, token))
     }
 
     /// Register one filesystem-owned directory notification request. `context` is the I/O
@@ -4260,7 +4597,14 @@ impl FileSystem {
     /// Export just the durable volume tree. Open handles are per-boot FILE_OBJECT state and are not
     /// included.
     pub fn export_volume_snapshot(&self) -> Result<Vec<u8>, MemFsSnapshotError> {
-        self.volume.to_snapshot()
+        let mut image = Vec::new();
+        self.export_volume_snapshot_into(&mut image)?;
+        Ok(image)
+    }
+
+    /// Exact size of the current encoded volume image, without allocating the image.
+    pub fn snapshot_encoded_len(&self) -> Result<usize, MemFsSnapshotError> {
+        self.volume.snapshot_encoded_len()
     }
 
     /// Capture into retained storage for checkpoints that must keep one immutable image across
@@ -4269,7 +4613,36 @@ impl FileSystem {
         &self,
         out: &mut Vec<u8>,
     ) -> Result<(), MemFsSnapshotError> {
-        self.volume.write_snapshot_into(out)
+        self.volume.write_snapshot_into(out)?;
+        self.check_snapshot_capture_len(out.len())
+    }
+
+    /// Reconcile the exact serialized result before a checkpoint may start physical I/O.
+    fn check_snapshot_capture_len(&self, actual: usize) -> Result<(), MemFsSnapshotError> {
+        if let Some(budget) = &self.snapshot_budget {
+            if actual > budget.capacity() {
+                return Err(MemFsSnapshotError::OutOfSpace);
+            }
+            if actual != budget.encoded_len() {
+                return Err(MemFsSnapshotError::InvalidRecord);
+            }
+        }
+        Ok(())
+    }
+
+    fn check_streaming_snapshot_before_io(&self, store_capacity: usize)
+        -> Result<(), SnapshotBlockStoreError>
+    {
+        let actual = self.volume.snapshot_encoded_len().map_err(|error| match error {
+            MemFsSnapshotError::OutOfMemory => SnapshotBlockStoreError::OutOfMemory,
+            _ => SnapshotBlockStoreError::Corrupt,
+        })?;
+        if let Some(budget) = &self.snapshot_budget {
+            if actual > budget.capacity() { return Err(SnapshotBlockStoreError::OutOfSpace); }
+            if actual != budget.encoded_len() { return Err(SnapshotBlockStoreError::Corrupt); }
+        }
+        if actual > store_capacity { return Err(SnapshotBlockStoreError::OutOfSpace); }
+        Ok(())
     }
 
     /// Reclaim immutable file-data blobs made unreachable by truncate, replace, or unlink.
@@ -4285,6 +4658,7 @@ impl FileSystem {
         store: &SnapshotBlockStore,
         dev: &mut D,
     ) -> Result<(u64, usize), SnapshotBlockStoreError> {
+        self.check_streaming_snapshot_before_io(store.payload_capacity(dev)?)?;
         self.volume.commit_snapshot_to_store(store, dev, None, false)
     }
 
@@ -4297,6 +4671,7 @@ impl FileSystem {
         dev: &mut D,
         manifest: WalSnapshotManifest,
     ) -> Result<(u64, usize), SnapshotBlockStoreError> {
+        self.check_streaming_snapshot_before_io(store.payload_capacity(dev)?)?;
         self.volume.commit_snapshot_to_store(store, dev, Some(manifest), false)
     }
 
@@ -4306,6 +4681,7 @@ impl FileSystem {
         dev: &mut D,
         manifest: WalSnapshotManifest,
     ) -> Result<(u64, usize), SnapshotBlockStoreError> {
+        self.check_streaming_snapshot_before_io(store.payload_capacity(dev)?)?;
         self.volume.commit_snapshot_to_store(store, dev, Some(manifest), true)
     }
 
@@ -4461,7 +4837,7 @@ impl FileSystem {
         else {
             return STATUS_INVALID_HANDLE;
         };
-        if self.wal_protected_subtree(source) {
+        if self.wal_protected_subtree(source) || self.reserved_replacement_node(source) {
             return STATUS_ACCESS_DENIED;
         }
         if target.is_empty() || self.to_relative(target).is_some() {
@@ -4482,25 +4858,23 @@ impl FileSystem {
         {
             return STATUS_ACCESS_DENIED;
         }
-        let status = match root {
+        let (start, target) = match root {
             FileRenameRoot::SourceParent => {
                 if target.starts_with('\\') {
                     return STATUS_INVALID_PARAMETER;
                 }
-                self.volume.rename_relative_to_source_parent(
-                    source,
-                    source_entry,
-                    target,
-                    replace_if_exists,
-                )
+                let Some((parent, _, entry_node)) = self.volume.entry_location(source_entry) else {
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                };
+                if entry_node != source { return STATUS_INVALID_HANDLE; }
+                (Some(parent), target)
             }
             FileRenameRoot::VolumeRoot => {
                 let target = target.trim_start_matches('\\');
                 if target.is_empty() {
                     return STATUS_INVALID_PARAMETER;
                 }
-                self.volume
-                    .rename_relative(source, source_entry, target, replace_if_exists)
+                (None, target)
             }
             FileRenameRoot::Directory(directory) => {
                 if target.starts_with('\\') {
@@ -4512,16 +4886,59 @@ impl FileSystem {
                 if !self.volume.is_dir(root_id) {
                     return STATUS_NOT_A_DIRECTORY;
                 }
-                self.volume.rename_relative_to_dir(
-                    source,
-                    source_entry,
-                    root_id,
-                    target,
-                    replace_if_exists,
-                )
+                (Some(root_id), target)
             }
         };
+        let plan = match self.volume.prepare_rename_relative(
+            source, source_entry, start, target, replace_if_exists,
+        ) {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+        if plan.replacement_entry.is_some_and(|entry| {
+            self.volume.entry_location(entry).is_some_and(|(_, _, node)|
+                self.reserved_replacement_node(node))
+        }) {
+            return STATUS_ACCESS_DENIED;
+        }
+        let next_snapshot_size = if let Some(budget) = &self.snapshot_budget {
+            let entries = match self.volume.subtree_snapshot_entry_count(plan.source) {
+                Ok(entries) => entries,
+                Err(status) => return status,
+            };
+            let old_paths = old_name.len().checked_mul(entries);
+            let new_paths = new_name.len().checked_mul(entries);
+            let (Some(old_paths), Some(new_paths)) = (old_paths, new_paths) else {
+                return STATUS_DATA_ERROR;
+            };
+            let replacement = if let Some(entry) = plan.replacement_entry {
+                let Some((_, _, node_id)) = self.volume.entry_location(entry) else {
+                    return STATUS_DATA_ERROR;
+                };
+                let Some(node) = self.volume.node(node_id) else { return STATUS_DATA_ERROR; };
+                let data = if node.link_count == 1 {
+                    match self.volume.live_file_data_encoded_len(node_id) {
+                        Ok(len) => len,
+                        Err(_) => return STATUS_DATA_ERROR,
+                    }
+                } else { 0 };
+                let Some(cost) = SNAP_RECORD_FIXED_LEN
+                    .checked_add(new_name.trim_start_matches('\\').len())
+                    .and_then(|len| len.checked_add(data))
+                else { return STATUS_DATA_ERROR; };
+                cost
+            } else { 0 };
+            let Some(old) = old_paths.checked_add(replacement) else {
+                return STATUS_DATA_ERROR;
+            };
+            match budget.project(old, new_paths) {
+                Ok(next) => Some(next),
+                Err(status) => return status,
+            }
+        } else { None };
+        let status = self.volume.apply_rename_into_parent(plan);
         if status == STATUS_SUCCESS {
+            self.publish_snapshot_size(next_snapshot_size);
             let filter = if self.volume.is_dir(source) {
                 crate::FILE_NOTIFY_CHANGE_DIR_NAME
             } else {
@@ -4617,7 +5034,7 @@ impl FileSystem {
         else {
             return STATUS_INVALID_HANDLE;
         };
-        if self.wal_protected_subtree(source) {
+        if self.wal_protected_subtree(source) || self.reserved_replacement_node(source) {
             return STATUS_ACCESS_DENIED;
         }
         if target.is_empty() || self.to_relative(target).is_some() {
@@ -4629,24 +5046,23 @@ impl FileSystem {
         if self.wal_protected_target_name(&new_name) {
             return STATUS_ACCESS_DENIED;
         }
-        let status = match root {
+        let (start, target) = match root {
             FileRenameRoot::SourceParent => {
                 if target.starts_with('\\') {
                     return STATUS_INVALID_PARAMETER;
                 }
-                self.volume.link_relative_to_source_parent(
-                    source,
-                    source_entry,
-                    target,
-                    replace_if_exists,
-                )
+                let Some((parent, _, entry_node)) = self.volume.entry_location(source_entry) else {
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                };
+                if entry_node != source { return STATUS_INVALID_HANDLE; }
+                (Some(parent), target)
             }
             FileRenameRoot::VolumeRoot => {
                 let target = target.trim_start_matches('\\');
                 if target.is_empty() {
                     return STATUS_INVALID_PARAMETER;
                 }
-                self.volume.link_relative(source, target, replace_if_exists)
+                (None, target)
             }
             FileRenameRoot::Directory(directory) => {
                 if target.starts_with('\\') {
@@ -4658,11 +5074,61 @@ impl FileSystem {
                 if !self.volume.is_dir(root_id) {
                     return STATUS_NOT_A_DIRECTORY;
                 }
-                self.volume
-                    .link_relative_to_dir(source, root_id, target, replace_if_exists)
+                (Some(root_id), target)
             }
         };
+        let plan = match self.volume.prepare_link_relative(
+            source, start, target, replace_if_exists,
+        ) {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+        if matches!(&plan, PreparedLink::Add { replacement_entry: Some(entry), .. }
+            if self.volume.entry_location(*entry).is_some_and(|(_, _, node)|
+                self.reserved_replacement_node(node))) {
+            return STATUS_ACCESS_DENIED;
+        }
+        let next_snapshot_size = if let (Some(budget), PreparedLink::Add {
+            replacement_entry, ..
+        }) = (&self.snapshot_budget, &plan) {
+            let Some(record) = SNAP_RECORD_FIXED_LEN
+                .checked_add(new_name.trim_start_matches('\\').len()) else {
+                return STATUS_DATA_ERROR;
+            };
+            let source_data = match self.volume.node(source) {
+                Some(node) if node.link_count == 0 => {
+                    match MemFs::snapshot_file_data_encoded_len(&self.volume.blobs, &node.data) {
+                        Ok(len) => len,
+                        Err(_) => return STATUS_DATA_ERROR,
+                    }
+                }
+                Some(_) => 0,
+                None => return STATUS_DATA_ERROR,
+            };
+            let old_data = if let Some(entry) = replacement_entry {
+                let Some((_, _, node_id)) = self.volume.entry_location(*entry) else {
+                    return STATUS_DATA_ERROR;
+                };
+                if self.volume.node(node_id).is_some_and(|node| node.link_count == 1) {
+                    match self.volume.live_file_data_encoded_len(node_id) {
+                        Ok(len) => len,
+                        Err(_) => return STATUS_DATA_ERROR,
+                    }
+                } else { 0 }
+            } else { 0 };
+            let old = if replacement_entry.is_some() {
+                record.checked_add(old_data)
+            } else { Some(0) };
+            let Some(old) = old else { return STATUS_DATA_ERROR; };
+            let Some(new) = record.checked_add(source_data) else { return STATUS_DATA_ERROR; };
+            match budget.project(old, new) {
+                Ok(next) => Some(next),
+                Err(status) => return status,
+            }
+        } else { None };
+        let status = self.volume.apply_link(plan);
         if status == STATUS_SUCCESS {
+            self.publish_snapshot_size(next_snapshot_size);
             self.notifications.report_change(crate::DirectoryChange {
                 full_path: &new_name,
                 filter: crate::FILE_NOTIFY_CHANGE_FILE_NAME,
@@ -4700,6 +5166,60 @@ impl FileSystem {
         disposition: u32,
         options: u32,
     ) -> CreateResult {
+        self.zw_create_file_with_reservation(
+            path, desired_access, file_attributes, share_access, disposition, options, None,
+        )
+    }
+
+    /// Open the exact file named by a retained capacity reservation, consuming only its
+    /// precharged CREATE record if this operation actually publishes a new file.
+    pub fn zw_create_file_reserved(
+        &mut self,
+        token: &mut SnapshotCapacityReservation,
+        path: &str,
+        desired_access: u32,
+        file_attributes: u32,
+        share_access: u32,
+        disposition: u32,
+        options: u32,
+    ) -> CreateResult {
+        let fail = |status| CreateResult {
+            status, handle: INVALID_HANDLE, information: 0,
+        };
+        let Some(budget) = &self.snapshot_budget else { return fail(STATUS_DEVICE_NOT_READY); };
+        if !budget.owns(token) || token.kind != SnapshotReservationKind::Append
+            || !matches!(disposition, FILE_OPEN | FILE_OPEN_IF | FILE_CREATE) {
+            return fail(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let Some(rel) = self.to_relative(&normalize_separators(path)) else {
+            return fail(STATUS_OBJECT_PATH_NOT_FOUND);
+        };
+        if !rel.eq_ignore_ascii_case(&token.relative_path) {
+            return fail(STATUS_INVALID_PARAMETER);
+        }
+        let result = self.zw_create_file_with_reservation(
+            path, desired_access, file_attributes, share_access, disposition, options,
+            Some(token),
+        );
+        if result.status == STATUS_SUCCESS {
+            let node_id = self.obj(result.handle).expect("reserved opened File").node_id;
+            let file_id = self.volume.node(node_id).expect("reserved opened node").file_id;
+            token.file_id = Some(file_id);
+            token.create_charge = 0;
+        }
+        result
+    }
+
+    fn zw_create_file_with_reservation(
+        &mut self,
+        path: &str,
+        desired_access: u32,
+        file_attributes: u32,
+        share_access: u32,
+        disposition: u32,
+        options: u32,
+        reservation: Option<&SnapshotCapacityReservation>,
+    ) -> CreateResult {
         let fail = |status| CreateResult {
             status,
             handle: INVALID_HANDLE,
@@ -4725,7 +5245,7 @@ impl FileSystem {
                 }
             }
         }
-        self.create_and_publish(options, share, |volume, allocator| {
+        self.create_and_publish(options, share, reservation, |volume, allocator| {
             volume.prepare_create(&rel, disposition, options, file_attributes, allocator)
         })
     }
@@ -4765,7 +5285,7 @@ impl FileSystem {
                 }
             }
         }
-        self.create_and_publish(options, share, |volume, allocator| {
+        self.create_and_publish(options, share, None, |volume, allocator| {
             volume.prepare_create_folded(
                 0, relative, disposition, options, file_attributes, allocator,
             )
@@ -4818,6 +5338,7 @@ impl FileSystem {
             parent, leaf, FILE_NON_DIRECTORY_FILE, 0,
             &mut file_create::CreateAllocator::default(),
         )?;
+        let next = self.project_provision_relative(relative, Some(&bytes))?;
         let (node_id, entry_id, _) = self.volume.apply_create(plan);
         if !self.volume.set_file_data_owned(node_id, bytes) {
             let _ = self.volume.unlink_entry(entry_id);
@@ -4836,6 +5357,7 @@ impl FileSystem {
             0 => FILE_ATTRIBUTE_NORMAL,
             attributes => attributes,
         };
+        self.publish_snapshot_size(next);
         Ok(true)
     }
 
@@ -4857,14 +5379,30 @@ impl FileSystem {
         let first_entry = self.volume.next_entry_id;
         let first_file = self.volume.next_file_id;
         let first_node_len = self.volume.nodes.len();
+        let first_snapshot_size = self.snapshot_budget.as_ref().map(SnapshotBudget::encoded_len);
         let fail = |status| CreateResult {
             status, handle: INVALID_HANDLE, information: 0,
         };
+        // The import must fit with all newly materialized parents before the first name effect.
+        if let Some((_, bytes)) = &import {
+            if let Err(status) = self.project_provision_relative(relative, Some(bytes)) {
+                return fail(status);
+            }
+        } else if let Some(parent) = parent_path {
+            if let Err(status) = self.project_provision_relative(parent, None) {
+                return fail(status);
+            }
+        }
         let result = (|| {
             if let Some(parent) = parent_path {
+                let next = match self.project_provision_relative(parent, None) {
+                    Ok(next) => next,
+                    Err(status) => return fail(status),
+                };
                 if let Err(status) = self.volume.materialize_parent_folded_relative(parent) {
                     return fail(status);
                 }
+                self.publish_snapshot_size(next);
             }
             if let Some((metadata, bytes)) = import {
                 if let Err(status) = self.import_file_relative(relative, metadata, bytes) {
@@ -4892,6 +5430,9 @@ impl FileSystem {
         self.volume.nodes.truncate(first_node_len);
         self.volume.next_file_id = first_file;
         self.volume.next_entry_id = first_entry;
+        if let Some(first) = first_snapshot_size {
+            self.snapshot_budget.as_mut().expect("configured snapshot budget").publish(first);
+        }
         result
     }
 
@@ -4941,7 +5482,7 @@ impl FileSystem {
                 }
             }
         }
-        self.create_and_publish(options, share, |volume, allocator| {
+        self.create_and_publish(options, share, None, |volume, allocator| {
             volume.prepare_create_folded(
                 root_node, relative, disposition, options, file_attributes, allocator,
             )
@@ -5074,11 +5615,24 @@ impl FileSystem {
             return (STATUS_ACCESS_DENIED, 0);
         }
         let offset = byte_offset.unwrap_or(obj.current_offset);
+        let next_snapshot_size = if self.snapshot_budget.is_some() && !data.is_empty() {
+            let next_data_cost = match self.volume.projected_write_data_cost(
+                node_id, offset, data, self.recent_immutable_read,
+            ) {
+                Ok(cost) => cost,
+                Err(status) => return (status, 0),
+            };
+            match self.project_snapshot_data_cost(node_id, next_data_cost) {
+                Ok(next) => next,
+                Err(status) => return (status, 0),
+            }
+        } else { None };
         let recent_read = self.recent_immutable_read.take();
         let n = self.volume.write_at(node_id, offset, data, recent_read);
         if !data.is_empty() && n == 0 {
             return (STATUS_INSUFFICIENT_RESOURCES, 0);
         }
+        self.publish_snapshot_size(next_snapshot_size);
         if byte_offset.is_none() {
             self.obj_mut(handle).unwrap().current_offset = offset + n as u64;
         }
@@ -5110,10 +5664,15 @@ impl FileSystem {
         if data.is_empty() {
             return (STATUS_SUCCESS, 0);
         }
+        let next_snapshot_size = match self.project_snapshot_append(node_id, data.len()) {
+            Ok(next) => next,
+            Err(status) => return (status, 0),
+        };
         let n = self.volume.append_at_end(node_id, data);
         if n == 0 {
             return (STATUS_INSUFFICIENT_RESOURCES, 0);
         }
+        self.publish_snapshot_size(next_snapshot_size);
         let end = self.volume.size(node_id);
         self.obj_mut(handle).unwrap().current_offset = end;
         self.volume.ensure_allocation_covers_eof(node_id);
@@ -5138,29 +5697,150 @@ impl FileSystem {
         let Some(rel) = self.to_relative(&normalize_separators(path)) else {
             return (STATUS_OBJECT_PATH_NOT_FOUND, 0);
         };
-        if self.volume.lookup(&rel).is_some_and(|node_id| self.wal_protected_node(node_id)) {
+        if self.volume.lookup(&rel).is_some_and(|node_id| {
+            self.wal_protected_node(node_id) || self.reserved_replacement_node(node_id)
+        }) {
             return (STATUS_ACCESS_DENIED, 0);
         }
-        let (node_id, _, _) =
-            match self
-                .volume
-                .create(&rel, FILE_OPEN_IF, FILE_NON_DIRECTORY_FILE, 0)
-            {
-                Ok(result) => result,
+        let mut allocator = file_create::CreateAllocator::default();
+        let mut plan = match self.volume.prepare_create(
+            &rel, FILE_OPEN_IF, FILE_NON_DIRECTORY_FILE, 0, &mut allocator,
+        ) {
+            Ok(plan) => plan,
+            Err(status) => return (status, 0),
+        };
+        let opened_name = if matches!(&plan, file_create::PreparedCreate::New { .. }) {
+            match self.volume.create_opened_name(&plan, &mut allocator) {
+                Ok(name) => name,
                 Err(status) => return (status, 0),
-            };
-        if self.volume.is_dir(node_id) {
-            return (STATUS_FILE_IS_A_DIRECTORY, 0);
+            }
+        } else { String::new() };
+        let (node_id, next_snapshot_size) = match &mut plan {
+            file_create::PreparedCreate::Existing { node, .. } => {
+                if self.volume.is_dir(*node) { return (STATUS_FILE_IS_A_DIRECTORY, 0); }
+                let next = match self.project_snapshot_append(*node, data.len()) {
+                    Ok(next) => next,
+                    Err(status) => return (status, 0),
+                };
+                let written = self.volume.append_at_end(*node, data);
+                if written != data.len() {
+                    return (STATUS_INSUFFICIENT_RESOURCES, 0);
+                }
+                (*node, next)
+            }
+            file_create::PreparedCreate::New { node, entry, .. } => {
+                let mut owned = Vec::new();
+                if owned.try_reserve_exact(data.len()).is_err() {
+                    return (STATUS_INSUFFICIENT_RESOURCES, 0);
+                }
+                owned.extend_from_slice(data);
+                node.allocation_size = allocation_size_for_eof(data.len() as u64);
+                node.valid_data_length = data.len() as u64;
+                node.data = FileData::Bytes(owned);
+                let next = match &self.snapshot_budget {
+                    Some(budget) => {
+                        let Some(cost) = SNAP_RECORD_FIXED_LEN
+                            .checked_add(opened_name.trim_start_matches('\\').len())
+                            .and_then(|len| len.checked_add(if data.is_empty() { 0 } else { 9 }))
+                            .and_then(|len| len.checked_add(data.len()))
+                        else { return (STATUS_DATA_ERROR, 0); };
+                        match budget.project(0, cost) {
+                            Ok(next) => Some(next),
+                            Err(status) => return (status, 0),
+                        }
+                    }
+                    None => None,
+                };
+                (entry.node_id, next)
+            }
+        };
+        if matches!(&plan, file_create::PreparedCreate::New { .. }) {
+            self.volume.apply_create(plan);
         }
-        let written = self.volume.append_at_end(node_id, data);
-        if written != data.len() {
-            return (STATUS_INSUFFICIENT_RESOURCES, written);
-        }
+        self.publish_snapshot_size(next_snapshot_size);
         self.volume.ensure_allocation_covers_eof(node_id);
         self.volume
             .mark_data_initialized_through(node_id, self.volume.size(node_id));
         self.volume.touch_write(node_id);
-        (STATUS_SUCCESS, written)
+        (STATUS_SUCCESS, data.len())
+    }
+
+    /// Complete an append whose exact CREATE and data growth were reserved before a native
+    /// durable effect. A refusal returns the same move-only token, including after uncertainty.
+    pub fn append_file_by_path_reserved(
+        &mut self,
+        token: SnapshotCapacityReservation,
+        path: &str,
+        data: &[u8],
+    ) -> Result<usize, (u32, SnapshotCapacityReservation)> {
+        self.append_file_by_path_reserved_inner(token, path, data, false)
+    }
+
+    fn append_file_by_path_reserved_inner(
+        &mut self,
+        token: SnapshotCapacityReservation,
+        path: &str,
+        data: &[u8],
+        replay_anchored_wal: bool,
+    ) -> Result<usize, (u32, SnapshotCapacityReservation)> {
+        let Some(budget) = &self.snapshot_budget else {
+            return Err((STATUS_DEVICE_NOT_READY, token));
+        };
+        if !budget.owns(&token) || token.kind != SnapshotReservationKind::Append
+            || token.create_charge != 0
+            || token.bytes_len != data.len()
+            || token.append_charge != if data.is_empty() { 0 } else {
+                SNAP_EXTENT_HEADER_LEN.checked_add(data.len()).unwrap_or(usize::MAX)
+            }
+        {
+            return Err((STATUS_DATA_ERROR, token));
+        }
+        let Some(rel) = self.to_relative(&normalize_separators(path)) else {
+            return Err((STATUS_OBJECT_PATH_NOT_FOUND, token));
+        };
+        if !rel.eq_ignore_ascii_case(&token.relative_path) {
+            return Err((STATUS_INVALID_PARAMETER, token));
+        }
+        let Some(node_id) = self.volume.lookup(&rel) else {
+            return Err((STATUS_OBJECT_NAME_NOT_FOUND, token));
+        };
+        let Some(node) = self.volume.node(node_id) else {
+            return Err((STATUS_DATA_ERROR, token));
+        };
+        if node.is_dir { return Err((STATUS_FILE_IS_A_DIRECTORY, token)); }
+        if Some(node.file_id) != token.file_id {
+            return Err((STATUS_DATA_ERROR, token));
+        }
+        if !replay_anchored_wal && self.wal_protected_node(node_id) {
+            return Err((STATUS_ACCESS_DENIED, token));
+        }
+        let old = match self.volume.live_file_data_encoded_len(node_id) {
+            Ok(old) => old,
+            Err(_) => return Err((STATUS_DATA_ERROR, token)),
+        };
+        let Some(next_cost) = old.checked_add(token.append_charge) else {
+            return Err((STATUS_DATA_ERROR, token));
+        };
+        let next = match budget.project_reserved(
+            &token, old, next_cost, token.append_charge,
+        ) {
+            Ok(next) => next,
+            Err(status) => return Err((status, token)),
+        };
+        if !data.is_empty() && self.volume.append_at_end(node_id, data) != data.len() {
+            return Err((STATUS_INSUFFICIENT_RESOURCES, token));
+        }
+        self.snapshot_budget.as_mut().expect("reserved append budget")
+            .publish_reserved(&token, next, token.append_charge);
+        self.volume.ensure_allocation_covers_eof(node_id);
+        self.volume.mark_data_initialized_through(node_id, self.volume.size(node_id));
+        self.volume.touch_write(node_id);
+        if let Err(status) = self.snapshot_budget.as_mut().expect("reserved append budget")
+            .finish(&token)
+        {
+            return Err((status, token));
+        }
+        Ok(data.len())
     }
 
     /// Replace the whole contents of an open file by taking ownership of `data`.
@@ -5179,10 +5859,19 @@ impl FileSystem {
         if self.wal_protected_node(node_id) {
             return STATUS_ACCESS_DENIED;
         }
+        let next_data_cost = if data.is_empty() { Some(0) } else {
+            data.len().checked_add(9)
+        };
+        let Some(next_data_cost) = next_data_cost else { return STATUS_DATA_ERROR; };
+        let next_snapshot_size = match self.project_snapshot_data_cost(node_id, next_data_cost) {
+            Ok(next) => next,
+            Err(status) => return status,
+        };
         let len = data.len() as u64;
         if !self.volume.set_file_data_owned(node_id, data) {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
+        self.publish_snapshot_size(next_snapshot_size);
         self.obj_mut(handle).unwrap().current_offset = len;
         self.volume.touch_write(node_id);
         self.report_handle_change(
@@ -5190,6 +5879,67 @@ impl FileSystem {
             crate::FILE_NOTIFY_CHANGE_SIZE | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
         );
         STATUS_SUCCESS
+    }
+
+    /// Consume a previously retained future replacement at the same instant as its file data
+    /// effect. On refusal, ownership of both the charge and image returns to the caller.
+    pub fn replace_file_data_owned_reserved(
+        &mut self, token: SnapshotCapacityReservation, handle: u64, data: Vec<u8>,
+    ) -> Result<(), (u32, SnapshotCapacityReservation, Vec<u8>)> {
+        let fail = |status, token, data| Err((status, token, data));
+        let Some(budget) = &self.snapshot_budget else {
+            return fail(STATUS_DEVICE_NOT_READY, token, data);
+        };
+        if token.kind != SnapshotReservationKind::Replacement || !budget.owns(&token)
+            || token.bytes_len != data.len() || token.create_charge != 0
+        {
+            return fail(STATUS_DATA_ERROR, token, data);
+        }
+        let Some(object) = self.obj(handle) else {
+            return fail(STATUS_INVALID_HANDLE, token, data);
+        };
+        let node_id = object.node_id;
+        let Some(node) = self.volume.node(node_id) else {
+            return fail(STATUS_DATA_ERROR, token, data);
+        };
+        if node.is_dir { return fail(STATUS_FILE_IS_A_DIRECTORY, token, data); }
+        if Some(node.file_id) != token.file_id {
+            return fail(STATUS_DATA_ERROR, token, data);
+        }
+        let old = match self.volume.live_file_data_encoded_len(node_id) {
+            Ok(old) => old,
+            Err(_) => return fail(STATUS_DATA_ERROR, token, data),
+        };
+        let new = if data.is_empty() { 0 } else {
+            match SNAP_EXTENT_HEADER_LEN.checked_add(data.len()) {
+                Some(new) => new,
+                None => return fail(STATUS_DATA_ERROR, token, data),
+            }
+        };
+        if old != token.replacement_base_cost
+            || new.saturating_sub(old) != token.append_charge {
+            return fail(STATUS_DATA_ERROR, token, data);
+        }
+        let next = match budget.project_reserved(&token, old, new, token.append_charge) {
+            Ok(next) => next,
+            Err(status) => return fail(status, token, data),
+        };
+        let len = data.len() as u64;
+        let Some(node) = self.volume.node_mut(node_id) else {
+            return fail(STATUS_DATA_ERROR, token, data);
+        };
+        node.allocation_size = allocation_size_for_eof(len);
+        node.valid_data_length = len;
+        node.data = FileData::Bytes(data);
+        self.snapshot_budget.as_mut().expect("reserved replacement budget")
+            .publish_reserved(&token, next, token.append_charge);
+        self.snapshot_budget.as_mut().expect("reserved replacement budget")
+            .finish(&token).expect("fully consumed replacement reservation");
+        self.obj_mut(handle).expect("validated replacement handle").current_offset = len;
+        self.volume.touch_write(node_id);
+        self.report_handle_change(handle,
+            crate::FILE_NOTIFY_CHANGE_SIZE | crate::FILE_NOTIFY_CHANGE_LAST_WRITE);
+        Ok(())
     }
 
     /// `ZwFlushBuffersFile` (spec §8.4) — MemFs is already coherent, so this is a no-op success.
@@ -5288,7 +6038,7 @@ impl FileSystem {
             return STATUS_INVALID_HANDLE;
         };
         let node_id = obj.node_id;
-        if self.wal_protected_subtree(node_id)
+        if (self.wal_protected_subtree(node_id) || self.reserved_replacement_node(node_id))
             && matches!(class,
                 FILE_DISPOSITION_INFORMATION | FILE_DISPOSITION_INFORMATION_EX
                 | FILE_END_OF_FILE_INFORMATION | FILE_ALLOCATION_INFORMATION
@@ -5346,8 +6096,21 @@ impl FileSystem {
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
                 let length = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let next_snapshot_size = if self.snapshot_budget.is_some() {
+                    let next_data_cost = match self.volume.projected_end_of_file_data_cost(
+                        node_id, length,
+                    ) {
+                        Ok(cost) => cost,
+                        Err(status) => return status,
+                    };
+                    match self.project_snapshot_data_cost(node_id, next_data_cost) {
+                        Ok(next) => next,
+                        Err(status) => return status,
+                    }
+                } else { None };
                 let status = self.volume.set_end_of_file(node_id, length);
                 if status == STATUS_SUCCESS {
+                    self.publish_snapshot_size(next_snapshot_size);
                     self.volume.touch_write(node_id);
                     self.report_handle_change(
                         handle,
@@ -5361,8 +6124,21 @@ impl FileSystem {
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
                 let allocation_size = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let next_snapshot_size = if self.snapshot_budget.is_some() {
+                    let next_data_cost = match self.volume.projected_allocation_data_cost(
+                        node_id, allocation_size,
+                    ) {
+                        Ok(cost) => cost,
+                        Err(status) => return status,
+                    };
+                    match self.project_snapshot_data_cost(node_id, next_data_cost) {
+                        Ok(next) => next,
+                        Err(status) => return status,
+                    }
+                } else { None };
                 let status = self.volume.set_allocation_size(node_id, allocation_size);
                 if status == STATUS_SUCCESS {
+                    self.publish_snapshot_size(next_snapshot_size);
                     self.volume.touch_write(node_id);
                     self.report_handle_change(
                         handle,
@@ -5500,11 +6276,18 @@ impl FileSystem {
     /// This is volume PROVISIONING (the content a formatted/installed volume already carries), not
     /// a syscall path: hosted processes only ever reach the `Zw*` surface above.
     pub fn provision_directory(&mut self, path: &str) -> bool {
+        self.provision_directory_checked(path).unwrap_or(false)
+    }
+
+    pub fn provision_directory_checked(&mut self, path: &str) -> Result<bool, u32> {
         let Some(rel) = self.to_relative(&normalize_separators(path)) else {
-            return false;
+            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
         };
+        let next = self.project_provision_relative(rel.as_bytes(), None)?;
         let id = self.volume.ensure_dir(&rel);
-        self.volume.is_dir(id)
+        let is_dir = self.volume.is_dir(id);
+        if is_dir { self.publish_snapshot_size(next); }
+        Ok(is_dir)
     }
 
     /// Create every missing directory along a folded volume-relative path.
@@ -5513,10 +6296,19 @@ impl FileSystem {
     /// resolved a path through the mount-prefix seam can provision installed volume content without
     /// depending on the `FileSystem` mount manager's DOS aliases.
     pub fn provision_directory_relative(&mut self, relative: &[u8]) -> bool {
+        self.provision_directory_relative_checked(relative).unwrap_or(false)
+    }
+
+    pub fn provision_directory_relative_checked(&mut self, relative: &[u8])
+        -> Result<bool, u32>
+    {
+        let next = self.project_provision_relative(relative, None)?;
         let Some(id) = self.volume.ensure_dir_folded_relative(relative) else {
-            return false;
+            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
         };
-        self.volume.is_dir(id)
+        let is_dir = self.volume.is_dir(id);
+        if is_dir { self.publish_snapshot_size(next); }
+        Ok(is_dir)
     }
 
     /// Create `path` (and every missing directory above it) as a FILE holding `bytes`.
@@ -5526,25 +6318,33 @@ impl FileSystem {
     /// surface above. It is the file-shaped sibling of [`provision_directory`](Self::provision_directory).
     /// Returns `false` if the path does not resolve to this volume or names an existing directory.
     pub fn provision_file(&mut self, path: &str, bytes: &[u8]) -> bool {
+        self.provision_file_checked(path, bytes).unwrap_or(false)
+    }
+
+    pub fn provision_file_checked(&mut self, path: &str, bytes: &[u8])
+        -> Result<bool, u32>
+    {
         let Some(rel) = self.to_relative(&normalize_separators(path)) else {
-            return false;
+            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
         };
         let Some((parent_path, leaf)) = MemFs::parent_and_leaf(&rel) else {
-            return false;
+            return Err(STATUS_INVALID_PARAMETER);
         };
+        let next = self.project_provision_relative(rel.as_bytes(), Some(bytes))?;
         let parent = self.volume.ensure_dir(parent_path);
         let id = match self.volume.child(parent, leaf) {
             Some(id) => id,
             None => self.volume.create_child(parent, leaf, false),
         };
         if self.volume.is_dir(id) {
-            return false;
+            return Err(STATUS_FILE_IS_A_DIRECTORY);
         }
         let installed = self.volume.set_file_data(id, bytes);
         if installed {
             self.volume.touch_write(id);
         }
-        installed
+        if installed { self.publish_snapshot_size(next); }
+        Ok(installed)
     }
 
     /// Create `path` as a FILE by taking ownership of `bytes`.
@@ -5559,6 +6359,10 @@ impl FileSystem {
         let Some((parent_path, leaf)) = MemFs::parent_and_leaf(&rel) else {
             return Err(bytes);
         };
+        let next = match self.project_provision_relative(rel.as_bytes(), Some(&bytes)) {
+            Ok(next) => next,
+            Err(_) => return Err(bytes),
+        };
         let parent = self.volume.ensure_dir(parent_path);
         let id = match self.volume.child(parent, leaf) {
             Some(id) => id,
@@ -5571,33 +6375,42 @@ impl FileSystem {
         debug_assert!(installed);
         if installed {
             self.volume.touch_write(id);
+            self.publish_snapshot_size(next);
         }
         Ok(())
     }
 
     /// Create a file by folded volume-relative path, and create every missing directory above it.
     pub fn provision_file_relative(&mut self, relative: &[u8], bytes: &[u8]) -> bool {
+        self.provision_file_relative_checked(relative, bytes).unwrap_or(false)
+    }
+
+    pub fn provision_file_relative_checked(&mut self, relative: &[u8], bytes: &[u8])
+        -> Result<bool, u32>
+    {
         let Some((parent_path, leaf)) = MemFs::parent_and_leaf_bytes(relative) else {
-            return false;
+            return Err(STATUS_INVALID_PARAMETER);
         };
+        let next = self.project_provision_relative(relative, Some(bytes))?;
         let Some(parent) = self.volume.ensure_dir_folded_relative(parent_path) else {
-            return false;
+            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
         };
         let Ok(leaf) = core::str::from_utf8(leaf) else {
-            return false;
+            return Err(STATUS_INVALID_PARAMETER);
         };
         let id = match self.volume.child(parent, leaf) {
             Some(id) => id,
             None => self.volume.create_child(parent, leaf, false),
         };
         if self.volume.is_dir(id) {
-            return false;
+            return Err(STATUS_FILE_IS_A_DIRECTORY);
         }
         let installed = self.volume.set_file_data(id, bytes);
         if installed {
             self.volume.touch_write(id);
         }
-        installed
+        if installed { self.publish_snapshot_size(next); }
+        Ok(installed)
     }
 
     /// A file's bytes, borrowed in place (no copy) — the read side [`provision_file`] writes.
@@ -5687,6 +6500,55 @@ impl FileSystem {
         &mut self,
         payload: HiveLogWalPayload<'_>,
     ) -> Result<HiveLogWalReplay, HiveLogWalReplayError> {
+        let (node_id, already_present) = self.classify_hive_log_wal_payload(payload)?;
+        if already_present { return Ok(HiveLogWalReplay::AlreadyPresent); }
+        let next = self.project_snapshot_append(node_id, payload.record.len())
+            .map_err(|status| if status == STATUS_DISK_FULL {
+                HiveLogWalReplayError::Capacity
+            } else { HiveLogWalReplayError::OutOfMemory })?;
+        if self.volume.append_at_end(node_id, payload.record) != payload.record.len() {
+            return Err(HiveLogWalReplayError::OutOfMemory);
+        }
+        self.publish_snapshot_size(next);
+        let end = self.volume.size(node_id);
+        self.volume.ensure_allocation_covers_eof(node_id);
+        self.volume.mark_data_initialized_through(node_id, end);
+        self.volume.touch_write(node_id);
+        Ok(HiveLogWalReplay::Appended)
+    }
+
+    /// Replay an anchored append under the charge retained before the WAL effect. The token
+    /// returns on every refusal; an exact already-present record proves the charge can be freed.
+    pub fn replay_hive_log_wal_payload_reserved(
+        &mut self,
+        token: SnapshotCapacityReservation,
+        payload: HiveLogWalPayload<'_>,
+    ) -> Result<HiveLogWalReplay, (HiveLogWalReplayError, SnapshotCapacityReservation)> {
+        let (_, already_present) = match self.classify_hive_log_wal_payload(payload) {
+            Ok(result) => result,
+            Err(error) => return Err((error, token)),
+        };
+        if already_present {
+            return match self.cancel_snapshot_reservation(token) {
+                Ok(()) => Ok(HiveLogWalReplay::AlreadyPresent),
+                Err((_, token)) => Err((HiveLogWalReplayError::ForeignIdentity, token)),
+            };
+        }
+        self.append_file_by_path_reserved_inner(token, payload.path, payload.record, true)
+            .map(|_| HiveLogWalReplay::Appended)
+            .map_err(|(status, token)| (
+                if status == STATUS_DISK_FULL { HiveLogWalReplayError::Capacity }
+                else if status == STATUS_DATA_ERROR || status == STATUS_INVALID_PARAMETER {
+                    HiveLogWalReplayError::ForeignIdentity
+                } else { HiveLogWalReplayError::OutOfMemory },
+                token,
+            ))
+    }
+
+    fn classify_hive_log_wal_payload(
+        &self,
+        payload: HiveLogWalPayload<'_>,
+    ) -> Result<(u64, bool), HiveLogWalReplayError> {
         validate_hive_log(payload).map_err(|_| HiveLogWalReplayError::InvalidPayload)?;
         let rel = self.to_relative(&normalize_separators(payload.path))
             .ok_or(HiveLogWalReplayError::MissingFile)?;
@@ -5703,14 +6565,7 @@ impl FileSystem {
             return Err(HiveLogWalReplayError::UnexpectedLength);
         }
         if length == payload.expected_log_len {
-            if self.volume.append_at_end(node_id, payload.record) != payload.record.len() {
-                return Err(HiveLogWalReplayError::OutOfMemory);
-            }
-            let end = self.volume.size(node_id);
-            self.volume.ensure_allocation_covers_eof(node_id);
-            self.volume.mark_data_initialized_through(node_id, end);
-            self.volume.touch_write(node_id);
-            return Ok(HiveLogWalReplay::Appended);
+            return Ok((node_id, false));
         }
         let record_end = payload.expected_log_len + payload.record.len() as u64;
         if length < record_end {
@@ -5728,7 +6583,7 @@ impl FileSystem {
             }
             checked += take;
         }
-        Ok(HiveLogWalReplay::AlreadyPresent)
+        Ok((node_id, true))
     }
 
     /// A file's bytes by folded volume-relative path.

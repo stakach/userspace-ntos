@@ -299,7 +299,8 @@ impl FileSystem {
         }
         let object = self.handles[index].as_ref().unwrap();
         let entry_id = object.entry_id;
-        if object.requests_delete() && self.wal_protected_subtree(object.node_id) {
+        if object.requests_delete() && (self.wal_protected_subtree(object.node_id)
+            || self.reserved_replacement_node(object.node_id)) {
             return Err(STATUS_ACCESS_DENIED);
         }
         let delete_due = self.delete_due_at_cleanup(index);
@@ -326,8 +327,22 @@ impl FileSystem {
         };
         // Fallible namespace preparation precedes cleanup effects. An absent exact entry
         // is already unlinked, not permission to delete a replacement with the same spelling.
+        let next_snapshot_size = if let (Some(name), Some(budget)) =
+            (&deleted_name, &self.snapshot_budget)
+        {
+            let entry_cost = SNAP_RECORD_FIXED_LEN
+                .checked_add(name.trim_start_matches('\\').len())
+                .ok_or(STATUS_DATA_ERROR)?;
+            let data_cost = if node.link_count == 1 {
+                self.volume.live_file_data_encoded_len(object.node_id)
+                    .map_err(|_| STATUS_DATA_ERROR)?
+            } else { 0 };
+            let old = entry_cost.checked_add(data_cost).ok_or(STATUS_DATA_ERROR)?;
+            Some(budget.project(old, 0)?)
+        } else { None };
         if deleted_name.is_some() {
             self.volume.unlink_entry(entry_id)?;
+            self.publish_snapshot_size(next_snapshot_size);
             self.file_cleanup_effects.namespace_changed = true;
         }
         self.file_cleanup_effects.notifications_completed |=

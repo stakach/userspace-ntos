@@ -63,6 +63,7 @@ pub enum HiveLogWalReplayError {
     ProtectedTarget,
     UnexpectedLength,
     ContradictoryBytes,
+    Capacity,
     OutOfMemory,
 }
 
