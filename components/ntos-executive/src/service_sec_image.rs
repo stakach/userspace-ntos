@@ -104,6 +104,8 @@ pub(crate) mod mounted_installer_file_trace;
 pub(crate) mod native_process_time_census;
 #[path = "installer_child_span_census.rs"]
 pub(crate) mod installer_child_span_census;
+#[path = "root_service_gap_census.rs"]
+pub(crate) mod root_service_gap_census;
 #[path = "inline_file_retirement.rs"]
 pub(crate) mod inline_file_retirement;
 #[path = "hosted_gui_client_info.rs"]

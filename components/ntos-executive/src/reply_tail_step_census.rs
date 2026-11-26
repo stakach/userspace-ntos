@@ -148,3 +148,17 @@ pub(crate) fn print_census() {
     let _ = census.write_census(&mut record);
     crate::print_str(record.bytes());
 }
+
+/// Root-only value snapshot for a bounded exact installer gap.
+pub(crate) fn snapshot() -> Option<([u64; STEPS], [u64; STEPS])> {
+    let rows = &root()?.rows;
+    let mut ticks = [0; STEPS];
+    let mut calls = [0; STEPS];
+    for (index, row) in rows.iter().enumerate() {
+        ticks[index] = row.ticks;
+        calls[index] = row.calls;
+    }
+    Some((ticks, calls))
+}
+
+pub(crate) fn label(index: usize) -> Option<&'static str> { NAMES.get(index).copied() }

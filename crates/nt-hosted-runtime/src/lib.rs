@@ -30,6 +30,7 @@ mod hosted_file_phase_diagnostic;
 mod hosted_file_rpc_phase;
 mod hosted_install_pipe_diagnostic;
 mod installer_syscall_span;
+mod root_service_gap;
 mod installer_fault_receipt;
 mod primary_alias_activation;
 mod native_block_stage_sample;
@@ -80,6 +81,8 @@ pub use win32k_bulk_stage::{
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
 pub use installer_syscall_span::{CensusEpochGate, CloseUnmapRuntimeTotals, InstallerFaultTicket, InstallerSyscallSpans, LongestGap, OpenCloseGap, OpenCloseGapSampleBudget, PairedRuntimeSample, RuntimeSample, SpanOwner, SpanSample, SpanSnapshot, SsnTotal, TransitionPairTotal, OPEN_CLOSE_GAP_THRESHOLD_100NS};
+pub use root_service_gap::{CounterDelta, RootGapBaselineBudget, RootGapObservation,
+    RootRuntimeDelta, RootServiceGapLedger, top_counter_deltas};
 pub use installer_fault_receipt::{InstallerFaultReceipt, InstallerFaultReceipts};
 pub use primary_alias_activation::{
     classify_alias_registration_status, AliasRetryDisposition,
