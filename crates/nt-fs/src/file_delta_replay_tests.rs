@@ -979,6 +979,9 @@ fn replay_recovered(wal: &RegistryWal<CachedDisk>, fs: &mut FileSystem) -> Resul
             VolumeWalPayload::FileDelta(payload) => {
                 fs.replay_file_delta_wal_payload(&mut cursor, payload)?;
             }
+            VolumeWalPayload::FileBasic(payload) => {
+                fs.replay_file_basic_wal_payload(&mut cursor, payload)?;
+            }
             VolumeWalPayload::FileCreate(payload) => {
                 fs.replay_file_create_wal_payload(&mut cursor, payload)?;
             }

@@ -37,6 +37,9 @@ mod wal_log_protection_tests;
 #[path = "file_delta_replay.rs"]
 mod file_delta_replay;
 
+#[path = "file_basic_replay.rs"]
+mod file_basic_replay;
+
 #[path = "file_create_replay.rs"]
 mod file_create_replay;
 

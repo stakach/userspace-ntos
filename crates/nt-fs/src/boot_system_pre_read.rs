@@ -5,7 +5,7 @@
 //! across interleaved SYSTEM and other-hive records.
 
 use crate::{
-    FileDeltaWalPayload, FileDeltaWalReplayError, FileSystem, FileCreateWalPayload,
+    FileBasicWalPayload, FileDeltaWalPayload, FileDeltaWalReplayError, FileSystem, FileCreateWalPayload,
     FileRenameWalPayload, HiveLogWalPayload, HiveLogWalReplay, HiveLogWalReplayError,
 };
 use crate::volume_wal_sequence::VolumeWalReplayCursor;
@@ -50,6 +50,22 @@ impl BootSystemPreRead {
             return Err(FileDeltaWalReplayError::ProtectedTarget);
         }
         fs.replay_file_delta_wal_payload(&mut self.file_delta_cursor, payload)
+    }
+
+    pub fn replay_file_basic(
+        &mut self,
+        fs: &mut FileSystem,
+        payload: FileBasicWalPayload<'_>,
+    ) -> Result<(), FileDeltaWalReplayError> {
+        if self.is_pre_read(payload.file_id)
+            || fs.existing_file_id(payload.path).is_some_and(|id| self.is_pre_read(id))
+            || [self.system_primary_id, self.system_log_id].into_iter().flatten().any(|id| {
+                fs.source_subtree_contains_file_id(payload.path, id)
+            })
+        {
+            return Err(FileDeltaWalReplayError::ProtectedTarget);
+        }
+        fs.replay_file_basic_wal_payload(&mut self.file_delta_cursor, payload)
     }
 
     pub fn replay_file_create(
