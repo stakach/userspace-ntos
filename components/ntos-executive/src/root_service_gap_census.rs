@@ -4,8 +4,9 @@
 
 use crate::*;
 use core::sync::atomic::Ordering;
-use nt_hosted_runtime::{CounterDelta, RootGapBaselineBudget, RootGapObservation,
-    RootServiceGapLedger, RootRuntimeDelta, RuntimeSample, SpanOwner, top_counter_deltas};
+use nt_hosted_runtime::{CounterDelta, HotProcessCost, HotProcessRank,
+    RootGapBaselineBudget, RootGapObservation, RootServiceGapLedger, RootRuntimeDelta,
+    RuntimeSample, SpanOwner, rank_hot_process_deltas, top_counter_deltas};
 
 const ROWS: usize = super::installer_child_span_census::ROWS;
 const STEPS: usize = crate::reply_tail_step_census::STEPS;
@@ -21,30 +22,35 @@ struct Baseline {
     step_calls: [u64; STEPS],
     hot_ticks: [u64; HOT],
     hot_calls: [u64; HOT],
+    owners: [HotProcessCost; MAX_PI],
 }
 
 impl Baseline {
     const fn new() -> Self {
         Self { at_100ns: 0, at_tsc: 0, totals: [0; TOTALS],
             step_ticks: [0; STEPS], step_calls: [0; STEPS],
-            hot_ticks: [0; HOT], hot_calls: [0; HOT] }
+            hot_ticks: [0; HOT], hot_calls: [0; HOT],
+            owners: [HotProcessCost::EMPTY; MAX_PI] }
     }
 
     fn capture(&mut self) -> bool {
         if !crate::serial_records::is_root_executor() { return false; }
+        let started_at_100ns = monotonic_time_100ns();
+        let started_at_tsc = crate::disk_census_ticks();
         let Some((hot_ticks, hot_calls)) = crate::hot_service_cost_census::snapshot() else {
             return false;
         };
         let Some((step_ticks, step_calls)) = crate::reply_tail_step_census::snapshot() else {
             return false;
         };
-        self.at_100ns = monotonic_time_100ns();
-        self.at_tsc = crate::disk_census_ticks();
+        self.at_100ns = started_at_100ns;
+        self.at_tsc = started_at_tsc;
         for index in 0..TOTALS { self.totals[index] = total_counter(index); }
         self.step_ticks = step_ticks;
         self.step_calls = step_calls;
         self.hot_ticks = hot_ticks;
         self.hot_calls = hot_calls;
+        self.owners = crate::native_process_time_census::snapshot_hot_file();
         true
     }
 
@@ -60,6 +66,7 @@ impl Baseline {
         for (index, total) in totals.iter_mut().enumerate() {
             *total = total_counter(index).checked_sub(self.totals[index])?;
         }
+        let current_owners = crate::native_process_time_census::snapshot_hot_file();
         let observed_at_100ns = monotonic_time_100ns();
         if observed_at_100ns < self.at_100ns { return None; }
         let elapsed_tsc = crate::disk_census_ticks().checked_sub(self.at_tsc)?;
@@ -74,8 +81,9 @@ impl Baseline {
         }
         let steps = ranked(steps, &self.step_calls, |index| step_calls[index])?;
         let hot = ranked(hot, &self.hot_calls, |index| hot_calls[index])?;
+        let owners = rank_hot_process_deltas::<MAX_PI, 3>(&self.owners, &current_owners);
         Some(CounterSummary { started_at_100ns: self.at_100ns, observed_at_100ns,
-            elapsed_tsc, totals, steps, hot })
+            elapsed_tsc, totals, steps, hot, owners })
     }
 }
 
@@ -116,6 +124,7 @@ pub(crate) struct CounterSummary {
     totals: [u64; TOTALS],
     steps: [Option<Ranked>; 3],
     hot: [Option<Ranked>; 2],
+    owners: Option<HotProcessRank<3>>,
 }
 
 static mut LEDGER: RootServiceGapLedger<ROWS> = RootServiceGapLedger::new();
@@ -232,6 +241,26 @@ fn print_observation(phase: &[u8], observation: RootGapObservation,
             print_str(label.as_bytes());
         } else { print_u64(row.index as u64); }
         print_str(b"="); print_u64(row.ticks); print_str(b"/"); print_u64(row.calls);
+    }
+    print_str(b" exact-generation-hot-file-top=pi/gen/read-calls/read-ticks/read-serial-bytes/read-requested-bytes/read-known-requests/write-calls/write-ticks/write-serial-bytes/write-requested-bytes/write-known-requests:");
+    if let Some(owners) = counters.owners {
+        for row in owners.top.into_iter().flatten() {
+            print_str(b" ");
+            for (index, value) in [row.process_index as u64, row.generation,
+                row.read.calls, row.read.ticks, row.read.serial_bytes,
+                row.read.requested_bytes, row.read.known_request_calls,
+                row.write.calls, row.write.ticks, row.write.serial_bytes,
+                row.write.requested_bytes, row.write.known_request_calls]
+                .into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+        }
+        print_str(b" omitted/changed=");
+        print_u64(owners.omitted_owners); print_str(b"/");
+        print_u64(owners.changed_owners);
+    } else {
+        print_str(b" counter-regression-or-unavailable");
     }
     print_str(b"\n");
 }
