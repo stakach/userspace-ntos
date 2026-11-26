@@ -683,6 +683,7 @@ struct Work {
 
 static mut ATTEMPTS: CmMutationBeginAttempts = CmMutationBeginAttempts::new();
 static mut WORK: Vec<Option<Work>> = Vec::new();
+/// Shared by syscall rows and relation publications observed in the same CM outcome ledger.
 static NEXT_WORK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The executive retains one process-local CM outcome ledger across rows and parked flushes.
@@ -733,17 +734,17 @@ fn system_commit_status(error: nt_config_client::SystemCommitObservationError) -
     }
 }
 
-unsafe fn arm_system_commit(work_id: u64, prepared: &PreparedSystemHiveMutation) -> Result<(), u32> {
+pub(crate) unsafe fn arm_system_commit(work_id: u64, prepared: &PreparedSystemHiveMutation) -> Result<(), u32> {
     (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
         .arm(work_id, prepared).map_err(system_commit_status)
 }
 
-unsafe fn enter_system_commit(work_id: u64, prepared: &PreparedSystemHiveMutation) -> Result<(), u32> {
+pub(crate) unsafe fn enter_system_commit(work_id: u64, prepared: &PreparedSystemHiveMutation) -> Result<(), u32> {
     (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
         .enter(work_id, prepared).map_err(system_commit_status)
 }
 
-unsafe fn publish_system_commit(
+pub(crate) unsafe fn publish_system_commit(
     work_id: u64, prepared: &PreparedSystemHiveMutation,
     receipt: SystemHiveMutationCommitReceipt,
 ) -> Result<(), u32> {
@@ -751,7 +752,7 @@ unsafe fn publish_system_commit(
         .publish(work_id, prepared, receipt).map_err(system_commit_status)
 }
 
-unsafe fn abort_system_commit(
+pub(crate) unsafe fn abort_system_commit(
     work_id: u64, prepared: &PreparedSystemHiveMutation,
     ack: SystemHiveMutationAbortAcknowledgement,
 ) -> Result<(), u32> {
@@ -790,7 +791,7 @@ pub(crate) unsafe fn release_system_commit(
     }
 }
 
-unsafe fn retire_system_commit(work_id: u64) {
+pub(crate) unsafe fn retire_system_commit(work_id: u64) {
     (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS)).retire(work_id);
 }
 
@@ -902,7 +903,7 @@ pub(crate) fn take_hosted_reply_receive_work() -> u64 {
     HOSTED_REPLY_RECEIVE_WORK.swap(0, Ordering::AcqRel)
 }
 
-fn next_work_id() -> u64 {
+pub(crate) fn next_work_id() -> u64 {
     let id = NEXT_WORK_ID.fetch_add(1, Ordering::Relaxed);
     assert_ne!(id, 0, "registry mutation work id exhausted");
     id
