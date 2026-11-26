@@ -35,6 +35,7 @@ enum HostedCompletion {
         key: KeyRef,
         target: CmSystemKeyTarget,
         kind: ExistingMutationKind,
+        setup_write: Option<nt_hosted_runtime::SetupWriteCandidate>,
     },
     SystemLocale { lease: SystemHiveKeyLease, physical_path: String, locale_id: u32 },
 }
@@ -1588,9 +1589,15 @@ pub(crate) unsafe fn submit_hosted_existing(
             return Err(status);
         }
     };
+    let setup_write = match mutation {
+        SystemHiveMutation::SetValue { path, name, value_type, data } =>
+            crate::setup_registry_write_diagnostic::capture(
+                handler, logical, path, name, value_type, data),
+        _ => None,
+    };
     let key_owner = retained.owner.take().expect("retained existing Key owner");
     let hosted = HostedCaller {
-        completion: HostedCompletion::Existing { key_owner, key: retained.key, target: retained.target, kind },
+        completion: HostedCompletion::Existing { key_owner, key: retained.key, target: retained.target, kind, setup_write },
         pi: handler.pi,
         tid: handler.current_tid,
         badge: handler.current_badge,
@@ -2178,7 +2185,24 @@ unsafe fn advance(
             work.phase = Phase::ReleasePublication(ack);
         }
         Phase::ReleasePublication(ack) => {
+            let storage = match &work.persistence.owner {
+                PersistenceOwner::BatchSlot { epoch, .. } => nt_hosted_runtime::SetupWriteStorage::Batch {
+                    epoch: *epoch, cm_mount: work.prepared.as_ref().unwrap().mount().identity_token(),
+                },
+                _ => nt_hosted_runtime::SetupWriteStorage::PerRow,
+            };
             work.persistence.release_after_publication(*ack).map_err(|status| status as i32)?;
+            if let Caller::Hosted(HostedCaller {
+                completion: HostedCompletion::Existing { setup_write: Some(candidate), .. }, ..
+            }) = &work.caller {
+                crate::setup_registry_write_diagnostic::cm_acked(
+                    work.id,
+                    nt_hosted_runtime::AckedSetupWrite::new(
+                        *candidate, ack.receipt().outcome().generation, storage),
+                    work.status,
+                    work.cancelled,
+                );
+            }
             if let Caller::Hosted(HostedCaller {
                 completion: HostedCompletion::SystemLocale { locale_id, .. }, ..
             }) = &work.caller {

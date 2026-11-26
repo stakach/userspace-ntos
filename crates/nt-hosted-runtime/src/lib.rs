@@ -33,6 +33,7 @@ mod installer_syscall_span;
 mod root_service_gap;
 mod root_gap_route;
 mod setup_owner_census;
+mod setup_registry_write_receipt;
 mod installer_fault_receipt;
 mod primary_alias_activation;
 mod native_block_stage_sample;
@@ -92,6 +93,9 @@ pub use root_gap_route::{GapFileRoute, GapIoDisposition, GapIoKind, GapIoObserva
 pub use setup_owner_census::{OwnerTableCost, SetupOwnerCensusGate, SetupOwnerIdentity,
     SetupWaitedApplication, select_unique_waited_application,
     SetupOwnerPairValidity, SetupOwnerReceipt, SetupOwnerSample, top_owner_table_delta};
+pub use setup_registry_write_receipt::{
+    AckedSetupWrite, BatchDurableRange, SetupValueName, SetupWriteCandidate, SetupWriteStorage,
+};
 pub use installer_fault_receipt::{InstallerFaultReceipt, InstallerFaultReceipts};
 pub use primary_alias_activation::{
     classify_alias_registration_status, AliasRetryDisposition,
