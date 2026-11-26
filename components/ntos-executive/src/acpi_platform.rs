@@ -1033,7 +1033,7 @@ unsafe fn acpi_root_registry_policy(
 /// boot-driver launch snapshot is taken. No service name is embedded here.
 pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
 ) -> Result<(), nt_status::NtStatus> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     let policy = acpi_root_registry_policy(expected_generation)?;
     if policy.mount_generation != expected_generation {
         return Err(nt_status::NtStatus(0xC000_0059u32 as i32));

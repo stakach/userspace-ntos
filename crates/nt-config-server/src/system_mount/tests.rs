@@ -190,6 +190,37 @@ fn exact_generation_and_incarnation_queries_are_read_only() {
 }
 
 #[test]
+fn hive_sequence_query_requires_exact_mount_and_does_not_change_it() {
+    let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
+    let image = image();
+    let sequence = nt_hive_core::decode_image(&image).unwrap().sequence;
+    assert_eq!(publish(&mut server, &image), 1);
+    let identity = query(&mut server, 1, 0).detail1;
+    let before = nt_hive_core::encode_image(&server.system_hive.as_ref().unwrap().hive);
+    let exact_mount_request = request(1, identity);
+    let observed = server.dispatch(
+        opcode::CM_OP_QUERY_SYSTEM_HIVE_SEQUENCE,
+        exact_mount_request.as_bytes(),
+        &mut [],
+    );
+    assert_eq!(observed.status, STATUS_SUCCESS);
+    assert_eq!((observed.information, observed.detail0, observed.detail1), (0, 1, sequence));
+    rejected(
+        server.dispatch(opcode::CM_OP_QUERY_SYSTEM_HIVE_SEQUENCE, request(1, 0).as_bytes(), &mut []),
+        STATUS_INVALID_PARAMETER,
+    );
+    rejected(
+        server.dispatch(opcode::CM_OP_QUERY_SYSTEM_HIVE_SEQUENCE, request(2, identity).as_bytes(), &mut []),
+        STATUS_REVISION_MISMATCH,
+    );
+    rejected(
+        server.dispatch(opcode::CM_OP_QUERY_SYSTEM_HIVE_SEQUENCE, request(1, identity + 1).as_bytes(), &mut []),
+        STATUS_REVISION_MISMATCH,
+    );
+    assert_eq!(nt_hive_core::encode_image(&server.system_hive.as_ref().unwrap().hive), before);
+}
+
+#[test]
 fn reimport_and_reconstructed_server_never_reuse_mount_incarnation() {
     let source = Rc::new(CmIdentitySource::new(NonZeroU32::MIN));
     let bytes = image();

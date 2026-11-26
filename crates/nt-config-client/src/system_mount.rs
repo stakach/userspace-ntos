@@ -47,23 +47,23 @@ impl SystemHiveMountState {
 }
 
 impl<B: Backend> ConfigClient<B> {
-    /// Revalidate a retained key for a revision retry only after the caller's durable
-    /// generation has caught up with CM. A newer CM observation is not proof that
-    /// the writer which published it has completed its durable commit.
-    pub fn query_leased_system_hive_key_at_durable_mount(
+    /// Revalidate a retained key at one exact CM generation and mount identity.
+    /// The caller must supply a generation authorized by its own publication contract;
+    /// this observation does not prove physical WAL durability.
+    pub fn query_leased_system_hive_key_at_exact_mount(
         &mut self,
         lease: SystemHiveKeyLease,
         mount: SystemHiveMount,
-        durable_generation: u64,
+        expected_generation: u64,
     ) -> Result<LeasedHiveKeyInformation, i32> {
-        if durable_generation == 0 {
+        if expected_generation == 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let information = self.query_leased_system_hive_key_information(lease)?;
-        if information.mount_generation != durable_generation {
+        if information.mount_generation != expected_generation {
             return Err(STATUS_DEVICE_BUSY);
         }
-        self.validate_system_hive_mount(mount, durable_generation)?;
+        self.validate_system_hive_mount(mount, expected_generation)?;
         Ok(information)
     }
 
@@ -85,20 +85,50 @@ impl<B: Backend> ConfigClient<B> {
         self.system_hive_mount_call(Some(mount), expected_generation)
     }
 
-    fn system_hive_mount_call(
+    /// Observe the exact CM hive-log sequence under the retained mount and published
+    /// generation. This is read-only; it is neither a storage lease nor a durability proof.
+    pub fn query_system_hive_sequence_at_mount(
         &mut self,
+        mount: SystemHiveMount,
+        expected_generation: u64,
+    ) -> Result<u64, i32> {
+        let request = Self::system_hive_mount_request(Some(mount), expected_generation)?;
+        let response = self.backend.call(
+            opcode::CM_OP_QUERY_SYSTEM_HIVE_SEQUENCE,
+            request.as_bytes(),
+            &mut [],
+        );
+        if response.status != STATUS_SUCCESS {
+            return Err(response.status);
+        }
+        if response.information != 0 || response.detail0 != expected_generation {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(response.detail1)
+    }
+
+    fn system_hive_mount_request(
         expected_mount: Option<SystemHiveMount>,
         expected_generation: u64,
-    ) -> Result<SystemHiveMountState, i32> {
-        let generation = NonZeroU64::new(expected_generation).ok_or(STATUS_INVALID_PARAMETER)?;
-        let request = CmSystemHiveMountRequest {
+    ) -> Result<CmSystemHiveMountRequest, i32> {
+        NonZeroU64::new(expected_generation).ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok(CmSystemHiveMountRequest {
             abi_size: core::mem::size_of::<CmSystemHiveMountRequest>() as u16,
             abi_version: CM_ABI_VERSION,
             mount: hive_mount::SYSTEM,
             _reserved: 0,
             expected_generation,
             expected_identity: expected_mount.map_or(0, |mount| mount.0.get()),
-        };
+        })
+    }
+
+    fn system_hive_mount_call(
+        &mut self,
+        expected_mount: Option<SystemHiveMount>,
+        expected_generation: u64,
+    ) -> Result<SystemHiveMountState, i32> {
+        let generation = NonZeroU64::new(expected_generation).ok_or(STATUS_INVALID_PARAMETER)?;
+        let request = Self::system_hive_mount_request(expected_mount, expected_generation)?;
         let response = self.backend.call(
             opcode::CM_OP_QUERY_SYSTEM_HIVE_MOUNT,
             request.as_bytes(),

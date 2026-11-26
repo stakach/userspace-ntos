@@ -710,7 +710,7 @@ impl ExecNtHandler {
             nt_hive_core::KeyKind::Ordinary
         };
         let expected_generation =
-            crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+            crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
         let (mut state, creator_pointer) =
             match self.capture_hosted_registry_publication(args, true) {
                 Ok(state) => state,

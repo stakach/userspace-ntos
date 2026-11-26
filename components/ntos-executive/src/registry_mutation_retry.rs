@@ -22,7 +22,7 @@ fn retained_target_matches(key: KeyRef, expected: &CmSystemKeyTarget) -> Result<
 pub(super) unsafe fn revalidate_hosted_revision(
     caller: &HostedCaller,
     mount: SystemHiveMount,
-    durable_generation: u64,
+    expected_generation: u64,
 ) -> Result<(), i32> {
     let (lease, physical_path, retained_key) = match &caller.completion {
         HostedCompletion::Create { parent, parent_target, .. } =>
@@ -39,7 +39,7 @@ pub(super) unsafe fn revalidate_hosted_revision(
     }
     let information = CONFIG_CLIENT_PTR.as_mut()
         .ok_or(0xC000_00A3u32 as i32)?
-        .query_leased_system_hive_key_at_durable_mount(lease, mount, durable_generation)?;
+        .query_leased_system_hive_key_at_exact_mount(lease, mount, expected_generation)?;
     if nt_hive_core::canon_path(&information.path) != nt_hive_core::canon_path(physical_path) {
         return Err(INVALID_KEY);
     }

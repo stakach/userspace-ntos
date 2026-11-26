@@ -149,6 +149,8 @@ pub mod opcode {
     pub const CM_OP_SYSTEM_HIVE_MUTATION_BEGIN: u16 = 0x2161;
     /// Observe or revalidate the exact mounted SYSTEM incarnation at a semantic generation.
     pub const CM_OP_QUERY_SYSTEM_HIVE_MOUNT: u16 = 0x2162;
+    /// Observe the HLR1 sequence at an exact mounted SYSTEM identity and generation.
+    pub const CM_OP_QUERY_SYSTEM_HIVE_SEQUENCE: u16 = 0x2163;
 }
 
 pub mod hive_key_open_operation {
@@ -1113,6 +1115,7 @@ mod tests {
     #[test]
     fn system_mount_query_wire_has_exact_identity_and_generation_offsets() {
         assert_eq!(opcode::CM_OP_QUERY_SYSTEM_HIVE_MOUNT, 0x2162);
+        assert_eq!(opcode::CM_OP_QUERY_SYSTEM_HIVE_SEQUENCE, 0x2163);
         assert_eq!(core::mem::size_of::<CmSystemHiveMountRequest>(), 24);
         let request = CmSystemHiveMountRequest {
             abi_size: 24,

@@ -1217,6 +1217,7 @@ impl CmServer {
             }
             opcode::CM_OP_IMPORT_HIVE => self.op_import_hive(in_buf),
             opcode::CM_OP_QUERY_SYSTEM_HIVE_MOUNT => self.op_query_system_hive_mount(in_buf),
+            opcode::CM_OP_QUERY_SYSTEM_HIVE_SEQUENCE => self.op_query_system_hive_sequence(in_buf),
             opcode::CM_OP_MUTATE_SYSTEM_HIVE => self.op_mutate_system_hive(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_MUTATION_BEGIN => self.op_system_hive_mutation_begin(in_buf, out_buf),
             opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE => self.op_checkpoint_system_hive(in_buf, out_buf),

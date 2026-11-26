@@ -38,6 +38,14 @@ pub enum RegistryWalState {
     Uncertain,
 }
 
+/// Read-only frame geometry from one settled WAL owner at its current cursor.
+/// This is a capacity hint, not authority to use a different physical reserve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegistryWalFrameRoom {
+    pub remaining_sectors: u64,
+    pub sector_bytes: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegistryWalRecord {
     pub serial: u64,
@@ -523,6 +531,33 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     }
     pub fn state(&self) -> RegistryWalState {
         self.state
+    }
+
+    /// Remaining sectors from this WAL's exact cursor, including the future PREPARE and
+    /// COMMIT sectors. A full settled WAL reports zero; only `begin` reserves a frame.
+    pub fn frame_room(&self) -> Result<RegistryWalFrameRoom, RegistryWalError> {
+        if self.state == RegistryWalState::Uncertain {
+            return Err(RegistryWalError::Uncertain);
+        }
+        if self.state != RegistryWalState::Ready || self.async_effect.is_some() {
+            return Err(RegistryWalError::InvalidState);
+        }
+        self.next_serial
+            .checked_add(1)
+            .ok_or(RegistryWalError::GenerationExhausted)?;
+        let device = self.device.as_ref().ok_or(RegistryWalError::InvalidState)?;
+        let sector_bytes = device.sector_size();
+        if sector_bytes < HEADER_BYTES {
+            return Err(RegistryWalError::InvalidGeometry);
+        }
+        let remaining_sectors = device
+            .sector_count()
+            .checked_sub(self.cursor)
+            .ok_or(RegistryWalError::Corrupt)?;
+        Ok(RegistryWalFrameRoom {
+            remaining_sectors,
+            sector_bytes,
+        })
     }
 
     /// The exact committed endpoint is observable only when no write or recovered tail

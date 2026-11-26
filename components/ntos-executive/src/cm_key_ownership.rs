@@ -241,7 +241,7 @@ unsafe fn open_target(
     open_link: bool,
 ) -> Result<SystemKeyOpen, i32> {
     let _durable = allocator::enter_durable();
-    let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if generation == 0 || CONFIG_CLIENT_PTR.is_null() {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }

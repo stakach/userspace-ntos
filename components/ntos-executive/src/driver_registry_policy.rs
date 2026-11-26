@@ -250,7 +250,7 @@ unsafe fn create_registry_path(
         })
         .map_err(|status| status as i32)
     };
-    let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     match open_driver_registry_handle(
         metadata.dispatch,
         caller,

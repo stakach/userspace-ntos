@@ -21,7 +21,7 @@ fn resident_catalog_receipt_is_valid(catalog: &Catalog, receipt: PreloadReceipt)
 pub(crate) unsafe fn receipt_is_current(receipt: PreloadReceipt) -> bool {
     let Some(catalog) = (*core::ptr::addr_of!(SOURCES)).as_ref() else { return false; };
     resident_catalog_receipt_is_valid(catalog, receipt)
-        && LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) == receipt.generation
+        && LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire) == receipt.generation
 }
 
 pub(crate) unsafe fn current_receipt() -> Option<PreloadReceipt> {
@@ -33,7 +33,7 @@ pub(crate) unsafe fn current_receipt() -> Option<PreloadReceipt> {
     if receipt_is_current(receipt) {
         return Some(receipt);
     }
-    let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if generation == receipt.generation || !crate::boot_storage_dma_handoff::boot_disk_reads_admitted() {
         return None;
     }
@@ -289,8 +289,8 @@ pub(super) unsafe fn stage_registry_boot_sources(fs: &Fat32, generation: u64) ->
         }
     }
     stage_file(fs, &mut candidate, prior, generation, HOSTED_AUXILIARY_PE_PATH)?;
-    if LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != generation {
-        preload_failure(b"final-generation", b"system", LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire));
+    if LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire) != generation {
+        preload_failure(b"final-generation", b"system", LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire));
         return None;
     }
     if crate::fs_loader::POOL_EPOCH.load(Ordering::Acquire) != epoch {

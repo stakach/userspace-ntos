@@ -174,10 +174,10 @@ fn leased_key_revalidation_accepts_new_revision_only_on_the_same_mount() {
     assert_eq!(client.publish_system_hive_mutation(&prepared).unwrap().generation, 2);
 
     assert_eq!(
-        client.query_leased_system_hive_key_at_durable_mount(lease, first.mount(), 1),
+        client.query_leased_system_hive_key_at_exact_mount(lease, first.mount(), 1),
         Err(STATUS_DEVICE_BUSY),
     );
-    let rebased = client.query_leased_system_hive_key_at_durable_mount(
+    let rebased = client.query_leased_system_hive_key_at_exact_mount(
         lease, first.mount(), 2,
     ).unwrap();
     assert_eq!(rebased.mount_generation, 2);
@@ -186,9 +186,51 @@ fn leased_key_revalidation_accepts_new_revision_only_on_the_same_mount() {
     assert_eq!(client.import_system_hive(&image()), Ok(3));
     let replacement = crate::retained_test_keys::open(&mut client, path).lease;
     assert_eq!(
-        client.query_leased_system_hive_key_at_durable_mount(replacement, first.mount(), 3),
+        client.query_leased_system_hive_key_at_exact_mount(replacement, first.mount(), 3),
         Err(STALE),
     );
+}
+
+#[test]
+fn hive_log_sequence_observation_requires_exact_mount_and_published_generation() {
+    let image = image();
+    let initial_sequence = decode_image(&image).unwrap().sequence;
+    let mut client = client(source());
+    assert_eq!(client.import_system_hive(&image), Ok(1));
+    let mount = client.query_system_hive_mount(1).unwrap().mount();
+    assert_eq!(
+        client.query_system_hive_sequence_at_mount(mount, 1),
+        Ok(initial_sequence),
+    );
+
+    let path = r"\Registry\Machine\System\ControlSet001\Services\Stable";
+    let prepared = client.prepare_system_hive_mutation(1, &[
+        SystemHiveMutation::SetValue {
+            path,
+            name: "Start",
+            value_type: RegistryValueType::Dword as u32,
+            data: &2u32.to_le_bytes(),
+        },
+    ]).unwrap();
+    assert!(!prepared.durable_journal().is_empty());
+    assert_eq!(client.publish_system_hive_mutation(&prepared).unwrap().generation, 2);
+    let written_sequence = client.query_system_hive_sequence_at_mount(mount, 2).unwrap();
+    assert!(written_sequence > initial_sequence);
+    assert_eq!(client.query_system_hive_sequence_at_mount(mount, 1), Err(STALE));
+
+    let unchanged = client.prepare_system_hive_mutation(2, &[
+        SystemHiveMutation::CreateKey { path },
+    ]).unwrap();
+    assert!(unchanged.durable_journal().is_empty());
+    assert_eq!(client.publish_system_hive_mutation(&unchanged).unwrap().generation, 3);
+    assert_eq!(
+        client.query_system_hive_sequence_at_mount(mount, 3),
+        Ok(written_sequence),
+        "an empty journal advances CM generation without consuming an HLR1 sequence",
+    );
+
+    assert_eq!(client.import_system_hive(&image), Ok(4));
+    assert_eq!(client.query_system_hive_sequence_at_mount(mount, 4), Err(STALE));
 }
 
 #[test]

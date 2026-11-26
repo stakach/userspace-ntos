@@ -48736,7 +48736,7 @@ unsafe fn collect_hosted_relation_registry_inputs(
             critical_starts.push((child.pdo_object_id, hosted_relation_instance_path(child)?));
         }
     }
-    if crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != expected_generation {
+    if crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire) != expected_generation {
         return Err(HostedRelationPublishError::Retry);
     }
     let mutations = build_hosted_relation_mutations(
@@ -48753,7 +48753,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         crate::writable_fs::ensure_mounted()
             .map_err(|status| hosted_relation_error_from_config(status as i32))
             .inspect_err(|error| trace_hosted_relation_admission_failure(b"writable-mount", error))?;
-        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
         let mount_identity = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
             .ok_or(HostedRelationPublishError::Retry)?
             .identity_token();

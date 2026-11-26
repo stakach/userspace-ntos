@@ -1640,7 +1640,7 @@ unsafe fn advance(
                     && matches!(&work.caller, Caller::Hosted(_))
                 {
                     let rebase = (|| {
-                        let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+                        let generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
                         let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
                             .ok_or(0xC000_00A3u32 as i32)?;
                         if mount != attempt.mount() {
@@ -1655,8 +1655,8 @@ unsafe fn advance(
                     })();
                     match rebase {
                         Ok(()) => return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as i32),
-                        // The durable writer may still be catching up. Keep the ACKed attempt;
-                        // its exact continuation remains available for the next revalidation.
+                        // An entered CM COMMIT may still be awaiting its exact receipt. Keep
+                        // the ACKed attempt for the next published-generation revalidation.
                         Err(status) if status == nt_status::NtStatus::DEVICE_BUSY.raw() as i32 =>
                             return Err(status),
                         Err(status) => {
@@ -1675,7 +1675,7 @@ unsafe fn advance(
                     // advance SYSTEM, but the original interface may retry only on the same
                     // mounted hive while its exact PDO and devnode still name that instance.
                     let rebase = (|| {
-                        let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+                        let generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
                         let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
                             .ok_or(0xC000_00A3u32 as i32)?;
                         let value = match &mut work.caller {
