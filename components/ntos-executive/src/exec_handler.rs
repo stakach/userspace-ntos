@@ -1109,7 +1109,7 @@ impl CollectSystemSetupSeedTarget {
     fn check_generation(&self) -> Result<(), u32> {
         let status = if self.expected_generation == 0 {
             crate::CONFIG_STATUS_DEVICE_NOT_READY as u32
-        } else if crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire)
+        } else if crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire)
             != self.expected_generation
         {
             0xC000_0059 // STATUS_REVISION_MISMATCH
@@ -4706,7 +4706,7 @@ impl ExecNtHandler {
     fn provision_reactos_time_zone_setup(
         &mut self,
     ) -> Result<nt_hive_core::ReactOsTimeZoneSeedOutcome, u32> {
-        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
         const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
 
         let (selected_index, selection_source): (u32, &[u8]) =
@@ -4951,7 +4951,7 @@ impl ExecNtHandler {
     /// architecture. This lets `spoolsv`/`localspl` discover the print environment through real
     /// registry syscalls and then load `winprint.dll` from the real spool directory.
     fn provision_reactos_print_setup(&mut self) {
-        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
         let (stats, mutations, failed, driver_present) = {
             let mut target = CollectSystemSetupSeedTarget::new(expected_generation);
             trace_setup_provision_phase(b"print-seed-begin", 0);
@@ -5082,7 +5082,7 @@ impl ExecNtHandler {
     /// # Safety
     /// Runs during construction; the overlay owns the strings it allocates.
     unsafe fn provision_default_user_locale(&mut self) {
-        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
         const USER_INTERNATIONAL: &str = r"\Registry\User\.Default\Control Panel\International";
         const REG_SZ: u32 = 1;
         let mut locale_ascii = [0u8; 8];
@@ -7829,7 +7829,7 @@ impl ExecNtHandler {
             let current = (|| {
                 let information = unsafe { config_manager_query_leased_system_hive_key_information(lease) }
                     .map_err(|status| status as u32)?;
-                let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+                let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
                 if information.mount_generation != generation
                     || nt_hive_core::canon_path(&information.path)
                         != nt_hive_core::canon_path(&opened.physical_path)
@@ -7892,7 +7892,7 @@ impl ExecNtHandler {
         if user_profile {
             NT_SESSION_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
         } else {
-            if generation != crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) {
+            if generation != crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire) {
                 return 0xC000_022D;
             }
             if crate::registry_mutation_work::system_locale_pending() {
@@ -38145,7 +38145,7 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+                let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
                 let mut retained = if self.cm_system_key_target(key).is_some() {
                     match crate::registry_mutation_work::retain_hosted_existing(self, key) {
                         Ok(retained) => Some(retained),

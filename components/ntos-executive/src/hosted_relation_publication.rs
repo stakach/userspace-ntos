@@ -143,7 +143,7 @@ unsafe fn revalidate_hosted_relation_begin_revision(
 ) -> Result<bool, HostedRelationPublishError> {
     let attempt = owner.attempt.as_ref().expect("retained relation BEGIN");
     let mount = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(HostedRelationPublishError::Retry)?;
-    let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if mount != attempt.mount() || mount.identity_token() != owner.mount_identity {
         return Err(HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_HANDLE));
     }

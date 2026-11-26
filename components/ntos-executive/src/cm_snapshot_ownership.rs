@@ -100,7 +100,7 @@ pub(crate) unsafe fn query_active_driver_service(
     path: &str,
 ) -> Result<nt_config_client::ActiveDriverServiceBinding, i32> {
     let _durable = allocator::enter_durable();
-    let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if generation == 0 || CONFIG_CLIENT_PTR.is_null() {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -126,7 +126,7 @@ pub(crate) unsafe fn query_active_driver_service(
             exchange(index, CmSnapshotOperation::Pull)?;
         }
         exchange(index, CmSnapshotOperation::Acknowledge)?;
-        if LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != generation {
+        if LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire) != generation {
             return Err(CONFIG_STATUS_DEVICE_NOT_READY);
         }
         // Decode enforces the same captured generation. No IPC occurs before publication.

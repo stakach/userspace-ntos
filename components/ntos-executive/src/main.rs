@@ -16238,7 +16238,7 @@ pub(crate) unsafe fn config_manager_exchange_retained_snapshot(
 pub(crate) unsafe fn config_manager_query_driver_launch_plan(
     plan_kind: u16,
 ) -> Result<nt_config_client::DriverLaunchPlanSnapshot, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16255,7 +16255,7 @@ pub(crate) unsafe fn config_manager_query_driver_launch_plan(
 pub(crate) unsafe fn config_manager_query_driver_service(
     service_name: &str,
 ) -> Result<nt_config_client::DriverServiceBinding, i32> {
-    if LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) == 0 {
+    if LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire) == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     CONFIG_CLIENT_PTR
@@ -16267,7 +16267,7 @@ pub(crate) unsafe fn config_manager_query_driver_service(
 pub(crate) unsafe fn config_manager_query_upper_filter_launch_plan(
     instance_id: &str,
 ) -> Result<Option<nt_config_client::UpperFilterLaunchPlanSnapshot>, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16275,7 +16275,7 @@ pub(crate) unsafe fn config_manager_query_upper_filter_launch_plan(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     let plan = client.query_upper_filter_launch_plan(instance_id)?;
-    if LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != expected_generation
+    if LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire) != expected_generation
         || plan.as_ref().is_some_and(|plan| plan.mount_generation != expected_generation)
     {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
@@ -16286,7 +16286,7 @@ pub(crate) unsafe fn config_manager_query_upper_filter_launch_plan(
 pub(crate) unsafe fn config_manager_query_critical_device_binding(
     bus_id: &str,
 ) -> Result<Option<nt_config_client::CriticalDeviceBinding>, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16304,7 +16304,7 @@ pub(crate) unsafe fn config_manager_query_critical_device_binding(
 pub(crate) unsafe fn config_manager_query_driver_database_binding(
     bus_id: &str,
 ) -> Result<Option<nt_config_client::CriticalDeviceBinding>, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16330,7 +16330,7 @@ pub(crate) unsafe fn config_manager_next_device_action(
     if !config_manager_device_action_pending() {
         return Ok(None);
     }
-    let current_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let current_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if current_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16353,7 +16353,7 @@ pub(crate) unsafe fn config_manager_next_device_action(
 pub(crate) unsafe fn config_manager_acknowledge_device_action(
     event: &nt_config_client::DeviceActionEvent,
 ) -> Result<bool, i32> {
-    let current_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let current_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if current_generation == 0
         || event.mount_generation == 0
         || event.mount_generation > current_generation
@@ -16371,7 +16371,7 @@ pub(crate) unsafe fn config_manager_acknowledge_device_action(
 unsafe fn config_manager_query_win32_service_launch_plan(
     plan_kind: u16,
 ) -> Result<nt_config_client::Win32ServiceLaunchPlanSnapshot, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16391,7 +16391,7 @@ pub(crate) unsafe fn config_manager_query_pnp(
     instance: &str,
     auxiliary: &[u8],
 ) -> Result<nt_config_client::PnpQuerySnapshot, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16407,7 +16407,7 @@ pub(crate) unsafe fn config_manager_query_pnp(
 
 pub(crate) unsafe fn config_manager_query_network_adapter_plan(
 ) -> Result<nt_config_client::NetworkAdapterPlanSnapshot, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16424,7 +16424,7 @@ pub(crate) unsafe fn config_manager_query_network_adapter_plan(
 pub(crate) unsafe fn config_manager_query_system_hive_key(
     path: &str,
 ) -> Result<nt_config_client::HiveKeySnapshot, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16465,7 +16465,7 @@ pub(crate) unsafe fn config_manager_exchange_system_hive_key_open(
 pub(crate) unsafe fn config_manager_resolve_system_hive_path(
     path: &str,
 ) -> Result<nt_config_client::ResolvedSystemHivePath, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16508,7 +16508,7 @@ pub(crate) unsafe fn config_manager_acknowledge_system_hive_key_close(
 pub(crate) unsafe fn config_manager_query_leased_system_hive_key_information(
     lease: nt_config_client::SystemHiveKeyLease,
 ) -> Result<nt_config_client::LeasedHiveKeyInformation, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16525,7 +16525,7 @@ pub(crate) unsafe fn config_manager_query_leased_system_hive_key_information(
 pub(crate) unsafe fn config_manager_export_leased_system_hive(
     lease: nt_config_client::SystemHiveKeyLease,
 ) -> Result<nt_config_client::ExportedSystemHive, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16543,7 +16543,7 @@ pub(crate) unsafe fn config_manager_query_leased_system_hive_value(
     lease: nt_config_client::SystemHiveKeyLease,
     name: &str,
 ) -> Result<nt_config_client::LeasedHiveValue, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16561,7 +16561,7 @@ pub(crate) unsafe fn config_manager_enumerate_leased_system_hive_subkey(
     lease: nt_config_client::SystemHiveKeyLease,
     index: u32,
 ) -> Result<nt_config_client::LeasedHiveSubkey, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
@@ -16579,7 +16579,7 @@ pub(crate) unsafe fn config_manager_enumerate_leased_system_hive_value(
     lease: nt_config_client::SystemHiveKeyLease,
     index: u32,
 ) -> Result<nt_config_client::LeasedHiveValue, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }

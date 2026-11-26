@@ -129,7 +129,7 @@ struct CmState {
     writes: Vec<RecordedMutation>,
 }
 thread_local! { static CM: RefCell<CmState> = RefCell::new(CmState::default()); }
-static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(7);
+static LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION: AtomicU64 = AtomicU64::new(7);
 
 fn config_manager_query_critical_device_binding(
     id: &str,

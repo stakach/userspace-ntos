@@ -77,6 +77,7 @@ impl Catalog {
 
 static mut SOURCES: Option<Catalog> = None;
 static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(0);
+static LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION: AtomicU64 = AtomicU64::new(0);
 static FAIL_REFRESH: AtomicBool = AtomicBool::new(false);
 mod fs_loader {
     use std::sync::atomic::AtomicU64;
@@ -113,10 +114,13 @@ fn unrelated_system_hive_publication_keeps_the_exact_resident_closure() {
     }
     fs_loader::POOL_EPOCH.store(7, Ordering::Release);
     fs_loader::POOL_NEXT.store(0x3000, Ordering::Release);
-    LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(3, Ordering::Release);
+    LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(2, Ordering::Release);
+    LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.store(3, Ordering::Release);
     let refreshed = PreloadReceipt { generation: 3, ..receipt };
     assert_eq!(unsafe { current_receipt() }, Some(refreshed));
     assert_eq!(unsafe { SOURCES.as_ref().unwrap().receipt }, Some(refreshed));
+    assert_eq!(LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire), 2,
+        "the resident catalog follows confirmed CM publication before WAL durability");
 
     // The same CM drift cannot excuse a changed source catalog or recycled pool pin.
     unsafe { SOURCES.as_mut().unwrap().bytes += 1; }
@@ -130,7 +134,7 @@ fn unrelated_system_hive_publication_keeps_the_exact_resident_closure() {
 
     // A failed candidate cannot replace the published receipt.
     fs_loader::POOL_NEXT.store(refreshed.watermark, Ordering::Release);
-    LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(4, Ordering::Release);
+    LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.store(4, Ordering::Release);
     FAIL_REFRESH.store(true, Ordering::Release);
     assert_eq!(unsafe { current_receipt() }, None);
     assert_eq!(unsafe { SOURCES.as_ref().unwrap().receipt }, Some(refreshed));

@@ -153,7 +153,7 @@ pub(super) fn service_register(
         let admission = DeferredInterfaceRegistration {
             caller,
             dispatch,
-            expected_generation: crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire),
+            expected_generation: crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire),
             mount,
             registry_parent,
             owner: HostedDomainIdentity {

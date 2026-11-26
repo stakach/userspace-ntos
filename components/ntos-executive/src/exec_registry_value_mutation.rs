@@ -156,7 +156,7 @@ impl ExecNtHandler {
                 retained.abort(self);
                 return STATUS_INVALID_PARAMETER;
             }
-            let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+            let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
             let information = match retained.information() {
                 Ok(information) if information.mount_generation == generation => information,
                 Ok(_) => { retained.abort(self); return 0xC000_022D; }
@@ -229,7 +229,7 @@ impl ExecNtHandler {
             }
         };
         if let Some(retained) = retained {
-            let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+            let generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
             let information = match retained.information() {
                 Ok(information) if information.mount_generation == generation => information,
                 Ok(_) => { retained.abort(self); return 0xC000_022D; }
