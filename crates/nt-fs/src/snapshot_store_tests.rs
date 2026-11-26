@@ -28,6 +28,9 @@ mod async_wal_anchor;
 #[path = "snapshot_store_tests/hive_wal_publication.rs"]
 mod hive_wal_publication;
 
+#[path = "snapshot_store_tests/large_slot_powercuts.rs"]
+mod large_slot_powercuts;
+
 fn two_generations() -> (SnapshotBlockStore, CachedDisk) {
     let store = SnapshotBlockStore::new(0, 16);
     let mut dev = CachedDisk::new();
