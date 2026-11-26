@@ -21,6 +21,7 @@ fn live_create_key_retains_inherited_security_for_every_new_intermediate() {
                 else { mounted.hive.open_key(path).unwrap() };
             assert!(mounted.hive.set_key_security_descriptor(key, &descriptor));
         }
+        mounted.checkpoint_image_len = nt_hive_core::encoded_image_len(&mounted.hive).unwrap() as u32;
         server.cm = config_manager_from_system_hive(&mounted.hive, &mounted.current_control_set);
     }
     let mutations = alloc::vec![HiveMutation::CreateKey {
@@ -40,6 +41,7 @@ fn live_create_key_retains_inherited_security_for_every_new_intermediate() {
         semantic_journal_len: 100,
         mutations: prepared.mutations,
         durable_journal: prepared.durable_journal,
+        projected_checkpoint_image_len: prepared.projected_checkpoint_image_len,
     });
     let request = CmHiveMutationCommitRequest {
         abi_size: core::mem::size_of::<CmHiveMutationCommitRequest>() as u16,
@@ -126,6 +128,7 @@ fn live_create_key_inherits_staged_security_changes_in_batch_order() {
             let key = if path.is_empty() { mounted.hive.root() } else { mounted.hive.open_key(path).unwrap() };
             assert!(mounted.hive.set_key_security_descriptor(key, &initial));
         }
+        mounted.checkpoint_image_len = nt_hive_core::encoded_image_len(&mounted.hive).unwrap() as u32;
         server.cm = config_manager_from_system_hive(&mounted.hive, &mounted.current_control_set);
     }
     let parent = r"\Registry\Machine\System\CurrentControlSet\Services";
@@ -147,6 +150,7 @@ fn live_create_key_inherits_staged_security_changes_in_batch_order() {
     server.prepared_system_mutation = Some(PreparedSystemHiveMutation {
         token, expected_generation: 1, next_generation: 2, semantic_journal_len: 100,
         mutations: normalized.mutations, durable_journal: normalized.durable_journal,
+        projected_checkpoint_image_len: normalized.projected_checkpoint_image_len,
     });
     exchange(&mut server, CmHiveMutationCommitRequest {
         abi_size: core::mem::size_of::<CmHiveMutationCommitRequest>() as u16,

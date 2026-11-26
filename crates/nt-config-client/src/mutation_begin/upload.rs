@@ -63,6 +63,7 @@ pub struct SystemHiveMutationPreparation<C> {
     uploaded: usize,
     durable_len: Option<u32>,
     durable: Vec<u8>,
+    projected_checkpoint_image_len: Option<usize>,
     cancel_receipt: Option<CancellationReceipt>,
 }
 
@@ -138,6 +139,7 @@ impl<C> SystemHiveMutationUpload<C> {
             uploaded: 0,
             durable_len: None,
             durable: Vec::new(),
+            projected_checkpoint_image_len: None,
             cancel_receipt: None,
         }
     }
@@ -408,13 +410,19 @@ impl<C> SystemHiveMutationPreparation<C> {
                 };
             }
             Pull => {
-                if response.reply.detail0
-                    != u64::from(self.durable_len.ok_or(STATUS_INVALID_PARAMETER)?)
+                let detail = transfer::unpack_pull_detail(response.reply.detail0);
+                let projection = detail.and_then(|(journal_total, image_len)| {
+                    (Some(journal_total) == self.durable_len).then_some(image_len as usize)
+                });
+                if projection.is_none()
+                    || self.projected_checkpoint_image_len
+                        .is_some_and(|previous| Some(previous) != projection)
                     || response.reply.detail1 != upload.mutation_token
                     || response.reply.information as usize != exchange.reply_len
                 {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
+                self.projected_checkpoint_image_len = projection;
                 self.durable
                     .extend_from_slice(&response.bytes[..exchange.reply_len]);
                 if Some(self.durable.len() as u32) == self.durable_len {
@@ -472,6 +480,7 @@ impl<C> SystemHiveMutationPreparation<C> {
                 lease_token: upload.mutation_token,
                 semantic_journal_len: upload.journal.len() as u32,
                 durable_journal: core::mem::take(&mut self.durable),
+                projected_checkpoint_image_len: self.projected_checkpoint_image_len,
             },
             upload.continuation,
         ))

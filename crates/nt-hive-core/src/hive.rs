@@ -32,6 +32,9 @@ mod delete;
 pub use delete::{
     DeleteKeyEditError, DeleteValueEditError, OwnedPreparedDeleteKey, OwnedPreparedDeleteValue,
 };
+#[cfg(test)]
+#[path = "hive_projection_tests.rs"]
+mod projection_tests;
 
 pub use nt_config_manager::RegistryValueType;
 
@@ -211,6 +214,56 @@ pub struct HiveTransaction<'a> {
 }
 
 impl HiveTransaction<'_> {
+    /// Project the exact encoded image length from the pre-transaction length. The undo journal
+    /// already owns each changed original cell; only those cells and newly allocated cells can
+    /// change the image length. Old value blobs remain readable until commit or rollback.
+    pub fn projected_encoded_image_len(&self, baseline: usize) -> Result<usize, crate::HiveEncodeError> {
+        use crate::codec::{key_record_len, value_record_len};
+        use crate::HiveEncodeError;
+
+        let original_parent_volatile = |parent: CellId| {
+            let index = parent.0 as usize;
+            let cell = self.original_cells.iter()
+                .find(|(saved, _)| *saved == index)
+                .map(|(_, cell)| cell.as_ref())
+                .unwrap_or_else(|| self.hive.cells.get(index).and_then(Option::as_ref));
+            matches!(cell, Some(Cell::Key(key)) if key.volatile)
+        };
+        let old_len = |cell: &Cell| -> Result<usize, HiveEncodeError> {
+            match cell {
+                Cell::Key(key) if !key.volatile => key_record_len(key),
+                Cell::Value(value) if !original_parent_volatile(value.parent_key) => {
+                    value_record_len(self.hive, value)
+                }
+                _ => Ok(0),
+            }
+        };
+        let new_len = |cell: &Cell| -> Result<usize, HiveEncodeError> {
+            match cell {
+                Cell::Key(key) if !key.volatile => key_record_len(key),
+                Cell::Value(value) if !self.hive.is_volatile(value.parent_key) => {
+                    value_record_len(self.hive, value)
+                }
+                _ => Ok(0),
+            }
+        };
+        let mut len = baseline;
+        for (index, original) in &self.original_cells {
+            if let Some(original) = original {
+                len = len.checked_sub(old_len(original)?).ok_or(HiveEncodeError::SizeOverflow)?;
+            }
+            if let Some(current) = self.hive.cells[*index].as_ref() {
+                len = len.checked_add(new_len(current)?).ok_or(HiveEncodeError::SizeOverflow)?;
+            }
+        }
+        for index in self.original_cells_len..self.hive.cells.len() {
+            if let Some(cell) = self.hive.cells[index].as_ref() {
+                len = len.checked_add(new_len(cell)?).ok_or(HiveEncodeError::SizeOverflow)?;
+            }
+        }
+        Ok(len)
+    }
+
     fn snapshot_cell(&mut self, id: CellId) {
         let index = id.0 as usize;
         if index >= self.original_cells_len

@@ -2,6 +2,78 @@ use super::test_support::*;
 use super::*;
 use crate::SystemHiveMutation;
 use alloc::vec::Vec;
+use nt_config_abi::{hive_mount, hive_mutation_transfer, CmHiveMutationRequest, CM_ABI_VERSION};
+
+#[test]
+fn prepared_pull_reports_exact_future_system_checkpoint_image_length() {
+    let mut client = client(1);
+    let prepared = prepare(&mut client, 1, "Projected");
+    assert!(!prepared.durable_journal().is_empty());
+    let request = CmHiveMutationRequest {
+        abi_size: core::mem::size_of::<CmHiveMutationRequest>() as u16,
+        abi_version: CM_ABI_VERSION,
+        operation: hive_mutation_transfer::PULL,
+        mount: hive_mount::SYSTEM,
+        journal_offset: 0,
+        chunk_offset: 0,
+        chunk_len_bytes: 1,
+        journal_len_bytes: prepared.semantic_journal_len,
+        expected_generation: prepared.expected_generation,
+        lease_token: prepared.lease_token,
+        expected_mount: 0,
+    };
+    let mut one_byte = [0u8; 1];
+    let reply = client.backend.server.dispatch(
+        opcode::CM_OP_MUTATE_SYSTEM_HIVE, request.as_bytes(), &mut one_byte,
+    );
+    assert_eq!((reply.status, reply.information, reply.detail1),
+        (STATUS_SUCCESS, 1, prepared.lease_token));
+
+    let committed = client.commit_system_hive_mutation_retained(&prepared).unwrap();
+    let _ = client.acknowledge_system_hive_mutation_commit(committed).unwrap();
+    let checkpoint = client.prepare_system_hive_checkpoint(2).unwrap().unwrap();
+    assert_eq!(reply.detail0 as u32, prepared.durable_journal().len() as u32);
+    assert_eq!((reply.detail0 >> 32) as usize, checkpoint.image.len());
+    assert_eq!(prepared.projected_checkpoint_image_len(), Some(checkpoint.image.len()));
+    client.abort_system_hive_checkpoint(&checkpoint);
+}
+
+#[test]
+fn projected_checkpoint_length_tracks_value_growth_and_deletion() {
+    let mut client = client(1);
+    let created = prepare(&mut client, 1, "Projected");
+    let created_receipt = client.commit_system_hive_mutation_retained(&created).unwrap();
+    let _ = client.acknowledge_system_hive_mutation_commit(created_receipt).unwrap();
+    let initial = client.prepare_system_hive_checkpoint(2).unwrap().unwrap();
+    assert_eq!(created.projected_checkpoint_image_len(), Some(initial.image.len()));
+    client.acknowledge_system_hive_checkpoint(&initial).unwrap();
+
+    let path = alloc::format!("{PARENT}\\Projected");
+    let payload = [0x5a; 256];
+    let mut generation = 2;
+    for mutation in [
+        SystemHiveMutation::SetValue {
+            path: &path,
+            name: "Payload",
+            value_type: 3,
+            data: &payload,
+        },
+        SystemHiveMutation::DeleteValue {
+            path: &path,
+            name: "Payload",
+        },
+    ] {
+        let prepared = client.prepare_system_hive_mutation(generation,
+            core::slice::from_ref(&mutation)).unwrap();
+        assert!(prepared.projected_checkpoint_image_len().is_some());
+        let receipt = client.commit_system_hive_mutation_retained(&prepared).unwrap();
+        let _ = client.acknowledge_system_hive_mutation_commit(receipt).unwrap();
+        generation += 1;
+        let checkpoint = client.prepare_system_hive_checkpoint(generation).unwrap().unwrap();
+        assert_eq!(prepared.projected_checkpoint_image_len(), Some(checkpoint.image.len()));
+        client.acknowledge_system_hive_checkpoint(&checkpoint).unwrap();
+    }
+}
 
 #[test]
 fn storage_receipts_bind_to_the_exact_preparation_across_equal_generations() {
@@ -253,6 +325,7 @@ fn invalid_prepared_identity_is_rejected_without_transport() {
         lease_token: prepared.lease_token,
         semantic_journal_len: prepared.semantic_journal_len,
         durable_journal: Vec::new(),
+        projected_checkpoint_image_len: prepared.projected_checkpoint_image_len,
     });
     invalid[0].lease_token = 0;
     invalid[1].expected_generation = 0;

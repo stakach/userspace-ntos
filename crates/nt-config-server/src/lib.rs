@@ -1017,6 +1017,8 @@ impl CmIdentitySource {
 
 struct MountedSystemHive {
     hive: Hive,
+    /// Exact length of the next encoded checkpoint image at this committed hive state.
+    checkpoint_image_len: u32,
     identity: u64,
     generation: u64,
     current_control_set: CurrentControlSet,
@@ -1030,12 +1032,14 @@ struct PreparedSystemHiveMutation {
     semantic_journal_len: usize,
     mutations: Vec<HiveMutation>,
     durable_journal: Vec<u8>,
+    projected_checkpoint_image_len: u32,
 }
 
 #[derive(Debug)]
 struct PreparedSystemHiveMutations {
     mutations: Vec<HiveMutation>,
     durable_journal: Vec<u8>,
+    projected_checkpoint_image_len: u32,
 }
 
 struct PreparedSystemHiveCheckpoint {
@@ -2074,6 +2078,11 @@ impl CmServer {
                 let Ok(current_control_set) = hive.current_control_set() else {
                     return reply(STATUS_REGISTRY_CORRUPT, 0);
                 };
+                let Ok(checkpoint_image_len) = nt_hive_core::encoded_image_len(&hive)
+                    .and_then(|len| u32::try_from(len).map_err(|_| nt_hive_core::HiveEncodeError::SizeOverflow))
+                else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
                 let hardware_profile = match nt_hive_core::HardwareProfileAlias::capture(
                     &hive, &current_control_set,
                 ) {
@@ -2103,6 +2112,7 @@ impl CmServer {
                 self.cm = cm;
                 self.system_hive = Some(MountedSystemHive {
                     hive,
+                    checkpoint_image_len,
                     identity,
                     generation,
                     current_control_set,
@@ -2232,9 +2242,17 @@ impl CmServer {
         } else {
             let _ = config_manager_from_system_hive(transaction.hive(), &current_control_set);
         }
+        let projected_checkpoint_image_len = transaction
+            .projected_encoded_image_len(mounted.checkpoint_image_len as usize)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)
+            .and_then(|len| u32::try_from(len).map_err(|_| STATUS_INSUFFICIENT_RESOURCES))?;
         // Both validation transactions roll back here. Publication happens only after the caller
         // has made `durable_journal` stable.
-        Ok(PreparedSystemHiveMutations { mutations: normalized, durable_journal })
+        Ok(PreparedSystemHiveMutations {
+            mutations: normalized,
+            durable_journal,
+            projected_checkpoint_image_len,
+        })
     }
 
     fn commit_system_hive_mutations(
@@ -2251,6 +2269,10 @@ impl CmServer {
         let current_control_set = transaction
             .current_control_set()
             .map_err(|_| STATUS_REGISTRY_CORRUPT)?;
+        let projected_checkpoint_image_len = transaction
+            .projected_encoded_image_len(mounted.checkpoint_image_len as usize)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)
+            .and_then(|len| u32::try_from(len).map_err(|_| STATUS_INSUFFICIENT_RESOURCES))?;
 
         let actions = device_action_intents(mutations)?;
         let mut topology = if previous_control_set != current_control_set || !actions.is_empty() {
@@ -2289,6 +2311,7 @@ impl CmServer {
             self.cm.refresh_registry_devnodes();
         }
         mounted.generation = next_generation;
+        mounted.checkpoint_image_len = projected_checkpoint_image_len;
         mounted.current_control_set = current_control_set;
         Ok(self.device_action_journal.pending_len() != 0)
     }
@@ -2355,6 +2378,9 @@ impl CmServer {
                 let Ok(image_len_bytes) = u32::try_from(image.len()) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
                 };
+                if image_len_bytes != mounted.checkpoint_image_len {
+                    return reply(STATUS_REGISTRY_CORRUPT, current_generation);
+                }
                 let checkpoint_header = CmHiveCheckpointHeader {
                     magic: CM_HIVE_CHECKPOINT_MAGIC,
                     version: CM_HIVE_CHECKPOINT_VERSION,
@@ -4521,6 +4547,7 @@ mod tests {
             semantic_journal_len: 0,
             mutations: Vec::new(),
             durable_journal: Vec::new(),
+            projected_checkpoint_image_len: 0,
         });
         let begin = server.dispatch(
             opcode::CM_OP_IMPORT_HIVE,
@@ -4539,6 +4566,7 @@ mod tests {
             semantic_journal_len: 0,
             mutations: Vec::new(),
             durable_journal: Vec::new(),
+            projected_checkpoint_image_len: 0,
         });
         let commit = server.dispatch(
             opcode::CM_OP_IMPORT_HIVE,

@@ -27,6 +27,7 @@ fn volatile_server() -> CmServer {
         nt_hive_core::HardwareProfileAlias::capture(&hive, &current_control_set).unwrap();
     server.cm = config_manager_from_system_hive(&hive, &current_control_set);
     server.system_hive = Some(MountedSystemHive {
+        checkpoint_image_len: nt_hive_core::encoded_image_len(&hive).unwrap() as u32,
         hive,
         identity: server.identities.take().unwrap(),
         generation: 1,
@@ -179,6 +180,7 @@ fn volatile_only_and_mixed_preparations_keep_durable_sequence_and_replay_exact()
         semantic_journal_len: 100,
         mutations: prepared.mutations,
         durable_journal: prepared.durable_journal,
+        projected_checkpoint_image_len: prepared.projected_checkpoint_image_len,
     });
     assert_eq!(
         server

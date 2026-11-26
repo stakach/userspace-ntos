@@ -253,6 +253,27 @@ pub mod hive_mutation_transfer {
     pub const ABORT: u16 = 6;
     /// Read-only exact prepared-owner validation before admitting storage effects.
     pub const VALIDATE_PREPARED: u16 = 7;
+
+    /// Preserve the prepared journal length in the low word of `CmReply::detail0` while carrying
+    /// the exact prospective SYSTEM checkpoint image length in the high word of every PULL reply.
+    /// A checkpoint image is limited to `u32` by `CmHiveCheckpointHeader::image_len_bytes`.
+    pub const fn pack_pull_detail(journal_len: u32, checkpoint_image_len: u32) -> Option<u64> {
+        if journal_len == 0 || checkpoint_image_len == 0 {
+            None
+        } else {
+            Some(((checkpoint_image_len as u64) << 32) | journal_len as u64)
+        }
+    }
+
+    pub const fn unpack_pull_detail(detail: u64) -> Option<(u32, u32)> {
+        let journal_len = detail as u32;
+        let checkpoint_image_len = (detail >> 32) as u32;
+        if journal_len == 0 || checkpoint_image_len == 0 {
+            None
+        } else {
+            Some((journal_len, checkpoint_image_len))
+        }
+    }
 }
 
 /// Operation carried by [`CmHiveCheckpointRequest::operation`].
@@ -1426,6 +1447,15 @@ mod tests {
     #[test]
     fn mounted_hive_mutation_has_stable_wire_layout() {
         assert_eq!(hive_mutation_transfer::VALIDATE_PREPARED, 7);
+        let detail = hive_mutation_transfer::pack_pull_detail(0x1122_3344, 0x5566_7788)
+            .expect("nonempty prepared journal and image");
+        assert_eq!(detail, 0x5566_7788_1122_3344);
+        assert_eq!(hive_mutation_transfer::unpack_pull_detail(detail),
+            Some((0x1122_3344, 0x5566_7788)));
+        assert_eq!(hive_mutation_transfer::pack_pull_detail(0, 1), None);
+        assert_eq!(hive_mutation_transfer::pack_pull_detail(1, 0), None);
+        assert_eq!(hive_mutation_transfer::unpack_pull_detail(1), None);
+        assert_eq!(hive_mutation_transfer::unpack_pull_detail(1u64 << 32), None);
         assert_eq!(opcode::CM_OP_MUTATE_SYSTEM_HIVE, 0x2156);
         assert_eq!(opcode::CM_OP_EXPORT_LEASED_HIVE, 0x215b);
         assert_eq!(core::mem::size_of::<CmHiveExportHeader>(), 24);
