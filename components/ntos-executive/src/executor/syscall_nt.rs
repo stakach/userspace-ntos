@@ -556,14 +556,21 @@ pub(super) unsafe fn syscall_nt_route(
             dispatch_generation, res.status);
         sc.pended_create = crate::native_device_path_trace::staged_create(
             &nt_handler, table_entry.map(|entry| entry.service), &argv[..n], dispatch_generation);
+        let service = table_entry.map(|entry| entry.service);
+        let dispatch_serial_bytes =
+            crate::serial_records::root_serial_bytes().wrapping_sub(dispatch_serial);
         crate::hot_service_cost_census::record_dispatch(
-            table_entry.map(|entry| entry.service), res.status, elapsed_ticks,
-            crate::serial_records::root_serial_bytes().wrapping_sub(dispatch_serial),
-        );
+            service, res.status, elapsed_ticks, dispatch_serial_bytes);
+        let requested_file_bytes = match service {
+            Some(nt_syscall::NativeService::NtReadFile | nt_syscall::NativeService::NtWriteFile)
+                if n > 6 => Some(argv[6] as u32 as u64),
+            _ => None,
+        };
         native_process_time_census::record_dispatch(
-            pi, dispatch_generation,
-            table_entry.map(|entry| entry.service), res.status,
-            elapsed_ticks,
+            pi, nt_hosted_runtime::exact_dispatch_generation(
+                dispatch_generation, nt_handler.hosted_process_generation(pi)),
+            service, res.status, elapsed_ticks,
+            dispatch_serial_bytes, requested_file_bytes,
         );
         let installer_gap_timer_rearm = installer_child_span_census::returned(
             &nt_handler, installer_span, lp.msg.badge, lp.msg.m0 as u32, res.status);

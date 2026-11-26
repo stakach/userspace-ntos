@@ -4,6 +4,7 @@
 //! evaluating job limits, changing a wait, or retaining a thread owner.
 
 use super::*;
+use nt_hosted_runtime::{HotIoCost, HotProcessCost};
 use nt_syscall::NativeService;
 
 const FAMILY_COUNT: usize = 5;
@@ -63,6 +64,7 @@ struct ScBaseline { signature: u64, count: u64, bound_us: u64, donated_us: u64, 
 struct Row {
     generation: u64,
     families: [FamilyTotal; FAMILY_COUNT],
+    hot_file: [HotIoCost; 2],
     reported_calls: u64,
     baseline: Option<ScBaseline>,
     guest_us: u64,
@@ -77,6 +79,7 @@ struct Row {
 impl Row {
     const EMPTY: Self = Self {
         generation: 0, families: [FamilyTotal::EMPTY; FAMILY_COUNT], reported_calls: 0,
+        hot_file: [HotIoCost::EMPTY; 2],
         baseline: None, guest_us: 0, server_us: 0, wall_us: 0, sc_gaps: 0,
         sc_failures: 0, live_threads: 0, parked_threads: 0,
     };
@@ -112,7 +115,8 @@ static mut REPLACED_GENERATIONS: u64 = 0;
 /// Only the registered table-dispatch bracket is counted; native fast paths that bypass it
 /// remain outside these family totals. SC time is sampled independently of that coverage.
 pub(crate) fn record_dispatch(pi: usize, generation: Option<u64>,
-    service: Option<NativeService>, status: u32, ticks: u64) {
+    service: Option<NativeService>, status: u32, ticks: u64, serial_bytes: u64,
+    requested_bytes: Option<u64>) {
     let Some(generation) = generation.filter(|generation| *generation != 0) else {
         unsafe { INVALID_OWNER = INVALID_OWNER.saturating_add(1); }
         return;
@@ -134,6 +138,36 @@ pub(crate) fn record_dispatch(pi: usize, generation: Option<u64>,
     total.failed = total.failed.saturating_add(u64::from(status & 0xc000_0000 == 0xc000_0000));
     total.ticks = total.ticks.saturating_add(ticks);
     total.max_ticks = total.max_ticks.max(ticks);
+    let hot_index = match service {
+        Some(NativeService::NtReadFile) => Some(0),
+        Some(NativeService::NtWriteFile) => Some(1),
+        _ => None,
+    };
+    if let Some(index) = hot_index {
+        let hot = &mut row.hot_file[index];
+        hot.calls = hot.calls.saturating_add(1);
+        hot.ticks = hot.ticks.saturating_add(ticks);
+        hot.serial_bytes = hot.serial_bytes.saturating_add(serial_bytes);
+        if let Some(requested_bytes) = requested_bytes {
+            hot.requested_bytes = hot.requested_bytes.saturating_add(requested_bytes);
+            hot.known_request_calls = hot.known_request_calls.saturating_add(1);
+        }
+    }
+}
+
+/// Root-only value snapshot for exact installer-gap baselines. A reused PI carries a new
+/// generation, so the pure ranker refuses to assign its old counters to the new process.
+pub(crate) fn snapshot_hot_file() -> [HotProcessCost; MAX_PI] {
+    let rows = unsafe { &*core::ptr::addr_of!(ROWS) };
+    let mut snapshot = [HotProcessCost::EMPTY; MAX_PI];
+    for (pi, value) in snapshot.iter_mut().enumerate() {
+        let row = &rows[pi];
+        if row.generation != 0 {
+            *value = HotProcessCost { generation: row.generation,
+                read: row.hot_file[0], write: row.hot_file[1] };
+        }
+    }
+    snapshot
 }
 
 /// Called after a periodic census, including one started inside a nested pump. An exact live

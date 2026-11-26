@@ -166,6 +166,109 @@ pub fn top_counter_deltas<const TOP: usize>(before: &[u64], mut current: impl Fn
     Some(top)
 }
 
+/// Cumulative, inclusive work in one registered Read/Write table dispatch family.
+/// Requested bytes describe the call argument, not a completed transfer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HotIoCost {
+    pub calls: u64,
+    pub ticks: u64,
+    pub serial_bytes: u64,
+    pub requested_bytes: u64,
+    pub known_request_calls: u64,
+}
+
+impl HotIoCost {
+    pub const EMPTY: Self = Self { calls: 0, ticks: 0, serial_bytes: 0,
+        requested_bytes: 0, known_request_calls: 0 };
+
+    fn checked_delta(self, before: Self) -> Option<Self> {
+        Some(Self {
+            calls: self.calls.checked_sub(before.calls)?,
+            ticks: self.ticks.checked_sub(before.ticks)?,
+            serial_bytes: self.serial_bytes.checked_sub(before.serial_bytes)?,
+            requested_bytes: self.requested_bytes.checked_sub(before.requested_bytes)?,
+            known_request_calls: self.known_request_calls.checked_sub(before.known_request_calls)?,
+        })
+    }
+}
+
+/// A process slot is authoritative only with its hosted generation. An empty slot has
+/// generation zero and all-zero counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HotProcessCost {
+    pub generation: u64,
+    pub read: HotIoCost,
+    pub write: HotIoCost,
+}
+
+impl HotProcessCost {
+    pub const EMPTY: Self = Self { generation: 0, read: HotIoCost::EMPTY,
+        write: HotIoCost::EMPTY };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HotProcessDelta {
+    pub process_index: usize,
+    pub generation: u64,
+    pub read: HotIoCost,
+    pub write: HotIoCost,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HotProcessRank<const TOP: usize> {
+    pub top: [Option<HotProcessDelta>; TOP],
+    pub omitted_owners: u64,
+    pub changed_owners: u64,
+}
+
+/// Rank exact-generation work within one baseline window. Reused slots are excluded;
+/// a counter regression refuses the whole window rather than claiming missing work is zero.
+pub fn rank_hot_process_deltas<const N: usize, const TOP: usize>(
+    before: &[HotProcessCost; N], after: &[HotProcessCost; N],
+) -> Option<HotProcessRank<TOP>> {
+    let mut top = [None; TOP];
+    let mut seen = 0u64;
+    let mut changed = 0u64;
+    for (process_index, (&old, &new)) in before.iter().zip(after).enumerate() {
+        if new.generation == 0 {
+            if new != HotProcessCost::EMPTY { return None; }
+            changed += u64::from(old.generation != 0);
+            continue;
+        }
+        let baseline = if old.generation == new.generation {
+            old
+        } else if old == HotProcessCost::EMPTY {
+            HotProcessCost { generation: new.generation, ..HotProcessCost::EMPTY }
+        } else {
+            changed += 1;
+            continue;
+        };
+        let read = new.read.checked_delta(baseline.read)?;
+        let write = new.write.checked_delta(baseline.write)?;
+        let ticks = read.ticks.checked_add(write.ticks)?;
+        if read.calls == 0 && write.calls == 0 { continue; }
+        seen += 1;
+        let entry = HotProcessDelta { process_index, generation: new.generation, read, write };
+        for rank in 0..TOP {
+            let prior_ticks = top[rank].map(|prior: HotProcessDelta|
+                prior.read.ticks.saturating_add(prior.write.ticks));
+            if prior_ticks.is_none_or(|prior| ticks > prior) {
+                for lower in (rank + 1..TOP).rev() { top[lower] = top[lower - 1]; }
+                top[rank] = Some(entry);
+                break;
+            }
+        }
+    }
+    let displayed = top.iter().filter(|entry| entry.is_some()).count() as u64;
+    Some(HotProcessRank { top, omitted_owners: seen - displayed, changed_owners: changed })
+}
+
+/// A nested dispatch can retire and reuse the PI before the outer call returns.
+/// Refuse its stale cost instead of reintroducing the old generation in a census row.
+pub fn exact_dispatch_generation(start: Option<u64>, end: Option<u64>) -> Option<u64> {
+    start.filter(|generation| *generation != 0 && end == Some(*generation))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +329,57 @@ mod tests {
         assert!(budget.admit());
         assert!(!budget.admit());
         assert_eq!((budget.used(), budget.refused()), (2, 1));
+    }
+
+    #[test]
+    fn hot_process_ranking_requires_the_exact_generation() {
+        let before = [
+            HotProcessCost { generation: 19, read: HotIoCost {
+                calls: 4, ticks: 40, serial_bytes: 2, requested_bytes: 100,
+                known_request_calls: 4 }, ..HotProcessCost::EMPTY },
+            HotProcessCost { generation: 20, ..HotProcessCost::EMPTY },
+            HotProcessCost::EMPTY,
+            HotProcessCost::EMPTY,
+        ];
+        let after = [
+            HotProcessCost { generation: 19, read: HotIoCost {
+                calls: 6, ticks: 90, serial_bytes: 5, requested_bytes: 180,
+                known_request_calls: 6 }, ..HotProcessCost::EMPTY },
+            HotProcessCost { generation: 21, read: HotIoCost {
+                calls: 99, ticks: 999, ..HotIoCost::EMPTY }, ..HotProcessCost::EMPTY },
+            HotProcessCost { generation: 22, write: HotIoCost {
+                calls: 3, ticks: 30, serial_bytes: 1, requested_bytes: 60,
+                known_request_calls: 3 }, ..HotProcessCost::EMPTY },
+            HotProcessCost::EMPTY,
+        ];
+        let ranked = rank_hot_process_deltas::<4, 1>(&before, &after).unwrap();
+        assert_eq!(ranked.changed_owners, 1);
+        assert_eq!(ranked.omitted_owners, 1);
+        assert_eq!(ranked.top[0], Some(HotProcessDelta {
+            process_index: 0, generation: 19,
+            read: HotIoCost { calls: 2, ticks: 50, serial_bytes: 3,
+                requested_bytes: 80, known_request_calls: 2 },
+            write: HotIoCost::EMPTY,
+        }));
+    }
+
+    #[test]
+    fn hot_process_ranking_rejects_regression_even_outside_top() {
+        let before = [HotProcessCost { generation: 7, read: HotIoCost {
+            calls: 3, ticks: 30, serial_bytes: 4, requested_bytes: 90,
+            known_request_calls: 3 }, ..HotProcessCost::EMPTY }];
+        let after = [HotProcessCost { generation: 7, read: HotIoCost {
+            calls: 4, ticks: 31, serial_bytes: 3, requested_bytes: 100,
+            known_request_calls: 4 }, ..HotProcessCost::EMPTY }];
+        assert_eq!(rank_hot_process_deltas::<1, 1>(&before, &after), None);
+    }
+
+    #[test]
+    fn nested_slot_reuse_cannot_resurrect_a_stale_dispatch_generation() {
+        assert_eq!(exact_dispatch_generation(Some(20), Some(20)), Some(20));
+        assert_eq!(exact_dispatch_generation(Some(20), Some(21)), None);
+        assert_eq!(exact_dispatch_generation(Some(20), None), None);
+        assert_eq!(exact_dispatch_generation(None, Some(21)), None);
+        assert_eq!(exact_dispatch_generation(Some(0), Some(0)), None);
     }
 }

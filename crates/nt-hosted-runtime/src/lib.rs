@@ -81,8 +81,10 @@ pub use win32k_bulk_stage::{
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
 pub use installer_syscall_span::{CensusEpochGate, CloseUnmapRuntimeTotals, InstallerFaultTicket, InstallerSyscallSpans, LongestGap, OpenCloseGap, OpenCloseGapSampleBudget, PairedRuntimeSample, RuntimeSample, SpanOwner, SpanSample, SpanSnapshot, SsnTotal, TransitionPairTotal, OPEN_CLOSE_GAP_THRESHOLD_100NS};
-pub use root_service_gap::{CounterDelta, RootGapBaselineBudget, RootGapObservation,
-    RootRuntimeDelta, RootServiceGapLedger, top_counter_deltas};
+pub use root_service_gap::{CounterDelta, HotIoCost, HotProcessCost, HotProcessDelta,
+    HotProcessRank, RootGapBaselineBudget, RootGapObservation, RootRuntimeDelta,
+    RootServiceGapLedger, exact_dispatch_generation, rank_hot_process_deltas,
+    top_counter_deltas};
 pub use installer_fault_receipt::{InstallerFaultReceipt, InstallerFaultReceipts};
 pub use primary_alias_activation::{
     classify_alias_registration_status, AliasRetryDisposition,
