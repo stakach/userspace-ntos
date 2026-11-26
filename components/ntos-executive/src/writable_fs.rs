@@ -886,16 +886,6 @@ pub(crate) fn checkpoint_epochs() -> (u64, u64) {
     SNAPSHOT_PUBLICATION.epochs()
 }
 
-/// A checkpoint cleared the dirty bit and will capture the volume.
-fn note_checkpoint_begun() {
-    SNAPSHOT_PUBLICATION.record_begun();
-}
-
-/// The one checkpoint in flight published. Only one runs at a time, so it is the latest begun.
-fn note_checkpoint_published() {
-    SNAPSHOT_PUBLICATION.publish_current();
-}
-
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
 /// `Ok(false)` means the volume was already clean.
 pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
@@ -924,11 +914,12 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
             return Err(snapshot_storage::BUSY);
         }
     }
-    if !SNAPSHOT_PUBLICATION.take_dirty() {
-        return Ok(false);
-    }
-    note_checkpoint_begun();
-    let begun_epoch = checkpoint_epochs().0;
+    let capture = match SNAPSHOT_PUBLICATION.begin_dirty_capture() {
+        Ok(Some(capture)) => capture,
+        Ok(None) => return Ok(false),
+        Err(_) => return Err(nt_fs::STATUS_INSUFFICIENT_RESOURCES),
+    };
+    let begun_epoch = capture.epoch();
     let written_before = WRITABLE_FS_SNAPSHOT_WRITE_SECTORS.load(Ordering::Relaxed);
     let trace = BOOT_CHECKPOINT_MEASURES.fetch_update(Ordering::AcqRel,
         Ordering::Acquire, |used| (used < 2048).then_some(used + 1)).is_ok();
@@ -1008,7 +999,11 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
                     return Err(status);
                 }
             }
-            note_checkpoint_published();
+            if capture.publish().is_err() {
+                WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+                core::mem::forget(dev);
+                return Err(nt_fs::STATUS_DATA_ERROR);
+            }
             WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);

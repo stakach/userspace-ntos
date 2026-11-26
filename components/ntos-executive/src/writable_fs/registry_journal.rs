@@ -102,12 +102,13 @@ impl<C> Journal<C> {
         });
         match self.storage.release_after_publication() {
             Ok((filesystem, device, context)) => {
+                debug_assert!(legacy_snapshot_writes_allowed());
                 if let Some((generation, bytes)) = evidence {
                     WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
                     WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
                     WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
                 }
-                SNAPSHOT_PUBLICATION.clear_dirty();
+                SNAPSHOT_PUBLICATION.clear_after_legacy_journal();
                 restore(filesystem);
                 drop(device);
                 Ok(context)
@@ -120,7 +121,8 @@ impl<C> Journal<C> {
         let _durable = crate::allocator::enter_durable();
         match self.storage.release_rolled_back() {
             Ok((filesystem, device, context)) => {
-                SNAPSHOT_PUBLICATION.clear_dirty();
+                debug_assert!(legacy_snapshot_writes_allowed());
+                SNAPSHOT_PUBLICATION.clear_after_legacy_journal();
                 restore(filesystem);
                 drop(device);
                 Ok(context)

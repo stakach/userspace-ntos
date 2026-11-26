@@ -47,6 +47,7 @@ impl Cursor {
 }
 
 struct Active {
+    capture_epoch: nt_fs::SnapshotCaptureEpoch<'static>,
     id: u64,
     started_ticks: u64,
     start_after_print: bool,
@@ -228,7 +229,11 @@ unsafe fn advance_recheck() -> Result<(), u32> {
     if let Err(status) = stage_prepared_checkpoint(&mut staged, &prepared) {
         return Err(stall_before_commit(slot, lease, token, proof, prepared, None, status));
     }
-    SNAPSHOT_PUBLICATION.begin_fold_capture();
+    let capture_epoch = match SNAPSHOT_PUBLICATION.begin_fold_capture() {
+        Ok(capture) => capture,
+        Err(_) => return Err(stall_before_commit(slot, lease, token, proof, prepared, None,
+            nt_fs::STATUS_INSUFFICIENT_RESOURCES)),
+    };
     let image = match snapshot_capture::CapturedSnapshot::capture(&lease, &staged) {
         Ok(image) => image,
         Err(status) => {
@@ -246,7 +251,7 @@ unsafe fn advance_recheck() -> Result<(), u32> {
     };
     commit.set_max_batch_sectors(crate::driver_launch::native_storage_transfer_sectors())
         .expect("a fresh snapshot commit has no request in flight");
-    *slot = Some(Work::Active(Active { id, started_ticks, start_after_print,
+    *slot = Some(Work::Active(Active { capture_epoch, id, started_ticks, start_after_print,
         trace, write_sectors: 0,
         prepared, lease, token, old_pair: None, manifest, bytes,
         cursor: Some(Cursor::First(commit)), entered: false, failed: false }));
@@ -644,6 +649,7 @@ unsafe fn publish_ready(active: Active,
     );
     let old = if next.is_none() { Some(active.token) } else { None };
     *core::ptr::addr_of_mut!(FOLD_WORK) = Some(FoldWork {
+        capture_epoch: Some(active.capture_epoch),
         prepared: active.prepared, lease: active.lease,
         old_continuation: old, old_pair: active.old_pair,
         next_continuation: next, next_pair: Some(pair),
