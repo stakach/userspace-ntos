@@ -16,6 +16,7 @@ static NEXT_TABLE_ID: AtomicU64 = AtomicU64::new(1);
 /// The Overlay File lifetime owner is supplied by the native adapter and is never copied here.
 /// The adapter must provide a dedicated retained reference or transfer the pending row's owned
 /// local reference with a single release authority; a syscall-local handler borrow is insufficient.
+#[must_use = "retain or explicitly release the native Overlay File reference"]
 pub struct PendingBasicPreparedOwner<FileReference> {
     input: [u8; 40],
     prepared: nt_fs::PreparedBasicInformation,
@@ -160,13 +161,17 @@ impl<FileReference> PendingBasicPreparedTable<FileReference> {
         Some(())
     }
 
-    /// Return the owner after a known exact native terminal. The physical terminal and any
-    /// durable WAL proof are caller obligations; this method cannot manufacture either one.
-    pub fn take_terminal_exact(&mut self, pending: &PendingFileIoTable,
-        claim: PendingBasicPreparedClaim) -> Result<PendingBasicPreparedOwner<FileReference>,
-            PendingBasicPreparedClaim> {
+    /// Settle the exact delivery row and transfer its prepared owner together after a known
+    /// native terminal. The caller must prove the physical terminal and any durable WAL result;
+    /// a sidecar claim alone grants neither. Refusal retains the row and owner unchanged.
+    pub fn commit_owned_basic_exact(&mut self, pending: &mut PendingFileIoTable,
+        claim: PendingBasicPreparedClaim, status: u32,
+    ) -> Result<PendingBasicPreparedOwner<FileReference>, PendingBasicPreparedClaim> {
         let Some(slot) = self.claimed_slot(pending, &claim) else { return Err(claim); };
-        let Some(entry) = self.entries[slot].take() else { return Err(claim); };
+        if pending.commit_owned_basic_terminal_exact(claim.identity, claim.irp_id, status).is_none() {
+            return Err(claim);
+        }
+        let entry = self.entries[slot].take().expect("settled Basic row lost its prepared owner");
         Ok(entry.owner)
     }
 

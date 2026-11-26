@@ -58,6 +58,15 @@ impl HiveTicket {
     pub(crate) fn enters_wal_effect(&self) -> bool { matches!(self.request, HiveRequest::Wal(_)) }
 }
 
+/// Scheduling witness minted only when an entered physical HiveTicket has settled the
+/// journal into Ready. It does not transfer the journal, its reserve, or a caller Reply.
+#[must_use = "pass the exact ready journal to its retained mutation row"]
+pub(crate) struct HiveJournalReady { id: u64 }
+
+impl HiveJournalReady {
+    pub(crate) fn owner_id(self) -> u64 { self.id }
+}
+
 pub(crate) struct NativeHiveJournalReceipt {
     pub(crate) id: u64,
     pub(crate) file_id: u64,
@@ -490,6 +499,20 @@ pub(crate) unsafe fn refuse_unentered_native_hive_io(
 }
 
 pub(crate) unsafe fn complete_native_hive_io(
+    ticket: HiveTicket, result: Result<&[u8], nt_status::NtStatus>,
+) -> Result<(super::super::native_snapshot_io::SnapshotCompletion,
+    Option<HiveJournalReady>), u32> {
+    let id = ticket.id;
+    let completion = complete_native_hive_io_inner(ticket, result)?;
+    // Wal and Anchor have an autonomous next-command claim. The mutation row can collect
+    // a receipt only in Ready, so an intermediate physical step needs no row wake.
+    let ready = matches!(&completion, super::super::native_snapshot_io::SnapshotCompletion::Settled)
+        && (&*core::ptr::addr_of!(JOURNAL)).as_ref().is_some_and(|journal|
+            journal.id == id && matches!(&journal.phase, Phase::Ready { .. }));
+    Ok((completion, ready.then_some(HiveJournalReady { id })))
+}
+
+unsafe fn complete_native_hive_io_inner(
     ticket: HiveTicket, result: Result<&[u8], nt_status::NtStatus>,
 ) -> Result<super::super::native_snapshot_io::SnapshotCompletion, u32> {
     use super::super::native_snapshot_io::SnapshotCompletion;
