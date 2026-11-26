@@ -985,3 +985,13 @@ diagnosis-free failure.
 - When a caller needs to authenticate reply length, use a transport that preserves raw
   MessageInfo. Execute the production decoded wrapper in a fixture and model raw and decoded
   replies separately; a mock with the right name but the wrong return contract conceals bugs.
+
+## Search The Entire Timer Collector Before Declaring A Wake Missing
+- A read-only #401 review stopped at `timer_deadline.rs:117` and incorrectly reported that
+  mutable-hive work had no canonical deadline; its source was registered at line 125. Search
+  the whole collector for the exact symbol and check its callers before changing timer wiring.
+- Trace the producer of each physical command before assigning its delay to a retained row.
+  The hive row's `Poll` phase cannot advance intermediate WAL or anchor I/O; the native
+  executor claims those commands autonomously after each terminal. The row needs a wake
+  when the final anchor makes its receipt ready, while between-command latency is a
+  separate mounted-executor measurement.

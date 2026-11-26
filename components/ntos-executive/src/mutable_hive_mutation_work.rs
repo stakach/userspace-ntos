@@ -132,6 +132,8 @@ static EXECUTING_TID: AtomicU64 = AtomicU64::new(0);
 static PENDING: AtomicU64 = AtomicU64::new(0);
 static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
 static NEXT: AtomicU64 = AtomicU64::new(0);
+static HIVE_COMPLETION: nt_config_client::mutation_retry_schedule::MutableHiveCompletionHint =
+    nt_config_client::mutation_retry_schedule::MutableHiveCompletionHint::new();
 static TRANSFERRED: AtomicBool = AtomicBool::new(false);
 static DURABLE_TRACED: AtomicU64 = AtomicU64::new(0);
 /// Rows parked in `Phase::Notify`. They wait for a registry change, not for time, so they
@@ -622,10 +624,17 @@ pub(crate) unsafe fn submit_hosted_create_child(
 }
 
 pub(crate) fn take_transferred() -> bool { TRANSFERRED.swap(false, Ordering::AcqRel) }
-pub(crate) fn next_deadline() -> Option<u64> {
-    let pending = PENDING.load(Ordering::Acquire);
-    (pending > NOTIFY_WAITING.load(Ordering::Acquire) || NOTIFY_READY.load(Ordering::Acquire))
-        .then(|| NEXT.load(Ordering::Acquire))
+pub(crate) fn next_deadline(now: u64) -> Option<u64> {
+    nt_config_client::mutation_retry_schedule::mutable_hive_deadline(
+        PENDING.load(Ordering::Acquire), NOTIFY_WAITING.load(Ordering::Acquire),
+        NOTIFY_READY.load(Ordering::Acquire), NEXT.load(Ordering::Acquire),
+        HIVE_COMPLETION.current(), ACTIVE.load(Ordering::Acquire), now)
+}
+
+/// A move-only witness from the exact entered HiveTicket's physical terminal schedules
+/// its retained Poll row. This hint never polls the journal or publishes the caller's Reply.
+pub(crate) fn wake_completed_hive_journal(ready: writable_fs::hive_wal::HiveJournalReady) {
+    let _ = HIVE_COMPLETION.publish(ready.owner_id());
 }
 pub(crate) fn has_thread(tid: u64) -> bool {
     EXECUTING_TID.load(Ordering::Acquire) == tid || unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten()
@@ -981,8 +990,9 @@ pub(crate) unsafe fn redrive(
 /// journal phases, so the single native hive journal is never held by a row this frame cannot
 /// move. No nested frame owns a hosted Reply, so hosted rows stop before their reply phases.
 pub(crate) unsafe fn redrive_nested() -> bool {
-    if PENDING.load(Ordering::Acquire) == 0
-        || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
+    if nt_config_client::mutation_retry_schedule::mutable_hive_pass(
+        PENDING.load(Ordering::Acquire), monotonic_time_100ns(),
+        NEXT.load(Ordering::Acquire), HIVE_COMPLETION.current()).is_none()
         || ACTIVE.load(Ordering::Acquire) { return false; }
     let Ok(handler) = crate::service_sec_image::registry_live_handler() else { return false; };
     let before = PENDING.load(Ordering::Acquire);
@@ -1002,15 +1012,21 @@ pub(crate) fn pending_nested_hive_wal_io() -> Option<u64> {
 unsafe fn redrive_rows(
     handler: &mut ExecNtHandler, mut queue: Option<&mut nt_delay_execution::Queue>,
 ) {
-    if PENDING.load(Ordering::Acquire) == 0
-        || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
-        || ACTIVE.swap(true, Ordering::AcqRel) { return; }
+    let ready_journal = HIVE_COMPLETION.current();
+    let Some(pass) = nt_config_client::mutation_retry_schedule::mutable_hive_pass(
+        PENDING.load(Ordering::Acquire), monotonic_time_100ns(),
+        NEXT.load(Ordering::Acquire), ready_journal) else { return; };
+    if ACTIVE.swap(true, Ordering::AcqRel) { return; }
     let outer = queue.is_some();
-    if outer { NOTIFY_READY.store(false, Ordering::Release); }
+    if outer && pass.is_timed() { NOTIFY_READY.store(false, Ordering::Release); }
     let mut failed = false;
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     for index in 0..rows.len() {
         let Some(mut work) = rows[index].take() else { continue; };
+        if !pass.row_due(work.journal_id, matches!(work.phase, Phase::Poll)) {
+            rows[index] = Some(work);
+            continue;
+        }
         EXECUTING_INDEX.store(index as u64, Ordering::Relaxed);
         let mut completed = false;
         for _ in 0..8 {
@@ -1037,7 +1053,10 @@ unsafe fn redrive_rows(
         EXECUTING_INDEX.store(u64::MAX, Ordering::Relaxed);
         EXECUTING_TID.store(0, Ordering::Release);
     }
-    NEXT.store(monotonic_time_100ns().saturating_add(if failed { RETRY_DELAY } else { POLL_DELAY }),
-        Ordering::Release);
+    if let Some(journal) = ready_journal { HIVE_COMPLETION.clear_exact(journal); }
+    if pass.is_timed() {
+        NEXT.store(monotonic_time_100ns().saturating_add(if failed { RETRY_DELAY } else { POLL_DELAY }),
+            Ordering::Release);
+    }
     ACTIVE.store(false, Ordering::Release);
 }
