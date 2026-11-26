@@ -3,7 +3,11 @@
 //! The caller records its in-flight phase before entering here. These adapters never infer
 //! cancellation from an error, replace a captured generation, or discard a receipt.
 
-use crate::{CONFIG_CLIENT_PTR, CONFIG_STATUS_DEVICE_NOT_READY};
+use crate::{
+    CONFIG_CLIENT_PTR, CONFIG_STATUS_DEVICE_NOT_READY,
+    LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION,
+};
+use core::sync::atomic::Ordering;
 use nt_config_client::*;
 
 pub(crate) unsafe fn begin(exchange: &CmMutationBeginExchange) -> CmMutationBeginResponse {
@@ -28,10 +32,15 @@ pub(crate) unsafe fn commit(
     // Recorded before the IPC: a lost COMMIT reply may already have published CM, and readers
     // run before this writer's durable marker advances the durable generation.
     crate::config_manager_note_system_commit_entered(prepared.next_generation());
-    CONFIG_CLIENT_PTR
+    let receipt = CONFIG_CLIENT_PTR
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?
-        .commit_system_hive_mutation_retained(prepared)
+        .commit_system_hive_mutation_retained(prepared)?;
+    // A positive, validated receipt proves CM published this generation. The WAL marker may
+    // still be in flight, so readers need this high-water mark independently of durability.
+    LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION
+        .fetch_max(receipt.outcome().generation, Ordering::AcqRel);
+    Ok(receipt)
 }
 
 pub(crate) unsafe fn validate_storage(prepared: &PreparedSystemHiveMutation) -> Result<(), i32> {

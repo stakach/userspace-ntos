@@ -16041,6 +16041,8 @@ pub(crate) fn config_manager_channel_idle() -> bool {
 }
 static mut LIVE_CONFIG_MANAGER_SYSTEM_MOUNT: Option<nt_config_client::SystemHiveMount> = None;
 static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Latest CM-acknowledged SYSTEM generation, including records awaiting their WAL marker.
+static LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Generation of the latest SYSTEM COMMIT issued to CM. CM publishes it before the commit
 /// marker that advances `LIVE_CONFIG_MANAGER_SYSTEM_GENERATION` is durable.
 static LIVE_CONFIG_MANAGER_SYSTEM_COMMIT_ENTERED_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -16050,23 +16052,26 @@ pub(crate) fn config_manager_note_system_commit_entered(next_generation: u64) {
 }
 
 fn config_manager_system_generation_view() -> nt_config_client::SystemGenerationView {
+    let durable = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     nt_config_client::SystemGenerationView::new(
-        LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire),
+        durable,
+        LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire),
         LIVE_CONFIG_MANAGER_SYSTEM_COMMIT_ENTERED_GENERATION.load(Ordering::Acquire),
     )
 }
 
 /// Whether a SYSTEM read that CM answered at `observed` belongs to the live mount history.
 fn config_manager_system_read_admitted(observed: u64) -> bool {
-    config_manager_system_read_generation(observed) == observed
+    config_manager_system_generation_view().admits_read(observed)
 }
 
 /// The generation to validate a SYSTEM read against; see `SystemGenerationView`.
 pub(crate) fn config_manager_system_read_generation(observed: u64) -> u64 {
     static READS_AHEAD_OF_DURABLE: AtomicU64 = AtomicU64::new(0);
     let durable = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    let admitted = config_manager_system_generation_view().read_generation(observed);
-    if admitted != durable {
+    let view = config_manager_system_generation_view();
+    let admitted = view.read_generation(observed);
+    if view.admits_read(observed) && observed != durable {
         let count = READS_AHEAD_OF_DURABLE.fetch_add(1, Ordering::Relaxed) + 1;
         if count <= 8 || count.is_power_of_two() {
             print_str(b"[cm-read-ahead] n/observed/durable=");
@@ -16090,6 +16095,7 @@ unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static
     CM_CHANNEL_REQUEST_PENDING.store(false, Ordering::Release);
     LIVE_CONFIG_MANAGER_SYSTEM_MOUNT = None;
     LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(0, Ordering::Release);
+    LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.store(0, Ordering::Release);
     LIVE_CONFIG_MANAGER_SYSTEM_COMMIT_ENTERED_GENERATION.store(0, Ordering::Release);
     CONFIG_CLIENT_PTR = client as *mut _;
 }
@@ -22965,6 +22971,7 @@ fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
         LIVE_CONFIG_MANAGER_SYSTEM_MOUNT = None;
     }
     LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(0, Ordering::Release);
+    LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.store(0, Ordering::Release);
     LIVE_CONFIG_MANAGER_SYSTEM_COMMIT_ENTERED_GENERATION.store(0, Ordering::Release);
     {
         let _transient = allocator::enter_transient();
@@ -22979,6 +22986,8 @@ fn mount_live_config_manager_config_hive() -> LiveConfigManagerMountReport {
                         Ok(state) => {
                             report.generation = state.generation();
                             LIVE_CONFIG_MANAGER_SYSTEM_MOUNT = Some(state.mount());
+                            LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION
+                                .store(state.generation(), Ordering::Release);
                             LIVE_CONFIG_MANAGER_SYSTEM_GENERATION
                                 .store(state.generation(), Ordering::Release);
                         }
