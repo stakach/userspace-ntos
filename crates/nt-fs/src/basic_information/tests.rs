@@ -55,6 +55,54 @@ fn zero_fields_leave_every_value_unchanged() {
 }
 
 #[test]
+fn set_information_reports_only_durable_volume_effects() {
+    let (mut fs, handle) = open(FILE, FILE_NON_DIRECTORY_FILE);
+    assert_eq!(fs.zw_write_file(handle, None, b"abcdef"), (STATUS_SUCCESS, 6));
+    let original = metadata(&fs, handle);
+
+    assert_eq!(
+        fs.zw_set_information_file_effect(handle, FILE_POSITION_INFORMATION, &2u64.to_le_bytes()),
+        (STATUS_SUCCESS, SetInformationEffect::NoVolumeChange),
+    );
+    assert_eq!(fs.current_offset(handle), Some(2));
+    assert_eq!(metadata(&fs, handle), original);
+
+    assert_eq!(
+        fs.zw_set_information_file_effect(handle, FILE_MODE_INFORMATION, &FILE_WRITE_THROUGH.to_le_bytes()),
+        (STATUS_SUCCESS, SetInformationEffect::NoVolumeChange),
+    );
+    assert_eq!(fs.query_file_object_information(handle).unwrap().mode, FILE_WRITE_THROUGH);
+    assert_eq!(metadata(&fs, handle), original);
+
+    for times in [[0; 4], [u64::MAX; 4]] {
+        assert_eq!(
+            fs.zw_set_information_file_effect(handle, FILE_BASIC_INFORMATION, &basic(times, 0)),
+            (STATUS_SUCCESS, SetInformationEffect::NoVolumeChange),
+        );
+        assert_eq!(metadata(&fs, handle), original);
+    }
+
+    let requested = basic([11, 12, 13, 14], FILE_ATTRIBUTE_HIDDEN);
+    let (status, effect) = fs.zw_set_information_file_effect(handle, FILE_BASIC_INFORMATION, &requested);
+    assert_eq!(status, STATUS_SUCCESS);
+    let changed = metadata(&fs, handle);
+    assert_eq!(effect, SetInformationEffect::FileBasic(changed));
+    assert_eq!(
+        (changed.creation_time, changed.last_access_time, changed.last_write_time,
+            changed.change_time, changed.attributes),
+        (11, 12, 13, 14, FILE_ATTRIBUTE_HIDDEN),
+    );
+    assert_eq!(changed.file_id, original.file_id);
+    assert_eq!(changed.end_of_file, original.end_of_file);
+
+    assert_eq!(
+        fs.zw_set_information_file_effect(handle, FILE_END_OF_FILE_INFORMATION, &3u64.to_le_bytes()),
+        (STATUS_SUCCESS, SetInformationEffect::SnapshotRequired),
+    );
+    assert_eq!(metadata(&fs, handle).end_of_file, 3);
+}
+
+#[test]
 fn minus_one_times_are_not_stored_as_timestamps() {
     let (mut fs, handle) = open(FILE, FILE_NON_DIRECTORY_FILE);
     let before = metadata(&fs, handle);

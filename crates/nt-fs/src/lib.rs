@@ -106,7 +106,8 @@ pub use fs::{
     FileObjectInformation, FileOpenPrivileges, FileRenameRoot, FileShareAccess, FileSystem,
     InstalledFileOpenAction, LayeredFileOpenDecision, MemFs, MemFsBlobCompactError,
     MemFsBlobCompaction, MemFsSnapshotError,
-    MemFsSnapshotInfo, MoveClusterInformation, SetFileNameInformation, StandardInformation,
+    MemFsSnapshotInfo, MoveClusterInformation, SetFileNameInformation, SetInformationEffect,
+    StandardInformation,
     INVALID_HANDLE, SnapshotJournal, SnapshotJournalDurability, SnapshotJournalError,
     SnapshotJournalOpenError, SnapshotJournalPhase, OwnedSnapshotJournal, OwnedSnapshotJournalOpenError,
 };
