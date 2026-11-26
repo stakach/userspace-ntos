@@ -12,6 +12,27 @@ type Reserve = SnapshotReserve<AhciSnapshotDevice, SectionMountId>;
 pub(crate) type Lease = SnapshotReserveLease<'static, AhciSnapshotDevice, SectionMountId>;
 static mut RESERVE: Option<Reserve> = None;
 static mut PHYSICAL_RANGE: Option<(SectionMountId, u64, u64)> = None;
+static SNAPSHOT_REFUSAL_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic presence only; neither observation grants the mounted lease or WAL proof.
+pub(super) unsafe fn published_owner_presence() -> (bool, bool) {
+    ((&*core::ptr::addr_of!(RESERVE)).is_some(),
+        (&*core::ptr::addr_of!(WAL_CONTINUATION)).is_some())
+}
+
+fn trace_refusal(stage: &'static [u8], lease_mount: Option<SectionMountId>,
+    current_mount: Option<SectionMountId>,
+) {
+    if SNAPSHOT_REFUSAL_TRACES.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        |used| (used < 16).then_some(used + 1)).is_err() {
+        return;
+    }
+    print_str(b"[snapshot-storage-refusal] stage="); print_str(stage);
+    print_str(b" lease-mount="); print_u64(lease_mount.map_or(0, SectionMountId::value));
+    print_str(b" current-mount="); print_u64(current_mount.map_or(0, SectionMountId::value));
+    print_str(b" status="); print_hex(nt_fs::STATUS_DEVICE_NOT_READY);
+    print_str(b"\n");
+}
 
 /// The exact reserve published with this mounted filesystem, including its WAL tail.
 /// A metadata reader may use this only to prove a SCSI write is disjoint from installed FAT.
@@ -79,11 +100,14 @@ pub(super) fn owned_wal_region(
 }
 
 pub(super) unsafe fn acquire() -> Result<Lease, u32> {
-    let reserve = (&*core::ptr::addr_of!(RESERVE))
-        .as_ref()
-        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let Some(reserve) = (&*core::ptr::addr_of!(RESERVE)).as_ref() else {
+        trace_refusal(b"reserve-absent", None, crate::fs_loader::exec_fs_mount_identity());
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    };
     let lease = reserve.try_acquire().ok_or(BUSY)?;
-    if Some(*lease.identity()) != crate::fs_loader::exec_fs_mount_identity() {
+    let current_mount = crate::fs_loader::exec_fs_mount_identity();
+    if Some(*lease.identity()) != current_mount {
+        trace_refusal(b"reserve-mount", Some(*lease.identity()), current_mount);
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }
     Ok(lease)
@@ -91,7 +115,9 @@ pub(super) unsafe fn acquire() -> Result<Lease, u32> {
 
 fn checked_mount(lease: &Lease) -> Result<SectionMountId, u32> {
     let mount = *lease.identity();
-    if Some(mount) != unsafe { crate::fs_loader::exec_fs_mount_identity() } {
+    let current_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() };
+    if Some(mount) != current_mount {
+        trace_refusal(b"checked-mount", Some(mount), current_mount);
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }
     Ok(mount)
@@ -101,8 +127,10 @@ fn checked_mount(lease: &Lease) -> Result<SectionMountId, u32> {
 /// The native executor still validates the resulting absolute request against its disk route.
 pub(super) fn physical_lba(lease: &Lease, relative_lba: u64) -> Result<u64, u32> {
     let mount = checked_mount(lease)?;
-    let (range_mount, start, sectors) = unsafe { *core::ptr::addr_of!(PHYSICAL_RANGE) }
-        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let Some((range_mount, start, sectors)) = (unsafe { *core::ptr::addr_of!(PHYSICAL_RANGE) }) else {
+        trace_refusal(b"physical-range-absent", Some(mount), Some(mount));
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    };
     if mount != range_mount || relative_lba >= sectors || relative_lba >= lease.sector_count() {
         return Err(nt_fs::STATUS_INVALID_PARAMETER);
     }
@@ -183,8 +211,10 @@ pub(super) fn peek_wal_continuation(
 /// checkpoint, and fold owner; no provider I/O is needed to prove a completed durability fence.
 pub(super) fn check_cached_wal_fence(lease: &Lease) -> Result<(), u32> {
     let mount = checked_mount(lease)?;
-    let cached = unsafe { &*core::ptr::addr_of!(WAL_CONTINUATION) }
-        .as_ref().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let Some(cached) = (unsafe { &*core::ptr::addr_of!(WAL_CONTINUATION) }).as_ref() else {
+        trace_refusal(b"cached-continuation-absent", Some(mount), Some(mount));
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    };
     let anchor = cached.token.anchor();
     if cached.mount != mount
         || !cached.pair.matches_cached_fence(lease.store(), anchor)

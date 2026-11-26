@@ -33,7 +33,7 @@ fn second_pass_reuses_the_first_acknowledged_proof_and_stalls_retain_owners() {
         && NATIVE.contains("_image: image, _pair: pair"),
         "both returned second-pass values must remain owned under the exact lease");
     assert!(NATIVE.contains("enum StalledState")
-        && NATIVE.contains("Active(Active)")
-        && NATIVE.contains("StalledState::Active(active)"),
-        "an uncertain active cursor, exact lease, and proof must remain owned in a stalled fold");
+        && NATIVE.contains("Active(Active, FailureReceipt)")
+        && NATIVE.contains("StalledState::Active(active, receipt)"),
+        "an uncertain active cursor, exact lease, proof, and first failure receipt must remain owned in a stalled fold");
 }
