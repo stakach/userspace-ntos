@@ -42,6 +42,35 @@ impl FileSystem {
             .map(|entry| (entry.id, entry.node_id));
         let target = self.volume.child_long_entry(target_parent, target_leaf)
             .map(|entry| (entry.id, entry.node_id));
+        let same_entry = source.is_some_and(|(entry, _)| {
+            target.is_some_and(|(target_entry, _)| target_entry == entry)
+        });
+        if same_entry {
+            // A case-only rename keeps one directory entry. Case-folded lookup sees that same
+            // entry through both names before and after the move; the stored long name decides
+            // whether the selected snapshot needs the mutation or already contains it.
+            if source_parent != target_parent || source_leaf == target_leaf
+                || payload.replaced_file_id != 0
+            {
+                return Err(ForeignIdentity);
+            }
+            let source_node = source.ok_or(MissingFile)?.1;
+            if self.volume.node(source_node).is_none_or(|node| node.file_id != payload.source_file_id) {
+                return Err(ForeignIdentity);
+            }
+            if self.wal_protected_subtree(source_node) {
+                return Err(ProtectedTarget);
+            }
+            let stored_name = self.volume.child_long_entry(source_parent, source_leaf)
+                .ok_or(MissingFile)?.created_name.as_str();
+            if stored_name == target_leaf {
+                cursor.advance(payload.sequence);
+                return Ok(());
+            }
+            if stored_name != source_leaf {
+                return Err(ForeignIdentity);
+            }
+        }
         // A later snapshot may contain both the moved file and a new file at its old name.
         // The moved identity at its exact long name proves this operation is already represented;
         // leave later snapshot metadata intact, including timestamps a later basic-info update
@@ -68,6 +97,7 @@ impl FileSystem {
             return Err(ProtectedTarget);
         }
         let replaced_node = match target {
+            Some((entry, _)) if same_entry && entry == source_entry => None,
             Some((_, node)) => {
                 let body = self.volume.node(node).ok_or(MissingFile)?;
                 if body.file_id != payload.replaced_file_id {

@@ -378,6 +378,124 @@ fn installer_backup_rename_requires_a_committed_namespace_record() {
     }
 }
 
+/// A case-only move changes the long name of the same directory entry. The destination is not a
+/// replaced file, and a later selected snapshot may already contain the new spelling.
+#[test]
+fn case_only_rename_replays_from_each_snapshot_without_replacing_its_entry() {
+    const SOURCE: &str = r"\??\C:\Users\Default\NTUSER.DAT";
+    const TARGET: &str = r"\??\C:\Users\Default\ntuser.dat";
+    const PARENT: &str = r"\??\C:\Users\Default";
+    const SIBLING: &str = r"\??\C:\Users\Default\next.dat";
+    const OLD_OPENED_NAME: &str = r"\Users\Default\NTUSER.DAT";
+    const NEW_OPENED_NAME: &str = r"\Users\Default\ntuser.dat";
+
+    let mut live = FileSystem::new(MemFs::new());
+    assert!(live.provision_file(SOURCE, b"profile hive"));
+    let source_id = live.existing_file_id(SOURCE).unwrap();
+    let parent_id = live.query_metadata(PARENT).unwrap().file_id;
+    let before = live.export_volume_snapshot().unwrap();
+    let opened = live.zw_create_file(
+        SOURCE, crate::DELETE | crate::SYNCHRONIZE, 0,
+        crate::FILE_SHARE_READ | crate::FILE_SHARE_WRITE | crate::FILE_SHARE_DELETE,
+        crate::FILE_OPEN, crate::FILE_OPEN_FOR_BACKUP_INTENT,
+    );
+    assert_eq!(opened.status, crate::STATUS_SUCCESS);
+    assert_eq!(live.zw_query_opened_name(opened.handle).as_deref(), Some(OLD_OPENED_NAME));
+    live.set_current_time_100ns(200);
+    let target_name: Vec<u8> = NEW_OPENED_NAME.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert_eq!(live.zw_rename_file(
+        opened.handle, crate::FileRenameRoot::VolumeRoot, &target_name, false,
+    ), crate::STATUS_SUCCESS);
+    assert_eq!(live.zw_query_opened_name(opened.handle).as_deref(), Some(NEW_OPENED_NAME));
+    let moved_short_name = live.zw_query_short_name(opened.handle).unwrap();
+    let moved = live.query_metadata(TARGET).unwrap();
+    assert_eq!(moved.file_id, source_id);
+    // A selected snapshot can carry later basic-info values even when the physical WAL still
+    // contains this rename. Replaying it must not restore the older recorded change time.
+    let mut later_basic = [0u8; 40];
+    for (index, time) in [71u64, 72, 73, 74].into_iter().enumerate() {
+        later_basic[index * 8..index * 8 + 8].copy_from_slice(&time.to_le_bytes());
+    }
+    assert_eq!(live.zw_set_information_file(
+        opened.handle, crate::FILE_BASIC_INFORMATION, &later_basic,
+    ), crate::STATUS_SUCCESS);
+    let later = live.query_metadata(TARGET).unwrap();
+    assert_eq!((later.creation_time, later.last_access_time,
+        later.last_write_time, later.change_time), (71, 72, 73, 74));
+    assert_ne!(later, moved);
+    assert_eq!(live.zw_close(opened.handle), crate::STATUS_SUCCESS);
+    let after = live.export_volume_snapshot().unwrap();
+
+    let payload = FileRenameWalPayload {
+        sequence: 1,
+        source_file_id: source_id,
+        source_parent_file_id: parent_id,
+        target_parent_file_id: parent_id,
+        replaced_file_id: 0,
+        source_path: SOURCE,
+        target_path: TARGET,
+        moved_short_name,
+        change_time: moved.change_time,
+    };
+    let encoded = encode_file_rename_wal_payload(payload).unwrap();
+    let mut uncommitted = RegistryWal::recover(CachedDisk::with_sectors(64), INCARNATION).unwrap();
+    uncommitted.begin(encoded.clone()).unwrap();
+    uncommitted.prepare().unwrap();
+    assert!(recover_after_power_cut(uncommitted.into_device_for_test()).records().is_empty());
+    let mut unreplayed = FileSystem::from_volume_snapshot(&before).unwrap();
+    let original = unreplayed.zw_create_file(
+        SOURCE, crate::FILE_READ_DATA, 0, crate::FILE_SHARE_READ,
+        crate::FILE_OPEN, crate::FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(original.status, crate::STATUS_SUCCESS);
+    assert_eq!(unreplayed.zw_query_opened_name(original.handle).as_deref(), Some(OLD_OPENED_NAME));
+    assert_eq!(unreplayed.zw_close(original.handle), crate::STATUS_SUCCESS);
+
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(64), INCARNATION).unwrap();
+    append(&mut wal, &encoded);
+    let wal = recover_after_power_cut(wal.into_device().unwrap());
+    assert_eq!(wal.records().len(), 1);
+    assert_eq!(decode_volume_wal_payload(&wal.records()[0].payload),
+        Ok(VolumeWalPayload::FileRename(payload)));
+    assert!(live.provision_file(SIBLING, b""));
+    let next_id = live.existing_file_id(SIBLING);
+
+    for (snapshot, expected_metadata) in [(&before, moved), (&after, later)] {
+        let mut restored = FileSystem::from_volume_snapshot(snapshot).unwrap();
+        let mut cursor = FileDeltaReplayCursor::new();
+        assert_eq!(restored.replay_file_rename_wal_payload(
+            &mut cursor, FileRenameWalPayload { replaced_file_id: source_id, ..payload },
+        ), Err(FileDeltaWalReplayError::ForeignIdentity));
+        assert_eq!(cursor.last_applied(), None);
+        if core::ptr::eq(snapshot, &before) {
+            // Case-folded lookup reaches this entry, but the producer's old long-name spelling
+            // must match the snapshot before replay mutates it.
+            assert_eq!(restored.replay_file_rename_wal_payload(
+                &mut cursor,
+                FileRenameWalPayload {
+                    source_path: r"\??\C:\Users\Default\NtUser.dat",
+                    ..payload
+                },
+            ), Err(FileDeltaWalReplayError::ForeignIdentity));
+            assert_eq!(cursor.last_applied(), None);
+            assert_eq!(restored.export_volume_snapshot().unwrap(), *snapshot);
+        }
+        assert_eq!(restored.replay_file_rename_wal_payload(&mut cursor, payload), Ok(()));
+        assert_eq!(cursor.last_applied(), Some(1));
+        assert_eq!(restored.query_metadata(TARGET), Some(expected_metadata));
+        assert_eq!(restored.file_bytes_owned(TARGET), Some(b"profile hive".to_vec()));
+        let reopened = restored.zw_create_file(
+            TARGET, crate::FILE_READ_DATA, 0, crate::FILE_SHARE_READ,
+            crate::FILE_OPEN, crate::FILE_NON_DIRECTORY_FILE,
+        );
+        assert_eq!(reopened.status, crate::STATUS_SUCCESS);
+        assert_eq!(restored.zw_query_opened_name(reopened.handle).as_deref(), Some(NEW_OPENED_NAME));
+        assert_eq!(restored.zw_close(reopened.handle), crate::STATUS_SUCCESS);
+        assert!(restored.provision_file(SIBLING, b""));
+        assert_eq!(restored.existing_file_id(SIBLING), next_id);
+    }
+}
+
 #[test]
 fn two_renames_replay_only_the_suffix_after_the_selected_snapshot_base() {
     const PARENT: &str = r"\??\C:\Users\Default";
