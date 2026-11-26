@@ -911,3 +911,6 @@ fn folded_snapshot_pair_preserves_same_epoch_continuation_for_next_append() {
     wal.commit().unwrap();
     assert_eq!(wal.settled_anchor().unwrap().serial, 2);
 }
+
+#[path = "floor_recovery_tests.rs"]
+mod floor_recovery_tests;

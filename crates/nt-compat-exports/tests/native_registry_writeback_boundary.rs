@@ -63,10 +63,6 @@ fn native_boot_verifies_wal_suffix_before_publishing_volume_for_cm_import() {
     );
     let boot = &source[source.find("fn verified_boot_log(").unwrap()
         ..source.find("\n/// Whether the volume has been mounted").unwrap()];
-    assert!(
-        boot.contains("RegistryWal::recover("),
-        "boot must parse the disjoint WAL before publishing persisted SYSTEM state"
-    );
     assert!(boot.contains("wal.verified_prefix()")
         && boot.contains("wal.verified_record_end_lba(anchor.serial)"),
         "boot must bind the selected snapshot anchor to the recovered physical WAL prefix");

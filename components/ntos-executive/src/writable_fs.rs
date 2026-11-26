@@ -1661,7 +1661,9 @@ fn verified_boot_log(
     let store = lease.store();
     let range = snapshot_storage::owned_wal_region(lease)
         .map_err(|(status, _lease)| BootSystemRestoreError::Snapshot(status))?;
-    let mut wal = nt_fs::RegistryWal::recover(range, anchor.incarnation)
+    // The streamed v2 snapshot was read under this lease and supplies the exact
+    // minimum durable WAL prefix. Verify it before clearing any later torn tail.
+    let mut wal = unsafe { nt_fs::RegistryWal::recover_with_floor(range, anchor) }
         .map_err(BootSystemRestoreError::Wal)?;
     if wal.state() == nt_fs::RegistryWalState::RecoveredUncommitted {
         if let Err(error) = wal.clear_recovered_tail() {
