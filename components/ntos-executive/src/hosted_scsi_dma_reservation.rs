@@ -28,35 +28,6 @@ pub(super) struct HostedScsiDmaReservation {
 
 static mut RESERVATIONS: Vec<HostedScsiDmaReservation> = Vec::new();
 
-/// Count only the exact in-flight proof's DMA gates. These values do not grant authority.
-fn trace_scsi_dma_proof(
-    stage: &[u8], request: &IrpDispatchRequest, parent: u64,
-    counts: &[u64; 9], grant_mismatch: u64, detail: u64,
-) {
-    let Some(active) = (unsafe { pending_scsi_proof_slot() }) else { return; };
-    if active.irp_id.map(IrpId::raw) != Some(request.irp_id)
-        || active.authority.child_pdo != request.device_id
-    { return; }
-    static TRACED: AtomicU64 = AtomicU64::new(0);
-    if TRACED.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-        |used| (used < 16).then_some(used + 1)).is_err()
-    { return; }
-    print_str(b"[native-disk-proof-dma] stage="); print_str(stage);
-    print_str(b" irp/pdo/parent/provider/generation/detail/mask=");
-    print_u64(request.irp_id); print_str(b"/");
-    print_u64(request.device_id); print_str(b"/");
-    print_u64(parent); print_str(b"/");
-    print_u64(request.target_domain_id); print_str(b"/");
-    print_u64(request.scsi_relation_generation); print_str(b"/");
-    print_u64(detail); print_str(b"/"); print_u64(grant_mismatch);
-    print_str(b" counts=parent/provider/state/registration/geometry/window/grant/candidate/live=");
-    for (index, count) in counts.iter().enumerate() {
-        if index != 0 { print_str(b"/"); }
-        print_u64(*count);
-    }
-    print_str(b"\n");
-}
-
 fn reservations() -> &'static mut Vec<HostedScsiDmaReservation> {
     unsafe { &mut *core::ptr::addr_of_mut!(RESERVATIONS) }
 }
@@ -153,28 +124,17 @@ unsafe fn controller_for_scsi_child(
     };
     hosted_device_pointer_registration(
         provider, provider_pdo, nt_io_manager::DeviceId(request.device_id),
-    ).map_err(|status| {
-        trace_scsi_dma_proof(b"child-registration", request, 0, &[0; 9], 0,
-            status.raw() as u32 as u64);
-        status
-    })?;
+    )?;
     let relation = if let Some(pending) = pending_scsi_proof_relation(request, provider_pdo) {
         pending
     } else {
         let accepted = hosted_pnp_manager_mut()
             .parent_relation_for_pdo(request.device_id)
-            .ok_or_else(|| {
-                trace_scsi_dma_proof(b"relation-missing", request, 0, &[0; 9], 0, 0);
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST
-            })?;
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         if accepted.relation().generation() != request.scsi_relation_generation
             || !hosted_bus_relations().relation_contains(accepted.relation(), request.device_id)
             || !hosted_pnp_manager_mut().relation_parent_is_started(accepted)
-        {
-            trace_scsi_dma_proof(b"relation-stale", request,
-                accepted.parent().pdo_object_id(), &[0; 9], 0, 0);
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        }
+        { return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST); }
         accepted
     };
     let parent = relation.parent();
@@ -187,21 +147,15 @@ unsafe fn controller_for_scsi_child(
         provider_cookie: request.target_domain_cookie,
     };
     let mut candidates: Vec<ScsiControllerCandidate> = Vec::new();
-    let mut counts = [0u64; 9];
-    let mut grant_mismatch = 0u64;
     for binding in hosted_device_bindings().into_iter().flatten().copied() {
         if !binding.used || binding.pdo_device_id != parent.pdo_object_id()
-        { continue; }
-        counts[0] += 1;
-        if binding.projection_domain != provider
+            || binding.projection_domain != provider
             || hosted_dma_pdo_generation(binding.pdo_device_id)
                 .is_none_or(|generation| !hosted_dma_pdo_generation_is_live(binding.pdo_device_id, generation))
         { continue; }
-        counts[1] += 1;
         let Some(state) = hosted_device_resource_state_by_device_id(binding.device_id) else {
             continue;
         };
-        counts[2] += 1;
         if state.instance != binding.instance
             || state.projection_domain != binding.projection_domain
             || state.pdo_object != binding.pdo_object
@@ -210,7 +164,6 @@ unsafe fn controller_for_scsi_child(
                 nt_io_manager::DeviceId(binding.pdo_device_id),
             ).is_err()
         { continue; }
-        counts[3] += 1;
         let Some(context_lease) = state.pnp_context_lease else { continue; };
         if state.interface_type != HOSTED_INTERFACE_TYPE_PCIBUS
             || state.bus_number > u8::MAX as u32
@@ -218,28 +171,20 @@ unsafe fn controller_for_scsi_child(
             || state.dma_frame_base == 0 || state.dma_pages == 0
             || state.dma_broker_va == 0
         { continue; }
-        counts[4] += 1;
         let Ok((_, window)) = crate::hosted_pnp_context::hosted_pnp_pci_window_by_lease(
             context_lease,
             state.bus_number as u8,
             (state.address >> 16) as u8,
             state.address as u8,
         ) else { continue; };
-        counts[5] += 1;
-        // Bits: invalid grant, frame base, page count, broker VA, provider VA,
-        // grant length, logical address. OR across exact-parent candidates.
-        let mismatch = u64::from(!window.dma_grant_valid())
-            | ((state.dma_frame_base != window.dma_frame_base) as u64) << 1
-            | ((state.dma_pages != window.dma_pages) as u64) << 2
-            | ((state.dma_broker_va != window.dma_seed_va) as u64) << 3
-            | ((state.evidence.dma_common_va != window.dma_va) as u64) << 4
-            | ((state.evidence.dma_common_len != window.dma_len) as u64) << 5
-            | ((state.evidence.dma_common_logical != window.dma_logical) as u64) << 6;
-        if mismatch != 0 {
-            grant_mismatch |= mismatch;
-            continue;
-        }
-        counts[6] += 1;
+        if !window.dma_grant_valid()
+            || state.dma_frame_base != window.dma_frame_base
+            || state.dma_pages != window.dma_pages
+            || state.dma_broker_va != window.dma_seed_va
+            || state.evidence.dma_common_va != window.dma_va
+            || state.evidence.dma_common_len != window.dma_len
+            || state.evidence.dma_common_logical != window.dma_logical
+        { continue; }
         let grant = (window.dma_va, window.dma_len, window.dma_logical);
         let owner = hosted_dma_owner(binding);
         let lease_live = hosted_dma_adapter_leases_mut().iter().any(|lease| {
@@ -270,23 +215,13 @@ unsafe fn controller_for_scsi_child(
         };
         candidates.try_reserve(1).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         candidates.push(candidate);
-        counts[7] += 1;
-        counts[8] += u64::from(lease_live);
     }
     let selected = select_scsi_coherent_controller(authority, &candidates)
-        .ok_or_else(|| {
-            trace_scsi_dma_proof(b"select-controller", request, parent.pdo_object_id(),
-                &counts, grant_mismatch, 0);
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST
-        })?;
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let binding = hosted_device_binding_by_device_id(selected.controller_device_id)
         .filter(|binding| binding.pdo_device_id == selected.parent_pdo
             && binding.projection_domain == provider)
-        .ok_or_else(|| {
-            trace_scsi_dma_proof(b"selected-binding", request, parent.pdo_object_id(),
-                &counts, grant_mismatch, selected.controller_device_id);
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST
-        })?;
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     Ok((binding, selected))
 }
 
@@ -310,11 +245,7 @@ pub(super) unsafe fn reserve_scsi_dma_data(
     hosted_dma_manager_mut().register_coherent_window(
         owner, window, controller.grant_logical,
         controller.grant_length, controller.broker_va,
-    ).map_err(|error| {
-        trace_scsi_dma_proof(b"register-window", request, controller.parent_pdo,
-            &[0; 9], 0, error as u64);
-        hosted_dma_status(error)
-    })?;
+    ).map_err(hosted_dma_status)?;
     let mut offset = 0u64;
     loop {
         let aligned = align_up(offset, HOSTED_DMA_COMMON_ALIGNMENT)
@@ -348,11 +279,7 @@ pub(super) unsafe fn reserve_scsi_dma_data(
                 offset = aligned.checked_add(HOSTED_DMA_COMMON_ALIGNMENT)
                     .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
             }
-            Err(error) => {
-                trace_scsi_dma_proof(b"reserve-slice", request, controller.parent_pdo,
-                    &[0; 9], 0, error as u64);
-                return Err(hosted_dma_status(error));
-            }
+            Err(error) => return Err(hosted_dma_status(error)),
         }
     }
 }
