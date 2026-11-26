@@ -56,6 +56,7 @@ mod snapshot_publication;
 mod snapshot_reserve;
 mod snapshot_region;
 mod registry_wal_store;
+mod system_wal_batch_payload;
 mod hive_wal_publication;
 mod volume_wal_payload;
 mod file_delta_wal_payload;
@@ -148,6 +149,9 @@ pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
 pub use snapshot_publication::SnapshotPublicationState;
 pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};
 pub use registry_wal_store::{AsyncWalIoKind, AsyncWalIoRequest, AsyncWalRefusal, RegistryWal, RegistryWalContinuation, RegistryWalError, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
+pub use system_wal_batch_payload::{
+    SealedSystemWalBatch, SystemWalBatchError, SystemWalBatchPayload, SystemWalBatchReservation,
+};
 pub use hive_wal_publication::{
     publish_anchored_hive_child, publish_anchored_hive_delete_key,
     publish_anchored_hive_delete_value, publish_anchored_hive_security,
@@ -175,3 +179,5 @@ pub use volume::*;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod system_wal_batch_payload_tests;
