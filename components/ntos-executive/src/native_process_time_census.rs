@@ -173,6 +173,8 @@ fn observed_logon_child_pi(handler: &ExecNtHandler, rows: &[Row; MAX_PI]) -> Opt
                 pid: child.pid, generation: child_generation },
             live_application: target.role == nt_exe_image::HostedProcessRole::Application
                 && handler.is_live_execution_process(target, child),
+            direct_parent: handler.pm.process(child.pid)
+                .is_some_and(|process| process.parent == Some(logon.pid)),
         });
     });
     select_unique_waited_application(logon, waits).map(|child| child.process_index)

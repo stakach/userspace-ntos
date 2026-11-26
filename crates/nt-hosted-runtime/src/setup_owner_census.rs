@@ -29,17 +29,19 @@ pub struct SetupWaitedApplication {
     pub caller: SetupOwnerIdentity,
     pub child: SetupOwnerIdentity,
     pub live_application: bool,
+    /// Process Manager creation parent equals the exact live logon process's nonreused PID.
+    pub direct_parent: bool,
 }
 
-/// Select the one live application whose process object the interactive logon owner waits on.
-/// Repeated waits for the same child are harmless; distinct children make attribution ambiguous.
+/// Select the one live direct child whose process object the interactive logon owner waits on.
+/// Repeated waits for the same child are harmless; distinct direct children are ambiguous.
 pub fn select_unique_waited_application(
     logon: SetupOwnerIdentity,
     waits: impl IntoIterator<Item = SetupWaitedApplication>,
 ) -> Option<SetupOwnerIdentity> {
     let mut selected = None;
     for wait in waits {
-        if wait.caller != logon || !wait.live_application {
+        if wait.caller != logon || !wait.live_application || !wait.direct_parent {
             continue;
         }
         if selected.is_some_and(|child| child != wait.child) {
@@ -228,11 +230,13 @@ mod tests {
                 caller: logon,
                 child: setup,
                 live_application: true,
+                direct_parent: true,
             },
             SetupWaitedApplication {
                 caller: other,
                 child: other,
                 live_application: true,
+                direct_parent: true,
             },
         ];
         assert_eq!(select_unique_waited_application(logon, waits), Some(setup));
@@ -243,12 +247,14 @@ mod tests {
                     SetupWaitedApplication {
                         caller: logon,
                         child: setup,
-                        live_application: true
+                        live_application: true,
+                        direct_parent: true,
                     },
                     SetupWaitedApplication {
                         caller: logon,
                         child: setup,
-                        live_application: true
+                        live_application: true,
+                        direct_parent: true,
                     },
                 ]
             ),
@@ -261,12 +267,14 @@ mod tests {
                     SetupWaitedApplication {
                         caller: other,
                         child: setup,
-                        live_application: true
+                        live_application: true,
+                        direct_parent: true,
                     },
                     SetupWaitedApplication {
                         caller: logon,
                         child: setup,
-                        live_application: false
+                        live_application: false,
+                        direct_parent: true,
                     },
                 ]
             ),
@@ -283,16 +291,67 @@ mod tests {
                     SetupWaitedApplication {
                         caller: logon,
                         child: setup,
-                        live_application: true
+                        live_application: true,
+                        direct_parent: true,
                     },
                     SetupWaitedApplication {
                         caller: logon,
                         child: reused,
-                        live_application: true
+                        live_application: true,
+                        direct_parent: true,
                     },
                 ]
             ),
             None
+        );
+    }
+
+    #[test]
+    fn direct_logon_child_wins_over_an_unrelated_waited_application() {
+        let logon = SetupOwnerIdentity {
+            process_index: 8,
+            pid: 104,
+            generation: 3,
+        };
+        let service_child = SetupOwnerIdentity {
+            process_index: 13,
+            pid: 224,
+            generation: 8,
+        };
+        let setup = SetupOwnerIdentity {
+            process_index: 14,
+            pid: 236,
+            generation: 9,
+        };
+        // In the live trace, Winlogon waits on both process objects. The first is
+        // another process's child; only setup is Winlogon's direct child.
+        let waits = [
+            SetupWaitedApplication {
+                caller: logon,
+                child: service_child,
+                live_application: true,
+                direct_parent: false,
+            },
+            SetupWaitedApplication {
+                caller: logon,
+                child: setup,
+                live_application: true,
+                direct_parent: true,
+            },
+        ];
+        assert_eq!(select_unique_waited_application(logon, waits), Some(setup));
+        assert_eq!(
+            select_unique_waited_application(
+                logon,
+                [
+                    SetupWaitedApplication {
+                        direct_parent: true,
+                        ..waits[0]
+                    },
+                    waits[1]
+                ],
+            ),
+            None,
         );
     }
 
