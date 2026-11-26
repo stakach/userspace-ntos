@@ -107,6 +107,8 @@ struct HostedRelationPublication {
     abort_receipt: Option<SystemHiveMutationAbortReceipt>,
     abort_acknowledgement: Option<SystemHiveMutationAbortAcknowledgement>,
     phase: HostedRelationPublicationPhase,
+    /// Exact shared CM COMMIT observation retained through uncertain relation publication.
+    commit_observation_id: u64,
     commit_entered: bool,
     preparation_refused: bool,
     refusal: nt_status::NtStatus,
@@ -614,7 +616,19 @@ unsafe fn advance_hosted_relation_publication(
             }
             Phase::Commit => {
                 if !owner.commit_entered {
+                    if crate::registry_mutation_work::arm_system_commit(
+                        owner.commit_observation_id,
+                        owner.prepared.as_ref().expect("retained relation COMMIT"),
+                    ).is_err() {
+                        return owner.pending();
+                    }
                     if owner.persistence.begin_publication().is_err() {
+                        return owner.pending();
+                    }
+                    if crate::registry_mutation_work::enter_system_commit(
+                        owner.commit_observation_id,
+                        owner.prepared.as_ref().expect("retained relation COMMIT"),
+                    ).is_err() {
                         return owner.pending();
                     }
                     owner.commit_entered = true;
@@ -629,15 +643,19 @@ unsafe fn advance_hosted_relation_publication(
                 owner.phase = Phase::DurableCommit;
             }
             Phase::DurableCommit => {
+                if crate::registry_mutation_work::publish_system_commit(
+                    owner.commit_observation_id,
+                    owner.prepared.as_ref().expect("retained relation COMMIT"),
+                    owner.receipt.expect("retained relation COMMIT receipt"),
+                ).is_err() {
+                    return owner.pending();
+                }
                 if owner.persistence.commit_durable(
                     owner.receipt.expect("retained relation COMMIT receipt"),
                 ).is_err() {
                     return owner.pending();
                 }
                 let outcome = owner.receipt.expect("retained relation COMMIT receipt").outcome();
-                crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(
-                    outcome.generation, Ordering::AcqRel,
-                );
                 if outcome.has_pending_device_action
                     && !crate::CONFIG_DEVICE_ACTION_PENDING.swap(true, Ordering::AcqRel)
                 {
@@ -883,6 +901,13 @@ unsafe fn advance_hosted_relation_publication(
                 ).is_err() {
                     return owner.pending();
                 }
+                if crate::registry_mutation_work::abort_system_commit(
+                    owner.commit_observation_id,
+                    owner.prepared.as_ref().expect("retained relation ABORT preparation"),
+                    owner.abort_acknowledgement.expect("retained relation ABORT acknowledgement"),
+                ).is_err() {
+                    return owner.pending();
+                }
                 owner.phase = Phase::AbortProvider;
             }
             Phase::AbortProvider => {
@@ -909,8 +934,14 @@ unsafe fn advance_hosted_relation_publication(
                 }
                 owner.phase = Phase::Refused;
             }
-            Phase::Published => return HostedRelationPublicationProgress::Published,
-            Phase::Refused => return HostedRelationPublicationProgress::Refused(owner.refusal),
+            Phase::Published => {
+                crate::registry_mutation_work::retire_system_commit(owner.commit_observation_id);
+                return HostedRelationPublicationProgress::Published;
+            }
+            Phase::Refused => {
+                crate::registry_mutation_work::retire_system_commit(owner.commit_observation_id);
+                return HostedRelationPublicationProgress::Refused(owner.refusal);
+            }
         }
     }
     owner.pending()

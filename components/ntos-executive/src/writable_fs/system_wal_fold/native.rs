@@ -263,6 +263,9 @@ unsafe fn retry_pending_admission() -> Result<bool, u32> {
     if crate::monotonic_time_100ns() < *retry_after_100ns {
         return Err(snapshot_storage::BUSY);
     }
+    // A retained SYSTEM batch owns this same physical reserve. Seal it before retrying
+    // the fold so its marker and anchors can settle through the native claim pump.
+    super::super::system_wal_batch_native::request_drain_if_active()?;
     let Some(Work::AdmissionPending { prepared, manifest, mount, .. }) = slot.take()
         else { unreachable!() };
     let lease = match snapshot_storage::acquire() {
@@ -371,6 +374,8 @@ pub(super) unsafe fn fold_system_wal_native() -> Result<bool, u32> {
         advance_recheck()?;
         return Err(snapshot_storage::BUSY);
     }
+    // Preserve the fold demand while a live SYSTEM batch drains its exact WAL prefix.
+    super::super::system_wal_batch_native::request_drain_if_active()?;
     let lease = snapshot_storage::acquire()?;
     let manifest = snapshot_storage::cached_wal_manifest(&lease).map_err(|status| {
         block(report_fold_failure(b"cached-manifest-native", status))

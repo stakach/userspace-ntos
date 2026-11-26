@@ -121,15 +121,24 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     /// A permanent local refusal is cancellable only before the first PREPARE write. Later
     /// steps retain the exact device because earlier physical effects may be durable.
     pub fn refuse_unentered_async(&mut self, request: AsyncWalIoRequest) -> Result<AsyncWalRefusal, RegistryWalError> {
+        self.refuse_unentered_async_owned(request).map(|(refusal, _payload)| refusal)
+    }
+
+    /// A post-publication owner must retain the exact frame bytes on first-step refusal.
+    /// No bytes may be reclaimed from a later, potentially durable physical effect.
+    pub fn refuse_unentered_async_owned(
+        &mut self,
+        request: AsyncWalIoRequest,
+    ) -> Result<(AsyncWalRefusal, Option<Vec<u8>>), RegistryWalError> {
         let Some(effect) = self.async_effect.as_ref() else { return Err(RegistryWalError::InvalidState); };
         if effect.pending != Some(request) || effect.entered { return Err(RegistryWalError::InvalidState); }
         if effect.operation == Operation::Prepare && effect.step == 0 {
             self.async_effect = None;
-            self.cancel_pending()?;
-            Ok(AsyncWalRefusal::NoEffect)
+            let payload = self.cancel_pending_owned()?;
+            Ok((AsyncWalRefusal::NoEffect, Some(payload)))
         } else {
             self.state = RegistryWalState::Uncertain;
-            Ok(AsyncWalRefusal::RetainedEffects)
+            Ok((AsyncWalRefusal::RetainedEffects, None))
         }
     }
 

@@ -299,6 +299,19 @@ class ContinuationTests(unittest.TestCase):
             disk.verify_migration_manifest(self.manifest, 101, 2, self.current, self.run)
         self.assertEqual(self.paths["DISK"].read_bytes(), self.baseline)
 
+    def test_migration_accepts_ancestor_from_another_branch_with_exact_source_ref(self):
+        prior = "1" * 40
+        self.run["head_sha"] = prior
+        self.run["head_branch"] = "main"
+        self.manifest["source_head_sha"] = prior
+        self.manifest["source_ref"] = "refs/heads/main"
+        with patch.object(disk, "source_is_ancestor", return_value=True):
+            disk.verify_migration_run(self.run, 101, 2, self.current)
+            disk.verify_migration_manifest(self.manifest, 101, 2, self.current, self.run)
+            changed = {**self.manifest, "source_ref": self.current["ref"]}
+            with self.assertRaisesRegex(disk.ContinuationError, "source_ref"):
+                disk.verify_migration_manifest(changed, 101, 2, self.current, self.run)
+
     def test_migration_accepts_an_ancestor_kernel_submodule_only(self):
         self.run["head_sha"] = "9" * 40
         self.manifest["source_head_sha"] = "9" * 40

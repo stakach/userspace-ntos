@@ -197,6 +197,9 @@ pub(super) unsafe fn checkpoint_dirty_native() -> Result<bool, u32> {
         advance_recheck()?;
         return Err(snapshot_storage::BUSY);
     }
+    // Do not let a clean observation or a new snapshot bypass a published SYSTEM
+    // batch. The native claim pump completes its marker and paired anchors first.
+    super::system_wal_batch_native::request_drain_if_active()?;
     // Clean observations still acquire the exact reserve as a durability exclusion barrier.
     if !SNAPSHOT_PUBLICATION.is_dirty() {
         let lease = snapshot_storage::acquire()?;

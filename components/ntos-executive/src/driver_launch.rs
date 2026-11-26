@@ -48931,6 +48931,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             receipt: None, acknowledgement: None,
             abort_receipt: None, abort_acknowledgement: None,
             phase: HostedRelationPublicationPhase::AcquireBusLease,
+            commit_observation_id: crate::registry_mutation_work::next_work_id(),
             commit_entered: false,
             preparation_refused: false,
             refusal: nt_status::NtStatus::INVALID_DEVICE_REQUEST,

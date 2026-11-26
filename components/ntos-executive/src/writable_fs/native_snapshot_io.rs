@@ -6,6 +6,11 @@ use nt_memory_manager::SectionMountId;
 
 enum SnapshotOwnerToken {
     Mutation { work_id: u64, request: nt_fs::AsyncWalIoRequest },
+    SystemBatch {
+        epoch: u64,
+        mount: SectionMountId,
+        request: nt_fs::AsyncWalIoRequest,
+    },
     RelationWal {
         claim: nt_pnp_context::native_route_publication::RelationWalClaim<
             nt_pnp_manager::DeviceRelationInvalidation, nt_fs::AsyncWalIoRequest,
@@ -33,8 +38,8 @@ pub(crate) struct SnapshotClaim {
 }
 
 /// Labels of the snapshot owner kinds, indexed by [`SnapshotClaim::owner_index`].
-pub(crate) const OWNER_KINDS: [&[u8]; 6] =
-    [b"mutation", b"relation-wal", b"hive", b"storage", b"checkpoint", b"fold"];
+pub(crate) const OWNER_KINDS: [&[u8]; 7] =
+    [b"mutation", b"relation-wal", b"hive", b"storage", b"checkpoint", b"fold", b"system-batch"];
 
 impl SnapshotClaim {
     pub(crate) fn owner_index(&self) -> usize {
@@ -45,16 +50,19 @@ impl SnapshotClaim {
             SnapshotOwnerToken::Storage(_) => 3,
             SnapshotOwnerToken::Checkpoint(_) => 4,
             SnapshotOwnerToken::Fold(_) => 5,
+            SnapshotOwnerToken::SystemBatch { .. } => 6,
         }
     }
     pub(crate) fn owner_kind(&self) -> &'static [u8] {
         OWNER_KINDS[self.owner_index()]
     }
-    /// The command belongs to a background snapshot owner (lazy checkpoint or SYSTEM fold),
+    /// The command belongs to a background snapshot owner (lazy checkpoint, SYSTEM fold or batch),
     /// including the header recheck read that owner is waiting on.
     pub(crate) unsafe fn is_background(&self) -> bool {
         match &self.owner {
-            SnapshotOwnerToken::Checkpoint(_) | SnapshotOwnerToken::Fold(_) => true,
+            SnapshotOwnerToken::Checkpoint(_)
+            | SnapshotOwnerToken::Fold(_)
+            | SnapshotOwnerToken::SystemBatch { .. } => true,
             SnapshotOwnerToken::Storage(ticket) => {
                 let id = Some(ticket.owner_id());
                 id == super::native_checkpoint::recheck_id()
@@ -96,6 +104,16 @@ impl SnapshotClaim {
             owner: SnapshotOwnerToken::Mutation { work_id, request } }
     }
 
+    /// A SYSTEM batch outlives its publishing row. Its physical command therefore carries
+    /// the exact retained batch epoch and mount instead of a mutation work ID.
+    pub(crate) fn from_system_batch(
+        mount: SectionMountId, operation: nt_fs::BlockOperation, input: Vec<u8>,
+        epoch: u64, request: nt_fs::AsyncWalIoRequest,
+    ) -> Self {
+        Self { mount, operation, input,
+            owner: SnapshotOwnerToken::SystemBatch { epoch, mount, request } }
+    }
+
     pub(crate) fn from_relation_wal(
         mount: SectionMountId, operation: nt_fs::BlockOperation, input: Vec<u8>,
         owner: nt_pnp_manager::DeviceRelationInvalidation, request: nt_fs::AsyncWalIoRequest,
@@ -114,15 +132,19 @@ pub(crate) fn admission_busy(status: u32) -> bool {
 
 static mut RELATION_WAL_FIRST: bool = false;
 
-/// A background snapshot owner (lazy checkpoint or SYSTEM WAL fold) holds the reserve and has
+/// A background snapshot owner (lazy checkpoint, SYSTEM fold or batch) holds the reserve and has
 /// I/O that only the outer owner claims. Foreground registry owners claim their own commands.
 pub(crate) unsafe fn background_outer_io_queued() -> bool {
-    super::native_checkpoint::outer_io_queued() || super::system_wal_fold::native::outer_io_queued()
+    super::native_checkpoint::outer_io_queued()
+        || super::system_wal_fold::native::outer_io_queued()
+        || super::system_wal_batch_native::outer_io_queued()
 }
 
 /// A background snapshot owner holds the snapshot reserve.
 pub(crate) unsafe fn background_owner_holds_reserve() -> bool {
-    super::native_checkpoint::holds_reserve() || super::system_wal_fold::native::holds_reserve()
+    super::native_checkpoint::holds_reserve()
+        || super::system_wal_fold::native::holds_reserve()
+        || super::system_wal_batch_native::holds_reserve()
 }
 
 /// Claim the next command of a background snapshot owner that holds the reserve: its own
@@ -134,6 +156,7 @@ pub(crate) unsafe fn claim_background_snapshot_io() -> Option<SnapshotClaim> {
         .or_else(|| super::native_checkpoint::claim_next())
         .or_else(|| recheck(super::system_wal_fold::native::recheck_id()))
         .or_else(|| super::system_wal_fold::native::claim_next())
+        .or_else(|| super::system_wal_batch_native::claim_next())
 }
 
 /// Claim at most one request from an owner already retained in the executive. No caller may
@@ -142,6 +165,7 @@ pub(crate) unsafe fn claim_next_native_snapshot_io() -> Option<SnapshotClaim> {
     let generic = || snapshot_storage::claim_next_storage_io()
         .or_else(|| super::native_checkpoint::claim_next())
         .or_else(|| super::system_wal_fold::native::claim_next())
+        .or_else(|| super::system_wal_batch_native::claim_next())
         .or_else(|| super::hive_wal::claim_next_native_hive_io().map(
             |(ticket, mount, operation, input)| SnapshotClaim::from_hive(
                 mount, operation, input, ticket)))
@@ -194,6 +218,8 @@ pub(crate) unsafe fn mark_entered_native_snapshot_io(claim: &SnapshotClaim) -> R
         }
         SnapshotOwnerToken::Mutation { work_id, request } =>
             crate::registry_mutation_work::mark_native_wal_io_entered(*work_id, *request),
+        SnapshotOwnerToken::SystemBatch { epoch, mount, request } =>
+            super::system_wal_batch_native::mark_entered(*epoch, *mount, *request),
         SnapshotOwnerToken::RelationWal { claim } =>
             crate::driver_launch::mark_native_relation_wal_entered(claim.owner, claim.request),
         SnapshotOwnerToken::Storage(ticket) => snapshot_storage::mark_storage_io_entered(ticket),
@@ -207,6 +233,8 @@ pub(crate) unsafe fn release_unentered_native_snapshot_io(claim: SnapshotClaim) 
         SnapshotOwnerToken::Hive(ticket) => super::hive_wal::release_unentered_native_hive_io(ticket),
         SnapshotOwnerToken::Mutation { work_id, request } =>
             crate::registry_mutation_work::release_unentered_native_wal_io(work_id, request),
+        SnapshotOwnerToken::SystemBatch { epoch, mount, request } =>
+            super::system_wal_batch_native::release_unentered(epoch, mount, request),
         SnapshotOwnerToken::RelationWal { claim } =>
             crate::driver_launch::release_unentered_native_relation_wal(claim.owner, claim.request),
         SnapshotOwnerToken::Storage(ticket) => snapshot_storage::release_unentered_storage_io(ticket),
@@ -223,6 +251,8 @@ pub(crate) unsafe fn refuse_unentered_native_snapshot_io(
         SnapshotOwnerToken::Hive(ticket) => super::hive_wal::refuse_unentered_native_hive_io(ticket, status),
         SnapshotOwnerToken::Mutation { work_id, request } =>
             crate::registry_mutation_work::refuse_unentered_native_wal_io(work_id, request, status),
+        SnapshotOwnerToken::SystemBatch { epoch, mount, request } =>
+            super::system_wal_batch_native::refuse_unentered(epoch, mount, request, status),
         SnapshotOwnerToken::RelationWal { claim } =>
             crate::driver_launch::refuse_unentered_native_relation_wal(claim.owner, claim.request, status),
         SnapshotOwnerToken::Storage(ticket) => {
@@ -259,6 +289,8 @@ pub(crate) unsafe fn complete_native_snapshot_io(
         SnapshotOwnerToken::Hive(ticket) => super::hive_wal::complete_native_hive_io(ticket, result),
         SnapshotOwnerToken::Mutation { work_id, request } =>
             crate::registry_mutation_work::complete_native_wal_io(work_id, request, result),
+        SnapshotOwnerToken::SystemBatch { epoch, mount, request } =>
+            super::system_wal_batch_native::complete(epoch, mount, request, result),
         SnapshotOwnerToken::RelationWal { claim } =>
             crate::driver_launch::complete_native_relation_wal_io(claim.owner, claim.request, result),
         SnapshotOwnerToken::Storage(ticket) => {
