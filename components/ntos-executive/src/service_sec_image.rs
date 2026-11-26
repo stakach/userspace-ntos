@@ -17376,7 +17376,7 @@ unsafe fn pending_file_io_redrive_pass(
                 .expect("released owned File reference lost its pending owner");
         }
         assert!(
-            !pending.operation.is_owned_mode_uncommitted(),
+            !pending.operation.is_owned_work_uncommitted(),
             "nonterminal mode preparation cannot retire its retained File owner",
         );
         if matches!(pending.operation, nt_io_manager::PendingFileIoOperation::AttributeQuery(_)) {
@@ -17467,8 +17467,9 @@ unsafe fn pending_file_io_redrive_pass(
             | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
             | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {}
             nt_io_manager::PendingFileIoOperation::OwnedModeInputCapture(_)
-            | nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_) => {
-                unreachable!("finished File owner retained nonterminal mode preparation")
+            | nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_)
+            | nt_io_manager::PendingFileIoOperation::OwnedBasicPreflight(_) => {
+                unreachable!("finished File owner retained nonterminal preparation")
             }
         }
         delivered += 1;

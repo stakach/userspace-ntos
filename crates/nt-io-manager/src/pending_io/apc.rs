@@ -381,7 +381,7 @@ impl PendingFileIoTable {
         let pending = self.get_exact(identity)
             .filter(|pending| pending.irp_id == expected_irp)
             .ok_or(PendingFileApcError::WrongIdentity)?;
-        if pending.operation.is_owned_mode_uncommitted()
+        if pending.operation.is_owned_work_uncommitted()
             || self.delivery_attempts[identity.slot] != 0
             || self.apc_controls[identity.slot]
                 .is_some_and(|control| control.phase != PendingFileApcPhase::AwaitTerminal)

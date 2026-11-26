@@ -268,7 +268,7 @@ pub(super) unsafe fn before_post_action(
         // calls attach their reply in this same commit, never exposing an unarmed delivery row.
         let identity = reservation.identity();
         let local_terminal = pending.owned_terminal_result().is_some()
-            || pending.operation.is_owned_mode_uncommitted();
+            || pending.operation.is_owned_work_uncommitted();
         if let Some(event) = nt_handler.current_file_transfer_event.take() {
             assert!(pending.transfer_event.is_none());
             assert!(pending.event_obj_idx == u64::MAX || pending.event_obj_idx == event.native_identity);

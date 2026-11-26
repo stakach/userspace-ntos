@@ -99,7 +99,8 @@ impl PendingFileBusy {
                 PendingFileRoute::Local(LocalFileObject::Overlay(file)) => {
                     matches!(pending.operation, PendingFileIoOperation::OwnedInline(_)
                         | PendingFileIoOperation::OwnedModeInputCapture(_)
-                        | PendingFileIoOperation::OwnedModePrecommit(_))
+                        | PendingFileIoOperation::OwnedModePrecommit(_)
+                        | PendingFileIoOperation::OwnedBasicPreflight(_))
                         && self.owner.key == FileIoWaitKey::LocalOverlay(file)
                 }
                 PendingFileRoute::Local(_) => false,
@@ -210,7 +211,7 @@ impl PendingFileIoTable {
             return Err(PendingFileBusyError::InvalidPhase);
         }
         let pending = self.get(slot).ok_or(PendingFileBusyError::WrongIdentity)?;
-        if pending.operation.is_owned_mode_uncommitted() {
+        if pending.operation.is_owned_work_uncommitted() {
             return Err(PendingFileBusyError::InvalidPhase);
         }
         let busy = pending.busy.ok_or(PendingFileBusyError::WrongIdentity)?;
