@@ -2269,6 +2269,25 @@ impl MemFs {
         self.create_child_with_entry(parent, name, is_dir).0
     }
 
+    /// Undo only entries published by a private composition/provisioning transaction. Identity
+    /// order removes children before parents, and no File object or notification was published.
+    fn rollback_unpublished_entries(&mut self, first_entry: u64, first_file: u64,
+        first_node_len: usize)
+    {
+        let mut entry = self.next_entry_id;
+        while entry > first_entry {
+            entry -= 1;
+            if self.entry_location(entry).is_some() {
+                let node = self.unlink_entry(entry)
+                    .expect("newly created transaction entry has no published child");
+                self.reap_unlinked(node);
+            }
+        }
+        self.nodes.truncate(first_node_len);
+        self.next_file_id = first_file;
+        self.next_entry_id = first_entry;
+    }
+
     fn entry_location(&self, entry_id: u64) -> Option<(u64, usize, u64)> {
         if entry_id == 0 {
             return None;
@@ -2749,15 +2768,18 @@ impl MemFs {
         cur
     }
 
-    /// Create every missing directory along a folded volume-relative path, returning the leaf id.
-    fn ensure_dir_folded_relative(&mut self, path: &[u8]) -> Option<u64> {
-        self.materialize_parent_folded_relative(path).ok()
-    }
-
     /// Fallible directory materialization used by a prepared CREATE transaction. Each component
     /// is admitted before its local namespace effect; the outer transaction rolls back earlier
     /// components if a later admission fails.
     fn materialize_parent_folded_relative(&mut self, path: &[u8]) -> Result<u64, u32> {
+        self.materialize_parent_folded_relative_with_allocator(
+            path, &mut file_create::CreateAllocator::default(),
+        )
+    }
+
+    fn materialize_parent_folded_relative_with_allocator(
+        &mut self, path: &[u8], allocator: &mut file_create::CreateAllocator,
+    ) -> Result<u64, u32> {
         let mut cur = 0;
         for comp in path.split(|byte| *byte == b'\\').filter(|c| !c.is_empty()) {
             if !self.is_dir(cur) {
@@ -2769,8 +2791,7 @@ impl MemFs {
                     let name = core::str::from_utf8(comp)
                         .map_err(|_| STATUS_INVALID_PARAMETER)?;
                     let plan = self.prepare_create_child(
-                        cur, name, FILE_DIRECTORY_FILE, 0,
-                        &mut file_create::CreateAllocator::default(),
+                        cur, name, FILE_DIRECTORY_FILE, 0, allocator,
                     )?;
                     self.apply_create(plan).0
                 }
@@ -5420,20 +5441,8 @@ impl FileSystem {
             return result;
         }
         // Provisioning and import publish neither handles nor notifications. `zw_create` plans
-        // all fallible work before `apply_create`, so a failed result added no File object or
-        // entry. Reverse identity order removes the imported leaf before any new parent.
-        let mut entry = self.volume.next_entry_id;
-        while entry > first_entry {
-            entry -= 1;
-            if self.volume.entry_location(entry).is_some() {
-                let node = self.volume.unlink_entry(entry)
-                    .expect("newly created transaction entry has no published child");
-                self.volume.reap_unlinked(node);
-            }
-        }
-        self.volume.nodes.truncate(first_node_len);
-        self.volume.next_file_id = first_file;
-        self.volume.next_entry_id = first_entry;
+        // all fallible work before `apply_create`, so a failed result added no File object.
+        self.volume.rollback_unpublished_entries(first_entry, first_file, first_node_len);
         if let Some(first) = first_snapshot_size {
             self.snapshot_budget.as_mut().expect("configured snapshot budget").publish(first);
         }
@@ -6277,6 +6286,51 @@ impl FileSystem {
         self.obj(handle).map(|obj| obj.mode_state.query_bits())
     }
 
+    fn provision_allocator(&mut self) -> file_create::CreateAllocator {
+        let mut allocator = file_create::CreateAllocator::default();
+        #[cfg(test)]
+        allocator.fail_at(self.create_fail_at.take());
+        allocator
+    }
+
+    fn provision_transaction<T>(
+        &mut self, next_snapshot_size: Option<usize>,
+        apply: impl FnOnce(&mut Self, &mut file_create::CreateAllocator) -> Result<T, u32>,
+    ) -> Result<T, u32> {
+        let first_entry = self.volume.next_entry_id;
+        let first_file = self.volume.next_file_id;
+        let first_node_len = self.volume.nodes.len();
+        let mut allocator = self.provision_allocator();
+        match apply(self, &mut allocator) {
+            Ok(value) => {
+                self.publish_snapshot_size(next_snapshot_size);
+                Ok(value)
+            }
+            Err(status) => {
+                self.volume.rollback_unpublished_entries(first_entry, first_file, first_node_len);
+                Err(status)
+            }
+        }
+    }
+
+    fn provision_file_node(
+        &mut self, parent_path: &[u8], leaf: &str,
+        allocator: &mut file_create::CreateAllocator,
+    ) -> Result<u64, u32> {
+        let parent = self.volume.materialize_parent_folded_relative_with_allocator(
+            parent_path, allocator,
+        )?;
+        if let Some(id) = self.volume.child(parent, leaf) {
+            return if self.volume.is_dir(id) {
+                Err(STATUS_FILE_IS_A_DIRECTORY)
+            } else { Ok(id) };
+        }
+        let plan = self.volume.prepare_create_child(
+            parent, leaf, FILE_NON_DIRECTORY_FILE, 0, allocator,
+        )?;
+        Ok(self.volume.apply_create(plan).0)
+    }
+
     /// Create every missing directory along `path`, and return whether the leaf is a directory.
     /// This is volume PROVISIONING (the content a formatted/installed volume already carries), not
     /// a syscall path: hosted processes only ever reach the `Zw*` surface above.
@@ -6288,11 +6342,7 @@ impl FileSystem {
         let Some(rel) = self.to_relative(&normalize_separators(path)) else {
             return Err(STATUS_OBJECT_PATH_NOT_FOUND);
         };
-        let next = self.project_provision_relative(rel.as_bytes(), None)?;
-        let id = self.volume.ensure_dir(&rel);
-        let is_dir = self.volume.is_dir(id);
-        if is_dir { self.publish_snapshot_size(next); }
-        Ok(is_dir)
+        self.provision_directory_relative_checked(rel.as_bytes())
     }
 
     /// Create every missing directory along a folded volume-relative path.
@@ -6308,12 +6358,12 @@ impl FileSystem {
         -> Result<bool, u32>
     {
         let next = self.project_provision_relative(relative, None)?;
-        let Some(id) = self.volume.ensure_dir_folded_relative(relative) else {
-            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
-        };
-        let is_dir = self.volume.is_dir(id);
-        if is_dir { self.publish_snapshot_size(next); }
-        Ok(is_dir)
+        self.provision_transaction(next, |fs, allocator| {
+            let id = fs.volume.materialize_parent_folded_relative_with_allocator(
+                relative, allocator,
+            )?;
+            Ok(fs.volume.is_dir(id))
+        })
     }
 
     /// Create `path` (and every missing directory above it) as a FILE holding `bytes`.
@@ -6332,24 +6382,7 @@ impl FileSystem {
         let Some(rel) = self.to_relative(&normalize_separators(path)) else {
             return Err(STATUS_OBJECT_PATH_NOT_FOUND);
         };
-        let Some((parent_path, leaf)) = MemFs::parent_and_leaf(&rel) else {
-            return Err(STATUS_INVALID_PARAMETER);
-        };
-        let next = self.project_provision_relative(rel.as_bytes(), Some(bytes))?;
-        let parent = self.volume.ensure_dir(parent_path);
-        let id = match self.volume.child(parent, leaf) {
-            Some(id) => id,
-            None => self.volume.create_child(parent, leaf, false),
-        };
-        if self.volume.is_dir(id) {
-            return Err(STATUS_FILE_IS_A_DIRECTORY);
-        }
-        let installed = self.volume.set_file_data(id, bytes);
-        if installed {
-            self.volume.touch_write(id);
-        }
-        if installed { self.publish_snapshot_size(next); }
-        Ok(installed)
+        self.provision_file_relative_checked(rel.as_bytes(), bytes)
     }
 
     /// Create `path` as a FILE by taking ownership of `bytes`.
@@ -6361,28 +6394,28 @@ impl FileSystem {
         let Some(rel) = self.to_relative(&normalize_separators(path)) else {
             return Err(bytes);
         };
-        let Some((parent_path, leaf)) = MemFs::parent_and_leaf(&rel) else {
+        let Some((parent_path, leaf)) = MemFs::parent_and_leaf_bytes(rel.as_bytes()) else {
             return Err(bytes);
         };
+        let Ok(leaf) = core::str::from_utf8(leaf) else { return Err(bytes); };
         let next = match self.project_provision_relative(rel.as_bytes(), Some(&bytes)) {
             Ok(next) => next,
             Err(_) => return Err(bytes),
         };
-        let parent = self.volume.ensure_dir(parent_path);
-        let id = match self.volume.child(parent, leaf) {
-            Some(id) => id,
-            None => self.volume.create_child(parent, leaf, false),
-        };
-        if self.volume.is_dir(id) {
-            return Err(bytes);
-        }
-        let installed = self.volume.set_file_data_owned(id, bytes);
-        debug_assert!(installed);
-        if installed {
-            self.volume.touch_write(id);
-            self.publish_snapshot_size(next);
-        }
-        Ok(())
+        let mut owned = Some(bytes);
+        let result = self.provision_transaction(next, |fs, allocator| {
+            let id = fs.provision_file_node(parent_path, leaf, allocator)?;
+            let node = fs.volume.node_mut(id).ok_or(STATUS_DATA_ERROR)?;
+            if node.is_dir { return Err(STATUS_FILE_IS_A_DIRECTORY); }
+            let bytes = owned.take().ok_or(STATUS_DATA_ERROR)?;
+            let len = bytes.len() as u64;
+            node.data = FileData::Bytes(bytes);
+            node.allocation_size = allocation_size_for_eof(len);
+            node.valid_data_length = len;
+            fs.volume.touch_write(id);
+            Ok(())
+        });
+        result.map_err(|_| owned.expect("owned image retained before any fallible publication"))
     }
 
     /// Create a file by folded volume-relative path, and create every missing directory above it.
@@ -6397,25 +6430,17 @@ impl FileSystem {
             return Err(STATUS_INVALID_PARAMETER);
         };
         let next = self.project_provision_relative(relative, Some(bytes))?;
-        let Some(parent) = self.volume.ensure_dir_folded_relative(parent_path) else {
-            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
-        };
         let Ok(leaf) = core::str::from_utf8(leaf) else {
             return Err(STATUS_INVALID_PARAMETER);
         };
-        let id = match self.volume.child(parent, leaf) {
-            Some(id) => id,
-            None => self.volume.create_child(parent, leaf, false),
-        };
-        if self.volume.is_dir(id) {
-            return Err(STATUS_FILE_IS_A_DIRECTORY);
-        }
-        let installed = self.volume.set_file_data(id, bytes);
-        if installed {
-            self.volume.touch_write(id);
-        }
-        if installed { self.publish_snapshot_size(next); }
-        Ok(installed)
+        self.provision_transaction(next, |fs, allocator| {
+            let id = fs.provision_file_node(parent_path, leaf, allocator)?;
+            if !fs.volume.set_file_data(id, bytes) {
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            }
+            fs.volume.touch_write(id);
+            Ok(true)
+        })
     }
 
     /// A file's bytes, borrowed in place (no copy) — the read side [`provision_file`] writes.
@@ -6721,3 +6746,7 @@ impl FileSystem {
             .ok_or(STATUS_INVALID_HANDLE)
     }
 }
+
+#[cfg(test)]
+#[path = "provisioning_transaction_tests.rs"]
+mod provisioning_transaction_tests;

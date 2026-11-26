@@ -11,6 +11,11 @@ pub(super) struct CreateAllocator {
 }
 
 impl CreateAllocator {
+    #[cfg(test)]
+    pub(super) fn fail_at(&mut self, stage: Option<usize>) {
+        self.fail_at = stage;
+    }
+
     fn checkpoint(&mut self) -> Result<(), u32> {
         #[cfg(test)]
         {
