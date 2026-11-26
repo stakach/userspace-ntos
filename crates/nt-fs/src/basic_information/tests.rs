@@ -30,6 +30,85 @@ fn set(fs: &mut FileSystem, handle: u64, times: [u64; 4], attributes: u32) -> u3
     fs.zw_set_information_file(handle, FILE_BASIC_INFORMATION, &basic(times, attributes))
 }
 
+#[test]
+fn prepared_basic_information_freezes_resolved_state_until_one_apply() {
+    let (mut fs, handle) = open(FILE, FILE_NON_DIRECTORY_FILE);
+    let directory = fs.zw_create_file(
+        r"\??\C:\Dir", FILE_LIST_DIRECTORY, 0, SHARE, FILE_OPEN, FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(directory.status, STATUS_SUCCESS);
+    let notification = fs.zw_notify_change_directory_file(
+        directory.handle, crate::FILE_NOTIFY_CHANGE_ATTRIBUTES,
+        false, 256, 9,
+    ).unwrap();
+    let before = metadata(&fs, handle);
+    let plan = fs.prepare_basic_information(
+        handle, &basic([0, 0, 777, 0], FILE_ATTRIBUTE_HIDDEN),
+    ).unwrap();
+    assert_eq!(plan.opened_path(), Some(r"\Dir\Report.txt"));
+    assert_eq!(plan.resolved_metadata().file_id, before.file_id);
+    assert_eq!(plan.resolved_metadata().change_time, NOW);
+    assert_eq!(metadata(&fs, handle), before);
+    assert!(fs.directory_notify_completion(notification).is_none());
+
+    fs.set_current_time_100ns(999);
+    let applied = fs.apply_prepared_basic_information(plan).unwrap();
+    assert_eq!(metadata(&fs, handle), applied);
+    assert_eq!((applied.last_write_time, applied.change_time, applied.attributes),
+        (777, NOW, FILE_ATTRIBUTE_HIDDEN));
+    let completion = fs.pop_directory_notify_completion().unwrap();
+    assert_eq!((completion.id, completion.context, completion.status),
+        (notification, 9, STATUS_SUCCESS));
+    assert!(fs.pop_directory_notify_completion().is_none());
+}
+
+#[test]
+fn prepared_basic_information_refuses_stale_path_and_file_identity() {
+    let (mut fs, handle) = open(FILE, FILE_NON_DIRECTORY_FILE);
+    let requested = basic([0, 0, 777, 0], FILE_ATTRIBUTE_HIDDEN);
+    let renamed = fs.prepare_basic_information(handle, &requested).unwrap();
+    let before_rename = metadata(&fs, handle);
+    fs.set_current_time_100ns(before_rename.change_time);
+    let target: alloc::vec::Vec<u8> = "Moved.txt".encode_utf16()
+        .flat_map(u16::to_le_bytes).collect();
+    assert_eq!(fs.zw_rename_file(handle, FileRenameRoot::SourceParent, &target, false),
+        STATUS_SUCCESS);
+    let after_rename = metadata(&fs, handle);
+    assert_eq!(after_rename, before_rename);
+    assert_eq!(fs.apply_prepared_basic_information(renamed), Err(STATUS_DATA_ERROR));
+    assert_eq!(metadata(&fs, handle), after_rename);
+
+    let replaced = fs.prepare_basic_information(handle, &requested).unwrap();
+    assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
+    assert_eq!(fs.apply_prepared_basic_information(replaced), Err(STATUS_DATA_ERROR));
+}
+
+#[test]
+fn prepared_basic_information_refuses_intervening_metadata_and_skips_noop_notify() {
+    let (mut fs, handle) = open(FILE, FILE_NON_DIRECTORY_FILE);
+    let directory = fs.zw_create_file(
+        r"\??\C:\Dir", FILE_LIST_DIRECTORY, 0, SHARE, FILE_OPEN, FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(directory.status, STATUS_SUCCESS);
+    let notification = fs.zw_notify_change_directory_file(
+        directory.handle, crate::FILE_NOTIFY_CHANGE_ATTRIBUTES,
+        false, 256, 19,
+    ).unwrap();
+    let noop = fs.prepare_basic_information(handle, &basic([0; 4], 0)).unwrap();
+    assert_eq!(fs.apply_prepared_basic_information(noop), Ok(metadata(&fs, handle)));
+    assert!(fs.directory_notify_completion(notification).is_none());
+
+    let stale = fs.prepare_basic_information(
+        handle, &basic([0, 0, 777, 0], FILE_ATTRIBUTE_HIDDEN),
+    ).unwrap();
+    assert_eq!(set(&mut fs, handle, [0, 0, 0, 666], 0), STATUS_SUCCESS);
+    assert_eq!(fs.pop_directory_notify_completion().unwrap().id, notification);
+    let current = metadata(&fs, handle);
+    assert_eq!(fs.apply_prepared_basic_information(stale), Err(STATUS_DATA_ERROR));
+    assert_eq!(metadata(&fs, handle), current);
+    assert!(fs.pop_directory_notify_completion().is_none());
+}
+
 fn metadata(fs: &FileSystem, handle: u64) -> FileMetadata {
     fs.query_file_object_information(handle).unwrap().metadata
 }
