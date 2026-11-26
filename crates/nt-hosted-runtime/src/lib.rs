@@ -31,6 +31,7 @@ mod hosted_file_rpc_phase;
 mod hosted_install_pipe_diagnostic;
 mod installer_syscall_span;
 mod root_service_gap;
+mod root_gap_route;
 mod installer_fault_receipt;
 mod primary_alias_activation;
 mod native_block_stage_sample;
@@ -85,6 +86,8 @@ pub use root_service_gap::{CounterDelta, HotIoCost, HotProcessCost, HotProcessDe
     HotProcessRank, RootGapBaselineBudget, RootGapObservation, RootRuntimeDelta,
     RootServiceGapLedger, exact_dispatch_generation, rank_hot_process_deltas,
     top_counter_deltas};
+pub use root_gap_route::{GapFileRoute, GapIoDisposition, GapIoKind, GapIoObservation,
+    GapRouteEntry, GapRouteKey, GapRouteSnapshot, GapRouteStats, RootGapRouteLedger};
 pub use installer_fault_receipt::{InstallerFaultReceipt, InstallerFaultReceipts};
 pub use primary_alias_activation::{
     classify_alias_registration_status, AliasRetryDisposition,
