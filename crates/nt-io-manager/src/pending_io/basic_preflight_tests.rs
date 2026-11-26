@@ -5,10 +5,8 @@ const TID: u64 = 23;
 const IOSB: u64 = 0x2000;
 const REPLY: u64 = 41;
 
-fn park_basic(table: &mut PendingFileIoTable) -> (PendingFileIoIdentity, u64) {
-    let reservation = table.reserve().unwrap();
-    let id = table.local_operation_id(reservation).unwrap();
-    let row = PendingFileIo {
+fn basic_row(id: u64) -> PendingFileIo {
+    PendingFileIo {
         route: PendingFileRoute::Local(LocalFileObject::Overlay(FILE)),
         irp_id: id,
         major: nt_io_abi::major::IRP_MJ_SET_INFORMATION,
@@ -25,7 +23,13 @@ fn park_basic(table: &mut PendingFileIoTable) -> (PendingFileIoIdentity, u64) {
         completion_port_suppressed: true,
         event_obj_idx: u64::MAX,
         ..PendingFileIo::default()
-    };
+    }
+}
+
+fn park_basic(table: &mut PendingFileIoTable) -> (PendingFileIoIdentity, u64) {
+    let reservation = table.reserve().unwrap();
+    let id = table.local_operation_id(reservation).unwrap();
+    let row = basic_row(id);
     let slot = table.park_reserved(reservation, row).unwrap();
     (table.identity(slot).unwrap(), id)
 }
@@ -169,7 +173,8 @@ fn cancelled_consumer_before_baseline_entry_cannot_start_effect() {
 #[test]
 fn prepared_sidecar_refuses_a_crossed_generation_of_the_same_pending_slot() {
     let mut table = PendingFileIoTable::new();
-    let (identity, irp_id) = park_basic(&mut table);
+    let reservation = table.reserve().unwrap();
+    let irp_id = table.local_operation_id(reservation).unwrap();
     let mut fs = nt_fs::FileSystem::new(nt_fs::MemFs::new());
     assert!(fs.provision_directory(r"\??\C:\Dir"));
     let opened = fs.zw_create_file(r"\??\C:\Dir\file.txt",
@@ -179,8 +184,9 @@ fn prepared_sidecar_refuses_a_crossed_generation_of_the_same_pending_slot() {
     assert_eq!(opened.status, nt_fs::STATUS_SUCCESS);
     let input = [0u8; 40];
     let mut sidecar = crate::PendingBasicPreparedTable::new();
-    assert!(sidecar.park_exact(&table, identity, irp_id,
-        crate::PendingBasicPreparedOwner::prepare(&fs, opened.handle, input, ()).ok().unwrap()).is_ok());
+    let identity = sidecar.admit_reserved_exact(&mut table, reservation, basic_row(irp_id),
+        crate::PendingBasicPreparedOwner::prepare(&fs, opened.handle, input, ()).ok().unwrap())
+        .ok().unwrap();
     let crossed = PendingFileIoIdentity {
         generation: identity.generation + 1, ..identity
     };

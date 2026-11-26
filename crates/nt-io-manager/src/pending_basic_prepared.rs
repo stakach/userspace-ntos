@@ -9,7 +9,8 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{PendingFileIoIdentity, PendingFileIoOperation, PendingFileIoTable};
+use crate::{PendingFileIo, PendingFileIoIdentity, PendingFileIoOperation,
+    PendingFileIoParkError, PendingFileIoReservation, PendingFileIoTable};
 
 static NEXT_TABLE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -68,6 +69,14 @@ pub struct PendingBasicPreparedTable<FileReference> {
     limit: usize,
 }
 
+/// Admission refusal before any Basic effect. A row-shape failure preserves the pending table's
+/// exact reason; the caller also receives its original delivery row and move-only File owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingBasicPreparedAdmissionError {
+    SidecarUnavailable,
+    PendingRow(PendingFileIoParkError),
+}
+
 impl<FileReference> Default for PendingBasicPreparedTable<FileReference> {
     fn default() -> Self { Self::new() }
 }
@@ -91,35 +100,58 @@ impl<FileReference> PendingBasicPreparedTable<FileReference> {
             && matches!(row.operation, PendingFileIoOperation::OwnedBasicPreflight(_))
     }
 
-    /// Attach before physical entry. Refusal returns every move-only value to the caller.
-    /// The same pending table/slot cannot be reused while an older generation is retained.
-    pub fn park_exact(&mut self, pending: &PendingFileIoTable,
-        identity: PendingFileIoIdentity, irp_id: u64,
-        owner: PendingBasicPreparedOwner<FileReference>,
-    ) -> Result<(), PendingBasicPreparedOwner<FileReference>> {
-        if !Self::exact_row(pending, identity, irp_id, false)
-            || self.len() >= self.limit
+    fn admission_slot(&mut self, identity: PendingFileIoIdentity) -> Option<usize> {
+        if self.len() >= self.limit
             || self.entries.iter().flatten().any(|entry| {
                 entry.identity.table() == identity.table()
                     && entry.identity.slot() == identity.slot()
             })
-        { return Err(owner); }
+        { return None; }
         let slot = if let Some(slot) = self.entries.iter().position(Option::is_none) {
             slot
         } else {
-            if self.entries.try_reserve(1).is_err() { return Err(owner); }
+            if self.entries.try_reserve(1).is_err() { return None; }
             self.entries.push(None);
             self.entries.len() - 1
         };
         if self.table_id == 0 {
-            self.table_id = match NEXT_TABLE_ID.fetch_update(Ordering::Relaxed,
+            self.table_id = match NEXT_TABLE_ID.try_update(Ordering::Relaxed,
                 Ordering::Relaxed, |id| id.checked_add(1)) {
                 Ok(id) => id,
-                Err(_) => return Err(owner),
+                Err(_) => return None,
             };
         }
-        self.entries[slot] = Some(Entry { identity, irp_id, phase: Phase::Ready, owner });
-        Ok(())
+        Some(slot)
+    }
+
+    /// Publish the exact Basic delivery row and its move-only prepared owner as one admission.
+    /// All fallible sidecar work finishes before the pending row can be observed. A refusal
+    /// cancels only the exact still-live unoccupied reservation and returns both the delivery
+    /// row and File reference without physical entry.
+    pub fn admit_reserved_exact(&mut self, pending: &mut PendingFileIoTable,
+        reservation: PendingFileIoReservation, row: PendingFileIo,
+        owner: PendingBasicPreparedOwner<FileReference>,
+    ) -> Result<PendingFileIoIdentity,
+        (PendingBasicPreparedAdmissionError, PendingFileIo,
+            PendingBasicPreparedOwner<FileReference>)> {
+        let identity = reservation.identity();
+        if !matches!(row.operation, PendingFileIoOperation::OwnedBasicPreflight(_)) {
+            pending.cancel_reservation(reservation);
+            return Err((PendingBasicPreparedAdmissionError::PendingRow(
+                PendingFileIoParkError::InvalidRecord), row, owner));
+        }
+        let Some(slot) = self.admission_slot(identity) else {
+            pending.cancel_reservation(reservation);
+            return Err((PendingBasicPreparedAdmissionError::SidecarUnavailable, row, owner));
+        };
+        if let Err(error) = pending.park_reserved(reservation, row) {
+            pending.cancel_reservation(reservation);
+            return Err((PendingBasicPreparedAdmissionError::PendingRow(error), row, owner));
+        }
+        self.entries[slot] = Some(Entry {
+            identity, irp_id: row.irp_id, phase: Phase::Ready, owner,
+        });
+        Ok(identity)
     }
 
     /// Claim once against the exact still-parked row. This is not permission for a WAL effect.
