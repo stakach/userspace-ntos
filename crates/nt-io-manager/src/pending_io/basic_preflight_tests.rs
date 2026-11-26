@@ -30,6 +30,31 @@ fn park_basic(table: &mut PendingFileIoTable) -> (PendingFileIoIdentity, u64) {
     (table.identity(slot).unwrap(), id)
 }
 
+#[test]
+fn basic_terminal_refuses_crossed_row_generation_and_irp() {
+    let mut table = PendingFileIoTable::new();
+    let (identity, irp_id) = park_basic(&mut table);
+    let (other, other_irp) = park_basic(&mut table);
+    let mut peer = PendingFileIoTable::new();
+    let (peer_identity, _) = park_basic(&mut peer);
+    let crossed_slot = PendingFileIoIdentity { slot: other.slot, ..identity };
+    let crossed_generation = PendingFileIoIdentity {
+        generation: identity.generation + 1, ..identity
+    };
+
+    assert_eq!(table.commit_owned_basic_terminal_exact(peer_identity, irp_id, 0), None);
+    assert_eq!(table.commit_owned_basic_terminal_exact(crossed_slot, irp_id, 0), None);
+    assert_eq!(table.commit_owned_basic_terminal_exact(crossed_generation, irp_id, 0), None);
+    assert_eq!(table.commit_owned_basic_terminal_exact(identity, other_irp, 0), None);
+    assert_eq!(table.get_exact(identity).unwrap().owned_terminal_result(), None);
+    assert_eq!(table.get_exact(other).unwrap().owned_terminal_result(), None);
+
+    assert_eq!(table.commit_owned_basic_terminal_exact(identity, irp_id, 0), Some(()));
+    assert_eq!(table.commit_owned_basic_terminal_exact(identity, irp_id, 0), None);
+    assert_eq!(table.get_exact(identity).unwrap().owned_terminal_result(), Some((0, 0)));
+    assert_eq!(table.get_exact(other).unwrap().owned_terminal_result(), None);
+}
+
 fn assert_uncommitted(table: &mut PendingFileIoTable, owner: PendingFileIoIdentity, id: u64) {
     let row = table.get_exact(owner).unwrap();
     assert_eq!(row.owned_terminal_result(), None);
