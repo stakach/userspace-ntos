@@ -103,6 +103,13 @@ impl Owner {
         matches!(self.stage.as_ref(), Some(Stage::Wal(_)))
     }
 
+    pub(super) fn frame_room(&self) -> Result<nt_fs::RegistryWalFrameRoom, u32> {
+        let Some(Stage::Wal(wal)) = self.stage.as_ref() else {
+            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+        };
+        wal.frame_room().map_err(status)
+    }
+
     pub(crate) fn native_io_active(&self) -> bool {
         match self.stage.as_ref() {
             Some(Stage::Wal(wal)) =>
@@ -263,6 +270,31 @@ impl Owner {
         authority: PairAuthority,
         manifest: nt_fs::WalSnapshotManifest,
     ) -> Result<Self, u32> {
+        let mut owner = unsafe { Self::resume_authority(lease, continuation, authority, manifest) }?;
+        if let Err(error) = owner.begin_payload(bytes) {
+            // BEGIN has no native effect. Restore this exact continuation before another
+            // writer may acquire the reserve; retain the owner if publication fails.
+            if let Err(release_error) = owner.release_aborted() {
+                core::mem::forget(owner);
+                return Err(release_error);
+            }
+            return Err(error);
+        }
+        Ok(owner)
+    }
+
+    /// Keep the mount lease and paired-header authority while collecting several CM journals.
+    /// The caller must validate its exact CM mount/binding before accepting a mutation slot.
+    ///
+    /// # Safety
+    /// `lease` must be the same exclusive physical reserve that minted `continuation`, and
+    /// `authority` must prove both snapshot headers still name `manifest` under that lease.
+    pub(super) unsafe fn resume_authority(
+        lease: snapshot_storage::Lease,
+        continuation: RegistryWalContinuation,
+        authority: PairAuthority,
+        manifest: nt_fs::WalSnapshotManifest,
+    ) -> Result<Self, u32> {
         let mut authority = Some(authority);
         let store = lease.store();
         let expected = WalSnapshotAnchor {
@@ -302,7 +334,7 @@ impl Owner {
         // No physical WAL writer can intervene while the reserve lease is held here.
         // SAFETY: the caller owns the exact mount lease and paired-header proof;
         // this method does not release either before resuming the continuation.
-        let mut wal = match unsafe { RegistryWal::resume_from_continuation(range, continuation, expected) } {
+        let wal = match unsafe { RegistryWal::resume_from_continuation(range, continuation, expected) } {
             Ok(wal) => wal,
             Err((error, range, continuation)) => {
                 restore_continuation(range.into_device(), continuation,
@@ -311,14 +343,6 @@ impl Owner {
                 return Err(status(error));
             }
         };
-        if let Err(error) = wal.begin(bytes) {
-            // BEGIN is reservation only. Its failure leaves no physical effect.
-            let (range, continuation) = wal.into_continuation()
-                .expect("failed WAL reservation has no effect");
-            restore_continuation(range.into_device(), continuation,
-                authority.take().unwrap().into_pair())?;
-            return Err(status(error));
-        }
         Ok(Self {
             store,
             stage: Some(Stage::Wal(wal)),
@@ -329,6 +353,15 @@ impl Owner {
             wal_sectors,
             anchor_entered: false,
         })
+    }
+
+    /// Reserve one sealed frame on the same ready WAL and mount lease. This is a pure
+    /// in-memory transition; PREPARE begins the first native effect later.
+    pub(super) fn begin_payload(&mut self, bytes: Vec<u8>) -> Result<(), u32> {
+        let Some(Stage::Wal(wal)) = self.stage.as_mut() else {
+            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+        };
+        wal.begin(bytes).map_err(status)
     }
 
     /// Durable PREPARE plus payload. A failure leaves this owner and lease unchanged.

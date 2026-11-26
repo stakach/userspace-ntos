@@ -148,7 +148,7 @@ pub use snapshot_store::{
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
 pub use snapshot_publication::SnapshotPublicationState;
 pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};
-pub use registry_wal_store::{AsyncWalIoKind, AsyncWalIoRequest, AsyncWalRefusal, RegistryWal, RegistryWalContinuation, RegistryWalError, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
+pub use registry_wal_store::{AsyncWalIoKind, AsyncWalIoRequest, AsyncWalRefusal, RegistryWal, RegistryWalContinuation, RegistryWalError, RegistryWalFrameRoom, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
 pub use system_wal_batch_payload::{
     SealedSystemWalBatch, SystemWalBatchError, SystemWalBatchPayload, SystemWalBatchReservation,
 };
@@ -181,3 +181,5 @@ pub use volume::*;
 mod tests;
 #[cfg(test)]
 mod system_wal_batch_payload_tests;
+#[cfg(test)]
+mod registry_wal_frame_room_tests;
