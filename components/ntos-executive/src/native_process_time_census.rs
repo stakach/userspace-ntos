@@ -401,6 +401,9 @@ fn print_setup_owner_receipt(handler: &ExecNtHandler, rows: &[Row; MAX_PI], now_
             print_str(b" coverage=native-table-dispatch\n");
         }
     }
+    if receipt.validity == SetupOwnerPairValidity::MissingOwner {
+        print_setup_owner_selector_audit(handler, rows, receipt.ordinal);
+    }
     let Some(sample) = receipt.sample else { return; };
     print_row(sample.process_index, &rows[sample.process_index]);
     let Some(process) = handler.capture_process_identity(sample.process_index) else { return; };
@@ -427,6 +430,71 @@ fn print_setup_owner_receipt(handler: &ExecNtHandler, rows: &[Row; MAX_PI], now_
     print_u64(u64::from(receipt.ordinal)); print_str(b"/");
     print_u64(matching); print_str(b"/");
     print_u64(matching.min(2)); print_str(b"\n");
+}
+
+/// One bounded rejection snapshot on each of the gate's two missing-owner receipts. The
+/// selector itself stays unchanged; these are value reads from the outer root turn only.
+fn print_setup_owner_selector_audit(handler: &ExecNtHandler, rows: &[Row; MAX_PI], ordinal: u8) {
+    let Some((logon_target, logon)) = handler.unique_live_execution_target(
+        nt_exe_image::HostedProcessRole::InteractiveLogon) else {
+        print_str(b"[setup-owner-selector] ordinal/logon-present=");
+        print_u64(u64::from(ordinal)); print_str(b"/0\n");
+        return;
+    };
+    let mut waiters = 0u64;
+    let mut process_objects = 0u64;
+    let mut shown = 0u64;
+    for slot in 0..crate::object_waiter_len() {
+        let Some((identity, record)) = crate::object_waiter_record(slot) else { continue; };
+        if record.caller.pi() != logon_target.pi || record.caller.process() != logon { continue; }
+        waiters += 1;
+        for object in record.objects.iter().take(record.count as usize) {
+            if object.kind() != WaitObject::KIND_PROCESS { continue; }
+            process_objects += 1;
+            if shown == 2 { continue; }
+            shown += 1;
+            let child_pid = object.id() as nt_process::ProcessId;
+            let child_pi = handler.pi_for_pid(child_pid).filter(|pi| *pi < MAX_PI);
+            let image = child_pi.and_then(|pi| handler.hosted_process_image(pi));
+            let child = child_pi.and_then(|pi| handler.capture_process_identity(pi));
+            let child_generation = child.and_then(|process| match process.generation {
+                nt_types::ProcessGeneration::Hosted(value) => Some(value),
+                nt_types::ProcessGeneration::Temporary(_) => None,
+            }).unwrap_or(0);
+            let image_generation = image.map_or(0, |image| image.generation);
+            let row_generation = child_pi.map_or(0, |pi| rows[pi].generation);
+            let app = image.is_some_and(|image|
+                image.role == nt_exe_image::HostedProcessRole::Application);
+            let mechanism_top = child_pi.and_then(|pi| handler.process_mechanisms.get(pi))
+                .zip(image).is_some_and(|(mechanism, image)|
+                    mechanism.top_badge == image.top_badge);
+            let pm_running = handler.pm.process(child_pid)
+                .is_some_and(|entry| entry.state == nt_process::ProcessState::Running);
+            let live = child.zip(image).is_some_and(|(process, image)|
+                handler.is_live_execution_process(nt_exe_image::SpawnTarget::from_image(image), process));
+            print_str(b"[setup-owner-selector] ordinal/seq/tid/tgen/claimed/replied/reply/child-pid/pi-plus-one/pid-match/child-gen/image-gen/row-gen/app/mech-top/pm-running/live=");
+            for (index, value) in [u64::from(ordinal), record.sequence, record.tid,
+                record.caller.thread().generation(),
+                u64::from(crate::object_waiter_is_claimed(identity)),
+                u64::from(record.reply_sent), record.reply_cap,
+                u64::from(child_pid), child_pi.map_or(0, |pi| pi as u64 + 1),
+                u64::from(child.is_some_and(|process| process.pid == child_pid)),
+                child_generation, image_generation, row_generation,
+                u64::from(app), u64::from(mechanism_top), u64::from(pm_running),
+                u64::from(live)].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b"\n");
+        }
+    }
+    print_str(b"[setup-owner-selector] ordinal/logon-pi/pid/waiters/process-objects/shown=");
+    for (index, value) in [u64::from(ordinal), logon_target.pi as u64,
+        u64::from(logon.pid), waiters, process_objects, shown].into_iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(value);
+    }
+    print_str(b"\n");
 }
 
 fn print_row(pi: usize, row: &Row) {
