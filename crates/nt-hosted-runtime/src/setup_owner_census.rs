@@ -15,6 +15,41 @@ pub struct SetupOwnerSample {
     pub table_calls: u64,
 }
 
+/// Exact live identity used only to attribute a diagnostic row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetupOwnerIdentity {
+    pub process_index: usize,
+    pub pid: u32,
+    pub generation: u64,
+}
+
+/// A retained process wait, resolved against the current hosted identity and image catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetupWaitedApplication {
+    pub caller: SetupOwnerIdentity,
+    pub child: SetupOwnerIdentity,
+    pub live_application: bool,
+}
+
+/// Select the one live application whose process object the interactive logon owner waits on.
+/// Repeated waits for the same child are harmless; distinct children make attribution ambiguous.
+pub fn select_unique_waited_application(
+    logon: SetupOwnerIdentity,
+    waits: impl IntoIterator<Item = SetupWaitedApplication>,
+) -> Option<SetupOwnerIdentity> {
+    let mut selected = None;
+    for wait in waits {
+        if wait.caller != logon || !wait.live_application {
+            continue;
+        }
+        if selected.is_some_and(|child| child != wait.child) {
+            return None;
+        }
+        selected = Some(wait.child);
+    }
+    selected
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupOwnerPairValidity {
     Baseline,
@@ -170,6 +205,96 @@ impl SetupOwnerCensusGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waited_application_is_selected_without_a_creator_role_entry() {
+        let logon = SetupOwnerIdentity {
+            process_index: 8,
+            pid: 104,
+            generation: 3,
+        };
+        let setup = SetupOwnerIdentity {
+            process_index: 14,
+            pid: 236,
+            generation: 9,
+        };
+        let other = SetupOwnerIdentity {
+            process_index: 20,
+            pid: 464,
+            generation: 16,
+        };
+        let waits = [
+            SetupWaitedApplication {
+                caller: logon,
+                child: setup,
+                live_application: true,
+            },
+            SetupWaitedApplication {
+                caller: other,
+                child: other,
+                live_application: true,
+            },
+        ];
+        assert_eq!(select_unique_waited_application(logon, waits), Some(setup));
+        assert_eq!(
+            select_unique_waited_application(
+                logon,
+                [
+                    SetupWaitedApplication {
+                        caller: logon,
+                        child: setup,
+                        live_application: true
+                    },
+                    SetupWaitedApplication {
+                        caller: logon,
+                        child: setup,
+                        live_application: true
+                    },
+                ]
+            ),
+            Some(setup)
+        );
+        assert_eq!(
+            select_unique_waited_application(
+                logon,
+                [
+                    SetupWaitedApplication {
+                        caller: other,
+                        child: setup,
+                        live_application: true
+                    },
+                    SetupWaitedApplication {
+                        caller: logon,
+                        child: setup,
+                        live_application: false
+                    },
+                ]
+            ),
+            None
+        );
+        let reused = SetupOwnerIdentity {
+            generation: 10,
+            ..setup
+        };
+        assert_eq!(
+            select_unique_waited_application(
+                logon,
+                [
+                    SetupWaitedApplication {
+                        caller: logon,
+                        child: setup,
+                        live_application: true
+                    },
+                    SetupWaitedApplication {
+                        caller: logon,
+                        child: reused,
+                        live_application: true
+                    },
+                ]
+            ),
+            None
+        );
+    }
 
     const OWNER: SetupOwnerSample = SetupOwnerSample {
         process_index: 14,

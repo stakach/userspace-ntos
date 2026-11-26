@@ -89,7 +89,8 @@ pub use root_service_gap::{CounterDelta, HotIoCost, HotProcessCost, HotProcessDe
     top_counter_deltas};
 pub use root_gap_route::{GapFileRoute, GapIoDisposition, GapIoKind, GapIoObservation,
     GapRouteEntry, GapRouteKey, GapRouteSnapshot, GapRouteStats, RootGapRouteLedger};
-pub use setup_owner_census::{OwnerTableCost, SetupOwnerCensusGate,
+pub use setup_owner_census::{OwnerTableCost, SetupOwnerCensusGate, SetupOwnerIdentity,
+    SetupWaitedApplication, select_unique_waited_application,
     SetupOwnerPairValidity, SetupOwnerReceipt, SetupOwnerSample, top_owner_table_delta};
 pub use installer_fault_receipt::{InstallerFaultReceipt, InstallerFaultReceipts};
 pub use primary_alias_activation::{

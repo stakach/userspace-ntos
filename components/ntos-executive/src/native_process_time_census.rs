@@ -5,7 +5,8 @@
 
 use super::*;
 use nt_hosted_runtime::{HotIoCost, HotProcessCost, OwnerTableCost,
-    SetupOwnerCensusGate, SetupOwnerPairValidity, SetupOwnerReceipt, SetupOwnerSample,
+    SetupOwnerCensusGate, SetupOwnerIdentity, SetupOwnerPairValidity, SetupOwnerReceipt,
+    SetupOwnerSample, SetupWaitedApplication, select_unique_waited_application,
     top_owner_table_delta};
 use nt_syscall::NativeService;
 
@@ -129,28 +130,52 @@ fn owner_table_costs(rows: &[Row; MAX_PI]) -> [OwnerTableCost; MAX_PI] {
     costs
 }
 
-/// Observe the unique live application child of the registered interactive-logon process.
-/// The committed creator chain and process generation scope the diagnostic; no executable
-/// basename, PI or PID selects kernel behavior.
+/// Observe the live application process that the registered interactive-logon process waits on.
+/// Ordinary children need not have a committed execution-role creator entry. The retained wait
+/// object, exact caller, live process identity and catalog generation scope this read-only probe.
 fn observed_logon_child_pi(handler: &ExecNtHandler, rows: &[Row; MAX_PI]) -> Option<usize> {
-    let (_, logon) = handler.unique_live_execution_target(
+    let (logon_target, logon) = handler.unique_live_execution_target(
         nt_exe_image::HostedProcessRole::InteractiveLogon)?;
-    let mut found = None;
-    for (pi, row) in rows.iter().enumerate() {
-        if row.generation == 0 { continue; }
-        let Some(image) = handler.hosted_process_image(pi) else { continue; };
-        if image.generation != row.generation { continue; }
-        let Some(process) = handler.capture_process_identity(pi) else { continue; };
-        let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
-            process.generation else { continue; };
-        if generation != row.generation { continue; }
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(logon_generation) =
+        logon.generation else { return None; };
+    let logon = SetupOwnerIdentity { process_index: logon_target.pi, pid: logon.pid,
+        generation: logon_generation };
+    let mut slot = 0;
+    let mut object_index = 0;
+    let waits = core::iter::from_fn(|| loop {
+        if slot == crate::object_waiter_len() { return None; }
+        let Some((identity, record)) = crate::object_waiter_record(slot) else {
+            slot += 1; object_index = 0; continue;
+        };
+        if crate::object_waiter_is_claimed(identity) || object_index >= record.count as usize {
+            slot += 1; object_index = 0; continue;
+        }
+        let object = record.objects[object_index];
+        object_index += 1;
+        if object.kind() != WaitObject::KIND_PROCESS { continue; }
+        let caller = record.caller.process();
+        let nt_user_host::process_identity::ProcessGeneration::Hosted(caller_generation) =
+            caller.generation else { continue; };
+        let child_pid = object.id() as nt_process::ProcessId;
+        let Some(child_pi) = handler.pi_for_pid(child_pid) else { continue; };
+        if child_pi >= MAX_PI { continue; }
+        let Some(image) = handler.hosted_process_image(child_pi) else { continue; };
+        let Some(child) = handler.capture_process_identity(child_pi) else { continue; };
+        let nt_user_host::process_identity::ProcessGeneration::Hosted(child_generation) =
+            child.generation else { continue; };
+        if child.pid != child_pid || child_generation != image.generation
+            || rows[child_pi].generation != child_generation { continue; }
         let target = nt_exe_image::SpawnTarget::from_image(image);
-        if target.role != nt_exe_image::HostedProcessRole::Application
-            || !handler.is_live_execution_process(target, process)
-            || handler.execution_roles.creator_of(target, process) != Some(logon) { continue; }
-        if found.replace(pi).is_some() { return None; }
-    }
-    found
+        return Some(SetupWaitedApplication {
+            caller: SetupOwnerIdentity { process_index: record.caller.pi(),
+                pid: caller.pid, generation: caller_generation },
+            child: SetupOwnerIdentity { process_index: child_pi,
+                pid: child.pid, generation: child_generation },
+            live_application: target.role == nt_exe_image::HostedProcessRole::Application
+                && handler.is_live_execution_process(target, child),
+        });
+    });
+    select_unique_waited_application(logon, waits).map(|child| child.process_index)
 }
 
 /// Only the registered table-dispatch bracket is counted; native fast paths that bypass it
