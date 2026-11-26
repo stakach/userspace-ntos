@@ -155,6 +155,7 @@ mod object_port;
 mod open;
 mod owned_file_metadata;
 pub mod owned_file_lifecycle;
+mod pending_basic_prepared;
 mod pending_io;
 pub mod pending_irp_graph;
 mod pending_set_file_name;
@@ -269,6 +270,9 @@ pub use set_information_completion::{
 };
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
+pub use pending_basic_prepared::{
+    PendingBasicPreparedClaim, PendingBasicPreparedOwner, PendingBasicPreparedTable,
+};
 pub use pending_io::{
     PendingFileApcAttempt, PendingFileApcDeliveryLease, PendingFileApcDisposition,
     PendingFileApcEffect, PendingFileApcError, PendingFileApcOutcome, PendingFileApcPhase,
