@@ -137,8 +137,7 @@ impl Owner {
             let (operation, input) = if request.kind == nt_fs::AsyncSnapshotIoKind::Write {
                 let sectors = u32::try_from(request.bytes / 512).ok().filter(|sectors| {
                     *sectors != 0 && request.bytes == *sectors as usize * 512
-                        && request.lba.checked_add(u64::from(*sectors))
-                            .is_some_and(|end| end <= self.store.sector_count())
+                        && self.store.contains_sector_range(request.lba, u64::from(*sectors))
                 });
                 let lba = sectors.and_then(|_| self.snapshot_physical_start.checked_add(request.lba));
                 let (Some(sectors), Some(lba)) = (sectors, lba) else {

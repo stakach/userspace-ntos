@@ -37,6 +37,187 @@ fn two_generations() -> (SnapshotBlockStore, CachedDisk) {
     (store, dev)
 }
 
+/// The migration changes slot spacing, not header encoding or payload contents. Keep only
+/// written sectors while retaining the real LBA geometry of the installed reserve.
+struct SparseMigrationDisk {
+    sectors: u64,
+    written: alloc::collections::BTreeMap<u64, [u8; 512]>,
+}
+
+impl SparseMigrationDisk {
+    fn new(sectors: u64) -> Self {
+        Self { sectors, written: alloc::collections::BTreeMap::new() }
+    }
+
+    fn copy_slot_start_from(
+        &mut self,
+        source: &Self,
+        source_start: u64,
+        target_start: u64,
+        slot_sectors: u64,
+    ) {
+        for (&lba, sector) in source.written.range(source_start..source_start + slot_sectors) {
+            self.write_sector(target_start + (lba - source_start), sector).unwrap();
+        }
+    }
+}
+
+impl SnapshotBlockDevice for SparseMigrationDisk {
+    fn sector_size(&self) -> usize { 512 }
+    fn sector_count(&self) -> u64 { self.sectors }
+
+    fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        if lba >= self.sectors || out.len() != 512 {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
+        out.copy_from_slice(self.written.get(&lba).unwrap_or(&[0; 512]));
+        Ok(())
+    }
+
+    fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
+        if lba >= self.sectors || data.len() != 512 {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
+        let mut sector = [0; 512];
+        sector.copy_from_slice(data);
+        self.written.insert(lba, sector);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), SnapshotBlockStoreError> { Ok(()) }
+}
+
+#[test]
+fn relocated_eight_mib_slots_keep_latest_generation_and_wal_proof() {
+    use crate::{OwnedBoundedBlockRange, RegistryWal};
+
+    const MIB_SECTORS: u64 = 1024 * 1024 / 512;
+    const WAL_SECTORS: u64 = 16 * MIB_SECTORS;
+    const OLD_SLOT_SECTORS: u64 = 8 * MIB_SECTORS;
+    const NEW_SLOT_SECTORS: u64 = 32 * MIB_SECTORS;
+    const INCARNATION: u64 = 77;
+
+    let old_store = SnapshotBlockStore::new(0, 2 * OLD_SLOT_SECTORS);
+    let new_store = SnapshotBlockStore::new(WAL_SECTORS, 2 * NEW_SLOT_SECTORS);
+    let mut old = SparseMigrationDisk::new(2 * OLD_SLOT_SECTORS);
+    let baseline = WalSnapshotManifest {
+        incarnation: INCARNATION,
+        base_serial: 0,
+        high_water_serial: 0,
+        high_water_end_lba: 0,
+    };
+    assert_eq!(old_store.commit_next_with_wal_manifest(&mut old, b"older", baseline), Ok(1));
+    assert_eq!(old_store.commit_next_with_wal_manifest(&mut old, b"latest", baseline), Ok(2));
+
+    let new = SparseMigrationDisk::new(WAL_SECTORS + 2 * NEW_SLOT_SECTORS);
+    let range = OwnedBoundedBlockRange::new(new, 0, WAL_SECTORS).ok().unwrap();
+    let mut wal = RegistryWal::recover(range, INCARNATION).unwrap();
+    wal.begin(b"committed-before-slot-migration".to_vec()).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let (incarnation, serial, end_lba) = wal.verified_prefix().unwrap();
+    let anchor = WalSnapshotAnchor { incarnation, serial, end_lba };
+    assert_eq!(serial, 1);
+    let mut new = wal.into_device().ok().unwrap().into_device();
+
+    let mut update = WalSnapshotAnchorUpdate::admit(old_store, old, anchor).ok().unwrap();
+    update.advance().unwrap();
+    old = update.into_device().unwrap();
+    assert_eq!(old_store.verify_paired_wal_snapshot(&mut old).unwrap().anchor(), anchor);
+
+    // Copy each complete old 8 MiB slot into the beginning of its new 32 MiB slot.
+    // Unwritten sparse sectors represent the copied zero-filled remainder.
+    for slot in 0..2 {
+        new.copy_slot_start_from(
+            &old,
+            slot * OLD_SLOT_SECTORS,
+            WAL_SECTORS + slot * NEW_SLOT_SECTORS,
+            OLD_SLOT_SECTORS,
+        );
+    }
+    assert!(!new.written.contains_key(&(WAL_SECTORS + OLD_SLOT_SECTORS)),
+        "the old second-slot header must not remain at its former spacing");
+    assert!(new.written.contains_key(&(WAL_SECTORS + NEW_SLOT_SECTORS)));
+
+    let recovered = new_store.read_latest_wal(&mut new).unwrap().unwrap();
+    assert_eq!(recovered.snapshot.generation, 2);
+    assert_eq!(recovered.snapshot.payload, b"latest");
+    assert_eq!(recovered.selected_base_serial, 0);
+    assert_eq!(recovered.anchor, anchor);
+
+    let proof = new_store.verify_paired_wal_snapshot(&mut new).unwrap();
+    assert_eq!(proof.manifest().high_water_serial, 1);
+    assert_eq!(proof.anchor(), anchor);
+    assert!(proof.matches_cached_fence(new_store, anchor));
+    assert!(!proof.matches_cached_fence(old_store, anchor));
+    assert_eq!(new_store.recheck_verified_paired_wal_snapshot(&mut new, &proof),
+        Ok(proof.manifest()));
+
+    let range = OwnedBoundedBlockRange::new(new, 0, WAL_SECTORS).ok().unwrap();
+    let wal = RegistryWal::recover(range, INCARNATION).unwrap();
+    assert_eq!(recovered.verify_recovered_wal(&wal), Ok(()));
+}
+
+#[test]
+fn async_epoch_rollover_admits_disjoint_wal_before_nonzero_snapshot_store() {
+    use crate::{AsyncWalEpochRollover, OwnedBoundedBlockRange, RegistryWal};
+
+    const MIB_SECTORS: u64 = 1024 * 1024 / 512;
+    const WAL_SECTORS: u64 = 16 * MIB_SECTORS;
+    const SNAPSHOT_SLOT_SECTORS: u64 = 32 * MIB_SECTORS;
+    let store = SnapshotBlockStore::new(WAL_SECTORS, 2 * SNAPSHOT_SLOT_SECTORS);
+    let store_end = WAL_SECTORS + 2 * SNAPSHOT_SLOT_SECTORS;
+    assert!(!store.contains_sector_range(WAL_SECTORS - 1, 1));
+    assert!(!store.contains_sector_range(WAL_SECTORS, 0));
+    assert!(store.contains_sector_range(WAL_SECTORS, 1));
+    assert!(store.contains_sector_range(store_end - 1, 1));
+    assert!(!store.contains_sector_range(store_end - 1, 2));
+    let mut disk = SparseMigrationDisk::new(WAL_SECTORS + 2 * SNAPSHOT_SLOT_SECTORS);
+    let empty = WalSnapshotManifest {
+        incarnation: 77, base_serial: 0,
+        high_water_serial: 0, high_water_end_lba: 0,
+    };
+    store.commit_next_with_wal_manifest(&mut disk, b"old", empty).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"old", empty).unwrap();
+
+    let range = OwnedBoundedBlockRange::new(disk, 0, WAL_SECTORS).ok().unwrap();
+    let mut wal = RegistryWal::recover(range, 77).unwrap();
+    wal.begin(b"durable-before-fold".to_vec()).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let (incarnation, serial, end_lba) = wal.verified_prefix().unwrap();
+    assert_eq!(serial, 1);
+    let anchor = WalSnapshotAnchor { incarnation, serial, end_lba };
+    let disk = wal.into_device().ok().unwrap().into_device();
+    let mut update = WalSnapshotAnchorUpdate::admit(store, disk, anchor).ok().unwrap();
+    update.advance().unwrap();
+    let mut disk = update.into_device().unwrap();
+
+    let folded = WalSnapshotManifest {
+        incarnation, base_serial: serial,
+        high_water_serial: serial, high_water_end_lba: end_lba,
+    };
+    store.commit_next_with_wal_manifest(&mut disk, b"folded", folded).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"folded", folded).unwrap();
+    let pair = store.verify_paired_wal_snapshot(&mut disk).unwrap();
+    assert_eq!(pair.manifest(), folded, "the proof must cover both real folded payloads");
+
+    let (error, pair) = AsyncWalEpochRollover::admit(
+        store, pair, WAL_SECTORS, 1, 88, disk.sector_size(), disk.sector_count(),
+    ).err().expect("overlapping WAL and snapshot ranges must be rejected");
+    assert_eq!(error, SnapshotBlockStoreError::Corrupt);
+    let (error, pair) = AsyncWalEpochRollover::admit(
+        store, pair, u64::MAX, 2, 88, disk.sector_size(), disk.sector_count(),
+    ).err().expect("overflowing WAL range must be rejected");
+    assert_eq!(error, SnapshotBlockStoreError::Corrupt);
+
+    let mut rollover = AsyncWalEpochRollover::admit(
+        store, pair, 0, WAL_SECTORS, 88, disk.sector_size(), disk.sector_count(),
+    ).ok().expect("a disjoint WAL before the snapshots must be admissible");
+    let first = rollover.enter_next().unwrap().unwrap();
+    assert_eq!(first.lba, WAL_SECTORS, "reset starts at the first snapshot header");
+}
+
 #[test]
 fn commit_orders_three_barriers_and_survives_power_loss() {
     let (store, mut dev) = two_generations();

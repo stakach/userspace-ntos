@@ -19,7 +19,7 @@ enum Phase {
     Wal { wal: Wal, proof: RecheckedPairedWalSnapshot,
         store: nt_fs::SnapshotBlockStore,
         mount: SectionMountId, base_lba: u64, snapshot_lba: u64, entered: bool },
-    Anchor { update: Anchor, mount: SectionMountId,
+    Anchor { update: Anchor, store: nt_fs::SnapshotBlockStore, mount: SectionMountId,
         base_lba: u64, entered: bool },
     Ready { lease: snapshot_storage::Lease,
         anchored: Option<AnchoredWalPublication> },
@@ -219,6 +219,7 @@ pub(crate) unsafe fn poll_native_hive_journal(id: u64)
             };
             let mount = *lease.identity();
             let store = lease.store();
+            // Anchor requests already carry store-relative-to-reserve LBAs.
             let snapshot_lba = match snapshot_storage::physical_lba(&lease, 0) {
                 Ok(lba) => lba,
                 Err(status) => {
@@ -230,7 +231,7 @@ pub(crate) unsafe fn poll_native_hive_journal(id: u64)
                 }
             };
             let base_lba = match snapshot_storage::physical_lba(&lease,
-                crate::fs_loader::WRITABLE_SNAPSHOT_RESERVE_SECTORS as u64) {
+                snapshot_storage::WAL_START_SECTORS) {
                 Ok(lba) => lba,
                 Err(status) => {
                     let (status, restored) = restore_unentered_recheck(
@@ -358,9 +359,8 @@ pub(crate) unsafe fn claim_next_native_hive_io()
                 AsyncWalIoKind::Flush => BlockOperation::Flush,
                 AsyncWalIoKind::Write => {
                     let sectors = u32::try_from(request.bytes / 512).unwrap_or(0);
-                    if sectors == 0 || request.bytes != sectors as usize * 512
-                        || request.lba.checked_add(u64::from(sectors))
-                            .is_none_or(|end| end > crate::fs_loader::WRITABLE_SNAPSHOT_RESERVE_SECTORS as u64) {
+                    if request.bytes != sectors as usize * 512
+                        || !snapshot_storage::wal_request_fits(request.lba, u64::from(sectors)) {
                         let _ = wal.release_unentered_async(request);
                         journal.failed = Some(block(nt_fs::STATUS_INVALID_PARAMETER));
                         return None;
@@ -383,7 +383,7 @@ pub(crate) unsafe fn claim_next_native_hive_io()
             Some((HiveTicket { id: journal.id, request: HiveRequest::Wal(request) },
                 *mount, operation, input))
         }
-        Phase::Anchor { update, mount, base_lba, entered } => {
+        Phase::Anchor { update, store, mount, base_lba, entered } => {
             if *entered { return None; }
             let request = match update.enter_next() {
                 Ok(Some(request)) => request,
@@ -395,9 +395,8 @@ pub(crate) unsafe fn claim_next_native_hive_io()
                 AsyncSnapshotIoKind::Flush => BlockOperation::Flush,
                 AsyncSnapshotIoKind::Write => {
                     let sectors = u32::try_from(request.bytes / 512).unwrap_or(0);
-                    if sectors == 0 || request.bytes != sectors as usize * 512
-                        || request.lba.checked_add(u64::from(sectors))
-                            .is_none_or(|end| end > crate::fs_loader::WRITABLE_SNAPSHOT_RESERVE_SECTORS as u64) {
+                    if request.bytes != sectors as usize * 512
+                        || !store.contains_sector_range(request.lba, u64::from(sectors)) {
                         let _ = update.release_unentered(request);
                         journal.failed = Some(block(nt_fs::STATUS_INVALID_PARAMETER));
                         return None;
@@ -551,7 +550,7 @@ unsafe fn complete_native_hive_io_inner(
                     return Ok(SnapshotCompletion::Failed(block(snapshot_store_error_status(error))));
                 }
             };
-            journal.phase = Phase::Anchor { update, mount,
+            journal.phase = Phase::Anchor { update, store, mount,
                 base_lba: snapshot_lba, entered: false };
             Ok(SnapshotCompletion::Settled)
         }

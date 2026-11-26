@@ -656,7 +656,7 @@ unsafe fn snapshot_reserve_available() -> bool {
     let Some(fat) = crate::fs_loader::exec_fs() else {
         return false;
     };
-    crate::fs_loader::writable_snapshot_reserve(&fat).is_some()
+    crate::fs_loader::writable_snapshot_reserve_start(&fat).is_some()
 }
 
 fn note_restored_snapshot(generation: u64, bytes: usize, nodes: usize) {

@@ -42,6 +42,11 @@ def stop_marker(stop):
 MIGRATION_CANDIDATE = DISK.with_name("disk.migration-candidate.img")
 WORKFLOW = ".github/workflows/native-kvm-smoke.yml"
 MAX_DISK_BYTES = 2 * 1024**3
+MIB = 1024 * 1024
+OLD_PERSIST_BYTES = 32 * MIB
+NEW_PERSIST_BYTES = 96 * MIB
+OLD_SNAPSHOT_SLOT_BYTES = 8 * MIB
+NEW_SNAPSHOT_SLOT_BYTES = 32 * MIB
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 ESP_TYPE = uuid.UUID("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
@@ -279,11 +284,13 @@ def verify_migration_manifest(value: dict, run_id: int, attempt: int,
         "source_repo": current["repo"], "workflow": WORKFLOW,
     }
     expected.update({key: current[key] for key in (
-        "libernt_manifest_sha256", "disk_size_bytes", "image_profile",
+        "libernt_manifest_sha256", "image_profile",
     )})
     for key, target in expected.items():
         if value.get(key) != target:
             raise ContinuationError(f"migration {key} differs from source or current build")
+    if not migration_size_shape(value.get("disk_size_bytes"), current["disk_size_bytes"]):
+        raise ContinuationError("migration disk_size_bytes differs from source or current build")
     if not migration_submodule_is_compatible(value.get("submodule_sha"), current["submodule_sha"]):
         raise ContinuationError("migration submodule_sha is not this build's or an ancestor of it")
     for key in ("disk_sha256", "base_disk_sha256", "kernel_sha256",
@@ -292,6 +299,81 @@ def verify_migration_manifest(value: dict, run_id: int, attempt: int,
             raise ContinuationError(f"migration {key} is invalid")
     if value.get("qemu_stopped") is not True:
         raise ContinuationError("source QEMU stop receipt absent")
+
+
+def migration_size_shape(source_bytes: object, target_bytes: object) -> bool:
+    """Only an unchanged disk or the one supported 32-to-96 MiB tail growth."""
+    return type(source_bytes) is int and type(target_bytes) is int \
+        and source_bytes > 0 and target_bytes <= MAX_DISK_BYTES \
+        and (source_bytes == target_bytes
+             or target_bytes - source_bytes == NEW_PERSIST_BYTES - OLD_PERSIST_BYTES)
+
+
+def gpt_base_bytes(image: Path) -> int:
+    """The GPT alternate LBA locates the end of Simpleboot's FAT-visible disk."""
+    with image.open("rb") as disk_file:
+        disk_file.seek(512)
+        header = disk_file.read(92)
+    if header[:8] != b"EFI PART" or int.from_bytes(header[24:32], "little") != 1:
+        raise ContinuationError("migration has no expected primary GPT header")
+    alternate = int.from_bytes(header[32:40], "little")
+    if alternate < 34 or alternate >= MAX_DISK_BYTES // 512:
+        raise ContinuationError("migration has invalid GPT disk geometry")
+    return (alternate + 1) * 512
+
+
+def migration_expansion_base(source: Path, target: Path,
+                             source_bytes: int, target_bytes: int) -> int | None:
+    """Prove both images share one base before moving any persistent bytes."""
+    if source_bytes == target_bytes:
+        return None
+    if not migration_size_shape(source_bytes, target_bytes):
+        raise ContinuationError("migration disk tail has unsupported sizes")
+    base = gpt_base_bytes(source)
+    if base != gpt_base_bytes(target) or source_bytes != base + OLD_PERSIST_BYTES \
+            or target_bytes != base + NEW_PERSIST_BYTES:
+        raise ContinuationError("migration disk tail differs from verified 32-to-96 MiB geometry")
+    return base
+
+
+def copy_region(source: Path, target: Path, source_start: int,
+                target_start: int, length: int) -> None:
+    with source.open("rb") as incoming, target.open("r+b") as candidate:
+        incoming.seek(source_start)
+        candidate.seek(target_start)
+        while length:
+            block = incoming.read(min(length, MIB))
+            if not block:
+                raise ContinuationError("snapshot slot ended early during migration")
+            candidate.write(block)
+            length -= len(block)
+
+
+def extend_snapshot_tail(candidate: Path, source: Path, base: int,
+                         target_bytes: int) -> None:
+    with candidate.open("r+b") as image:
+        image.truncate(target_bytes)
+    for slot in range(2):
+        copy_region(source, candidate, base + slot * OLD_SNAPSHOT_SLOT_BYTES,
+                    base + OLD_PERSIST_BYTES + slot * NEW_SNAPSHOT_SLOT_BYTES,
+                    OLD_SNAPSHOT_SLOT_BYTES)
+
+
+def verify_expanded_snapshot_tail(candidate: Path, source: Path, base: int) -> None:
+    zero = hashlib.sha256()
+    zero_block = bytes(MIB)
+    for _ in range((NEW_SNAPSHOT_SLOT_BYTES - OLD_SNAPSHOT_SLOT_BYTES) // MIB):
+        zero.update(zero_block)
+    zero_hash = zero.hexdigest()
+    for slot in range(2):
+        old = base + slot * OLD_SNAPSHOT_SLOT_BYTES
+        new = base + OLD_PERSIST_BYTES + slot * NEW_SNAPSHOT_SLOT_BYTES
+        if region_digest(candidate, new, OLD_SNAPSHOT_SLOT_BYTES) != \
+                region_digest(source, old, OLD_SNAPSHOT_SLOT_BYTES):
+            raise ContinuationError("migration snapshot slot copy differs from source")
+        if region_digest(candidate, new + OLD_SNAPSHOT_SLOT_BYTES,
+                         NEW_SNAPSHOT_SLOT_BYTES - OLD_SNAPSHOT_SLOT_BYTES) != zero_hash:
+            raise ContinuationError("migration new snapshot slot slack is not zero")
 
 
 def esp_geometry(image: Path) -> tuple[int, int]:
@@ -447,7 +529,8 @@ def patch_migration_esp(candidate: Path, source: Path, current: dict) -> dict:
     if driver_inventory(candidate, offset) != source_drivers:
         raise ContinuationError("migration changed driver inventory")
     end = offset + length
-    for start, count in ((0, offset), (end, current["disk_size_bytes"] - end)):
+    source_bytes = require_regular(source, MAX_DISK_BYTES)
+    for start, count in ((0, offset), (end, source_bytes - end)):
         if region_digest(source, start, count) != region_digest(candidate, start, count):
             raise ContinuationError("migration changed bytes outside the ESP")
     return changes
@@ -567,10 +650,12 @@ def migrate(run_id: int, attempt: int, token: str) -> None:
     verify_stop(run, manifest)
     verify_migration_manifest(manifest, run_id, attempt, current, run)
     incoming = IN / "disk.img"
-    if require_regular(incoming, MAX_DISK_BYTES) != current["disk_size_bytes"]:
-        raise ContinuationError("source disk length differs from current generated disk")
+    source_bytes = require_regular(incoming, MAX_DISK_BYTES)
+    if source_bytes != manifest["disk_size_bytes"]:
+        raise ContinuationError("source disk length differs from migration manifest")
     if digest(incoming) != manifest["disk_sha256"]:
         raise ContinuationError("source disk SHA-256 mismatch")
+    base = migration_expansion_base(incoming, DISK, source_bytes, current["disk_size_bytes"])
     verify_hive_provenance(manifest, incoming)
     no_qemu_owner()
     if any(path.exists() for path in (BACKUP, RECEIPT, FAILED, MIGRATION_CANDIDATE)):
@@ -578,9 +663,13 @@ def migrate(run_id: int, attempt: int, token: str) -> None:
     candidate = MIGRATION_CANDIDATE
     try:
         shutil.copyfile(incoming, candidate)
+        if base is not None:
+            extend_snapshot_tail(candidate, incoming, base, current["disk_size_bytes"])
         changes = patch_migration_esp(candidate, incoming, current)
         if require_regular(candidate, MAX_DISK_BYTES) != current["disk_size_bytes"]:
             raise ContinuationError("migration changed disk length")
+        if base is not None:
+            verify_expanded_snapshot_tail(candidate, incoming, base)
         migrated_hash = digest(candidate)
         if digest(incoming) != manifest["disk_sha256"]:
             raise ContinuationError("migration changed the source artifact")

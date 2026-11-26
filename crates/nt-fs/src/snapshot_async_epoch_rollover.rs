@@ -39,15 +39,17 @@ impl AsyncWalEpochRollover {
         device_sectors: u64,
     ) -> Result<Self, (SnapshotBlockStoreError, VerifiedPairedWalSnapshot)> {
         let old = pair.anchor();
-        let end = wal_start.checked_add(wal_sectors);
-        let store_end = store.start_lba.checked_add(store.sector_count);
+        let ranges_disjoint = wal_start.checked_add(wal_sectors)
+            .zip(store.start_lba.checked_add(store.sector_count))
+            .is_some_and(|(wal_end, store_end)| {
+                wal_end <= device_sectors && store_end <= device_sectors
+                    && (wal_end <= store.start_lba || store_end <= wal_start)
+            });
         if pair.store != store || old.incarnation == 0 || old.serial == 0
             || next_incarnation == 0 || next_incarnation == old.incarnation
             || wal_sectors == 0 || sector_size < WAL_RESET_HEADER_LEN
             || store.sector_count < 4 || store.sector_count % 2 != 0
-            || end.is_none_or(|v| v > device_sectors)
-            || store_end.is_none_or(|v| v > device_sectors)
-            || wal_start < store_end.unwrap_or(u64::MAX)
+            || !ranges_disjoint
             || pair.plans[0].generation == pair.plans[1].generation
             || pair.plans.iter().any(|plan| plan.resetting || plan.wal.is_none_or(|wal| {
                 wal.anchor() != old || wal.base_serial != old.serial

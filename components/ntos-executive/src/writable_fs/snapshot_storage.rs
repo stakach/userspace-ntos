@@ -1,7 +1,7 @@
 //! The single owned backend for the executable mount's physical snapshot reserve.
 
 use super::*;
-use nt_fs::{BoundedBlockRange, OwnedBoundedBlockRange, SnapshotBlockDevice, SnapshotReserve, SnapshotReserveLease};
+use nt_fs::{OwnedBoundedBlockRange, SnapshotBlockDevice, SnapshotReserve, SnapshotReserveLease};
 use nt_memory_manager::SectionMountId;
 
 #[path = "snapshot_storage/native_header_recheck.rs"]
@@ -51,14 +51,22 @@ struct MountedWalContinuation {
 // WAL and validates both snapshot payloads before installing a fresh mounted pair.
 static mut WAL_CONTINUATION: Option<MountedWalContinuation> = None;
 pub(super) const BUSY: u32 = 0x8000_0011;
-const SNAPSHOT_SECTORS: u64 = crate::fs_loader::WRITABLE_SNAPSHOT_RESERVE_SECTORS as u64;
-const WAL_SECTORS: u64 = SNAPSHOT_SECTORS;
+const MIB_SECTORS: u64 = 1024 * 1024 / 512;
+pub(super) const WAL_START_SECTORS: u64 = 16 * MIB_SECTORS;
+pub(super) const WAL_SECTORS: u64 = 16 * MIB_SECTORS;
+const SNAPSHOT_START_SECTORS: u64 = 32 * MIB_SECTORS;
+const SNAPSHOT_SECTORS: u64 = 64 * MIB_SECTORS;
+const RESERVE_SECTORS: u64 = SNAPSHOT_START_SECTORS + SNAPSHOT_SECTORS;
+
+pub(super) fn wal_request_fits(lba: u64, sectors: u64) -> bool {
+    sectors != 0 && lba.checked_add(sectors).is_some_and(|end| end <= WAL_SECTORS)
+}
 
 pub(super) fn wal_bounds(lease: &Lease) -> Result<(u64, u64), u32> {
-    if lease.sector_count() < SNAPSHOT_SECTORS + WAL_SECTORS {
+    if lease.sector_count() < RESERVE_SECTORS {
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
     }
-    Ok((SNAPSHOT_SECTORS, WAL_SECTORS))
+    Ok((WAL_START_SECTORS, WAL_SECTORS))
 }
 
 /// Boot-only publication, before the executable filesystem identity becomes visible. This slot
@@ -70,32 +78,19 @@ pub(crate) unsafe fn publish(fat: Fat32, mount: SectionMountId, physical_sectors
     }
     if let Some(device) = AhciSnapshotDevice::from_backing(fat, physical_sectors)? {
         let physical_range = (mount, device.start_lba, u64::from(device.sectors));
-        let store = nt_fs::SnapshotBlockStore::new(0, SNAPSHOT_SECTORS);
+        let store = nt_fs::SnapshotBlockStore::new(SNAPSHOT_START_SECTORS, SNAPSHOT_SECTORS);
         *slot = Some(SnapshotReserve::new(device, mount, store));
         *core::ptr::addr_of_mut!(PHYSICAL_RANGE) = Some(physical_range);
     }
     Ok(())
 }
 
-/// A disjoint tail view under the snapshot backend's existing exclusive mount lease.
-/// No registry write path uses this region until append/recovery ownership is implemented.
-#[allow(dead_code)]
-pub(super) fn wal_region(lease: &mut Lease) -> Result<Option<BoundedBlockRange<'_, Lease>>, u32> {
-    if lease.sector_count() < SNAPSHOT_SECTORS + WAL_SECTORS {
-        return Ok(None);
-    }
-    BoundedBlockRange::new(lease, SNAPSHOT_SECTORS, WAL_SECTORS)
-        .map(Some)
-        .map_err(|_| nt_fs::STATUS_INVALID_PARAMETER)
-}
-
 /// Move the exact reserve lease into a bounded WAL owner. Once a record write begins,
 /// uncertainty must retain this owner so the reserve cannot be reused by a new writer.
-#[allow(dead_code)]
 pub(super) fn owned_wal_region(
     lease: Lease,
 ) -> Result<OwnedBoundedBlockRange<Lease>, (u32, Lease)> {
-    OwnedBoundedBlockRange::new(lease, SNAPSHOT_SECTORS, WAL_SECTORS)
+    OwnedBoundedBlockRange::new(lease, WAL_START_SECTORS, WAL_SECTORS)
         .map_err(|(_, lease)| (nt_fs::STATUS_INVALID_PARAMETER, lease))
 }
 
@@ -250,26 +245,19 @@ pub(crate) struct AhciSnapshotDevice {
 
 impl AhciSnapshotDevice {
     fn from_backing(fat: Fat32, physical_sectors: u64) -> Result<Option<Self>, u32> {
-        let Some((start_lba, snapshot_sectors)) = crate::fs_loader::writable_snapshot_reserve(&fat) else {
+        let Some(start_lba) = crate::fs_loader::writable_snapshot_reserve_start(&fat) else {
             return Ok(None);
         };
-        let snapshot_end = start_lba
-            .checked_add(u64::from(snapshot_sectors))
+        let reserve_end = start_lba
+            .checked_add(RESERVE_SECTORS)
             .ok_or(nt_fs::STATUS_INVALID_PARAMETER)?;
-        if snapshot_end > physical_sectors {
-            return Ok(None);
+        if reserve_end > physical_sectors {
+            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
-        let wal_end = snapshot_end.checked_add(WAL_SECTORS)
-            .ok_or(nt_fs::STATUS_INVALID_PARAMETER)?;
-        let sectors = if wal_end <= physical_sectors {
-            snapshot_sectors + WAL_SECTORS as u32
-        } else {
-            snapshot_sectors
-        };
         Ok(Some(Self {
             fat,
             start_lba,
-            sectors,
+            sectors: RESERVE_SECTORS as u32,
             flush_command: None,
         }))
     }
