@@ -52,12 +52,9 @@ impl ExecNtHandler {
             Err(status) => status.raw() as u32,
             Ok(()) => match route.file_object {
                 LocalFileObject::Overlay(file_id) => {
-                    let status =
-                        self.set_overlay_file_information(file_id, information_class, payload);
-                    if status == nt_fs::STATUS_SUCCESS {
-                        self.writable_fs_dirty = true;
-                    }
-                    status
+                    // The writable volume publishes its durable mutation bit after applying
+                    // the class. File position and unchanged basic information owe no snapshot.
+                    self.set_overlay_file_information(file_id, information_class, payload)
                 }
                 LocalFileObject::ReadonlyFile(object_id) => {
                     self.readonly_file_opens

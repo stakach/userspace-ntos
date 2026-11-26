@@ -59,6 +59,10 @@ mod delete_disposition;
 mod basic_information;
 pub(crate) use basic_information::BasicInformationChange;
 
+#[path = "set_information_effect.rs"]
+mod set_information_effect;
+pub use set_information_effect::SetInformationEffect;
+
 #[path = "file_object_information.rs"]
 mod file_object_information;
 pub use file_object_information::FileObjectInformation;

@@ -2770,10 +2770,12 @@ pub(crate) unsafe fn set_information(file_id: u64, class: u32, data: &[u8]) -> u
         Ok(fs) => fs,
         Err(status) => return status,
     };
-    let status = fs.zw_set_information_file(file_id, class, data);
+    let (status, effect) = fs.zw_set_information_file_effect(file_id, class, data);
     if status == nt_fs::STATUS_SUCCESS {
         OVERLAY_SET_INFO.fetch_add(1, Ordering::Relaxed);
-        mark_snapshot_dirty();
+        if effect != nt_fs::SetInformationEffect::NoVolumeChange {
+            mark_snapshot_dirty();
+        }
     }
     status
 }
