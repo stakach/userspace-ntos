@@ -161,6 +161,10 @@ pub struct PendingOwnedModeInputCapture {
     pub signal_reset: bool,
 }
 
+#[path = "pending_io/basic_preflight.rs"]
+mod basic_preflight;
+pub use basic_preflight::{PendingBasicBaselineTicket, PendingOwnedBasicPreflight};
+
 /// An already-terminal local read or directory query with immutable table-owned output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PendingLocalBuffered {
@@ -181,13 +185,15 @@ pub enum PendingFileIoOperation {
     OwnedInline(PendingOwnedInline),
     OwnedModeInputCapture(PendingOwnedModeInputCapture),
     OwnedModePrecommit(PendingOwnedModePrecommit),
+    OwnedBasicPreflight(PendingOwnedBasicPreflight),
     LocalBuffered(PendingLocalBuffered),
     LocalFlush(PendingLocalFlush),
 }
 
 impl PendingFileIoOperation {
-    pub const fn is_owned_mode_uncommitted(self) -> bool {
-        matches!(self, Self::OwnedModeInputCapture(_) | Self::OwnedModePrecommit(_))
+    pub const fn is_owned_work_uncommitted(self) -> bool {
+        matches!(self, Self::OwnedModeInputCapture(_) | Self::OwnedModePrecommit(_)
+            | Self::OwnedBasicPreflight(_))
     }
 }
 
@@ -817,6 +823,14 @@ impl PendingFileIoTable {
                     && pending.completion_port_suppressed
                     && pending.event_obj_idx == u64::MAX
             }
+            PendingFileIoOperation::OwnedBasicPreflight(_) => {
+                pending.major == nt_io_abi::major::IRP_MJ_SET_INFORMATION
+                    && pending.output_va == 0 && pending.output_len == 0
+                    && pending.iosb_va != 0
+                    && pending.apc_routine == 0 && !pending.publish_iocp
+                    && pending.completion_port_suppressed
+                    && pending.event_obj_idx == u64::MAX
+            }
             PendingFileIoOperation::LocalBuffered(operation) => {
                 matches!(pending.major,
                     nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL)
@@ -959,7 +973,8 @@ impl PendingFileIoTable {
         if self.contains_irp(pending.irp_id) {
             return Err(PendingFileIoParkError::DuplicateIrp);
         }
-        if matches!(pending.operation, PendingFileIoOperation::LocalFlush(_))
+        if matches!(pending.operation, PendingFileIoOperation::LocalFlush(_)
+            | PendingFileIoOperation::OwnedBasicPreflight(_))
             && self.local_operation_id(reservation) != Some(pending.irp_id)
         {
             return Err(PendingFileIoParkError::InvalidRecord);
@@ -1129,7 +1144,7 @@ impl PendingFileIoTable {
             };
             !pending.is_local()
                 && !matches!(pending.operation, PendingFileIoOperation::OwnedInline(_))
-                && !pending.operation.is_owned_mode_uncommitted()
+                && !pending.operation.is_owned_work_uncommitted()
                 && pending.irp_id == irp_id
                 && expected_file_id == file_id
                 && pending.tid == requestor_tid
@@ -1390,7 +1405,7 @@ impl PendingFileIoTable {
         }
         self.get(slot).is_some_and(|pending| {
             pending.irp_id == irp_id
-                && !pending.operation.is_owned_mode_uncommitted()
+                && !pending.operation.is_owned_work_uncommitted()
                 && pending.busy_is_settled()
                 && Self::create_output_is_settled(pending)
                 && pending.delivery_state
@@ -1461,7 +1476,7 @@ impl PendingFileIoTable {
         let entry = self.slots.get_mut(slot)?;
         let finished = if entry.is_some_and(|pending| {
             pending.irp_id == irp_id
-                && !pending.operation.is_owned_mode_uncommitted()
+                && !pending.operation.is_owned_work_uncommitted()
                 && pending.busy_is_settled()
                 && Self::create_output_is_settled(pending)
                 && pending.delivery_state & Self::required_delivery_state(pending)
@@ -1495,7 +1510,7 @@ impl PendingFileIoTable {
         }
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
-            || pending.operation.is_owned_mode_uncommitted()
+            || pending.operation.is_owned_work_uncommitted()
             || !Self::local_flush_delivery_flag_is_valid(*pending, flag)
             || (matches!(pending.operation, PendingFileIoOperation::LocalBuffered(_))
                 && (flag == IO_DELIVERY_BUFFER_PUBLISHED || !Self::local_output_settled(*pending)))
@@ -1525,7 +1540,9 @@ impl PendingFileIoTable {
         if pending.irp_id != irp_id
             || matches!(pending.operation, PendingFileIoOperation::LocalFlush(_)
                 | PendingFileIoOperation::OwnedModeInputCapture(_)
-                | PendingFileIoOperation::OwnedModePrecommit(_) | PendingFileIoOperation::Create(_))
+                | PendingFileIoOperation::OwnedModePrecommit(_)
+                | PendingFileIoOperation::OwnedBasicPreflight(_)
+                | PendingFileIoOperation::Create(_))
             || expected_iosb_va == 0
             || pending.iosb_va != expected_iosb_va
             || pending.consumer_abandoned
@@ -1571,6 +1588,7 @@ impl PendingFileIoTable {
             || matches!(pending.operation,
                 PendingFileIoOperation::OwnedInline(_) | PendingFileIoOperation::OwnedModeInputCapture(_)
                     | PendingFileIoOperation::OwnedModePrecommit(_)
+                    | PendingFileIoOperation::OwnedBasicPreflight(_)
                     | PendingFileIoOperation::LocalFlush(_))
             || terminal_output_len > pending.output_len
             || pending.output_offset > terminal_output_len
@@ -1596,7 +1614,7 @@ impl PendingFileIoTable {
         }
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
-            || pending.operation.is_owned_mode_uncommitted()
+            || pending.operation.is_owned_work_uncommitted()
             || !pending.reply_required
             || !Self::local_output_settled(*pending)
             || !Self::local_flush_reply_ready(*pending)
@@ -1657,7 +1675,7 @@ impl PendingFileIoTable {
         }
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
-            || pending.operation.is_owned_mode_uncommitted()
+            || pending.operation.is_owned_work_uncommitted()
             || !pending.busy_is_settled()
             || !Self::create_output_is_settled(*pending)
             || pending.delivery_state & IO_DELIVERY_BACKEND_ACKED != 0
@@ -1885,6 +1903,10 @@ mod local_delivery_tests;
 #[cfg(test)]
 #[path = "pending_io/local_inline_tests.rs"]
 mod local_inline_tests;
+
+#[cfg(test)]
+#[path = "pending_io/basic_preflight_tests.rs"]
+mod basic_preflight_tests;
 
 #[cfg(test)]
 #[path = "pending_io/local_operation_id_tests.rs"]

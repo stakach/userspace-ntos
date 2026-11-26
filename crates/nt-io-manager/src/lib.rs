@@ -281,6 +281,7 @@ pub use pending_io::{
     LocalFlushMode, PendingFileIoIdentity, PendingFileIoReservation, PendingFileIoTable, PendingLocalBuffered,
     PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingOwnedInline,
     PendingOwnedModeInputCapture, PendingOwnedModePrecommit,
+    PendingBasicBaselineTicket, PendingOwnedBasicPreflight,
     PendingSetFileNameOperation, PendingFileAttributeQuery, PendingObjectNameQuery,
     IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED,
     IO_DELIVERY_CREATE_COMMITTED,
