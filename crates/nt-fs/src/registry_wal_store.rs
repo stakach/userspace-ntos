@@ -679,13 +679,18 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     /// Cancel a reservation before PREPARE starts. No sector has been touched, so this
     /// is the only pending state that can release its device without a clearing barrier.
     pub fn cancel_pending(&mut self) -> Result<(), RegistryWalError> {
+        self.cancel_pending_owned().map(|_payload| ())
+    }
+
+    /// Return a post-publication frame's exact bytes after a confirmed no-effect cancel.
+    pub fn cancel_pending_owned(&mut self) -> Result<Vec<u8>, RegistryWalError> {
         if self.async_effect.is_some() { return Err(RegistryWalError::InvalidState); }
         if self.state != RegistryWalState::PendingPrepare {
             return Err(RegistryWalError::InvalidState);
         }
-        self.pending = None;
+        let pending = self.pending.take().ok_or(RegistryWalError::InvalidState)?;
         self.state = RegistryWalState::Ready;
-        Ok(())
+        Ok(pending.payload)
     }
 
     /// Write PREPARE plus payload, then issue the first device durability barrier.
