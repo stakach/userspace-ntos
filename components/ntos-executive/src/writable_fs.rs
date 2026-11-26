@@ -1761,8 +1761,9 @@ fn verified_boot_log(
                         _ => nt_fs::STATUS_DATA_ERROR,
                     }))?;
             }
-            // No native owner can produce or admit namespace records yet.
-            nt_fs::VolumeWalPayload::FileCreate(_)
+            // No native owner can produce or admit these typed volume records yet.
+            nt_fs::VolumeWalPayload::FileBasic(_)
+            | nt_fs::VolumeWalPayload::FileCreate(_)
             | nt_fs::VolumeWalPayload::FileRename(_) => {
                 return Err(BootSystemRestoreError::Snapshot(nt_fs::STATUS_DATA_ERROR));
             }
