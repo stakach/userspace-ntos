@@ -2,6 +2,26 @@
 
 use super::*;
 
+/// A single validated basic-information update with its resolved clock value.
+/// The FileSystem remains unchanged until this move-only value is applied.
+pub struct PreparedBasicInformation {
+    handle: u64,
+    node_id: u64,
+    entry_id: u64,
+    before: FileMetadata,
+    after: FileMetadata,
+    opened_path: Option<String>,
+    notify: bool,
+}
+
+impl PreparedBasicInformation {
+    pub fn resolved_metadata(&self) -> FileMetadata { self.after }
+
+    /// The exact live entry name captured for a future durable producer. The synchronous Zw
+    /// surface uses the same prepared state without allocating or retaining a path.
+    pub fn opened_path(&self) -> Option<&str> { self.opened_path.as_deref() }
+}
+
 /// A validated `FILE_BASIC_INFORMATION` request. `None` leaves the stored value unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BasicInformationChange {
@@ -63,34 +83,90 @@ impl BasicInformationChange {
 }
 
 impl FileSystem {
-    pub(super) fn set_basic_information(&mut self, handle: u64, data: &[u8]) -> u32 {
-        let Some(node_id) = self.obj(handle).map(|object| object.node_id) else {
-            return STATUS_INVALID_HANDLE;
+    /// Validate a live named File and freeze the resolved metadata without mutating it. The
+    /// captured entry name allows a later publisher to refuse a rename or replacement while its
+    /// physical work is outstanding. Unlinked Files retain ordinary synchronous Zw semantics.
+    pub fn prepare_basic_information(
+        &self, handle: u64, data: &[u8],
+    ) -> Result<PreparedBasicInformation, u32> {
+        self.prepare_basic_information_inner(handle, data, true)
+    }
+
+    fn prepare_basic_information_inner(
+        &self, handle: u64, data: &[u8], capture_path: bool,
+    ) -> Result<PreparedBasicInformation, u32> {
+        let object = self.obj(handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let node = self.volume.node(object.node_id).ok_or(STATUS_INVALID_HANDLE)?;
+        let change = BasicInformationChange::parse(data, node.is_dir)?;
+        let before = self.volume.metadata(object.node_id, object.delete_pending)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let opened_path = if capture_path {
+            if object.entry_id != 0 && self.checked_object_entry(object)?.is_none() {
+                return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+            }
+            Some(self.query_opened_name(handle)?)
+        } else {
+            None
         };
-        let change = match BasicInformationChange::parse(data, self.volume.is_dir(node_id)) {
-            Ok(change) => change,
+        let mut after = before;
+        if !change.is_empty() {
+            after.creation_time = change.creation_time.unwrap_or(before.creation_time);
+            after.last_access_time = change.last_access_time.unwrap_or(before.last_access_time);
+            after.last_write_time = change.last_write_time.unwrap_or(before.last_write_time);
+            after.attributes = change.attributes.unwrap_or(before.attributes);
+            after.change_time = change.change_time.unwrap_or(self.volume.current_time_100ns);
+        }
+        Ok(PreparedBasicInformation {
+            handle, node_id: object.node_id, entry_id: object.entry_id,
+            before, after, opened_path, notify: !change.is_empty(),
+        })
+    }
+
+    /// Apply only to the same live File and namespace entry that preparation observed. A stale
+    /// plan has no effect; the caller holding a durable record must retain that uncertainty.
+    pub fn apply_prepared_basic_information(
+        &mut self, prepared: PreparedBasicInformation,
+    ) -> Result<FileMetadata, u32> {
+        let object = self.obj(prepared.handle).ok_or(STATUS_DATA_ERROR)?;
+        if object.node_id != prepared.node_id || object.entry_id != prepared.entry_id
+            || self.volume.metadata(object.node_id, object.delete_pending) != Some(prepared.before)
+        {
+            return Err(STATUS_DATA_ERROR);
+        }
+        if let Some(path) = prepared.opened_path.as_deref() {
+            if (object.entry_id != 0 && self.checked_object_entry(object)?.is_none())
+                || self.query_opened_name(prepared.handle).as_deref() != Ok(path)
+            {
+                return Err(STATUS_DATA_ERROR);
+            }
+        }
+        let node = self.volume.node_mut(prepared.node_id).ok_or(STATUS_DATA_ERROR)?;
+        node.creation_time = prepared.after.creation_time;
+        node.last_access_time = prepared.after.last_access_time;
+        node.last_write_time = prepared.after.last_write_time;
+        node.attributes = prepared.after.attributes;
+        node.change_time = prepared.after.change_time;
+        if prepared.notify {
+            self.report_handle_change(
+                prepared.handle,
+                crate::FILE_NOTIFY_CHANGE_ATTRIBUTES
+                    | crate::FILE_NOTIFY_CHANGE_CREATION
+                    | crate::FILE_NOTIFY_CHANGE_LAST_ACCESS
+                    | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
+            );
+        }
+        Ok(prepared.after)
+    }
+
+    pub(super) fn set_basic_information(&mut self, handle: u64, data: &[u8]) -> u32 {
+        let prepared = match self.prepare_basic_information_inner(handle, data, false) {
+            Ok(prepared) => prepared,
             Err(status) => return status,
         };
-        if change.is_empty() {
-            return STATUS_SUCCESS;
+        match self.apply_prepared_basic_information(prepared) {
+            Ok(_) => STATUS_SUCCESS,
+            Err(status) => status,
         }
-        let now = self.volume.current_time_100ns;
-        let Some(node) = self.volume.node_mut(node_id) else {
-            return STATUS_INVALID_HANDLE;
-        };
-        node.creation_time = change.creation_time.unwrap_or(node.creation_time);
-        node.last_access_time = change.last_access_time.unwrap_or(node.last_access_time);
-        node.last_write_time = change.last_write_time.unwrap_or(node.last_write_time);
-        node.attributes = change.attributes.unwrap_or(node.attributes);
-        node.change_time = change.change_time.unwrap_or(now);
-        self.report_handle_change(
-            handle,
-            crate::FILE_NOTIFY_CHANGE_ATTRIBUTES
-                | crate::FILE_NOTIFY_CHANGE_CREATION
-                | crate::FILE_NOTIFY_CHANGE_LAST_ACCESS
-                | crate::FILE_NOTIFY_CHANGE_LAST_WRITE,
-        );
-        STATUS_SUCCESS
     }
 }
 
