@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     PreparedSystemHiveMutation, SystemHiveMount, SystemHiveMutationAbortAcknowledgement,
-    SystemHiveMutationCommitReceipt,
+    SystemHiveMutationCommitReceipt, SystemHiveMutationStorageBinding,
 };
 
 static NEXT_MANAGER_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -41,6 +41,7 @@ struct Record {
     work_id: u64,
     mount: SystemHiveMount,
     generation: u64,
+    storage_binding: SystemHiveMutationStorageBinding,
     state: State,
     row_retired: bool,
     observers: usize,
@@ -116,6 +117,7 @@ impl SystemCommitObservations {
     ) -> Result<(), SystemCommitObservationError> {
         let mount = prepared.mount();
         let generation = prepared.next_generation();
+        let storage_binding = prepared.storage_binding();
         if let Some(record) = self
             .records
             .iter()
@@ -124,6 +126,7 @@ impl SystemCommitObservations {
         {
             return if record.mount == mount
                 && record.generation == generation
+                && record.storage_binding == storage_binding
                 && matches!(record.state, State::Armed | State::Pending)
             {
                 Ok(())
@@ -166,6 +169,7 @@ impl SystemCommitObservations {
             work_id,
             mount,
             generation,
+            storage_binding,
             state: State::Armed,
             row_retired: false,
             observers: 0,
@@ -186,6 +190,7 @@ impl SystemCommitObservations {
                 record.work_id == work_id
                     && record.mount == prepared.mount()
                     && record.generation == prepared.next_generation()
+                    && record.storage_binding == prepared.storage_binding()
             })
             .ok_or(SystemCommitObservationError::Invalid)?;
         match record.state {
@@ -217,6 +222,7 @@ impl SystemCommitObservations {
                 record.work_id == work_id
                     && record.mount == prepared.mount()
                     && record.generation == prepared.next_generation()
+                    && record.storage_binding == prepared.storage_binding()
             })
             .ok_or(SystemCommitObservationError::Invalid)?;
         match record.state {
@@ -249,7 +255,10 @@ impl SystemCommitObservations {
         else {
             return Ok(()); // The row never armed or entered CM COMMIT.
         };
-        if record.mount != prepared.mount() || record.generation != prepared.next_generation() {
+        if record.mount != prepared.mount()
+            || record.generation != prepared.next_generation()
+            || record.storage_binding != prepared.storage_binding()
+        {
             return Err(SystemCommitObservationError::Invalid);
         }
         match record.state {
@@ -438,5 +447,42 @@ mod tests {
         let (error, _) = records.release(stale).unwrap_err();
         assert_eq!(error, SystemCommitObservationError::Invalid);
         records.release(next_ticket).unwrap();
+    }
+
+    #[test]
+    fn different_preparation_at_same_mount_and_generation_cannot_settle_ticket() {
+        let mut client = client(1);
+        let first = prepare(&mut client, 1, "First");
+        let mut records = SystemCommitObservations::new();
+        records.arm(45, &first).unwrap();
+        records.enter(45, &first).unwrap();
+        let ticket = records.capture(first.mount()).unwrap().unwrap();
+
+        let aborted = client
+            .abort_prepared_system_hive_mutation_retained(&first)
+            .unwrap();
+        let first_ack = client
+            .acknowledge_system_hive_mutation_abort(aborted)
+            .unwrap();
+        let other = prepare(&mut client, 1, "Other");
+        assert_eq!(first.mount(), other.mount());
+        assert_eq!(first.next_generation(), other.next_generation());
+        assert_ne!(first.storage_binding(), other.storage_binding());
+        assert_eq!(
+            records.enter(45, &other),
+            Err(SystemCommitObservationError::Invalid)
+        );
+        let other_receipt = client.commit_system_hive_mutation_retained(&other).unwrap();
+        assert_eq!(
+            records.publish(45, &other, other_receipt),
+            Err(SystemCommitObservationError::Invalid)
+        );
+        assert_eq!(records.poll(&ticket), Ok(SystemCommitOutcome::Pending));
+
+        let _ = client.acknowledge_system_hive_mutation_commit(other_receipt).unwrap();
+        records.no_effect(45, &first, first_ack).unwrap();
+        records.retire(45);
+        assert_eq!(records.poll(&ticket), Ok(SystemCommitOutcome::NoEffect));
+        records.release(ticket).unwrap();
     }
 }
