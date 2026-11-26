@@ -140,3 +140,26 @@ fn cancelled_consumer_before_baseline_entry_cannot_start_effect() {
         Some((nt_status::NtStatus::CANCELLED.raw() as u32, 0))
     );
 }
+
+#[test]
+fn prepared_sidecar_refuses_a_crossed_generation_of_the_same_pending_slot() {
+    let mut table = PendingFileIoTable::new();
+    let (identity, irp_id) = park_basic(&mut table);
+    let mut fs = nt_fs::FileSystem::new(nt_fs::MemFs::new());
+    assert!(fs.provision_directory(r"\??\C:\Dir"));
+    let opened = fs.zw_create_file(r"\??\C:\Dir\file.txt",
+        nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE, 0,
+        nt_fs::FILE_SHARE_READ | nt_fs::FILE_SHARE_WRITE | nt_fs::FILE_SHARE_DELETE,
+        nt_fs::FILE_CREATE, nt_fs::FILE_NON_DIRECTORY_FILE);
+    assert_eq!(opened.status, nt_fs::STATUS_SUCCESS);
+    let input = [0u8; 40];
+    let mut sidecar = crate::PendingBasicPreparedTable::new();
+    assert!(sidecar.park_exact(&table, identity, irp_id,
+        crate::PendingBasicPreparedOwner::prepare(&fs, opened.handle, input, ()).ok().unwrap()).is_ok());
+    let crossed = PendingFileIoIdentity {
+        generation: identity.generation + 1, ..identity
+    };
+    assert!(sidecar.claim_exact(&table, crossed, irp_id).is_none());
+    assert_eq!(sidecar.len(), 1);
+    assert!(sidecar.claim_exact(&table, identity, irp_id).is_some());
+}

@@ -145,7 +145,7 @@ fn setup_constructor_waits_for_provider_registry_and_journal_quiescence() {
     assert!(drain.contains("bootstrap_receive::drive("),
         "provider work needs the pre-constructor bootstrap scheduler");
     assert!(drain.contains("registry_mutation_work::pending_count()"));
-    assert!(drain.contains("registry_journal::owns_volume()"),
+    assert!(drain.contains("volume_owner::owns_volume()"),
         "storage ownership must also be clear before setup admission");
 }
 

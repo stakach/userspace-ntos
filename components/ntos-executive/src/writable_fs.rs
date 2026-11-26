@@ -48,6 +48,9 @@ mod snapshot_capture;
 #[path = "writable_fs/registry_journal.rs"]
 pub(crate) mod registry_journal;
 
+#[path = "writable_fs/volume_owner.rs"]
+pub(crate) mod volume_owner;
+
 #[path = "writable_fs/registry_wal.rs"]
 pub(crate) mod registry_wal;
 
@@ -672,7 +675,7 @@ fn note_restored_snapshot(generation: u64, bytes: usize, nodes: usize) {
 static mut WRITABLE_MOUNT_ID: Option<nt_memory_manager::SectionMountId> = None;
 
 unsafe fn install_writable_fs(mut fs: nt_fs::FileSystem, restored: bool) -> Result<(), u32> {
-    if registry_journal::owns_volume() {
+    if volume_owner::owns_volume() {
         return Err(snapshot_storage::BUSY);
     }
     if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some() {
@@ -703,6 +706,9 @@ unsafe fn checkpoint_volume_snapshot(
     wal_manifest: Option<nt_fs::WalSnapshotManifest>,
     captured_image: Option<&[u8]>,
 ) -> Result<(u64, usize), SnapshotCommitFailure> {
+    if volume_owner::owns_volume() {
+        return Err(SnapshotCommitFailure::Unentered(snapshot_storage::BUSY));
+    }
     let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
         return Err(SnapshotCommitFailure::Unentered(nt_fs::STATUS_INVALID_HANDLE));
     };
@@ -763,6 +769,7 @@ unsafe fn with_durable_wal_fence<F>(proof: F) -> Result<(), u32>
 where
     F: FnOnce() -> Result<(), u32>,
 {
+    if volume_owner::owns_volume() { return Err(snapshot_storage::BUSY); }
     let native = crate::fs_loader::exec_fs_mount_identity()
         .and_then(crate::fs_loader::exec_block_route_kind)
         == Some(nt_fs::BlockSourceKind::Native);
@@ -807,6 +814,9 @@ pub(crate) unsafe fn with_clean_v2_volume_at_quiesce<F>(verify_hives: F) -> Resu
 where
     F: FnOnce() -> Result<(), u32>,
 {
+    if volume_owner::owns_volume() {
+        return Err(report_quiesce_proof_failure(b"volume-owned", snapshot_storage::BUSY));
+    }
     let native = crate::fs_loader::exec_fs_mount_identity()
         .and_then(crate::fs_loader::exec_block_route_kind)
         == Some(nt_fs::BlockSourceKind::Native);
@@ -886,16 +896,6 @@ pub(crate) fn checkpoint_epochs() -> (u64, u64) {
     SNAPSHOT_PUBLICATION.epochs()
 }
 
-/// A checkpoint cleared the dirty bit and will capture the volume.
-fn note_checkpoint_begun() {
-    SNAPSHOT_PUBLICATION.record_begun();
-}
-
-/// The one checkpoint in flight published. Only one runs at a time, so it is the latest begun.
-fn note_checkpoint_published() {
-    SNAPSHOT_PUBLICATION.publish_current();
-}
-
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
 /// `Ok(false)` means the volume was already clean.
 pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
@@ -924,11 +924,12 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
             return Err(snapshot_storage::BUSY);
         }
     }
-    if !SNAPSHOT_PUBLICATION.take_dirty() {
-        return Ok(false);
-    }
-    note_checkpoint_begun();
-    let begun_epoch = checkpoint_epochs().0;
+    let capture = match SNAPSHOT_PUBLICATION.begin_dirty_capture() {
+        Ok(Some(capture)) => capture,
+        Ok(None) => return Ok(false),
+        Err(_) => return Err(nt_fs::STATUS_INSUFFICIENT_RESOURCES),
+    };
+    let begun_epoch = capture.epoch();
     let written_before = WRITABLE_FS_SNAPSHOT_WRITE_SECTORS.load(Ordering::Relaxed);
     let trace = BOOT_CHECKPOINT_MEASURES.fetch_update(Ordering::AcqRel,
         Ordering::Acquire, |used| (used < 2048).then_some(used + 1)).is_ok();
@@ -1008,7 +1009,11 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
                     return Err(status);
                 }
             }
-            note_checkpoint_published();
+            if capture.publish().is_err() {
+                WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+                core::mem::forget(dev);
+                return Err(nt_fs::STATUS_DATA_ERROR);
+            }
             WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
@@ -1058,6 +1063,7 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
 /// The caller must run this after resetting snapshot scratch and preserve the allocator mark when
 /// this returns `true`, because the compacted extent index becomes durable mounted-volume state.
 pub(crate) unsafe fn compact_unreferenced_blobs() -> bool {
+    if volume_owner::owns_volume() { return false; }
     let Some(fs) = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() else {
         return false;
     };
@@ -1289,7 +1295,7 @@ unsafe fn provision_missing_installed_sources(fs: &mut nt_fs::FileSystem) -> boo
 /// # Safety
 /// Single-threaded executive; the returned reference must not outlive the calling syscall service.
 unsafe fn writable_fs() -> Result<&'static mut nt_fs::FileSystem, u32> {
-    if registry_journal::owns_volume() {
+    if volume_owner::owns_volume() {
         return Err(snapshot_storage::BUSY);
     }
     if !WRITABLE_OVERLAY_MOUNTED {
@@ -1337,7 +1343,7 @@ pub(crate) unsafe fn ensure_mounted() -> Result<(), u32> {
 /// A non-mounting namespace observation. An unread or unsuccessfully installed snapshot is not
 /// an absent upper layer. Only a disabled overlay or a confirmed empty reserve permits that result.
 unsafe fn mounted_namespace_fs() -> Result<Option<&'static mut nt_fs::FileSystem>, u32> {
-    if registry_journal::owns_volume() {
+    if volume_owner::owns_volume() {
         return Err(snapshot_storage::BUSY);
     }
     if !WRITABLE_OVERLAY_MOUNTED {
@@ -1795,7 +1801,7 @@ fn verified_boot_log(
 /// Single-threaded early boot, after the executable FAT volume is mounted and before hosted code.
 pub(crate) unsafe fn restore_boot_system_persistence(
 ) -> Result<BootSystemPersistence, BootSystemRestoreError> {
-    if registry_journal::owns_volume() {
+    if volume_owner::owns_volume() {
         return Err(BootSystemRestoreError::Snapshot(snapshot_storage::BUSY));
     }
     if !WRITABLE_OVERLAY_MOUNTED {
@@ -1860,7 +1866,7 @@ pub(crate) unsafe fn restore_boot_system_persistence(
 
 /// Whether the volume has been mounted (i.e. something actually resolved into it).
 pub(crate) unsafe fn writable_fs_mounted() -> bool {
-    registry_journal::owns_volume() || (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some()
+    volume_owner::owns_volume() || (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some()
 }
 
 /// Copy a complete internal file into caller-owned storage without exposing a filesystem borrow.

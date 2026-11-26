@@ -11,9 +11,6 @@ fn mounted_v2_volume_checkpoint_captures_one_image_before_disk_effects() {
         < checkpoint.find("checkpoint_volume_snapshot(").unwrap());
     assert!(checkpoint.contains("SNAPSHOT_PUBLICATION.mark_dirty()"),
         "failed pre-effect capture must preserve the dirty owner");
-    assert!(checkpoint.find("SNAPSHOT_PUBLICATION.take_dirty()").unwrap()
-        < checkpoint.find("snapshot_storage::take_wal_continuation(&mut dev)").unwrap(),
-        "a clean checkpoint poll must not acquire WAL proof or read snapshot headers");
     let start = source.find("unsafe fn checkpoint_volume_snapshot(")
         .expect("checkpoint writer");
     let end = source[start..].find("\n/// ").map(|offset| start + offset).unwrap_or(source.len());

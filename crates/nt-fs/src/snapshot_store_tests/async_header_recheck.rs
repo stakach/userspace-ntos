@@ -74,8 +74,7 @@ fn unentered_checkpoint_recheck_abort_retains_dirty_publication_obligation() {
     disk.events.clear();
     let publication = crate::SnapshotPublicationState::new();
     publication.mark_dirty();
-    assert!(publication.take_dirty());
-    publication.record_begun();
+    let capture = publication.begin_dirty_capture().unwrap().unwrap();
     let mut recheck = AsyncSnapshotHeaderRecheck::new(
         store, pair, disk.sector_size(), disk.sector_count()).ok().unwrap();
     let request = recheck.enter_next().unwrap().unwrap();
@@ -85,6 +84,7 @@ fn unentered_checkpoint_recheck_abort_retains_dirty_publication_obligation() {
     assert!(!disk.events.iter().any(|event| matches!(event, Event::Write(_))),
         "the recheck refusal must not publish a snapshot slot");
     publication.abort_unwritten_checkpoint();
+    drop(capture);
     assert!(publication.is_dirty(), "a later checkpoint must still capture the bytes");
     assert_eq!(publication.epochs(), (1, 0),
         "a refused read cannot satisfy the caller's publication target");

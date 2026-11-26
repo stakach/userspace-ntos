@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 static NATIVE: AtomicBool = AtomicBool::new(false);
-static JOURNAL_OWNS: AtomicBool = AtomicBool::new(false);
+static VOLUME_OWNS: AtomicBool = AtomicBool::new(false);
 static FAT_READS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_ROUTES: AtomicUsize = AtomicUsize::new(0);
 static mut NT_QUERY_ATTR_FOLDED_SCRATCH: [u8; 512] = [0; 512];
@@ -42,11 +42,11 @@ mod smss_attribute_probe_trace {
 }
 
 mod writable_fs {
-    use crate::{nt_fs, JOURNAL_OWNS};
+    use crate::{nt_fs, VOLUME_OWNS};
     use std::sync::atomic::Ordering;
-    pub mod registry_journal {
+    pub mod volume_owner {
         pub fn owns_volume() -> bool {
-            crate::JOURNAL_OWNS.load(std::sync::atomic::Ordering::SeqCst)
+            crate::VOLUME_OWNS.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
     pub fn writable_path_into(_: &[u16], _: &mut [u8], _: &mut [u8]) -> Option<usize> {
@@ -60,7 +60,7 @@ mod writable_fs {
     }
     pub fn query_metadata_relative_if_mounted(_: &[u8])
         -> Result<Option<nt_fs::FileMetadata>, u32> {
-        if JOURNAL_OWNS.load(Ordering::SeqCst) { Err(0x8000_0011) }
+        if VOLUME_OWNS.load(Ordering::SeqCst) { Err(0x8000_0011) }
         else { Ok(None) }
     }
 }
@@ -174,15 +174,15 @@ fn full_attributes_do_not_read_boot_fat_after_native_handoff() {
 }
 
 #[test]
-fn journal_owned_absolute_attributes_route_before_busy_overlay_probe() {
+fn volume_owned_absolute_attributes_route_before_busy_overlay_probe() {
     let _guard = TEST_LOCK.lock().unwrap();
     NATIVE.store(true, Ordering::SeqCst);
-    JOURNAL_OWNS.store(true, Ordering::SeqCst);
+    VOLUME_OWNS.store(true, Ordering::SeqCst);
     NATIVE_ROUTES.store(0, Ordering::SeqCst);
     FAT_READS.store(0, Ordering::SeqCst);
     let basic = unsafe { handler().nt_query_attributes_file_service(&[0, 0]) };
     let full = unsafe { handler().nt_query_full_attributes_file_service(&[0, 0]) };
-    JOURNAL_OWNS.store(false, Ordering::SeqCst);
+    VOLUME_OWNS.store(false, Ordering::SeqCst);
     assert_eq!((basic, full), (0x103, 0x103));
     assert_eq!(NATIVE_ROUTES.load(Ordering::SeqCst), 2);
     assert_eq!(FAT_READS.load(Ordering::SeqCst), 0);

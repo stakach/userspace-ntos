@@ -53,6 +53,7 @@ mod path;
 mod query;
 mod snapshot_store;
 mod snapshot_publication;
+mod hive_log_baseline;
 mod snapshot_reserve;
 mod snapshot_region;
 mod registry_wal_store;
@@ -68,6 +69,7 @@ mod volume_wal_sequence;
 mod snapshot_test_device;
 mod status;
 mod volume;
+mod volume_owner;
 mod volume_open_route;
 
 pub use byte_lock::*;
@@ -149,7 +151,9 @@ pub use snapshot_store::{
     WalSnapshotAnchorUpdate, WalSnapshotEpochRollover, WalSnapshotManifest, VerifiedPairedWalSnapshot,
 };
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
-pub use snapshot_publication::SnapshotPublicationState;
+pub use snapshot_publication::{SnapshotCaptureEpoch, SnapshotPublicationError, SnapshotPublicationState};
+pub use hive_log_baseline::{HiveLogBaselineAuthority, HiveLogBaselineMismatch};
+pub use volume_owner::{VolumeOwner, VolumeOwnerError, VolumeOwnerGate};
 pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};
 pub use registry_wal_store::{AsyncWalIoKind, AsyncWalIoRequest, AsyncWalRefusal, RegistryWal, RegistryWalContinuation, RegistryWalError, RegistryWalFrameRoom, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
 pub use system_wal_batch_payload::{

@@ -423,6 +423,112 @@ fn anchored_run_once_deletions_stay_deleted_after_volume_reload() {
     assert!(rebooted.open_key(RUN_ONCE_EX).is_some());
 }
 
+fn anchor_named_log_record(
+    store: SnapshotBlockStore,
+    disk: CachedDisk,
+    file_id: u64,
+    expected_len: u64,
+    record: &[u8],
+) -> CachedDisk {
+    let payload = crate::encode_hive_log_wal_payload(HiveLogWalPayload {
+        file_id, expected_log_len: expected_len, path: SOFTWARE_LOG, record,
+    }).unwrap();
+    let mut disk = disk;
+    let pair = store.verify_paired_wal_snapshot(&mut disk).unwrap();
+    let range = OwnedBoundedBlockRange::new(disk, 32, 32).ok().unwrap();
+    let mut wal = RegistryWal::recover(range, 77).unwrap();
+    wal.begin(payload).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let mut update = WalSnapshotAnchorUpdate::admit_verified_wal_pair(store, verified, pair)
+        .ok().unwrap();
+    update.advance().unwrap();
+    let (disk, receipt) = update.into_anchored_publication().ok().unwrap();
+    let _ = receipt.into_parts();
+    disk
+}
+
+#[test]
+fn named_hive_log_fold_and_next_wal_record_recover_from_durable_pair() {
+    let store = SnapshotBlockStore::new(0, 32);
+    let mut disk = CachedDisk::with_sectors(64);
+    let mut volume = crate::FileSystem::new(crate::MemFs::new());
+    assert!(volume.provision_file(SOFTWARE_LOG, b""));
+    let file_id = volume.existing_file_id(SOFTWARE_LOG).unwrap();
+    let snapshot_a = volume.export_volume_snapshot().unwrap();
+    let manifest_a = WalSnapshotManifest { incarnation: 77, base_serial: 0,
+        high_water_serial: 0, high_water_end_lba: 0 };
+    store.commit_next_with_wal_manifest(&mut disk, &snapshot_a, manifest_a).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, &snapshot_a, manifest_a).unwrap();
+
+    let first = nt_hive_core::encode_log_record(&nt_hive_core::HiveLogOp::CreateKey {
+        path: r"\Registry\Machine\SOFTWARE\FoldFirst",
+    }, 1);
+    disk = anchor_named_log_record(store, disk, file_id, 0, &first);
+    assert_eq!(volume.replay_hive_log_wal_payload(HiveLogWalPayload {
+        file_id, expected_log_len: 0, path: SOFTWARE_LOG, record: &first,
+    }), Ok(crate::HiveLogWalReplay::Appended));
+    let snapshot_b = volume.export_volume_snapshot().unwrap();
+    let old = store.current_wal_checkpoint_manifest(&mut disk).unwrap();
+    assert_eq!((old.base_serial, old.high_water_serial), (0, 1));
+    let folded = WalSnapshotManifest { base_serial: 1, ..old };
+
+    // A failed first fold header leaves A and record N as the recoverable pair.
+    disk.events.clear();
+    disk.fail_event = Some(3);
+    assert_eq!(store.commit_next_with_wal_manifest(&mut disk, &snapshot_b, folded),
+        Err(crate::SnapshotBlockStoreError::Io));
+    disk.power_cut();
+    let selected = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    assert_eq!(selected.snapshot.payload, snapshot_a);
+    assert_eq!(selected.selected_base_serial, 0);
+    assert_eq!(selected.anchor.serial, 1);
+
+    // Cut after the first fold header: recovery accepts B only with its retired WAL
+    // marker. A second header and CM acknowledgement have not yet licensed live reuse.
+    store.commit_next_with_wal_manifest(&mut disk, &snapshot_b, folded).unwrap();
+    disk.power_cut();
+    let selected = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    let range = OwnedBoundedBlockRange::new(disk, 32, 32).ok().unwrap();
+    let wal = RegistryWal::recover(range, 77).unwrap();
+    assert_eq!(selected.verify_recovered_wal(&wal), Ok(()));
+    assert_eq!(selected.anchor.serial, 1);
+    let mut disk = wal.into_device().unwrap().into_device();
+    store.commit_next_with_wal_manifest(&mut disk, &snapshot_b, folded).unwrap();
+    let pair = store.verify_paired_wal_snapshot(&mut disk).unwrap();
+    assert_eq!(pair.anchor().serial, 1);
+
+    let publication = crate::SnapshotPublicationState::new();
+    let capture = publication.begin_fold_capture().unwrap();
+    let epoch = capture.epoch();
+    capture.publish().unwrap();
+    let baseline = crate::HiveLogBaselineAuthority::AnchoredSuffix
+        .after_durable_fold(epoch, Some(0), true);
+    assert_eq!(baseline.needs_checkpoint(true, Some(first.len() as u64),
+        first.len() as u64, &publication), Ok(false));
+    let second = nt_hive_core::encode_log_record(&nt_hive_core::HiveLogOp::CreateKey {
+        path: r"\Registry\Machine\SOFTWARE\FoldSecond",
+    }, 2);
+    disk = anchor_named_log_record(store, disk, file_id, first.len() as u64, &second);
+    disk.power_cut();
+    let selected = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    assert_eq!(selected.selected_base_serial, 1);
+    assert_eq!(selected.anchor.serial, 2);
+    let range = OwnedBoundedBlockRange::new(disk, 32, 32).ok().unwrap();
+    let wal = RegistryWal::recover(range, 77).unwrap();
+    assert_eq!(selected.verify_recovered_wal(&wal), Ok(()));
+    let mut restored = crate::FileSystem::from_volume_snapshot(&selected.snapshot.payload).unwrap();
+    for entry in &wal.records()[selected.selected_base_serial as usize..] {
+        let crate::VolumeWalPayload::HiveLog(payload) =
+            crate::decode_volume_wal_payload(&entry.payload).unwrap() else { panic!("named log") };
+        assert_eq!(restored.replay_hive_log_wal_payload(payload),
+            Ok(crate::HiveLogWalReplay::Appended));
+    }
+    assert_eq!(restored.file_bytes_owned(SOFTWARE_LOG).unwrap(),
+        [first.as_slice(), second.as_slice()].concat());
+}
+
 // #424: a kernel driver's `ZwSetValueKey` and win32k's writes reach the same hive log as a
 // hosted caller's, and a delete made on the Boot route of a WAL volume is anchored as an exact
 // record too. Both must survive the volume reload and hive log replay of the next boot.

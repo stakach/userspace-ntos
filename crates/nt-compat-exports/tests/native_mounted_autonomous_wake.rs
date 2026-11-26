@@ -88,7 +88,7 @@ fn claimable_mounted_work_has_a_timer_source_without_incidental_irq() {
 fn native_publication_requests_outer_rearm_before_parking() {
     let create = &BACKEND[BACKEND.find("    fn create(&mut self, irp: &IrpProjection)")
         .expect("mounted CREATE handler")..];
-    let native = &create[create.find("if route_kind != nt_fs::BlockSourceKind::Boot || journal_owned")
+    let native = &create[create.find("if route_kind != nt_fs::BlockSourceKind::Boot || volume_owned")
         .expect("native mounted CREATE branch")..];
     let pending = native.find("return Ok(DispatchOutcome::Pending);")
         .expect("native CREATE parks its original IRP");

@@ -501,7 +501,7 @@ pub(super) unsafe fn maintain(
             let win32k_busy = crate::spawn_hosts::shared_ingress::owner::runtime::
                 is_win32k_native_call(lp.msg.mi, lp.msg.m0) && component_shared_publication_is_busy();
             match nt_driver_start::add_device_turn_call(
-                win32k_busy, crate::writable_fs::registry_journal::owns_volume(),
+                win32k_busy, crate::writable_fs::volume_owner::owns_volume(),
             ) {
                 nt_driver_start::AddDeviceTurnCall::Admit => {
                     let ingress = match nt_handler.admit_hosted_thread_ingress(lp.msg.badge) {
@@ -779,7 +779,7 @@ pub(super) unsafe fn maintain(
     if alpc_reply_committed.is_some() {
         let _ = lpc_component_reply_commit_drain(&mut nt_handler);
     }
-    if crate::writable_fs::registry_journal::owns_volume()
+    if crate::writable_fs::volume_owner::owns_volume()
         && lp.msg.badge != DELAY_TIMER_BADGE
         && hosted_irq_lines_from_badge(lp.msg.badge) == 0
     {
