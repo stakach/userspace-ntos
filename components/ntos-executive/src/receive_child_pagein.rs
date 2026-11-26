@@ -15,7 +15,7 @@ pub(crate) unsafe fn deferral_admitted() -> bool {
     !service_sec_image::root_add_device_exclusive_pending()
         && !service_sec_image::root_queued_callback_exclusive_pending()
         && !driver_launch::unsettled_queued_callback()
-        && !writable_fs::registry_journal::owns_volume()
+        && !writable_fs::volume_owner::owns_volume()
 }
 
 /// One timer or IRQ notification while the child's page-in owns its Reply.

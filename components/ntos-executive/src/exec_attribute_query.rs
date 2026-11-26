@@ -77,8 +77,8 @@ impl ExecNtHandler {
     ) -> Option<u32> {
         let route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
             .and_then(crate::fs_loader::exec_block_route_kind);
-        let journal_owned = crate::writable_fs::registry_journal::owns_volume();
-        let mounted_owns = nt_fs::mounted_volume_owns_installed_names(route, journal_owned);
+        let volume_owned = crate::writable_fs::volume_owner::owns_volume();
+        let mounted_owns = nt_fs::mounted_volume_owns_installed_names(route, volume_owned);
         let installed = nt_fs::nt_path_to_volume_relative(name, crate::installed_layout::ROOT)
             .is_some();
         if installed && !mounted_owns {
@@ -88,7 +88,7 @@ impl ExecNtHandler {
             name, object_attributes & 0x40 != 0,
         );
         if !nt_fs::absolute_file_routes_to_mounted_volume(
-            false, Self::absolute_file_name(name, Some(&resolved)), route, journal_owned,
+            false, Self::absolute_file_name(name, Some(&resolved)), route, volume_owned,
         ) {
             if !mounted_owns { return None; }
             smss_attribute_probe_trace::trace_smss_attribute_resolution(

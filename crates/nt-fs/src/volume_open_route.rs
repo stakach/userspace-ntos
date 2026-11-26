@@ -2,7 +2,7 @@
 //!
 //! Before the native block handoff the boot loader's synchronous FAT reader serves the
 //! installed-volume spellings it can translate (`\??\C:\...`, `\SystemRoot\...`). Once boot
-//! storage drains, or the registry journal owns the writable overlay, the registered
+//! storage drains, or an exclusive owner holds the writable overlay, the registered
 //! mounted-volume Device is the only owner of those names.
 
 use alloc::vec::Vec;
@@ -51,13 +51,13 @@ pub struct AbsoluteFileName {
     pub installed_volume_spelling: bool,
 }
 
-/// After the handoff starts (or while the registry journal owns the overlay), installed-volume
+/// After the handoff starts (or while the exclusive owner holds the overlay), installed-volume
 /// names belong to the mounted Device; the boot reader must not observe or mutate them.
 pub fn mounted_volume_owns_installed_names(
     block_route: Option<BlockSourceKind>,
-    journal_owns_volume: bool,
+    volume_owned: bool,
 ) -> bool {
-    journal_owns_volume
+    volume_owned
         || matches!(block_route, Some(BlockSourceKind::Draining | BlockSourceKind::Native))
 }
 
@@ -72,13 +72,13 @@ pub fn absolute_file_routes_to_mounted_volume(
     directory_file: bool,
     name: AbsoluteFileName,
     block_route: Option<BlockSourceKind>,
-    journal_owns_volume: bool,
+    volume_owned: bool,
 ) -> bool {
     if directory_file || name.target == ResolvedFileTarget::FilesystemVolume {
         return true;
     }
     if name.installed_volume_spelling {
-        return mounted_volume_owns_installed_names(block_route, journal_owns_volume);
+        return mounted_volume_owns_installed_names(block_route, volume_owned);
     }
     name.target == ResolvedFileTarget::FilesystemChild
 }
@@ -93,7 +93,7 @@ pub enum InstalledImageReader {
 }
 
 /// Select the reader for an installed system image, or `None` when no installed volume is
-/// mounted. Image reads never consult the writable overlay, so the registry journal's ownership
+/// mounted. Image reads never consult the writable overlay, so the exclusive ownership
 /// of that overlay leaves them where they are; the native block handoff moves them for good.
 pub fn installed_image_reader(block_route: Option<BlockSourceKind>) -> Option<InstalledImageReader> {
     let route = block_route?;
@@ -145,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_spellings_stay_on_the_boot_reader_until_the_handoff_or_journal() {
+    fn installed_spellings_stay_on_the_boot_reader_until_the_handoff_or_volume_owner() {
         for target in [ResolvedFileTarget::Unowned, ResolvedFileTarget::FilesystemChild] {
             let installed = name(target, true);
             assert!(!absolute_file_routes_to_mounted_volume(false, installed, None, false));
@@ -157,18 +157,18 @@ mod tests {
                 false, installed, Some(BlockSourceKind::Native), false));
             assert!(absolute_file_routes_to_mounted_volume(
                 false, installed, Some(BlockSourceKind::Boot), true),
-                "a journal-owned overlay retains the CREATE on the mounted owner");
+                "an owned overlay retains the CREATE on the mounted owner");
         }
     }
 
     #[test]
     fn directory_files_and_the_volume_file_always_use_the_mounted_device() {
         for phase in PHASES {
-            for journal in [false, true] {
+            for owner in [false, true] {
                 assert!(absolute_file_routes_to_mounted_volume(
-                    true, name(ResolvedFileTarget::Unowned, false), phase, journal));
+                    true, name(ResolvedFileTarget::Unowned, false), phase, owner));
                 assert!(absolute_file_routes_to_mounted_volume(
-                    false, name(ResolvedFileTarget::FilesystemVolume, false), phase, journal));
+                    false, name(ResolvedFileTarget::FilesystemVolume, false), phase, owner));
             }
         }
     }
@@ -178,10 +178,10 @@ mod tests {
         // `\Device\<volume>\reactos\...` has no boot-reader translation. Once the Object
         // Manager resolved it onto a registered kernel filesystem, only that Device can serve it.
         for phase in PHASES {
-            for journal in [false, true] {
+            for owner in [false, true] {
                 assert!(absolute_file_routes_to_mounted_volume(
-                    false, name(ResolvedFileTarget::FilesystemChild, false), phase, journal),
-                    "device-spelled child must enter the mounted Device: {phase:?} {journal}");
+                    false, name(ResolvedFileTarget::FilesystemChild, false), phase, owner),
+                    "device-spelled child must enter the mounted Device: {phase:?} {owner}");
             }
         }
     }
@@ -201,9 +201,9 @@ mod tests {
     #[test]
     fn names_outside_every_filesystem_never_enter_the_mounted_device() {
         for phase in PHASES {
-            for journal in [false, true] {
+            for owner in [false, true] {
                 assert!(!absolute_file_routes_to_mounted_volume(
-                    false, name(ResolvedFileTarget::Unowned, false), phase, journal));
+                    false, name(ResolvedFileTarget::Unowned, false), phase, owner));
             }
         }
     }

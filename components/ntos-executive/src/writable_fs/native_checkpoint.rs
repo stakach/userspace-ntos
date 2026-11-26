@@ -98,6 +98,7 @@ fn block(status: u32) -> u32 {
 /// Progress admission only from the outer service turn. The recheck owner holds the reserve
 /// while its two native header reads are outstanding; no synchronous disk access occurs here.
 unsafe fn advance_recheck() -> Result<(), u32> {
+    if volume_owner::owns_volume() { return Err(snapshot_storage::BUSY); }
     let _durable = crate::allocator::enter_durable();
     let slot = &mut *core::ptr::addr_of_mut!(WORK);
     let Some(Work::Rechecking { id, started_ticks, start_after_print, trace, .. }) = slot.as_ref()
@@ -175,6 +176,7 @@ unsafe fn advance_recheck() -> Result<(), u32> {
 }
 
 pub(super) unsafe fn checkpoint_dirty_native() -> Result<bool, u32> {
+    if volume_owner::owns_volume() { return Err(snapshot_storage::BUSY); }
     if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_none() {
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }

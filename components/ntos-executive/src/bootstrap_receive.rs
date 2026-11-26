@@ -45,7 +45,7 @@ pub(crate) unsafe fn drive<T: Copy + Eq>(
         }
         // The registry journal owns the mounted volume until its terminal ACK. Incoming
         // autonomous Calls remain in the shared receiver while that ownership is live.
-        if !writable_fs::registry_journal::owns_volume() {
+        if !writable_fs::volume_owner::owns_volume() {
             if ingress::service_autonomous().map_err(|_| nt_process::STATUS_UNSUCCESSFUL)? {
                 continue;
             }

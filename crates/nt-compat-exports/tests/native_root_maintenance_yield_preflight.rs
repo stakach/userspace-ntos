@@ -21,7 +21,7 @@ fn maintenance_yield_requires_due_outer_work_and_an_unencumbered_hosted_syscall(
         "process_image_snapshot_work::due_for_outer",
         "ReqKind::Syscall",
         "channel.kernel_caller.is_some()",
-        "registry_journal::owns_volume()",
+        "volume_owner::owns_volume()",
         "snapshot.oldest.is_some()",
         "receive_child_pending()",
         "snapshot.running",

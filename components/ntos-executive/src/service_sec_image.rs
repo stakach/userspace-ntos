@@ -4750,7 +4750,7 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
 }
 
 /// Advance retained service owners before attempting a mounted-volume checkpoint.
-/// A pending fold ACK, journal volume owner, or section-retirement error can defer it.
+/// A pending fold ACK, exclusive volume owner, or section-retirement error can defer it.
 fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u32> {
     use crate::reply_tail_step_census::{begin, end, Step};
     // A native directory caller owns its original Reply until the exact Object Manager
@@ -4813,7 +4813,7 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
     }
     // The journal owns the mounted volume, including all dirty state, until its terminal proof.
     // Leave maintenance flags untouched; an unavailable volume is neither clean nor absent.
-    if crate::writable_fs::registry_journal::owns_volume() {
+    if crate::writable_fs::volume_owner::owns_volume() {
         return Some(nt_fs::STATUS_SUCCESS);
     }
     let t = begin();
@@ -14172,7 +14172,7 @@ pub(crate) unsafe fn root_progress_pass() -> Result<(), RootPassError> {
     if ingress::resume_acknowledged_retained_services().map_err(|_| RootPassError::Transport)? {
         return Ok(());
     }
-    if !crate::writable_fs::registry_journal::owns_volume()
+    if !crate::writable_fs::volume_owner::owns_volume()
         && ingress::service_autonomous().map_err(|_| RootPassError::Transport)?
     {
         return Ok(());

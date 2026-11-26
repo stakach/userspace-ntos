@@ -385,7 +385,7 @@ pub(crate) unsafe fn observed_win32k_call_for_client(
 /// Read-only gate state for retained hosted Calls at a periodic root census.
 #[derive(Clone, Copy)]
 pub(crate) struct DeliveryGateSnapshot {
-    pub journal_owned: bool,
+    pub volume_owned: bool,
     pub receive_child_pending: bool,
     pub oldest_can_park: Option<bool>,
     pub oldest_settlement_prepared: Option<bool>,
@@ -399,7 +399,7 @@ pub(crate) struct DeliveryGateSnapshot {
 impl core::fmt::Debug for DeliveryGateSnapshot {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DeliveryGateSnapshot")
-            .field("journal_owned", &self.journal_owned)
+            .field("volume_owned", &self.volume_owned)
             .field("receive_child_pending", &self.receive_child_pending)
             .field("oldest_can_park", &self.oldest_can_park)
             .field("oldest_settlement_prepared", &self.oldest_settlement_prepared)
@@ -445,7 +445,7 @@ pub(crate) unsafe fn delivery_gate_snapshot(sample_page: usize) -> DeliveryGateS
         });
     }
     DeliveryGateSnapshot {
-        journal_owned: crate::writable_fs::registry_journal::owns_volume(),
+        volume_owned: crate::writable_fs::volume_owner::owns_volume(),
         receive_child_pending: receive_child_pending(),
         oldest_can_park: oldest_row.and_then(|row| row.call.as_ref().map(ExternalIngress::can_park)),
         oldest_settlement_prepared: oldest_row.map(|row| row.receive_settlement.is_some()),
@@ -562,7 +562,7 @@ pub(crate) unsafe fn take_hosted_with(
     import: impl FnOnce(u64, &ReceivedMessage) -> RootReplyImportOutcome,
 ) -> Result<Option<(u64, ReceivedMessage)>, HostedHandoffRefused> {
     recycle_completed()?;
-    if crate::writable_fs::registry_journal::owns_volume() {
+    if crate::writable_fs::volume_owner::owns_volume() {
         return Ok(None);
     }
     let pending_receive = receive_child_pending();
@@ -1116,7 +1116,7 @@ unsafe fn defer_hosted_delivery_inner(
             });
     // A Receive child can become selected while root redrives an already delivered,
     // unrelated Call. Return that untouched Call to its exact ingress owner first.
-    if !crate::writable_fs::registry_journal::owns_volume()
+    if !crate::writable_fs::volume_owner::owns_volume()
         && (!receive_child_pending() || receive_child_is_current(binding, reply))
         && !busy_win32k
         && parked_parent.is_none()

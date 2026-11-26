@@ -49,8 +49,8 @@ fn trace_winlogon_open_early_busy(stage: &[u8], pi: usize, tid: u64,
         Some(nt_fs::BlockSourceKind::Native) => b"native",
         None => b"none",
     });
-    print_str(b" journal-owned=");
-    print_u64(crate::writable_fs::registry_journal::owns_volume() as u64);
+    print_str(b" volume-owned=");
+    print_u64(crate::writable_fs::volume_owner::owns_volume() as u64);
     print_str(b" name=\"");
     print_sanitized_utf16_ascii(name, 160);
     print_str(b"\"\n");
@@ -58,7 +58,7 @@ fn trace_winlogon_open_early_busy(stage: &[u8], pi: usize, tid: u64,
 
 fn trace_winlogon_open(
     stage: &[u8], pi: usize, tid: u64, root: FileParseRoot,
-    route: Option<nt_fs::BlockSourceKind>, journal_owned: bool,
+    route: Option<nt_fs::BlockSourceKind>, volume_owned: bool,
     mounted: bool, status: Option<u32>, file: Option<(u64, u64)>, name: &[u16],
 ) {
     if ![b"msgina.dll" as &[u8], b"sfc.dll", b"shsvcs.dll"].iter().any(|suffix| {
@@ -90,7 +90,7 @@ fn trace_winlogon_open(
         None => b"none",
     });
     print_str(b" journal=");
-    print_u64(journal_owned as u64);
+    print_u64(volume_owned as u64);
     print_str(b" mounted=");
     print_u64(mounted as u64);
     if let Some(status) = status {
@@ -10599,7 +10599,7 @@ impl ExecNtHandler {
             open_options & nt_fs::FILE_DIRECTORY_FILE != 0,
             Self::absolute_file_name(name16, resolved),
             mount_route,
-            crate::writable_fs::registry_journal::owns_volume(),
+            crate::writable_fs::volume_owner::owns_volume(),
         )
     }
 
@@ -27583,7 +27583,7 @@ impl ExecNtHandler {
         trace_winlogon_open(b"target-resolve", self.pi, self.current_tid, root,
             unsafe { crate::fs_loader::exec_fs_mount_identity() }
                 .and_then(crate::fs_loader::exec_block_route_kind),
-            crate::writable_fs::registry_journal::owns_volume(), true,
+            crate::writable_fs::volume_owner::owns_volume(), true,
             Some(target.as_ref().map(|_| nt_fs::STATUS_SUCCESS)
                 .unwrap_or_else(|&status| status)),
             target.as_ref().ok().map(|(device_id, _, _)| (*device_id, 0)), name16);
@@ -27938,7 +27938,7 @@ impl ExecNtHandler {
             FileParseRoot::Absolute,
             unsafe { crate::fs_loader::exec_fs_mount_identity() }
                 .and_then(crate::fs_loader::exec_block_route_kind),
-            crate::writable_fs::registry_journal::owns_volume(), true,
+            crate::writable_fs::volume_owner::owns_volume(), true,
             Some(status as u32), Some((canonical_file_id,
                 pending_irp_id.map_or(0, nt_io_manager::IrpId::raw))), name16);
         if let Some(irp_id) = pending_irp_id {
@@ -32574,7 +32574,7 @@ impl ExecNtHandler {
         trace_winlogon_open(b"entry", self.pi, self.current_tid, parse_root,
             unsafe { crate::fs_loader::exec_fs_mount_identity() }
                 .and_then(crate::fs_loader::exec_block_route_kind),
-            crate::writable_fs::registry_journal::owns_volume(), false, None, None, name16);
+            crate::writable_fs::volume_owner::owns_volume(), false, None, None, name16);
         if !matches!(parse_root, FileParseRoot::Absolute) {
             if let FileParseRoot::HostedFile { file_id, device_id } = parse_root {
                 if name16.first() == Some(&(b'\\' as u16)) {
@@ -32823,7 +32823,7 @@ impl ExecNtHandler {
             .and_then(crate::fs_loader::exec_block_route_kind);
         let mounted_route = Self::route_absolute_open_to_kernel_file(name16, open_options, mount_route, resolved);
         trace_winlogon_open(b"decide", self.pi, self.current_tid, parse_root,
-            mount_route, crate::writable_fs::registry_journal::owns_volume(),
+            mount_route, crate::writable_fs::volume_owner::owns_volume(),
             mounted_route, None, None, name16);
         if mounted_route {
             static SMSS_MOUNTED_OPEN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -32855,7 +32855,7 @@ impl ExecNtHandler {
                 args[3],
             );
             trace_winlogon_open(b"mounted-return", self.pi, self.current_tid, parse_root,
-                mount_route, crate::writable_fs::registry_journal::owns_volume(),
+                mount_route, crate::writable_fs::volume_owner::owns_volume(),
                 true, Some(status), None, name16);
             return status;
         }
@@ -32874,7 +32874,7 @@ impl ExecNtHandler {
                 open_options,
             );
             trace_winlogon_open(b"legacy-overlay-create", self.pi, self.current_tid, parse_root,
-                mount_route, crate::writable_fs::registry_journal::owns_volume(),
+                mount_route, crate::writable_fs::volume_owner::owns_volume(),
                 false, Some(status), None, name16);
             if Self::overlay_open_missed(status) {
                 if let Some(source) = Self::readonly_volume_metadata(name16)
@@ -32942,7 +32942,7 @@ impl ExecNtHandler {
                 Ok(info) => info.is_some(),
                 Err(status) => {
                     trace_winlogon_open(b"legacy-overlay-query", self.pi, self.current_tid, parse_root,
-                        mount_route, crate::writable_fs::registry_journal::owns_volume(),
+                        mount_route, crate::writable_fs::volume_owner::owns_volume(),
                         false, Some(status), None, name16);
                     return status;
                 }
@@ -32957,7 +32957,7 @@ impl ExecNtHandler {
                         open_options,
                     );
                 trace_winlogon_open(b"legacy-overlay-open-existing", self.pi, self.current_tid,
-                    parse_root, mount_route, crate::writable_fs::registry_journal::owns_volume(),
+                    parse_root, mount_route, crate::writable_fs::volume_owner::owns_volume(),
                     false, Some(status), None, name16);
                 let mut opened_handle = 0u64;
                 if let Some(file_id) = file_id {
