@@ -4371,6 +4371,9 @@ impl FileSystem {
             SNAP_EXTENT_HEADER_LEN.checked_add(bytes_len).ok_or(STATUS_DATA_ERROR)?
         };
         let budget = self.snapshot_budget.as_mut().ok_or(STATUS_DEVICE_NOT_READY)?;
+        if file_id.is_some_and(|id| budget.reserved_file(id)) {
+            return Err(STATUS_ACCESS_DENIED);
+        }
         budget.reserve_append(rel, file_id, bytes_len, create_charge, append_charge)
     }
 
@@ -4397,6 +4400,7 @@ impl FileSystem {
         };
         let charge = new.saturating_sub(old);
         let budget = self.snapshot_budget.as_mut().ok_or(STATUS_DEVICE_NOT_READY)?;
+        if budget.reserved_file(file_id) { return Err(STATUS_ACCESS_DENIED); }
         budget.reserve_replacement(rel, file_id, new_bytes_len, old, charge)
     }
 
@@ -5811,7 +5815,8 @@ impl FileSystem {
         if Some(node.file_id) != token.file_id {
             return Err((STATUS_DATA_ERROR, token));
         }
-        if !replay_anchored_wal && self.wal_protected_node(node_id) {
+        if self.reserved_replacement_node(node_id)
+            || (!replay_anchored_wal && self.wal_protected_node(node_id)) {
             return Err((STATUS_ACCESS_DENIED, token));
         }
         let old = match self.volume.live_file_data_encoded_len(node_id) {

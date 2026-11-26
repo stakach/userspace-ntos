@@ -184,6 +184,23 @@ impl SnapshotBudget {
         })
     }
 
+    pub(super) fn reserved_file(&self, file_id: u64) -> bool {
+        self.reservations.iter().any(|row| row.file_id == Some(file_id))
+    }
+
+    pub(super) fn bind_created_file(&mut self, token: &SnapshotCapacityReservation,
+        file_id: u64) -> Result<(), u32>
+    {
+        if token.kind != SnapshotReservationKind::Append || token.file_id.is_some() {
+            return Err(STATUS_DATA_ERROR);
+        }
+        let row = self.reservations.iter_mut().find(|row| row.id == token.id)
+            .ok_or(STATUS_DATA_ERROR)?;
+        if row.file_id.is_some() { return Err(STATUS_DATA_ERROR); }
+        row.file_id = Some(file_id);
+        Ok(())
+    }
+
     pub(super) fn reconcile_unpublished_replay(&mut self, actual: usize)
         -> Result<(), u32>
     {

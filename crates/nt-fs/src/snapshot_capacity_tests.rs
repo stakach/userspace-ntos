@@ -356,3 +356,23 @@ fn snapshot_capacity_reconciles_private_boot_replay_once_before_publication() {
     assert_eq!(fs.snapshot_payload_encoded_len(), Ok(actual));
     assert_eq!(fs.export_volume_snapshot().unwrap().len(), actual);
 }
+
+#[test]
+fn snapshot_capacity_rejects_overlapping_tokens_for_one_file_identity() {
+    let path = r"\??\C:\SYSTEM";
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(path, b"old"));
+    let before = fs.export_volume_snapshot().unwrap();
+    fs.set_snapshot_payload_capacity(before.len() + 256).unwrap();
+
+    let replacement = fs.reserve_snapshot_replacement_by_path(path, 4).unwrap();
+    assert!(matches!(fs.reserve_snapshot_append_by_path(path, 3),
+        Err(STATUS_ACCESS_DENIED)));
+    fs.cancel_snapshot_reservation(replacement).map_err(|(status, _)| status).unwrap();
+
+    let append = fs.reserve_snapshot_append_by_path(path, 3).unwrap();
+    assert!(matches!(fs.reserve_snapshot_replacement_by_path(path, 4),
+        Err(STATUS_ACCESS_DENIED)));
+    fs.cancel_snapshot_reservation(append).map_err(|(status, _)| status).unwrap();
+    assert_eq!(fs.export_volume_snapshot().unwrap(), before);
+}

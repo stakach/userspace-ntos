@@ -392,8 +392,11 @@ impl FileSystem {
         let (node_id, entry_id, information) = self.volume.apply_create(plan);
         if let (Some(token), Some(next)) = (reservation, next_snapshot_size) {
             if was_new {
-                self.snapshot_budget.as_mut().expect("reserved create budget")
-                    .publish_reserved(token, next, token.create_charge);
+                let budget = self.snapshot_budget.as_mut().expect("reserved create budget");
+                budget.publish_reserved(token, next, token.create_charge);
+                let file_id = self.volume.node(node_id).expect("prepared created node").file_id;
+                budget.bind_created_file(token, file_id)
+                    .expect("prepared reserved create row");
             }
         } else {
             self.publish_snapshot_size(next_snapshot_size);

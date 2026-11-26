@@ -107,7 +107,7 @@ pub use fs::{
     validate_file_create_parameters, CreateResult, FileCleanupEffects, FileIoState, FileMetadata,
     FileObjectInformation, FileOpenPrivileges, FileRenameRoot, FileShareAccess, FileSystem,
     InstalledFileOpenAction, LayeredFileOpenDecision, MemFs, MemFsBlobCompactError,
-    MemFsBlobCompaction, MemFsSnapshotError,
+    MemFsBlobCompaction, MemFsSnapshotError, SnapshotCapacityReservation,
     MemFsSnapshotInfo, MoveClusterInformation, PreparedBasicInformation,
     SetFileNameInformation, SetInformationEffect,
     StandardInformation,
