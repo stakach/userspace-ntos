@@ -10,6 +10,10 @@ use nt_fs::RegistryWalContinuation;
 mod physical;
 use physical::{Owner as PhysicalWalOwner, PairAuthority, restore_continuation};
 
+#[path = "registry_wal/batch.rs"]
+mod batch;
+pub(crate) use batch::{BatchOwner, BatchReservation};
+
 /// Keep the exact physical owner until CM acknowledges the matching publication or abort.
 #[must_use = "retain the WAL owner through CM COMMIT, both anchors, and exact ACK"]
 pub(crate) struct Journal {

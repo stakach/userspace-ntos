@@ -214,17 +214,22 @@ impl Owner {
     }
 
     pub(crate) fn refuse_unentered_native_io(&mut self, request: nt_fs::AsyncWalIoRequest) -> Result<nt_fs::AsyncWalRefusal, u32> {
+        self.refuse_unentered_native_io_owned(request).map(|(refusal, _payload)| refusal)
+    }
+
+    /// Preserve a CM-published frame on a first PREPARE refusal with no physical effect.
+    pub(crate) fn refuse_unentered_native_io_owned(&mut self, request: nt_fs::AsyncWalIoRequest) -> Result<(nt_fs::AsyncWalRefusal, Option<Vec<u8>>), u32> {
         if let Some(Stage::AsyncAnchoring(update)) = self.stage.as_mut() {
             if self.anchor_entered || update.pending() != Some(anchor_request(request)) {
                 return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
             }
             let _ = unsafe { update.complete(anchor_request(request), false) };
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-            return Ok(nt_fs::AsyncWalRefusal::RetainedEffects);
+            return Ok((nt_fs::AsyncWalRefusal::RetainedEffects, None));
         }
         let Some(Stage::Wal(wal)) = self.stage.as_mut() else { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); };
-        let result = wal.refuse_unentered_async(request).map_err(status)?;
-        if result == nt_fs::AsyncWalRefusal::RetainedEffects {
+        let result = wal.refuse_unentered_async_owned(request).map_err(status)?;
+        if result.0 == nt_fs::AsyncWalRefusal::RetainedEffects {
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
         }
         Ok(result)
@@ -358,10 +363,15 @@ impl Owner {
     /// Reserve one sealed frame on the same ready WAL and mount lease. This is a pure
     /// in-memory transition; PREPARE begins the first native effect later.
     pub(super) fn begin_payload(&mut self, bytes: Vec<u8>) -> Result<(), u32> {
+        self.begin_payload_owned(bytes).map_err(|(status, _bytes)| status)
+    }
+
+    /// A post-CM batch must retain its exact bytes if in-memory WAL reservation refuses.
+    pub(super) fn begin_payload_owned(&mut self, bytes: Vec<u8>) -> Result<(), (u32, Vec<u8>)> {
         let Some(Stage::Wal(wal)) = self.stage.as_mut() else {
-            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+            return Err((nt_fs::STATUS_INVALID_DEVICE_REQUEST, bytes));
         };
-        wal.begin(bytes).map_err(status)
+        wal.begin_owned(bytes).map_err(|(error, bytes)| (status(error), bytes))
     }
 
     /// Durable PREPARE plus payload. A failure leaves this owner and lease unchanged.

@@ -282,6 +282,8 @@ enum PersistenceOwner {
     Unadmitted,
     NoStorage,
     Admitting { recheck_id: u64, bytes: Vec<u8> },
+    BatchAdmissionPending { owner: writable_fs::registry_wal::BatchOwner, bytes: Vec<u8> },
+    BatchSlot { epoch: u64, reservation: Option<writable_fs::registry_wal::BatchReservation> },
     Legacy(writable_fs::registry_journal::Journal<()>),
     Wal(WalJournal),
 }
@@ -310,7 +312,12 @@ impl MutationPersistence {
     }
 
     pub(crate) fn admitting(&self) -> bool {
-        matches!(&self.owner, PersistenceOwner::Admitting { .. })
+        matches!(&self.owner,
+            PersistenceOwner::Admitting { .. } | PersistenceOwner::BatchAdmissionPending { .. })
+    }
+
+    pub(crate) fn pending_batch_install(&self) -> bool {
+        matches!(&self.owner, PersistenceOwner::BatchAdmissionPending { .. })
     }
 
     pub(crate) fn claim_native_wal_io(&mut self) -> Result<Option<(nt_fs::AsyncWalIoRequest, nt_fs::BlockOperation, Vec<u8>, nt_memory_manager::SectionMountId)>, u32> {
@@ -334,7 +341,13 @@ impl MutationPersistence {
     }
 
     pub(crate) fn has_journal(&self) -> bool {
-        matches!(&self.owner, PersistenceOwner::Legacy(_) | PersistenceOwner::Wal(_))
+        matches!(&self.owner,
+            PersistenceOwner::Legacy(_) | PersistenceOwner::Wal(_) | PersistenceOwner::BatchSlot { .. })
+    }
+
+    /// A CM receipt may advance publication before the batch marker reaches stable storage.
+    pub(crate) fn waits_for_batch_barrier(&self) -> bool {
+        matches!(&self.owner, PersistenceOwner::BatchSlot { .. })
     }
 
     pub(crate) unsafe fn admit(
@@ -342,6 +355,20 @@ impl MutationPersistence {
         prepared: &PreparedSystemHiveMutation,
         bytes: Vec<u8>,
     ) -> Result<(), u32> {
+        if matches!(&self.owner, PersistenceOwner::BatchAdmissionPending { .. }) {
+            let PersistenceOwner::BatchAdmissionPending { owner, bytes: retained } =
+                core::mem::replace(&mut self.owner, PersistenceOwner::Unadmitted)
+            else { unreachable!() };
+            drop(bytes);
+            let epoch = match writable_fs::system_wal_batch_native::install(owner) {
+                Ok(epoch) => epoch,
+                Err((_status, owner)) => {
+                    self.owner = PersistenceOwner::BatchAdmissionPending { owner, bytes: retained };
+                    return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
+                }
+            };
+            return self.reserve_batch_slot(prepared, retained, epoch);
+        }
         if let PersistenceOwner::Admitting { recheck_id, .. } = &self.owner {
             let recheck_id = *recheck_id;
             let Some((lease, token, rechecked)) =
@@ -353,12 +380,29 @@ impl MutationPersistence {
             // The prepared CM bytes are checked again by admit_rechecked before its lease
             // moves into the WAL. The retained copy is the only bytes that may be persisted.
             drop(bytes);
-            let wal = WalJournal::admit_rechecked(prepared, retained, lease, token, rechecked)?;
-            self.owner = PersistenceOwner::Wal(wal);
-            return Ok(());
+            let durable_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+            let owner = writable_fs::registry_wal::BatchOwner::admit_rechecked(
+                prepared, lease, token, rechecked, durable_generation,
+            )?;
+            let epoch = match writable_fs::system_wal_batch_native::install(owner) {
+                Ok(epoch) => epoch,
+                Err((_status, owner)) => {
+                    self.owner = PersistenceOwner::BatchAdmissionPending { owner, bytes: retained };
+                    return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
+                }
+            };
+            return self.reserve_batch_slot(prepared, retained, epoch);
         }
         assert!(matches!(&self.owner, PersistenceOwner::Unadmitted), "one storage owner per CM mutation");
         writable_fs::ensure_mounted()?;
+        if let Some(epoch) = writable_fs::system_wal_batch_native::active_epoch_for(prepared) {
+            return self.reserve_batch_slot(prepared, bytes, epoch);
+        }
+        // An empty semantic journal still occupies one CM generation. It cannot bypass a
+        // sealed batch whose earlier published bytes have not reached their physical barrier.
+        if writable_fs::system_wal_batch_native::holds_reserve() {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
+        }
         if bytes.is_empty() {
             // Volatile-only and idempotent CM mutations have semantic work but no durable
             // journal. They still COMMIT and ACK; no WAL serial is consumed.
@@ -393,12 +437,37 @@ impl MutationPersistence {
         Ok(())
     }
 
+    unsafe fn reserve_batch_slot(
+        &mut self, prepared: &PreparedSystemHiveMutation, bytes: Vec<u8>, epoch: u64,
+    ) -> Result<(), u32> {
+        match writable_fs::system_wal_batch_native::reserve(epoch, prepared, bytes) {
+            Ok(reservation) => {
+                self.binding = Some(prepared.storage_binding());
+                self.owner = PersistenceOwner::BatchSlot { epoch, reservation: Some(reservation) };
+                Ok(())
+            }
+            Err((nt_fs::SystemWalBatchError::OutOfSpace, _bytes))
+                if writable_fs::system_wal_batch_native::has_collected_entries(epoch) => {
+                // Earlier published rows occupy this bounded frame. Their independent
+                // physical owner can drain; this row has not entered CM COMMIT and retries
+                // against the next batch. A single oversized row remains a terminal error.
+                writable_fs::system_wal_batch_native::request_drain(epoch)?;
+                Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32)
+            }
+            Err((error, _bytes)) =>
+                Err(writable_fs::system_wal_batch_native::batch_error_status(error)),
+        }
+    }
+
     pub(crate) fn make_durable(&mut self) -> Result<(), u32> {
         match &mut self.owner {
             PersistenceOwner::Legacy(journal) => journal.make_durable(),
             PersistenceOwner::Wal(wal) => wal.prepare(),
-            PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
-            PersistenceOwner::Admitting { .. } => Err(nt_fs::STATUS_DEVICE_NOT_READY),
+            PersistenceOwner::BatchSlot { reservation: Some(_), .. }
+            | PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
+            PersistenceOwner::Admitting { .. } | PersistenceOwner::BatchAdmissionPending { .. }
+            | PersistenceOwner::BatchSlot { reservation: None, .. } =>
+                Err(nt_fs::STATUS_DEVICE_NOT_READY),
         }
     }
 
@@ -421,6 +490,16 @@ impl MutationPersistence {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
         self.commit_receipt = Some(receipt);
+        if let PersistenceOwner::BatchSlot { epoch, reservation } = &mut self.owner {
+            let slot = reservation.take().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+            match unsafe { writable_fs::system_wal_batch_native::append_committed(*epoch, slot, receipt) } {
+                Ok(()) => return Ok(()),
+                Err((error, slot)) => {
+                    *reservation = Some(slot);
+                    return Err(writable_fs::system_wal_batch_native::batch_error_status(error));
+                }
+            }
+        }
         if let PersistenceOwner::Wal(wal) = &mut self.owner {
             if !self.marker_complete {
                 wal.commit_marker(receipt)?;
@@ -428,14 +507,22 @@ impl MutationPersistence {
             }
             wal.anchor()?;
         }
+        // This is the only per-row durable publication authority. A batch returns
+        // above with only CM publication; its retained owner advances this counter
+        // after the shared marker and both anchors settle.
+        LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(
+            receipt.outcome().generation, Ordering::AcqRel,
+        );
         Ok(())
     }
 
     pub(crate) fn rollback(&mut self) -> Result<(), u32> {
         match &mut self.owner {
             PersistenceOwner::Legacy(journal) => journal.rollback(),
-            PersistenceOwner::Wal(_) | PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
-            PersistenceOwner::Admitting { .. } => Err(nt_fs::STATUS_DEVICE_NOT_READY),
+            PersistenceOwner::Wal(_) | PersistenceOwner::BatchSlot { .. }
+            | PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
+            PersistenceOwner::Admitting { .. } | PersistenceOwner::BatchAdmissionPending { .. } =>
+                Err(nt_fs::STATUS_DEVICE_NOT_READY),
         }
     }
 
@@ -450,6 +537,16 @@ impl MutationPersistence {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
         self.abort_receipt = Some(receipt);
+        if let PersistenceOwner::BatchSlot { epoch, reservation } = &mut self.owner {
+            let slot = reservation.take().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+            match unsafe { writable_fs::system_wal_batch_native::cancel(*epoch, slot) } {
+                Ok(_bytes) => return Ok(()),
+                Err((error, slot)) => {
+                    *reservation = Some(slot);
+                    return Err(writable_fs::system_wal_batch_native::batch_error_status(error));
+                }
+            }
+        }
         if let PersistenceOwner::Wal(wal) = &mut self.owner {
             wal.abort_prepared(receipt)?;
         }
@@ -468,6 +565,16 @@ impl MutationPersistence {
             PersistenceOwner::Admitting { recheck_id, bytes } => {
                 self.owner = PersistenceOwner::Admitting { recheck_id, bytes };
                 return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+            }
+            PersistenceOwner::BatchAdmissionPending { owner, bytes } => {
+                self.owner = PersistenceOwner::BatchAdmissionPending { owner, bytes };
+                return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+            }
+            PersistenceOwner::BatchSlot { epoch, reservation } => {
+                if reservation.is_some() {
+                    self.owner = PersistenceOwner::BatchSlot { epoch, reservation };
+                    return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+                }
             }
             PersistenceOwner::Unadmitted => return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
             PersistenceOwner::Legacy(journal) => match journal.release_after_publication() {
@@ -528,6 +635,16 @@ impl MutationPersistence {
                 self.owner = PersistenceOwner::Admitting { recheck_id, bytes };
                 return Err(nt_fs::STATUS_DEVICE_NOT_READY);
             }
+            PersistenceOwner::BatchAdmissionPending { owner, bytes } => {
+                self.owner = PersistenceOwner::BatchAdmissionPending { owner, bytes };
+                return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+            }
+            PersistenceOwner::BatchSlot { epoch, reservation } => {
+                if reservation.is_some() {
+                    self.owner = PersistenceOwner::BatchSlot { epoch, reservation };
+                    return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+                }
+            }
             PersistenceOwner::Legacy(journal) => match journal.release_rolled_back() {
                 Ok(()) => {}
                 Err(journal) => {
@@ -566,7 +683,118 @@ struct Work {
 
 static mut ATTEMPTS: CmMutationBeginAttempts = CmMutationBeginAttempts::new();
 static mut WORK: Vec<Option<Work>> = Vec::new();
+/// Shared by syscall rows and relation publications observed in the same CM outcome ledger.
 static NEXT_WORK_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The executive retains one process-local CM outcome ledger across rows and parked flushes.
+/// Its state transitions and ticket identity checks are independently tested in nt-config-client.
+pub(crate) use nt_config_client::SystemCommitOutcome;
+static mut SYSTEM_COMMIT_OBSERVATIONS: nt_config_client::SystemCommitObservations =
+    nt_config_client::SystemCommitObservations::new();
+
+/// A flush's exact claim on one entered CM COMMIT outcome. Its pure ticket is returned to
+/// this wrapper on any release refusal, so a parked flush can retain it without guessing.
+#[must_use = "release the exact CM COMMIT observation after fixing the flush target"]
+pub(crate) struct SystemCommitTicket {
+    inner: Option<nt_config_client::SystemCommitObservationTicket>,
+}
+
+impl SystemCommitTicket {
+    fn live(&self) -> &nt_config_client::SystemCommitObservationTicket {
+        self.inner.as_ref().expect("retained SYSTEM COMMIT observation")
+    }
+    pub(crate) fn work_id(&self) -> u64 { self.live().work_id() }
+    pub(crate) fn mount(&self) -> SystemHiveMount { self.live().mount() }
+    pub(crate) fn generation(&self) -> u64 { self.live().generation() }
+}
+
+impl Drop for SystemCommitTicket {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.take() else { return; };
+        let ledger = unsafe { &mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS) };
+        if let Err((error, inner)) = ledger.release(inner) {
+            let status = system_commit_status(error);
+            writable_fs::block_uncertain_snapshot_reserve();
+            print_str(b"[cm-commit-observation] dropped-ticket-release status=0x");
+            print_hex(status);
+            print_str(b"\n");
+            core::mem::forget(inner);
+        }
+    }
+}
+
+fn system_commit_status(error: nt_config_client::SystemCommitObservationError) -> u32 {
+    match error {
+        nt_config_client::SystemCommitObservationError::Invalid =>
+            nt_fs::STATUS_INVALID_DEVICE_REQUEST,
+        nt_config_client::SystemCommitObservationError::Busy =>
+            nt_status::NtStatus::DEVICE_BUSY.raw() as u32,
+        nt_config_client::SystemCommitObservationError::Exhausted =>
+            nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+    }
+}
+
+pub(crate) unsafe fn arm_system_commit(work_id: u64, prepared: &PreparedSystemHiveMutation) -> Result<(), u32> {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
+        .arm(work_id, prepared).map_err(system_commit_status)
+}
+
+pub(crate) unsafe fn enter_system_commit(work_id: u64, prepared: &PreparedSystemHiveMutation) -> Result<(), u32> {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
+        .enter(work_id, prepared).map_err(system_commit_status)
+}
+
+pub(crate) unsafe fn publish_system_commit(
+    work_id: u64, prepared: &PreparedSystemHiveMutation,
+    receipt: SystemHiveMutationCommitReceipt,
+) -> Result<(), u32> {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
+        .publish(work_id, prepared, receipt).map_err(system_commit_status)
+}
+
+pub(crate) unsafe fn abort_system_commit(
+    work_id: u64, prepared: &PreparedSystemHiveMutation,
+    ack: SystemHiveMutationAbortAcknowledgement,
+) -> Result<(), u32> {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
+        .no_effect(work_id, prepared, ack).map_err(system_commit_status)
+}
+
+pub(crate) unsafe fn capture_system_commit(
+    mount: SystemHiveMount,
+) -> Result<Option<SystemCommitTicket>, u32> {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
+        .capture(mount).map(|ticket| ticket.map(|inner| SystemCommitTicket { inner: Some(inner) }))
+        .map_err(system_commit_status)
+}
+
+pub(crate) unsafe fn poll_system_commit(ticket: &SystemCommitTicket)
+    -> Result<SystemCommitOutcome, u32>
+{
+    (&*core::ptr::addr_of!(SYSTEM_COMMIT_OBSERVATIONS))
+        .poll(ticket.live()).map_err(system_commit_status)
+}
+
+/// A refusal returns the same move-only ticket to the caller's parked flush.
+pub(crate) unsafe fn release_system_commit(
+    mut ticket: SystemCommitTicket,
+) -> Result<(), (u32, SystemCommitTicket)> {
+    let Some(inner) = ticket.inner.take() else {
+        return Err((nt_fs::STATUS_INVALID_DEVICE_REQUEST, ticket));
+    };
+    match (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS)).release(inner) {
+        Ok(()) => Ok(()),
+        Err((error, inner)) => {
+            ticket.inner = Some(inner);
+            Err((system_commit_status(error), ticket))
+        }
+    }
+}
+
+pub(crate) unsafe fn retire_system_commit(work_id: u64) {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS)).retire(work_id);
+}
+
 static LAST_INTERFACE_RETRY_WORK_ID: AtomicU64 = AtomicU64::new(0);
 static LAST_INTERFACE_RETRY_PHASE: AtomicU64 = AtomicU64::new(0);
 static INTERFACE_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -675,7 +903,7 @@ pub(crate) fn take_hosted_reply_receive_work() -> u64 {
     HOSTED_REPLY_RECEIVE_WORK.swap(0, Ordering::AcqRel)
 }
 
-fn next_work_id() -> u64 {
+pub(crate) fn next_work_id() -> u64 {
     let id = NEXT_WORK_ID.fetch_add(1, Ordering::Relaxed);
     assert_ne!(id, 0, "registry mutation work id exhausted");
     id
@@ -778,6 +1006,8 @@ fn trace_interface_retry(work: &Work, error: i32, substage: AdmitRetrySubstage) 
             PersistenceOwner::Unadmitted => b"unadmitted",
             PersistenceOwner::NoStorage => b"no-storage",
             PersistenceOwner::Admitting { .. } => b"admitting",
+            PersistenceOwner::BatchAdmissionPending { .. } => b"batch-install-pending",
+            PersistenceOwner::BatchSlot { .. } => b"batch-slot",
             PersistenceOwner::Legacy(_) => b"legacy",
             PersistenceOwner::Wal(_) => b"wal",
         });
@@ -848,6 +1078,8 @@ fn trace_existing_provider_retry(work: &Work, error: i32, substage: AdmitRetrySu
         PersistenceOwner::Unadmitted => b"unadmitted",
         PersistenceOwner::NoStorage => b"no-storage",
         PersistenceOwner::Admitting { .. } => b"admitting",
+        PersistenceOwner::BatchAdmissionPending { .. } => b"batch-install-pending",
+        PersistenceOwner::BatchSlot { .. } => b"batch-slot",
         PersistenceOwner::Legacy(_) => b"legacy",
         PersistenceOwner::Wal(_) => b"wal",
     });
@@ -888,6 +1120,8 @@ pub(crate) unsafe fn print_quiesce_owners() {
             PersistenceOwner::Unadmitted => b"unadmitted",
             PersistenceOwner::NoStorage => b"no-storage",
             PersistenceOwner::Admitting { .. } => b"admitting",
+            PersistenceOwner::BatchAdmissionPending { .. } => b"batch-install-pending",
+            PersistenceOwner::BatchSlot { .. } => b"batch-slot",
             PersistenceOwner::Legacy(_) => b"legacy",
             PersistenceOwner::Wal(_) => b"wal",
         });
@@ -1033,6 +1267,8 @@ fn persistence_name(owner: &PersistenceOwner) -> &'static str {
         PersistenceOwner::Unadmitted => "unadmitted",
         PersistenceOwner::NoStorage => "no-storage",
         PersistenceOwner::Admitting { .. } => "admitting",
+        PersistenceOwner::BatchAdmissionPending { .. } => "batch-install-pending",
+        PersistenceOwner::BatchSlot { .. } => "batch-slot",
         PersistenceOwner::Legacy(_) => "legacy",
         PersistenceOwner::Wal(_) => "wal",
     }
@@ -1554,7 +1790,12 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>, gate_time: Option<u64>) 
             trace_hosted_reply(&work, previous_name,
                 result.as_ref().err().copied().unwrap_or(0) as u32);
             match result {
-                Ok(true) => { completed = true; immediate_progress = true; break; }
+                Ok(true) => {
+                    retire_system_commit(work.id);
+                    completed = true;
+                    immediate_progress = true;
+                    break;
+                }
                 Ok(false) => {
                     immediate_progress = previous_phase != phase_progress_fingerprint(&work.phase);
                 }
@@ -1769,14 +2010,16 @@ unsafe fn advance(
                 return Ok(false);
             }
             let prepared = work.prepared.as_ref().unwrap();
-            if let Err(status) = cm_mutation_transport::validate_storage(prepared) {
-                if status == nt_status::NtStatus::DEVICE_BUSY.raw() {
-                    *admit_retry_substage = AdmitRetrySubstage::ValidateStorage;
-                    return Err(status);
+            if !work.persistence.pending_batch_install() {
+                if let Err(status) = cm_mutation_transport::validate_storage(prepared) {
+                    if status == nt_status::NtStatus::DEVICE_BUSY.raw() {
+                        *admit_retry_substage = AdmitRetrySubstage::ValidateStorage;
+                        return Err(status);
+                    }
+                    work.status = status as u32;
+                    work.phase = Phase::Abort;
+                    return Ok(false);
                 }
-                work.status = status as u32;
-                work.phase = Phase::Abort;
-                return Ok(false);
             }
             let bytes = if work.persistence.admitting() { Vec::new() }
                 else { system_mutation_storage(prepared).map_err(|status| status as i32)? };
@@ -1808,8 +2051,12 @@ unsafe fn advance(
                 return Ok(false);
             }
             if !work.commit_entered {
+                arm_system_commit(work.id, work.prepared.as_ref().unwrap())
+                    .map_err(|status| status as i32)?;
                 work.persistence.begin_publication().map_err(|status| status as i32)?;
-                // No IPC separates the storage barrier from recording COMMIT entry.
+                enter_system_commit(work.id, work.prepared.as_ref().unwrap())
+                    .map_err(|status| status as i32)?;
+                // No IPC separates the storage barrier from the typed COMMIT entry.
                 work.commit_entered = true;
             }
             let receipt = cm_mutation_transport::commit(work.prepared.as_ref().unwrap())?;
@@ -1818,10 +2065,14 @@ unsafe fn advance(
         }
         Phase::CommitDurable => {
             let receipt = work.receipt.expect("retained CM COMMIT receipt");
+            publish_system_commit(work.id, work.prepared.as_ref().unwrap(), receipt)
+                .map_err(|status| status as i32)?;
             work.persistence.commit_durable(receipt).map_err(|status| status as i32)?;
             let outcome = receipt.outcome();
             CM_RUNTIME_SYSTEM_MUTATION_COMMITS.fetch_add(1, Ordering::Relaxed);
-            note_boot_progress(BootProgress::DurableRegistryPublication);
+            if !work.persistence.waits_for_batch_barrier() {
+                note_boot_progress(BootProgress::DurableRegistryPublication);
+            }
             match &work.caller {
                 Caller::Hosted(HostedCaller { completion: HostedCompletion::Existing { kind, .. }, .. }) => {
                     match kind {
@@ -1854,7 +2105,6 @@ unsafe fn advance(
                 },
                 _ => { CM_RUNTIME_SYSTEM_CREATE_KEYS.fetch_add(1, Ordering::Relaxed); }
             }
-            LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(outcome.generation, Ordering::AcqRel);
             note_committed(context, committed_change(&work.caller));
             if outcome.has_pending_device_action {
                 if !CONFIG_DEVICE_ACTION_PENDING.swap(true, Ordering::AcqRel) {
@@ -1956,6 +2206,10 @@ unsafe fn advance(
         }
         Phase::ReleaseRollback(ack) => {
             work.persistence.release_rolled_back(*ack).map_err(|status| status as i32)?;
+            // The no-effect terminal is observable only after exact storage cleanup has
+            // released its owner under the matching CM abort acknowledgement.
+            abort_system_commit(work.id, work.prepared.as_ref().unwrap(), *ack)
+                .map_err(|status| status as i32)?;
             work.phase = Phase::Complete;
         }
         Phase::Complete => {

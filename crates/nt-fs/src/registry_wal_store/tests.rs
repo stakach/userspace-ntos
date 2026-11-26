@@ -125,6 +125,39 @@ fn hard_refusal_before_first_wal_effect_can_abort_but_later_refusal_retains_owne
     core::mem::forget(wal);
 }
 
+#[test]
+fn post_publication_first_prepare_refusal_returns_owned_payload() {
+    let mut wal = RegistryWal::recover(disk(), 77).unwrap();
+    let bytes = alloc::vec![0x51; 512];
+    let pointer = bytes.as_ptr();
+    wal.begin_owned(bytes).unwrap();
+    wal.start_async_prepare().unwrap();
+    let first = wal.enter_next_async().unwrap().unwrap();
+    let (refusal, returned) = wal.refuse_unentered_async_owned(first).unwrap();
+    assert_eq!(refusal, AsyncWalRefusal::NoEffect);
+    let returned = returned.expect("post-publication bytes remain owned after no effect");
+    assert_eq!(returned.as_ptr(), pointer);
+    assert_eq!(wal.state(), RegistryWalState::Ready);
+
+    wal.begin_owned(returned).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    assert_eq!(wal.records()[0].payload, alloc::vec![0x51; 512]);
+
+    let mut entered = RegistryWal::recover(disk(), 77).unwrap();
+    entered.begin_owned(alloc::vec![0x52; 512]).unwrap();
+    entered.start_async_prepare().unwrap();
+    let header = entered.enter_next_async().unwrap().unwrap();
+    entered.mark_entered_async(header).unwrap();
+    settle_async_step(&mut entered, header);
+    let next = entered.enter_next_async().unwrap().unwrap();
+    let (refusal, returned) = entered.refuse_unentered_async_owned(next).unwrap();
+    assert_eq!(refusal, AsyncWalRefusal::RetainedEffects);
+    assert!(returned.is_none());
+    assert_eq!(entered.state(), RegistryWalState::Uncertain);
+    core::mem::forget(entered);
+}
+
 struct BatchedZeroDisk {
     inner: CachedDisk,
     singles: Rc<Cell<usize>>,

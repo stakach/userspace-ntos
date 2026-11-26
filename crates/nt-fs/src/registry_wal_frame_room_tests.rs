@@ -54,3 +54,19 @@ fn uncertain_wal_refuses_capacity_query_and_retains_its_device() {
     assert_eq!(wal.frame_room(), Err(RegistryWalError::Uncertain));
     let _retained = wal.into_device_for_test();
 }
+
+#[test]
+fn refused_owned_frame_returns_the_exact_bytes_without_consuming_room() {
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(3), 77).unwrap();
+    let bytes = alloc::vec![0xa5; 513];
+    let pointer = bytes.as_ptr();
+    let (error, returned) = wal.begin_owned(bytes).unwrap_err();
+    assert_eq!(error, RegistryWalError::OutOfSpace);
+    assert_eq!(returned.as_ptr(), pointer);
+    assert_eq!(returned, alloc::vec![0xa5; 513]);
+    assert_eq!(wal.frame_room().unwrap().remaining_sectors, 3);
+
+    wal.begin_owned(alloc::vec![0x5a]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+}

@@ -9,6 +9,92 @@
 //! attempted again at later service turns (`mutable_hive_mutation_work`).
 use super::*;
 use crate::volume_checkpoint_deferral::{Publication, PublicationTarget, STATUS_DEVICE_BUSY};
+use nt_config_client::SystemHiveMount;
+
+/// One caller's SYSTEM prefix, fixed at syscall admission. A COMMIT that entered CM before
+/// admission may still publish or abort, so its exact outcome must settle before the target
+/// generation can be frozen. Later mutations cannot move this caller's target.
+struct SystemFlushFence {
+    mount: SystemHiveMount,
+    admitted_published: u64,
+    entered: Option<crate::registry_mutation_work::SystemCommitTicket>,
+    target: Option<u64>,
+}
+
+impl SystemFlushFence {
+    unsafe fn capture() -> Result<Self, u32> {
+        let mount = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
+            .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+        let admitted_published =
+            crate::LIVE_CONFIG_MANAGER_SYSTEM_PUBLISHED_GENERATION.load(Ordering::Acquire);
+        let entered = unsafe { crate::registry_mutation_work::capture_system_commit(mount) }?;
+        let target = entered.is_none().then_some(admitted_published);
+        Ok(Self { mount, admitted_published, entered, target })
+    }
+
+    fn attempt(&mut self) -> u32 {
+        if let Some(ticket) = self.entered.as_ref() {
+            let outcome = match unsafe { crate::registry_mutation_work::poll_system_commit(ticket) } {
+                Ok(outcome) => outcome,
+                Err(status) => return status,
+            };
+            let target = match outcome {
+                crate::registry_mutation_work::SystemCommitOutcome::Pending => {
+                    return STATUS_DEVICE_BUSY;
+                }
+                crate::registry_mutation_work::SystemCommitOutcome::Published => {
+                    self.admitted_published.max(ticket.generation())
+                }
+                crate::registry_mutation_work::SystemCommitOutcome::NoEffect => {
+                    self.admitted_published
+                }
+            };
+            let Some(ticket) = self.entered.take() else {
+                return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+            };
+            if let Err((status, ticket)) = unsafe {
+                crate::registry_mutation_work::release_system_commit(ticket)
+            } {
+                self.entered = Some(ticket);
+                return status;
+            }
+            self.target = Some(target);
+        }
+        let Some(target) = self.target else {
+            return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+        };
+        if unsafe { crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT } != Some(self.mount) {
+            return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+        }
+        if let Some((mount, _, _)) = unsafe {
+            crate::writable_fs::system_wal_batch_native::active_generations()
+        } {
+            if mount != self.mount {
+                return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+            }
+        }
+        if let Err(status) = unsafe {
+            crate::writable_fs::system_wal_batch_native::request_drain_if_active()
+        } {
+            return status;
+        }
+        if crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) < target {
+            return STATUS_DEVICE_BUSY;
+        }
+        if unsafe { crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT } != Some(self.mount) {
+            return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+        }
+        if let Err(status) = unsafe { crate::writable_fs::verify_durable_system_wal() } {
+            return status;
+        }
+        if unsafe { crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT } != Some(self.mount)
+            || crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) < target
+        {
+            return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+        }
+        nt_fs::STATUS_SUCCESS
+    }
+}
 
 /// What one `NtFlushKey` makes durable (`CmFlushKey`, ReactOS `ntoskrnl/config/cmapi.c:1938`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +118,7 @@ pub(crate) struct UnloadTarget {
 }
 
 enum DurableKind {
-    Flush(FlushScope),
+    Flush { scope: FlushScope, system: Option<SystemFlushFence> },
     /// The image is written and its File flushed; the volume snapshot holding it is owed.
     Save,
     Unload {
@@ -57,7 +143,7 @@ impl DurableRegistryRequest {
 
     pub(crate) fn name(&self) -> &'static [u8] {
         match self.kind {
-            DurableKind::Flush(_) => b"flush-key",
+            DurableKind::Flush { .. } => b"flush-key",
             DurableKind::Save => b"save-key",
             DurableKind::Unload { .. } => b"unload-key",
         }
@@ -90,15 +176,17 @@ impl ExecNtHandler {
     /// format each hive is proven durable in place and nothing is written; a WAL fold stays
     /// with the service loop. On the legacy format dynamic `NtLoadKey` profile hives write back
     /// to their source file and boot-mounted hives write full images under `system32\config`.
-    pub(super) fn flush_registry_scope(&mut self, scope: FlushScope) -> u32 {
+    pub(super) fn flush_registry_scope(&mut self, scope: FlushScope, system_proven: bool) -> u32 {
         match scope {
             FlushScope::Nothing => nt_fs::STATUS_SUCCESS,
             FlushScope::All => self.flush_all_mutable_hives_preserving_headroom(
                 BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM,
+                system_proven,
             ),
             FlushScope::System => {
                 REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(0, Ordering::Relaxed);
-                self.checkpoint_system_hive_from_config_manager()
+                if system_proven { nt_fs::STATUS_SUCCESS }
+                else { self.checkpoint_system_hive_from_config_manager() }
             }
             FlushScope::Hive(hive_sel) => {
                 let dirty = self
@@ -174,8 +262,18 @@ impl ExecNtHandler {
     /// `NtFlushKey` on the key the caller named.
     pub(super) unsafe fn nt_flush_key(&mut self, key: KeyRef) -> u32 {
         let scope = self.registry_flush_scope(key);
+        let system = if matches!(scope, FlushScope::All | FlushScope::System)
+            && !crate::writable_fs::legacy_snapshot_writes_allowed()
+        {
+            match unsafe { SystemFlushFence::capture() } {
+                Ok(fence) => Some(fence),
+                Err(status) => return status,
+            }
+        } else {
+            None
+        };
         self.complete_or_park_durable_registry_request(DurableRegistryRequest::new(
-            DurableKind::Flush(scope),
+            DurableKind::Flush { scope, system },
         ))
     }
 
@@ -195,7 +293,13 @@ impl ExecNtHandler {
     ) -> u32 {
         let DurableRegistryRequest { kind, publication } = request;
         match kind {
-            DurableKind::Flush(scope) => self.flush_registry_scope(*scope),
+            DurableKind::Flush { scope, system } => {
+                if let Some(fence) = system {
+                    let status = fence.attempt();
+                    if status != nt_fs::STATUS_SUCCESS { return status; }
+                }
+                self.flush_registry_scope(*scope, system.is_some())
+            }
             DurableKind::Save => self.publish_volume_for_caller(publication, b"NtSaveKey"),
             DurableKind::Unload { target, .. } => {
                 self.unload_mounted_hive(&target.canon, target.event_index, publication)

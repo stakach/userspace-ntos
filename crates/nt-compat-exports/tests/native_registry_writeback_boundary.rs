@@ -301,6 +301,9 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
     syn::parse_str::<syn::File>(owner).expect("native persistence owner parses");
     let harness = String::from(r#"
         use std::vec::Vec;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(0);
+        static ACTIVE_BATCH: AtomicBool = AtomicBool::new(false);
         #[derive(Clone, Copy, PartialEq, Eq)] struct SystemHiveMutationStorageBinding(u8);
         struct PreparedSystemHiveMutation(SystemHiveMutationStorageBinding);
         impl PreparedSystemHiveMutation {
@@ -309,7 +312,9 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
         #[derive(Clone, Copy, PartialEq, Eq)] struct SystemHiveMutationCommitReceipt(u8);
         impl SystemHiveMutationCommitReceipt {
             fn matches_storage_binding(self, binding: SystemHiveMutationStorageBinding) -> bool { self.0 == binding.0 }
+            fn outcome(self) -> CommitOutcome { CommitOutcome { generation: self.0 as u64 } }
         }
+        struct CommitOutcome { generation: u64 }
         #[derive(Clone, Copy, PartialEq, Eq)] struct SystemHiveMutationAbortReceipt(u8);
         impl SystemHiveMutationAbortReceipt {
             fn matches_storage_binding(self, binding: SystemHiveMutationStorageBinding) -> bool { self.0 == binding.0 }
@@ -329,6 +334,7 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
             pub struct AsyncWalIoRequest;
             pub enum BlockOperation { Flush }
             pub enum BlockSourceKind { Draining, Native }
+            pub enum SystemWalBatchError { OutOfSpace, ReservationMismatch }
         }
         mod nt_memory_manager { pub struct SectionMountId; }
         mod nt_status {
@@ -411,6 +417,15 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
             }
             pub mod registry_wal {
                 use super::*;
+                pub struct BatchOwner;
+                pub struct BatchReservation;
+                impl BatchOwner {
+                    pub fn admit_rechecked(_: &PreparedSystemHiveMutation,
+                        _: crate::writable_fs::snapshot_storage::Lease,
+                        _: crate::writable_fs::snapshot_storage::Token,
+                        _: crate::writable_fs::snapshot_storage::Proof, _: u64)
+                        -> Result<Self, u32> { Ok(Self) }
+                }
                 pub struct Journal;
                 impl Journal {
                     pub unsafe fn admit(_: &PreparedSystemHiveMutation, _: Vec<u8>) -> Result<Self, u32> { Ok(Self) }
@@ -432,6 +447,37 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
                     pub fn release_after_abort(self, _: SystemHiveMutationAbortAcknowledgement) -> Result<(), Self> { Ok(()) }
                 }
             }
+            pub mod system_wal_batch_native {
+                use super::*;
+                use crate::writable_fs::registry_wal::{BatchOwner, BatchReservation};
+                pub unsafe fn install(owner: BatchOwner) -> Result<u64, (u32, BatchOwner)> {
+                    let _ = owner; Ok(1)
+                }
+                pub unsafe fn active_epoch_for(_: &PreparedSystemHiveMutation) -> Option<u64> {
+                    super::super::ACTIVE_BATCH.load(std::sync::atomic::Ordering::Relaxed).then_some(1)
+                }
+                pub unsafe fn holds_reserve() -> bool {
+                    super::super::ACTIVE_BATCH.load(std::sync::atomic::Ordering::Relaxed)
+                }
+                pub unsafe fn reserve(_: u64, _: &PreparedSystemHiveMutation, bytes: Vec<u8>)
+                    -> Result<BatchReservation, (nt_fs::SystemWalBatchError, Vec<u8>)> {
+                    let _ = bytes; Ok(BatchReservation)
+                }
+                pub unsafe fn has_collected_entries(_: u64) -> bool { false }
+                pub unsafe fn request_drain(_: u64) -> Result<(), u32> { Ok(()) }
+                pub fn batch_error_status(_: nt_fs::SystemWalBatchError) -> u32 {
+                    nt_fs::STATUS_INVALID_DEVICE_REQUEST
+                }
+                pub unsafe fn append_committed(_: u64, slot: BatchReservation,
+                    _: SystemHiveMutationCommitReceipt)
+                    -> Result<(), (nt_fs::SystemWalBatchError, BatchReservation)> {
+                    let _ = slot; Ok(())
+                }
+                pub unsafe fn cancel(_: u64, slot: BatchReservation)
+                    -> Result<Vec<u8>, (nt_fs::SystemWalBatchError, BatchReservation)> {
+                    let _ = slot; Ok(Vec::new())
+                }
+            }
         }
         use writable_fs::registry_wal::Journal as WalJournal;
     "#) + owner + r#"
@@ -444,6 +490,7 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
             committed.make_durable().unwrap();
             committed.begin_publication().unwrap();
             committed.commit_durable(receipt).unwrap();
+            assert_eq!(LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire), 7);
             assert_eq!(committed.release_after_publication(ack), Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST));
             assert!(committed.has_journal());
             committed.release_after_publication(ack).unwrap();
@@ -498,6 +545,20 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
             assert!(!volatile.has_journal());
             volatile.commit_durable(receipt).unwrap();
             volatile.release_after_publication(ack).unwrap();
+            assert_eq!(LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire), 9);
+
+            ACTIVE_BATCH.store(true, Ordering::Release);
+            let prepared = PreparedSystemHiveMutation(SystemHiveMutationStorageBinding(10));
+            let receipt = SystemHiveMutationCommitReceipt(10);
+            let ack = SystemHiveMutationAcknowledgement(receipt);
+            let mut batched = MutationPersistence::new();
+            batched.admit(&prepared, vec![10]).unwrap();
+            assert!(batched.waits_for_batch_barrier());
+            batched.commit_durable(receipt).unwrap();
+            assert_eq!(LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire), 9,
+                "a CM receipt in a live batch cannot claim physical WAL durability");
+            batched.release_after_publication(ack).unwrap();
+            ACTIVE_BATCH.store(false, Ordering::Release);
         } }
     "#;
     let directory = std::env::temp_dir().join(format!(
@@ -755,20 +816,6 @@ fn hosted_relation_v2_abort_keeps_wal_owner_through_acknowledged_cancel() {
     assert!(abort < wal_abort && wal_abort < ack_abort && ack_abort < release
         && release < providers && providers < bus,
         "abort receipt, WAL rollback, ACK_ABORT, provider cleanup and bus release must be retained");
-}
-
-#[test]
-fn hosted_relation_publishes_generation_only_after_wal_anchor() {
-    let helper = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
-    )).expect("retained relation publication helper must exist");
-    let advance = source_block(&helper, "unsafe fn advance_hosted_relation_publication(");
-    let barrier = advance.find("owner.persistence.commit_durable(").unwrap();
-    let generation = advance.find("LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(").unwrap();
-    let wake = advance.find("config_manager_request_device_action_wake()").unwrap();
-    let local = advance.find("commit_prospective_relation_with_lease(").unwrap();
-    assert!(barrier < generation && barrier < wake && generation < local && wake < local,
-        "CM generation and device wake must follow the marker and both WAL anchors");
 }
 
 #[test]

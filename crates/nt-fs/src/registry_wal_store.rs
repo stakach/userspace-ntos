@@ -620,36 +620,52 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
 
     /// Reserve the entire frame and its marker before the first native effect.
     pub fn begin(&mut self, payload: Vec<u8>) -> Result<(), RegistryWalError> {
-        if self.state == RegistryWalState::Uncertain {
-            return Err(RegistryWalError::Uncertain);
-        }
-        if self.state != RegistryWalState::Ready {
-            return Err(RegistryWalError::InvalidState);
-        }
-        let device = self.device.as_ref().expect("retained WAL device");
-        let size = device.sector_size();
-        let len = u32::try_from(payload.len()).map_err(|_| RegistryWalError::OutOfSpace)?;
-        if len == 0 {
-            return Err(RegistryWalError::InvalidGeometry);
-        }
-        let count = payload_sectors(payload.len(), size)?;
-        let end = self
-            .cursor
-            .checked_add(count)
-            .and_then(|v| v.checked_add(2))
-            .ok_or(RegistryWalError::OutOfSpace)?;
-        if end > device.sector_count() {
-            return Err(RegistryWalError::OutOfSpace);
-        }
-        self.next_serial
-            .checked_add(1)
-            .ok_or(RegistryWalError::GenerationExhausted)?;
-        self.records
-            .try_reserve(1)
-            .map_err(|_| RegistryWalError::OutOfMemory)?;
-        self.record_end_lbas
-            .try_reserve(1)
-            .map_err(|_| RegistryWalError::OutOfMemory)?;
+        self.begin_owned(payload).map_err(|(error, _payload)| error)
+    }
+
+    /// Reserve a frame after its caller may already have published the payload's records.
+    /// A refusal has no native effect and returns the same allocation to its retained owner.
+    pub fn begin_owned(
+        &mut self,
+        payload: Vec<u8>,
+    ) -> Result<(), (RegistryWalError, Vec<u8>)> {
+        let admission = (|| {
+            if self.state == RegistryWalState::Uncertain {
+                return Err(RegistryWalError::Uncertain);
+            }
+            if self.state != RegistryWalState::Ready {
+                return Err(RegistryWalError::InvalidState);
+            }
+            let device = self.device.as_ref().expect("retained WAL device");
+            let size = device.sector_size();
+            let len = u32::try_from(payload.len()).map_err(|_| RegistryWalError::OutOfSpace)?;
+            if len == 0 {
+                return Err(RegistryWalError::InvalidGeometry);
+            }
+            let count = payload_sectors(payload.len(), size)?;
+            let end = self
+                .cursor
+                .checked_add(count)
+                .and_then(|v| v.checked_add(2))
+                .ok_or(RegistryWalError::OutOfSpace)?;
+            if end > device.sector_count() {
+                return Err(RegistryWalError::OutOfSpace);
+            }
+            self.next_serial
+                .checked_add(1)
+                .ok_or(RegistryWalError::GenerationExhausted)?;
+            self.records
+                .try_reserve(1)
+                .map_err(|_| RegistryWalError::OutOfMemory)?;
+            self.record_end_lbas
+                .try_reserve(1)
+                .map_err(|_| RegistryWalError::OutOfMemory)?;
+            Ok(count)
+        })();
+        let count = match admission {
+            Ok(count) => count,
+            Err(error) => return Err((error, payload)),
+        };
         self.newly_committed_serial = None;
         self.pending = Some(Pending {
             serial: self.next_serial,
@@ -663,13 +679,18 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     /// Cancel a reservation before PREPARE starts. No sector has been touched, so this
     /// is the only pending state that can release its device without a clearing barrier.
     pub fn cancel_pending(&mut self) -> Result<(), RegistryWalError> {
+        self.cancel_pending_owned().map(|_payload| ())
+    }
+
+    /// Return a post-publication frame's exact bytes after a confirmed no-effect cancel.
+    pub fn cancel_pending_owned(&mut self) -> Result<Vec<u8>, RegistryWalError> {
         if self.async_effect.is_some() { return Err(RegistryWalError::InvalidState); }
         if self.state != RegistryWalState::PendingPrepare {
             return Err(RegistryWalError::InvalidState);
         }
-        self.pending = None;
+        let pending = self.pending.take().ok_or(RegistryWalError::InvalidState)?;
         self.state = RegistryWalState::Ready;
-        Ok(())
+        Ok(pending.payload)
     }
 
     /// Write PREPARE plus payload, then issue the first device durability barrier.

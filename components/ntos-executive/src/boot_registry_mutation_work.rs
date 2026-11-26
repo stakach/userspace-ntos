@@ -231,7 +231,6 @@ impl<C> BootSystemMutationWork<C> {
                     return BootMutationProgress::Blocked;
                 }
                 let published = receipt.outcome();
-                LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(published.generation, Ordering::AcqRel);
                 let wake_device_action = published.has_pending_device_action
                     && !CONFIG_DEVICE_ACTION_PENDING.swap(true, Ordering::AcqRel);
                 if wake_device_action {
