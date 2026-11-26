@@ -21,6 +21,7 @@ const SERVICES: [(NativeService, &str); 8] = [
     (NativeService::NtRemoveIoCompletion, "remove-completion"),
     (NativeService::NtClose, "close"),
 ];
+pub(crate) const HOT_SERVICES: usize = SERVICES.len();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OutcomeCost {
@@ -98,6 +99,24 @@ pub(crate) fn print_census() {
     // SAFETY: see `record_dispatch`.
     let _ = unsafe { (*core::ptr::addr_of!(ROOT)).write_census(&mut record) };
     crate::print_str(record.bytes());
+}
+
+/// Cumulative values for an exact installer gap. The caller must be the root executor,
+/// as with `record_dispatch`; these inclusive TSC values are not exclusive SC runtime.
+pub(crate) fn snapshot() -> Option<([u64; HOT_SERVICES], [u64; HOT_SERVICES])> {
+    // SAFETY: only the root executive calls this snapshot; see the caller's guard.
+    let rows = &unsafe { &*core::ptr::addr_of!(ROOT) }.rows;
+    let mut ticks = [0; HOT_SERVICES];
+    let mut calls = [0; HOT_SERVICES];
+    for (index, row) in rows.iter().enumerate() {
+        ticks[index] = row.completed.ticks.saturating_add(row.failed.ticks);
+        calls[index] = row.completed.calls.saturating_add(row.failed.calls);
+    }
+    Some((ticks, calls))
+}
+
+pub(crate) fn label(index: usize) -> Option<&'static str> {
+    SERVICES.get(index).map(|(_, label)| *label)
 }
 
 /// Exact statuses returned by NtWaitForMultipleObjects dispatches (a parked wait's dispatch

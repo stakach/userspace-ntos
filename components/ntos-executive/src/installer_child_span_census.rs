@@ -8,7 +8,7 @@ use nt_hosted_runtime::{CensusEpochGate, InstallerFaultReceipt, InstallerFaultRe
     PairedRuntimeSample, RuntimeSample, SpanOwner, OPEN_CLOSE_GAP_THRESHOLD_100NS};
 use core::fmt::Write;
 
-const ROWS: usize = 8;
+pub(crate) const ROWS: usize = 8;
 const TOP: usize = 4;
 const CENSUS_LIMIT: u64 = 16;
 const GAP_SCAN_INTERVAL_100NS: u64 = 2_500_000; // 250 ms.
@@ -16,6 +16,7 @@ const GAP_SAMPLES_TOTAL: usize = 12;
 const RUNTIME_READ_LIMIT: u64 = 8192;
 const RUNTIME_FINAL_LIMIT: u64 = 64;
 const SSN_NT_CLOSE: u32 = 27;
+const SSN_NT_UNMAP_VIEW_OF_SECTION: u32 = 277;
 // rust-micro publishes the boot rootserver's bound SC at the canonical init cap slot.
 const ROOT_SCHED_CONTEXT_CAP: u64 = 14;
 // The rootserver TCB is the canonical initial cap, also used by the deadman diagnostic.
@@ -154,6 +155,7 @@ fn retire_stale(handler: &ExecNtHandler) {
             print_str(b"\n");
         }
         let _ = ledger.retire(owner);
+        super::root_service_gap_census::retire(owner);
         unsafe { (&mut *core::ptr::addr_of_mut!(FAULTS)).retire(owner); }
     }
 }
@@ -232,12 +234,22 @@ pub(crate) fn begin(handler: &ExecNtHandler, pi: usize, tid: u64,
     // Timestamp the table entry before diagnostic IPC so read cost is not
     // charged to the guest's return-to-entry wall interval.
     let now = monotonic_time_100ns();
-    let needs_runtime = unsafe { (&*core::ptr::addr_of!(SPANS)) }
-        .needs_runtime_sample(owner, ssn);
+    let ledger = unsafe { &*core::ptr::addr_of!(SPANS) };
+    let open = ledger.open_close_gap(owner, now);
+    let counters = open.and_then(|gap| super::root_service_gap_census::capture_delta(
+        owner, gap.return_at_100ns));
+    let needs_runtime = ledger.needs_runtime_sample(owner, ssn);
     let runtime = if needs_runtime { runtime_sample(handler, owner, badge) }
         else { PairedRuntimeSample::default() };
-    unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)).begin_with_pair_runtime(
-        owner, ssn, now, runtime).then_some(owner) }
+    let begun = unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)).begin_with_pair_runtime(
+        owner, ssn, now, runtime) };
+    if let Some(gap) = open {
+        if begun {
+            super::root_service_gap_census::finish(owner, gap.return_at_100ns, now,
+                ssn == SSN_NT_UNMAP_VIEW_OF_SECTION, runtime.root, counters);
+        } else { super::root_service_gap_census::retire(owner); }
+    }
+    begun.then_some(owner)
 }
 
 pub(crate) fn returned(handler: &ExecNtHandler, owner: Option<SpanOwner>,
@@ -250,13 +262,18 @@ pub(crate) fn returned(handler: &ExecNtHandler, owner: Option<SpanOwner>,
     let returned = unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)).return_from_dispatch(
         owner, ssn, status, now) };
     if returned && ssn == SSN_NT_CLOSE && status != nt_user_callback::STATUS_PENDING as u32 {
+        let may_sample = unsafe { (&*core::ptr::addr_of!(GAP_SAMPLES)).can_sample(owner) };
+        if may_sample { let _ = super::root_service_gap_census::arm(owner, now); }
         let runtime = runtime_sample(handler, owner, badge);
         let _ = unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)) }
             .record_close_pair_runtime(owner, now, runtime);
+        super::root_service_gap_census::attach_root_runtime(owner, now, runtime.root);
         // The owning route rearms its shared one-shot after this ledger mutation.
-        return unsafe { (&*core::ptr::addr_of!(GAP_SAMPLES)).can_sample(owner) }
+        let armed = unsafe { (&*core::ptr::addr_of!(GAP_SAMPLES)).can_sample(owner) }
             && unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)) }
                 .arm_open_close_gap_deadline(owner);
+        if !armed { super::root_service_gap_census::retire(owner); }
+        return armed;
     }
     false
 }
@@ -328,6 +345,10 @@ pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
         let Some(tcb) = handler.hosted_thread_tcb_for_badge(badge).filter(|tcb| *tcb > 1)
             else { continue; };
         if !claim_gap_sample(owner, return_at) { continue; }
+        // Earlier candidates can perform debug IPC and serial output. Timestamp this
+        // exact candidate at its own counter boundary, not at the start of the pass.
+        let sample_at = monotonic_time_100ns();
+        let root_counters = super::root_service_gap_census::capture_delta(owner, return_at);
         let runtime = runtime_sample(handler, owner, badge);
 
         // Copy value-only root/worker records before debug IPC can nest into a provider pump.
@@ -350,17 +371,19 @@ pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
 
         // A numeric TCB cap or badge is not identity. Do not attribute a sample to an
         // owner that retired, changed generation, or entered another table call.
-        let still_same_gap = unsafe { (&*core::ptr::addr_of!(SPANS)).open_close_gap(owner, now) }
+        let still_same_gap = unsafe { (&*core::ptr::addr_of!(SPANS)).open_close_gap(owner, sample_at) }
             .is_some_and(|current| current.return_at_100ns == return_at
                 && current.from_status == gap.from_status);
         if exact_owner(handler, owner.process_index, owner.thread_id, badge) == Some(owner)
             && handler.hosted_thread_tcb_for_badge(badge) == Some(tcb)
             && still_same_gap
         {
+            super::root_service_gap_census::sample(owner, return_at, sample_at,
+                runtime.root, root_counters);
             print_str(b"[installer-child-open-close-gap-tcb] pi/pgen/tid/tgen/badge/tcb/return-at-100ns/sample-at-100ns/age-ms/close-status/regs-valid/state/sched/enqueued/active-sc/pending-reply/reply-to/fault-type/blocked-is-call/call-reply-kind/call-reply-index/receiver-tcb/receiver-cspace/receiver-state=");
             for (index, value) in [owner.process_index as u64, owner.process_generation,
                 owner.thread_id, owner.thread_generation, badge, tcb,
-                return_at, now, now.saturating_sub(return_at) / 10_000,
+                return_at, sample_at, sample_at.saturating_sub(return_at) / 10_000,
                 u64::from(gap.from_status),
                 u64::from(regs_valid),
                 state[win32k_glue::TCB_DBG_STATE], state[win32k_glue::TCB_DBG_SCHEDULABLE],
@@ -433,16 +456,16 @@ pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
                             owner.process_index, owner.process_generation, owner.thread_id,
                             owner.thread_generation, badge, fault.reply, fault.fault_ip,
                             fault.fault_addr, fault.fault_error_code,
-                            now.saturating_sub(fault.entered_at_100ns) / 10_000);
+                            sample_at.saturating_sub(fault.entered_at_100ns) / 10_000);
                         match (section_probe, image_probe) {
                             (Some(probe), None) | (None, Some(probe)) => {
                                 let _ = write!(record,
                                     " worker={:?} phase={} age-ms={} read-subphase={} irp={:?} irp-age-ms={:?} executing={}",
                                     probe.source, probe.phase,
-                                    now.saturating_sub(probe.phase_entered_at_100ns) / 10_000,
+                                    sample_at.saturating_sub(probe.phase_entered_at_100ns) / 10_000,
                                     probe.read_subphase, probe.irp_id,
                                     probe.irp_entered_at_100ns.map(|at|
-                                        now.saturating_sub(at) / 10_000), probe.executing);
+                                        sample_at.saturating_sub(at) / 10_000), probe.executing);
                             }
                             (None, None) => { let _ = write!(record, " worker=none"); }
                             (Some(_), Some(_)) => {
@@ -585,4 +608,5 @@ pub(crate) fn print_census(handler: &ExecNtHandler) {
         print_u64(RUNTIME_READS_USED.load(Ordering::Relaxed)); print_str(b"/");
         print_u64(refused); print_str(b"\n");
     }
+    super::root_service_gap_census::print_budget();
 }
