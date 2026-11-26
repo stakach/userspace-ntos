@@ -620,36 +620,52 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
 
     /// Reserve the entire frame and its marker before the first native effect.
     pub fn begin(&mut self, payload: Vec<u8>) -> Result<(), RegistryWalError> {
-        if self.state == RegistryWalState::Uncertain {
-            return Err(RegistryWalError::Uncertain);
-        }
-        if self.state != RegistryWalState::Ready {
-            return Err(RegistryWalError::InvalidState);
-        }
-        let device = self.device.as_ref().expect("retained WAL device");
-        let size = device.sector_size();
-        let len = u32::try_from(payload.len()).map_err(|_| RegistryWalError::OutOfSpace)?;
-        if len == 0 {
-            return Err(RegistryWalError::InvalidGeometry);
-        }
-        let count = payload_sectors(payload.len(), size)?;
-        let end = self
-            .cursor
-            .checked_add(count)
-            .and_then(|v| v.checked_add(2))
-            .ok_or(RegistryWalError::OutOfSpace)?;
-        if end > device.sector_count() {
-            return Err(RegistryWalError::OutOfSpace);
-        }
-        self.next_serial
-            .checked_add(1)
-            .ok_or(RegistryWalError::GenerationExhausted)?;
-        self.records
-            .try_reserve(1)
-            .map_err(|_| RegistryWalError::OutOfMemory)?;
-        self.record_end_lbas
-            .try_reserve(1)
-            .map_err(|_| RegistryWalError::OutOfMemory)?;
+        self.begin_owned(payload).map_err(|(error, _payload)| error)
+    }
+
+    /// Reserve a frame after its caller may already have published the payload's records.
+    /// A refusal has no native effect and returns the same allocation to its retained owner.
+    pub fn begin_owned(
+        &mut self,
+        payload: Vec<u8>,
+    ) -> Result<(), (RegistryWalError, Vec<u8>)> {
+        let admission = (|| {
+            if self.state == RegistryWalState::Uncertain {
+                return Err(RegistryWalError::Uncertain);
+            }
+            if self.state != RegistryWalState::Ready {
+                return Err(RegistryWalError::InvalidState);
+            }
+            let device = self.device.as_ref().expect("retained WAL device");
+            let size = device.sector_size();
+            let len = u32::try_from(payload.len()).map_err(|_| RegistryWalError::OutOfSpace)?;
+            if len == 0 {
+                return Err(RegistryWalError::InvalidGeometry);
+            }
+            let count = payload_sectors(payload.len(), size)?;
+            let end = self
+                .cursor
+                .checked_add(count)
+                .and_then(|v| v.checked_add(2))
+                .ok_or(RegistryWalError::OutOfSpace)?;
+            if end > device.sector_count() {
+                return Err(RegistryWalError::OutOfSpace);
+            }
+            self.next_serial
+                .checked_add(1)
+                .ok_or(RegistryWalError::GenerationExhausted)?;
+            self.records
+                .try_reserve(1)
+                .map_err(|_| RegistryWalError::OutOfMemory)?;
+            self.record_end_lbas
+                .try_reserve(1)
+                .map_err(|_| RegistryWalError::OutOfMemory)?;
+            Ok(count)
+        })();
+        let count = match admission {
+            Ok(count) => count,
+            Err(error) => return Err((error, payload)),
+        };
         self.newly_committed_serial = None;
         self.pending = Some(Pending {
             serial: self.next_serial,
