@@ -49,6 +49,12 @@ fn trace_device(observation: &nt_hosted_runtime::InstallPipeObservation) {
 }
 
 impl ExecNtHandler {
+    /// Observation only. No installer completion follows from an empty diagnostic slot.
+    pub(crate) fn install_pipe_census_position(&self) -> (u64, usize) {
+        (self.install_pipe_diagnostic.counts().terminal,
+            self.install_pipe_diagnostic.active_child_count())
+    }
+
     /// Root-turn snapshot after an exact installer child terminal. The Process Manager and
     /// waiter table remain authoritative; this diagnostic only copies their live identities.
     pub(crate) fn print_install_pipe_parent_wait_census(&self, now_100ns: u64) {

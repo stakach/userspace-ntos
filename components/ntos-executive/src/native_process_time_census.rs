@@ -4,7 +4,10 @@
 //! evaluating job limits, changing a wait, or retaining a thread owner.
 
 use super::*;
-use nt_hosted_runtime::{HotIoCost, HotProcessCost};
+use nt_hosted_runtime::{HotIoCost, HotProcessCost, OwnerTableCost,
+    SetupOwnerCensusGate, SetupOwnerIdentity, SetupOwnerPairValidity, SetupOwnerReceipt,
+    SetupOwnerSample, SetupWaitedApplication, select_unique_waited_application,
+    top_owner_table_delta};
 use nt_syscall::NativeService;
 
 const FAMILY_COUNT: usize = 5;
@@ -111,6 +114,71 @@ static mut LAST_CENSUS: u64 = 0;
 static mut REPORTED_INVALID_OWNER: u64 = 0;
 static mut REPORTED_SC_OVERFLOW: u64 = 0;
 static mut REPLACED_GENERATIONS: u64 = 0;
+static mut SETUP_OWNER_GATE: SetupOwnerCensusGate = SetupOwnerCensusGate::new();
+static mut SETUP_ROOT_BASELINE: [OwnerTableCost; MAX_PI] =
+    [OwnerTableCost::EMPTY; MAX_PI];
+
+fn owner_table_costs(rows: &[Row; MAX_PI]) -> [OwnerTableCost; MAX_PI] {
+    let mut costs = [OwnerTableCost::EMPTY; MAX_PI];
+    for (pi, row) in rows.iter().enumerate() {
+        if row.generation != 0 {
+            costs[pi] = OwnerTableCost { generation: row.generation,
+                calls: row.calls(), ticks: row.families.iter()
+                    .fold(0u64, |total, family| total.saturating_add(family.ticks)) };
+        }
+    }
+    costs
+}
+
+/// Observe the live application process that the registered interactive-logon process waits on.
+/// Ordinary children need not have a committed execution-role creator entry. The retained wait
+/// object, exact caller, live process identity and catalog generation scope this read-only probe.
+fn observed_logon_child_pi(handler: &ExecNtHandler, rows: &[Row; MAX_PI]) -> Option<usize> {
+    let (logon_target, logon) = handler.unique_live_execution_target(
+        nt_exe_image::HostedProcessRole::InteractiveLogon)?;
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(logon_generation) =
+        logon.generation else { return None; };
+    let logon = SetupOwnerIdentity { process_index: logon_target.pi, pid: logon.pid,
+        generation: logon_generation };
+    let mut slot = 0;
+    let mut object_index = 0;
+    let waits = core::iter::from_fn(|| loop {
+        if slot == crate::object_waiter_len() { return None; }
+        let Some((identity, record)) = crate::object_waiter_record(slot) else {
+            slot += 1; object_index = 0; continue;
+        };
+        if crate::object_waiter_is_claimed(identity) || object_index >= record.count as usize {
+            slot += 1; object_index = 0; continue;
+        }
+        let object = record.objects[object_index];
+        object_index += 1;
+        if object.kind() != WaitObject::KIND_PROCESS { continue; }
+        let caller = record.caller.process();
+        let nt_user_host::process_identity::ProcessGeneration::Hosted(caller_generation) =
+            caller.generation else { continue; };
+        let child_pid = object.id() as nt_process::ProcessId;
+        let Some(child_pi) = handler.pi_for_pid(child_pid) else { continue; };
+        if child_pi >= MAX_PI { continue; }
+        let Some(image) = handler.hosted_process_image(child_pi) else { continue; };
+        let Some(child) = handler.capture_process_identity(child_pi) else { continue; };
+        let nt_user_host::process_identity::ProcessGeneration::Hosted(child_generation) =
+            child.generation else { continue; };
+        if child.pid != child_pid || child_generation != image.generation
+            || rows[child_pi].generation != child_generation { continue; }
+        let target = nt_exe_image::SpawnTarget::from_image(image);
+        return Some(SetupWaitedApplication {
+            caller: SetupOwnerIdentity { process_index: record.caller.pi(),
+                pid: caller.pid, generation: caller_generation },
+            child: SetupOwnerIdentity { process_index: child_pi,
+                pid: child.pid, generation: child_generation },
+            live_application: target.role == nt_exe_image::HostedProcessRole::Application
+                && handler.is_live_execution_process(target, child),
+            direct_parent: handler.pm.process(child.pid)
+                .is_some_and(|process| process.parent == Some(logon.pid)),
+        });
+    });
+    select_unique_waited_application(logon, waits).map(|child| child.process_index)
+}
 
 /// Only the registered table-dispatch bracket is counted; native fast paths that bypass it
 /// remain outside these family totals. SC time is sampled independently of that coverage.
@@ -170,14 +238,18 @@ pub(crate) fn snapshot_hot_file() -> [HotProcessCost; MAX_PI] {
     snapshot
 }
 
-/// Called after a periodic census, including one started inside a nested pump. An exact live
-/// binding and its current process generation gate every read-only scheduler-context request.
+/// Called only by the outer root maintenance turn after a periodic census, including one whose
+/// clock was advanced inside a nested pump. The nested pump never reads these root-owned tables.
+/// An exact live binding and generation gate every read-only scheduler-context request.
 pub(crate) fn sample_after_census(handler: &ExecNtHandler) {
     let census = CENSUS_PERIODIC_DUMPS.load(Ordering::Acquire);
     if census == 0 || census == unsafe { LAST_CENSUS } { return; }
     unsafe { LAST_CENSUS = census; }
     let now_100ns = crate::monotonic_time_100ns();
     let rows = unsafe { &mut *core::ptr::addr_of_mut!(ROWS) };
+    let setup_pi = crate::serial_records::is_root_executor()
+        .then(|| observed_logon_child_pi(handler, rows)).flatten();
+    let mut setup_sample = None;
     let mut scans = [ScScan::EMPTY; MAX_PI];
     let mut cursor = 0;
     let mut sc_reads = 0;
@@ -242,11 +314,28 @@ pub(crate) fn sample_after_census(handler: &ExecNtHandler) {
             row.baseline = None;
         }
         let calls = row.calls();
+        if setup_pi == Some(pi) {
+            if let Some(process) = handler.capture_process_identity(pi) {
+                setup_sample = Some(SetupOwnerSample { process_index: pi, pid: process.pid,
+                    process_generation: row.generation, thread_signature: scan.signature,
+                    live_threads: scan.count, parked_threads: scan.parked,
+                    sc_errors: scan.failures, bound_us: scan.bound_us,
+                    donated_us: scan.donated_us, table_calls: calls });
+            }
+        }
         if calls != 0 && (row.reported_calls == 0
             || calls >= row.reported_calls.saturating_mul(2)
             || census.is_power_of_two()) {
             row.reported_calls = calls;
             print_row(pi, row);
+        }
+    }
+    if crate::serial_records::is_root_executor() {
+        let (terminals, active_children) = handler.install_pipe_census_position();
+        let receipt = unsafe { (&mut *core::ptr::addr_of_mut!(SETUP_OWNER_GATE)) }
+            .observe(terminals, active_children, setup_sample);
+        if let Some(receipt) = receipt {
+            print_setup_owner_receipt(handler, rows, now_100ns, receipt);
         }
     }
     let invalid = unsafe { INVALID_OWNER };
@@ -265,6 +354,81 @@ pub(crate) fn sample_after_census(handler: &ExecNtHandler) {
         print_str(b"[native-process-time] replaced-generations=");
         print_u64(unsafe { REPLACED_GENERATIONS }); print_str(b"\n");
     }
+}
+
+fn print_setup_owner_receipt(handler: &ExecNtHandler, rows: &[Row; MAX_PI], now_100ns: u64,
+    receipt: SetupOwnerReceipt) {
+    print_str(b"[setup-owner-census] ordinal/terminal-count/at-100ns/validity=");
+    print_u64(u64::from(receipt.ordinal)); print_str(b"/");
+    print_u64(receipt.terminal_count); print_str(b"/");
+    print_u64(now_100ns); print_str(b"/");
+    let validity: &[u8] = match receipt.validity {
+        SetupOwnerPairValidity::Baseline => b"baseline",
+        SetupOwnerPairValidity::Valid => b"valid",
+        SetupOwnerPairValidity::MissingOwner => b"missing-owner",
+        SetupOwnerPairValidity::ChangedOwner => b"changed-owner",
+        SetupOwnerPairValidity::InterruptedByChild => b"interrupted-by-child",
+        SetupOwnerPairValidity::ChangedThreadSet => b"changed-thread-set",
+        SetupOwnerPairValidity::FailedRuntimeRead => b"failed-runtime-read",
+        SetupOwnerPairValidity::CounterRegression => b"counter-regression",
+    };
+    print_str(validity);
+    if let Some(sample) = receipt.sample {
+        print_str(b" pi/pid/gen/sc-signature/live/parked/sc-errors/bound-us/donated-us/table-calls=");
+        for (index, value) in [sample.process_index as u64, u64::from(sample.pid), sample.process_generation,
+            sample.thread_signature, sample.live_threads, sample.parked_threads,
+            sample.sc_errors, sample.bound_us, sample.donated_us, sample.table_calls]
+            .into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        if let Some(image) = handler.hosted_process_image(sample.process_index) {
+            print_str(b" image=\"");
+            crate::exec_handler::print_sanitized_ascii(image.leaf, 48);
+            print_str(b"\"");
+        }
+    }
+    print_str(b"\n");
+    let costs = owner_table_costs(rows);
+    if receipt.ordinal == 1 {
+        unsafe { *core::ptr::addr_of_mut!(SETUP_ROOT_BASELINE) = costs; }
+    } else if receipt.validity == SetupOwnerPairValidity::Valid {
+        if let Some((pi, generation, calls, ticks)) = top_owner_table_delta(
+        unsafe { &*core::ptr::addr_of!(SETUP_ROOT_BASELINE) }, &costs) {
+            print_str(b"[setup-owner-root] top-table-pi/gen/calls/ticks=");
+            for (index, value) in [pi as u64, generation, calls, ticks].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b" coverage=native-table-dispatch\n");
+        }
+    }
+    let Some(sample) = receipt.sample else { return; };
+    print_row(sample.process_index, &rows[sample.process_index]);
+    let Some(process) = handler.capture_process_identity(sample.process_index) else { return; };
+    let mut matching = 0u64;
+    for slot in 0..crate::object_waiter_len() {
+        let Some((wait_identity, record)) = crate::object_waiter_record(slot) else { continue; };
+        if record.pi != sample.process_index || record.caller.process() != process { continue; }
+        matching += 1;
+        if matching > 2 { continue; }
+        print_str(b"[setup-owner-wait] ordinal/pi/gen/tid/tgen/seq/claimed/reply-cap/reply-sent/count/age-ms/first-object=");
+        for (index, value) in [u64::from(receipt.ordinal), sample.process_index as u64,
+            sample.process_generation, record.tid, record.caller.thread().generation(),
+            record.sequence, u64::from(crate::object_waiter_is_claimed(wait_identity)),
+            record.reply_cap, u64::from(record.reply_sent), u64::from(record.count),
+            record.latency.parked_age_100ns(now_100ns).unwrap_or(0) / 10_000,
+            record.objects.first().map_or(0, |object| object.raw())]
+            .into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
+    }
+    print_str(b"[setup-owner-wait] ordinal/matching/shown=");
+    print_u64(u64::from(receipt.ordinal)); print_str(b"/");
+    print_u64(matching); print_str(b"/");
+    print_u64(matching.min(2)); print_str(b"\n");
 }
 
 fn print_row(pi: usize, row: &Row) {
