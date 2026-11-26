@@ -101,11 +101,10 @@ pub(crate) fn print_census() {
     crate::print_str(record.bytes());
 }
 
-/// Root-only cumulative values for an exact installer gap. These remain inclusive TSC
-/// observations; no caller infers exclusive SC runtime from them.
+/// Cumulative values for an exact installer gap. The caller must be the root executor,
+/// as with `record_dispatch`; these inclusive TSC values are not exclusive SC runtime.
 pub(crate) fn snapshot() -> Option<([u64; HOT_SERVICES], [u64; HOT_SERVICES])> {
-    if !crate::serial_records::is_root_executor() { return None; }
-    // SAFETY: the root executor is the sole writer and reader of this table.
+    // SAFETY: only the root executive calls this snapshot; see the caller's guard.
     let rows = &unsafe { &*core::ptr::addr_of!(ROOT) }.rows;
     let mut ticks = [0; HOT_SERVICES];
     let mut calls = [0; HOT_SERVICES];
