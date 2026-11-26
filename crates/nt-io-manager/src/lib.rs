@@ -271,7 +271,8 @@ pub use set_information_completion::{
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pending_basic_prepared::{
-    PendingBasicPreparedClaim, PendingBasicPreparedOwner, PendingBasicPreparedTable,
+    PendingBasicPreparedAdmissionError, PendingBasicPreparedClaim,
+    PendingBasicPreparedOwner, PendingBasicPreparedTable,
 };
 pub use pending_io::{
     PendingFileApcAttempt, PendingFileApcDeliveryLease, PendingFileApcDisposition,
