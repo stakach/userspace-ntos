@@ -15,11 +15,18 @@ pub enum SnapshotPublicationError { EpochExhausted, CrossedCapture }
 pub struct SnapshotCaptureEpoch<'a> {
     publication: &'a SnapshotPublicationState,
     epoch: u64,
+    prior_clean_published_epoch: Option<u64>,
     pending: bool,
 }
 
 impl SnapshotCaptureEpoch<'_> {
     pub fn epoch(&self) -> u64 { self.epoch }
+
+    /// Exact prior publication observed when this capture atomically began. A dirty
+    /// volume or an unpublished predecessor cannot certify an unchanged folded log.
+    pub fn prior_clean_published_epoch(&self) -> Option<u64> {
+        self.prior_clean_published_epoch
+    }
 
     /// Call only after the snapshot's exact durable terminal and any paired CM acknowledgement,
     /// while still holding the same exclusive physical reserve used to mint this ticket.
@@ -107,7 +114,11 @@ impl SnapshotPublicationState {
             match self.state.compare_exchange_weak(state, next,
                 Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return Ok(Some(SnapshotCaptureEpoch {
-                    publication: self, epoch: next, pending: true,
+                    publication: self, epoch: next,
+                    prior_clean_published_epoch: (state & DIRTY == 0
+                        && self.published.load(Ordering::Acquire) == state & EPOCH_MASK)
+                        .then_some(state & EPOCH_MASK),
+                    pending: true,
                 })),
                 Err(observed) => state = observed,
             }

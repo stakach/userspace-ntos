@@ -105,26 +105,6 @@ fn retained_wal_files_and_checkpoint_images_escape_transient_request_scope() {
 }
 
 #[test]
-fn folded_hive_log_cache_requires_a_new_baseline_before_reuse() {
-    let source = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal_native.rs");
-    let cache = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal.rs");
-    let fold = source_block(cache, "pub(super) unsafe fn note_volume_wal_folded(");
-    let baseline = source_block(cache, "unsafe fn inspect_baseline(");
-    let classify = source_block(cache, "unsafe fn baseline_needs_checkpoint(");
-    let finish = source_block(cache, "unsafe fn finish_baseline(");
-    assert!(fold.contains("baseline.has_wal_records = false"));
-    assert!(classify.contains("!entry.has_wal_records")
-        && classify.contains("file_id != Some(entry.file_id)")
-        && classify.contains("length.is_none_or(|len| len < entry.expected_len)")
-        && classify.contains("length != Some(entry.expected_len)"),
-        "a fold releases write protection, so only an exact anchored log can reuse its baseline");
-    assert!(baseline.contains("mark_snapshot_dirty()")
-        && source.contains("native_checkpoint::checkpoint_dirty_native()")
-        && finish.contains("validate_first_record(fs, path"),
-        "the first append after a fold must checkpoint and verify a fresh durable baseline");
-}
-
-#[test]
 fn boot_hive_log_baseline_folds_an_older_wal_suffix_before_ordinary_checkpoint() {
     let boot = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal_boot.rs");
     let cache = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal.rs");

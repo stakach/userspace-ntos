@@ -17,7 +17,7 @@ struct LogBaseline {
     file_id: u64,
     expected_len: u64,
     last_sequence: u64,
-    has_wal_records: bool,
+    authority: nt_fs::HiveLogBaselineAuthority,
 }
 
 // This module uses the executive's serialized filesystem admission. The cache is only a live
@@ -28,12 +28,18 @@ unsafe fn baselines() -> &'static mut alloc::vec::Vec<LogBaseline> {
     &mut *core::ptr::addr_of_mut!(LOG_BASELINES)
 }
 
-/// Call only after the fold has installed the exact continuation for two payload-valid slots
-/// whose base includes the previous global WAL high-water. A later log replacement/truncation can
-/// then take a new baseline without replaying the retired records against a different stream.
-pub(super) unsafe fn note_volume_wal_folded() {
+/// Call only after the two-slot fold and its CM acknowledgement have published the exact
+/// capture. The prior clean epoch proves whether an earlier folded log was still unchanged at
+/// capture admission; exact file identity and length prevent reusing a replaced sidecar.
+pub(super) unsafe fn note_volume_wal_folded(
+    folded_epoch: u64, prior_clean_epoch: Option<u64>,
+) {
+    let fs = (&*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref();
     for baseline in baselines() {
-        baseline.has_wal_records = false;
+        let exact = fs.is_some_and(|fs| fs.existing_file_id(&baseline.path) == Some(baseline.file_id)
+            && fs.file_len(&baseline.path) == Some(baseline.expected_len));
+        baseline.authority = baseline.authority.after_durable_fold(
+            folded_epoch, prior_clean_epoch, exact);
     }
 }
 
@@ -111,13 +117,9 @@ unsafe fn baseline_needs_checkpoint(path: &str) -> Result<bool, u32> {
     let Some(entry) = baselines().iter().find(|entry| entry.path == path) else {
         return Ok(true);
     };
-    if !entry.has_wal_records {
-        return Ok(true);
-    }
-    if file_id != Some(entry.file_id) || length.is_none_or(|len| len < entry.expected_len) {
-        return Err(block(nt_fs::STATUS_DATA_ERROR));
-    }
-    Ok(length != Some(entry.expected_len))
+    entry.authority.needs_checkpoint(file_id == Some(entry.file_id), length,
+        entry.expected_len, &SNAPSHOT_PUBLICATION)
+        .map_err(|_| block(nt_fs::STATUS_DATA_ERROR))
 }
 
 unsafe fn finish_baseline(path: &str, record: &[u8], baseline: &mut Baseline) -> Result<(), u32> {
@@ -134,12 +136,13 @@ unsafe fn finish_baseline(path: &str, record: &[u8], baseline: &mut Baseline) ->
         entry.file_id = baseline.file_id;
         entry.expected_len = baseline.length;
         entry.last_sequence = first - 1;
-        entry.has_wal_records = false;
+        entry.authority = nt_fs::HiveLogBaselineAuthority::Unpublished;
     } else {
         baselines().try_reserve(1).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
         baselines().push(LogBaseline { path: clone_path(path)?,
             file_id: baseline.file_id, expected_len: baseline.length,
-            last_sequence: first - 1, has_wal_records: false });
+            last_sequence: first - 1,
+            authority: nt_fs::HiveLogBaselineAuthority::Unpublished });
     }
     baseline.needs_checkpoint = false;
     Ok(())
@@ -173,7 +176,7 @@ unsafe fn replay_anchored_record(
         .ok_or_else(|| block(nt_fs::STATUS_DATA_ERROR))?;
     entry.expected_len = new_log_len;
     entry.last_sequence = baseline.last_sequence;
-    entry.has_wal_records = true;
+    entry.authority = nt_fs::HiveLogBaselineAuthority::AnchoredSuffix;
     Ok(())
 }
 
