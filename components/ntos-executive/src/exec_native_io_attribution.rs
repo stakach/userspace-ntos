@@ -5,6 +5,7 @@
 
 use super::*;
 use nt_user_host::native_io_attribution::{sample_slow_ordinal, NativeIoCall, NativeIoKind, NativeIoOutcome};
+use nt_hosted_runtime::{GapFileRoute, GapIoDisposition, GapIoKind, GapIoObservation};
 
 static CALLS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static TICKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -17,6 +18,11 @@ static ROUTE_CALLS: [AtomicU64; 3 * ROUTE_BUCKETS] =
     [const { AtomicU64::new(0) }; 3 * ROUTE_BUCKETS];
 static ROUTE_TICKS: [AtomicU64; 3 * ROUTE_BUCKETS] =
     [const { AtomicU64::new(0) }; 3 * ROUTE_BUCKETS];
+
+pub(crate) fn snapshot_file_calls() -> [u64; 2] {
+    [CALLS[NativeIoKind::Read.index()].load(Ordering::Relaxed),
+     CALLS[NativeIoKind::Write.index()].load(Ordering::Relaxed)]
+}
 
 fn route_bucket(kind: NativeIoKind, route: Option<HostedFileRoute>) -> usize {
     kind.index() * ROUTE_BUCKETS + usize::from(route.is_some())
@@ -69,8 +75,8 @@ fn label(kind: NativeIoKind) -> &'static [u8] {
 }
 
 /// Called after the actual syscall arm returns, including its early error returns. The optional
-/// IOSB read is diagnostic only and runs only for a sampled, successful call with the same live
-/// process generation. A failed read remains unknown rather than being reported as zero bytes.
+/// IOSB read is diagnostic only and runs for a sampled or active-gap successful call with the
+/// same live process generation. A failed read remains unknown rather than reported as zero bytes.
 pub(super) fn record(
     handler: &ExecNtHandler,
     call: NativeIoCall,
@@ -94,8 +100,12 @@ pub(super) fn record(
         if parked { &PENDING_PARK[index] } else { &PENDING_ASYNC[index] }
             .fetch_add(1, Ordering::Relaxed);
     }
-    // Eight initial and geometrically spaced slow samples per operation and exact PI generation.
-    if !should_trace(pi, generation, call.kind, ticks, ordinal) { return; }
+    // The gap ledger accounts every Read/Write before sparse serial printing exits. IOSB is
+    // inspected only while that bounded probe is active or this call has a trace sample.
+    let trace = should_trace(pi, generation, call.kind, ticks, ordinal);
+    let gap_active = matches!(call.kind, NativeIoKind::Read | NativeIoKind::Write)
+        && crate::service_sec_image::root_service_gap_census::has_active_file_route_gap();
+    if !trace && !gap_active { return; }
 
     let information = if status == 0 && call.iosb_address != 0
         && handler.pi == pi
@@ -110,6 +120,32 @@ pub(super) fn record(
         None
     };
     let outcome = call.classify(status, information, parked);
+    if gap_active {
+        let disposition = match outcome {
+            NativeIoOutcome::Completed(_) => GapIoDisposition::Completed,
+            NativeIoOutcome::PendingAsync => GapIoDisposition::PendingAsync,
+            NativeIoOutcome::PendingPark => GapIoDisposition::PendingPark,
+            NativeIoOutcome::TimedOut | NativeIoOutcome::Failed => GapIoDisposition::Failed(status),
+        };
+        crate::service_sec_image::root_service_gap_census::record_file_route(GapIoObservation {
+            kind: if call.kind == NativeIoKind::Read { GapIoKind::Read } else { GapIoKind::Write },
+            process_index: pi,
+            captured_generation: generation,
+            current_generation: handler.hosted_process_generation(pi),
+            handle: call.handle,
+            route: route.map(|route| GapFileRoute {
+                file_id: route.file_id, device_id: route.device_id,
+            }),
+            disposition,
+            requested_bytes: call.requested_bytes,
+            completed_bytes: match outcome {
+                NativeIoOutcome::Completed(bytes) => bytes,
+                _ => None,
+            },
+            dispatch_ticks: ticks,
+        });
+    }
+    if !trace { return; }
     print_str(b"[native-io-dispatch] kind=");
     print_str(label(call.kind));
     print_str(b" ordinal="); print_u64(ordinal);
