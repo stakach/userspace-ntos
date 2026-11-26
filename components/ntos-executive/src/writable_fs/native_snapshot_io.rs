@@ -286,7 +286,15 @@ pub(crate) unsafe fn complete_native_snapshot_io(
 ) -> Result<SnapshotCompletion, u32> {
     COMPLETED_REQUESTS.fetch_add(1, Ordering::Relaxed);
     match claim.owner {
-        SnapshotOwnerToken::Hive(ticket) => super::hive_wal::complete_native_hive_io(ticket, result),
+        SnapshotOwnerToken::Hive(ticket) => {
+            let (completion, ready) = super::hive_wal::complete_native_hive_io(ticket, result)?;
+            if let Some(ready) = ready {
+                // This runs only after an inline physical terminal or the pending IRP's
+                // authenticated completion and strict ACK. A numeric ID is never an ACK.
+                crate::mutable_hive_mutation_work::wake_completed_hive_journal(ready);
+            }
+            Ok(completion)
+        }
         SnapshotOwnerToken::Mutation { work_id, request } =>
             crate::registry_mutation_work::complete_native_wal_io(work_id, request, result),
         SnapshotOwnerToken::SystemBatch { epoch, mount, request } =>
