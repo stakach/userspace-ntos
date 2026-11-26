@@ -58,6 +58,11 @@ pub use key_close::{SystemHiveKeyCloseAcknowledgement, SystemHiveKeyCloseAcknowl
     SystemHiveKeyCloseReceipt};
 
 mod mutation_commit;
+mod system_commit_observation;
+pub use system_commit_observation::{
+    SystemCommitObservationError, SystemCommitObservationTicket, SystemCommitObservations,
+    SystemCommitOutcome,
+};
 mod mutation_begin;
 pub mod mutation_retry_schedule;
 pub use mutation_begin::{

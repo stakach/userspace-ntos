@@ -635,9 +635,6 @@ unsafe fn advance_hosted_relation_publication(
                     return owner.pending();
                 }
                 let outcome = owner.receipt.expect("retained relation COMMIT receipt").outcome();
-                crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(
-                    outcome.generation, Ordering::AcqRel,
-                );
                 if outcome.has_pending_device_action
                     && !crate::CONFIG_DEVICE_ACTION_PENDING.swap(true, Ordering::AcqRel)
                 {

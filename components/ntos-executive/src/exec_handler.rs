@@ -6651,10 +6651,13 @@ impl ExecNtHandler {
     fn flush_all_mutable_hives_preserving_headroom(
         &mut self,
         min_post_checkpoint_headroom: usize,
+        system_proven: bool,
     ) -> u32 {
-        let system_status = self.checkpoint_system_hive_from_config_manager();
-        if system_status != nt_fs::STATUS_SUCCESS {
-            return system_status;
+        if !system_proven {
+            let system_status = self.checkpoint_system_hive_from_config_manager();
+            if system_status != nt_fs::STATUS_SUCCESS {
+                return system_status;
+            }
         }
         let mut total_dirty = 0usize;
         for hive_sel in [

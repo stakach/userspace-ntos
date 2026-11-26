@@ -507,6 +507,12 @@ impl MutationPersistence {
             }
             wal.anchor()?;
         }
+        // This is the only per-row durable publication authority. A batch returns
+        // above with only CM publication; its retained owner advances this counter
+        // after the shared marker and both anchors settle.
+        LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(
+            receipt.outcome().generation, Ordering::AcqRel,
+        );
         Ok(())
     }
 
@@ -678,6 +684,116 @@ struct Work {
 static mut ATTEMPTS: CmMutationBeginAttempts = CmMutationBeginAttempts::new();
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static NEXT_WORK_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The executive retains one process-local CM outcome ledger across rows and parked flushes.
+/// Its state transitions and ticket identity checks are independently tested in nt-config-client.
+pub(crate) use nt_config_client::SystemCommitOutcome;
+static mut SYSTEM_COMMIT_OBSERVATIONS: nt_config_client::SystemCommitObservations =
+    nt_config_client::SystemCommitObservations::new();
+
+/// A flush's exact claim on one entered CM COMMIT outcome. Its pure ticket is returned to
+/// this wrapper on any release refusal, so a parked flush can retain it without guessing.
+#[must_use = "release the exact CM COMMIT observation after fixing the flush target"]
+pub(crate) struct SystemCommitTicket {
+    inner: Option<nt_config_client::SystemCommitObservationTicket>,
+}
+
+impl SystemCommitTicket {
+    fn live(&self) -> &nt_config_client::SystemCommitObservationTicket {
+        self.inner.as_ref().expect("retained SYSTEM COMMIT observation")
+    }
+    pub(crate) fn work_id(&self) -> u64 { self.live().work_id() }
+    pub(crate) fn mount(&self) -> SystemHiveMount { self.live().mount() }
+    pub(crate) fn generation(&self) -> u64 { self.live().generation() }
+}
+
+impl Drop for SystemCommitTicket {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.take() else { return; };
+        let ledger = unsafe { &mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS) };
+        if let Err((error, inner)) = ledger.release(inner) {
+            let status = system_commit_status(error);
+            writable_fs::block_uncertain_snapshot_reserve();
+            print_str(b"[cm-commit-observation] dropped-ticket-release status=0x");
+            print_hex(status);
+            print_str(b"\n");
+            core::mem::forget(inner);
+        }
+    }
+}
+
+fn system_commit_status(error: nt_config_client::SystemCommitObservationError) -> u32 {
+    match error {
+        nt_config_client::SystemCommitObservationError::Invalid =>
+            nt_fs::STATUS_INVALID_DEVICE_REQUEST,
+        nt_config_client::SystemCommitObservationError::Busy =>
+            nt_status::NtStatus::DEVICE_BUSY.raw() as u32,
+        nt_config_client::SystemCommitObservationError::Exhausted =>
+            nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+    }
+}
+
+unsafe fn arm_system_commit(work_id: u64, prepared: &PreparedSystemHiveMutation) -> Result<(), u32> {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
+        .arm(work_id, prepared).map_err(system_commit_status)
+}
+
+unsafe fn enter_system_commit(work_id: u64, prepared: &PreparedSystemHiveMutation) -> Result<(), u32> {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
+        .enter(work_id, prepared).map_err(system_commit_status)
+}
+
+unsafe fn publish_system_commit(
+    work_id: u64, prepared: &PreparedSystemHiveMutation,
+    receipt: SystemHiveMutationCommitReceipt,
+) -> Result<(), u32> {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
+        .publish(work_id, prepared, receipt).map_err(system_commit_status)
+}
+
+unsafe fn abort_system_commit(
+    work_id: u64, prepared: &PreparedSystemHiveMutation,
+    ack: SystemHiveMutationAbortAcknowledgement,
+) -> Result<(), u32> {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
+        .no_effect(work_id, prepared, ack).map_err(system_commit_status)
+}
+
+pub(crate) unsafe fn capture_system_commit(
+    mount: SystemHiveMount,
+) -> Result<Option<SystemCommitTicket>, u32> {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS))
+        .capture(mount).map(|ticket| ticket.map(|inner| SystemCommitTicket { inner: Some(inner) }))
+        .map_err(system_commit_status)
+}
+
+pub(crate) unsafe fn poll_system_commit(ticket: &SystemCommitTicket)
+    -> Result<SystemCommitOutcome, u32>
+{
+    (&*core::ptr::addr_of!(SYSTEM_COMMIT_OBSERVATIONS))
+        .poll(ticket.live()).map_err(system_commit_status)
+}
+
+/// A refusal returns the same move-only ticket to the caller's parked flush.
+pub(crate) unsafe fn release_system_commit(
+    mut ticket: SystemCommitTicket,
+) -> Result<(), (u32, SystemCommitTicket)> {
+    let Some(inner) = ticket.inner.take() else {
+        return Err((nt_fs::STATUS_INVALID_DEVICE_REQUEST, ticket));
+    };
+    match (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS)).release(inner) {
+        Ok(()) => Ok(()),
+        Err((error, inner)) => {
+            ticket.inner = Some(inner);
+            Err((system_commit_status(error), ticket))
+        }
+    }
+}
+
+unsafe fn retire_system_commit(work_id: u64) {
+    (&mut *core::ptr::addr_of_mut!(SYSTEM_COMMIT_OBSERVATIONS)).retire(work_id);
+}
+
 static LAST_INTERFACE_RETRY_WORK_ID: AtomicU64 = AtomicU64::new(0);
 static LAST_INTERFACE_RETRY_PHASE: AtomicU64 = AtomicU64::new(0);
 static INTERFACE_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1673,7 +1789,12 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>, gate_time: Option<u64>) 
             trace_hosted_reply(&work, previous_name,
                 result.as_ref().err().copied().unwrap_or(0) as u32);
             match result {
-                Ok(true) => { completed = true; immediate_progress = true; break; }
+                Ok(true) => {
+                    retire_system_commit(work.id);
+                    completed = true;
+                    immediate_progress = true;
+                    break;
+                }
                 Ok(false) => {
                     immediate_progress = previous_phase != phase_progress_fingerprint(&work.phase);
                 }
@@ -1929,8 +2050,12 @@ unsafe fn advance(
                 return Ok(false);
             }
             if !work.commit_entered {
+                arm_system_commit(work.id, work.prepared.as_ref().unwrap())
+                    .map_err(|status| status as i32)?;
                 work.persistence.begin_publication().map_err(|status| status as i32)?;
-                // No IPC separates the storage barrier from recording COMMIT entry.
+                enter_system_commit(work.id, work.prepared.as_ref().unwrap())
+                    .map_err(|status| status as i32)?;
+                // No IPC separates the storage barrier from the typed COMMIT entry.
                 work.commit_entered = true;
             }
             let receipt = cm_mutation_transport::commit(work.prepared.as_ref().unwrap())?;
@@ -1939,6 +2064,8 @@ unsafe fn advance(
         }
         Phase::CommitDurable => {
             let receipt = work.receipt.expect("retained CM COMMIT receipt");
+            publish_system_commit(work.id, work.prepared.as_ref().unwrap(), receipt)
+                .map_err(|status| status as i32)?;
             work.persistence.commit_durable(receipt).map_err(|status| status as i32)?;
             let outcome = receipt.outcome();
             CM_RUNTIME_SYSTEM_MUTATION_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -1976,11 +2103,6 @@ unsafe fn advance(
                     }
                 },
                 _ => { CM_RUNTIME_SYSTEM_CREATE_KEYS.fetch_add(1, Ordering::Relaxed); }
-            }
-            // A batch row has only a positive CM publication receipt here. Its physical
-            // durability is published by the retained batch owner after marker and anchors.
-            if !work.persistence.waits_for_batch_barrier() {
-                LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(outcome.generation, Ordering::AcqRel);
             }
             note_committed(context, committed_change(&work.caller));
             if outcome.has_pending_device_action {
@@ -2083,6 +2205,10 @@ unsafe fn advance(
         }
         Phase::ReleaseRollback(ack) => {
             work.persistence.release_rolled_back(*ack).map_err(|status| status as i32)?;
+            // The no-effect terminal is observable only after exact storage cleanup has
+            // released its owner under the matching CM abort acknowledgement.
+            abort_system_commit(work.id, work.prepared.as_ref().unwrap(), *ack)
+                .map_err(|status| status as i32)?;
             work.phase = Phase::Complete;
         }
         Phase::Complete => {
