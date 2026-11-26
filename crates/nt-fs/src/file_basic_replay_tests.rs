@@ -2,7 +2,8 @@ use crate::snapshot_test_device::CachedDisk;
 use crate::{
     decode_volume_wal_payload, encode_file_basic_wal_payload, BootSystemPreRead,
     FileBasicWalPayload, FileDeltaWalReplayError, FileMetadata, FileSystem, MemFs,
-    RegistryWal, RegistryWalState, VolumeWalPayload, FILE_ATTRIBUTE_DIRECTORY,
+    OwnedBoundedBlockRange, RegistryWal, RegistryWalState, SnapshotBlockStore,
+    WalSnapshotAnchorUpdate, WalSnapshotManifest, VolumeWalPayload, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFORMATION,
     FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_SHARE_READ, FILE_WRITE_DATA, STATUS_SUCCESS,
 };
@@ -52,6 +53,90 @@ fn recover_after_power_cut(mut disk: CachedDisk) -> RegistryWal<CachedDisk> {
         wal.clear_recovered_tail().unwrap();
     }
     wal
+}
+
+#[test]
+fn mixed_uncheckpointed_file_work_requires_a_baseline_before_basic_wal() {
+    let mut live = FileSystem::new(MemFs::new());
+    assert!(live.provision_file(FILE, b"old data"));
+    let original_id = live.existing_file_id(FILE).unwrap();
+    let store = SnapshotBlockStore::new(0, 64);
+    let mut disk = CachedDisk::with_sectors(128);
+    let manifest = WalSnapshotManifest {
+        incarnation: INCARNATION, base_serial: 0, high_water_serial: 0,
+        high_water_end_lba: 0,
+    };
+    for _ in 0..2 {
+        live.commit_volume_snapshot_with_wal_manifest(&store, &mut disk, manifest).unwrap();
+    }
+    let pair = store.verify_paired_wal_snapshot(&mut disk).unwrap();
+
+    // These real MemFs effects are still only in RAM. A metadata-only WAL record cannot
+    // reconstruct either the new entry or the earlier write from the selected snapshot.
+    let opened = live.zw_create_file(
+        FILE, FILE_WRITE_DATA, 0, FILE_SHARE_READ, FILE_OPEN, FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(opened.status, STATUS_SUCCESS);
+    assert_eq!(live.zw_write_file(opened.handle, Some(0), b"new data").0, STATUS_SUCCESS);
+    assert_eq!(live.zw_close(opened.handle), STATUS_SUCCESS);
+    assert!(live.provision_file(OTHER, b"new file"));
+    let before_basic = live.export_volume_snapshot().unwrap();
+    let new_file_id = live.existing_file_id(OTHER).unwrap();
+    let opened = live.zw_create_file(
+        OTHER, FILE_WRITE_DATA, 0, FILE_SHARE_READ, FILE_OPEN, FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(opened.status, STATUS_SUCCESS);
+    let mut basic = [0u8; 40];
+    basic[16..24].copy_from_slice(&777u64.to_le_bytes());
+    basic[32..36].copy_from_slice(&FILE_ATTRIBUTE_HIDDEN.to_le_bytes());
+    assert_eq!(live.zw_set_information_file(opened.handle, FILE_BASIC_INFORMATION, &basic),
+        STATUS_SUCCESS);
+    assert_eq!(live.zw_close(opened.handle), STATUS_SUCCESS);
+    let after_basic = live.query_metadata(OTHER).unwrap();
+    let record = encode_file_basic_wal_payload(state(1, OTHER, after_basic)).unwrap();
+
+    let range = OwnedBoundedBlockRange::new(disk, 64, 64).ok().unwrap();
+    let mut wal = RegistryWal::recover(range, INCARNATION).unwrap();
+    wal.begin(record).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let mut update = WalSnapshotAnchorUpdate::admit_verified_wal_pair(store, verified, pair)
+        .ok().unwrap();
+    update.advance().unwrap();
+    let (mut disk, _continuation, _pair) = update.into_continuation_and_pair().ok().unwrap();
+    disk.power_cut();
+
+    let selected = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    assert_eq!(selected.selected_base_serial, 0);
+    assert_eq!(selected.anchor.serial, 1);
+    let range = OwnedBoundedBlockRange::new(disk, 64, 64).ok().unwrap();
+    let wal = RegistryWal::recover(range, INCARNATION).unwrap();
+    assert_eq!(selected.verify_recovered_wal(&wal), Ok(()));
+    assert_eq!(wal.records().len(), 1);
+    let VolumeWalPayload::FileBasic(payload) =
+        decode_volume_wal_payload(&wal.records()[0].payload).unwrap()
+    else { panic!("the physical record must retain its FileBasic type") };
+
+    let mut restored = FileSystem::from_volume_snapshot(&selected.snapshot.payload).unwrap();
+    let unchanged = restored.export_volume_snapshot().unwrap();
+    let mut pre_read = BootSystemPreRead::new(&restored, SYSTEM, SYSTEM_LOG);
+    assert_eq!(pre_read.replay_file_basic(&mut restored, payload),
+        Err(FileDeltaWalReplayError::MissingFile));
+    assert_eq!(restored.export_volume_snapshot().unwrap(), unchanged);
+    assert_eq!(restored.file_bytes_owned(FILE), Some(b"old data".to_vec()));
+    assert_eq!(restored.existing_file_id(FILE), Some(original_id));
+    assert_eq!(restored.existing_file_id(OTHER), None);
+
+    // Capturing the preceding namespace/data state before the marker makes the same
+    // authenticated record replayable with its original file identity and bytes.
+    let mut baseline = FileSystem::from_volume_snapshot(&before_basic).unwrap();
+    let mut pre_read = BootSystemPreRead::new(&baseline, SYSTEM, SYSTEM_LOG);
+    assert_eq!(pre_read.replay_file_basic(&mut baseline, payload), Ok(()));
+    assert_eq!(baseline.query_metadata(OTHER), Some(after_basic));
+    assert_eq!(baseline.existing_file_id(OTHER), Some(new_file_id));
+    assert_eq!(baseline.file_bytes_owned(FILE), Some(b"new data".to_vec()));
+    assert_eq!(baseline.file_bytes_owned(OTHER), Some(b"new file".to_vec()));
 }
 
 #[test]
