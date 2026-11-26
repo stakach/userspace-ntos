@@ -12,7 +12,7 @@ pub(super) fn reset() {
     TRACE_OUTPUT_TICKS.store(0, Ordering::Release);
 }
 
-fn counter() -> Option<u64> {
+pub(super) fn counter() -> Option<u64> {
     let mut value = 0i64;
     let status = unsafe {
         nt_ntdll::trap_stubs::nt_query_performance_counter(core::ptr::addr_of_mut!(value) as u64, 0)

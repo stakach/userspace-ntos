@@ -34,6 +34,11 @@ mod csr_connect;
 #[cfg(target_arch = "x86_64")]
 #[path = "on_target_runtime_loader_trace.rs"]
 mod runtime_loader_trace;
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn loader_phase_qpc_100ns() -> Option<u64> {
+    runtime_loader_trace::counter()
+}
 #[cfg(target_arch = "x86_64")]
 #[path = "on_target_name_redirection.rs"]
 mod name_redirection;

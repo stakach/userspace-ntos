@@ -10255,6 +10255,7 @@ impl ExecNtHandler {
         PM_DYNAMIC_PROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         self.refresh_process_manager_gates();
         unsafe {
+            let at_100ns = monotonic_time_100ns();
             print_str(b"[pm-dynamic] allocated hosted process pi=");
             print_u64(child_pi as u64);
             print_str(b" pid=");
@@ -10265,7 +10266,15 @@ impl ExecNtHandler {
             print_str(name.as_bytes());
             print_str(b" token=");
             print_u64(token.raw() as u64);
-            print_str(b" inherited\n");
+            print_str(b" inherited pgen=");
+            if let Some(generation) = self.hosted_process_generation(child_pi) {
+                print_u64(generation);
+            } else {
+                print_str(b"unknown");
+            }
+            print_str(b" at_100ns=");
+            print_u64(at_100ns);
+            print_str(b"\n");
         }
         Ok(child_pi)
     }

@@ -1597,11 +1597,14 @@ pub unsafe extern "C" fn LdrpInitialize(
         // SAFETY: on-target, marker is a mapped stack buffer.
         unsafe { dbg_print_bytes(marker.as_ptr(), marker_len) };
 
+        // Sample after the start marker so serial output is not charged to the loader drive.
+        let loader_start_qpc = on_target::loader_phase_qpc_100ns();
         let ntdll = ntdll_base as u64;
         {
             // Initialize the process heap, imports, loader lists and attach notifications.
             // SAFETY: on-target; both are mapped PE images in this VSpace.
             let res = unsafe { on_target::ldrp_drive(image_base, ntdll, context as u64) };
+            let loader_end_qpc = on_target::loader_phase_qpc_100ns();
 
             #[cfg(feature = "rtl_work_item_probe")]
             {
@@ -1621,9 +1624,9 @@ pub unsafe extern "C" fn LdrpInitialize(
 
             // (4) Report the snap result: "snap N/M spot=0x..." (built on the STACK). N=resolved,
             // M=resolved+missing, spot = the first written IAT value (proves it points into our ntdll).
-            let mut buf = [0u8; 160];
+            let mut buf = [0u8; 224];
             let mut n = 0usize;
-            let put = |buf: &mut [u8; 160], n: &mut usize, b: &[u8]| {
+            let put = |buf: &mut [u8; 224], n: &mut usize, b: &[u8]| {
                 for &c in b {
                     if *n < buf.len() {
                         buf[*n] = c;
@@ -1641,6 +1644,14 @@ pub unsafe extern "C" fn LdrpInitialize(
             n = write_u64_hex(&mut buf, n, process_id);
             put(&mut buf, &mut n, b" tsc=0x");
             n = write_u64_hex(&mut buf, n, unsafe { core::arch::x86_64::_rdtsc() });
+            if let (Some(start), Some(end)) = (loader_start_qpc, loader_end_qpc) {
+                put(&mut buf, &mut n, b" qpc-start=0x");
+                n = write_u64_hex(&mut buf, n, start);
+                put(&mut buf, &mut n, b" qpc-end=0x");
+                n = write_u64_hex(&mut buf, n, end);
+            } else {
+                put(&mut buf, &mut n, b" qpc=unavailable");
+            }
             // SAFETY: on-target, buf is a mapped stack buffer.
             unsafe { dbg_print_bytes(buf.as_ptr(), n) };
         }

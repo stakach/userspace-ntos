@@ -293,6 +293,16 @@ jobs:
           elif [ "$boot_status" -ne 0 ]; then
             exit "$boot_status"
           fi
+      - name: Correlate bounded installer child phases
+        if: always()
+        run: |
+          for suffix in '' '-boot1'; do
+            serial="native-kvm-smoke${suffix}.log"
+            if [ -f "$serial" ]; then
+              python3 scripts/ci_kvm_installer_phase.py "$serial" --installer-only \
+                > "native-kvm-installer-phase${suffix}.json"
+            fi
+          done
       # A disk is published from a boot that passed the desktop gate, or from a failed boot the
       # runner marked as worth continuing: it went idle after setup completed and a user logged
       # on, or it ran its whole bound without a fault. The manifest records
@@ -331,8 +341,10 @@ jobs:
             native-kvm-build.log
             native-kvm-smoke.log
             native-kvm-smoke.ppm
+            native-kvm-installer-phase.json
             native-kvm-smoke-boot1.log
             native-kvm-smoke-boot1.ppm
+            native-kvm-installer-phase-boot1.json
             native-kvm-qemu-int-tail.log
             native-kvm-qemu-int-tail-boot1.log
             native-kvm-guest-reset-state.json

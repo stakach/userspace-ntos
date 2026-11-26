@@ -6,6 +6,7 @@ use super::*;
 const PIPE_NAME_CAP: usize = 96;
 const PRINT_DEVICE_CAP: u64 = 128;
 const PRINT_RPC_CAP: u64 = 32;
+static PHASE_ATTACH_PRINTED: AtomicU64 = AtomicU64::new(0);
 
 fn plugplay_pipe_name_hash() -> u64 {
     const LEAF: [u16; 9] = [b'\\' as u16, b'p' as u16, b'l' as u16, b'u' as u16,
@@ -23,6 +24,7 @@ fn exact_pipe_name(file_id: u64, out: &mut [u16; PIPE_NAME_CAP]) -> Option<usize
 }
 
 fn trace_device(observation: &nt_hosted_runtime::InstallPipeObservation) {
+    let at_100ns = monotonic_time_100ns();
     print_str(b"[pnp-install-batch] child-pid/gen/file/ordinal/total=");
     print_u64(u64::from(observation.child.pid));
     print_str(b"/");
@@ -37,7 +39,13 @@ fn trace_device(observation: &nt_hosted_runtime::InstallPipeObservation) {
     print_hex_u64(observation.pipe.file_id);
     print_str(b" device=\"");
     print_sanitized_utf16_ascii(&observation.device[..observation.device_len], 180);
-    print_str(b"\"\n");
+    print_str(b"\" owner-pid/gen=");
+    print_u64(u64::from(observation.pipe.owner_pid));
+    print_str(b"/");
+    print_u64(observation.pipe.owner_generation);
+    print_str(b" at_100ns=");
+    print_u64(at_100ns);
+    print_str(b"\n");
 }
 
 impl ExecNtHandler {
@@ -229,6 +237,7 @@ impl ExecNtHandler {
         if !self.install_pipe_diagnostic.child_is_tracked(child) { return; }
         let Some(open) = self.install_pipe_diagnostic.observe_enum_open(child, path, status)
             else { return; };
+        let at_100ns = monotonic_time_100ns();
         if status == 0 && open.device_ordinal == 1 {
             crate::service_sec_image::installer_child_span_census::activate_after_enum_open(self, pi);
         }
@@ -242,6 +251,8 @@ impl ExecNtHandler {
         print_u64(u64::from(open.device_ordinal));
         print_str(b"/0x");
         print_hex(status);
+        print_str(b" at_100ns=");
+        print_u64(at_100ns);
         print_str(b"\n");
     }
 
@@ -292,7 +303,24 @@ impl ExecNtHandler {
         }) else {
             return false;
         };
-        self.install_pipe_diagnostic.attach_child(server, &name[..len], child, client_file_id)
+        let attached = self.install_pipe_diagnostic.attach_child(
+            server, &name[..len], child, client_file_id,
+        );
+        if attached && PHASE_ATTACH_PRINTED.fetch_add(1, Ordering::Relaxed) < PRINT_DEVICE_CAP {
+            let at_100ns = monotonic_time_100ns();
+            print_str(b"[pnp-install-child] child-pid/gen/owner-pid/gen/client-file/server-file=");
+            for (index, value) in [
+                u64::from(child_pid), generation, u64::from(server.owner_pid),
+                server.owner_generation, client_file_id, server.file_id,
+            ].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b" at_100ns=");
+            print_u64(at_100ns);
+            print_str(b"\n");
+        }
+        attached
     }
 
     pub(crate) fn observe_install_pipe_child_handle(&mut self, pi: usize, handle: u64) -> bool {
@@ -357,6 +385,7 @@ impl ExecNtHandler {
         if !self.install_pipe_diagnostic.child_is_tracked(child) { return false; }
         let Some(terminal) = self.install_pipe_diagnostic.record_child_terminal(child, exit_status)
             else { return false; };
+        let at_100ns = monotonic_time_100ns();
         print_str(b"[pnp-install-batch] child-terminal pid/gen/server-file/client-file/status=");
         print_u64(u64::from(pid));
         print_str(b"/");
@@ -367,6 +396,8 @@ impl ExecNtHandler {
         print_hex_u64(terminal.client_file_id);
         print_str(b"/0x");
         print_hex(exit_status);
+        print_str(b" at_100ns=");
+        print_u64(at_100ns);
         print_str(b"\n");
         true
     }
