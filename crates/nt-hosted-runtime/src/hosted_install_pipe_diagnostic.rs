@@ -344,6 +344,11 @@ impl<const N: usize> InstallPipeDiagnostic<N> {
 
     pub fn counts(&self) -> InstallPipeCounts { self.counts }
 
+    /// Current exact child assignments; a terminal consumes its slot.
+    pub fn active_child_count(&self) -> usize {
+        self.slots.iter().flatten().filter(|slot| slot.child.is_some()).count()
+    }
+
     /// Most recent exact child terminal; rejected observations do not replace it.
     pub fn last_terminal(&self) -> Option<InstallPipeTerminal> { self.last_terminal }
 
