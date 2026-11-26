@@ -1450,8 +1450,10 @@ mod tests {
         let detail = hive_mutation_transfer::pack_pull_detail(0x1122_3344, 0x5566_7788)
             .expect("nonempty prepared journal and image");
         assert_eq!(detail, 0x5566_7788_1122_3344);
-        assert_eq!(hive_mutation_transfer::unpack_pull_detail(detail),
-            Some((0x1122_3344, 0x5566_7788)));
+        assert_eq!(
+            hive_mutation_transfer::unpack_pull_detail(detail),
+            Some((0x1122_3344, 0x5566_7788))
+        );
         assert_eq!(hive_mutation_transfer::pack_pull_detail(0, 1), None);
         assert_eq!(hive_mutation_transfer::pack_pull_detail(1, 0), None);
         assert_eq!(hive_mutation_transfer::unpack_pull_detail(1), None);
