@@ -237,6 +237,13 @@ def migration_submodule_is_compatible(source_sha: object, current_sha: str) -> b
         source_sha, current_sha, cwd=ROOT / "rust-micro")
 
 
+def migration_source_ref(run: dict) -> str:
+    branch = run.get("head_branch")
+    if not isinstance(branch, str) or not branch:
+        raise ContinuationError("migration source run branch is absent")
+    return f"refs/heads/{branch}"
+
+
 def verify_migration_run(run: dict, run_id: int, attempt: int, current: dict) -> None:
     expected = {
         "id": run_id, "run_attempt": attempt, "status": "completed",
@@ -255,8 +262,7 @@ def verify_migration_run(run: dict, run_id: int, attempt: int, current: dict) ->
         raise ContinuationError("source run belongs to another repository")
     if run.get("path", "").split("@", 1)[0] != WORKFLOW:
         raise ContinuationError("source run used another workflow")
-    if current["ref"] != f"refs/heads/{run.get('head_branch')}":
-        raise ContinuationError("source run branch differs from this ref")
+    migration_source_ref(run)
     if run_id == int(os.environ["GITHUB_RUN_ID"]):
         raise ContinuationError("cannot migrate this same workflow run")
 
@@ -269,7 +275,7 @@ def verify_migration_manifest(value: dict, run_id: int, attempt: int,
         raise ContinuationError("cross-commit migration is limited to production images")
     expected = {
         "source_run_id": run_id, "source_run_attempt": attempt,
-        "source_head_sha": run["head_sha"], "source_ref": current["ref"],
+        "source_head_sha": run["head_sha"], "source_ref": migration_source_ref(run),
         "source_repo": current["repo"], "workflow": WORKFLOW,
     }
     expected.update({key: current[key] for key in (
