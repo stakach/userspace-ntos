@@ -416,12 +416,14 @@ unsafe fn install_retained() -> Result<bool, u32> {
     (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut()
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
         .release_wal_log_protection_after_fold();
-    hive_wal::note_volume_wal_folded();
     let capture_epoch = work.capture_epoch.take().ok_or(nt_fs::STATUS_DATA_ERROR)?;
+    let folded_epoch = capture_epoch.epoch();
+    let prior_clean_epoch = capture_epoch.prior_clean_published_epoch();
     if capture_epoch.publish().is_err() {
         work.phase = Phase::Failed;
         return Err(block(nt_fs::STATUS_DATA_ERROR));
     }
+    hive_wal::note_volume_wal_folded(folded_epoch, prior_clean_epoch);
     *core::ptr::addr_of_mut!(FOLD_WORK) = None;
     SYSTEM_WAL_FOLD_REQUIRED.store(false, Ordering::Release);
     crate::service_sec_image::note_system_wal_fold_complete();
