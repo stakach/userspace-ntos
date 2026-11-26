@@ -60,6 +60,7 @@ mod system_wal_batch_payload;
 mod hive_wal_publication;
 mod volume_wal_payload;
 mod file_delta_wal_payload;
+mod file_basic_wal_payload;
 mod file_create_wal_payload;
 mod file_rename_wal_payload;
 mod volume_wal_sequence;
@@ -164,6 +165,9 @@ pub use file_delta_wal_payload::{
     changed_file_delta_extents, decode_file_delta_wal_payload, encode_file_delta_wal_payload,
     FileDeltaExtent, FileDeltaRecord, FileDeltaReplayCursor, FileDeltaWalPayload,
     FileDeltaWalPayloadError, FileDeltaWalReplayError, FILE_DELTA_BLOCK_BYTES,
+};
+pub use file_basic_wal_payload::{
+    decode_file_basic_wal_payload, encode_file_basic_wal_payload, FileBasicWalPayload,
 };
 pub use file_create_wal_payload::{
     decode_file_create_wal_payload, encode_file_create_wal_payload, FileCreateWalPayload,

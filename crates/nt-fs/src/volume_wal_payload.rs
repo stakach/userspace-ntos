@@ -7,6 +7,9 @@ use crate::file_delta_wal_payload::{
     decode_file_delta_wal_payload, FileDeltaWalPayload, FileDeltaWalPayloadError,
     FILE_DELTA_MAGIC,
 };
+use crate::file_basic_wal_payload::{
+    decode_file_basic_wal_payload, FileBasicWalPayload, FILE_BASIC_MAGIC,
+};
 use crate::file_create_wal_payload::{
     decode_file_create_wal_payload, FileCreateWalPayload, FILE_CREATE_MAGIC,
 };
@@ -79,6 +82,7 @@ pub enum VolumeWalPayload<'a> {
     System(&'a [u8]),
     HiveLog(HiveLogWalPayload<'a>),
     FileDelta(FileDeltaWalPayload<'a>),
+    FileBasic(FileBasicWalPayload<'a>),
     FileCreate(FileCreateWalPayload<'a>),
     FileRename(FileRenameWalPayload<'a>),
 }
@@ -134,6 +138,9 @@ pub fn decode_volume_wal_payload(bytes: &[u8]) -> Result<VolumeWalPayload<'_>, V
         return decode_file_delta_wal_payload(bytes)
             .map(VolumeWalPayload::FileDelta)
             .map_err(VolumeWalPayloadError::from);
+    }
+    if bytes.starts_with(FILE_BASIC_MAGIC) {
+        return decode_file_basic_wal_payload(bytes).map(VolumeWalPayload::FileBasic);
     }
     if bytes.starts_with(FILE_CREATE_MAGIC) {
         return decode_file_create_wal_payload(bytes).map(VolumeWalPayload::FileCreate);
