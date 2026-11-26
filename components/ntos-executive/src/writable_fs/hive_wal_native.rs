@@ -171,6 +171,13 @@ pub(crate) unsafe fn poll_native_hive_journal(id: u64)
     if let Some(status) = journal.failed { return Err(status); }
     match &mut journal.phase {
         Phase::Baseline { started } => {
+            // This hive and SYSTEM share the volume WAL. Seal the SYSTEM batch before
+            // trying to acquire its recheck owner, retaining this journal on BUSY.
+            match super::system_wal_batch_native::request_drain_if_active() {
+                Ok(()) => {}
+                Err(status) if status == snapshot_storage::BUSY => return Ok(None),
+                Err(status) => return Err(status),
+            }
             if journal.baseline.needs_checkpoint {
                 if !*started { *started = true; }
                 match super::native_checkpoint::checkpoint_dirty_native() {

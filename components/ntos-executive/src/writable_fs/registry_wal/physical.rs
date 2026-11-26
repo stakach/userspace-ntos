@@ -214,17 +214,22 @@ impl Owner {
     }
 
     pub(crate) fn refuse_unentered_native_io(&mut self, request: nt_fs::AsyncWalIoRequest) -> Result<nt_fs::AsyncWalRefusal, u32> {
+        self.refuse_unentered_native_io_owned(request).map(|(refusal, _payload)| refusal)
+    }
+
+    /// Preserve a CM-published frame on a first PREPARE refusal with no physical effect.
+    pub(crate) fn refuse_unentered_native_io_owned(&mut self, request: nt_fs::AsyncWalIoRequest) -> Result<(nt_fs::AsyncWalRefusal, Option<Vec<u8>>), u32> {
         if let Some(Stage::AsyncAnchoring(update)) = self.stage.as_mut() {
             if self.anchor_entered || update.pending() != Some(anchor_request(request)) {
                 return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
             }
             let _ = unsafe { update.complete(anchor_request(request), false) };
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-            return Ok(nt_fs::AsyncWalRefusal::RetainedEffects);
+            return Ok((nt_fs::AsyncWalRefusal::RetainedEffects, None));
         }
         let Some(Stage::Wal(wal)) = self.stage.as_mut() else { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); };
-        let result = wal.refuse_unentered_async(request).map_err(status)?;
-        if result == nt_fs::AsyncWalRefusal::RetainedEffects {
+        let result = wal.refuse_unentered_async_owned(request).map_err(status)?;
+        if result.0 == nt_fs::AsyncWalRefusal::RetainedEffects {
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
         }
         Ok(result)

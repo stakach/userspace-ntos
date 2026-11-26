@@ -51,6 +51,9 @@ pub(crate) mod registry_journal;
 #[path = "writable_fs/registry_wal.rs"]
 pub(crate) mod registry_wal;
 
+#[path = "writable_fs/system_wal_batch_native.rs"]
+pub(crate) mod system_wal_batch_native;
+
 #[path = "writable_fs/hive_wal.rs"]
 pub(crate) mod hive_wal;
 
@@ -63,6 +66,7 @@ pub(crate) use system_wal_fold::{fold_system_wal_if_dirty,
 pub(crate) unsafe fn print_quiesce_snapshot_owners() {
     system_wal_fold::print_quiesce_owner();
     native_checkpoint::print_quiesce_owner();
+    system_wal_batch_native::print_quiesce_owner();
 }
 
 #[path = "writable_fs/file_cleanup.rs"]
