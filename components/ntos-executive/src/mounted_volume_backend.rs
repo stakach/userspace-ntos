@@ -336,8 +336,8 @@ impl MountedVolumeBackend {
             .ok_or(NtStatus::DEVICE_NOT_READY)?;
         let route_kind = crate::fs_loader::exec_block_route_kind(physical_mount)
             .ok_or(NtStatus::DEVICE_NOT_READY)?;
-        let journal_owned = crate::writable_fs::registry_journal::owns_volume();
-        if route_kind != nt_fs::BlockSourceKind::Boot || journal_owned {
+        let volume_owned = crate::writable_fs::volume_owner::owns_volume();
+        if route_kind != nt_fs::BlockSourceKind::Boot || volume_owned {
             let mut owned_name = Vec::new();
             owned_name.try_reserve_exact(units.len()).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
             owned_name.extend_from_slice(units);
@@ -347,7 +347,7 @@ impl MountedVolumeBackend {
             let owner = CapturedCreate { irp: irp.irp_id, file: file_id,
                 name: owned_name, relative: owned_relative, parameters: *parameters,
                 target_directory };
-            if journal_owned && route_kind == nt_fs::BlockSourceKind::Boot {
+            if volume_owned && route_kind == nt_fs::BlockSourceKind::Boot {
                 self.pending_creates.borrow_mut().capture_deferred_boot(
                     irp.irp_id.raw(), physical_mount.value(), owner)
                     .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
@@ -549,9 +549,9 @@ impl MountedVolumeBackend {
         let Some(mut resolved) = self.pending_creates.borrow_mut().take_resolved() else { return 0; };
         let deferred_boot = matches!(resolved.result, Ok(CreateLookupFound::DeferredBoot));
         if deferred_boot {
-            if crate::writable_fs::registry_journal::owns_volume() {
+            if crate::writable_fs::volume_owner::owns_volume() {
                 self.pending_creates.borrow_mut().restore_resolved(resolved)
-                    .expect("journal-owned CREATE retains its exact pending owner");
+                    .expect("volume-owned CREATE retains its exact pending owner");
                 return 0;
             }
             let route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
@@ -713,8 +713,8 @@ impl MountedVolumeBackend {
                 crate::print_str(&owner.relative[..owner.relative.len().min(120)]);
                 crate::print_str(b"\" deferred-boot=");
                 crate::print_u64(deferred_boot as u64);
-                crate::print_str(b" journal-owned=");
-                crate::print_u64(crate::writable_fs::registry_journal::owns_volume() as u64);
+                crate::print_str(b" volume-owned=");
+                crate::print_u64(crate::writable_fs::volume_owner::owns_volume() as u64);
                 crate::print_str(b"\n");
             }
             self.pending_creates.borrow_mut().restore_resolved(resolved)

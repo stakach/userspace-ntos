@@ -78,6 +78,7 @@ pub(super) fn publish_file_cleanup_effects(fs: &mut nt_fs::FileSystem) {
 /// Retry each retained cleanup once, including objects whose process handle is already gone.
 /// The filesystem keeps failed cleanup ownership; an unrelated syscall never inherits its error.
 pub(crate) unsafe fn redrive_file_cleanup_work() {
+    if volume_owner::owns_volume() { return; }
     // Do not mount or materialize a filesystem merely to look for retained work.
     let Some(fs) = (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() else {
         return;

@@ -311,7 +311,7 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
         // Autonomous Calls stay retained and unadmitted while that ownership is live, and
         // while a held Receive parent awaits its child.
         if !runtime::receive_child_pending()
-            && !crate::writable_fs::registry_journal::owns_volume()
+            && !crate::writable_fs::volume_owner::owns_volume()
             && !crate::service_sec_image::root_add_device_exclusive_pending()
             && !crate::service_sec_image::root_queued_callback_exclusive_pending()
             && !crate::driver_launch::unsettled_queued_callback()

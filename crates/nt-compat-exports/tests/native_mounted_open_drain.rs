@@ -30,7 +30,7 @@ fn parked_mounted_create_remains_a_live_signaler_until_native_service_drives_it(
 }
 
 #[test]
-fn create_file_routes_journal_owned_volume_before_overlay_admission() {
+fn create_file_routes_volume_owned_volume_before_overlay_admission() {
     let source = include_str!("../../../components/ntos-executive/src/exec_file_create.rs");
     let create = source.split("unsafe fn nt_create_file_service(").nth(1)
         .expect("native NtCreateFile service");

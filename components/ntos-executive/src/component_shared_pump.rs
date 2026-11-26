@@ -920,7 +920,7 @@ unsafe fn parked_dispatch_wait_yield(
 ) -> Option<crate::win32k_glue::ServiceWaitYield> {
     if !ch.caps.parked_dispatch_yield || ch.caps.kind != ReqKind::Irp
         || ch.kernel_caller.is_some()
-        || crate::writable_fs::registry_journal::owns_volume()
+        || crate::writable_fs::volume_owner::owns_volume()
     {
         return None;
     }
@@ -1433,7 +1433,7 @@ pub(super) unsafe fn receive(
         }
         // The registry journal has moved the mounted volume into its own transaction.
         // Leave autonomous Calls in the retained receiver until that owner releases it.
-        if !crate::writable_fs::registry_journal::owns_volume() {
+        if !crate::writable_fs::volume_owner::owns_volume() {
             trace_ps_create_receive(ch, b"autonomous-select", Some(route));
             if PS_CREATE_AFTER_AUTONOMOUS_TRACE.load(Ordering::Relaxed) != 0 {
                 let selected = PS_CREATE_AFTER_AUTONOMOUS_SELECT.fetch_add(1, Ordering::Relaxed) + 1;

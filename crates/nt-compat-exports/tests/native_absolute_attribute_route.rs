@@ -61,7 +61,7 @@ mod fs_loader {{
     }}
 }}
 mod writable_fs {{
-    pub mod registry_journal {{ pub fn owns_volume() -> bool {{ false }} }}
+    pub mod volume_owner {{ pub fn owns_volume() -> bool {{ false }} }}
     pub fn volume_path_into(name: &[u16], _: &mut [u8], out: &mut [u8]) -> Option<usize> {{
         let relative = crate::nt_fs::nt_path_to_volume_relative(name, b"reactos")?;
         out[..relative.len()].copy_from_slice(&relative);
