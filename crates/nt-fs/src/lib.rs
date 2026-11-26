@@ -192,6 +192,8 @@ mod tests;
 #[cfg(test)]
 mod snapshot_capacity_tests;
 #[cfg(test)]
+mod hive_log_capacity_red_tests;
+#[cfg(test)]
 mod system_wal_batch_payload_tests;
 #[cfg(test)]
 mod registry_wal_frame_room_tests;

@@ -35,12 +35,16 @@ struct Journal {
     encoded: Vec<u8>,
     new_log_len: u64,
     baseline: Baseline,
+    capacity_reservation: Option<nt_fs::SnapshotCapacityReservation>,
     phase: Phase,
     failed: Option<u32>,
     wal_entered_ever: bool,
 }
 
 static mut JOURNAL: Option<Journal> = None;
+// A refused pre-WAL cancellation retains its exact claim for a later no-effect retry. Dropping
+// the token would leave its FileSystem-owned charge unreachable, although it cannot be reused.
+static mut UNADMITTED_CAPACITY: Option<nt_fs::SnapshotCapacityReservation> = None;
 
 pub(crate) unsafe fn has_retained_native_hive_journal() -> bool {
     (&*core::ptr::addr_of!(JOURNAL)).is_some()
@@ -80,6 +84,36 @@ fn clone_owned(bytes: &[u8]) -> Result<Vec<u8>, u32> {
     result.try_reserve_exact(bytes.len()).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
     result.extend_from_slice(bytes);
     Ok(result)
+}
+
+unsafe fn cancel_unadmitted_capacity(
+    token: nt_fs::SnapshotCapacityReservation, status: u32,
+) -> u32 {
+    let cancellation = match writable_fs() {
+        Ok(fs) => fs.cancel_snapshot_reservation(token),
+        Err(error) => Err((error, token)),
+    };
+    match cancellation {
+        Ok(()) => status,
+        Err((error, token)) => {
+            *core::ptr::addr_of_mut!(UNADMITTED_CAPACITY) = Some(token);
+            error
+        }
+    }
+}
+
+unsafe fn retry_unadmitted_capacity_cancel() -> Result<(), u32> {
+    let slot = &mut *core::ptr::addr_of_mut!(UNADMITTED_CAPACITY);
+    let Some(token) = slot.take() else { return Ok(()); };
+    let cancellation = match writable_fs() {
+        Ok(fs) => fs.cancel_snapshot_reservation(token),
+        Err(error) => Err((error, token)),
+    };
+    if let Err((error, token)) = cancellation {
+        *slot = Some(token);
+        return Err(error);
+    }
+    Ok(())
 }
 
 unsafe fn restore_unentered_wal(
@@ -136,6 +170,7 @@ pub(crate) unsafe fn begin_native_hive_journal(path: &str, record: &[u8]) -> Res
         return Err(snapshot_storage::BUSY);
     }
     ensure_mounted()?;
+    retry_unadmitted_capacity_cancel()?;
     let mount = crate::fs_loader::exec_fs_mount_identity()
         .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
     if crate::fs_loader::exec_block_route_kind(mount) != Some(nt_fs::BlockSourceKind::Native) {
@@ -147,24 +182,43 @@ pub(crate) unsafe fn begin_native_hive_journal(path: &str, record: &[u8]) -> Res
     }
     let path = clone_path(path)?;
     let record = clone_owned(record)?;
-    let baseline = inspect_baseline(&path, &record)?;
-    let new_log_len = baseline.length.checked_add(u64::try_from(record.len())
-        .map_err(|_| nt_fs::STATUS_INVALID_PARAMETER)?)
-        .ok_or(nt_fs::STATUS_INVALID_PARAMETER)?;
+    let record_len = u64::try_from(record.len())
+        .map_err(|_| nt_fs::STATUS_INVALID_PARAMETER)?;
+    let id = *core::ptr::addr_of!(NEXT_ID);
+    let next = id.checked_add(1)
+        .ok_or(nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
+    let mut capacity_reservation = writable_fs()?
+        .reserve_snapshot_append_by_path(&path, record.len())?;
+    let baseline = match inspect_baseline_with_reservation(
+        &path, &record, Some(&mut capacity_reservation)) {
+        Ok(baseline) => baseline,
+        Err(status) => return Err(cancel_unadmitted_capacity(capacity_reservation, status)),
+    };
+    let new_log_len = baseline.length.checked_add(record_len)
+        .ok_or(nt_fs::STATUS_INVALID_PARAMETER);
+    let new_log_len = match new_log_len {
+        Ok(length) => length,
+        Err(status) => return Err(cancel_unadmitted_capacity(capacity_reservation, status)),
+    };
     let encoded = nt_fs::encode_hive_log_wal_payload(HiveLogWalPayload {
         file_id: baseline.file_id, expected_log_len: baseline.length,
         path: &path, record: &record,
     }).map_err(|error| match error {
         nt_fs::VolumeWalPayloadError::OutOfMemory => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
         _ => nt_fs::STATUS_INVALID_PARAMETER,
-    })?;
-    let id = *core::ptr::addr_of!(NEXT_ID);
-    let next = id.checked_add(1)
-        .ok_or(nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
-    writable_fs()?.protect_wal_log(&path, baseline.file_id)?;
+    });
+    let encoded = match encoded {
+        Ok(encoded) => encoded,
+        Err(status) => return Err(cancel_unadmitted_capacity(capacity_reservation, status)),
+    };
+    let protected = writable_fs()
+        .and_then(|fs| fs.protect_wal_log(&path, baseline.file_id));
+    if let Err(status) = protected {
+        return Err(cancel_unadmitted_capacity(capacity_reservation, status));
+    }
     *core::ptr::addr_of_mut!(NEXT_ID) = next;
     *core::ptr::addr_of_mut!(JOURNAL) = Some(Journal { id, path, record, encoded,
-        new_log_len, baseline,
+        new_log_len, baseline, capacity_reservation: Some(capacity_reservation),
         phase: Phase::Baseline { started: false }, failed: None,
         wal_entered_ever: false });
     Ok(id)
@@ -303,12 +357,22 @@ pub(crate) unsafe fn native_hive_journal_has_entered_wal(id: u64) -> bool {
 /// failed caller reply, even when no WAL write has entered yet.
 pub(crate) unsafe fn abort_unentered_native_hive_journal(id: u64) -> Result<(), u32> {
     let slot = &mut *core::ptr::addr_of_mut!(JOURNAL);
-    let journal = slot.as_ref().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    let journal = slot.as_mut().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
     if journal.id != id || journal.wal_entered_ever {
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
     }
     if !matches!(journal.phase, Phase::Baseline { .. } | Phase::Released) {
         return Err(snapshot_storage::BUSY);
+    }
+    let token = journal.capacity_reservation.take()
+        .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+    let cancellation = match writable_fs() {
+        Ok(fs) => fs.cancel_snapshot_reservation(token),
+        Err(status) => Err((status, token)),
+    };
+    if let Err((status, token)) = cancellation {
+        journal.capacity_reservation = Some(token);
+        return Err(status);
     }
     *slot = None;
     Ok(())
@@ -572,8 +636,8 @@ unsafe fn complete_native_hive_io_inner(
                 Err(update) => { core::mem::forget(update);
                     return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DATA_ERROR))); }
             };
-            if let Err(status) = replay_anchored_record(&journal.path, &journal.record,
-                &journal.baseline, journal.new_log_len, ReplayMountError::NativeInvalidHandle) {
+            if let Err(status) = replay_anchored_record_reserved(&journal.path, &journal.record,
+                &journal.baseline, journal.new_log_len, &mut journal.capacity_reservation) {
                 core::mem::forget(lease);
                 core::mem::forget(anchored);
                 return Ok(SnapshotCompletion::Failed(status));
@@ -597,6 +661,9 @@ pub(crate) unsafe fn install_native_hive_publication(
     let Phase::AwaitInstall { lease } = &journal.phase else {
         return Err((nt_fs::STATUS_INVALID_DEVICE_REQUEST, continuation, pair));
     };
+    if journal.capacity_reservation.is_some() {
+        return Err((block(nt_fs::STATUS_DATA_ERROR), continuation, pair));
+    }
     if let Err((status, continuation, pair)) =
         snapshot_storage::install_wal_continuation(lease, continuation, pair) {
         return Err((block(status), continuation, pair));

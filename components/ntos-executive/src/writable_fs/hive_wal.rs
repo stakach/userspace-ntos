@@ -81,13 +81,28 @@ fn clone_path(path: &str) -> Result<alloc::string::String, u32> {
 }
 
 unsafe fn inspect_baseline(path: &str, record: &[u8]) -> Result<Baseline, u32> {
+    inspect_baseline_with_reservation(path, record, None)
+}
+
+/// A native admission may precharge an absent LOG's CREATE and its future WAL append. Boot
+/// admission uses the same baseline rules without a native capacity token.
+unsafe fn inspect_baseline_with_reservation(
+    path: &str, record: &[u8],
+    reservation: Option<&mut nt_fs::SnapshotCapacityReservation>,
+) -> Result<Baseline, u32> {
     // Classify before creating a missing stream. A prior anchored suffix still names its
     // original file, so replacing that file cannot silently establish a new baseline.
     let needs_checkpoint = baseline_needs_checkpoint(path)?;
     let fs = writable_fs()?;
     if fs.existing_file_id(path).is_none() {
-        let created = fs.zw_create_file(path, nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE,
-            0, 0, nt_fs::FILE_OPEN_IF, nt_fs::FILE_NON_DIRECTORY_FILE);
+        let created = if let Some(token) = reservation {
+            fs.zw_create_file_reserved(token, path,
+                nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE,
+                0, 0, nt_fs::FILE_OPEN_IF, nt_fs::FILE_NON_DIRECTORY_FILE)
+        } else {
+            fs.zw_create_file(path, nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE,
+                0, 0, nt_fs::FILE_OPEN_IF, nt_fs::FILE_NON_DIRECTORY_FILE)
+        };
         if created.status != nt_fs::STATUS_SUCCESS { return Err(created.status); }
         let close = fs.zw_close(created.handle);
         if close != nt_fs::STATUS_SUCCESS { return Err(close); }
@@ -148,29 +163,47 @@ unsafe fn finish_baseline(path: &str, record: &[u8], baseline: &mut Baseline) ->
     Ok(())
 }
 
-enum ReplayMountError {
-    /// Boot setup reports the failed mount admission itself.
-    AsReported,
-    /// Preserve the Native journal's existing post-anchor invalid-handle status.
-    NativeInvalidHandle,
-}
-
 /// The physical WAL record and both paired anchors are already durable. Only then may the
 /// mounted sidecar and its live sequence baseline advance to the exact encoded append.
 unsafe fn replay_anchored_record(
     path: &str, record: &[u8], baseline: &Baseline, new_log_len: u64,
-    mount_error: ReplayMountError,
 ) -> Result<(), u32> {
     let payload = HiveLogWalPayload { file_id: baseline.file_id,
         expected_log_len: baseline.length, path, record };
-    let fs = writable_fs().map_err(|status| block(match mount_error {
-        ReplayMountError::AsReported => status,
-        ReplayMountError::NativeInvalidHandle => nt_fs::STATUS_INVALID_HANDLE,
-    }))?;
+    let fs = writable_fs().map_err(block)?;
     fs.replay_hive_log_wal_payload(payload).map_err(|error| block(match error {
         nt_fs::HiveLogWalReplayError::OutOfMemory => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
         _ => nt_fs::STATUS_DATA_ERROR,
     }))?;
+    advance_anchored_baseline(path, baseline, new_log_len)
+}
+
+/// A native journal carries the exact charge acquired before its baseline CREATE and all WAL
+/// effects. A failed replay returns that token to the journal; it cannot be released or reused
+/// while the durable anchor may still require this append.
+unsafe fn replay_anchored_record_reserved(
+    path: &str, record: &[u8], baseline: &Baseline, new_log_len: u64,
+    reservation: &mut Option<nt_fs::SnapshotCapacityReservation>,
+) -> Result<(), u32> {
+    let fs = writable_fs().map_err(|_| block(nt_fs::STATUS_INVALID_HANDLE))?;
+    let token = reservation.take().ok_or_else(|| block(nt_fs::STATUS_DATA_ERROR))?;
+    let payload = HiveLogWalPayload { file_id: baseline.file_id,
+        expected_log_len: baseline.length, path, record };
+    if let Err((error, token)) = fs.replay_hive_log_wal_payload_reserved(token, payload) {
+        *reservation = Some(token);
+        return Err(block(match error {
+            nt_fs::HiveLogWalReplayError::Capacity => nt_fs::STATUS_DISK_FULL,
+            nt_fs::HiveLogWalReplayError::OutOfMemory =>
+                nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+            _ => nt_fs::STATUS_DATA_ERROR,
+        }));
+    }
+    advance_anchored_baseline(path, baseline, new_log_len)
+}
+
+unsafe fn advance_anchored_baseline(
+    path: &str, baseline: &Baseline, new_log_len: u64,
+) -> Result<(), u32> {
     let entry = baselines().iter_mut().find(|entry|
         entry.path == path && entry.file_id == baseline.file_id)
         .ok_or_else(|| block(nt_fs::STATUS_DATA_ERROR))?;

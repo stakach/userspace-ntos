@@ -100,7 +100,7 @@ fn retained_wal_files_and_checkpoint_images_escape_transient_request_scope() {
             .expect("CM checkpoint transfer"),
         "CM image transferred into the mounted filesystem must outlive the transient timer scope");
     assert!(commit_entry.find("allocator::enter_durable()").expect("durable log admission")
-        < commit_entry.find("inspect_baseline(&path, &record)").expect("log baseline"),
+        < commit_entry.find("inspect_baseline_with_reservation(").expect("log baseline"),
         "retained log catalog and WAL replay bytes must be allocated durably");
 }
 
