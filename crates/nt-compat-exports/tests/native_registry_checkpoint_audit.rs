@@ -129,7 +129,11 @@ fn journal_captures_exact_lease_and_journal_extent_before_storage_move() {
         && item.paths.iter().any(|name| name == "journal"))
         .expect("capture the owned journal length");
     assert!(mount < storage && bytes < storage);
-    assert!(!items.iter().any(latest_global));
+    // Admission may mark the mount blocked if the claimed volume has no slot.
+    // It must still avoid consulting later snapshot metadata for this attempt.
+    assert!(!items.iter().flat_map(|item| &item.paths).any(|name|
+        name.starts_with("WRITABLE_FS_SNAPSHOT_")
+            && name != "WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED"));
 }
 
 #[test]

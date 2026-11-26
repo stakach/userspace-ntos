@@ -305,7 +305,7 @@ unsafe fn drive_kernel_job(
         crate::mutable_hive_mutation_work::redrive_nested();
         if ingress::resume_acknowledged_retained_services()
             .map_err(|_| nt_process::STATUS_UNSUCCESSFUL)? { continue; }
-        if !crate::writable_fs::registry_journal::owns_volume()
+        if !crate::writable_fs::volume_owner::owns_volume()
             && ingress::service_autonomous().map_err(|_| nt_process::STATUS_UNSUCCESSFUL)?
         { continue; }
         // Re-evaluate actual ready work after IRQ/autonomous effects, then sleep on the root

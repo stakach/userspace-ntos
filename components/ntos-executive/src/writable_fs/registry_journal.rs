@@ -5,15 +5,10 @@ use super::*;
 use alloc::vec::Vec;
 use nt_fs::{OwnedSnapshotJournal, SnapshotJournalError};
 
-static OWNED: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn owns_volume() -> bool {
-    OWNED.load(Ordering::Acquire)
-}
-
 #[must_use = "retain journal work until confirmed publication or rollback"]
 pub(crate) struct Journal<C> {
     storage: OwnedSnapshotJournal<snapshot_storage::Lease, C>,
+    owner: nt_fs::VolumeOwner<'static>,
     mount: nt_memory_manager::SectionMountId,
     journal_bytes: usize,
 }
@@ -43,12 +38,17 @@ impl<C> Journal<C> {
         let mount = *device.identity();
         let journal_bytes = journal.len();
         // No IPC occurs between this admission and the move. All public access checks this gate.
-        if OWNED.swap(true, Ordering::AcqRel) {
-            return Err((snapshot_storage::BUSY, journal, context));
-        }
-        let filesystem = (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS))
-            .take()
-            .expect("admitted writable volume");
+        let owner = match volume_owner::claim() {
+            Ok(owner) => owner,
+            Err(status) => return Err((status, journal, context)),
+        };
+        let Some(filesystem) = (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).take() else {
+            // The admitted FileSystem vanished. There is no exact instance to restore, so the
+            // gate must remain claimed instead of authorizing a replacement mount.
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            drop(owner);
+            return Err((nt_fs::STATUS_DEVICE_NOT_READY, journal, context));
+        };
         let store = device.store();
         let result = if exists {
             OwnedSnapshotJournal::open(filesystem, device, store, &path, journal, context)
@@ -56,9 +56,9 @@ impl<C> Journal<C> {
             OwnedSnapshotJournal::create(filesystem, device, store, &path, journal, context)
         };
         match result {
-            Ok(storage) => Ok(Self { storage, mount, journal_bytes }),
+            Ok(storage) => Ok(Self { storage, owner, mount, journal_bytes }),
             Err(error) => {
-                restore(error.filesystem);
+                restore(error.filesystem, owner);
                 drop(error.device);
                 Err((error.status, error.journal, error.context))
             }
@@ -109,11 +109,12 @@ impl<C> Journal<C> {
                     WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
                 }
                 SNAPSHOT_PUBLICATION.clear_after_legacy_journal();
-                restore(filesystem);
+                restore(filesystem, self.owner);
                 drop(device);
                 Ok(context)
             }
-            Err(storage) => Err(Self { storage, mount: self.mount, journal_bytes: self.journal_bytes }),
+            Err(storage) => Err(Self { storage, owner: self.owner,
+                mount: self.mount, journal_bytes: self.journal_bytes }),
         }
     }
 
@@ -123,20 +124,24 @@ impl<C> Journal<C> {
             Ok((filesystem, device, context)) => {
                 debug_assert!(legacy_snapshot_writes_allowed());
                 SNAPSHOT_PUBLICATION.clear_after_legacy_journal();
-                restore(filesystem);
+                restore(filesystem, self.owner);
                 drop(device);
                 Ok(context)
             }
-            Err(storage) => Err(Self { storage, mount: self.mount, journal_bytes: self.journal_bytes }),
+            Err(storage) => Err(Self { storage, owner: self.owner,
+                mount: self.mount, journal_bytes: self.journal_bytes }),
         }
     }
 }
 
-unsafe fn restore(filesystem: nt_fs::FileSystem) {
+unsafe fn restore(filesystem: nt_fs::FileSystem, owner: nt_fs::VolumeOwner<'static>) {
     let slot = &mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS);
-    assert!(slot.is_none() && owns_volume(), "registry journal volume ownership");
+    assert!(slot.is_none() && volume_owner::owns_volume(), "owned writable volume restore");
     *slot = Some(filesystem);
-    OWNED.store(false, Ordering::Release);
+    if unsafe { owner.release() }.is_err() {
+        // An exact-token mismatch is not permission to admit another volume owner.
+        WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+    }
     mark_runtime_dirty();
 }
 

@@ -348,7 +348,7 @@ pub(crate) unsafe fn drain_boot_registry_before_handler_constructor() -> Result<
     crate::bootstrap_receive::drive((), || {
         let quiescent = crate::registry_mutation_work::pending_count() == 0
             && !crate::registry_mutation_work::redrive_active()
-            && !crate::writable_fs::registry_journal::owns_volume();
+            && !crate::writable_fs::volume_owner::owns_volume();
         Ok(quiescent.then_some(true))
     })?;
     Ok(())
@@ -367,7 +367,7 @@ pub(crate) unsafe fn publish_setup_system_mutation(
         "provider CM owner appeared during handler construction");
     assert!(!crate::registry_mutation_work::redrive_active(),
         "provider CM owner is executing during handler construction");
-    assert!(!crate::writable_fs::registry_journal::owns_volume(),
+    assert!(!crate::writable_fs::volume_owner::owns_volume(),
         "registry journal was not released before setup");
 
     let work_slot = core::ptr::addr_of_mut!(BOOT_WORK);

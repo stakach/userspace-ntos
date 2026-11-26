@@ -428,7 +428,7 @@ pub(crate) unsafe fn prepare_service_wait_yield(
     if !(channel.caps.hosted_receive_yield || channel.caps.nested_service_wait_yield)
         || channel.kernel_caller.is_some()
         || channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
-        || crate::writable_fs::registry_journal::owns_volume()
+        || crate::writable_fs::volume_owner::owns_volume()
         || runtime::hold_snapshot().running.is_some()
     {
         return Ok(None);
@@ -481,7 +481,7 @@ pub(crate) unsafe fn prepare_root_maintenance_yield(
     if !channel.caps.hosted_receive_yield
         || channel.kernel_caller.is_some()
         || channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
-        || crate::writable_fs::registry_journal::owns_volume()
+        || crate::writable_fs::volume_owner::owns_volume()
         || runtime::receive_child_pending()
         || !crate::process_image_snapshot_work::due_for_outer_with_clock(monotonic_time_100ns)
     {
@@ -660,7 +660,7 @@ pub(crate) unsafe fn prepare_receive_yield(
     if !channel.caps.hosted_receive_yield
         || channel.kernel_caller.is_some()
         || channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
-        || crate::writable_fs::registry_journal::owns_volume()
+        || crate::writable_fs::volume_owner::owns_volume()
     {
         return Ok(None);
     }
@@ -773,7 +773,7 @@ pub(crate) unsafe fn prepare_root_ingress_yield(
     if !channel.caps.hosted_receive_yield
         || channel.kernel_caller.is_some()
         || channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
-        || crate::writable_fs::registry_journal::owns_volume()
+        || crate::writable_fs::volume_owner::owns_volume()
     {
         return Ok(None);
     }

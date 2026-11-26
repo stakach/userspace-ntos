@@ -58,7 +58,7 @@ mod driver_launch {{
     }}
 }}
 mod writable_fs {{
-    pub mod registry_journal {{ pub fn owns_volume() -> bool {{ false }} }}
+    pub mod volume_owner {{ pub fn owns_volume() -> bool {{ false }} }}
 }}
 struct ExecNtHandler;
 impl ExecNtHandler {{ {selector} }}
