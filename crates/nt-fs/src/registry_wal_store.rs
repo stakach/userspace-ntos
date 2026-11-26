@@ -347,13 +347,14 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
         Self::recover_inner(device, incarnation, None)
     }
 
-    /// Recover against a paired snapshot's minimum durable WAL prefix. Valid marked
+    /// Recover against a validated v2 snapshot's minimum durable WAL prefix. Valid marked
     /// records after it are still replayed; only a later torn suffix may be cleared.
     ///
     /// # Safety
-    /// `floor` must come from verified paired snapshot headers on the same exclusively
-    /// owned physical reserve as `device`. A bare numeric anchor is not authority to
-    /// discard any WAL sector.
+    /// `floor` must come from validated v2 snapshot recovery metadata read on the same
+    /// exclusively owned physical reserve as `device`. The companion slot may be torn;
+    /// the selected valid slot must still authenticate the floor. A bare numeric anchor
+    /// is not authority to discard any WAL sector.
     pub unsafe fn recover_with_floor(device: D, floor: WalSnapshotAnchor) -> Result<Self, RegistryWalError> {
         Self::recover_inner(device, floor.incarnation, Some(floor))
     }
