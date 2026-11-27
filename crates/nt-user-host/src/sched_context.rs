@@ -216,3 +216,13 @@ impl SchedContextConstruction {
 #[cfg(test)]
 #[path = "sched_context_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sched_context_worker_bootstrap_tests.rs"]
+mod worker_bootstrap_tests;
+
+#[path = "sched_context_worker_bootstrap.rs"]
+mod worker_bootstrap;
+pub use worker_bootstrap::{BlockedWorkerObservation, BootstrapError, BootstrapUnbindIo,
+    PassiveWorker, PassiveWorkerBootstrap, ReplyObservation, UnbindOutcome,
+    WorkerBootstrapResources};
