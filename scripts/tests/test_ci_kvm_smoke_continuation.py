@@ -374,6 +374,59 @@ class ContinuationTests(unittest.TestCase):
             self.assertFalse(disk.migration_submodule_is_compatible(source, divergent))
             self.assertFalse(disk.migration_submodule_is_compatible("0" * 40, target))
 
+    def test_migration_accepts_pre_squash_source_matching_target_ancestor_tree(self):
+        def git(*args):
+            return subprocess.check_output(["git", *args], cwd=self.root, text=True).strip()
+
+        git("init", "-q")
+        source_file = self.root / "source.txt"
+        source_file.write_text("base\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "base")
+        base = git("rev-parse", "HEAD")
+
+        source_file.write_text("merged source\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "pre-squash source")
+        source = git("rev-parse", "HEAD")
+
+        git("checkout", "-qB", "main", base)
+        source_file.write_text("merged source\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "squash merge")
+        squash = git("rev-parse", "HEAD")
+        self.assertNotEqual(source, squash)
+        self.assertEqual(git("rev-parse", f"{source}^{{tree}}"),
+                         git("rev-parse", f"{squash}^{{tree}}"))
+
+        (self.root / "next.txt").write_text("later target change\n")
+        git("add", "next.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "target")
+        target = git("rev-parse", "HEAD")
+        self.assertTrue(disk.source_is_ancestor(squash, target, cwd=self.root))
+        self.assertFalse(disk.source_is_ancestor(source, target, cwd=self.root))
+
+        git("checkout", "-qB", "diverged", base)
+        source_file.write_text("different source\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "divergent sibling")
+        divergent = git("rev-parse", "HEAD")
+
+        self.current["head_sha"] = target
+        with patch.object(disk, "ROOT", self.root):
+            self.run["head_sha"] = source
+            disk.verify_migration_run(self.run, 101, 2, self.current)
+            for refused in (divergent, "0" * 40, target):
+                with self.subTest(refused=refused):
+                    self.run["head_sha"] = refused
+                    with self.assertRaises(disk.ContinuationError):
+                        disk.verify_migration_run(self.run, 101, 2, self.current)
+
     def test_migration_rejects_unrelated_head_release_or_layout(self):
         prior = "1" * 40
         self.run["head_sha"] = prior
