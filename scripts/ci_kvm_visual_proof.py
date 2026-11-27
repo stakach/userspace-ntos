@@ -22,6 +22,9 @@ ATTRIB_COMMAND = re.compile(
 ATTRIB_RESULT = re.compile(
     r"(?im)^[ \t]*(?P<flags>[a-z \t]{0,24})[ \t]+(?P<path>[a-z]:\\[^\r\n]+?)[ \t]*$"
 )
+ATTRIB_RETURNED = re.compile(
+    r"(?im)^" + OCR_PUNCT_PREFIX + r"(?P<directory>[a-z]:\\[^\r\n>]*)>,?[ \t]*$"
+)
 NEXT_PROMPT = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]*>")
 READY_TITLE = re.compile(r"(?im)^[^\w\r\n]{0,3}Command Prompt[ \t]*$")
 # Sparse-text OCR may join up to three punctuation glyphs from adjacent desktop
@@ -46,6 +49,9 @@ CREATE_PROMPT_CROP = (70, 250, 600, 274)
 # Command, exact directory header, count row and returned prompt in the pinned
 # 1024x768 console. Whole-frame sparse OCR can read the zero as "@ File(s)".
 DIRECTORY_LIST_CROP = (70, 246, 500, 421)
+# The lower console rows in the pinned FileBasic frame show the attrib query,
+# its result and the returned prompt. Sparse full-frame OCR can split `.txt`.
+ATTRIB_READBACK_CROP = (68, 426, 520, 510)
 # Bottom input row of the pinned 1024x768 Command Prompt in the FileBasic
 # frame. Sparse full-screen OCR can merge desktop glyphs into this row.
 CHILD_PROMPT_CROP = (158, 558, 805, 582)
@@ -101,9 +107,11 @@ def contains_readonly_attribute(text, name, *, readonly):
     directory = command.group("directory").rstrip("\\")
     expected_path = (directory + "\\" + name).casefold()
     tail = text[command.end():]
-    next_prompt = NEXT_PROMPT.search(tail)
-    if next_prompt:
-        tail = tail[:next_prompt.start()]
+    returned = ATTRIB_RETURNED.search(tail)
+    if (returned is None or
+            returned.group("directory").rstrip("\\").casefold() != directory.casefold()):
+        return False
+    tail = tail[:returned.start()]
     for result in ATTRIB_RESULT.finditer(tail):
         if result.group("path").casefold() == expected_path:
             return ("r" in result.group("flags").casefold()) == readonly
@@ -390,6 +398,29 @@ def prove_ver_result(image):
 def prove_readonly_attribute(image, name, *, readonly):
     """Require the captured attrib query and its exact before/after state."""
     state = "present" if readonly else "absent"
-    return _prove_image(image,
-                        lambda text: contains_readonly_attribute(text, name, readonly=readonly),
-                        f"exact {name} attrib readback with read-only {state} not visible")
+    result = _prove_image(image,
+                          lambda text: contains_readonly_attribute(text, name, readonly=readonly),
+                          f"exact {name} attrib readback with read-only {state} not visible")
+    if result.passed or result.fatal:
+        return result
+    try:
+        frame = crop_ppm(image, *ATTRIB_READBACK_CROP, scale=2)
+        ocr = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "6"],
+            input=frame, capture_output=True, timeout=20, check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return VisualProof(False, result.ocr_text, f"attrib crop OCR unavailable: {error}",
+                           result.image_name, result.image_sha256, fatal=True)
+    text = ocr.stdout.decode("utf-8", errors="replace")
+    transcript = result.ocr_text + "\nattrib crop: " + text
+    if ocr.returncode != 0:
+        detail = ocr.stderr.decode("utf-8", errors="replace").strip()
+        return VisualProof(False, transcript,
+                           f"attrib crop OCR failed ({ocr.returncode}): {detail}",
+                           result.image_name, result.image_sha256, fatal=True)
+    if not contains_readonly_attribute(text, name, readonly=readonly):
+        return VisualProof(False, transcript, result.error,
+                           result.image_name, result.image_sha256)
+    return VisualProof(True, transcript, image_name=result.image_name,
+                       image_sha256=result.image_sha256)
