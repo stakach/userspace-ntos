@@ -2843,12 +2843,48 @@ pub(crate) unsafe fn prepare_basic_owner(file_id: u64, input: [u8; 40])
 {
     let mount = (*core::ptr::addr_of!(WRITABLE_MOUNT_ID))
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-    let fs = writable_fs()?;
-    nt_io_manager::PendingBasicPreparedOwner::prepare(fs, file_id, input,
-        BasicFileReference { file_id, mount }).map_err(|(status, file)| {
+    prepare_basic_with_reference(file_id, input, BasicFileReference { file_id, mount })
+        .map_err(|(status, file)| {
             file.into_row();
             status
         })
+}
+
+/// The generation of the writable namespace that owns mounted overlay File handles.
+pub(crate) unsafe fn mounted_basic_namespace_identity()
+    -> Option<nt_memory_manager::SectionMountId>
+{
+    *core::ptr::addr_of!(WRITABLE_MOUNT_ID)
+}
+
+/// Prepare a Basic mutation for a caller that already retains the canonical File and IRP.
+/// The mounted backend keeps that lifetime through its completion ACK; the local route supplies
+/// its separately retained I/O reference. A refusal returns the caller's owner unchanged.
+pub(crate) unsafe fn prepare_basic_with_reference<FileReference>(
+    file_id: u64,
+    input: [u8; 40],
+    file: FileReference,
+) -> Result<nt_io_manager::PendingBasicPreparedOwner<FileReference>, (u32, FileReference)> {
+    let fs = match writable_fs() {
+        Ok(fs) => fs,
+        Err(status) => return Err((status, file)),
+    };
+    nt_io_manager::PendingBasicPreparedOwner::prepare(fs, file_id, input, file)
+}
+
+/// Apply one mounted Basic plan through the current snapshot producer. The move-only plan
+/// records its terminal status so a provider redrive cannot re-enter MemFs.
+pub(crate) unsafe fn apply_mounted_basic_snapshot_once<FileReference>(
+    owner: &mut nt_io_manager::PendingBasicPreparedOwner<FileReference>,
+) -> Result<u32, u32> {
+    let fs = writable_fs()?;
+    let fresh = owner.prepared().is_some();
+    let (status, changed) = owner.apply_snapshot_once(fs);
+    if fresh && status == nt_fs::STATUS_SUCCESS {
+        OVERLAY_SET_INFO.fetch_add(1, Ordering::Relaxed);
+        if changed { mark_snapshot_dirty(); }
+    }
+    Ok(status)
 }
 
 /// Apply a retained, generation-exact Basic plan through the existing snapshot route. A

@@ -11,6 +11,13 @@ OWNER = re.compile(
     rb"status=(?P<status>\d+) file=(?P<file>\d+)"
     rb"(?: stable=(?P<stable>\d+) attrs=(?P<attrs>\d+))?"
 )
+MOUNTED = re.compile(
+    rb"\[mounted-basic-owner\] stage=(?P<stage>terminal|ack) "
+    rb"irp=(?P<irp>\d+) file=(?P<file>\d+) context=(?P<context>\d+) "
+    rb"mount=(?P<mount>\d+) overlay_mount=(?P<overlay_mount>\d+) "
+    rb"overlay_file=(?P<overlay_file>\d+) status=(?P<status>\d+) "
+    rb"stable=(?P<stable>\d+) attrs=(?P<attrs>\d+)"
+)
 STAGES = (b"basic-terminal", b"reply", b"file-released", b"retired")
 
 
@@ -30,7 +37,30 @@ def prove_filebasic_receipts(serial: bytes) -> FileBasicProof:
     active = {}
     seen = set()
     complete = []
+    mounted = {}
+    mounted_seen = set()
     for line in serial.splitlines():
+        provider = MOUNTED.fullmatch(line.strip())
+        if provider is not None:
+            fields = provider.groupdict()
+            key = (int(fields["irp"]), int(fields["file"]))
+            owner = tuple(int(fields[name]) for name in
+                          ("context", "mount", "overlay_mount", "overlay_file",
+                           "stable", "attrs"))
+            if fields["stage"] == b"terminal":
+                if key in mounted_seen:
+                    mounted.pop(key, None)
+                    continue
+                mounted_seen.add(key)
+                if int(fields["status"]) == 0 and owner[4] != 0:
+                    mounted[key] = (1, owner, None)
+            elif int(fields["status"]) == 0:
+                stage = mounted.get(key)
+                if stage is not None and stage[0] == 2 and stage[1] == owner:
+                    mounted[key] = (3, owner, stage[2])
+                else:
+                    mounted.pop(key, None)
+            continue
         match = OWNER.fullmatch(line.strip())
         if match is None:
             continue
@@ -39,6 +69,17 @@ def prove_filebasic_receipts(serial: bytes) -> FileBasicProof:
                     ("table", "slot", "generation", "irp", "pi", "tid", "file"))
         stage = fields["stage"]
         status = int(fields["status"])
+        mounted_key = (int(fields["irp"]), int(fields["file"]))
+        mounted_stage = mounted.get(mounted_key)
+        if mounted_stage is not None:
+            if stage == b"reply" and mounted_stage[0] == 1 and status == 0:
+                mounted[mounted_key] = (2, mounted_stage[1], key)
+            elif stage == b"retired" and mounted_stage[0] == 3 and status == 0:
+                if mounted_stage[2] == key:
+                    complete.append((mounted_stage[1][4], mounted_stage[1][5]))
+                mounted.pop(mounted_key, None)
+            else:
+                mounted.pop(mounted_key, None)
         if stage == STAGES[0]:
             if key in seen:
                 active.pop(key, None)

@@ -93,6 +93,8 @@ mod pending_file_busy;
 mod pending_file_delivery;
 #[path = "file_dispatch_handoff.rs"]
 mod file_dispatch_handoff;
+#[path = "pending_device_control_trace.rs"]
+mod pending_device_control_trace;
 #[path = "mounted_create_owner_trace.rs"]
 pub(crate) mod mounted_create_owner_trace;
 #[path = "mounted_read_owner_trace.rs"]
@@ -16497,9 +16499,13 @@ unsafe fn pending_file_io_redrive_pass(
         }
         if completed.is_none() && transaction_terminal.is_none()
             && attribute_inline_terminal.is_none() && local_terminal.is_none() {
+            pending_device_control_trace::stage(identity, pending.irp_id,
+                pending_device_control_trace::Stage::AwaitTerminal, None);
             if !pending.is_local() && completions.copy_requires_retry(
                 || driver_launch::published_completed_irp_copy_requires_retry(pending.irp_id))
             {
+                pending_device_control_trace::stage(identity, pending.irp_id,
+                    pending_device_control_trace::Stage::ProviderCopyRetry, None);
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
             }
             continue;
@@ -16517,6 +16523,9 @@ unsafe fn pending_file_io_redrive_pass(
             ) {
                 panic!("pending File completion identity mismatch");
             }
+            pending_device_control_trace::stage(identity, pending.irp_id,
+                pending_device_control_trace::Stage::Terminal,
+                Some((completed.status, completed.information)));
             if pending.major == nt_io_abi::major::IRP_MJ_WRITE {
                 if let Some(file_id) = hosted_file_id {
                     let _ = nt_handler.complete_install_pipe_write(
@@ -16573,6 +16582,8 @@ unsafe fn pending_file_io_redrive_pass(
         else {
             // Terminal provider output and the parked Reply remain owned by this exact row.
             // Do not acknowledge or publish either into a retired caller's address space.
+            pending_device_control_trace::stage(identity, pending.irp_id,
+                pending_device_control_trace::Stage::CallerInvalid, None);
             continue;
         };
         crate::executor::local().client_pi.store(pending.pi as u64, Ordering::Relaxed);
@@ -17189,6 +17200,8 @@ unsafe fn pending_file_io_redrive_pass(
                     .expect("pending File empty output owner disappeared");
             }
             if copy_failed {
+                pending_device_control_trace::stage(identity, pending.irp_id,
+                    pending_device_control_trace::Stage::OutputCopyRetry, None);
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 restore_file_io_mirrors!();
                 continue;
@@ -17350,6 +17363,8 @@ unsafe fn pending_file_io_redrive_pass(
         }
 
         if pending.busy.is_some_and(|busy| !busy.is_settled()) {
+            pending_device_control_trace::stage(identity, pending.irp_id,
+                pending_device_control_trace::Stage::Busy, None);
             pending_file_busy::release_if_ready(nt_handler, slot, pending);
             // Waking may enter provider cleanup and re-enter this loop. It runs only after the
             // snapshot walk, with a separate retained attempt; this owner cannot reply/ACK yet.
@@ -17382,6 +17397,8 @@ unsafe fn pending_file_io_redrive_pass(
                 cap, pending.owned_syscall_status().unwrap_or(terminal_status) as u64,
             );
             if !replied {
+                pending_device_control_trace::stage(identity, pending.irp_id,
+                    pending_device_control_trace::Stage::ReplyFailed, None);
                 (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                     .restore_reply_cap_exact(slot, pending.irp_id, cap)
                     .expect("failed File reply lost its exact capability owner");
@@ -17392,6 +17409,8 @@ unsafe fn pending_file_io_redrive_pass(
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .mark_reply_published_exact(slot, pending.irp_id)
                 .expect("pending File reply publication owner disappeared");
+            pending_device_control_trace::stage(identity, pending.irp_id,
+                pending_device_control_trace::Stage::ReplyPublished, None);
             file_set_owner_receipts::reply(identity, pending, terminal_status);
             if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
                 if let Some(file) = hosted_file_id {
@@ -17404,6 +17423,8 @@ unsafe fn pending_file_io_redrive_pass(
             mounted_installer_file_trace::reply(identity, pending.irp_id);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
+            pending_device_control_trace::stage(identity, pending.irp_id,
+                pending_device_control_trace::Stage::WakeReady, None);
         }
 
         if !(&*core::ptr::addr_of!(PENDING_FILE_IO))
@@ -17422,6 +17443,8 @@ unsafe fn pending_file_io_redrive_pass(
                 _ => Ok(()),
             };
             if acknowledged.is_err() {
+                pending_device_control_trace::stage(identity, pending.irp_id,
+                    pending_device_control_trace::Stage::AckFailed, None);
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 restore_file_io_mirrors!();
                 continue;
@@ -17429,6 +17452,8 @@ unsafe fn pending_file_io_redrive_pass(
             delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .mark_backend_acked_exact(slot, pending.irp_id)
                 .expect("ACKed pending File owner disappeared");
+            pending_device_control_trace::stage(identity, pending.irp_id,
+                pending_device_control_trace::Stage::BackendAcked, None);
             mounted_read_lifetime_trace::backend_acked(identity, pending.irp_id);
             mounted_installer_file_trace::ack(identity, pending.irp_id);
             if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
@@ -17491,6 +17516,8 @@ unsafe fn pending_file_io_redrive_pass(
         let finished = table
             .finish_owner_exact(identity, pending.irp_id)
             .expect("completed pending File owner did not retire");
+        pending_device_control_trace::stage(identity, pending.irp_id,
+            pending_device_control_trace::Stage::Retired, None);
         file_set_owner_receipts::retired(identity, finished, terminal_status);
         pending_pipe_read_trace::retired(identity, pending.irp_id);
         mounted_read_lifetime_trace::retired(identity, pending.irp_id);

@@ -164,6 +164,9 @@ impl MountedVolumeBackend {
                 if !binding.overlay_open {
                     return Err(NtStatus::INVALID_HANDLE);
                 }
+                if class == nt_fs::FILE_BASIC_INFORMATION {
+                    return self.park_basic(irp, context, overlay_file, payload);
+                }
                 status(unsafe { crate::writable_fs::set_information(overlay_file, class, payload) })
             }
             nt_fs::LayeredSetInformationAction::InstalledPosition(offset) => {

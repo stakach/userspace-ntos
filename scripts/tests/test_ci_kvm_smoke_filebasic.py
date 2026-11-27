@@ -53,6 +53,27 @@ class FileBasicInteractionTests(unittest.TestCase):
         ])
         self.assertTrue(all(0 < step.wait_seconds <= 120
                             for step in profile.steps[len(desktop.steps):]))
+        child_steps = {step.name: step for step in profile.steps}
+        for name in ("basicproof-child-stdout", "basicproof-attrib-help"):
+            with self.subTest(name=name):
+                self.assertEqual(child_steps[name].readiness_poll_seconds, 2)
+                self.assertGreaterEqual(child_steps[name].wait_seconds, 45)
+
+    def test_child_steps_require_their_output_then_a_returned_prompt(self):
+        stdout = ci_kvm_visual_proof.contains_child_stdout_completion
+        help_done = ci_kvm_visual_proof.contains_attrib_help_completion
+        prompt = "C:\\Users\\User>"
+        self.assertFalse(stdout(prompt + "cmd /c echo CHILD_STDOUT_OK\n"))
+        self.assertFalse(stdout(prompt + "cmd /c echo CHILD_STDOUT_OK\n" + prompt))
+        self.assertFalse(stdout(prompt + "cmd /c echo CHILD_STDOUT_OK\nCHILD_STDOUT_OK\n"))
+        self.assertTrue(stdout(prompt + "cmd /c echo CHILD_STDOUT_OK\nCHILD_STDOUT_OK\n" + prompt))
+        self.assertTrue(stdout(prompt + "cmd /c echo CHILD_STDOUT_OK\n"
+                               + prompt + "aCHILD_STDOUT_OK\n" + prompt))
+        self.assertFalse(help_done(prompt + "attrib /?\n" + prompt))
+        self.assertFalse(help_done("Displays or changes file attributes.\n"))
+        self.assertTrue(help_done("Displays or changes file attributes.\n"
+                                  "Type ATTRIB without a parameter to display the attributes of all files.\n"
+                                  + prompt))
 
     def test_readback_requires_exact_current_directory_path_and_attribute_state(self):
         command = "D:\\Scratch\\Work>attrib basicproof.txt\n"

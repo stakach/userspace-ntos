@@ -43,6 +43,9 @@ use mounted_rename::{RenameTarget, TargetDirectory};
 #[path = "mounted_set_information.rs"]
 mod mounted_set_information;
 use mounted_set_information::InformationRefusals;
+#[path = "mounted_basic_set.rs"]
+mod mounted_basic_set;
+use mounted_basic_set::MountedBasicSet;
 
 struct CompletedCreate {
     owner: CapturedCreate,
@@ -160,6 +163,7 @@ pub(crate) struct MountedVolumeBackend {
     create_completions: Vec<CompletedCreate>,
     pending_directories: MountedDirectoryQueue,
     directory_completions: Vec<CompletedDirectory>,
+    pending_basic: Vec<MountedBasicSet>,
     information_refusals: InformationRefusals,
 }
 
@@ -179,6 +183,7 @@ impl MountedVolumeBackend {
             create_completions: Vec::new(),
             pending_directories,
             directory_completions: Vec::new(),
+            pending_basic: Vec::new(),
             information_refusals: InformationRefusals::default(),
         }
     }
@@ -1815,14 +1820,15 @@ impl DriverDispatchBackend for MountedVolumeBackend {
         }
     }
 
-    fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
-        Err(NtStatus::NOT_SUPPORTED)
+    fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+        self.cancel_basic(irp_id)
     }
 
     fn service_pending(&mut self) -> usize {
         let mut progress = self.service_resolved_create();
         progress += self.service_prepared_overlay();
         progress += self.service_resolved_directory();
+        progress += self.service_basic();
         let pending_position = self.read_completions.borrow().pending_position();
         if let Some((irp, open, next)) = pending_position {
             if let Ok(entry) = self.shares.get_mut(open) {
@@ -1843,6 +1849,9 @@ impl DriverDispatchBackend for MountedVolumeBackend {
         if let Some(ready) = self.directory_completions.iter_mut().find(|item| !item.published) {
             ready.published = true;
             return Some(ready.completion);
+        }
+        if let Some(completion) = self.poll_basic_completion() {
+            return Some(completion);
         }
         self.read_completions.borrow_mut().next_completion().map(|(irp, status, transferred)| DriverCompletion {
             irp_id: IrpId(irp),
@@ -1881,6 +1890,9 @@ impl DriverDispatchBackend for MountedVolumeBackend {
             if !self.directory_completions[index].published { return Err(NtStatus::INVALID_PARAMETER); }
             self.directory_completions.swap_remove(index);
             return Ok(());
+        }
+        if self.pending_basic.iter().any(|item| item.identity.irp == irp_id) {
+            return self.ack_basic_completion(irp_id);
         }
         self.read_completions.borrow_mut().ack(irp_id.raw())
             .map_err(|_| NtStatus::INVALID_PARAMETER)

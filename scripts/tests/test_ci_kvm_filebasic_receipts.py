@@ -22,7 +22,32 @@ def sequence(*, attrs, irp, file=81, stable=100, status=0):
                     for stage in ("basic-terminal", "reply", "file-released", "retired"))
 
 
+def mounted(stage, *, attrs, irp, file, stable=100, status=0):
+    return (f"[mounted-basic-owner] stage={stage} irp={irp} file={file} "
+            f"context=77 mount=3 overlay_mount=4 overlay_file=55 "
+            f"status={status} stable={stable} attrs={attrs}\n").encode()
+
+
+def mounted_sequence(*, attrs, irp, file, stable=100, status=0):
+    return (mounted("terminal", attrs=attrs, irp=irp, file=file, stable=stable, status=status)
+            + event("reply", irp=irp, file=file, status=status)
+            + mounted("ack", attrs=attrs, irp=irp, file=file, stable=stable, status=status)
+            + event("retired", irp=irp, file=file, status=status))
+
+
 class FileBasicReceiptTests(unittest.TestCase):
+    def test_accepts_mounted_basic_only_after_provider_and_delivery_both_settle(self):
+        clear = mounted_sequence(attrs=16, irp=101, file=81)
+        set_ = mounted_sequence(attrs=17, irp=102, file=82)
+        self.assertTrue(prove_filebasic_receipts(clear + set_).passed)
+        for omitted in (b"[mounted-basic-owner] stage=ack", b"[file-set-owner] stage=retired"):
+            with self.subTest(omitted=omitted):
+                self.assertFalse(prove_filebasic_receipts(
+                    clear + b"\n".join(line for line in set_.splitlines()
+                                        if not line.startswith(omitted)) + b"\n").passed)
+        self.assertFalse(prove_filebasic_receipts(
+            clear + mounted_sequence(attrs=17, irp=102, file=82, stable=101)).passed)
+
     def test_accepts_clear_then_set_of_same_file_with_exact_owner_stages(self):
         serial = sequence(attrs=16, irp=101, file=81) + sequence(attrs=17, irp=102, file=82)
         self.assertTrue(prove_filebasic_receipts(serial).passed)

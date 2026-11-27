@@ -303,6 +303,9 @@ pub(super) unsafe fn before_post_action(
             // Publish Waiting before any reentrant completion can make this thread Ready.
             thread_wait_state_park_badge_waiting(nt_handler, published_pending.badge);
         }
+        super::pending_device_control_trace::parked(
+            nt_handler, identity, published_pending, wait_for_completion,
+        );
         if async_in_flight {
             hold_async_in_flight(identity, published_pending.irp_id);
         }

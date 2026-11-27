@@ -84,6 +84,25 @@ fn prepared_basic_information_refuses_stale_path_and_file_identity() {
 }
 
 #[test]
+fn prepared_basic_information_keeps_its_file_through_cleanup_with_an_io_reference() {
+    let (mut fs, handle) = open(FILE, FILE_NON_DIRECTORY_FILE);
+    let input = basic([0, 0, 777, 0], FILE_ATTRIBUTE_READONLY);
+    let prepared = fs.prepare_basic_information(handle, &input).unwrap();
+    let original = metadata(&fs, handle);
+    fs.zw_retain_io_reference(handle).unwrap();
+    assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
+    assert_eq!(metadata(&fs, handle), original);
+
+    let rebased = prepared.rebase_snapshot(&fs, &input).unwrap();
+    assert_eq!(fs.apply_prepared_basic_information(rebased).unwrap().attributes,
+        FILE_ATTRIBUTE_READONLY);
+    assert_eq!(reported_attributes(&fs, handle), FILE_ATTRIBUTE_READONLY);
+    fs.zw_release_io_reference(handle).unwrap();
+    assert_eq!(fs.query_file_object_information(handle), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(fs.query_metadata(FILE).unwrap().attributes, FILE_ATTRIBUTE_READONLY);
+}
+
+#[test]
 fn prepared_basic_information_refuses_intervening_metadata_and_skips_noop_notify() {
     let (mut fs, handle) = open(FILE, FILE_NON_DIRECTORY_FILE);
     let directory = fs.zw_create_file(

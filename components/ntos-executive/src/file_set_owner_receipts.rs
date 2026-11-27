@@ -1,4 +1,4 @@
-//! Bounded receipts for exact local SET delivery, including owned FileBasic work.
+//! Bounded receipts for exact SET delivery, including mounted provider work.
 //!
 //! Basic terminal admission is distinct from Reply publication, File release and row
 //! retirement. Later stages use the same table/slot/generation/IRP key without a
@@ -18,12 +18,16 @@ fn local_set(
     status: u32,
     basic: Option<(u64, u32)>,
 ) {
-    let Some(nt_io_manager::LocalFileObject::Overlay(file)) = row.local_file_object() else {
-        return;
-    };
     if row.major != nt_io_abi::major::IRP_MJ_SET_INFORMATION {
         return;
     }
+    let file = match row.local_file_object() {
+        Some(nt_io_manager::LocalFileObject::Overlay(file)) => file,
+        _ => match row.hosted_file_id() {
+            Some(file) => file,
+            None => return,
+        },
+    };
     if TRACES.fetch_add(1, Ordering::Relaxed) >= TRACE_LIMIT {
         return;
     }

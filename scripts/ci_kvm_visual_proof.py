@@ -39,6 +39,14 @@ SEARCH_MENU_SHUTDOWN = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"Shut down[ \t
 # Pinned 1024x768 LiberNT Start edit interior. The full-frame sparse OCR has
 # misread its tiny text; a doubled crop reads the exact query on saved frames.
 SEARCH_QUERY_CROP = (17, 683, 210, 702)
+# OCR may attach the next prompt's first typed glyph to the child's stdout row.
+# The result is still distinguishable from the echoed `cmd /c echo` command.
+CHILD_STDOUT_LINE = re.compile(
+    r"(?im)^(?:" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]*>[a-z]?)?CHILD_STDOUT_OK[ \t]*$"
+)
+ATTRIB_HELP_TAIL = re.compile(
+    r"(?im)^Type ATTRIB without a parameter to display the attributes of all files\.[ \t]*$"
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +90,18 @@ def contains_ready_prompt(text):
     """Find a foreground Command Prompt title followed by a ready input prompt."""
     title = READY_TITLE.search(text)
     return title is not None and READY_PROMPT.search(text, title.end()) is not None
+
+
+def contains_child_stdout_completion(text):
+    """The child printed its marker and cmd returned to an empty input prompt."""
+    marker = CHILD_STDOUT_LINE.search(text)
+    return marker is not None and READY_PROMPT.search(text, marker.end()) is not None
+
+
+def contains_attrib_help_completion(text):
+    """The help command reached its final line and returned to cmd."""
+    tail = ATTRIB_HELP_TAIL.search(text)
+    return tail is not None and READY_PROMPT.search(text, tail.end()) is not None
 
 
 def contains_start_menu_search_box(text):
@@ -129,6 +149,16 @@ def _prove_image(image, predicate, missing):
 def prove_ready_prompt(image):
     """Require a visible ready Command Prompt before any test command is typed."""
     return _prove_image(image, contains_ready_prompt, "ready Command Prompt not visible")
+
+
+def prove_child_stdout_completion(image):
+    return _prove_image(image, contains_child_stdout_completion,
+                        "child stdout marker and returned prompt not visible")
+
+
+def prove_attrib_help_completion(image):
+    return _prove_image(image, contains_attrib_help_completion,
+                        "attrib help tail and returned prompt not visible")
 
 
 def prove_start_menu_search_box(image):
