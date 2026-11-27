@@ -103,6 +103,20 @@ fn prepared_basic_information_keeps_its_file_through_cleanup_with_an_io_referenc
 }
 
 #[test]
+fn basic_information_can_prepare_after_cleanup_while_io_reference_retains_file() {
+    let (mut fs, handle) = open(FILE, FILE_NON_DIRECTORY_FILE);
+    let input = basic([0, 0, 777, 0], FILE_ATTRIBUTE_READONLY);
+    fs.zw_retain_io_reference(handle).unwrap();
+    assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
+
+    let prepared = fs.prepare_basic_information(handle, &input).unwrap();
+    assert_eq!(fs.apply_prepared_basic_information(prepared).unwrap().attributes,
+        FILE_ATTRIBUTE_READONLY);
+    fs.zw_release_io_reference(handle).unwrap();
+    assert_eq!(fs.query_metadata(FILE).unwrap().attributes, FILE_ATTRIBUTE_READONLY);
+}
+
+#[test]
 fn prepared_basic_information_refuses_intervening_metadata_and_skips_noop_notify() {
     let (mut fs, handle) = open(FILE, FILE_NON_DIRECTORY_FILE);
     let directory = fs.zw_create_file(
