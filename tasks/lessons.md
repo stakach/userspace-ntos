@@ -1013,3 +1013,14 @@ diagnosis-free failure.
 - When a creator reads a suspended child's PEB, seed fields derived from the admitted PE before
   publishing the process. A correct PE section query does not imply the PEB exposes the same
   subsystem; test both the byte offset and the value the creator actually reads.
+
+## Preserve Installed-Disk Submodule Ancestry Across Squash Merges
+- An accepted installed disk records the exact `rust-micro` commit used to build it. A squash
+  merge can preserve every source byte while dropping that commit from the new submodule
+  history. If later kernel changes make the trees differ, authenticated disk migration
+  correctly refuses the source even though the native build passes (#553).
+- Before pinning a squash-merged kernel commit, compare its complete tree and ancestry with
+  the accepted disk's recorded submodule commit. When the source tree is already present but
+  ancestry was lost, use a reviewed zero-content merge commit that retains the source as a
+  parent; preserve its parents when merging that PR. Never weaken the migration verifier or
+  replace the accepted disk to hide a Git-history mistake.
