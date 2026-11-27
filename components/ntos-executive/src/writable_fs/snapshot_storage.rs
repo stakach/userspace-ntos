@@ -11,7 +11,15 @@ pub(crate) use native_header_recheck::*;
 type Reserve = SnapshotReserve<AhciSnapshotDevice, SectionMountId>;
 pub(crate) type Lease = SnapshotReserveLease<'static, AhciSnapshotDevice, SectionMountId>;
 static mut RESERVE: Option<Reserve> = None;
-static mut PHYSICAL_RANGE: Option<(SectionMountId, u64, u64)> = None;
+#[derive(Clone, Copy)]
+struct PublishedReserveGeometry {
+    mount: SectionMountId,
+    physical_start_lba: u64,
+    physical_sectors: u64,
+    snapshot_payload_capacity: usize,
+}
+
+static mut PUBLISHED_GEOMETRY: Option<PublishedReserveGeometry> = None;
 static SNAPSHOT_REFUSAL_TRACES: AtomicU64 = AtomicU64::new(0);
 
 /// Diagnostic presence only; neither observation grants the mounted lease or WAL proof.
@@ -37,8 +45,17 @@ fn trace_refusal(stage: &'static [u8], lease_mount: Option<SectionMountId>,
 /// The exact reserve published with this mounted filesystem, including its WAL tail.
 /// A metadata reader may use this only to prove a SCSI write is disjoint from installed FAT.
 pub(crate) fn published_physical_range(mount: SectionMountId) -> Option<(u64, u64)> {
-    unsafe { *core::ptr::addr_of!(PHYSICAL_RANGE) }
-        .and_then(|(owner, start, sectors)| (owner == mount).then_some((start, sectors)))
+    unsafe { *core::ptr::addr_of!(PUBLISHED_GEOMETRY) }
+        .and_then(|geometry| (geometry.mount == mount)
+            .then_some((geometry.physical_start_lba, geometry.physical_sectors)))
+}
+
+/// Exact payload bytes of one snapshot slot, derived from the published store and device.
+/// Metadata alone never grants a storage lease or WAL authority.
+pub(crate) fn published_payload_capacity(mount: SectionMountId) -> Option<usize> {
+    unsafe { *core::ptr::addr_of!(PUBLISHED_GEOMETRY) }
+        .and_then(|geometry| (geometry.mount == mount)
+            .then_some(geometry.snapshot_payload_capacity))
 }
 
 struct MountedWalContinuation {
@@ -77,10 +94,16 @@ pub(crate) unsafe fn publish(fat: Fat32, mount: SectionMountId, physical_sectors
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
     }
     if let Some(device) = AhciSnapshotDevice::from_backing(fat, physical_sectors)? {
-        let physical_range = (mount, device.start_lba, u64::from(device.sectors));
         let store = nt_fs::SnapshotBlockStore::new(SNAPSHOT_START_SECTORS, SNAPSHOT_SECTORS);
+        let geometry = PublishedReserveGeometry {
+            mount,
+            physical_start_lba: device.start_lba,
+            physical_sectors: u64::from(device.sectors),
+            snapshot_payload_capacity: store.payload_capacity(&device)
+                .map_err(snapshot_store_error_status)?,
+        };
         *slot = Some(SnapshotReserve::new(device, mount, store));
-        *core::ptr::addr_of_mut!(PHYSICAL_RANGE) = Some(physical_range);
+        *core::ptr::addr_of_mut!(PUBLISHED_GEOMETRY) = Some(geometry);
     }
     Ok(())
 }
@@ -122,14 +145,16 @@ fn checked_mount(lease: &Lease) -> Result<SectionMountId, u32> {
 /// The native executor still validates the resulting absolute request against its disk route.
 pub(super) fn physical_lba(lease: &Lease, relative_lba: u64) -> Result<u64, u32> {
     let mount = checked_mount(lease)?;
-    let Some((range_mount, start, sectors)) = (unsafe { *core::ptr::addr_of!(PHYSICAL_RANGE) }) else {
+    let Some(geometry) = (unsafe { *core::ptr::addr_of!(PUBLISHED_GEOMETRY) }) else {
         trace_refusal(b"physical-range-absent", Some(mount), Some(mount));
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     };
-    if mount != range_mount || relative_lba >= sectors || relative_lba >= lease.sector_count() {
+    if mount != geometry.mount || relative_lba >= geometry.physical_sectors
+        || relative_lba >= lease.sector_count() {
         return Err(nt_fs::STATUS_INVALID_PARAMETER);
     }
-    start.checked_add(relative_lba).ok_or(nt_fs::STATUS_INVALID_PARAMETER)
+    geometry.physical_start_lba.checked_add(relative_lba)
+        .ok_or(nt_fs::STATUS_INVALID_PARAMETER)
 }
 
 /// Publish the WAL continuation and verified snapshot pair under their physical mount lease.

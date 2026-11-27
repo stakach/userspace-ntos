@@ -512,6 +512,7 @@ pub(super) unsafe fn fold_system_wal_native() -> Result<bool, u32> {
     if prepared.is_none() && manifest.base_serial == manifest.high_water_serial {
         return Ok(false);
     }
+    system_snapshot_capacity::begin_fold(prepared.as_ref().map(|checkpoint| checkpoint.image.len()))?;
     let mount = *lease.identity();
     Err(begin_recheck_with_prepared(lease, prepared, manifest, mount, None))
 }
