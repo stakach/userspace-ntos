@@ -111,6 +111,7 @@ pub(crate) unsafe fn begin_wal_continuation_recheck_returning_lease(
     };
     let slot = &mut *core::ptr::addr_of_mut!(WAL_CONTINUATION);
     let Some(cached) = slot.as_ref() else {
+        trace_refusal(b"recheck-continuation-absent", Some(mount), Some(mount));
         return Err((nt_fs::STATUS_DEVICE_NOT_READY, lease));
     };
     if cached.mount != mount || cached.token.anchor() != cached.pair.anchor() {

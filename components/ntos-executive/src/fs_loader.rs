@@ -445,19 +445,14 @@ pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> 
     status
 }
 
-#[allow(dead_code)]
-pub(crate) const WRITABLE_SNAPSHOT_RESERVE_BYTES: u32 = 16 * 1024 * 1024;
-#[allow(dead_code)]
-pub(crate) const WRITABLE_SNAPSHOT_RESERVE_SECTORS: u32 = WRITABLE_SNAPSHOT_RESERVE_BYTES / 512;
-
 /// Return the raw disk region reserved immediately after the FAT-visible volume, if the BPB
 /// exposes a finite volume size. The image builder appends this reserve outside FAT metadata.
 #[allow(dead_code)]
-pub(crate) fn writable_snapshot_reserve(fs: &Fat32) -> Option<(u64, u32)> {
+pub(crate) fn writable_snapshot_reserve_start(fs: &Fat32) -> Option<u64> {
     if fs.snapshot_start_lba == 0 {
         return None;
     }
-    Some((fs.snapshot_start_lba, WRITABLE_SNAPSHOT_RESERVE_SECTORS))
+    Some(fs.snapshot_start_lba)
 }
 
 /// Return the mounted FAT volume's BPB identity, trimming only the format-time

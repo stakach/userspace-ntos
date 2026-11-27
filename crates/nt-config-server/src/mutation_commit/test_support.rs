@@ -11,6 +11,7 @@ pub(crate) fn server() -> CmServer {
         nt_hive_core::HardwareProfileAlias::capture(&hive, &current_control_set).unwrap();
     server.cm = config_manager_from_system_hive(&hive, &current_control_set);
     server.system_hive = Some(MountedSystemHive {
+        checkpoint_image_len: nt_hive_core::encoded_image_len(&hive).unwrap() as u32,
         identity: server.identities.take().unwrap(),
         hive,
         generation: 1,
@@ -42,6 +43,7 @@ pub(crate) fn secured_server() -> CmServer {
     let mut server = server();
     let mounted = server.system_hive.as_mut().unwrap();
     secure_fixture_hive(&mut mounted.hive);
+    mounted.checkpoint_image_len = nt_hive_core::encoded_image_len(&mounted.hive).unwrap() as u32;
     server.cm = config_manager_from_system_hive(&mounted.hive, &mounted.current_control_set);
     server
 }
@@ -66,6 +68,7 @@ pub(super) fn prepare(server: &mut CmServer, name: &str) -> CmHiveMutationCommit
         semantic_journal_len: 100,
         mutations: prepared.mutations,
         durable_journal: prepared.durable_journal,
+        projected_checkpoint_image_len: prepared.projected_checkpoint_image_len,
     });
     CmHiveMutationCommitRequest {
         abi_size: core::mem::size_of::<CmHiveMutationCommitRequest>() as u16,

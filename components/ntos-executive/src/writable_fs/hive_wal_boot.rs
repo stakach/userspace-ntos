@@ -344,7 +344,6 @@ pub(crate) unsafe fn enter_boot_hive_journal(id: u64) -> Result<NativeHiveJourna
         &journal.record,
         &journal.baseline,
         journal.new_log_len,
-        ReplayMountError::AsReported,
     ) {
         journal.failed = Some(status);
         return Err(status);

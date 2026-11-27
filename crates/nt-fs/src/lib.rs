@@ -107,7 +107,7 @@ pub use fs::{
     validate_file_create_parameters, CreateResult, FileCleanupEffects, FileIoState, FileMetadata,
     FileObjectInformation, FileOpenPrivileges, FileRenameRoot, FileShareAccess, FileSystem,
     InstalledFileOpenAction, LayeredFileOpenDecision, MemFs, MemFsBlobCompactError,
-    MemFsBlobCompaction, MemFsSnapshotError,
+    MemFsBlobCompaction, MemFsSnapshotError, SnapshotCapacityReservation,
     MemFsSnapshotInfo, MoveClusterInformation, PreparedBasicInformation,
     SetFileNameInformation, SetInformationEffect,
     StandardInformation,
@@ -189,6 +189,10 @@ pub use volume::*;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod snapshot_capacity_tests;
+#[cfg(test)]
+mod hive_log_capacity_red_tests;
 #[cfg(test)]
 mod system_wal_batch_payload_tests;
 #[cfg(test)]

@@ -180,7 +180,11 @@ impl CmServer {
                     Ok(prepared) => prepared,
                     Err(status) => return reply(status, current_generation),
                 };
-                let PreparedSystemHiveMutations { mutations, durable_journal } = prepared;
+                let PreparedSystemHiveMutations {
+                    mutations,
+                    durable_journal,
+                    projected_checkpoint_image_len,
+                } = prepared;
                 let Ok(durable_len) = u32::try_from(durable_journal.len()) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
                 };
@@ -195,6 +199,7 @@ impl CmServer {
                     semantic_journal_len: journal_len,
                     mutations,
                     durable_journal,
+                    projected_checkpoint_image_len,
                 });
                 reply_with_info(
                     STATUS_SUCCESS,
@@ -232,10 +237,16 @@ impl CmServer {
                 );
                 let written = end - offset;
                 out_buf[..written].copy_from_slice(&prepared.durable_journal[offset..end]);
+                let Some(detail) = hive_mutation_transfer::pack_pull_detail(
+                    prepared.durable_journal.len() as u32,
+                    prepared.projected_checkpoint_image_len,
+                ) else {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                };
                 reply_with_info(
                     STATUS_SUCCESS,
                     written as u32,
-                    prepared.durable_journal.len() as u64,
+                    detail,
                     prepared.token,
                 )
             }

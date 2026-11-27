@@ -316,6 +316,7 @@ pub struct PreparedSystemHiveMutation {
     lease_token: u64,
     semantic_journal_len: u32,
     durable_journal: Vec<u8>,
+    projected_checkpoint_image_len: Option<usize>,
 }
 
 impl PreparedSystemHiveMutation {
@@ -330,6 +331,11 @@ impl PreparedSystemHiveMutation {
     }
     pub fn durable_journal(&self) -> &[u8] {
         &self.durable_journal
+    }
+    /// CM's exact encoded SYSTEM hive image length after this prepared mutation. An empty
+    /// durable journal has no new persistence effect and does not pull a size projection.
+    pub fn projected_checkpoint_image_len(&self) -> Option<usize> {
+        self.projected_checkpoint_image_len
     }
     pub fn storage_binding(&self) -> SystemHiveMutationStorageBinding {
         SystemHiveMutationStorageBinding::for_prepared(self)
@@ -2243,6 +2249,7 @@ impl<B: Backend> ConfigClient<B> {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
         let mut offset = 0usize;
+        let mut projected_checkpoint_image_len = None;
         let mut chunk = [0u8; CM_HIVE_MUTATION_CHUNK_BYTES];
         while offset < durable_len {
             let capacity = core::cmp::min(chunk.len(), durable_len - offset);
@@ -2262,10 +2269,17 @@ impl<B: Backend> ConfigClient<B> {
                 }
             };
             let written = response.information as usize;
+            let detail = hive_mutation_transfer::unpack_pull_detail(response.detail0);
+            let projection = detail.and_then(|(journal_total, image_len)| {
+                (journal_total as usize == durable_len)
+                    .then_some(image_len as usize)
+            });
             if response.status != STATUS_SUCCESS
                 || written == 0
                 || written > capacity
-                || response.detail0 as usize != durable_len
+                || projection.is_none()
+                || projected_checkpoint_image_len
+                    .is_some_and(|previous| Some(previous) != projection)
                 || response.detail1 != token
             {
                 self.abort_hive_mutation(token, expected_generation, journal_len);
@@ -2275,6 +2289,7 @@ impl<B: Backend> ConfigClient<B> {
                     response.status
                 });
             }
+            projected_checkpoint_image_len = projection;
             durable_journal.extend_from_slice(&chunk[..written]);
             offset += written;
         }
@@ -2286,6 +2301,7 @@ impl<B: Backend> ConfigClient<B> {
             lease_token: token,
             semantic_journal_len: journal_len,
             durable_journal,
+            projected_checkpoint_image_len,
         })
     }
 

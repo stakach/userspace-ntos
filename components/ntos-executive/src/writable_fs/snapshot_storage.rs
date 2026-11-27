@@ -1,7 +1,7 @@
 //! The single owned backend for the executable mount's physical snapshot reserve.
 
 use super::*;
-use nt_fs::{BoundedBlockRange, OwnedBoundedBlockRange, SnapshotBlockDevice, SnapshotReserve, SnapshotReserveLease};
+use nt_fs::{OwnedBoundedBlockRange, SnapshotBlockDevice, SnapshotReserve, SnapshotReserveLease};
 use nt_memory_manager::SectionMountId;
 
 #[path = "snapshot_storage/native_header_recheck.rs"]
@@ -11,13 +11,51 @@ pub(crate) use native_header_recheck::*;
 type Reserve = SnapshotReserve<AhciSnapshotDevice, SectionMountId>;
 pub(crate) type Lease = SnapshotReserveLease<'static, AhciSnapshotDevice, SectionMountId>;
 static mut RESERVE: Option<Reserve> = None;
-static mut PHYSICAL_RANGE: Option<(SectionMountId, u64, u64)> = None;
+#[derive(Clone, Copy)]
+struct PublishedReserveGeometry {
+    mount: SectionMountId,
+    physical_start_lba: u64,
+    physical_sectors: u64,
+    snapshot_payload_capacity: usize,
+}
+
+static mut PUBLISHED_GEOMETRY: Option<PublishedReserveGeometry> = None;
+static SNAPSHOT_REFUSAL_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic presence only; neither observation grants the mounted lease or WAL proof.
+pub(super) unsafe fn published_owner_presence() -> (bool, bool) {
+    ((&*core::ptr::addr_of!(RESERVE)).is_some(),
+        (&*core::ptr::addr_of!(WAL_CONTINUATION)).is_some())
+}
+
+fn trace_refusal(stage: &'static [u8], lease_mount: Option<SectionMountId>,
+    current_mount: Option<SectionMountId>,
+) {
+    if SNAPSHOT_REFUSAL_TRACES.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        |used| (used < 16).then_some(used + 1)).is_err() {
+        return;
+    }
+    print_str(b"[snapshot-storage-refusal] stage="); print_str(stage);
+    print_str(b" lease-mount="); print_u64(lease_mount.map_or(0, SectionMountId::value));
+    print_str(b" current-mount="); print_u64(current_mount.map_or(0, SectionMountId::value));
+    print_str(b" status="); print_hex(nt_fs::STATUS_DEVICE_NOT_READY);
+    print_str(b"\n");
+}
 
 /// The exact reserve published with this mounted filesystem, including its WAL tail.
 /// A metadata reader may use this only to prove a SCSI write is disjoint from installed FAT.
 pub(crate) fn published_physical_range(mount: SectionMountId) -> Option<(u64, u64)> {
-    unsafe { *core::ptr::addr_of!(PHYSICAL_RANGE) }
-        .and_then(|(owner, start, sectors)| (owner == mount).then_some((start, sectors)))
+    unsafe { *core::ptr::addr_of!(PUBLISHED_GEOMETRY) }
+        .and_then(|geometry| (geometry.mount == mount)
+            .then_some((geometry.physical_start_lba, geometry.physical_sectors)))
+}
+
+/// Exact payload bytes of one snapshot slot, derived from the published store and device.
+/// Metadata alone never grants a storage lease or WAL authority.
+pub(crate) fn published_payload_capacity(mount: SectionMountId) -> Option<usize> {
+    unsafe { *core::ptr::addr_of!(PUBLISHED_GEOMETRY) }
+        .and_then(|geometry| (geometry.mount == mount)
+            .then_some(geometry.snapshot_payload_capacity))
 }
 
 struct MountedWalContinuation {
@@ -30,14 +68,22 @@ struct MountedWalContinuation {
 // WAL and validates both snapshot payloads before installing a fresh mounted pair.
 static mut WAL_CONTINUATION: Option<MountedWalContinuation> = None;
 pub(super) const BUSY: u32 = 0x8000_0011;
-const SNAPSHOT_SECTORS: u64 = crate::fs_loader::WRITABLE_SNAPSHOT_RESERVE_SECTORS as u64;
-const WAL_SECTORS: u64 = SNAPSHOT_SECTORS;
+const MIB_SECTORS: u64 = 1024 * 1024 / 512;
+pub(super) const WAL_START_SECTORS: u64 = 16 * MIB_SECTORS;
+pub(super) const WAL_SECTORS: u64 = 16 * MIB_SECTORS;
+const SNAPSHOT_START_SECTORS: u64 = 32 * MIB_SECTORS;
+const SNAPSHOT_SECTORS: u64 = 64 * MIB_SECTORS;
+const RESERVE_SECTORS: u64 = SNAPSHOT_START_SECTORS + SNAPSHOT_SECTORS;
+
+pub(super) fn wal_request_fits(lba: u64, sectors: u64) -> bool {
+    sectors != 0 && lba.checked_add(sectors).is_some_and(|end| end <= WAL_SECTORS)
+}
 
 pub(super) fn wal_bounds(lease: &Lease) -> Result<(u64, u64), u32> {
-    if lease.sector_count() < SNAPSHOT_SECTORS + WAL_SECTORS {
+    if lease.sector_count() < RESERVE_SECTORS {
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
     }
-    Ok((SNAPSHOT_SECTORS, WAL_SECTORS))
+    Ok((WAL_START_SECTORS, WAL_SECTORS))
 }
 
 /// Boot-only publication, before the executable filesystem identity becomes visible. This slot
@@ -48,42 +94,38 @@ pub(crate) unsafe fn publish(fat: Fat32, mount: SectionMountId, physical_sectors
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
     }
     if let Some(device) = AhciSnapshotDevice::from_backing(fat, physical_sectors)? {
-        let physical_range = (mount, device.start_lba, u64::from(device.sectors));
-        let store = nt_fs::SnapshotBlockStore::new(0, SNAPSHOT_SECTORS);
+        let store = nt_fs::SnapshotBlockStore::new(SNAPSHOT_START_SECTORS, SNAPSHOT_SECTORS);
+        let geometry = PublishedReserveGeometry {
+            mount,
+            physical_start_lba: device.start_lba,
+            physical_sectors: u64::from(device.sectors),
+            snapshot_payload_capacity: store.payload_capacity(&device)
+                .map_err(snapshot_store_error_status)?,
+        };
         *slot = Some(SnapshotReserve::new(device, mount, store));
-        *core::ptr::addr_of_mut!(PHYSICAL_RANGE) = Some(physical_range);
+        *core::ptr::addr_of_mut!(PUBLISHED_GEOMETRY) = Some(geometry);
     }
     Ok(())
 }
 
-/// A disjoint tail view under the snapshot backend's existing exclusive mount lease.
-/// No registry write path uses this region until append/recovery ownership is implemented.
-#[allow(dead_code)]
-pub(super) fn wal_region(lease: &mut Lease) -> Result<Option<BoundedBlockRange<'_, Lease>>, u32> {
-    if lease.sector_count() < SNAPSHOT_SECTORS + WAL_SECTORS {
-        return Ok(None);
-    }
-    BoundedBlockRange::new(lease, SNAPSHOT_SECTORS, WAL_SECTORS)
-        .map(Some)
-        .map_err(|_| nt_fs::STATUS_INVALID_PARAMETER)
-}
-
 /// Move the exact reserve lease into a bounded WAL owner. Once a record write begins,
 /// uncertainty must retain this owner so the reserve cannot be reused by a new writer.
-#[allow(dead_code)]
 pub(super) fn owned_wal_region(
     lease: Lease,
 ) -> Result<OwnedBoundedBlockRange<Lease>, (u32, Lease)> {
-    OwnedBoundedBlockRange::new(lease, SNAPSHOT_SECTORS, WAL_SECTORS)
+    OwnedBoundedBlockRange::new(lease, WAL_START_SECTORS, WAL_SECTORS)
         .map_err(|(_, lease)| (nt_fs::STATUS_INVALID_PARAMETER, lease))
 }
 
 pub(super) unsafe fn acquire() -> Result<Lease, u32> {
-    let reserve = (&*core::ptr::addr_of!(RESERVE))
-        .as_ref()
-        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let Some(reserve) = (&*core::ptr::addr_of!(RESERVE)).as_ref() else {
+        trace_refusal(b"reserve-absent", None, crate::fs_loader::exec_fs_mount_identity());
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    };
     let lease = reserve.try_acquire().ok_or(BUSY)?;
-    if Some(*lease.identity()) != crate::fs_loader::exec_fs_mount_identity() {
+    let current_mount = crate::fs_loader::exec_fs_mount_identity();
+    if Some(*lease.identity()) != current_mount {
+        trace_refusal(b"reserve-mount", Some(*lease.identity()), current_mount);
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }
     Ok(lease)
@@ -91,7 +133,9 @@ pub(super) unsafe fn acquire() -> Result<Lease, u32> {
 
 fn checked_mount(lease: &Lease) -> Result<SectionMountId, u32> {
     let mount = *lease.identity();
-    if Some(mount) != unsafe { crate::fs_loader::exec_fs_mount_identity() } {
+    let current_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() };
+    if Some(mount) != current_mount {
+        trace_refusal(b"checked-mount", Some(mount), current_mount);
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }
     Ok(mount)
@@ -101,12 +145,16 @@ fn checked_mount(lease: &Lease) -> Result<SectionMountId, u32> {
 /// The native executor still validates the resulting absolute request against its disk route.
 pub(super) fn physical_lba(lease: &Lease, relative_lba: u64) -> Result<u64, u32> {
     let mount = checked_mount(lease)?;
-    let (range_mount, start, sectors) = unsafe { *core::ptr::addr_of!(PHYSICAL_RANGE) }
-        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
-    if mount != range_mount || relative_lba >= sectors || relative_lba >= lease.sector_count() {
+    let Some(geometry) = (unsafe { *core::ptr::addr_of!(PUBLISHED_GEOMETRY) }) else {
+        trace_refusal(b"physical-range-absent", Some(mount), Some(mount));
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    };
+    if mount != geometry.mount || relative_lba >= geometry.physical_sectors
+        || relative_lba >= lease.sector_count() {
         return Err(nt_fs::STATUS_INVALID_PARAMETER);
     }
-    start.checked_add(relative_lba).ok_or(nt_fs::STATUS_INVALID_PARAMETER)
+    geometry.physical_start_lba.checked_add(relative_lba)
+        .ok_or(nt_fs::STATUS_INVALID_PARAMETER)
 }
 
 /// Publish the WAL continuation and verified snapshot pair under their physical mount lease.
@@ -183,8 +231,10 @@ pub(super) fn peek_wal_continuation(
 /// checkpoint, and fold owner; no provider I/O is needed to prove a completed durability fence.
 pub(super) fn check_cached_wal_fence(lease: &Lease) -> Result<(), u32> {
     let mount = checked_mount(lease)?;
-    let cached = unsafe { &*core::ptr::addr_of!(WAL_CONTINUATION) }
-        .as_ref().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let Some(cached) = (unsafe { &*core::ptr::addr_of!(WAL_CONTINUATION) }).as_ref() else {
+        trace_refusal(b"cached-continuation-absent", Some(mount), Some(mount));
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    };
     let anchor = cached.token.anchor();
     if cached.mount != mount
         || !cached.pair.matches_cached_fence(lease.store(), anchor)
@@ -220,26 +270,19 @@ pub(crate) struct AhciSnapshotDevice {
 
 impl AhciSnapshotDevice {
     fn from_backing(fat: Fat32, physical_sectors: u64) -> Result<Option<Self>, u32> {
-        let Some((start_lba, snapshot_sectors)) = crate::fs_loader::writable_snapshot_reserve(&fat) else {
+        let Some(start_lba) = crate::fs_loader::writable_snapshot_reserve_start(&fat) else {
             return Ok(None);
         };
-        let snapshot_end = start_lba
-            .checked_add(u64::from(snapshot_sectors))
+        let reserve_end = start_lba
+            .checked_add(RESERVE_SECTORS)
             .ok_or(nt_fs::STATUS_INVALID_PARAMETER)?;
-        if snapshot_end > physical_sectors {
-            return Ok(None);
+        if reserve_end > physical_sectors {
+            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
-        let wal_end = snapshot_end.checked_add(WAL_SECTORS)
-            .ok_or(nt_fs::STATUS_INVALID_PARAMETER)?;
-        let sectors = if wal_end <= physical_sectors {
-            snapshot_sectors + WAL_SECTORS as u32
-        } else {
-            snapshot_sectors
-        };
         Ok(Some(Self {
             fat,
             start_lba,
-            sectors,
+            sectors: RESERVE_SECTORS as u32,
             flush_command: None,
         }))
     }

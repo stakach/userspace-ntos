@@ -423,6 +423,16 @@ impl StoredSnapshotMetadata {
 impl SnapshotBlockStore {
     pub fn sector_count(&self) -> u64 { self.sector_count }
 
+    /// Check a whole device-relative transfer against this store's extent.
+    /// A nonzero start is part of the store's authority, not just its length.
+    pub fn contains_sector_range(&self, lba: u64, sectors: u64) -> bool {
+        sectors != 0
+            && lba >= self.start_lba
+            && self.start_lba.checked_add(self.sector_count)
+                .zip(lba.checked_add(sectors))
+                .is_some_and(|(store_end, request_end)| request_end <= store_end)
+    }
+
     pub fn new(start_lba: u64, sector_count: u64) -> Self {
         Self {
             start_lba,

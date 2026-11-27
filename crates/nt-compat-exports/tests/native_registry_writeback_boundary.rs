@@ -100,8 +100,23 @@ fn retained_wal_files_and_checkpoint_images_escape_transient_request_scope() {
             .expect("CM checkpoint transfer"),
         "CM image transferred into the mounted filesystem must outlive the transient timer scope");
     assert!(commit_entry.find("allocator::enter_durable()").expect("durable log admission")
-        < commit_entry.find("inspect_baseline(&path, &record)").expect("log baseline"),
+        < commit_entry.find("inspect_baseline_with_reservation(").expect("log baseline"),
         "retained log catalog and WAL replay bytes must be allocated durably");
+}
+
+#[test]
+fn non_system_wal_fold_fences_new_system_capacity_admission_until_install() {
+    let capacity = include_str!("../../../components/ntos-executive/src/writable_fs/system_snapshot_capacity.rs");
+    let fold = include_str!("../../../components/ntos-executive/src/writable_fs/system_wal_fold.rs");
+    let admit = source_block(capacity, "pub(crate) unsafe fn admit(");
+    let begin = source_block(capacity, "pub(crate) unsafe fn begin_fold(");
+    let install = source_block(fold, "unsafe fn install_retained(");
+    assert!(admit.contains("addr_of!(FOLDING)"),
+        "SYSTEM admission must observe a fold even when no SYSTEM image is prepared");
+    assert!(begin.contains("addr_of_mut!(FOLDING)"),
+        "every admitted fold must fence new SYSTEM reservations");
+    assert!(install.contains("system_snapshot_capacity::finish_fold()"),
+        "the fence must survive physical fold and CM ACK until installation completes");
 }
 
 #[test]
@@ -281,7 +296,7 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
     syn::parse_str::<syn::File>(owner).expect("native persistence owner parses");
     let harness = String::from(r#"
         use std::vec::Vec;
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
         static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(0);
         static ACTIVE_BATCH: AtomicBool = AtomicBool::new(false);
         #[derive(Clone, Copy, PartialEq, Eq)] struct SystemHiveMutationStorageBinding(u8);
@@ -311,6 +326,7 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
             pub const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
             pub const STATUS_DATA_ERROR: u32 = 0xC000_003E;
             pub const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
+            pub const STATUS_DISK_FULL: u32 = 0xC000_007F;
             pub struct AsyncWalIoRequest;
             pub enum BlockOperation { Flush }
             pub enum BlockSourceKind { Draining, Native }
@@ -334,6 +350,23 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
             pub fn ensure_mounted() -> Result<(), u32> { Ok(()) }
             pub fn block_uncertain_snapshot_reserve() {}
             pub static LEGACY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            pub static CAPACITY_FULL: AtomicBool = AtomicBool::new(false);
+            pub static CAPACITY_CHECKS: AtomicUsize = AtomicUsize::new(0);
+            pub mod system_snapshot_capacity {
+                use super::*;
+                pub unsafe fn admit(prepared: &PreparedSystemHiveMutation) -> Result<bool, u32> {
+                    CAPACITY_CHECKS.fetch_add(1, Ordering::Relaxed);
+                    if CAPACITY_FULL.load(Ordering::Relaxed) {
+                        Err(nt_fs::STATUS_DISK_FULL)
+                    } else {
+                        Ok(prepared.0.0 != 9)
+                    }
+                }
+                pub unsafe fn commit_after_ack(_: SystemHiveMutationStorageBinding)
+                    -> Result<(), u32> { Ok(()) }
+                pub unsafe fn abort_after_ack(_: SystemHiveMutationStorageBinding)
+                    -> Result<(), u32> { Ok(()) }
+            }
             pub fn legacy_snapshot_writes_allowed() -> bool {
                 LEGACY.load(std::sync::atomic::Ordering::Relaxed)
             }
@@ -539,6 +572,25 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
                 "a CM receipt in a live batch cannot claim physical WAL durability");
             batched.release_after_publication(ack).unwrap();
             ACTIVE_BATCH.store(false, Ordering::Release);
+
+            // The projected folded SYSTEM image exceeds the mounted slot budget. The
+            // prepared CM mutation is still abortable, and storage must not start a
+            // header recheck, WAL effect, COMMIT, or publication ACK for it.
+            use writable_fs::{CAPACITY_CHECKS, CAPACITY_FULL};
+            CAPACITY_FULL.store(true, Ordering::Release);
+            let checks = CAPACITY_CHECKS.load(Ordering::Acquire);
+            let prepared = PreparedSystemHiveMutation(SystemHiveMutationStorageBinding(11));
+            let mut full = MutationPersistence::new();
+            assert_eq!(full.admit(&prepared, vec![11]), Err(nt_fs::STATUS_DISK_FULL));
+            assert_eq!(CAPACITY_CHECKS.load(Ordering::Acquire), checks + 1);
+            assert!(!full.admitting());
+            assert!(!full.has_journal());
+            assert!(full.binding.is_none());
+            assert!(full.commit_receipt.is_none());
+            let abort = SystemHiveMutationAbortReceipt(11);
+            full.abort_after_receipt(abort).unwrap();
+            full.release_rolled_back(SystemHiveMutationAbortAcknowledgement(abort)).unwrap();
+            CAPACITY_FULL.store(false, Ordering::Release);
         } }
     "#;
     let directory = std::env::temp_dir().join(format!(
@@ -563,7 +615,9 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
     );
     let result = Command::new(&binary).output().unwrap();
     let _ = std::fs::remove_dir_all(directory);
-    assert!(result.status.success(), "persistence owner lost a refused release");
+    assert!(result.status.success(),
+        "persistence owner lost a refused release: {}",
+        String::from_utf8_lossy(&result.stderr));
 }
 
 #[test]

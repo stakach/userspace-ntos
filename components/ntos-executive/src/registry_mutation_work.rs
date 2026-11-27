@@ -35,6 +35,7 @@ enum HostedCompletion {
         key: KeyRef,
         target: CmSystemKeyTarget,
         kind: ExistingMutationKind,
+        setup_write: Option<nt_hosted_runtime::SetupWriteCandidate>,
     },
     SystemLocale { lease: SystemHiveKeyLease, physical_path: String, locale_id: u32 },
 }
@@ -280,6 +281,7 @@ enum Phase {
 
 enum PersistenceOwner {
     Unadmitted,
+    CapacityOnly,
     NoStorage,
     Admitting { recheck_id: u64, bytes: Vec<u8> },
     BatchAdmissionPending { owner: writable_fs::registry_wal::BatchOwner, bytes: Vec<u8> },
@@ -292,6 +294,7 @@ enum PersistenceOwner {
 /// The exact CM receipt and typed acknowledgement are required to release either format.
 pub(crate) struct MutationPersistence {
     owner: PersistenceOwner,
+    capacity_admitted: bool,
     binding: Option<SystemHiveMutationStorageBinding>,
     commit_receipt: Option<SystemHiveMutationCommitReceipt>,
     abort_receipt: Option<SystemHiveMutationAbortReceipt>,
@@ -333,6 +336,7 @@ impl MutationPersistence {
     pub(crate) fn new() -> Self {
         Self {
             owner: PersistenceOwner::Unadmitted,
+            capacity_admitted: false,
             binding: None,
             commit_receipt: None,
             abort_receipt: None,
@@ -395,6 +399,14 @@ impl MutationPersistence {
         }
         assert!(matches!(&self.owner, PersistenceOwner::Unadmitted), "one storage owner per CM mutation");
         writable_fs::ensure_mounted()?;
+        if !writable_fs::legacy_snapshot_writes_allowed() {
+            let admitted = writable_fs::system_snapshot_capacity::admit(prepared)?;
+            if !bytes.is_empty() && !admitted {
+                return Err(nt_fs::STATUS_DATA_ERROR);
+            }
+            self.capacity_admitted = admitted;
+            if admitted { self.binding = Some(prepared.storage_binding()); }
+        }
         if let Some(epoch) = writable_fs::system_wal_batch_native::active_epoch_for(prepared) {
             return self.reserve_batch_slot(prepared, bytes, epoch);
         }
@@ -465,7 +477,8 @@ impl MutationPersistence {
             PersistenceOwner::Wal(wal) => wal.prepare(),
             PersistenceOwner::BatchSlot { reservation: Some(_), .. }
             | PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
-            PersistenceOwner::Admitting { .. } | PersistenceOwner::BatchAdmissionPending { .. }
+            PersistenceOwner::CapacityOnly | PersistenceOwner::Admitting { .. }
+            | PersistenceOwner::BatchAdmissionPending { .. }
             | PersistenceOwner::BatchSlot { reservation: None, .. } =>
                 Err(nt_fs::STATUS_DEVICE_NOT_READY),
         }
@@ -521,7 +534,8 @@ impl MutationPersistence {
             PersistenceOwner::Legacy(journal) => journal.rollback(),
             PersistenceOwner::Wal(_) | PersistenceOwner::BatchSlot { .. }
             | PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
-            PersistenceOwner::Admitting { .. } | PersistenceOwner::BatchAdmissionPending { .. } =>
+            PersistenceOwner::CapacityOnly | PersistenceOwner::Admitting { .. }
+            | PersistenceOwner::BatchAdmissionPending { .. } =>
                 Err(nt_fs::STATUS_DEVICE_NOT_READY),
         }
     }
@@ -561,6 +575,7 @@ impl MutationPersistence {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
         match core::mem::replace(&mut self.owner, PersistenceOwner::Unadmitted) {
+            PersistenceOwner::CapacityOnly => {}
             PersistenceOwner::NoStorage => {}
             PersistenceOwner::Admitting { recheck_id, bytes } => {
                 self.owner = PersistenceOwner::Admitting { recheck_id, bytes };
@@ -592,6 +607,29 @@ impl MutationPersistence {
                 }
             },
         }
+        self.owner = PersistenceOwner::CapacityOnly;
+        self.finish_committed_capacity()
+    }
+
+    unsafe fn finish_committed_capacity(&mut self) -> Result<(), u32> {
+        if self.capacity_admitted {
+            writable_fs::system_snapshot_capacity::commit_after_ack(
+                self.binding.ok_or(nt_fs::STATUS_DATA_ERROR)?,
+            )?;
+            self.capacity_admitted = false;
+        }
+        self.owner = PersistenceOwner::Unadmitted;
+        Ok(())
+    }
+
+    unsafe fn finish_aborted_capacity(&mut self) -> Result<(), u32> {
+        if self.capacity_admitted {
+            writable_fs::system_snapshot_capacity::abort_after_ack(
+                self.binding.ok_or(nt_fs::STATUS_DATA_ERROR)?,
+            )?;
+            self.capacity_admitted = false;
+        }
+        self.owner = PersistenceOwner::Unadmitted;
         Ok(())
     }
 
@@ -608,8 +646,8 @@ impl MutationPersistence {
                 Ok(None) => return Err(nt_fs::STATUS_DEVICE_NOT_READY),
                 Err(status) => {
                     if writable_fs::snapshot_storage::recheck_was_aborted_no_effect(recheck_id) {
-                        self.owner = PersistenceOwner::Unadmitted;
-                        return Ok(());
+                        self.owner = PersistenceOwner::CapacityOnly;
+                        return self.finish_aborted_capacity();
                     }
                     return Err(status);
                 }
@@ -624,13 +662,14 @@ impl MutationPersistence {
                         return Err(status);
                     }
                     drop(lease);
-                    self.owner = PersistenceOwner::Unadmitted;
-                    return Ok(());
+                    self.owner = PersistenceOwner::CapacityOnly;
+                    return self.finish_aborted_capacity();
                 }
             }
         }
         match core::mem::replace(&mut self.owner, PersistenceOwner::Unadmitted) {
-            PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => {}
+            PersistenceOwner::CapacityOnly | PersistenceOwner::NoStorage
+            | PersistenceOwner::Unadmitted => {}
             PersistenceOwner::Admitting { recheck_id, bytes } => {
                 self.owner = PersistenceOwner::Admitting { recheck_id, bytes };
                 return Err(nt_fs::STATUS_DEVICE_NOT_READY);
@@ -660,7 +699,8 @@ impl MutationPersistence {
                 }
             }
         }
-        Ok(())
+        self.owner = PersistenceOwner::CapacityOnly;
+        self.finish_aborted_capacity()
     }
 }
 
@@ -1004,6 +1044,7 @@ fn trace_interface_retry(work: &Work, error: i32, substage: AdmitRetrySubstage) 
         print_str(b" storage-owner=");
         print_str(match &work.persistence.owner {
             PersistenceOwner::Unadmitted => b"unadmitted",
+            PersistenceOwner::CapacityOnly => b"capacity-only",
             PersistenceOwner::NoStorage => b"no-storage",
             PersistenceOwner::Admitting { .. } => b"admitting",
             PersistenceOwner::BatchAdmissionPending { .. } => b"batch-install-pending",
@@ -1076,6 +1117,7 @@ fn trace_existing_provider_retry(work: &Work, error: i32, substage: AdmitRetrySu
     print_str(b" storage-owner=");
     print_str(match &work.persistence.owner {
         PersistenceOwner::Unadmitted => b"unadmitted",
+        PersistenceOwner::CapacityOnly => b"capacity-only",
         PersistenceOwner::NoStorage => b"no-storage",
         PersistenceOwner::Admitting { .. } => b"admitting",
         PersistenceOwner::BatchAdmissionPending { .. } => b"batch-install-pending",
@@ -1118,6 +1160,7 @@ pub(crate) unsafe fn print_quiesce_owners() {
         print_str(b" storage=");
         print_str(match &work.persistence.owner {
             PersistenceOwner::Unadmitted => b"unadmitted",
+            PersistenceOwner::CapacityOnly => b"capacity-only",
             PersistenceOwner::NoStorage => b"no-storage",
             PersistenceOwner::Admitting { .. } => b"admitting",
             PersistenceOwner::BatchAdmissionPending { .. } => b"batch-install-pending",
@@ -1265,6 +1308,7 @@ pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
 fn persistence_name(owner: &PersistenceOwner) -> &'static str {
     match owner {
         PersistenceOwner::Unadmitted => "unadmitted",
+        PersistenceOwner::CapacityOnly => "capacity-only",
         PersistenceOwner::NoStorage => "no-storage",
         PersistenceOwner::Admitting { .. } => "admitting",
         PersistenceOwner::BatchAdmissionPending { .. } => "batch-install-pending",
@@ -1588,9 +1632,15 @@ pub(crate) unsafe fn submit_hosted_existing(
             return Err(status);
         }
     };
+    let setup_write = match mutation {
+        SystemHiveMutation::SetValue { path, name, value_type, data } =>
+            crate::setup_registry_write_diagnostic::capture(
+                handler, logical, path, name, value_type, data),
+        _ => None,
+    };
     let key_owner = retained.owner.take().expect("retained existing Key owner");
     let hosted = HostedCaller {
-        completion: HostedCompletion::Existing { key_owner, key: retained.key, target: retained.target, kind },
+        completion: HostedCompletion::Existing { key_owner, key: retained.key, target: retained.target, kind, setup_write },
         pi: handler.pi,
         tid: handler.current_tid,
         badge: handler.current_badge,
@@ -2178,7 +2228,24 @@ unsafe fn advance(
             work.phase = Phase::ReleasePublication(ack);
         }
         Phase::ReleasePublication(ack) => {
+            let storage = match &work.persistence.owner {
+                PersistenceOwner::BatchSlot { epoch, .. } => nt_hosted_runtime::SetupWriteStorage::Batch {
+                    epoch: *epoch, cm_mount: work.prepared.as_ref().unwrap().mount().identity_token(),
+                },
+                _ => nt_hosted_runtime::SetupWriteStorage::PerRow,
+            };
             work.persistence.release_after_publication(*ack).map_err(|status| status as i32)?;
+            if let Caller::Hosted(HostedCaller {
+                completion: HostedCompletion::Existing { setup_write: Some(candidate), .. }, ..
+            }) = &work.caller {
+                crate::setup_registry_write_diagnostic::cm_acked(
+                    work.id,
+                    nt_hosted_runtime::AckedSetupWrite::new(
+                        *candidate, ack.receipt().outcome().generation, storage),
+                    work.status,
+                    work.cancelled,
+                );
+            }
             if let Caller::Hosted(HostedCaller {
                 completion: HostedCompletion::SystemLocale { locale_id, .. }, ..
             }) = &work.caller {

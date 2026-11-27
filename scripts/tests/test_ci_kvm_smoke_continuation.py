@@ -333,6 +333,47 @@ class ContinuationTests(unittest.TestCase):
             with self.assertRaises(disk.ContinuationError):
                 disk.verify_migration_manifest(self.manifest, 101, 2, self.current, self.run)
 
+    def test_migration_accepts_equal_tree_squash_but_rejects_divergent_sibling(self):
+        kernel = self.root / "rust-micro"
+
+        def git(*args):
+            return subprocess.check_output(["git", *args], cwd=kernel, text=True).strip()
+
+        git("init", "-q")
+        (kernel / "source.txt").write_text("base\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "base")
+        base = git("rev-parse", "HEAD")
+
+        (kernel / "source.txt").write_text("same bytes\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "source commit")
+        source = git("rev-parse", "HEAD")
+
+        git("checkout", "-qB", "squashed", base)
+        (kernel / "source.txt").write_text("same bytes\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "squash commit")
+        target = git("rev-parse", "HEAD")
+        self.assertNotEqual(source, target)
+        self.assertEqual(git("rev-parse", f"{source}^{{tree}}"),
+                         git("rev-parse", f"{target}^{{tree}}"))
+
+        git("checkout", "-qB", "diverged", base)
+        (kernel / "source.txt").write_text("different bytes\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "divergent commit")
+        divergent = git("rev-parse", "HEAD")
+
+        with patch.object(disk, "ROOT", self.root):
+            self.assertTrue(disk.migration_submodule_is_compatible(source, target))
+            self.assertFalse(disk.migration_submodule_is_compatible(source, divergent))
+            self.assertFalse(disk.migration_submodule_is_compatible("0" * 40, target))
+
     def test_migration_rejects_unrelated_head_release_or_layout(self):
         prior = "1" * 40
         self.run["head_sha"] = prior
@@ -436,6 +477,125 @@ class ContinuationTests(unittest.TestCase):
         self.assertEqual(receipt["mode"], "migration")
         self.assertEqual(receipt["source_head_sha"], prior)
         self.assertEqual(receipt["target_head_sha"], self.current["head_sha"])
+
+    def prepare_expanding_migration(self):
+        mib = 1024 * 1024
+        prefix = bytearray(bytes(range(256)) * 256)
+        prefix[512:520] = b"EFI PART"
+        prefix[536:544] = (1).to_bytes(8, "little")
+        prefix[544:552] = (len(prefix) // 512 - 1).to_bytes(8, "little")
+        prefix = bytes(prefix)
+        old_slot0 = bytes(range(256)) * (8 * mib // 256)
+        old_slot1 = bytes(reversed(range(256))) * (8 * mib // 256)
+        wal = b"WAL!" * (16 * mib // 4)
+        source = self.paths["IN"] / "disk.img"
+        source.write_bytes(prefix + old_slot0 + old_slot1 + wal)
+        source_size = source.stat().st_size
+        target_size = len(prefix) + 96 * mib
+        self.assertEqual(source_size, len(prefix) + 32 * mib)
+        with self.paths["DISK"].open("wb") as generated:
+            generated.write(b"G" + prefix[1:])
+            generated.truncate(target_size)
+        self.current["disk_size_bytes"] = target_size
+        self.current["base_disk_sha256"] = disk.digest(self.paths["DISK"])
+        prior = "1" * 40
+        self.run["head_sha"] = prior
+        self.manifest.update(source_head_sha=prior, disk_size_bytes=source_size,
+                             disk_sha256=disk.digest(source))
+        (self.paths["IN"] / "manifest.json").write_text(json.dumps(self.manifest))
+        self.enterContext(patch.object(disk, "expected_build", return_value=self.current))
+        self.enterContext(patch.object(disk, "ROOT", self.root))
+        self.enterContext(patch.object(disk, "api_run", return_value=self.run))
+        self.enterContext(patch.object(disk, "source_is_ancestor", return_value=True))
+        self.enterContext(patch.object(disk, "verify_hive_provenance"))
+        self.enterContext(patch.object(disk, "no_qemu_owner"))
+        return prefix, old_slot0, old_slot1, wal, source, target_size
+
+    def test_migration_expands_snapshot_tail_without_changing_source_or_wal(self):
+        mib = 1024 * 1024
+        prefix, old_slot0, old_slot1, wal, source, target_size = \
+            self.prepare_expanding_migration()
+
+        def patch_candidate(candidate, original, current):
+            self.assertEqual(original, source)
+            # Stand in only for the independent ESP code overlay. The tail migration
+            # must preserve every other source byte and create the larger slots.
+            with candidate.open("r+b") as image:
+                image.write(b"N")
+            return {"kernel": {"source_sha256": "a" * 64,
+                               "target_sha256": "b" * 64}}
+
+        with patch.object(disk, "patch_migration_esp", side_effect=patch_candidate):
+            try:
+                disk.migrate(101, 2, "test-token")
+            except disk.ContinuationError as error:
+                self.fail(f"verified 32 MiB to 96 MiB migration refused: {error}")
+
+        def read_at(path, offset, length):
+            with path.open("rb") as image:
+                image.seek(offset)
+                return image.read(length)
+
+        migrated = self.paths["DISK"]
+        self.assertEqual(migrated.stat().st_size, target_size)
+        self.assertEqual(read_at(migrated, 0, len(prefix)), b"N" + prefix[1:])
+        self.assertEqual(read_at(migrated, len(prefix), 32 * mib),
+                         old_slot0 + old_slot1 + wal)
+        self.assertEqual(read_at(migrated, len(prefix) + 32 * mib, 8 * mib), old_slot0)
+        self.assertEqual(read_at(migrated, len(prefix) + 40 * mib, 24 * mib),
+                         bytes(24 * mib))
+        self.assertEqual(read_at(migrated, len(prefix) + 64 * mib, 8 * mib), old_slot1)
+        self.assertEqual(read_at(migrated, len(prefix) + 72 * mib, 24 * mib),
+                         bytes(24 * mib))
+        self.assertEqual(disk.digest(source), self.manifest["disk_sha256"])
+        self.assertEqual(read_at(source, 0, len(prefix)), prefix)
+        self.assertEqual(self.paths["BACKUP"].stat().st_size, target_size)
+        self.assertEqual(disk.digest(self.paths["BACKUP"]),
+                         self.current["base_disk_sha256"])
+
+    def test_expanding_migration_rejects_wrong_source_hash_and_gpt_base(self):
+        prefix, _, _, _, source, _ = self.prepare_expanding_migration()
+        generated_hash = self.current["base_disk_sha256"]
+        source_hash = self.manifest["disk_sha256"]
+        self.manifest["disk_sha256"] = "0" * 64
+        (self.paths["IN"] / "manifest.json").write_text(json.dumps(self.manifest))
+        with self.assertRaisesRegex(disk.ContinuationError, "source disk SHA-256 mismatch"):
+            disk.migrate(101, 2, "test-token")
+        self.manifest["disk_sha256"] = source_hash
+        (self.paths["IN"] / "manifest.json").write_text(json.dumps(self.manifest))
+        with source.open("r+b") as incoming:
+            incoming.seek(544)
+            incoming.write((len(prefix) // 512).to_bytes(8, "little"))
+        self.manifest["disk_sha256"] = disk.digest(source)
+        (self.paths["IN"] / "manifest.json").write_text(json.dumps(self.manifest))
+        with self.assertRaisesRegex(disk.ContinuationError, "32-to-96 MiB geometry"):
+            disk.migrate(101, 2, "test-token")
+        self.assertEqual(disk.digest(self.paths["DISK"]), generated_hash)
+        self.assertEqual(disk.digest(source), self.manifest["disk_sha256"])
+        self.assertFalse(self.paths["BACKUP"].exists())
+        self.assertFalse(self.paths["RECEIPT"].exists())
+
+    def test_expanding_migration_rejects_corrupt_slot_copy_or_nonzero_slack(self):
+        prefix, _, _, _, source, _ = self.prepare_expanding_migration()
+        generated_hash = self.current["base_disk_sha256"]
+        for offset, reason in ((32 * 1024 * 1024, "snapshot slot copy"),
+                               (40 * 1024 * 1024, "snapshot slot slack")):
+            with self.subTest(reason=reason):
+                def corrupt_candidate(candidate, original, current):
+                    self.assertEqual(original, source)
+                    with candidate.open("r+b") as image:
+                        image.seek(len(prefix) + offset)
+                        image.write(b"!")
+                    return {}
+
+                with patch.object(disk, "patch_migration_esp", side_effect=corrupt_candidate), \
+                     self.assertRaisesRegex(disk.ContinuationError, reason):
+                    disk.migrate(101, 2, "test-token")
+                self.assertEqual(disk.digest(self.paths["DISK"]), generated_hash)
+                self.assertEqual(disk.digest(source), self.manifest["disk_sha256"])
+                self.assertFalse(self.paths["BACKUP"].exists())
+                self.assertFalse(self.paths["RECEIPT"].exists())
+                self.assertFalse(self.paths["MIGRATION_CANDIDATE"].exists())
 
     def test_migration_patch_failure_does_not_replace_generated_disk(self):
         prior = "1" * 40

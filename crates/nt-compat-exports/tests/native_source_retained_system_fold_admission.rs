@@ -24,6 +24,17 @@ fn native_fold_keeps_prepared_cm_owner_until_a_timer_can_retry() {
             let result = (|| -> Result<u64, u32> {{ {old} Ok(id) }})();\n\
             result.err().unwrap_or(0)\n}}")
     };
+    let (_, stall_tail) = source.split_once("fn stall_admission(")
+        .expect("production retained admission failure");
+    let (stall_body, _) = stall_tail.split_once("\n}\n")
+        .expect("retained admission failure boundary");
+    let stall = format!("fn stall_admission({stall_body}\n}}");
+    let (_, retry_tail) = source.split_once("unsafe fn retry_pending_admission()")
+        .expect("production timer retry");
+    let (retry_body, _) = retry_tail.split_once("\n}\n")
+        .expect("timer retry boundary");
+    let retry = format!("unsafe fn retry_pending_admission(){retry_body}\n}}")
+        .replace("super::super::system_wal_batch_native::", "system_wal_batch_native::");
     let (_, advance) = source.split_once("unsafe fn advance_recheck()")
         .expect("production recheck continuation");
     let (advance, _) = advance.split_once("\n}\n").expect("recheck function boundary");
@@ -40,7 +51,7 @@ fn native_fold_keeps_prepared_cm_owner_until_a_timer_can_retry() {
         "observed.incarnation != manifest.incarnation{contradiction}"
     );
     let fixture = format!(
-        "{MOCKS}\n{begin}\nfn manifest_contradiction(observed: Manifest, manifest: Manifest) -> bool {{\n\
+        "{MOCKS}\n{stall}\n{begin}\n{retry}\nfn manifest_contradiction(observed: Manifest, manifest: Manifest) -> bool {{\n\
          {contradiction}\n}}\nfn failed_recheck(status: u32) -> Result<(), u32> {{\n\
          let slot = unsafe {{ &mut *core::ptr::addr_of_mut!(WORK) }};\n\
          let id = 7;\n{abort}\n    Err(status)\n}}\n{CASES}"
@@ -68,10 +79,15 @@ fn native_fold_keeps_prepared_cm_owner_until_a_timer_can_retry() {
 }
 
 const MOCKS: &str = r#"
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 static PREPARED_DROPS: AtomicUsize = AtomicUsize::new(0);
 static LEASE_DROPS: AtomicUsize = AtomicUsize::new(0);
 static BEGIN_STATUS: AtomicU32 = AtomicU32::new(0x8000_0011);
+static ACQUIRE_STATUS: AtomicU32 = AtomicU32::new(0);
+static CACHED_STATUS: AtomicU32 = AtomicU32::new(0);
+static FAILURE_STATUS: AtomicU32 = AtomicU32::new(0);
+static FAILURE_LEASE: AtomicBool = AtomicBool::new(false);
+static NOW_100NS: AtomicU64 = AtomicU64::new(100_000_000);
 static NO_EFFECT_ABORT: AtomicBool = AtomicBool::new(true);
 static mut WORK: Option<Work> = None;
 const ADMISSION_RETRY_100NS: u64 = 50_000_000;
@@ -86,10 +102,13 @@ const MOUNT: SectionMountId = 9;
 struct Manifest { incarnation: u64, base_serial: u64, high_water_serial: u64,
     high_water_end_lba: u64 }
 enum StalledState { Admission { _lease: Option<Lease>, _prepared: Option<Prepared>,
-    _mount: SectionMountId, _manifest: Manifest } }
+    _mount: SectionMountId, _manifest: Manifest, _source_recheck_id: Option<u64>,
+    receipt: FailureReceipt } }
+#[derive(Clone, Copy)]
+struct FailureReceipt { stage: &'static [u8], status: u32 }
 enum Work {
     AdmissionPending { prepared: Option<Prepared>, manifest: Manifest, mount: SectionMountId,
-        retry_after_100ns: u64, last_status: u32 },
+        retry_after_100ns: u64, last_status: u32, source_recheck_id: Option<u64> },
     Rechecking { id: u64, prepared: Option<Prepared>, manifest: Manifest, mount: SectionMountId,
         started_ticks: u64, start_after_print: bool, trace: bool },
     Stalled(StalledState),
@@ -99,11 +118,24 @@ mod nt_fs {
     pub(super) type WalSnapshotManifest = super::Manifest;
     pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
     pub const STATUS_DATA_ERROR: u32 = 0xc000_003e;
+    pub const STATUS_DEVICE_NOT_READY: u32 = 0xc000_00a3;
+    pub const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xc000_0010;
+}
+mod system_wal_batch_native {
+    pub fn request_drain_if_active() -> Result<(), u32> { Ok(()) }
 }
 mod snapshot_storage {
     use super::*;
     pub(super) type Lease = super::Lease;
     pub const BUSY: u32 = 0x8000_0011;
+    pub fn acquire() -> Result<Lease, u32> {
+        let status = ACQUIRE_STATUS.load(Ordering::Acquire);
+        if status == 0 { Ok(Lease) } else { Err(status) }
+    }
+    pub fn cached_wal_manifest(_: &Lease) -> Result<Manifest, u32> {
+        let status = CACHED_STATUS.load(Ordering::Acquire);
+        if status == 0 { Ok(super::manifest()) } else { Err(status) }
+    }
     pub fn begin_wal_continuation_recheck_returning_lease(
         lease: Lease,
     ) -> Result<u64, (u32, Lease)> {
@@ -117,16 +149,26 @@ mod snapshot_storage {
     }
 }
 fn block(status: u32) -> u32 { status }
+fn trace_failure(receipt: FailureReceipt, _: u64, _: SectionMountId,
+    lease: bool, _: bool) {
+    FAILURE_STATUS.store(receipt.status, Ordering::Release);
+    FAILURE_LEASE.store(lease, Ordering::Release);
+}
 fn disk_census_ticks() -> u64 { 1 }
 fn reserve_trace() -> bool { false }
 fn trace_started(_: u64, _: Manifest, _: bool) {}
 fn mark_runtime_dirty() {}
-fn monotonic_time_100ns() -> u64 { 100_000_000 }
+fn monotonic_time_100ns() -> u64 { NOW_100NS.load(Ordering::Acquire) }
 fn reset() {
     unsafe { WORK = None; }
     PREPARED_DROPS.store(0, Ordering::Release);
     LEASE_DROPS.store(0, Ordering::Release);
     BEGIN_STATUS.store(snapshot_storage::BUSY, Ordering::Release);
+    ACQUIRE_STATUS.store(0, Ordering::Release);
+    CACHED_STATUS.store(0, Ordering::Release);
+    FAILURE_STATUS.store(0, Ordering::Release);
+    FAILURE_LEASE.store(false, Ordering::Release);
+    NOW_100NS.store(100_000_000, Ordering::Release);
     NO_EFFECT_ABORT.store(true, Ordering::Release);
 }
 "#;
@@ -137,7 +179,7 @@ fn manifest() -> Manifest { Manifest { incarnation: 1, base_serial: 3,
 #[test]
 fn preentry_refusal_retains_cm_preparation_and_releases_only_the_unentered_lease() {
     reset();
-    let status = unsafe { begin_recheck_with_prepared(Lease, Some(Prepared), manifest(), MOUNT) };
+    let status = unsafe { begin_recheck_with_prepared(Lease, Some(Prepared), manifest(), MOUNT, None) };
     assert_eq!(status, snapshot_storage::BUSY);
     assert_eq!(PREPARED_DROPS.load(Ordering::Acquire), 0);
     assert_eq!(LEASE_DROPS.load(Ordering::Acquire), 1);
@@ -156,10 +198,52 @@ fn proven_no_effect_recheck_abort_keeps_preparation_for_timer_retry() {
         Some(Work::AdmissionPending { prepared: Some(_), mount: MOUNT, .. })));
 }
 #[test]
+fn failed_timer_reacquire_retains_preparation_without_claiming_a_lease() {
+    reset();
+    unsafe { WORK = Some(Work::Rechecking { id: 7, prepared: Some(Prepared),
+        manifest: manifest(), mount: MOUNT, started_ticks: 1,
+        start_after_print: true, trace: false }); }
+    assert_eq!(failed_recheck(nt_fs::STATUS_DEVICE_NOT_READY), Err(snapshot_storage::BUSY));
+    NOW_100NS.store(200_000_000, Ordering::Release);
+    ACQUIRE_STATUS.store(nt_fs::STATUS_DEVICE_NOT_READY, Ordering::Release);
+    assert_eq!(unsafe { retry_pending_admission() }, Err(nt_fs::STATUS_DEVICE_NOT_READY));
+    assert_eq!(PREPARED_DROPS.load(Ordering::Acquire), 0);
+    assert_eq!(LEASE_DROPS.load(Ordering::Acquire), 0);
+    assert_eq!(FAILURE_STATUS.load(Ordering::Acquire), nt_fs::STATUS_DEVICE_NOT_READY);
+    assert!(!FAILURE_LEASE.load(Ordering::Acquire));
+    let work = unsafe { &*core::ptr::addr_of!(WORK) };
+    let Some(Work::Stalled(StalledState::Admission { _lease: None,
+        _prepared: Some(_), _mount: MOUNT, _source_recheck_id: Some(7),
+        receipt, .. })) = work else { panic!("retry must retain admission failure"); };
+    assert_eq!(receipt.stage, b"retry-acquire");
+    assert_eq!(receipt.status, nt_fs::STATUS_DEVICE_NOT_READY);
+}
+#[test]
+fn failed_cached_fence_retains_exact_lease_and_preparation() {
+    reset();
+    unsafe { WORK = Some(Work::Rechecking { id: 7, prepared: Some(Prepared),
+        manifest: manifest(), mount: MOUNT, started_ticks: 1,
+        start_after_print: true, trace: false }); }
+    assert_eq!(failed_recheck(nt_fs::STATUS_DEVICE_NOT_READY), Err(snapshot_storage::BUSY));
+    NOW_100NS.store(200_000_000, Ordering::Release);
+    CACHED_STATUS.store(nt_fs::STATUS_DEVICE_NOT_READY, Ordering::Release);
+    assert_eq!(unsafe { retry_pending_admission() }, Err(nt_fs::STATUS_DEVICE_NOT_READY));
+    assert_eq!(PREPARED_DROPS.load(Ordering::Acquire), 0);
+    assert_eq!(LEASE_DROPS.load(Ordering::Acquire), 0);
+    assert_eq!(FAILURE_STATUS.load(Ordering::Acquire), nt_fs::STATUS_DEVICE_NOT_READY);
+    assert!(FAILURE_LEASE.load(Ordering::Acquire));
+    let work = unsafe { &*core::ptr::addr_of!(WORK) };
+    let Some(Work::Stalled(StalledState::Admission { _lease: Some(_),
+        _prepared: Some(_), _mount: MOUNT, _source_recheck_id: Some(7),
+        receipt, .. })) = work else { panic!("cached fence must retain lease and preparation"); };
+    assert_eq!(receipt.stage, b"retry-cached-manifest");
+    assert_eq!(receipt.status, nt_fs::STATUS_DEVICE_NOT_READY);
+}
+#[test]
 fn contradictory_preentry_refusal_stalls_with_both_owners_retained() {
     reset();
     BEGIN_STATUS.store(nt_fs::STATUS_DATA_ERROR, Ordering::Release);
-    let status = unsafe { begin_recheck_with_prepared(Lease, Some(Prepared), manifest(), MOUNT) };
+    let status = unsafe { begin_recheck_with_prepared(Lease, Some(Prepared), manifest(), MOUNT, None) };
     assert_eq!(status, nt_fs::STATUS_DATA_ERROR);
     assert_eq!(PREPARED_DROPS.load(Ordering::Acquire), 0);
     assert_eq!(LEASE_DROPS.load(Ordering::Acquire), 0);

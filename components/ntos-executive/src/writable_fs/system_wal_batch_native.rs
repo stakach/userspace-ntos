@@ -56,6 +56,8 @@ struct Active {
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 static mut ACTIVE: Option<Active> = None;
+/// At most one physical SYSTEM batch is active. This diagnostic never grants storage authority.
+static mut WATCHED_SETUP_GENERATION: Option<(u64, u64, u64)> = None;
 const NO_EFFECT_RETRY_DELAY_100NS: u64 = 5 * 10_000_000;
 const MAX_NO_EFFECT_RETRIES: u8 = 3;
 const IDLE_DRAIN_DELAY_100NS: u64 = 1_000_000;
@@ -244,6 +246,24 @@ pub(crate) unsafe fn append_committed(
     Ok(())
 }
 
+/// Remember a completed setup CM write until this exact batch either anchors or remains blocked.
+pub(crate) unsafe fn watch_setup_generation(epoch: u64, cm_mount: u64, generation: u64) -> bool {
+    let Some(active) = (unsafe { &*core::ptr::addr_of!(ACTIVE) }).as_ref() else { return false; };
+    if active.epoch != epoch || active.cm_mount.identity_token() != cm_mount
+        || generation <= active.durable_floor
+        || generation > active.owner.published_generation()
+    {
+        return false;
+    }
+    let watch = unsafe { &mut *core::ptr::addr_of_mut!(WATCHED_SETUP_GENERATION) };
+    *watch = Some((epoch, cm_mount, generation.max(
+        watch.filter(|(saved_epoch, saved_mount, _)|
+            *saved_epoch == epoch && *saved_mount == cm_mount)
+            .map_or(0, |(_, _, saved_generation)| saved_generation),
+    )));
+    true
+}
+
 /// The caller must retain exact pre-COMMIT no-effect evidence or a matching CM abort ACK.
 pub(crate) unsafe fn cancel(
     epoch: u64,
@@ -384,6 +404,18 @@ pub(crate) unsafe fn finish_durable(epoch: u64, target: u64) -> Result<(), u32> 
             crate::boot_progress::BootProgress::DurableRegistryPublication,
         );
     }
+    let watch = unsafe { &mut *core::ptr::addr_of_mut!(WATCHED_SETUP_GENERATION) };
+    if watch.is_some_and(|(watched_epoch, watched_mount, watched_generation)|
+        watched_epoch == epoch && watched_mount == active.cm_mount.identity_token()
+            && previous < watched_generation && watched_generation <= target)
+    {
+        print_str(b"[setup-registry-write] stage=batch-durable epoch/physical-mount/cm-mount/previous/target=");
+        print_u64(epoch); print_str(b"/");
+        print_u64(active.mount.value()); print_str(b"/");
+        print_u64(active.cm_mount.identity_token()); print_str(b"/");
+        print_u64(previous); print_str(b"/"); print_u64(target); print_str(b"\n");
+    }
+    *watch = None;
     let _finished = slot.take();
     Ok(())
 }

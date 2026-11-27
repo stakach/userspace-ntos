@@ -64,12 +64,21 @@ struct Active {
     failed: bool,
 }
 
+/// A scalar observation of the first contradiction. The owners stay in `StalledState`.
+#[derive(Clone, Copy)]
+struct FailureReceipt {
+    stage: &'static [u8],
+    status: u32,
+}
+
 enum StalledState {
     Admission {
         _lease: Option<snapshot_storage::Lease>,
         _prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
         _mount: SectionMountId,
         _manifest: nt_fs::WalSnapshotManifest,
+        _source_recheck_id: Option<u64>,
+        receipt: FailureReceipt,
     },
     BeforeCommit {
         _lease: snapshot_storage::Lease,
@@ -77,13 +86,16 @@ enum StalledState {
         _pair: nt_fs::VerifiedPairedWalSnapshot,
         _image: Option<snapshot_capture::CapturedSnapshot>,
         _prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
+        _recheck_id: u64,
+        receipt: FailureReceipt,
     },
     // An entered or uncertain request retains the cursor, request ID, lease and proof.
-    Active(Active),
+    Active(Active, FailureReceipt),
     SecondAdmission {
         _active: Active,
         _image: snapshot_capture::CapturedSnapshot,
         _pair: nt_fs::VerifiedPairedWalSnapshot,
+        receipt: FailureReceipt,
     },
 }
 
@@ -96,6 +108,7 @@ enum Work {
         mount: SectionMountId,
         retry_after_100ns: u64,
         last_status: u32,
+        source_recheck_id: Option<u64>,
     },
     Rechecking { id: u64, prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
         manifest: nt_fs::WalSnapshotManifest, mount: SectionMountId, started_ticks: u64,
@@ -136,22 +149,49 @@ pub(super) unsafe fn print_quiesce_owner() {
         Some(Work::AdmissionPending { .. }) => b"admission-pending",
         Some(Work::Rechecking { .. }) => b"rechecking",
         Some(Work::Active(_)) => b"active",
-        Some(Work::Stalled(_)) => b"stalled",
+        Some(Work::Stalled(StalledState::Admission { .. })) => b"stalled-admission",
+        Some(Work::Stalled(StalledState::BeforeCommit { .. })) => b"stalled-before-commit",
+        Some(Work::Stalled(StalledState::Active(..))) => b"stalled-active",
+        Some(Work::Stalled(StalledState::SecondAdmission { .. })) => b"stalled-second-admission",
     });
-    let (id, lease, entered, failed) = match work {
-        Some(Work::AdmissionPending { .. }) => (0, false, false, false),
-        Some(Work::Rechecking { id, .. }) => (*id, false, false, false),
+    let (id, mount, lease, entered, failed, receipt) = match work {
+        Some(Work::AdmissionPending { source_recheck_id, mount, .. }) =>
+            (source_recheck_id.unwrap_or(0), Some(*mount), false, false, false, None),
+        Some(Work::Rechecking { id, mount, .. }) =>
+            (*id, Some(*mount), false, false, false, None),
         Some(Work::Active(active)) =>
-            (active.id, true, active.entered, active.failed),
-        Some(Work::Stalled(_)) => (0, true, false, true),
-        None => (0, false, false, false),
+            (active.id, Some(*active.lease.identity()), true, active.entered, active.failed, None),
+        Some(Work::Stalled(StalledState::Admission {
+            _lease, _mount, _source_recheck_id, receipt, ..
+        })) => (_source_recheck_id.unwrap_or(0), Some(*_mount), _lease.is_some(),
+            false, true, Some(*receipt)),
+        Some(Work::Stalled(StalledState::BeforeCommit {
+            _lease, _recheck_id, receipt, ..
+        })) => (*_recheck_id, Some(*_lease.identity()), true, false, true, Some(*receipt)),
+        Some(Work::Stalled(StalledState::Active(active, receipt))) =>
+            (active.id, Some(*active.lease.identity()), true, active.entered, true,
+                Some(*receipt)),
+        Some(Work::Stalled(StalledState::SecondAdmission { _active, receipt, .. })) =>
+            (_active.id, Some(*_active.lease.identity()), true, _active.entered,
+                true, Some(*receipt)),
+        None => (0, None, false, false, false, None),
     };
     print_str(b" id="); print_u64(id);
+    print_str(b" mount="); print_u64(mount.map_or(0, SectionMountId::value));
     print_str(b" local-lease="); print_u64(u64::from(lease));
     print_str(b" entered="); print_u64(u64::from(entered));
     print_str(b" failed="); print_u64(u64::from(failed));
+    let (reserve, cached_wal) = snapshot_storage::published_owner_presence();
+    print_str(b" resident-fs=");
+    print_u64(u64::from((&*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some()));
+    print_str(b" reserve="); print_u64(u64::from(reserve));
+    print_str(b" cached-wal="); print_u64(u64::from(cached_wal));
     if let Some(Work::AdmissionPending { last_status, .. }) = work {
-        print_str(b" admission-refusal=0x"); print_hex(*last_status);
+        print_str(b" admission-refusal="); print_hex(*last_status);
+    }
+    if let Some(receipt) = receipt {
+        print_str(b" stage="); print_str(receipt.stage);
+        print_str(b" status="); print_hex(receipt.status);
     }
     print_str(b"\n");
 }
@@ -165,17 +205,38 @@ fn fold_manifest(old: nt_fs::WalSnapshotManifest) -> nt_fs::WalSnapshotManifest 
         high_water_end_lba: old.high_water_end_lba }
 }
 
+fn trace_failure(receipt: FailureReceipt, id: u64, mount: SectionMountId,
+    lease: bool, entered: bool,
+) {
+    print_str(b"[native-system-fold-refusal] stage="); print_str(receipt.stage);
+    print_str(b" status="); print_hex(receipt.status);
+    print_str(b" id="); print_u64(id);
+    print_str(b" mount="); print_u64(mount.value());
+    print_str(b" local-lease="); print_u64(u64::from(lease));
+    print_str(b" entered="); print_u64(u64::from(entered));
+    let (reserve, cached_wal) = unsafe { snapshot_storage::published_owner_presence() };
+    print_str(b" resident-fs=");
+    print_u64(u64::from(unsafe { (&*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some() }));
+    print_str(b" reserve="); print_u64(u64::from(reserve));
+    print_str(b" cached-wal="); print_u64(u64::from(cached_wal));
+    print_str(b"\n");
+}
+
 fn stall_before_commit(
-    slot: &mut Option<Work>, lease: snapshot_storage::Lease,
+    slot: &mut Option<Work>, id: u64, lease: snapshot_storage::Lease,
     token: nt_fs::RegistryWalContinuation, proof: nt_fs::RecheckedPairedWalSnapshot,
     prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
-    image: Option<snapshot_capture::CapturedSnapshot>, status: u32,
+    image: Option<snapshot_capture::CapturedSnapshot>, stage: &'static [u8], status: u32,
 ) -> u32 {
+    let receipt = FailureReceipt { stage, status };
+    let mount = *lease.identity();
     *slot = Some(Work::Stalled(StalledState::BeforeCommit {
         _lease: lease, _token: token, _pair: proof.into_pair(), _image: image,
-        _prepared: prepared,
+        _prepared: prepared, _recheck_id: id, receipt,
     }));
-    block(status)
+    let status = block(status);
+    trace_failure(receipt, id, mount, true, false);
+    status
 }
 
 unsafe fn advance_recheck() -> Result<(), u32> {
@@ -192,7 +253,7 @@ unsafe fn advance_recheck() -> Result<(), u32> {
                 *slot = Some(Work::AdmissionPending { prepared, manifest, mount,
                     retry_after_100ns: crate::monotonic_time_100ns()
                         .saturating_add(ADMISSION_RETRY_100NS),
-                    last_status: status });
+                    last_status: status, source_recheck_id: Some(id) });
                 return Err(snapshot_storage::BUSY);
             }
             return Err(status);
@@ -202,11 +263,13 @@ unsafe fn advance_recheck() -> Result<(), u32> {
         start_after_print, trace, .. }) = slot.take()
         else { unreachable!() };
     if proof.manifest() != manifest || proof.anchor() != token.anchor() {
-        return Err(stall_before_commit(slot, lease, token, proof, prepared, None,
+        return Err(stall_before_commit(slot, id, lease, token, proof, prepared, None,
+            b"recheck-manifest",
             nt_fs::STATUS_DATA_ERROR));
     }
     let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
-        return Err(stall_before_commit(slot, lease, token, proof, prepared, None,
+        return Err(stall_before_commit(slot, id, lease, token, proof, prepared, None,
+            b"resident-fs-absent",
             nt_fs::STATUS_DEVICE_NOT_READY));
     };
     // Derive an independent volume from the exact resident image. It has its own node tree,
@@ -215,29 +278,34 @@ unsafe fn advance_recheck() -> Result<(), u32> {
     let baseline = match snapshot_capture::CapturedSnapshot::capture(&lease, fs) {
         Ok(image) => image,
         Err(status) => {
-            return Err(stall_before_commit(slot, lease, token, proof, prepared, None, status));
+            return Err(stall_before_commit(slot, id, lease, token, proof, prepared, None,
+                b"baseline-capture", status));
         }
     };
     let mut staged = match nt_fs::FileSystem::from_volume_snapshot(baseline.as_slice()) {
         Ok(fs) => fs,
         Err(_) => {
-            return Err(stall_before_commit(slot, lease, token, proof, prepared, None,
+            return Err(stall_before_commit(slot, id, lease, token, proof, prepared, None,
+                b"baseline-import",
                 nt_fs::STATUS_DATA_ERROR));
         }
     };
     drop(baseline);
     if let Err(status) = stage_prepared_checkpoint(&mut staged, &prepared) {
-        return Err(stall_before_commit(slot, lease, token, proof, prepared, None, status));
+        return Err(stall_before_commit(slot, id, lease, token, proof, prepared, None,
+            b"prepared-checkpoint", status));
     }
     let capture_epoch = match SNAPSHOT_PUBLICATION.begin_fold_capture() {
         Ok(capture) => capture,
-        Err(_) => return Err(stall_before_commit(slot, lease, token, proof, prepared, None,
+        Err(_) => return Err(stall_before_commit(slot, id, lease, token, proof, prepared, None,
+            b"fold-capture-admission",
             nt_fs::STATUS_INSUFFICIENT_RESOURCES)),
     };
     let image = match snapshot_capture::CapturedSnapshot::capture(&lease, &staged) {
         Ok(image) => image,
         Err(status) => {
-            return Err(stall_before_commit(slot, lease, token, proof, prepared, None, status));
+            return Err(stall_before_commit(slot, id, lease, token, proof, prepared, None,
+                b"staged-capture", status));
         }
     };
     let bytes = image.as_slice().len();
@@ -245,7 +313,8 @@ unsafe fn advance_recheck() -> Result<(), u32> {
         image, fold_manifest(manifest), proof) {
         Ok(commit) => commit,
         Err((error, image, proof)) => {
-            return Err(stall_before_commit(slot, lease, token, proof, prepared, Some(image),
+            return Err(stall_before_commit(slot, id, lease, token, proof, prepared, Some(image),
+                b"first-commit-admission",
                 snapshot_store_error_status(error)));
         }
     };
@@ -256,6 +325,23 @@ unsafe fn advance_recheck() -> Result<(), u32> {
         prepared, lease, token, old_pair: None, manifest, bytes,
         cursor: Some(Cursor::First(commit)), entered: false, failed: false }));
     Ok(())
+}
+
+fn stall_admission(
+    slot: &mut Option<Work>, lease: Option<snapshot_storage::Lease>,
+    prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
+    mount: SectionMountId, manifest: nt_fs::WalSnapshotManifest,
+    source_recheck_id: Option<u64>, stage: &'static [u8], status: u32,
+) -> u32 {
+    let receipt = FailureReceipt { stage, status };
+    let has_lease = lease.is_some();
+    *slot = Some(Work::Stalled(StalledState::Admission {
+        _lease: lease, _prepared: prepared, _mount: mount, _manifest: manifest,
+        _source_recheck_id: source_recheck_id, receipt,
+    }));
+    let status = block(status);
+    trace_failure(receipt, source_recheck_id.unwrap_or(0), mount, has_lease, false);
+    status
 }
 
 /// Only a timer service boundary calls this after a no-effect refusal. An ordinary native I/O
@@ -271,36 +357,32 @@ unsafe fn retry_pending_admission() -> Result<bool, u32> {
     // A retained SYSTEM batch owns this same physical reserve. Seal it before retrying
     // the fold so its marker and anchors can settle through the native claim pump.
     super::super::system_wal_batch_native::request_drain_if_active()?;
-    let Some(Work::AdmissionPending { prepared, manifest, mount, .. }) = slot.take()
+    let Some(Work::AdmissionPending { prepared, manifest, mount,
+        source_recheck_id, .. }) = slot.take()
         else { unreachable!() };
     let lease = match snapshot_storage::acquire() {
         Ok(lease) => lease,
         Err(status) if status == snapshot_storage::BUSY => {
             *slot = Some(Work::AdmissionPending { prepared, manifest, mount,
                 retry_after_100ns: crate::monotonic_time_100ns()
-                    .saturating_add(ADMISSION_RETRY_100NS), last_status: status });
+                    .saturating_add(ADMISSION_RETRY_100NS), last_status: status,
+                source_recheck_id });
             return Err(snapshot_storage::BUSY);
         }
         Err(status) => {
-            *slot = Some(Work::Stalled(StalledState::Admission {
-                _lease: None, _prepared: prepared, _mount: mount, _manifest: manifest,
-            }));
-            return Err(block(status));
+            return Err(stall_admission(slot, None, prepared, mount, manifest,
+                source_recheck_id, b"retry-acquire", status));
         }
     };
     if *lease.identity() != mount {
-        *slot = Some(Work::Stalled(StalledState::Admission {
-            _lease: Some(lease), _prepared: prepared, _mount: mount, _manifest: manifest,
-        }));
-        return Err(block(nt_fs::STATUS_DATA_ERROR));
+        return Err(stall_admission(slot, Some(lease), prepared, mount, manifest,
+            source_recheck_id, b"retry-mount", nt_fs::STATUS_DATA_ERROR));
     }
     let observed = match snapshot_storage::cached_wal_manifest(&lease) {
         Ok(observed) => observed,
         Err(status) => {
-            *slot = Some(Work::Stalled(StalledState::Admission {
-                _lease: Some(lease), _prepared: prepared, _mount: mount, _manifest: manifest,
-            }));
-            return Err(block(status));
+            return Err(stall_admission(slot, Some(lease), prepared, mount, manifest,
+                source_recheck_id, b"retry-cached-manifest", status));
         }
     };
     // Non-SYSTEM hive records may have extended this same verified WAL while the reserve was
@@ -313,12 +395,10 @@ unsafe fn retry_pending_admission() -> Result<bool, u32> {
         || (observed.high_water_serial == manifest.high_water_serial
             && observed.high_water_end_lba != manifest.high_water_end_lba)
     {
-        *slot = Some(Work::Stalled(StalledState::Admission {
-            _lease: Some(lease), _prepared: prepared, _mount: mount, _manifest: manifest,
-        }));
-        return Err(block(nt_fs::STATUS_DATA_ERROR));
+        return Err(stall_admission(slot, Some(lease), prepared, mount, manifest,
+            source_recheck_id, b"retry-manifest-contradiction", nt_fs::STATUS_DATA_ERROR));
     }
-    Err(begin_recheck_with_prepared(lease, prepared, observed, mount))
+    Err(begin_recheck_with_prepared(lease, prepared, observed, mount, source_recheck_id))
 }
 
 unsafe fn begin_recheck_with_prepared(
@@ -326,6 +406,7 @@ unsafe fn begin_recheck_with_prepared(
     prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
     manifest: nt_fs::WalSnapshotManifest,
     mount: SectionMountId,
+    source_recheck_id: Option<u64>,
 ) -> u32 {
     let slot = &mut *core::ptr::addr_of_mut!(WORK);
     let id = match snapshot_storage::begin_wal_continuation_recheck_returning_lease(lease) {
@@ -336,14 +417,13 @@ unsafe fn begin_recheck_with_prepared(
             drop(lease);
             *slot = Some(Work::AdmissionPending { prepared, manifest, mount,
                 retry_after_100ns: crate::monotonic_time_100ns()
-                    .saturating_add(ADMISSION_RETRY_100NS), last_status: status });
+                    .saturating_add(ADMISSION_RETRY_100NS), last_status: status,
+                source_recheck_id });
             return snapshot_storage::BUSY;
         }
         Err((status, lease)) => {
-            *slot = Some(Work::Stalled(StalledState::Admission {
-                _lease: Some(lease), _prepared: prepared, _mount: mount, _manifest: manifest,
-            }));
-            return block(status);
+            return stall_admission(slot, Some(lease), prepared, mount, manifest,
+                source_recheck_id, b"begin-recheck", status);
         }
     };
     let started_ticks = crate::disk_census_ticks();
@@ -399,8 +479,9 @@ pub(super) unsafe fn fold_system_wal_native() -> Result<bool, u32> {
     if prepared.is_none() && manifest.base_serial == manifest.high_water_serial {
         return Ok(false);
     }
+    system_snapshot_capacity::begin_fold(prepared.as_ref().map(|checkpoint| checkpoint.image.len()))?;
     let mount = *lease.identity();
-    Err(begin_recheck_with_prepared(lease, prepared, manifest, mount))
+    Err(begin_recheck_with_prepared(lease, prepared, manifest, mount, None))
 }
 
 /// The header recheck this fold is waiting on, while it is rechecking.
@@ -547,6 +628,7 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
             };
             if pair.anchor() != active.token.anchor() {
                 return Ok(SnapshotCompletion::Failed(stall_second_admission(slot, active, image, pair,
+                    b"first-pair-anchor",
                     nt_fs::STATUS_DATA_ERROR)));
             }
             WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -558,7 +640,8 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
                 active.lease.sector_size(), active.lease.sector_count(), pair) } {
                 Ok(second) => second,
                 Err((error, image, pair)) => return Ok(SnapshotCompletion::Failed(stall_second_admission(
-                    slot, active, image, pair, snapshot_store_error_status(error)))),
+                    slot, active, image, pair, b"second-commit-admission",
+                    snapshot_store_error_status(error)))),
             };
             second.set_max_batch_sectors(crate::driver_launch::native_storage_transfer_sectors())
                 .expect("a fresh snapshot commit has no request in flight");
@@ -580,16 +663,19 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
             WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(active.bytes as u64, Ordering::Relaxed);
             if pair.anchor() != active.token.anchor() {
                 active.old_pair = Some(pair);
-                return Ok(SnapshotCompletion::Failed(stall(slot, active, nt_fs::STATUS_DATA_ERROR)));
+                return Ok(SnapshotCompletion::Failed(stall(slot, active,
+                    b"second-pair-anchor", nt_fs::STATUS_DATA_ERROR)));
             }
             active.old_pair = Some(pair);
             let (start, sectors) = match snapshot_storage::wal_bounds(&active.lease) {
                 Ok(bounds) => bounds,
-                Err(status) => return Ok(SnapshotCompletion::Failed(stall(slot, active, status))),
+                Err(status) => return Ok(SnapshotCompletion::Failed(stall(slot, active,
+                    b"wal-bounds", status))),
             };
             if needs_epoch_rollover(active.manifest.high_water_end_lba, sectors) {
                 let Some(next) = active.manifest.incarnation.checked_add(1) else {
-                    return Ok(SnapshotCompletion::Failed(stall(slot, active, nt_fs::STATUS_DATA_ERROR)));
+                    return Ok(SnapshotCompletion::Failed(stall(slot, active,
+                        b"rollover-incarnation", nt_fs::STATUS_DATA_ERROR)));
                 };
                 let pair = active.old_pair.take().expect("second folded pair retained");
                 let cursor = match AsyncWalEpochRollover::admit(active.lease.store(), pair,
@@ -597,7 +683,8 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
                 { Ok(cursor) => cursor,
                     Err((error, pair)) => {
                         active.old_pair = Some(pair);
-                        return Ok(SnapshotCompletion::Failed(stall(slot, active, snapshot_store_error_status(error))));
+                        return Ok(SnapshotCompletion::Failed(stall(slot, active,
+                            b"rollover-admission", snapshot_store_error_status(error))));
                     }
                 };
                 active.cursor = Some(Cursor::Rollover(cursor));
@@ -623,19 +710,27 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
     Ok(SnapshotCompletion::Settled)
 }
 
-fn stall(slot: &mut Option<Work>, active: Active, status: u32) -> u32 {
-    *slot = Some(Work::Stalled(StalledState::Active(active)));
-    block(status)
+fn stall(slot: &mut Option<Work>, active: Active, stage: &'static [u8], status: u32) -> u32 {
+    let receipt = FailureReceipt { stage, status };
+    let (id, mount, entered) = (active.id, *active.lease.identity(), active.entered);
+    *slot = Some(Work::Stalled(StalledState::Active(active, receipt)));
+    let status = block(status);
+    trace_failure(receipt, id, mount, true, entered);
+    status
 }
 
 fn stall_second_admission(
     slot: &mut Option<Work>, active: Active, image: snapshot_capture::CapturedSnapshot,
-    pair: nt_fs::VerifiedPairedWalSnapshot, status: u32,
+    pair: nt_fs::VerifiedPairedWalSnapshot, stage: &'static [u8], status: u32,
 ) -> u32 {
+    let receipt = FailureReceipt { stage, status };
+    let (id, mount, entered) = (active.id, *active.lease.identity(), active.entered);
     *slot = Some(Work::Stalled(StalledState::SecondAdmission {
-        _active: active, _image: image, _pair: pair,
+        _active: active, _image: image, _pair: pair, receipt,
     }));
-    block(status)
+    let status = block(status);
+    trace_failure(receipt, id, mount, true, entered);
+    status
 }
 
 unsafe fn publish_ready(active: Active,

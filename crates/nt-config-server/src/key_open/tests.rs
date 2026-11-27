@@ -13,6 +13,7 @@ fn server_with_source(source: Rc<CmIdentitySource>) -> CmServer {
     hive.create_key("ControlSet001\\Services\\Device");
     hive.finish_clean_import();
     server.system_hive = Some(MountedSystemHive {
+        checkpoint_image_len: nt_hive_core::encoded_image_len(&hive).unwrap() as u32,
         identity: server.identities.take().unwrap(),
         hardware_profile: nt_hive_core::HardwareProfileAlias::capture(
             &hive, &hive.current_control_set().unwrap(),

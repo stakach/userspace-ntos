@@ -708,3 +708,78 @@ fn real_hardlink_write_and_checkpoint_preserve_mapped_dirty_data_and_zero_eof_ga
     io.fs.zw_release_io_reference(caller.handle).unwrap();
     assert_eq!(io.fs.current_offset(caller.handle), None);
 }
+
+#[test]
+fn mapped_writeback_keeps_its_dirty_page_after_snapshot_capacity_refusal() {
+    let mut fs = nt_fs::FileSystem::new(nt_fs::MemFs::new());
+    let primary = fs.zw_create_file(r"\??\C:\mapped", 3, 0, 7, nt_fs::FILE_CREATE, 0);
+    assert_eq!(primary.status, 0);
+    assert_eq!(
+        fs.zw_set_information_file(
+            primary.handle,
+            nt_fs::FILE_END_OF_FILE_INFORMATION,
+            &0x2000u64.to_le_bytes(),
+        ),
+        0
+    );
+    let filler = fs.zw_create_file(r"\??\C:\filler", 3, 0, 7, nt_fs::FILE_CREATE, 0);
+    assert_eq!(filler.status, 0);
+    assert_eq!(
+        fs.zw_write_file(filler.handle, Some(0), &vec![0x55; 0x2000]),
+        (0, 0x2000)
+    );
+    let before = fs.export_volume_snapshot().unwrap();
+    fs.set_snapshot_payload_capacity(before.len()).unwrap();
+
+    let key = SectionFileIdentity {
+        mount: SectionMountIds::new().allocate().unwrap(),
+        file_id: fs.zw_query_metadata(primary.handle).unwrap().file_id,
+    };
+    let backing = GenericSectionBacking::overlay(primary.handle, key, 0x2000);
+    let mut table = GenericSectionTable::new();
+    let section = table
+        .create(
+            1,
+            7,
+            0x2000,
+            crate::PAGE_READWRITE,
+            SECTION_ATTR_SEC_COMMIT,
+            backing,
+        )
+        .unwrap();
+    let section_id = table.section_identity(section).unwrap();
+    assert!(table.set_page_frame(section, 1, 101));
+    assert!(table.mark_page_dirty(section, 1));
+    let (_, _, _, mut memory) = fixture(0x2000, &[1]);
+    memory.frames.get_mut(&101).unwrap().fill(0x77);
+    let mut io = FsIo {
+        memory,
+        fs,
+        file: primary.handle,
+        snapshot: Vec::new(),
+    };
+
+    let refused = table.writeback_file(backing, &mut io);
+    assert_eq!(refused.status, nt_fs::STATUS_DISK_FULL);
+    assert_eq!(refused.bytes_written, 0);
+    assert_eq!(refused.pages_written, 0);
+    assert_eq!(io.fs.export_volume_snapshot().unwrap(), before);
+    assert_eq!(table.prepare_section_writeback(section_id).unwrap().len(), 1);
+
+    assert_eq!(
+        io.fs
+            .zw_set_information_file(filler.handle, nt_fs::FILE_DISPOSITION_INFORMATION, &[1]),
+        0
+    );
+    assert_eq!(io.fs.zw_close(filler.handle), 0);
+    let retried = table.writeback_file(backing, &mut io);
+    assert_eq!(retried.status, 0);
+    assert_eq!(retried.bytes_written, 0x1000);
+    assert_eq!(table.prepare_section_writeback(section_id).unwrap().len(), 0);
+    let mut restored = nt_fs::FileSystem::from_volume_snapshot(&io.snapshot).unwrap();
+    let file = restored.zw_create_file(r"\??\C:\mapped", 1, 0, 7, nt_fs::FILE_OPEN, 0);
+    assert_eq!(file.status, 0);
+    let (status, bytes) = restored.zw_read_file(file.handle, Some(0), 0x2000);
+    assert_eq!(status, 0);
+    assert_eq!(&bytes[0x1000..], &[0x77; 0x1000]);
+}

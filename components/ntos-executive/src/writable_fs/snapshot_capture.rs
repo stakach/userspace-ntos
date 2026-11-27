@@ -26,6 +26,7 @@ impl CapturedSnapshot {
             fs.export_volume_snapshot_into(&mut capture.image)
                 .map_err(|error| match error {
                     nt_fs::MemFsSnapshotError::OutOfMemory => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+                    nt_fs::MemFsSnapshotError::OutOfSpace => nt_fs::STATUS_DISK_FULL,
                     _ => 0xC000_0001,
                 })?;
         }

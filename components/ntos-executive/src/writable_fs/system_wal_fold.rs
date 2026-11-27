@@ -194,6 +194,7 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
     if prepared.is_none() && manifest.base_serial == manifest.high_water_serial {
         return Ok(false);
     }
+    system_snapshot_capacity::begin_fold(prepared.as_ref().map(|checkpoint| checkpoint.image.len()))?;
     let old = snapshot_storage::take_wal_continuation(&mut lease);
     let refused = old.as_ref().err().copied();
     let (old_continuation, old_pair) = match old {
@@ -334,11 +335,42 @@ fn apply_prepared_checkpoint(
         if nt_hive_core::image_len_if_valid(&prepared.image).ok()
             != Some(prepared.image.len()) { return Err(nt_fs::STATUS_DATA_ERROR); }
         let image = core::mem::take(&mut prepared.image);
-        replace_boot_file(fs, CONFIG_SYSTEM_HIVE_PATH, image)?;
+        if let Err((status, image)) = replace_reserved_system_file(fs, image) {
+            if let Some(image) = image { prepared.image = image; }
+            return Err(status);
+        }
         let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
         replace_boot_file(fs, &log_path, alloc::vec::Vec::new())?;
     }
     Ok(())
+}
+
+fn replace_reserved_system_file(
+    fs: &mut nt_fs::FileSystem, image: alloc::vec::Vec<u8>,
+) -> Result<(), (u32, Option<alloc::vec::Vec<u8>>)> {
+    let file = fs.zw_create_file(
+        CONFIG_SYSTEM_HIVE_PATH,
+        nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE,
+        0,
+        0,
+        nt_fs::FILE_OPEN,
+        nt_fs::FILE_NON_DIRECTORY_FILE,
+    );
+    if file.status != nt_fs::STATUS_SUCCESS {
+        return Err((file.status, Some(image)));
+    }
+    let result = unsafe { system_snapshot_capacity::replace_folded(fs, file.handle, image) };
+    let result = match result {
+        Ok(()) => {
+            let status = fs.zw_flush_buffers_file(file.handle);
+            if status == nt_fs::STATUS_SUCCESS { Ok(()) } else {
+                Err((status, None))
+            }
+        }
+        Err((status, image)) => Err((status, Some(image))),
+    };
+    let _ = fs.zw_close(file.handle);
+    result
 }
 
 /// Prepare the exact post-CM volume privately while preserving the original image for the
@@ -424,6 +456,10 @@ unsafe fn install_retained() -> Result<bool, u32> {
         return Err(block(nt_fs::STATUS_DATA_ERROR));
     }
     hive_wal::note_volume_wal_folded(folded_epoch, prior_clean_epoch);
+    if let Err(status) = system_snapshot_capacity::finish_fold() {
+        work.phase = Phase::Failed;
+        return Err(block(status));
+    }
     *core::ptr::addr_of_mut!(FOLD_WORK) = None;
     SYSTEM_WAL_FOLD_REQUIRED.store(false, Ordering::Release);
     crate::service_sec_image::note_system_wal_fold_complete();

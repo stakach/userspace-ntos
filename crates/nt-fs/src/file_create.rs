@@ -11,6 +11,11 @@ pub(super) struct CreateAllocator {
 }
 
 impl CreateAllocator {
+    #[cfg(test)]
+    pub(super) fn fail_at(&mut self, stage: Option<usize>) {
+        self.fail_at = stage;
+    }
+
     fn checkpoint(&mut self) -> Result<(), u32> {
         #[cfg(test)]
         {
@@ -200,7 +205,7 @@ impl MemFs {
         })
     }
 
-    fn create_opened_name(
+    pub(super) fn create_opened_name(
         &self,
         plan: &PreparedCreate,
         allocator: &mut CreateAllocator,
@@ -285,6 +290,7 @@ impl FileSystem {
         &mut self,
         options: u32,
         share: FileShareAccess,
+        reservation: Option<&SnapshotCapacityReservation>,
         prepare: impl FnOnce(&mut MemFs, &mut CreateAllocator) -> Result<PreparedCreate, u32>,
     ) -> CreateResult {
         let mut allocator = CreateAllocator::default();
@@ -315,6 +321,16 @@ impl FileSystem {
             }
         };
         if let PreparedCreate::Existing { node, information, .. } = &plan {
+            if (self.reserved_replacement_node(*node) && *information != FILE_OPENED)
+                || (options & FILE_DELETE_ON_CLOSE != 0
+                    && self.reserved_replacement_subtree(*node))
+            {
+                return CreateResult {
+                    status: STATUS_ACCESS_DENIED,
+                    handle: INVALID_HANDLE,
+                    information: 0,
+                };
+            }
             if self.wal_protected_subtree(*node)
                 && (*information != FILE_OPENED || options & FILE_DELETE_ON_CLOSE != 0)
             {
@@ -332,7 +348,65 @@ impl FileSystem {
                 information: 0,
             };
         }
+        let was_new = matches!(&plan, PreparedCreate::New { .. });
+        let next_snapshot_size = match (&self.snapshot_budget, &plan, reservation) {
+            (Some(budget), PreparedCreate::New { .. }, Some(token)) => {
+                SNAP_RECORD_FIXED_LEN.checked_add(opened_name.trim_start_matches('\\').len())
+                    .ok_or(STATUS_DATA_ERROR)
+                    .and_then(|record_len| {
+                        if !budget.owns(token) || token.file_id.is_some()
+                            || token.create_charge != record_len
+                            || !opened_name.eq_ignore_ascii_case(&token.relative_path)
+                        {
+                            return Err(STATUS_DATA_ERROR);
+                        }
+                        budget.project_reserved(token, 0, record_len, record_len)
+                    })
+                    .map(Some)
+            }
+            (Some(budget), PreparedCreate::New { .. }, None) => {
+                SNAP_RECORD_FIXED_LEN.checked_add(opened_name.trim_start_matches('\\').len())
+                    .ok_or(STATUS_DATA_ERROR)
+                    .and_then(|record_len| budget.project(0, record_len))
+                    .map(Some)
+            }
+            (Some(budget), PreparedCreate::Existing { node, information, .. }, Some(token)) => {
+                if !budget.owns(token) || token.create_charge != 0
+                    || *information != FILE_OPENED
+                    || self.volume.node(*node).map(|node| node.file_id) != token.file_id
+                {
+                    Err(STATUS_DATA_ERROR)
+                } else { Ok(None) }
+            }
+            (Some(budget), PreparedCreate::Existing { node, information, .. }, None)
+                if matches!(*information, FILE_OVERWRITTEN | FILE_SUPERSEDED) =>
+            {
+                self.volume.live_file_data_encoded_len(*node)
+                    .map_err(|_| STATUS_DATA_ERROR)
+                    .and_then(|old| budget.project(old, 0))
+                    .map(Some)
+            }
+            (None, _, Some(_)) => Err(STATUS_DEVICE_NOT_READY),
+            _ => Ok(None),
+        };
+        let next_snapshot_size = match next_snapshot_size {
+            Ok(next) => next,
+            Err(status) => {
+                return CreateResult { status, handle: INVALID_HANDLE, information: 0 };
+            }
+        };
         let (node_id, entry_id, information) = self.volume.apply_create(plan);
+        if let (Some(token), Some(next)) = (reservation, next_snapshot_size) {
+            if was_new {
+                let budget = self.snapshot_budget.as_mut().expect("reserved create budget");
+                budget.publish_reserved(token, next, token.create_charge);
+                let file_id = self.volume.node(node_id).expect("prepared created node").file_id;
+                budget.bind_created_file(token, file_id)
+                    .expect("prepared reserved create row");
+            }
+        } else {
+            self.publish_snapshot_size(next_snapshot_size);
+        }
         if handle == self.handles.len() {
             self.handles.push(None);
         }

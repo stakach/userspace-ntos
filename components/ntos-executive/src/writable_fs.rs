@@ -45,6 +45,9 @@ mod native_checkpoint;
 #[path = "writable_fs/snapshot_capture.rs"]
 mod snapshot_capture;
 
+#[path = "writable_fs/system_snapshot_capacity.rs"]
+pub(crate) mod system_snapshot_capacity;
+
 #[path = "writable_fs/registry_journal.rs"]
 pub(crate) mod registry_journal;
 
@@ -520,8 +523,8 @@ unsafe fn restore_snapshot_volume(
 ) -> Result<Option<(nt_fs::FileSystem, nt_fs::StoredSnapshotMetadata)>, u32> {
     let store = dev.store();
     // A WAL-bearing snapshot cannot be published until its committed suffix has been
-    // authenticated and replayed. The current native writer still uses legacy snapshots;
-    // the pre-replay reader also admits a complete, empty-WAL v2 baseline.
+    // authenticated and replayed. The pre-replay reader also admits a complete, empty-WAL
+    // v2 baseline while retaining legacy snapshot recovery for older installed disks.
     match nt_fs::FileSystem::restore_volume_snapshot_before_wal_replay_from_store(&store, dev) {
         Ok(Some((fs, metadata))) => Ok(Some((fs, metadata))),
         Ok(None) => {
@@ -649,14 +652,18 @@ unsafe fn restore_boot_snapshot_volume_once(
         print_u64(dev.sector_count());
         print_str(b"\n");
     }
-    Ok(restored.map(|(fs, metadata)| (fs, metadata, dev)))
+    restored.map(|(mut fs, metadata)| {
+        let capacity = store.payload_capacity(&dev).map_err(snapshot_store_error_status)?;
+        fs.set_snapshot_payload_capacity(capacity)?;
+        Ok((fs, metadata, dev))
+    }).transpose()
 }
 
 unsafe fn snapshot_reserve_available() -> bool {
     let Some(fat) = crate::fs_loader::exec_fs() else {
         return false;
     };
-    crate::fs_loader::writable_snapshot_reserve(&fat).is_some()
+    crate::fs_loader::writable_snapshot_reserve_start(&fat).is_some()
 }
 
 fn note_restored_snapshot(generation: u64, bytes: usize, nodes: usize) {
@@ -681,10 +688,19 @@ unsafe fn install_writable_fs(mut fs: nt_fs::FileSystem, restored: bool) -> Resu
     if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some() {
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
     }
+    let exec_mount = crate::fs_loader::exec_fs_mount_identity()
+        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let capacity = snapshot_storage::published_payload_capacity(exec_mount)
+        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    match fs.snapshot_payload_capacity() {
+        Some(configured) if configured == capacity => {}
+        None => fs.set_snapshot_payload_capacity(capacity)?,
+        _ => return Err(nt_fs::STATUS_DATA_ERROR),
+    }
     let mount = crate::mounted_volume::allocate_mount_id()?;
     let timestamps_initialized = fs.initialize_timestamps(nt_system_time_100ns());
     selftest(&mut fs);
-    let provisioned = provision_missing_installed_sources(&mut fs);
+    let provisioned = provision_missing_installed_sources(&mut fs)?;
     let slot = &mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS);
     *slot = Some(fs);
     *core::ptr::addr_of_mut!(WRITABLE_MOUNT_ID) = Some(mount);
@@ -1264,19 +1280,19 @@ fn refresh_restored_config_proofs(fs: &nt_fs::FileSystem) {
     );
 }
 
-unsafe fn provision_missing_installed_sources(fs: &mut nt_fs::FileSystem) -> bool {
+unsafe fn provision_missing_installed_sources(fs: &mut nt_fs::FileSystem) -> Result<bool, u32> {
     let mut changed = false;
     if PROVISION_DEFAULT_USER_PROFILE && !has_directory_relative(fs, PROFILES_VOLUME_ROOT_RELATIVE)
     {
         let before = fs.node_count();
-        provision_staged_profiles(fs);
+        provision_staged_profiles(fs)?;
         changed |= fs.node_count() != before;
     } else {
         refresh_live_profile_source_proofs(fs);
     }
     if !has_directory_relative(fs, CONFIG_VOLUME_ROOT_RELATIVE) {
         let before = fs.node_count();
-        provision_staged_config(fs);
+        provision_staged_config(fs)?;
         changed |= fs.node_count() != before;
     } else {
         refresh_restored_config_proofs(fs);
@@ -1285,9 +1301,9 @@ unsafe fn provision_missing_installed_sources(fs: &mut nt_fs::FileSystem) -> boo
         .query_attributes_relative(BOOT_STATUS_VOLUME_RELATIVE)
         .is_none()
     {
-        changed |= fs.provision_file(BOOT_STATUS_PATH, &initial_boot_status_data());
+        changed |= fs.provision_file_checked(BOOT_STATUS_PATH, &initial_boot_status_data())?;
     }
-    changed
+    Ok(changed)
 }
 
 /// The live writable volume, mounting it on first use. Admission failure is never file absence.
@@ -1401,6 +1417,7 @@ pub(crate) struct RestoredBootSystem {
     pub(crate) wal_suffix: Option<nt_hive_regf::BootSystemWalSuffix>,
     fs: Option<nt_fs::FileSystem>,
     format: nt_fs::SnapshotReadFormat,
+    checkpoint_reservation: Option<(nt_fs::SnapshotCapacityReservation, usize)>,
     _lease: Option<BootSystemReserveOwner>,
 }
 
@@ -1480,14 +1497,18 @@ pub(crate) unsafe fn initialize_empty_boot_system_wal(
     image: &[u8],
     _admission: BootWalCutoverAdmission,
 ) -> Result<u64, BootSystemRestoreError> {
-    let mut fs = nt_fs::FileSystem::new(nt_fs::MemFs::new());
-    // The fresh MemFs has no Config or Profiles parents. Stage the installed source tree into
-    // the same image that becomes the first durable baseline, then replace its SYSTEM primary.
-    provision_missing_installed_sources(&mut fs);
-    fold_boot_system_sidecar(&mut fs, image).map_err(BootSystemRestoreError::Snapshot)?;
     let lease = snapshot_storage::acquire().map_err(BootSystemRestoreError::Snapshot)?;
     snapshot_storage::wal_bounds(&lease).map_err(BootSystemRestoreError::Snapshot)?;
     let store = lease.store();
+    let mut fs = nt_fs::FileSystem::new(nt_fs::MemFs::new());
+    fs.set_snapshot_payload_capacity(store.payload_capacity(&lease)
+        .map_err(snapshot_store_error_status)
+        .map_err(BootSystemRestoreError::Snapshot)?)
+        .map_err(BootSystemRestoreError::Snapshot)?;
+    // The fresh MemFs has no Config or Profiles parents. Stage the installed source tree into
+    // the same image that becomes the first durable baseline, then replace its SYSTEM primary.
+    provision_missing_installed_sources(&mut fs).map_err(BootSystemRestoreError::Snapshot)?;
+    fold_boot_system_sidecar(&mut fs, image).map_err(BootSystemRestoreError::Snapshot)?;
     let range = snapshot_storage::owned_wal_region(lease)
         .map_err(|(status, _lease)| BootSystemRestoreError::Snapshot(status))?;
     let wal = nt_fs::RegistryWal::recover(range, 1).map_err(BootSystemRestoreError::Wal)?;
@@ -1536,6 +1557,16 @@ impl RestoredBootSystem {
         _admission: BootWalCutoverAdmission,
     ) -> Result<(), BootSystemRestoreError> {
         let fs = self.fs.as_mut().expect("unpublished boot filesystem");
+        if matches!(self.format, nt_fs::SnapshotReadFormat::Wal { .. })
+            && self.wal_suffix.is_some()
+        {
+            if self.primary.is_none() {
+                return Err(BootSystemRestoreError::SystemStateMissing);
+            }
+            let token = system_snapshot_capacity::reserve_boot(fs, composed_image.len())
+                .map_err(BootSystemRestoreError::Snapshot)?;
+            self.checkpoint_reservation = Some((token, composed_image.len()));
+        }
         if self.format == nt_fs::SnapshotReadFormat::Legacy {
             let BootSystemReserveOwner::Legacy(lease) = self._lease.take()
                 .expect("retained boot reserve lease") else {
@@ -1623,6 +1654,10 @@ impl RestoredBootSystem {
         if install_writable_fs(fs, true).is_err() {
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
             return Err(BootSystemRestoreError::MountBlocked);
+        }
+        if let Some((token, image_len)) = self.checkpoint_reservation.take() {
+            system_snapshot_capacity::install_boot(token, image_len)
+                .map_err(BootSystemRestoreError::Snapshot)?;
         }
         note_restored_snapshot(self.snapshot_generation, self.snapshot_bytes, nodes);
         Ok(())
@@ -1829,6 +1864,8 @@ pub(crate) unsafe fn restore_boot_system_persistence(
             let (log, wal_suffix, lease) = verified_boot_log(
                 metadata, snapshot_log, lease, &mut fs, &log_path,
             )?;
+            fs.reconcile_unpublished_replay_snapshot()
+                .map_err(BootSystemRestoreError::Snapshot)?;
             SYSTEM_WAL_FOLD_REQUIRED.store(wal_suffix.is_some(), Ordering::Release);
             if primary.is_none() && log.is_empty() {
                 return Err(BootSystemRestoreError::SystemStateMissing);
@@ -1841,6 +1878,7 @@ pub(crate) unsafe fn restore_boot_system_persistence(
                 wal_suffix,
                 fs: Some(fs),
                 format: metadata.format,
+                checkpoint_reservation: None,
                 _lease: Some(lease),
             }))
         }
@@ -3139,10 +3177,10 @@ unsafe fn provision_staged_tree(
     root_cluster: u32,
     volume_root_relative: &[u8],
     max_depth: u32,
-) -> StagedTreeStats {
+) -> Result<StagedTreeStats, u32> {
     // Explicit DFS stack (no recursion in the executive): (fat cluster, volume path of the dir).
     let mut stack: alloc::vec::Vec<(u32, alloc::vec::Vec<u8>, u32)> = alloc::vec::Vec::new();
-    let _ = fs.provision_directory_relative(volume_root_relative);
+    let _ = fs.provision_directory_relative_checked(volume_root_relative)?;
     stack.push((root_cluster, volume_root_relative.to_vec(), 0));
     let mut stats = StagedTreeStats::default();
     while let Some((cluster, base, depth)) = stack.pop() {
@@ -3177,7 +3215,7 @@ unsafe fn provision_staged_tree(
             path.push(b'\\');
             path.extend_from_slice(name.as_bytes());
             if child_attr & 0x10 != 0 {
-                if fs.provision_directory_relative(&path) {
+                if fs.provision_directory_relative_checked(&path)? {
                     stats.dirs += 1;
                     if depth + 1 < max_depth {
                         stack.push((child, path, depth + 1));
@@ -3186,7 +3224,7 @@ unsafe fn provision_staged_tree(
             } else if is_deferred_boot_hive_source(&path) {
                 stats.deferred_boot_hives += 1;
             } else if let Some(data) = read_staged_file(fat, child, size) {
-                if fs.provision_file_relative(&path, &data) {
+                if fs.provision_file_relative_checked(&path, &data)? {
                     stats.files += 1;
                     stats.bytes += size as u64;
                 }
@@ -3195,7 +3233,7 @@ unsafe fn provision_staged_tree(
             }
         }
     }
-    stats
+    Ok(stats)
 }
 
 unsafe fn staged_config_hive_ok(fat: &Fat32, root_cluster: u32, leaf: &[u8]) -> bool {
@@ -3211,21 +3249,21 @@ unsafe fn staged_config_hive_ok(fat: &Fat32, root_cluster: u32, leaf: &[u8]) -> 
         .is_some_and(hive_image_ok)
 }
 
-unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
+unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) -> Result<(), u32> {
     let Some(fat) = crate::fs_loader::exec_fs() else {
         print_str(b"[profile-source] no FAT volume -> \\Profiles NOT materialised\n");
-        return;
+        return Ok(());
     };
     let Some((root_cluster, _, attr)) =
         crate::fs_loader::dir_find_lfn(&fat, fat.root_cl, STAGED_PROFILES_DIR)
     else {
         print_str(b"[profile-source] ::Profiles ABSENT from the image -> not materialised\n");
-        return;
+        return Ok(());
     };
     if attr & 0x10 == 0 {
-        return;
+        return Ok(());
     }
-    let stats = provision_staged_tree(fs, &fat, root_cluster, PROFILES_VOLUME_ROOT_RELATIVE, 12);
+    let stats = provision_staged_tree(fs, &fat, root_cluster, PROFILES_VOLUME_ROOT_RELATIVE, 12)?;
     PROFILE_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
     PROFILE_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
     PROFILE_SOURCE_BYTES.store(stats.bytes, Ordering::Relaxed);
@@ -3257,23 +3295,24 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     print_str(b" ntuser.dat-hive=");
     print_u64(hive_image_len_on(fs, DEFAULT_USER_NTUSER_DAT) as u64);
     print_str(b"B\n");
+    Ok(())
 }
 
-unsafe fn provision_staged_config(fs: &mut nt_fs::FileSystem) {
+unsafe fn provision_staged_config(fs: &mut nt_fs::FileSystem) -> Result<(), u32> {
     let Some(fat) = crate::fs_loader::exec_fs() else {
         print_str(b"[config-source] no FAT volume -> system32\\config NOT materialised\n");
-        return;
+        return Ok(());
     };
     let Some((root_cluster, _, attr)) =
         crate::fs_loader::fat_open_path_entry(&fat, STAGED_CONFIG_DIR)
     else {
         print_str(b"[config-source] reactos\\system32\\config ABSENT -> not materialised\n");
-        return;
+        return Ok(());
     };
     if attr & 0x10 == 0 {
-        return;
+        return Ok(());
     }
-    let stats = provision_staged_tree(fs, &fat, root_cluster, CONFIG_VOLUME_ROOT_RELATIVE, 4);
+    let stats = provision_staged_tree(fs, &fat, root_cluster, CONFIG_VOLUME_ROOT_RELATIVE, 4)?;
     CONFIG_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
     CONFIG_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
     CONFIG_SOURCE_BYTES.store(stats.bytes, Ordering::Relaxed);
@@ -3300,6 +3339,7 @@ unsafe fn provision_staged_config(fs: &mut nt_fs::FileSystem) {
     print_str(b" software-hive-ok=");
     print_u64(software_hive_ok as u64);
     print_str(b"\n");
+    Ok(())
 }
 
 /// How many records a directory really enumerates through the `Zw*` surface (`.`, `..`, children) —

@@ -216,6 +216,38 @@ fn proof_checkpoint_refusal_returns_payload_and_exact_proof_before_effect() {
 }
 
 #[test]
+fn over_capacity_rechecked_commit_returns_exact_image_and_proof_without_io() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    store.commit_next_with_wal_manifest(&mut disk, b"older", baseline()).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"newer", baseline()).unwrap();
+    let proof = rechecked_pair(store, &mut disk);
+    let anchor = proof.anchor();
+    let events = disk.events.clone();
+    let limit = store.payload_capacity(&disk).unwrap();
+    let image = alloc::vec![0x5a; limit + 1];
+    let image_ptr = image.as_ptr();
+
+    let (error, returned, proof) = match AsyncSnapshotCommit::new_from_rechecked_pair(
+        image, baseline(), proof,
+    ) {
+        Ok(_) => panic!("an over-capacity image must refuse before physical I/O"),
+        Err(parts) => parts,
+    };
+    assert_eq!(error, SnapshotBlockStoreError::OutOfSpace);
+    assert_eq!(returned.as_ptr(), image_ptr, "the caller keeps the exact image allocation");
+    assert_eq!(returned.len(), limit + 1);
+    assert_eq!(proof.anchor(), anchor);
+    assert_eq!(disk.events, events, "admission must enter no I/O");
+
+    let admitted = AsyncSnapshotCommit::new_from_rechecked_pair(
+        alloc::vec![0x5a; limit], baseline(), proof,
+    ).ok().expect("the returned proof remains usable with an in-capacity image");
+    assert_eq!(admitted.pending(), None);
+    assert_eq!(disk.events, events, "constructing the next owner still enters no I/O");
+}
+
+#[test]
 fn proof_checkpoint_uncertain_write_retains_ticket_and_previous_slot() {
     let store = SnapshotBlockStore::new(0, 16);
     let mut disk = CachedDisk::new();

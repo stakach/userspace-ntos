@@ -85,6 +85,7 @@ impl Backend for Direct {
                 2 => reply.detail0 ^= 1,
                 3 => reply.detail1 ^= 1,
                 4 => reply.status = 0x103,
+                5 => reply.detail0 ^= 1u64 << 32,
                 _ => unreachable!(),
             },
             Fault::Body(variant) => {
@@ -256,6 +257,7 @@ fn real_server_lost_append_prepare_and_pull_keep_exact_offsets_and_move_once() {
     assert_eq!(prepared.next_generation(), 2);
     assert_eq!(prepared.durable_journal().as_ptr(), pointer);
     assert_eq!(prepared.semantic_journal_len as usize, semantic_len);
+    assert!(prepared.projected_checkpoint_image_len().is_some_and(|len| len > 9000));
     assert_eq!(owner.phase(), Phase::Taken);
     assert!(owner.continuation().is_none());
     assert!(owner.take_prepared().is_err());
@@ -286,6 +288,7 @@ fn real_noop_preparation_has_zero_journal_and_never_issues_pull() {
     let (prepared, caller) = owner.take_prepared().unwrap();
     assert_eq!(caller, 7);
     assert!(prepared.durable_journal().is_empty());
+    assert_eq!(prepared.projected_checkpoint_image_len(), None);
     assert!(client
         .backend
         .requests
@@ -429,6 +432,23 @@ fn malformed_pull_length_total_or_token_never_appends_bytes() {
         cancel(&mut client, &mut owner);
         assert_eq!(owner.take_cancelled(), Ok(42));
     }
+}
+
+#[test]
+fn changed_projected_checkpoint_length_on_later_pull_never_appends_bytes() {
+    let mut client = client();
+    let mut owner = standard(&mut client, 42);
+    prepare_and_allocate(&mut client, &mut owner);
+    exchange(&mut client, &mut owner, Op::Pull).unwrap();
+    assert_eq!(owner.phase(), Phase::Pulling);
+    let collected = owner.collected_len();
+    client.backend.fault = Some((Op::Pull, Fault::Cqe(5)));
+    assert_eq!(exchange(&mut client, &mut owner, Op::Pull), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(owner.collected_len(), collected);
+    exchange(&mut client, &mut owner, Op::Pull).unwrap();
+    assert!(owner.collected_len() > collected);
+    cancel(&mut client, &mut owner);
+    assert_eq!(owner.take_cancelled(), Ok(42));
 }
 
 #[test]

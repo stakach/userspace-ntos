@@ -280,6 +280,7 @@ fn prepare_and_pull_replay_captured_result_without_revalidation() {
     );
     let prepared = server.prepared_system_mutation.as_ref().unwrap();
     let expected = prepared.durable_journal.clone();
+    let expected_projection = prepared.projected_checkpoint_image_len;
     let address = prepared.durable_journal.as_ptr();
     // New authority cannot change already captured bytes or their generation.
     server.system_hive.as_mut().unwrap().generation = 7;
@@ -305,7 +306,8 @@ fn prepare_and_pull_replay_captured_result_without_revalidation() {
         assert_eq!(reply.status, STATUS_SUCCESS);
         let end = core::cmp::min(offset + 13, expected.len());
         assert_eq!(reply.information as usize, end - offset);
-        assert_eq!(reply.detail0 as usize, expected.len());
+        assert_eq!(hive_mutation_transfer::unpack_pull_detail(reply.detail0),
+            Some((expected.len() as u32, expected_projection)));
         assert_eq!(reply.detail1, request.lease_token);
         assert_eq!(&out[..end - offset], &expected[offset..end]);
     }

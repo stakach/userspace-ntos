@@ -353,7 +353,7 @@ fn write_subtree_records(hive: &Hive, root: CellId, subtree_root: CellId, p: &mu
     }
 }
 
-fn key_record_len(key: &KeyCell) -> Result<usize, HiveEncodeError> {
+pub(crate) fn key_record_len(key: &KeyCell) -> Result<usize, HiveEncodeError> {
     let mut len = 2usize + 8 + 8;
     len = checked_add(len, str16_record_len(&key.name)?)?;
     len = checked_add(len, 4 + 1)?;
@@ -367,7 +367,7 @@ fn key_record_len(key: &KeyCell) -> Result<usize, HiveEncodeError> {
     checked_add(len, 8)
 }
 
-fn value_record_len(hive: &Hive, value: &ValueCell) -> Result<usize, HiveEncodeError> {
+pub(crate) fn value_record_len(hive: &Hive, value: &ValueCell) -> Result<usize, HiveEncodeError> {
     let mut len = 2usize + 8 + 8;
     len = checked_add(len, str16_record_len(&value.name)?)?;
     len = checked_add(len, 4)?;
