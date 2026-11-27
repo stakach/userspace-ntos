@@ -281,6 +281,9 @@ static mut WIN32K_SECONDARY_STACK_PUBLICATIONS:
 static mut WIN32K_DRIVER_STACK_EVENT_ACTIVATION: Option<ProviderStackEventActivation> = None;
 static WIN32K_DRIVER_OBJECT: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_LOCAL_EVENT_INITIALIZATIONS: AtomicU64 = AtomicU64::new(0);
+// The exact local Event whose retirement first found a live lease. Its signaler may release
+// after the waiter has already stopped, so retain the identity for a bounded failure receipt.
+static PROVIDER_LOCAL_EVENT_FAILED_RETIREMENT: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_COMPONENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SHUTDOWN_EVENT: AtomicU64 = AtomicU64::new(0);
 const WIN32K_STACK_BYTES: u64 = 32 * 0x1000;
@@ -958,6 +961,7 @@ unsafe fn initialize_provider_local_event_tracking() -> bool {
     (&mut *core::ptr::addr_of_mut!(WIN32K_CALLOUT_PHASES)).clear();
     *core::ptr::addr_of_mut!(WIN32K_DRIVER_STACK_EVENT_ACTIVATION) = None;
     PROVIDER_LOCAL_EVENT_INITIALIZATIONS.store(0, Ordering::Relaxed);
+    PROVIDER_LOCAL_EVENT_FAILED_RETIREMENT.store(0, Ordering::Relaxed);
     true
 }
 
@@ -5385,8 +5389,17 @@ unsafe fn retire_existing_provider_local_event(body: u64) -> bool {
     let retirement = match retirement {
         Ok(retirement) => retirement,
         Err(error) => {
+            PROVIDER_LOCAL_EVENT_FAILED_RETIREMENT.store(existing.id.raw(), Ordering::Release);
             print_str(b"[win32k-event] local reinitialization retirement rejected reason=");
             print_u64(error as u64);
+            print_str(b" body=");
+            print_win32k_hex64(body);
+            print_str(b" id=");
+            print_win32k_hex64(existing.id.raw());
+            print_str(b" wait/signal=");
+            print_u64(existing.wait_leases as u64);
+            print_str(b"/");
+            print_u64(existing.signal_leases as u64);
             print_str(b"\n");
             return false;
         }
@@ -5676,6 +5689,13 @@ unsafe fn provider_local_event_call(event: u64, op: u64) -> (u64, u64) {
     if !released {
         print_str(b"[win32k-event] canonical local Event operation failed\n");
         park();
+    }
+    if PROVIDER_LOCAL_EVENT_FAILED_RETIREMENT.load(Ordering::Acquire) == lease.id.raw() {
+        print_str(b"[win32k-event] failed-retirement Signal lease released id=");
+        print_win32k_hex64(lease.id.raw());
+        print_str(b" body=");
+        print_win32k_hex64(event);
+        print_str(b"\n");
     }
     (out1, out2)
 }
