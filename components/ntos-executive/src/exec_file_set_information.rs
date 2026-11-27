@@ -34,10 +34,20 @@ impl ExecNtHandler {
                 return Some(status.raw() as u32);
             }
         }
-        let request_id = match self.reserve_local_file_io_delivery() {
+        let reserved = if information_class == nt_fs::FILE_BASIC_INFORMATION {
+            self.reserve_local_basic_file_io_delivery()
+        } else {
+            self.reserve_local_file_io_delivery()
+        };
+        let request_id = match reserved {
             Ok(request_id) => request_id,
             Err(status) => return Some(status),
         };
+        if information_class == nt_fs::FILE_BASIC_INFORMATION {
+            if let Err(status) = self.preflight_basic_set_delivery(route, request_id, iosb) {
+                return Some(status);
+            }
+        }
         let retained = if policy.resets_file_signal() {
             self.begin_local_file_io(route.file_object)
         } else {
@@ -46,14 +56,59 @@ impl ExecNtHandler {
         if let Err(status) = retained {
             return Some(status);
         }
+        let mut basic_preparation_error = None;
+        if information_class == nt_fs::FILE_BASIC_INFORMATION && value.is_ok() {
+            if let Some(bytes) = payload.get(..40) {
+                let input: [u8; 40] = bytes.try_into().unwrap();
+                let file_id = match route.file_object {
+                    LocalFileObject::Overlay(file_id) => file_id,
+                    LocalFileObject::ReadonlyFile(_) => unreachable!("Basic SET lost Overlay File"),
+                };
+                match crate::writable_fs::prepare_basic_owner(file_id, input) {
+                    Ok(owner) => {
+                        assert!(self.pending_file_io_transfer.is_none());
+                        assert!(self.pending_basic_prepared_transfer.is_none());
+                        self.pending_basic_prepared_transfer = Some(owner);
+                        self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
+                            route: PendingFileRoute::Local(route.file_object),
+                            irp_id: request_id,
+                            major: major::IRP_MJ_SET_INFORMATION,
+                            operation: nt_io_manager::PendingFileIoOperation::OwnedBasicPreflight(
+                                nt_io_manager::PendingOwnedBasicPreflight::new(
+                                    crate::writable_fs::checkpoint_epochs().0,
+                                ),
+                            ),
+                            pi: self.pi as u32,
+                            tid: self.current_tid,
+                            badge: self.current_badge,
+                            iosb_va: iosb,
+                            signal_file: true,
+                            completion_port_suppressed: true,
+                            event_obj_idx: u64::MAX,
+                            ..nt_io_manager::PendingFileIo::default()
+                        });
+                        self.pending_file_io_wait = true;
+                        return Some(STATUS_PENDING);
+                    }
+                    Err(status) => basic_preparation_error = Some(status),
+                }
+            } else {
+                basic_preparation_error = Some(nt_fs::STATUS_INFO_LENGTH_MISMATCH);
+            }
+        }
+        if let Some(sidecar) = self.pending_basic_sidecar_reservation.take() {
+            assert!((&mut *core::ptr::addr_of_mut!(PENDING_BASIC_PREPARED))
+                .cancel_admission(sidecar));
+        }
         // Ordinary SET validation failure leaves the already-reset File event unsignaled.
         // No user-memory access or delivery retry may repeat the accepted mutation below.
         let status = match value {
             Err(status) => status.raw() as u32,
+            Ok(()) if basic_preparation_error.is_some() => basic_preparation_error.unwrap(),
             Ok(()) => match route.file_object {
                 LocalFileObject::Overlay(file_id) => {
                     // The writable volume publishes its durable mutation bit after applying
-                    // the class. File position and unchanged basic information owe no snapshot.
+                    // the class. File position changes owe no volume snapshot.
                     self.set_overlay_file_information(file_id, information_class, payload)
                 }
                 LocalFileObject::ReadonlyFile(object_id) => {
@@ -95,6 +150,58 @@ impl ExecNtHandler {
         });
         self.pending_file_io_wait = true;
         Some(STATUS_PENDING)
+    }
+
+    /// Check both possible Basic row shapes while the extra File operation reference and its
+    /// signal state are still untouched. The outer synchronous Busy source is already active.
+    unsafe fn preflight_basic_set_delivery(
+        &self,
+        route: LocalByteLockRoute,
+        request_id: u64,
+        iosb: u64,
+    ) -> Result<(), u32> {
+        let primary = self.pending_basic_primary_reservation.as_ref()
+            .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+        let sidecar = self.pending_basic_sidecar_reservation.as_ref()
+            .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+        let reply = self.pending_basic_reply_reservation.as_ref()
+            .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+        if !(&*core::ptr::addr_of!(PENDING_BASIC_PREPARED)).admission_live(sidecar) {
+            return Err(nt_fs::STATUS_DATA_ERROR);
+        }
+        let busy = self.current_synchronous_file.map(|identity| {
+            nt_io_manager::PendingFileBusy::new(inline_file_retirement::active_owner(identity))
+        });
+        let basic = nt_io_manager::PendingFileIo {
+            route: PendingFileRoute::Local(route.file_object),
+            irp_id: request_id,
+            major: major::IRP_MJ_SET_INFORMATION,
+            operation: nt_io_manager::PendingFileIoOperation::OwnedBasicPreflight(
+                nt_io_manager::PendingOwnedBasicPreflight::new(0)),
+            pi: self.pi as u32,
+            tid: self.current_tid,
+            badge: self.current_badge,
+            busy,
+            iosb_va: iosb,
+            signal_file: true,
+            completion_port_suppressed: true,
+            event_obj_idx: u64::MAX,
+            reply_cap: reply.active(),
+            reply_required: true,
+            ..nt_io_manager::PendingFileIo::default()
+        };
+        let table = &*core::ptr::addr_of!(PENDING_FILE_IO);
+        table.preflight_basic_primary(primary, basic)
+            .map_err(|_| nt_fs::STATUS_DATA_ERROR)?;
+        let mut inline = basic;
+        inline.operation = nt_io_manager::PendingFileIoOperation::OwnedInline(
+            nt_io_manager::PendingOwnedInline {
+                status: nt_fs::STATUS_DATA_ERROR, information: 0,
+            });
+        inline.iosb_va = 0;
+        inline.signal_file = false;
+        table.preflight_basic_primary(primary, inline)
+            .map_err(|_| nt_fs::STATUS_DATA_ERROR)
     }
 
     unsafe fn set_overlay_file_information(

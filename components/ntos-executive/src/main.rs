@@ -2696,6 +2696,9 @@ static KEYED_RELEASE_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 /// and backend acknowledgement, independent of the provider that owns the request.
 static mut PENDING_FILE_IO: nt_io_manager::PendingFileIoTable =
     nt_io_manager::PendingFileIoTable::new();
+static mut PENDING_BASIC_PREPARED:
+    nt_io_manager::PendingBasicPreparedTable<crate::writable_fs::BasicFileReference> =
+        nt_io_manager::PendingBasicPreparedTable::new();
 /// Captured provider rename/link buffers survive the internal target-parent CREATE and the source
 /// SET_INFORMATION without retaining caller memory. The generic pending File owner carries the
 /// syscall reply; this table owns a canonical source reference across all intervening IRP ACKs.
@@ -24655,6 +24658,11 @@ struct ExecNtHandler {
     /// loop attaches the live reply cap only when `pending_file_io_wait` says the native API or
     /// synchronous File object must wait for terminal completion.
     pending_file_io_transfer: Option<nt_io_manager::PendingFileIo>,
+    pending_basic_prepared_transfer: Option<nt_io_manager::PendingBasicPreparedOwner<
+        crate::writable_fs::BasicFileReference>>,
+    pending_basic_primary_reservation: Option<nt_io_manager::PendingBasicPrimaryReservation>,
+    pending_basic_sidecar_reservation: Option<nt_io_manager::PendingBasicPreparedReservation>,
+    pending_basic_reply_reservation: Option<crate::root_reply_park::RootReplyReservation>,
     pending_file_io_wait: bool,
     /// Exact pre-dispatch owner claim consumed only if the driver returns a pending IRP.
     pending_file_io_reservation: Option<nt_io_manager::PendingFileIoReservation>,

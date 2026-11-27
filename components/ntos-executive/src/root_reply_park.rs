@@ -16,6 +16,8 @@ pub(crate) struct RootReplyReservation {
 }
 
 impl RootReplyReservation {
+    pub(crate) fn active(&self) -> u64 { self.park.active }
+
     pub(crate) unsafe fn before_native() -> Option<Self> {
         let park = RootReplyPark::prepare()?;
         let lease = if let Some((index, cap)) = park.replacement {

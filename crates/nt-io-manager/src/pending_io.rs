@@ -343,6 +343,17 @@ pub struct PendingFileIoReservation {
     generation: u64,
 }
 
+/// Move-only primary File row for a local Basic SET. The raw reservation is hidden from the
+/// native handler so a second publisher cannot copy, cancel, or reuse the same claim.
+#[must_use = "publish the Basic row or cancel its unused claim"]
+pub struct PendingBasicPrimaryReservation {
+    reservation: PendingFileIoReservation,
+}
+
+impl PendingBasicPrimaryReservation {
+    pub fn identity(&self) -> PendingFileIoIdentity { self.reservation.identity() }
+}
+
 /// The delivery owner's lifetime identity, independent of its current provider IRP correlation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingFileIoIdentity {
@@ -897,6 +908,54 @@ impl PendingFileIoTable {
     /// Claim one exact owner slot before dispatching an IRP.
     pub fn reserve(&mut self) -> Option<PendingFileIoReservation> {
         self.reserve_with_identity_source(&NEXT_TABLE_IDENTITY)
+    }
+
+    pub fn reserve_basic_primary(&mut self) -> Option<PendingBasicPrimaryReservation> {
+        Some(PendingBasicPrimaryReservation { reservation: self.reserve()? })
+    }
+
+    pub fn basic_primary_local_operation_id(&self,
+        primary: &PendingBasicPrimaryReservation) -> Option<u64> {
+        self.local_operation_id(primary.reservation)
+    }
+
+    /// Validate the two possible Basic delivery shapes before the native File retain and signal
+    /// reset. The same move-only claim is used at commit; neither row nor Reply is published here.
+    pub fn preflight_basic_primary(&self, primary: &PendingBasicPrimaryReservation,
+        row: PendingFileIo,
+    ) -> Result<(), PendingFileIoParkError> {
+        let reservation = primary.reservation;
+        if reservation.table == 0 || reservation.table != self.identity
+            || reservation.generation == 0
+            || self.reservations.get(reservation.slot).copied() != Some(reservation.generation)
+        { return Err(PendingFileIoParkError::StaleReservation); }
+        if self.slots.get(reservation.slot).is_none_or(|slot| slot.is_some()) {
+            return Err(PendingFileIoParkError::OccupiedReservation);
+        }
+        if !matches!(row.operation, PendingFileIoOperation::OwnedBasicPreflight(_)
+            | PendingFileIoOperation::OwnedInline(_))
+            || self.local_operation_id(reservation) != Some(row.irp_id)
+            || !Self::pending_shape_is_valid(row)
+            || self.local_outputs[reservation.slot].is_some()
+        { return Err(PendingFileIoParkError::InvalidRecord); }
+        if self.contains_irp(row.irp_id) {
+            return Err(PendingFileIoParkError::DuplicateIrp);
+        }
+        Ok(())
+    }
+
+    pub fn cancel_basic_primary(&mut self, primary: PendingBasicPrimaryReservation) -> bool {
+        self.cancel_reservation(primary.reservation)
+    }
+
+    pub fn try_park_basic_primary(&mut self, primary: PendingBasicPrimaryReservation,
+        row: PendingFileIo,
+    ) -> Result<PendingFileIoIdentity,
+        (PendingFileIoParkError, PendingFileIo, PendingBasicPrimaryReservation)> {
+        match self.park_reserved(primary.reservation, row) {
+            Ok(_) => Ok(primary.identity()),
+            Err(error) => Err((error, row, primary)),
+        }
     }
 
     fn reserve_with_identity_source(

@@ -272,7 +272,7 @@ pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pending_basic_prepared::{
     PendingBasicPreparedAdmissionError, PendingBasicPreparedClaim,
-    PendingBasicPreparedOwner, PendingBasicPreparedTable,
+    PendingBasicPreparedOwner, PendingBasicPreparedReservation, PendingBasicPreparedTable,
 };
 pub use pending_io::{
     PendingFileApcAttempt, PendingFileApcDeliveryLease, PendingFileApcDisposition,
@@ -283,7 +283,9 @@ pub use pending_io::{
     PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,
     CompletionEvent, PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoParkError,
     CreateOutputSettlement, PendingCreateOutput, PendingCreateOutputAction, PendingCreateOutputObservation,
-    LocalFlushMode, PendingFileIoIdentity, PendingFileIoReservation, PendingFileIoTable, PendingLocalBuffered,
+    LocalFlushMode, PendingBasicPrimaryReservation,
+    PendingFileIoIdentity,
+    PendingFileIoReservation, PendingFileIoTable, PendingLocalBuffered,
     PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingOwnedInline,
     PendingOwnedModeInputCapture, PendingOwnedModePrecommit,
     PendingBasicBaselineTicket, PendingOwnedBasicPreflight,

@@ -4050,29 +4050,76 @@ pub(crate) enum HostedProcessDeletionOutcome {
 }
 
 impl ExecNtHandler {
+    unsafe fn reserve_file_io_claim(&mut self)
+        -> Option<nt_io_manager::PendingFileIoReservation> {
+        let Some(tcb) = self.hosted_thread_tcb(self.current_tid) else {
+            return None;
+        };
+        let Some(caller) = self.capture_provider_logical_caller(
+            self.pi, self.current_tid, self.current_badge, tcb,
+        ) else {
+            return None;
+        };
+        let Some(reservation) = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reserve()
+        else {
+            return None;
+        };
+        if !crate::pending_file_caller::reserve(reservation, caller) {
+            assert!((&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .cancel_reservation(reservation));
+            return None;
+        }
+        Some(reservation)
+    }
+
     unsafe fn reserve_pending_file_io_owner(&mut self) -> bool {
         assert!(
             self.pending_file_io_reservation.is_none(),
             "one syscall reserved more than one pending File owner"
         );
+        let Some(reservation) = self.reserve_file_io_claim() else { return false; };
+        self.pending_file_io_reservation = Some(reservation);
+        true
+    }
+
+    pub(super) unsafe fn reserve_basic_file_io_owner(&mut self) -> bool {
+        assert!(self.pending_basic_primary_reservation.is_none());
+        assert!(self.pending_basic_sidecar_reservation.is_none());
         let Some(tcb) = self.hosted_thread_tcb(self.current_tid) else {
             return false;
         };
         let Some(caller) = self.capture_provider_logical_caller(
             self.pi, self.current_tid, self.current_badge, tcb,
-        ) else {
-            return false;
-        };
-        let Some(reservation) = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).reserve()
-        else {
-            return false;
-        };
-        if !crate::pending_file_caller::reserve(reservation, caller) {
+        ) else { return false; };
+        let Some(primary) = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+            .reserve_basic_primary()
+        else { return false; };
+        if !crate::pending_file_caller::reserve_identity(primary.identity(), caller) {
             assert!((&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                .cancel_reservation(reservation));
+                .cancel_basic_primary(primary));
             return false;
         }
-        self.pending_file_io_reservation = Some(reservation);
+        let Some(sidecar) = (&mut *core::ptr::addr_of_mut!(PENDING_BASIC_PREPARED))
+            .reserve_admission()
+        else {
+            let identity = primary.identity();
+            assert!((&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .cancel_basic_primary(primary));
+            crate::pending_file_caller::cancel_reserved_identity(identity);
+            return false;
+        };
+        let Some(reply) = crate::root_reply_park::RootReplyReservation::before_native() else {
+            let identity = primary.identity();
+            assert!((&mut *core::ptr::addr_of_mut!(PENDING_BASIC_PREPARED))
+                .cancel_admission(sidecar));
+            assert!((&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .cancel_basic_primary(primary));
+            crate::pending_file_caller::cancel_reserved_identity(identity);
+            return false;
+        };
+        self.pending_basic_primary_reservation = Some(primary);
+        self.pending_basic_sidecar_reservation = Some(sidecar);
+        self.pending_basic_reply_reservation = Some(reply);
         true
     }
 
@@ -4384,6 +4431,10 @@ impl ExecNtHandler {
         write_field!(io_completion_timeout, PendingWaitTimeout::none());
         write_field!(io_signal_event, -1);
         write_field!(pending_file_io_transfer, None);
+        write_field!(pending_basic_prepared_transfer, None);
+        write_field!(pending_basic_primary_reservation, None);
+        write_field!(pending_basic_sidecar_reservation, None);
+        write_field!(pending_basic_reply_reservation, None);
         write_field!(pending_file_io_wait, false);
         write_field!(pending_file_io_reservation, None);
         write_field!(pending_driver_starts, driver_starts.pending);
