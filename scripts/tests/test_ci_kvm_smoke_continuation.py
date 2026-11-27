@@ -333,6 +333,47 @@ class ContinuationTests(unittest.TestCase):
             with self.assertRaises(disk.ContinuationError):
                 disk.verify_migration_manifest(self.manifest, 101, 2, self.current, self.run)
 
+    def test_migration_accepts_equal_tree_squash_but_rejects_divergent_sibling(self):
+        kernel = self.root / "rust-micro"
+
+        def git(*args):
+            return subprocess.check_output(["git", *args], cwd=kernel, text=True).strip()
+
+        git("init", "-q")
+        (kernel / "source.txt").write_text("base\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "base")
+        base = git("rev-parse", "HEAD")
+
+        (kernel / "source.txt").write_text("same bytes\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "source commit")
+        source = git("rev-parse", "HEAD")
+
+        git("checkout", "-qB", "squashed", base)
+        (kernel / "source.txt").write_text("same bytes\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "squash commit")
+        target = git("rev-parse", "HEAD")
+        self.assertNotEqual(source, target)
+        self.assertEqual(git("rev-parse", f"{source}^{{tree}}"),
+                         git("rev-parse", f"{target}^{{tree}}"))
+
+        git("checkout", "-qB", "diverged", base)
+        (kernel / "source.txt").write_text("different bytes\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "divergent commit")
+        divergent = git("rev-parse", "HEAD")
+
+        with patch.object(disk, "ROOT", self.root):
+            self.assertTrue(disk.migration_submodule_is_compatible(source, target))
+            self.assertFalse(disk.migration_submodule_is_compatible(source, divergent))
+            self.assertFalse(disk.migration_submodule_is_compatible("0" * 40, target))
+
     def test_migration_rejects_unrelated_head_release_or_layout(self):
         prior = "1" * 40
         self.run["head_sha"] = prior
