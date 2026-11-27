@@ -103,24 +103,34 @@ impl FastMutexWaitStore {
         if acquire_fast_mutex_unsafe(mutex, thread)? == AcquireResult::Acquired {
             return Ok(FastMutexWaitAdmission::Acquired);
         }
+        let waiting = index.map_or(0, |index| self.queues[index].waiting());
+        let next_waiting = waiting.checked_add(1)
+            .and_then(|count| i32::try_from(count).ok())
+            .ok_or(ExecutiveSyncError::AllocationFailed)?;
+        let ticket = FastMutexWaitTicket(self.next_ticket.max(1));
+        let next_ticket = ticket.0.checked_add(1).ok_or(ExecutiveSyncError::AllocationFailed)?;
         let index = match index {
-            Some(index) => index,
+            Some(index) => {
+                self.queues[index].waiters.try_reserve(1)
+                    .map_err(|_| ExecutiveSyncError::AllocationFailed)?;
+                index
+            }
             None => {
+                let mut queue = FastMutexQueue { address: mutex as u64, waiters: Vec::new() };
+                queue.waiters.try_reserve(1)
+                    .map_err(|_| ExecutiveSyncError::AllocationFailed)?;
                 self.queues.try_reserve(1).map_err(|_| ExecutiveSyncError::AllocationFailed)?;
-                self.queues.push(FastMutexQueue { address: mutex as u64, waiters: Vec::new() });
+                self.queues.push(queue);
                 self.queues.len() - 1
             }
         };
         let queue = &mut self.queues[index];
-        queue.waiters.try_reserve(1).map_err(|_| ExecutiveSyncError::AllocationFailed)?;
-        let ticket = FastMutexWaitTicket(self.next_ticket.max(1));
-        self.next_ticket = ticket.0.checked_add(1).ok_or(ExecutiveSyncError::AllocationFailed)?;
         queue.waiters.push(FastMutexWaiter { ticket, thread, event, granted: false });
-        let waiting = i32::try_from(queue.waiting()).map_err(|_| ExecutiveSyncError::AllocationFailed)?;
+        self.next_ticket = next_ticket;
         let contention_field = mutex.add(fast_mutex_layout::CONTENTION) as *mut u32;
         let contention = core::ptr::read_unaligned(contention_field).saturating_add(1);
         core::ptr::write_unaligned(contention_field, contention);
-        write_state(mutex, read_owner(mutex), -waiting);
+        write_state(mutex, read_owner(mutex), -next_waiting);
         Ok(FastMutexWaitAdmission::Queued(ticket))
     }
 
@@ -137,7 +147,8 @@ impl FastMutexWaitStore {
         validate(mutex, thread)?;
         let index = self.index_of(mutex);
         let waiting = index.map_or(0, |index| self.queues[index].waiting());
-        if read_owner(mutex) != thread || read_count(mutex) != -(waiting as i32) {
+        let waiting = i32::try_from(waiting).map_err(|_| ExecutiveSyncError::FastMutexCorrupt)?;
+        if read_owner(mutex) != thread || read_count(mutex) != -waiting {
             return Err(ExecutiveSyncError::NotOwned);
         }
         let Some(index) = index else {
@@ -151,7 +162,7 @@ impl FastMutexWaitStore {
         };
         next.granted = true;
         let (owner, event) = (next.thread, next.event);
-        write_state(mutex, owner, -((waiting - 1) as i32));
+        write_state(mutex, owner, -(waiting - 1));
         Ok(Some(event))
     }
 
@@ -200,6 +211,11 @@ impl FastMutexWaitStore {
             .ok_or(ExecutiveSyncError::InvalidOwner)?;
         let granted = queue.waiters[position].granted;
         if granted {
+            let waiting = i32::try_from(queue.waiting())
+                .map_err(|_| ExecutiveSyncError::FastMutexCorrupt)?;
+            if read_owner(mutex) != thread || read_count(mutex) != -waiting {
+                return Err(ExecutiveSyncError::NotOwned);
+            }
             // Ownership is real: complete the wait, then release it like any owner.
             self.complete_wait(mutex, thread, ticket)?;
             return self.release(mutex, thread);
@@ -311,6 +327,33 @@ mod tests {
             assert_eq!(state(&mut m), (A, -1));
             assert_eq!(store.release(p, A), Ok(Some(0xe2)));
             assert_eq!(store.cancel_wait(p, B, b), Ok(None), "granted then cancelled: released");
+            assert_eq!(state(&mut m), (0, 1));
+        }
+    }
+
+    #[test]
+    fn failed_granted_cancel_keeps_the_exact_ticket_for_retry() {
+        let mut m = mutex();
+        let mut store = FastMutexWaitStore::new();
+        let p = m.0.as_mut_ptr();
+        unsafe {
+            assert_eq!(store.begin_wait(p, A, 0xe1), Ok(FastMutexWaitAdmission::Acquired));
+            let FastMutexWaitAdmission::Queued(ticket) = store.begin_wait(p, B, 0xe2).unwrap() else {
+                panic!("B waits behind A");
+            };
+            assert_eq!(store.release(p, A), Ok(Some(0xe2)));
+            assert_eq!(state(&mut m), (B, 0));
+
+            // A native count mismatch must not consume B's granted wait ticket.
+            write_state(p, B, 1);
+            assert_eq!(store.cancel_wait(p, B, ticket), Err(ExecutiveSyncError::NotOwned));
+            assert_eq!(store.queues.len(), 1);
+            assert_eq!(store.queues[0].waiters.len(), 1);
+            assert_eq!(store.queues[0].waiters[0].ticket, ticket);
+
+            write_state(p, B, 0);
+            assert_eq!(store.cancel_wait(p, B, ticket), Ok(None));
+            assert!(store.queues.is_empty());
             assert_eq!(state(&mut m), (0, 1));
         }
     }
