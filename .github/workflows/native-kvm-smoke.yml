@@ -296,8 +296,14 @@ jobs:
             done
             # The probe has stopped and reaped QEMU; no image rebuild occurs between boots.
             boot_status=0
+            boot2_args=()
+            if [ "$boot1_status" -eq 0 ] && [ "$INTERACTION_PROFILE" = filebasic ]; then
+              # Boot 1 proved the directory and file on this exact disk. Boot 2 must observe
+              # their persistence, then verify the real listing and attribute receipts again.
+              boot2_args=(--expect-persisted-basicproof)
+            fi
             rm -f native-kvm-qemu-stopped
-            python3 scripts/ci_kvm_smoke.py --seconds "$BOOT_SECONDS" --trace-interrupts "${interact_args[@]}" || boot_status=$?
+            python3 scripts/ci_kvm_smoke.py --seconds "$BOOT_SECONDS" --trace-interrupts "${boot2_args[@]}" "${interact_args[@]}" || boot_status=$?
             if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
             sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot2.sha256
             if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi

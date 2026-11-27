@@ -981,6 +981,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seconds", type=int, default=180)
     parser.add_argument("--trace-interrupts", action="store_true")
+    parser.add_argument("--expect-persisted-basicproof", action="store_true",
+                        help="on a proven same-disk second FileBasic boot, require the existing "
+                             "directory result before the directory-list checkpoint")
     parser.add_argument("--interact", nargs="?", const=DEFAULT_SCRIPT, type=Path,
                             metavar="STEPS_JSON",
                         help="after the sealed Explorer desktop, drive guest input from a step "
@@ -1003,6 +1006,8 @@ def main():
         if not set(FILEBASIC_CHECKPOINTS) <= names:
             parser.error("FileBasic interaction needs both exact readback checkpoints")
         required_checkpoints = FILEBASIC_CHECKPOINTS
+    if args.expect_persisted_basicproof and required_checkpoints != FILEBASIC_CHECKPOINTS:
+        parser.error("--expect-persisted-basicproof requires the FileBasic interaction script")
     QMP_SOCKET.unlink(missing_ok=True)
     SCREENSHOT.unlink(missing_ok=True)
     INTERRUPT_TRACE.unlink(missing_ok=True)
@@ -1070,7 +1075,8 @@ def main():
                 "command-prompt-search": lambda name: prove_command_prompt_search_result(ROOT / name),
                 "command-prompt": lambda name: prove_ready_prompt(ROOT / name),
                 "basicproof-create-input": lambda name: prove_basicproof_create_input(ROOT / name),
-                "basicproof-create": lambda name: prove_basicproof_create_completion(ROOT / name),
+                "basicproof-create": lambda name: prove_basicproof_create_completion(
+                    ROOT / name, expect_existing=args.expect_persisted_basicproof),
                 "basicproof-directory-list": lambda name: prove_basicproof_directory(ROOT / name),
                 "basicproof-child-stdout": lambda name: prove_child_stdout_completion(ROOT / name),
                 "basicproof-attrib-help": lambda name: prove_attrib_help_completion(ROOT / name),

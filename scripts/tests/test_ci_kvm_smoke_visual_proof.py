@@ -53,6 +53,46 @@ RECORDED_BOOT2_VER_OCR = (Path(__file__).with_name("fixtures") /
 
 
 class VisualProofTests(unittest.TestCase):
+    def test_saved_second_boot_directory_persistence_is_a_real_completion(self):
+        # KVM 46064001108 boot 1 created and listed basicproof. Boot 2's
+        # original step-8 frame shows the exact existing-directory result and
+        # an empty returned prompt; the next step must still list the directory.
+        fixture = Path(__file__).parent / "fixtures"
+        persisted = gzip.decompress((fixture / "create_boot2_46064001108.ppm.gz").read_bytes())
+        image = Path("native-kvm-interact-08-basicproof-create-probe-05.ppm")
+        original_sha = "2d2db60f4952da36267d1f9ac75217018613323ca51fb14b72779270df73990e"
+        sparse = ("C:\\Users\\User>md basicproof\n"
+                  "A subdirectory or file basicproof already exists.\n"
+                  "C:\\Users\\User>\n")
+        with patch("scripts.ci_kvm_visual_proof._prove_image",
+                   return_value=ci_kvm_visual_proof.VisualProof(
+                       False, sparse, "md basicproof did not return to an empty prompt",
+                       image.name, original_sha)), \
+             patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=persisted) as crop:
+            proof = ci_kvm_visual_proof.prove_basicproof_create_completion(
+                image, expect_existing=True)
+        self.assertTrue(proof.passed, proof.error)
+        self.assertEqual(proof.image_sha256, original_sha)
+        crop.assert_called_with(image, 70, 220, 480, 286)
+        boot1 = gzip.decompress((fixture / "create_boot1_46064001108.ppm.gz").read_bytes())
+        with patch("scripts.ci_kvm_visual_proof._prove_image",
+                   return_value=ci_kvm_visual_proof.VisualProof(
+                       True, "C:\\Users\\User>md basicproof\nC:\\Users\\User>\n",
+                       image_name=image.name, image_sha256="boot1-sha")), \
+             patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=boot1):
+            self.assertFalse(ci_kvm_visual_proof.prove_basicproof_create_completion(
+                image, expect_existing=True).passed)
+        self.assertFalse(ci_kvm_visual_proof.contains_persisted_basicproof_directory(
+            "C:\\Users\\User>md basicproof\nSyntax error - md\nC:\\Users\\User>\n"))
+        self.assertFalse(ci_kvm_visual_proof.contains_persisted_basicproof_directory(
+            "C:\\Users\\User>md basicproof\n"
+            "A subdirectory or file basicproof already exists.\n"
+            "C:\\Other>\n"))
+        self.assertFalse(ci_kvm_visual_proof.contains_persisted_basicproof_directory(
+            "C:\\Users\\User>md basicproof\n"
+            "A subdirectory or file basicproof already exists.\n"
+            "C:\\Users\\User>dir basicproof\n"))
+
     def test_saved_child_stdout_crop_follows_console_position(self):
         # KVM 46059546967 probe 5 visibly shows child output and a returned
         # prompt at y=484. The old prompt crop at y=558 missed the console.
