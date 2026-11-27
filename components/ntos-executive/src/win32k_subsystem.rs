@@ -2144,6 +2144,21 @@ unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
 }
 
 unsafe fn provider_pool_alloc_tagged(size: u64, zero: bool, tag: u32) -> u64 {
+    provider_pool_alloc_tagged_with_fallback(size, zero, tag, true)
+}
+
+/// Temporary dispatcher objects need a catalogued shared-pool allocation. A large-pool
+/// fallback has no provider allocation identity and cannot own a local Event.
+unsafe fn provider_pool_alloc_tagged_tracked(size: u64, zero: bool, tag: u32) -> u64 {
+    provider_pool_alloc_tagged_with_fallback(size, zero, tag, false)
+}
+
+unsafe fn provider_pool_alloc_tagged_with_fallback(
+    size: u64,
+    zero: bool,
+    tag: u32,
+    allow_large_fallback: bool,
+) -> u64 {
     let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID) else {
         return 0;
     };
@@ -2183,10 +2198,16 @@ unsafe fn provider_pool_alloc_tagged(size: u64, zero: bool, tag: u32) -> u64 {
     match outcome {
         Ok(payload) => payload,
         Err(Failure::Native(shared_pool::PoolError::OutOfMemory)) => {
-            let payload = large_pool::allocate(size, zero);
-            if payload != 0 { return payload; }
+            if allow_large_fallback {
+                let payload = large_pool::allocate(size, zero);
+                if payload != 0 { return payload; }
+            }
             crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
-            print_str(b"[win32k-host] shared and large pool exhausted size=0x");
+            if allow_large_fallback {
+                print_str(b"[win32k-host] shared and large pool exhausted size=0x");
+            } else {
+                print_str(b"[win32k-host] tracked shared pool exhausted size=0x");
+            }
             print_hex(size as u32);
             print_str(b"\n");
             0
@@ -2455,6 +2476,16 @@ struct ProviderPoolRetirement {
 }
 
 unsafe fn reserve_provider_pool_owned(objects: &[(u64, u64)]) -> Option<ProviderPoolRetirement> {
+    reserve_provider_pool_owned_expected(objects, None)
+}
+
+unsafe fn reserve_provider_pool_owned_expected(
+    objects: &[(u64, u64)],
+    expected_backing: Option<nt_provider_wait::ProviderEventBacking>,
+) -> Option<ProviderPoolRetirement> {
+    if expected_backing.is_some() && objects.len() != 1 {
+        return None;
+    }
     let arena = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID)?;
     let mut retirement = ProviderPoolRetirement {
         pointers: Vec::new(),
@@ -2481,6 +2512,11 @@ unsafe fn reserve_provider_pool_owned(objects: &[(u64, u64)]) -> Option<Provider
             return None;
         }
         let allocation = catalog.active_exact_capacity(arena, pointer, capacity).ok()?;
+        if expected_backing.is_some_and(|expected| {
+            nt_provider_wait::ProviderEventBacking::from_allocation(allocation) != expected
+        }) {
+            return None;
+        }
         if !validate_provider_allocation_event_retirement(allocation)
             || !validate_provider_allocation_timer_retirement(allocation)
             || !local_sync::validate_backing_retirement(provider_allocation_event_backing(allocation))
@@ -2497,6 +2533,17 @@ unsafe fn reserve_provider_pool_owned(objects: &[(u64, u64)]) -> Option<Provider
 
 unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
     provider_pool_release_owned_with_projection(objects, None)
+}
+
+unsafe fn provider_pool_release_owned_exact(
+    pointer: u64,
+    required: u64,
+    backing: nt_provider_wait::ProviderEventBacking,
+) -> bool {
+    let Some(retirement) = reserve_provider_pool_owned_expected(&[(pointer, required)], Some(backing)) else {
+        return false;
+    };
+    release_reserved_provider_pool(retirement, None)
 }
 
 unsafe fn provider_pool_release_owned_with_projection(
@@ -5210,25 +5257,25 @@ unsafe fn retire_provider_local_event(
 ) -> bool {
     let (status, object_id, object_generation, _) = win32k_event_broker_call(
         W32_EVENT_OP_RETIRE_LOCAL,
-        retirement.id.raw(),
+        retirement.id().raw(),
         0,
         0,
     );
     if status != 0
-        || object_id != retirement.canonical.object_id
-        || object_generation != retirement.canonical.object_generation
+        || object_id != retirement.canonical().object_id
+        || object_generation != retirement.canonical().object_generation
     {
         print_str(b"[win32k-event] local retirement rejected status=0x");
         print_hex(status as u32);
         print_str(b" local=0x");
-        print_hex((retirement.id.raw() >> 32) as u32);
-        print_hex(retirement.id.raw() as u32);
+        print_hex((retirement.id().raw() >> 32) as u32);
+        print_hex(retirement.id().raw() as u32);
         print_str(b"\n");
         return false;
     }
     let (status, _, _, _) = win32k_event_broker_call(
         W32_EVENT_OP_ACK_LOCAL_RETIREMENT,
-        retirement.id.raw(),
+        retirement.id().raw(),
         object_id,
         object_generation,
     );
@@ -5674,7 +5721,7 @@ unsafe fn provider_local_event_call(event: u64, op: u64) -> (u64, u64) {
         W32_EVENT_OP_RESET_LOCAL | W32_EVENT_OP_CLEAR_LOCAL | W32_EVENT_OP_PULSE_LOCAL => false,
         _ => park(),
     };
-    let released = {
+    let retirement = {
         let _metadata = ProviderMetadataGuard::acquire();
         let apply = provider_local_events_mut().expect("local Event catalog disappeared")
             .observe_state(lease, sequence, signaled).unwrap_or_else(|_| {
@@ -5683,12 +5730,20 @@ unsafe fn provider_local_event_call(event: u64, op: u64) -> (u64, u64) {
         if apply { mirror_projected_event_state(event, signaled); }
         provider_local_events_mut()
             .expect("local Event catalog disappeared")
-            .release_lease(lease)
-            .is_ok()
+            .release_lease_for_retirement(lease)
     };
-    if !released {
-        print_str(b"[win32k-event] canonical local Event operation failed\n");
-        park();
+    let retirement = match retirement {
+        Ok(retirement) => retirement,
+        Err(_) => {
+            print_str(b"[win32k-event] canonical local Event operation failed\n");
+            park();
+        }
+    };
+    if let Some(retirement) = retirement {
+        if !finish_temporary_wait_event_retirement(retirement) {
+            print_str(b"[win32k-event] deferred local Event finalization retained\n");
+            park();
+        }
     }
     if PROVIDER_LOCAL_EVENT_FAILED_RETIREMENT.load(Ordering::Acquire) == lease.id.raw() {
         print_str(b"[win32k-event] failed-retirement Signal lease released id=");
@@ -5724,6 +5779,97 @@ extern "win64" fn s_ke_initialize_event(event: u64, event_type: u64, initial_sta
             )
         }
     }
+}
+
+/// A contended executive wait transfers its Event lifetime to the local catalog when the
+/// canonical signal is still in flight. Only the final exact Signal lease may free this pool
+/// allocation, after the executive has acknowledged the Event retirement.
+#[must_use = "retire or transfer the temporary Event after its wait ticket settles"]
+struct TemporaryWaitEvent {
+    body: u64,
+    id: nt_provider_wait::ProviderLocalEventId,
+    storage: nt_provider_wait::ProviderEventStorage,
+}
+
+impl TemporaryWaitEvent {
+    unsafe fn publish() -> Self {
+        let bytes = nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64;
+        let body = provider_pool_alloc_tagged_tracked(bytes, true, u32::from_le_bytes(*b"EvWt"));
+        if body == 0 {
+            crate::provider_bugcheck::raise_unhandled_status(
+                STATUS_INSUFFICIENT_RESOURCES_I32 as u32,
+                Self::publish as usize as u64,
+            );
+        }
+        // Pool allocation and its catalog identity are recorded before publication. A failed
+        // or uncertain broker call keeps that owner; this path never frees it speculatively.
+        s_ke_initialize_event(body, 1, 0);
+        let snapshot = {
+            let mut metadata = ProviderMetadataGuard::acquire();
+            let allocation = provider_allocations_unlocked(&mut metadata)
+                .and_then(|allocations| allocations.containing(body, bytes).ok());
+            let event = provider_local_events()
+                .and_then(|events| events.snapshot_for_body(body).ok());
+            match (allocation, event) {
+                (Some(allocation), Some(event))
+                    if event.body == body
+                        && event.canonical.is_some()
+                        && event.storage.offset == 0
+                        && event.storage.backing
+                            == nt_provider_wait::ProviderEventBacking::from_allocation(allocation) =>
+                {
+                    Some(event)
+                }
+                _ => None,
+            }
+        };
+        let Some(snapshot) = snapshot else {
+            print_str(b"[win32k-event] temporary Event lost exact allocation identity\n");
+            park();
+        };
+        Self { body, id: snapshot.id, storage: snapshot.storage }
+    }
+
+    unsafe fn retire(self) -> bool {
+        let decision = {
+            let _metadata = ProviderMetadataGuard::acquire();
+            provider_local_events_mut().and_then(|events| {
+                events.request_retire_after_leases(self.id, self.storage).ok()
+            })
+        };
+        match decision {
+            Some(nt_provider_wait::ProviderLocalEventRetireDecision::Ready(retirement)) => {
+                finish_temporary_wait_event_retirement(retirement)
+            }
+            Some(nt_provider_wait::ProviderLocalEventRetireDecision::Draining) => true,
+            None => {
+                print_str(b"[win32k-event] temporary Event retirement ownership rejected\n");
+                false
+            }
+        }
+    }
+}
+
+unsafe fn finish_temporary_wait_event_retirement(
+    retirement: nt_provider_wait::ProviderLocalEventRetirement,
+) -> bool {
+    let body = retirement.body();
+    let storage = retirement.storage();
+    if storage.offset != 0
+        || !matches!(storage.backing, nt_provider_wait::ProviderEventBacking::Allocation { .. })
+    {
+        return false;
+    }
+    // No metadata lock crosses the broker calls. The delete-pending Event and allocation keep
+    // the exact storage owned if either canonical effect is uncertain.
+    if !retire_provider_local_event(retirement) {
+        return false;
+    }
+    provider_pool_release_owned_exact(
+        body,
+        nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64,
+        storage.backing,
+    )
 }
 
 unsafe fn retire_existing_provider_local_timer(timer: u64) -> bool {
@@ -11723,10 +11869,9 @@ fn acquire_resource_lite(
         Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) if !wait => 0,
         Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) => {
             // Publication can enter a nested dispatch. Recheck the resource atomically with
-            // ticket insertion only after the stack Event has been published.
-            let mut event = [0u64; 3];
-            let event_body = event.as_mut_ptr() as u64;
-            s_ke_initialize_event(event_body, 1, 0);
+            // ticket insertion only after the owned Event has been published.
+            let event = unsafe { TemporaryWaitEvent::publish() };
+            let event_body = event.body;
             let admission = unsafe {
                 executive_resources_mut().begin_wait(resource as *mut u8, thread, mode, event_body)
             };
@@ -11757,7 +11902,7 @@ fn acquire_resource_lite(
                         let wake = unsafe { executive_resources_mut().cancel_wait(resource as *mut u8, thread, ticket) };
                         let Ok(wake) = wake else { park(); };
                         if let Some(next_event) = wake { s_ke_set_event(next_event, 0, 0); }
-                        if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+                        if !unsafe { event.retire() } { park(); }
                         reject_resource_sync(operation,
                             nt_kernel_exec::executive_sync::ExecutiveSyncError::BlockingWaitRequired,
                             resource, thread);
@@ -11767,11 +11912,11 @@ fn acquire_resource_lite(
                     }
                 }
                 Err(error) => {
-                    if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+                    if !unsafe { event.retire() } { park(); }
                     reject_resource_sync(operation, error, resource, thread);
                 }
             }
-            if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+            if !unsafe { event.retire() } { park(); }
             1
         }
         Err(error) => reject_resource_sync(operation, error, resource, thread),
@@ -11923,9 +12068,8 @@ extern "win64" fn s_ex_acquire_fast_mutex_unsafe(mutex: u64) {
         Err(error) => reject_fast_mutex_sync(operation, error, mutex, thread),
     }
     // Contended. Publish the Event, then recheck and enqueue in one step.
-    let mut event = [0u64; 3];
-    let event_body = event.as_mut_ptr() as u64;
-    s_ke_initialize_event(event_body, 1, 0);
+    let event = unsafe { TemporaryWaitEvent::publish() };
+    let event_body = event.body;
     let admission = unsafe { fast_mutex_waits_mut().begin_wait(mutex as *mut u8, thread, event_body) };
     match admission {
         Ok(FastMutexWaitAdmission::Acquired) => {}
@@ -11945,7 +12089,7 @@ extern "win64" fn s_ex_acquire_fast_mutex_unsafe(mutex: u64) {
                 let wake = unsafe { fast_mutex_waits_mut().cancel_wait(mutex as *mut u8, thread, ticket) };
                 let Ok(wake) = wake else { park(); };
                 if let Some(next_event) = wake { s_ke_set_event(next_event, 0, 0); }
-                if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+                if !unsafe { event.retire() } { park(); }
                 reject_fast_mutex_sync(operation, ExecutiveSyncError::BlockingWaitRequired, mutex, thread);
             }
             if unsafe { fast_mutex_waits_mut().complete_wait(mutex as *mut u8, thread, ticket) }.is_err() {
@@ -11953,11 +12097,11 @@ extern "win64" fn s_ex_acquire_fast_mutex_unsafe(mutex: u64) {
             }
         }
         Err(error) => {
-            if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+            if !unsafe { event.retire() } { park(); }
             reject_fast_mutex_sync(operation, error, mutex, thread);
         }
     }
-    if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+    if !unsafe { event.retire() } { park(); }
 }
 
 /// `VOID ExReleaseFastMutexUnsafe(PFAST_MUTEX FastMutex)`. The oldest waiter becomes the

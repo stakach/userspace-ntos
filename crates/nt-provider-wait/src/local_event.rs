@@ -11,6 +11,10 @@ pub enum ProviderEventKind {
     Synchronization,
 }
 
+#[cfg(test)]
+#[path = "local_event_deferred_retirement_tests.rs"]
+mod deferred_retirement_tests;
+
 /// Storage whose lifetime owns one or more embedded dispatcher Events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderEventBacking {
@@ -141,6 +145,7 @@ pub enum ProviderLocalEventError {
     RetirementMismatch,
     InvalidStateSequence,
     ContradictoryStateSequence,
+    DeferredRetirementRequired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,10 +161,42 @@ pub struct ProviderLocalEventSnapshot {
     pub signal_leases: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Exact canonical retirement authority. A lost receipt leaves the Event delete-pending rather
+/// than permitting a second owner to free its storage.
+#[must_use = "retain through canonical retirement acknowledgement"]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ProviderLocalEventRetirement {
-    pub id: ProviderLocalEventId,
-    pub canonical: ProviderWaitObject,
+    id: ProviderLocalEventId,
+    canonical: ProviderWaitObject,
+    body: u64,
+    storage: ProviderEventStorage,
+}
+
+impl ProviderLocalEventRetirement {
+    pub const fn id(&self) -> ProviderLocalEventId {
+        self.id
+    }
+
+    pub const fn canonical(&self) -> ProviderWaitObject {
+        self.canonical
+    }
+
+    pub const fn body(&self) -> u64 {
+        self.body
+    }
+
+    pub const fn storage(&self) -> ProviderEventStorage {
+        self.storage
+    }
+}
+
+/// One allocation-backed temporary Event has either no leases left or an exact lease owner
+/// that must finish retirement later. Stack storage is never admitted to the draining phase.
+#[must_use = "finish an immediate receipt or retain the draining owner"]
+#[derive(Debug, Eq, PartialEq)]
+pub enum ProviderLocalEventRetireDecision {
+    Ready(ProviderLocalEventRetirement),
+    Draining,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +209,7 @@ struct ProviderLocalEventRecord {
     initial_state: bool,
     canonical: Option<ProviderWaitObject>,
     delete_pending: bool,
+    deferred_retirement: bool,
     wait_leases: u32,
     signal_leases: u32,
     mirror_sequence: u64,
@@ -193,6 +231,7 @@ impl ProviderLocalEventRecord {
         initial_state: false,
         canonical: None,
         delete_pending: false,
+        deferred_retirement: false,
         wait_leases: 0,
         signal_leases: 0,
         mirror_sequence: 0,
@@ -565,8 +604,29 @@ impl ProviderLocalEventCatalog {
         &mut self,
         lease: ProviderLocalEventLease,
     ) -> Result<(), ProviderLocalEventError> {
+        // The ordinary release path cannot consume the final lease of a deferred Event: that
+        // would discard the only canonical retirement receipt while storage remains live.
+        self.release_lease_impl(lease, false).map(|_| ())
+    }
+
+    /// Release an exact lease and claim the canonical retirement receipt if this was the last
+    /// lease on a delete-pending allocation-backed temporary Event. The caller must complete
+    /// canonical retirement and acknowledgement before releasing the backing allocation.
+    pub fn release_lease_for_retirement(
+        &mut self,
+        lease: ProviderLocalEventLease,
+    ) -> Result<Option<ProviderLocalEventRetirement>, ProviderLocalEventError> {
+        self.release_lease_impl(lease, true)
+    }
+
+    fn release_lease_impl(
+        &mut self,
+        lease: ProviderLocalEventLease,
+        claim_retirement: bool,
+    ) -> Result<Option<ProviderLocalEventRetirement>, ProviderLocalEventError> {
         let slot = self.slot(lease.id)?;
-        if self.records[slot].canonical != Some(lease.canonical) {
+        let record = self.records[slot];
+        if record.canonical != Some(lease.canonical) {
             return Err(ProviderLocalEventError::WrongLease);
         }
         let index = self
@@ -574,6 +634,12 @@ impl ProviderLocalEventCatalog {
             .iter()
             .position(|active| *active == lease)
             .ok_or(ProviderLocalEventError::WrongLease)?;
+        let final_deferred = record.deferred_retirement
+            && ((record.wait_leases == 1 && record.signal_leases == 0)
+                || (record.wait_leases == 0 && record.signal_leases == 1));
+        if final_deferred && !claim_retirement {
+            return Err(ProviderLocalEventError::DeferredRetirementRequired);
+        }
         let count = match lease.kind {
             ProviderLocalEventLeaseKind::Wait => &mut self.records[slot].wait_leases,
             ProviderLocalEventLeaseKind::Signal => &mut self.records[slot].signal_leases,
@@ -582,7 +648,17 @@ impl ProviderLocalEventCatalog {
             .checked_sub(1)
             .ok_or(ProviderLocalEventError::LeaseUnderflow)?;
         self.leases.swap_remove(index);
-        Ok(())
+        if final_deferred {
+            self.records[slot].deferred_retirement = false;
+            Ok(Some(ProviderLocalEventRetirement {
+                id: lease.id,
+                canonical: lease.canonical,
+                body: record.body,
+                storage: record.storage,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Called under the component metadata guard immediately before writing its KEVENT mirror.
@@ -627,7 +703,57 @@ impl ProviderLocalEventCatalog {
             .canonical
             .ok_or(ProviderLocalEventError::NotPublished)?;
         self.records[slot].delete_pending = true;
-        Ok(ProviderLocalEventRetirement { id, canonical })
+        Ok(ProviderLocalEventRetirement {
+            id,
+            canonical,
+            body: record.body,
+            storage: record.storage,
+        })
+    }
+
+    /// Transfer one temporary Event's allocation-backed lifetime to the catalog before the
+    /// waiter returns. Existing exact leases may finish; all new leases are refused. A crossed
+    /// allocation or a shared backing is never deferred because the final releaser may free the
+    /// allocation only after this Event's exact canonical retirement acknowledgement.
+    pub fn request_retire_after_leases(
+        &mut self,
+        id: ProviderLocalEventId,
+        storage: ProviderEventStorage,
+    ) -> Result<ProviderLocalEventRetireDecision, ProviderLocalEventError> {
+        let slot = self.slot(id)?;
+        let record = self.records[slot];
+        if record.delete_pending {
+            return Err(ProviderLocalEventError::DeletePending);
+        }
+        if record.storage != storage
+            || !matches!(storage.backing, ProviderEventBacking::Allocation { .. })
+            || storage.offset != 0
+            || self.records.iter().enumerate().any(|(index, other)| {
+                index != slot && other.live && other.storage.backing == storage.backing
+            })
+        {
+            return Err(ProviderLocalEventError::InvalidStorage);
+        }
+        // The provider wait path releases its Wait lease before the temporary Event can
+        // outlive the waiter. Only the signaling lane has a deferred finalizer.
+        if record.wait_leases != 0 {
+            return Err(ProviderLocalEventError::ActiveLeases);
+        }
+        let canonical = record.canonical.ok_or(ProviderLocalEventError::NotPublished)?;
+        self.records[slot].delete_pending = true;
+        if record.has_leases() {
+            self.records[slot].deferred_retirement = true;
+            Ok(ProviderLocalEventRetireDecision::Draining)
+        } else {
+            Ok(ProviderLocalEventRetireDecision::Ready(
+                ProviderLocalEventRetirement {
+                    id,
+                    canonical,
+                    body: record.body,
+                    storage: record.storage,
+                },
+            ))
+        }
     }
 
     /// Mark every Event in one allocation/activation/instance delete-pending atomically.
@@ -651,6 +777,8 @@ impl ProviderLocalEventCatalog {
                 retirements.push(ProviderLocalEventRetirement {
                     id: ProviderLocalEventId::new(slot, record.generation)?,
                     canonical,
+                    body: record.body,
+                    storage: record.storage,
                 });
             }
         }
@@ -672,12 +800,15 @@ impl ProviderLocalEventCatalog {
         if !record.delete_pending
             || record.has_leases()
             || record.canonical != Some(retirement.canonical)
+            || record.body != retirement.body
+            || record.storage != retirement.storage
         {
             return Err(ProviderLocalEventError::RetirementMismatch);
         }
         record.live = false;
         record.canonical = None;
         record.delete_pending = false;
+        record.deferred_retirement = false;
         Ok(())
     }
 
