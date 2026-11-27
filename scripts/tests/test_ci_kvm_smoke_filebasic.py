@@ -25,7 +25,7 @@ def native_set(irp, attrs, handle):
 
 
 class FileBasicInteractionTests(unittest.TestCase):
-    def test_profile_keeps_desktop_proof_then_clears_and_sets_one_scratch_directory(self):
+    def test_profile_keeps_desktop_proof_then_clears_and_sets_one_scratch_file(self):
         desktop = load_script(DEFAULT_SCRIPT)
         profile = parse_script(json.loads(FILEBASIC_SCRIPT.read_text()))
 
@@ -33,51 +33,56 @@ class FileBasicInteractionTests(unittest.TestCase):
                          (desktop.screen, desktop.arm, desktop.settle_seconds))
         self.assertEqual(profile.steps[:len(desktop.steps)], desktop.steps)
         self.assertEqual([step.name for step in profile.steps[len(desktop.steps):]],
-                         ["basicproof-create", "basicproof-clear-readonly",
+                         ["basicproof-create", "basicproof-directory-list",
+                          "basicproof-file-create", "basicproof-file-list",
+                          "basicproof-clear-readonly",
                           "basicproof-baseline-readback", "basicproof-set-readonly",
                           "basicproof-readback"])
         self.assertEqual([step.actions for step in profile.steps[len(desktop.steps):]], [
             (("type", "if not exist basicproof md basicproof\n"),),
-            (("type", "attrib -R basicproof\n"),),
-            (("type", "attrib basicproof\n"),),
-            (("type", "attrib +R basicproof\n"),),
-            (("type", "attrib basicproof\n"),),
+            (("type", "dir basicproof\n"),),
+            (("type", "if not exist basicproof.txt echo filebasic>basicproof.txt\n"),),
+            (("type", "dir basicproof.txt\n"),),
+            (("type", "attrib -R basicproof.txt\n"),),
+            (("type", "attrib basicproof.txt\n"),),
+            (("type", "attrib +R basicproof.txt\n"),),
+            (("type", "attrib basicproof.txt\n"),),
         ])
         self.assertTrue(all(0 < step.wait_seconds <= 120
                             for step in profile.steps[len(desktop.steps):]))
 
     def test_readback_requires_exact_current_directory_path_and_attribute_state(self):
-        command = "D:\\Scratch\\Work>attrib basicproof\n"
-        result = "     R     D:\\Scratch\\Work\\basicproof\n"
-        clear = "           D:\\Scratch\\Work\\basicproof\n"
+        command = "D:\\Scratch\\Work>attrib basicproof.txt\n"
+        result = "     R     D:\\Scratch\\Work\\basicproof.txt\n"
+        clear = "           D:\\Scratch\\Work\\basicproof.txt\n"
         contains = ci_kvm_visual_proof.contains_readonly_attribute
 
-        self.assertTrue(contains(command + result, "basicproof", readonly=True))
-        self.assertTrue(contains(command + clear, "basicproof", readonly=False))
+        self.assertTrue(contains(command + result, "basicproof.txt", readonly=True))
+        self.assertTrue(contains(command + clear, "basicproof.txt", readonly=False))
         self.assertTrue(contains(command + clear + command + result,
-                                 "basicproof", readonly=True))
+                                 "basicproof.txt", readonly=True))
         self.assertFalse(contains(command + clear + command + result,
-                                  "basicproof", readonly=False))
-        self.assertTrue(contains(command + "A    R     D:\\Scratch\\Work\\BASICPROOF\n",
-                                 "basicproof", readonly=True))
+                                  "basicproof.txt", readonly=False))
+        self.assertTrue(contains(command + "A    R     D:\\Scratch\\Work\\BASICPROOF.TXT\n",
+                                 "basicproof.txt", readonly=True))
         for transcript in (
-            "D:\\Scratch\\Work>attrib +R basicproof\n",  # setter is not a readback
+            "D:\\Scratch\\Work>attrib +R basicproof.txt\n",  # setter is not a readback
             command,  # no result
             command + clear,  # R absent
             command + "     R     D:\\Scratch\\Work\\other\n",  # another File
-            command + "     R     D:\\Other\\basicproof\n",  # another directory
-            command + "     R     D:\\Scratch\\Work\\basicproof2\n",  # basename prefix
+            command + "     R     D:\\Other\\basicproof.txt\n",  # another directory
+            command + "     R     D:\\Scratch\\Work\\basicproof.txt2\n",  # basename prefix
             result + command,  # stale output before the readback command
         ):
             with self.subTest(transcript=transcript):
-                self.assertFalse(contains(transcript, "basicproof", readonly=True))
-        self.assertFalse(contains(command + result, "basicproof", readonly=False))
+                self.assertFalse(contains(transcript, "basicproof.txt", readonly=True))
+        self.assertFalse(contains(command + result, "basicproof.txt", readonly=False))
         self.assertFalse(contains(command + "     R     D:\\Scratch\\Work\\other\n",
-                                  "basicproof", readonly=False))
+                                  "basicproof.txt", readonly=False))
 
     def test_verdict_requires_both_visual_readbacks_for_filebasic_profile(self):
         required = ("basicproof-baseline-readback", "basicproof-readback")
-        outcome = dict(requested=True, armed=True, completed=11, total=11,
+        outcome = dict(requested=True, armed=True, completed=14, total=14,
                        visual_proof=VisualProof(True), required_checkpoints=required)
         self.assertFalse(boot_verdict(SEALED,
                                       InteractionOutcome(**outcome)).passed)

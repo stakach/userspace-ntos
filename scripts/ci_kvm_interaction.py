@@ -39,6 +39,7 @@ CHAR_QCODES = {" ": "spc", "\n": "ret", "\t": "tab", ".": "dot", ",": "comma",
                "-": "minus", "=": "equal", "/": "slash", "\\": "backslash",
                ";": "semicolon", "'": "apostrophe"}
 SHIFTED_CHAR_QCODES = {":": "semicolon", "_": "minus", "+": "equal", "?": "slash",
+                       ">": "dot",
                        '"': "apostrophe", "|": "backslash"}
 
 

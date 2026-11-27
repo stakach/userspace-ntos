@@ -1049,9 +1049,9 @@ def main():
                 "command-prompt-search": lambda name: prove_command_prompt_search_result(ROOT / name),
                 "command-prompt": lambda name: prove_ready_prompt(ROOT / name),
                 "basicproof-baseline-readback": lambda name: prove_readonly_attribute(
-                    ROOT / name, "basicproof", readonly=False),
+                    ROOT / name, "basicproof.txt", readonly=False),
                 "basicproof-readback": lambda name: prove_readonly_attribute(
-                    ROOT / name, "basicproof", readonly=True),
+                    ROOT / name, "basicproof.txt", readonly=True),
             }
             interaction = InteractionRunner(
                 interaction_script, send_input_batches,

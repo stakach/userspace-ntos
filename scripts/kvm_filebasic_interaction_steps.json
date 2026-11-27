@@ -10,9 +10,12 @@
     {"name": "command-prompt", "actions": [{"key": ["ret"]}], "wait_seconds": 120, "readiness_poll_seconds": 4},
     {"name": "ver", "actions": [{"type": "ver\n"}], "wait_seconds": 20},
     {"name": "basicproof-create", "actions": [{"type": "if not exist basicproof md basicproof\n"}], "wait_seconds": 20},
-    {"name": "basicproof-clear-readonly", "actions": [{"type": "attrib -R basicproof\n"}], "wait_seconds": 20},
-    {"name": "basicproof-baseline-readback", "actions": [{"type": "attrib basicproof\n"}], "wait_seconds": 45, "readiness_poll_seconds": 2},
-    {"name": "basicproof-set-readonly", "actions": [{"type": "attrib +R basicproof\n"}], "wait_seconds": 20},
-    {"name": "basicproof-readback", "actions": [{"type": "attrib basicproof\n"}], "wait_seconds": 45, "readiness_poll_seconds": 2}
+    {"name": "basicproof-directory-list", "actions": [{"type": "dir basicproof\n"}], "wait_seconds": 20},
+    {"name": "basicproof-file-create", "actions": [{"type": "if not exist basicproof.txt echo filebasic>basicproof.txt\n"}], "wait_seconds": 20},
+    {"name": "basicproof-file-list", "actions": [{"type": "dir basicproof.txt\n"}], "wait_seconds": 20},
+    {"name": "basicproof-clear-readonly", "actions": [{"type": "attrib -R basicproof.txt\n"}], "wait_seconds": 20},
+    {"name": "basicproof-baseline-readback", "actions": [{"type": "attrib basicproof.txt\n"}], "wait_seconds": 45, "readiness_poll_seconds": 2},
+    {"name": "basicproof-set-readonly", "actions": [{"type": "attrib +R basicproof.txt\n"}], "wait_seconds": 20},
+    {"name": "basicproof-readback", "actions": [{"type": "attrib basicproof.txt\n"}], "wait_seconds": 45, "readiness_poll_seconds": 2}
   ]
 }

@@ -182,6 +182,7 @@ class EventGenerationTests(unittest.TestCase):
     def test_text_maps_to_us_layout_qcodes(self):
         self.assertEqual(text_chords("ver\n"), (("v",), ("e",), ("r",), ("ret",)))
         self.assertEqual(text_chords("C:"), (("shift", "c"), ("shift", "semicolon")))
+        self.assertEqual(text_chords("echo x>proof.txt\n")[6], ("shift", "dot"))
         self.assertEqual(keys(action_batches(("type", "v\n"), (1024, 768))),
                          [("v", True), ("v", False), ("ret", True), ("ret", False)])
 
