@@ -5,7 +5,9 @@
 //! table is memory-only: it decides which executor an arrival may resume and performs no native
 //! effect. Arrivals stay retained by ingress; a refusal here changes nothing and consumes nothing.
 
-use crate::{peer_registry::PeerRoute, LaneDispatchIdentity};
+use crate::{
+    executor_local::FsInstallAcknowledgement, peer_registry::PeerRoute, LaneDispatchIdentity,
+};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -53,6 +55,8 @@ impl ExecutorWait {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutorState {
+    /// Created but not yet bound to an acknowledged physical TCB FS base.
+    Unready,
     /// At loop-top on its own endpoint; may take any unrouted work.
     Idle,
     Running,
@@ -100,6 +104,8 @@ pub enum ExecutorError {
     WrongDispatch,
     /// Another executor is already parked on this route.
     RouteOccupied,
+    /// Only an unready executor may be activated by an FS-install acknowledgement.
+    NotUnready,
 }
 
 /// Root's authority to resume an executor. Each table issues exactly one, and it is lent to at
@@ -166,31 +172,65 @@ impl ExecutorTable {
             return Err(ExecutorError::NoCapacity);
         }
         let mut slots = Vec::new();
-        slots.try_reserve_exact(capacity).map_err(|_| ExecutorError::NoCapacity)?;
+        slots
+            .try_reserve_exact(capacity)
+            .map_err(|_| ExecutorError::NoCapacity)?;
         // Burn the identity even if this table is dropped: a leftover token names no later table.
         let id = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
             .map_err(|_| ExecutorError::IdentityExhausted)?;
-        Ok((Self { id, capacity, slots }, RunToken { table: id }))
+        Ok((
+            Self {
+                id,
+                capacity,
+                slots,
+            },
+            RunToken { table: id },
+        ))
     }
 
-    /// Register an executor that is blocked at loop-top on its own endpoint.
-    pub fn register(&mut self, root: &RunToken) -> Result<ExecutorHandle, ExecutorError> {
+    /// Register an executor whose native TCB has already completed bootstrap and is blocked at
+    /// loop-top on its own endpoint. New native workers must use `register_unready` instead.
+    ///
+    /// # Safety
+    /// The caller must own the exact physical TCB, have acknowledged its executor-local FS base,
+    /// and have observed that it is blocked on its private receive endpoint before this table
+    /// may select it for ingress. A ready message or numeric TCB identity is insufficient.
+    pub unsafe fn register(&mut self, root: &RunToken) -> Result<ExecutorHandle, ExecutorError> {
+        self.register_with_state(root, ExecutorState::Idle)
+    }
+
+    /// Register a worker that cannot receive ingress until its FS base is acknowledged.
+    pub fn register_unready(&mut self, root: &RunToken) -> Result<ExecutorHandle, ExecutorError> {
+        self.register_with_state(root, ExecutorState::Unready)
+    }
+
+    fn register_with_state(
+        &mut self,
+        root: &RunToken,
+        initial: ExecutorState,
+    ) -> Result<ExecutorHandle, ExecutorError> {
         if root.table != self.id {
             return Err(ExecutorError::WrongTable);
         }
         // A retired slot that cannot take a new generation stays retired for good.
-        let reusable = self.slots.iter().position(|slot| {
-            slot.state == ExecutorState::Retired && slot.generation < u64::MAX
-        });
+        let reusable = self
+            .slots
+            .iter()
+            .position(|slot| slot.state == ExecutorState::Retired && slot.generation < u64::MAX);
         let index = match reusable {
             Some(index) => {
                 self.slots[index].generation += 1;
-                self.slots[index].state = ExecutorState::Idle;
+                self.slots[index].state = initial;
                 index
             }
             None if self.slots.len() < self.capacity => {
-                self.slots.push(Slot { generation: 1, state: ExecutorState::Idle });
+                self.slots.push(Slot {
+                    generation: 1,
+                    state: initial,
+                });
                 self.slots.len() - 1
             }
             None => return Err(ExecutorError::NoCapacity),
@@ -198,11 +238,53 @@ impl ExecutorTable {
         Ok(self.handle(index))
     }
 
+    /// Publish an unready worker only after the registry observed a successful SetTLSBase reply.
+    /// A dropped or mismatched acknowledgement leaves the worker unready.
+    pub fn activate_unready(
+        &mut self,
+        root: &RunToken,
+        acknowledged: FsInstallAcknowledgement,
+    ) -> Result<ExecutorHandle, (ExecutorError, FsInstallAcknowledgement)> {
+        if root.table != self.id {
+            return Err((ExecutorError::WrongTable, acknowledged));
+        }
+        let executor = acknowledged.executor();
+        if let Err(error) = self.state(executor) {
+            return Err((error, acknowledged));
+        }
+        let slot = &mut self.slots[executor.index as usize];
+        if slot.state != ExecutorState::Unready {
+            return Err((ExecutorError::NotUnready, acknowledged));
+        }
+        slot.state = ExecutorState::Idle;
+        Ok(executor)
+    }
+
+    /// Reclaim a never-started worker after the registry confirms exact physical TCB teardown.
+    /// Kept crate-private so a numeric executor handle cannot authorize native teardown.
+    pub(crate) fn retire_unready(
+        &mut self,
+        root: &RunToken,
+        executor: ExecutorHandle,
+    ) -> Result<(), ExecutorError> {
+        if root.table != self.id {
+            return Err(ExecutorError::WrongTable);
+        }
+        if self.state(executor)? != ExecutorState::Unready {
+            return Err(ExecutorError::NotUnready);
+        }
+        self.slots[executor.index as usize].state = ExecutorState::Retired;
+        Ok(())
+    }
+
     pub fn state(&self, executor: ExecutorHandle) -> Result<ExecutorState, ExecutorError> {
         if executor.table != self.id {
             return Err(ExecutorError::WrongTable);
         }
-        let slot = self.slots.get(executor.index as usize).ok_or(ExecutorError::NotFound)?;
+        let slot = self
+            .slots
+            .get(executor.index as usize)
+            .ok_or(ExecutorError::NotFound)?;
         if slot.generation != executor.generation {
             return Err(ExecutorError::StaleGeneration);
         }
@@ -210,11 +292,16 @@ impl ExecutorTable {
     }
 
     pub fn running(&self) -> Option<ExecutorHandle> {
-        self.position(|state| state == ExecutorState::Running).map(|index| self.handle(index))
+        self.position(|state| state == ExecutorState::Running)
+            .map(|index| self.handle(index))
     }
 
     fn handle(&self, index: usize) -> ExecutorHandle {
-        ExecutorHandle { table: self.id, index: index as u32, generation: self.slots[index].generation }
+        ExecutorHandle {
+            table: self.id,
+            index: index as u32,
+            generation: self.slots[index].generation,
+        }
     }
 
     fn position(&self, matches: impl Fn(ExecutorState) -> bool) -> Option<usize> {
@@ -223,10 +310,13 @@ impl ExecutorTable {
 
     /// The route-to-waiter map is this view of the slots, so it cannot disagree with them.
     fn waiter(&self, route: PeerRoute) -> Option<(usize, ExecutorWait)> {
-        self.slots.iter().enumerate().find_map(|(index, slot)| match slot.state {
-            ExecutorState::Parked(wait) if wait.route == route => Some((index, wait)),
-            _ => None,
-        })
+        self.slots
+            .iter()
+            .enumerate()
+            .find_map(|(index, slot)| match slot.state {
+                ExecutorState::Parked(wait) if wait.route == route => Some((index, wait)),
+                _ => None,
+            })
     }
 
     fn select(&self, cause: ExecutorResume) -> Result<usize, ExecutorError> {
@@ -261,7 +351,11 @@ impl ExecutorTable {
             Err(error) => return Err((error, token)),
         };
         self.slots[index].state = ExecutorState::Running;
-        Ok(ExecutorRun { executor: self.handle(index), cause, token })
+        Ok(ExecutorRun {
+            executor: self.handle(index),
+            cause,
+            token,
+        })
     }
 
     /// Record the running executor's yield and return the run token to root. A refusal leaves

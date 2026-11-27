@@ -1,13 +1,18 @@
 //! Host-side contract for selecting one executor's ambient state by its exact TCB anchor.
 //! Native FS installation and the executive's concrete state layout stay outside this crate.
+//! Calls to unsafe ready registration model a worker whose native bootstrap is already proven;
+//! native installation tests use unready registration and an acknowledged FS transaction.
 
 use crate::executor_local::{
-    ExecutorLocalError, ExecutorLocalRegistry, TcbIdentity, TcbRetirementObservation,
+    ExecutorLocalError, ExecutorLocalRegistry, PhysicalTcbClaim, TcbIdentity,
+    TcbRetirementObservation,
 };
-use crate::{ExecutorError, ExecutorResume, ExecutorTable, ExecutorYield};
+use crate::{ExecutorError, ExecutorResume, ExecutorState, ExecutorTable, ExecutorYield};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
+use alloc::sync::Arc;
 use core::cell::Cell;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Debug, Eq, PartialEq)]
 struct LocalStateProbe {
@@ -35,11 +40,16 @@ fn retired(tcb: TcbIdentity) -> TcbRetirementObservation {
     unsafe { TcbRetirementObservation::new(tcb) }
 }
 
+// Tests model a native retype owner that keeps this exact cap and slot from being reused.
+fn physical(tcb: TcbIdentity, cap: u64) -> PhysicalTcbClaim {
+    unsafe { PhysicalTcbClaim::new(tcb, cap).expect("valid physical TCB claim") }
+}
+
 #[test]
 fn exact_tcb_anchors_select_distinct_ipc_reply_scheduler_and_transient_state() {
     let (mut table, root) = ExecutorTable::try_new(2).unwrap();
-    let first = table.register(&root).unwrap();
-    let second = table.register(&root).unwrap();
+    let first = unsafe { table.register(&root) }.unwrap();
+    let second = unsafe { table.register(&root) }.unwrap();
     let first_tcb = TcbIdentity::new(0x101, 1);
     let second_tcb = TcbIdentity::new(0x102, 1);
     let mut locals = ExecutorLocalRegistry::new();
@@ -105,8 +115,8 @@ fn exact_tcb_anchors_select_distinct_ipc_reply_scheduler_and_transient_state() {
 #[test]
 fn missing_or_mismatched_anchor_refuses_access_without_changing_either_local() {
     let (mut table, root) = ExecutorTable::try_new(2).unwrap();
-    let first = table.register(&root).unwrap();
-    let second = table.register(&root).unwrap();
+    let first = unsafe { table.register(&root) }.unwrap();
+    let second = unsafe { table.register(&root) }.unwrap();
     let first_tcb = TcbIdentity::new(0x101, 1);
     let second_tcb = TcbIdentity::new(0x102, 1);
     let mut locals = ExecutorLocalRegistry::new();
@@ -147,7 +157,7 @@ fn missing_or_mismatched_anchor_refuses_access_without_changing_either_local() {
 #[test]
 fn bind_requires_a_current_idle_executor_in_the_supplied_table() {
     let (mut table, root) = ExecutorTable::try_new(1).unwrap();
-    let executor = table.register(&root).unwrap();
+    let executor = unsafe { table.register(&root) }.unwrap();
     let tcb = TcbIdentity::new(0x101, 1);
     let mut locals = ExecutorLocalRegistry::new();
 
@@ -198,7 +208,7 @@ fn bind_requires_a_current_idle_executor_in_the_supplied_table() {
             boxed_probe(0x2000, 0x202)
         )
         .is_err());
-    let replacement = table.register(&root).unwrap();
+    let replacement = unsafe { table.register(&root) }.unwrap();
     assert_ne!(executor.generation(), replacement.generation());
     assert!(locals
         .bind(
@@ -217,7 +227,7 @@ fn bind_requires_a_current_idle_executor_in_the_supplied_table() {
 #[test]
 fn retired_tcb_anchor_cannot_resolve_a_reused_executor_slot() {
     let (mut table, root) = ExecutorTable::try_new(1).unwrap();
-    let old = table.register(&root).unwrap();
+    let old = unsafe { table.register(&root) }.unwrap();
     let old_tcb = TcbIdentity::new(0x101, 1);
     let mut locals = ExecutorLocalRegistry::new();
     let old_anchor = locals
@@ -246,7 +256,7 @@ fn retired_tcb_anchor_cannot_resolve_a_reused_executor_slot() {
         &probe(0x1000, 0x201)
     );
     locals.retire(old_anchor, &table, retired(old_tcb)).unwrap();
-    let next = table.register(&root).unwrap();
+    let next = unsafe { table.register(&root) }.unwrap();
     assert_eq!(old.index(), next.index());
     assert_ne!(old.generation(), next.generation());
     let next_tcb = TcbIdentity::new(0x101, 2);
@@ -268,7 +278,7 @@ fn retired_tcb_anchor_cannot_resolve_a_reused_executor_slot() {
 #[test]
 fn late_exact_tcb_retirement_releases_a_binding_after_executor_slot_reuse() {
     let (mut table, root) = ExecutorTable::try_new(1).unwrap();
-    let old = table.register(&root).unwrap();
+    let old = unsafe { table.register(&root) }.unwrap();
     let old_tcb = TcbIdentity::new(0x101, 1);
     let mut locals = ExecutorLocalRegistry::new();
     let anchor = locals
@@ -277,7 +287,7 @@ fn late_exact_tcb_retirement_releases_a_binding_after_executor_slot_reuse() {
 
     let run = table.resume(root, ExecutorResume::Unrouted).unwrap();
     let root = table.accept_yield(run, ExecutorYield::Done).unwrap();
-    let replacement = table.register(&root).unwrap();
+    let replacement = unsafe { table.register(&root) }.unwrap();
     assert_eq!(table.state(old), Err(ExecutorError::StaleGeneration));
     assert_eq!(
         locals.resolve(Some(anchor), old_tcb, old).unwrap(),
@@ -317,6 +327,295 @@ fn late_exact_tcb_retirement_releases_a_binding_after_executor_slot_reuse() {
 }
 
 #[test]
+fn definite_no_effect_fs_install_can_unbind_unready_executor_and_return_exact_payload() {
+    let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+    let executor = table.register_unready(&root).unwrap();
+    let tcb = TcbIdentity::new(0x101, 1);
+    let mut locals = ExecutorLocalRegistry::new();
+    let payload = boxed_probe(0x1000, 0x201);
+    let original_address = &*payload as *const _;
+    let anchor = locals.bind(&table, executor, tcb, payload).unwrap();
+
+    // Model a definitive native refusal before FS publication. This worker cannot receive
+    // ingress and cannot produce a Done yield merely to free its unpublished binding.
+    assert_ne!(table.state(executor), Ok(crate::ExecutorState::Idle));
+    let returned = unsafe { locals.abort_unpublished(anchor, &table, tcb) }
+        .expect("no-effect FS refusal must return the unpublished payload");
+    assert!(core::ptr::eq(original_address, &*returned));
+    assert_ne!(table.state(executor), Ok(crate::ExecutorState::Idle));
+    assert_eq!(
+        locals.resolve(Some(anchor), tcb, executor),
+        Err(ExecutorLocalError::StaleAnchor),
+    );
+    let replacement = locals.bind(&table, executor, tcb, returned).unwrap();
+    assert_ne!(replacement, anchor);
+    assert!(core::ptr::eq(
+        original_address,
+        locals.resolve(Some(replacement), tcb, executor).unwrap(),
+    ));
+}
+
+#[test]
+fn fs_install_authority_rejects_a_different_physical_tcb_target() {
+    let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+    let executor = unsafe { table.register(&root) }.unwrap();
+    let claimed = TcbIdentity::new(0x101, 1);
+    let other_slot = TcbIdentity::new(0x102, 1);
+    let reused_slot = TcbIdentity::new(0x101, 2);
+    let mut locals = ExecutorLocalRegistry::new();
+    let anchor = locals
+        .bind(&table, executor, claimed, boxed_probe(0x1000, 0x201))
+        .unwrap();
+
+    assert_eq!(
+        locals.authorize_fs_install(anchor, executor, claimed, claimed),
+        Ok(&probe(0x1000, 0x201)),
+    );
+    // The first identity is what the binding claims; the last is the exact TCB capability
+    // about to receive SetTLSBase. Neither a different slot nor a reused incarnation may pass.
+    for target in [other_slot, reused_slot] {
+        assert_eq!(
+            locals.authorize_fs_install(anchor, executor, claimed, target),
+            Err(ExecutorLocalError::TcbMismatch),
+        );
+    }
+    assert_eq!(
+        locals.resolve(Some(anchor), claimed, executor),
+        Ok(&probe(0x1000, 0x201)),
+    );
+}
+
+#[test]
+fn native_bind_refusal_returns_the_exact_payload_and_physical_claim() {
+    let (mut table, root) = ExecutorTable::try_new(2).unwrap();
+    let idle = unsafe { table.register(&root) }.unwrap();
+    let unready = table.register_unready(&root).unwrap();
+    let tcb = TcbIdentity::new(0x101, 1);
+    let payload = boxed_probe(0x1000, 0x201);
+    let original_address = &*payload as *const _;
+    let mut locals = ExecutorLocalRegistry::new();
+
+    let (error, returned, claim) = locals
+        .bind_native(&table, idle, physical(tcb, 0x501), payload)
+        .unwrap_err();
+    assert_eq!(error, ExecutorLocalError::ExecutorNotIdle);
+    assert!(core::ptr::eq(original_address, &*returned));
+    assert_eq!(claim.identity(), tcb);
+
+    let anchor = match locals.bind_native(&table, unready, claim, returned) {
+        Ok(anchor) => anchor,
+        Err(_) => panic!("a refused bind must return reusable owners"),
+    };
+    let attempt = locals.begin_fs_install(anchor, &table).unwrap();
+    assert_eq!(attempt.target_cap(), 0x501);
+    assert!(core::ptr::eq(original_address, attempt.base()));
+}
+
+#[test]
+fn native_setup_can_return_both_owners_before_fs_install_begins() {
+    let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+    let worker = table.register_unready(&root).unwrap();
+    let tcb = TcbIdentity::new(0x101, 1);
+    let payload = boxed_probe(0x1000, 0x201);
+    let original_address = &*payload as *const _;
+    let mut locals = ExecutorLocalRegistry::new();
+    let anchor = locals
+        .bind_native(&table, worker, physical(tcb, 0x501), payload)
+        .map_err(|(error, _, _)| error)
+        .unwrap();
+
+    let (returned, claim) = locals.cancel_unpublished_native(anchor, &table).unwrap();
+    assert!(core::ptr::eq(original_address, &*returned));
+    assert_eq!(claim.identity(), tcb);
+    assert_eq!(table.state(worker), Ok(ExecutorState::Unready));
+    assert_eq!(
+        locals.resolve(Some(anchor), tcb, worker),
+        Err(ExecutorLocalError::StaleAnchor),
+    );
+    let rebound = locals
+        .bind_native(&table, worker, claim, returned)
+        .map_err(|(error, _, _)| error)
+        .unwrap();
+    assert_ne!(rebound, anchor);
+    let attempt = locals.begin_fs_install(rebound, &table).unwrap();
+    assert_eq!(attempt.target_cap(), 0x501);
+    assert_eq!(
+        locals.cancel_unpublished_native(rebound, &table).err(),
+        Some(ExecutorLocalError::PublicationAlreadyStarted),
+    );
+}
+
+#[test]
+fn native_fs_install_acknowledgement_is_the_only_path_to_runnable() {
+    let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+    let worker = table.register_unready(&root).unwrap();
+    let tcb = TcbIdentity::new(0x101, 1);
+    let payload = boxed_probe(0x1000, 0x201);
+    let original_address = &*payload as *const _;
+    let mut locals = ExecutorLocalRegistry::new();
+    let anchor = match locals.bind_native(&table, worker, physical(tcb, 0x501), payload) {
+        Ok(anchor) => anchor,
+        Err(_) => panic!("unready worker must accept its physical claim"),
+    };
+
+    assert_eq!(table.state(worker), Ok(ExecutorState::Unready));
+    let attempt = locals.begin_fs_install(anchor, &table).unwrap();
+    assert_eq!(attempt.target_cap(), 0x501);
+    assert!(core::ptr::eq(original_address, attempt.base()));
+    assert_eq!(
+        locals.begin_fs_install(anchor, &table).err(),
+        Some(ExecutorLocalError::PublicationAlreadyStarted),
+    );
+    assert_eq!(table.state(worker), Ok(ExecutorState::Unready));
+
+    // Model a checked, successful kernel reply for this exact cap, base and FS selector.
+    let acknowledged = unsafe { locals.acknowledge_fs_install(attempt) }.unwrap();
+    assert_eq!(acknowledged.executor(), worker);
+    assert_eq!(table.state(worker), Ok(ExecutorState::Unready));
+    assert!(matches!(
+        table.activate_unready(&root, acknowledged),
+        Ok(activated) if activated == worker,
+    ));
+    assert_eq!(table.state(worker), Ok(ExecutorState::Idle));
+    assert_eq!(
+        table
+            .resume(root, ExecutorResume::Unrouted)
+            .unwrap()
+            .executor(),
+        worker
+    );
+}
+
+#[test]
+fn definitive_no_effect_returns_both_native_owners_without_activation() {
+    let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+    let worker = table.register_unready(&root).unwrap();
+    let tcb = TcbIdentity::new(0x101, 1);
+    let payload = boxed_probe(0x1000, 0x201);
+    let original_address = &*payload as *const _;
+    let mut locals = ExecutorLocalRegistry::new();
+    let anchor = match locals.bind_native(&table, worker, physical(tcb, 0x501), payload) {
+        Ok(anchor) => anchor,
+        Err(_) => panic!("unready worker must accept its physical claim"),
+    };
+    assert_eq!(
+        unsafe { locals.abort_unpublished(anchor, &table, tcb) }.err(),
+        Some(ExecutorLocalError::NativeClaimNeedsTransaction),
+    );
+
+    let attempt = locals.begin_fs_install(anchor, &table).unwrap();
+    // Model a definitive kernel refusal before any FS-base effect.
+    let (returned, claim) = unsafe { locals.abort_no_effect(attempt, &table) }.unwrap();
+    assert!(core::ptr::eq(original_address, &*returned));
+    assert_eq!(claim.identity(), tcb);
+    assert_eq!(table.state(worker), Ok(ExecutorState::Unready));
+    assert_eq!(
+        locals.resolve(Some(anchor), tcb, worker),
+        Err(ExecutorLocalError::StaleAnchor),
+    );
+    let replacement = match locals.bind_native(&table, worker, claim, returned) {
+        Ok(anchor) => anchor,
+        Err(_) => panic!("the exact returned owners must remain bindable"),
+    };
+    assert_ne!(replacement, anchor);
+    assert_eq!(
+        locals
+            .begin_fs_install(replacement, &table)
+            .unwrap()
+            .target_cap(),
+        0x501
+    );
+}
+
+#[test]
+fn dropped_native_attempt_cannot_replay_or_release_before_exact_tcb_teardown() {
+    #[derive(Debug)]
+    struct DropProbe(Arc<AtomicU32>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+    let worker = table.register_unready(&root).unwrap();
+    let tcb = TcbIdentity::new(0x101, 1);
+    let drops = Arc::new(AtomicU32::new(0));
+    let mut locals = ExecutorLocalRegistry::new();
+    let anchor = match locals.bind_native(
+        &table,
+        worker,
+        physical(tcb, 0x501),
+        Box::new(DropProbe(drops.clone())),
+    ) {
+        Ok(anchor) => anchor,
+        Err(_) => panic!("unready worker must accept its physical claim"),
+    };
+
+    // Dropping an attempt models a missing reply: the kernel may have selected this payload.
+    drop(locals.begin_fs_install(anchor, &table).unwrap());
+    assert_eq!(
+        locals.begin_fs_install(anchor, &table).err(),
+        Some(ExecutorLocalError::PublicationAlreadyStarted),
+    );
+    assert_eq!(table.state(worker), Ok(ExecutorState::Unready));
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        locals.retire_unready_after_teardown(
+            anchor,
+            &mut table,
+            &root,
+            retired(TcbIdentity::new(0x101, 2)),
+        ),
+        Err(ExecutorLocalError::TcbMismatch),
+    );
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    assert_eq!(table.state(worker), Ok(ExecutorState::Unready));
+
+    locals
+        .retire_unready_after_teardown(anchor, &mut table, &root, retired(tcb))
+        .unwrap();
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    assert_eq!(table.state(worker), Ok(ExecutorState::Retired));
+    assert_eq!(
+        locals.resolve(Some(anchor), tcb, worker).err(),
+        Some(ExecutorLocalError::StaleAnchor),
+    );
+}
+
+#[test]
+fn uncertain_fs_install_keeps_the_payload_owned_if_the_registry_is_lost() {
+    #[derive(Debug)]
+    struct DropProbe(Arc<AtomicU32>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+    let executor = table.register_unready(&root).unwrap();
+    let tcb = TcbIdentity::new(0x101, 1);
+    let drops = Arc::new(AtomicU32::new(0));
+    let mut locals = ExecutorLocalRegistry::new();
+    let anchor = match locals.bind_native(
+        &table,
+        executor,
+        physical(tcb, 0x501),
+        Box::new(DropProbe(drops.clone())),
+    ) {
+        Ok(anchor) => anchor,
+        Err(_) => panic!("unready worker must accept its physical claim"),
+    };
+
+    // The exact native target and payload were selected for SetTLSBase, but no reply was
+    // observed. Its possible effect cannot be undone by dropping the Rust registry.
+    drop(locals.begin_fs_install(anchor, &table).unwrap());
+    drop(locals);
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn losing_the_registry_quarantines_a_payload_still_reachable_by_a_tcb() {
     #[derive(Debug)]
     struct DropProbe(Rc<Cell<u32>>);
@@ -327,7 +626,7 @@ fn losing_the_registry_quarantines_a_payload_still_reachable_by_a_tcb() {
     }
 
     let (mut table, root) = ExecutorTable::try_new(1).unwrap();
-    let executor = table.register(&root).unwrap();
+    let executor = unsafe { table.register(&root) }.unwrap();
     let drops = Rc::new(Cell::new(0));
     let mut locals = ExecutorLocalRegistry::new();
     locals

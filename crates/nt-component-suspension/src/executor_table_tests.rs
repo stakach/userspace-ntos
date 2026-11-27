@@ -55,7 +55,8 @@ impl Root {
     }
 
     pub(super) fn register(&mut self) -> Result<ExecutorHandle, ExecutorError> {
-        let executor = self.table.register(self.token.as_ref().unwrap())?;
+        // This fixture models an executor already bootstrapped on its private endpoint.
+        let executor = unsafe { self.table.register(self.token.as_ref().unwrap()) }?;
         self.executors.push(executor);
         Ok(executor)
     }
@@ -280,6 +281,21 @@ fn done_retires_the_executor_and_a_reused_slot_gets_a_new_generation() {
 }
 
 #[test]
+fn unready_worker_cannot_receive_unrouted_work_before_fs_publication() {
+    let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+    let worker = table.register_unready(&root).unwrap();
+
+    // The native SetTLSBase acknowledgement has not happened. An unrouted arrival must stay
+    // with root instead of selecting this worker while its FS base is still uninitialized.
+    assert_ne!(table.state(worker), Ok(ExecutorState::Idle));
+    let result = table.resume(root, Unrouted);
+    assert!(
+        matches!(result, Err((ExecutorError::NoIdleExecutor, _))),
+        "unready worker {worker:?} must not be selected before FS publication"
+    );
+}
+
+#[test]
 fn unknown_and_stale_handles_are_refused() {
     let root = Root::new(2, 1);
     let known = root.executors[0];
@@ -355,7 +371,8 @@ fn another_tables_token_is_refused_and_cannot_run_a_second_executor() {
     let (mut other, foreign) = ExecutorTable::try_new(1).unwrap();
     let before = root.states();
 
-    assert_eq!(root.table.register(&foreign), Err(ExecutorError::WrongTable));
+    // The modeled worker is already bootstrapped; authority still belongs to this table.
+    assert_eq!(unsafe { root.table.register(&foreign) }, Err(ExecutorError::WrongTable));
     let (error, foreign) = root.table.resume(foreign, Unrouted).unwrap_err();
     assert_eq!(error, ExecutorError::WrongTable);
     assert_eq!(root.states(), before);
@@ -369,7 +386,7 @@ fn another_tables_token_is_refused_and_cannot_run_a_second_executor() {
     root.yields(run, Idle);
 
     // The refused token is intact for its own table.
-    let only = other.register(&foreign).unwrap();
+    let only = unsafe { other.register(&foreign) }.unwrap();
     assert_eq!(other.resume(foreign, Unrouted).unwrap().executor(), only);
 }
 
