@@ -753,6 +753,39 @@ class InteractionRunnerTests(unittest.TestCase):
         self.assertTrue(cursor_is_at_target(tuple(runner.cursor_receipts[-1]["position"]),
                                             target))
 
+    def test_verified_click_waits_for_seventh_measured_frame_after_initial_overshoot(self):
+        # A live FileBasic boot measured these six hotspots while aiming at neutral wallpaper.
+        # The sixth remains outside the strict three-pixel margin, but a final bounded
+        # correction can reach the target. No button may precede that seventh receipt.
+        target = (925, 100)
+        measured = [(881, 132), (973, 65), (967, 70),
+                    (955, 79), (943, 87), (931, 96), target]
+        positions = iter(measured)
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "baseline", "actions": [], "wait_seconds": 0},
+                                   {"name": "desktop-pointer", "actions": [
+                                       {"verified_click": list(target)}], "wait_seconds": 0}]})
+
+        def probe(_before, after, _target):
+            return CursorProof(next(positions), after, "recorded-image-sha")
+
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock, cursor_probe=probe)
+        runner.arm(0)
+        runner.advance(0)
+        self.assertEqual(runner.failures, 0)
+        self.assertEqual([receipt["position"] for receipt in runner.cursor_receipts],
+                         [list(position) for position in measured])
+        self.assertEqual(len(self.performed), 8)  # aim, six corrections, proven click
+        self.assertEqual(rel_sum(self.performed[-2]), (-6, 4))
+        self.assertTrue(all(not any(event["type"] == "btn"
+                                    for events, _pause in batches for event in events)
+                            for batches in self.performed[:-1]))
+        self.assertEqual([events[0]["data"]["down"]
+                          for events, _pause in self.performed[-1]],
+                         [True, False])
+
     def test_unmeasured_cursor_halts_without_click(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
                                "steps": [
@@ -783,8 +816,8 @@ class InteractionRunnerTests(unittest.TestCase):
         runner.advance(0)
         self.assertTrue(runner.finished)
         self.assertEqual(runner.failures, 1)
-        self.assertEqual(len(runner.cursor_receipts), 6)
-        self.assertEqual(len(self.performed), 6)  # initial aim and five corrections, no click
+        self.assertEqual(len(runner.cursor_receipts), 7)
+        self.assertEqual(len(self.performed), 7)  # initial aim and six corrections, no click
 
     def test_missing_search_result_halts_before_enter(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,

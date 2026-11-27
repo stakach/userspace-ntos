@@ -33,7 +33,8 @@ CLICK_HOLD = 0.15  # a lone click holds long enough for the guest to read the pr
 KEY_PAUSE = 0.05
 POINTER_ACTIONS = ("move", "click", "double_click")
 VERIFIED_POINTER_ACTION = "verified_click"
-MAX_CURSOR_AIMS = 6
+# Six measurements may end one capped correction short after an accelerated first move.
+MAX_CURSOR_AIMS = 7
 MAX_CURSOR_CORRECTION = 12  # total requested movement on either axis before remeasuring
 POLL_SCHEDULING_SLACK = 1.0  # the bounded boot loop polls at most once per second
 CHAR_QCODES = {" ": "spc", "\n": "ret", "\t": "tab", ".": "dot", ",": "comma",
