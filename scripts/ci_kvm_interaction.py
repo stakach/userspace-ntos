@@ -10,7 +10,7 @@ accelerates or coalesces larger ones.
 Interaction is evidence, never a verdict: failures are recorded, not raised.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import re
@@ -47,6 +47,7 @@ class Step:
     name: str
     actions: tuple
     wait_seconds: float
+    readiness_poll_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -133,7 +134,8 @@ def parse_script(document):
     steps, names = [], set()
     for index, raw in enumerate(raw_steps, 1):
         field = f"steps[{index}]"
-        if not isinstance(raw, dict) or set(raw) - {"name", "actions", "wait_seconds"}:
+        if not isinstance(raw, dict) or set(raw) - {"name", "actions", "wait_seconds",
+                                                    "readiness_poll_seconds"}:
             raise ValueError(f"{field} must be an object with name, actions and wait_seconds")
         name = raw.get("name")
         if not isinstance(name, str) or not STEP_NAME.fullmatch(name) or name in names:
@@ -144,8 +146,14 @@ def parse_script(document):
             raise ValueError(f"{field}.actions must be a list")
         parsed_actions = tuple(_action(action, screen, f"{field}.actions[{number}]")
                                for number, action in enumerate(actions, 1))
-        steps.append(Step(name, parsed_actions,
-                          _seconds(raw.get("wait_seconds"), f"{field}.wait_seconds")))
+        wait = _seconds(raw.get("wait_seconds"), f"{field}.wait_seconds")
+        poll = None
+        if "readiness_poll_seconds" in raw:
+            poll = _seconds(raw["readiness_poll_seconds"],
+                            f"{field}.readiness_poll_seconds")
+            if not 1 <= poll <= wait:
+                raise ValueError(f"{field}.readiness_poll_seconds must be >= 1 and <= wait_seconds")
+        steps.append(Step(name, parsed_actions, wait, poll))
     return Script(screen, settle, tuple(steps), arm)
 
 
@@ -255,6 +263,9 @@ class InteractionRunner:
         self.index = 0
         self.acted = False
         self.next_at = None
+        self.step_started_at = None
+        self.step_deadline = None
+        self.poll_attempt = 0
         self.failures = 0
         self.checks = checks or {}
         self.checkpoints = {}
@@ -287,12 +298,36 @@ class InteractionRunner:
         while self.in_progress and now >= self.next_at:
             step = self.script.steps[self.index]
             if not self.acted:
+                if (step.readiness_poll_seconds is not None
+                        and step.name not in self.checks):
+                    self._fail(step, "readiness", RuntimeError("polled step has no visual check"))
+                    self.halted = True
+                    break
+                prior_failures = self.failures
                 self._act(step)
+                if self.halted or (step.readiness_poll_seconds is not None
+                                   and self.failures != prior_failures):
+                    self.halted = True
+                    break
                 self.acted = True
-                self.next_at = self.clock() + step.wait_seconds
+                self.step_started_at = self.clock()
+                self.step_deadline = self.step_started_at + step.wait_seconds
+                self.poll_attempt = 0
+                self.next_at = (self.step_started_at + step.readiness_poll_seconds
+                                if step.readiness_poll_seconds is not None
+                                else self.step_deadline)
                 now = self.clock()
                 continue
+            polling = step.readiness_poll_seconds is not None
+            if polling and self.clock() > self.step_deadline:
+                self._fail(step, "readiness", RuntimeError("visual readiness deadline expired"))
+                self.halted = True
+                break
+            if polling:
+                self.poll_attempt += 1
             name = screenshot_name(self.index + 1, step)
+            if polling:
+                name = name.removesuffix(".ppm") + f"-probe-{self.poll_attempt:02d}.ppm"
             shots.append(name)
             captured = False
             try:
@@ -310,14 +345,36 @@ class InteractionRunner:
                 else:
                     try:
                         proof = self.checks[step.name](name)
+                        completed_at = self.clock()
+                        if (polling and proof.passed
+                                and (proof.image_name != name or not proof.image_sha256.strip())):
+                            proof = replace(proof, passed=False, fatal=True,
+                                            error="visual readiness proof does not identify the captured frame")
+                        if polling and completed_at > self.step_deadline:
+                            proof = replace(proof, passed=False,
+                                            error="visual readiness proof completed after deadline")
                         self.checkpoints[step.name] = proof
-                        self._record({"event": "checkpoint", "step": self.index + 1,
-                                      "name": step.name, "passed": proof.passed,
-                                      "error": proof.error, "ocr_text": proof.ocr_text,
-                                      "image_sha256": proof.image_sha256})
+                        receipt = {"event": "checkpoint", "step": self.index + 1,
+                                   "name": step.name, "passed": proof.passed,
+                                   "error": proof.error, "ocr_text": proof.ocr_text,
+                                   "image_sha256": proof.image_sha256}
+                        if polling:
+                            receipt.update(attempt=self.poll_attempt,
+                                           ready_after_seconds=round(
+                                               completed_at - self.step_started_at, 2),
+                                           file=name)
+                        self._record(receipt)
                         if not proof.passed:
-                            self.failures += 1
-                            self.halted = True
+                            if (not polling or proof.fatal
+                                    or completed_at >= self.step_deadline):
+                                self.failures += 1
+                                self.halted = True
+                            else:
+                                interval = min(8, step.readiness_poll_seconds
+                                               * 2 ** (self.poll_attempt - 1))
+                                self.next_at = min(self.step_deadline, completed_at + interval)
+                                now = completed_at
+                                continue
                     except (OSError, RuntimeError, ValueError, KeyError) as error:
                         self._fail(step, "checkpoint", error)
                         self.halted = True
@@ -344,7 +401,8 @@ class InteractionRunner:
                               "argument": list(action[1]) if action[0] != "type" else action[1]})
             except (OSError, RuntimeError, ValueError, KeyError) as error:
                 self._fail(step, f"action {number} {action[0]}", error)
-                if action[0] == VERIFIED_POINTER_ACTION:
+                if (action[0] == VERIFIED_POINTER_ACTION
+                        or step.readiness_poll_seconds is not None):
                     self.halted = True
                     return
 

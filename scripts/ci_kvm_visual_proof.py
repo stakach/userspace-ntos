@@ -40,6 +40,7 @@ class VisualProof:
     error: str = ""
     image_name: str = ""
     image_sha256: str = ""
+    fatal: bool = False
 
 
 def contains_ver_result(text):
@@ -70,12 +71,12 @@ def _prove_image(image, predicate, missing):
     image = Path(image)
     if not image.is_file():
         return VisualProof(False, error=f"screenshot absent: {image}",
-                           image_name=image.name)
+                           image_name=image.name, fatal=True)
     try:
         image_sha256 = hashlib.sha256(image.read_bytes()).hexdigest()
     except OSError as error:
         return VisualProof(False, error=f"cannot read screenshot: {error}",
-                           image_name=image.name)
+                           image_name=image.name, fatal=True)
     try:
         result = subprocess.run(
             ["tesseract", str(image), "stdout", "-l", "eng", "--psm", "11"],
@@ -84,11 +85,11 @@ def _prove_image(image, predicate, missing):
     except (OSError, subprocess.TimeoutExpired) as error:
         return VisualProof(False, error=f"OCR unavailable: {error}",
                            image_name=image.name,
-                           image_sha256=image_sha256)
+                           image_sha256=image_sha256, fatal=True)
     if result.returncode != 0:
         return VisualProof(False, result.stdout,
                            f"OCR failed ({result.returncode}): {result.stderr.strip()}",
-                           image.name, image_sha256)
+                           image.name, image_sha256, fatal=True)
     if not predicate(result.stdout):
         return VisualProof(False, result.stdout, missing,
                            image.name, image_sha256)
@@ -122,14 +123,14 @@ def prove_command_prompt_search_result(image):
         )
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         return VisualProof(False, result.ocr_text, f"search query OCR unavailable: {error}",
-                           result.image_name, result.image_sha256)
+                           result.image_name, result.image_sha256, fatal=True)
     query_text = query.stdout.decode("utf-8", errors="replace").strip()
     transcript = result.ocr_text + "\nsearch query crop: " + query_text
     if query.returncode != 0:
         detail = query.stderr.decode("utf-8", errors="replace").strip()
         return VisualProof(False, transcript,
                            f"search query OCR failed ({query.returncode}): {detail}",
-                           result.image_name, result.image_sha256)
+                           result.image_name, result.image_sha256, fatal=True)
     if query_text.casefold() != "command":
         return VisualProof(False, transcript, "exact command query not visible",
                            result.image_name, result.image_sha256)

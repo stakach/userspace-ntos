@@ -56,6 +56,8 @@ class ParseScriptTests(unittest.TestCase):
         # Run 45436226805 captured the shell after 10 s while its menu was
         # still absent; 45425894277 had a visible menu after a 60 s settle.
         self.assertEqual(script.steps[2].wait_seconds, 60.0)
+        self.assertEqual([step.readiness_poll_seconds for step in script.steps],
+                         [None, None, 2.0, 2.0, 4.0, None])
         # The Start menu searches shortcut names, so "command" can find
         # Command Prompt; the result must be visible before Enter launches it.
         self.assertEqual([step.name for step in script.steps],
@@ -122,6 +124,14 @@ class ParseScriptTests(unittest.TestCase):
             "empty chord": lambda d: d["steps"][2].update(actions=[{"key": []}]),
             "boolean wait": lambda d: d["steps"][0].update(wait_seconds=True),
             "unbounded wait": lambda d: d["steps"][0].update(wait_seconds=601),
+            "zero readiness poll": lambda d: d["steps"][1].update(
+                readiness_poll_seconds=0),
+            "subsecond readiness poll": lambda d: d["steps"][1].update(
+                readiness_poll_seconds=0.5),
+            "poll beyond deadline": lambda d: d["steps"][1].update(
+                readiness_poll_seconds=6),
+            "boolean readiness poll": lambda d: d["steps"][1].update(
+                readiness_poll_seconds=True),
             "unknown field": lambda d: d.update(extra=1),
             "no steps": lambda d: d.update(steps=[]),
         }
@@ -197,6 +207,264 @@ class InteractionRunnerTests(unittest.TestCase):
     def runner(self, perform=None, capture=None):
         return InteractionRunner(parse_script(DOCUMENT), perform or self.performed.append,
                                  capture or self.captured.append, self.log, self.clock)
+
+    def test_start_menu_visual_readiness_advances_before_wait_ceiling(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "start-menu", "actions": [{"click": [28, 743]}],
+                                    "wait_seconds": 60, "readiness_poll_seconds": 2},
+                                   {"name": "ver", "actions": [{"type": "ver\n"}],
+                                    "wait_seconds": 0}]})
+        proof = lambda name: VisualProof(True, "Start menu search visible", "", name,
+                                         "start-sha")
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock,
+                                   checks={"start-menu": proof})
+        runner.arm(0)
+        runner.advance(0)
+        self.assertEqual(len(self.performed), 1)
+        self.clock.now = 2
+        runner.advance(2)
+        self.assertEqual(runner.checkpoints["start-menu"].image_name, self.captured[0])
+        self.assertIn("-probe-", self.captured[0])
+        self.assertEqual(self.captured[-1], "native-kvm-interact-02-ver.ppm")
+        self.assertEqual(len(self.performed), 2, "visible Start must permit the next action at 2 s")
+        receipt = next(entry for entry in map(json.loads, self.log.read_text().splitlines())
+                       if entry["event"] == "checkpoint" and entry["name"] == "start-menu")
+        self.assertEqual((receipt["attempt"], receipt["ready_after_seconds"]), (1, 2))
+        self.assertEqual(receipt["image_sha256"], "start-sha")
+
+    def test_ready_command_prompt_advances_before_wait_ceiling(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "command-prompt", "actions": [{"key": ["ret"]}],
+                                    "wait_seconds": 120, "readiness_poll_seconds": 4},
+                                   {"name": "ver", "actions": [{"type": "ver\n"}],
+                                    "wait_seconds": 0}]})
+        proof = lambda name: VisualProof(True, "C:\\Users\\User>", "", name,
+                                         "prompt-sha")
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock,
+                                   checks={"command-prompt": proof})
+        runner.arm(0)
+        runner.advance(0)
+        self.clock.now = 4
+        runner.advance(4)
+        self.assertEqual(runner.checkpoints["command-prompt"].image_name, self.captured[0])
+        self.assertEqual(self.captured[-1], "native-kvm-interact-02-ver.ppm")
+        self.assertEqual(len(self.performed), 2, "ready prompt must permit ver at 4 s")
+
+    def test_failed_visual_probes_retry_then_halt_at_wait_ceiling(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "start-menu", "actions": [{"click": [28, 743]}],
+                                    "wait_seconds": 6, "readiness_poll_seconds": 2},
+                                   {"name": "ver", "actions": [{"type": "ver\n"}],
+                                    "wait_seconds": 0}]})
+        proof = lambda name: VisualProof(False, "", "Start menu absent", name,
+                                         "failed-sha")
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock,
+                                   checks={"start-menu": proof})
+        runner.arm(0)
+        runner.advance(0)
+        self.clock.now = 2
+        runner.advance(2)
+        self.assertGreaterEqual(len(self.captured), 1, "must probe before the 6 s ceiling")
+        self.assertFalse(runner.finished, "a failed early probe may retry")
+        self.clock.now = 6
+        runner.advance(6)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertGreaterEqual(len(self.captured), 2)
+        self.assertEqual(len(self.captured), len(set(self.captured)),
+                         "each failed probe must retain a distinct screenshot")
+        self.assertTrue(all("-probe-" in name for name in self.captured))
+        self.assertEqual(len(self.performed), 1, "never type ver without Start proof")
+
+    def test_visual_probe_retries_without_repeating_guest_input(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "start-menu", "actions": [{"click": [28, 743]}],
+                                    "wait_seconds": 60, "readiness_poll_seconds": 2},
+                                   {"name": "ver", "actions": [{"type": "ver\n"}],
+                                    "wait_seconds": 0}]})
+        proofs = iter(((False, "not ready", "sha1"), (True, "", "sha2")))
+        def prove(name):
+            ready, error, digest = next(proofs)
+            return VisualProof(ready, "search box" if ready else "", error, name, digest)
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock,
+                                   checks={"start-menu": prove})
+        runner.arm(0)
+        runner.advance(0)
+        self.clock.now = 2
+        runner.advance(2)
+        self.assertEqual(len(self.performed), 1, "no next action before visual proof")
+        runner.advance(2)
+        self.assertEqual(len(self.captured), 1, "a same-time tick must not repeat OCR")
+        self.clock.now = 4
+        runner.advance(4)
+        self.assertEqual(len(self.performed), 2, "successful retry permits next action")
+        self.assertEqual(runner.failures, 0)
+        self.assertEqual(len(self.captured), len(set(self.captured)))
+        self.assertTrue(all("-probe-" in name for name in self.captured[:-1]))
+        self.assertEqual(self.captured[-1], "native-kvm-interact-02-ver.ppm")
+
+    def test_early_probe_capture_error_fails_closed(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "start-menu", "actions": [{"click": [28, 743]}],
+                                    "wait_seconds": 60, "readiness_poll_seconds": 2},
+                                   {"name": "ver", "actions": [{"type": "ver\n"}],
+                                    "wait_seconds": 0}]})
+        def broken(_name):
+            raise OSError("framebuffer unavailable")
+        runner = InteractionRunner(script, self.performed.append, broken, self.log, self.clock,
+                                   checks={"start-menu": lambda _name: None})
+        runner.arm(0)
+        runner.advance(0)
+        self.clock.now = 2
+        runner.advance(2)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(len(self.performed), 1, "never type ver after capture failure")
+
+    def test_checked_step_without_poll_opt_in_keeps_legacy_wait(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [{"name": "start-menu", "actions": [],
+                                          "wait_seconds": 60}]})
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock,
+                                   checks={"start-menu": lambda name: VisualProof(
+                                       True, image_name=name, image_sha256="sha")})
+        runner.arm(0)
+        runner.advance(0)
+        self.clock.now = 2
+        self.assertEqual(runner.advance(2), [])
+        self.assertEqual(self.captured, [])
+        self.clock.now = 60
+        self.assertEqual(runner.advance(60), ["native-kvm-interact-01-start-menu.ppm"])
+        self.assertTrue(runner.finished)
+
+    def test_slow_ocr_cannot_accept_proof_after_deadline(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "start-menu", "actions": [{"click": [28, 743]}],
+                                    "wait_seconds": 6, "readiness_poll_seconds": 2},
+                                   {"name": "ver", "actions": [{"type": "ver\n"}],
+                                    "wait_seconds": 0}]})
+        def slow_proof(name):
+            self.clock.now = 7
+            return VisualProof(True, "Start menu search visible", image_name=name,
+                               image_sha256="sha")
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock, checks={"start-menu": slow_proof})
+        runner.arm(0)
+        runner.advance(0)
+        self.clock.now = 2
+        runner.advance(2)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(len(self.performed), 1)
+
+    def test_input_error_does_not_advance_on_visual_proof(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "start-menu", "actions": [{"click": [28, 743]}],
+                                    "wait_seconds": 60, "readiness_poll_seconds": 2},
+                                   {"name": "ver", "actions": [{"type": "ver\n"}],
+                                    "wait_seconds": 0}]})
+        def refuse(_batches):
+            raise RuntimeError("QMP input-send-event: refused")
+        runner = InteractionRunner(script, refuse, self.captured.append,
+                                   self.log, self.clock,
+                                   checks={"start-menu": lambda name: VisualProof(
+                                       True, image_name=name, image_sha256="sha")})
+        runner.arm(0)
+        runner.advance(0)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(self.captured, [])
+
+    def test_visual_infrastructure_failure_halts_without_retry(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "start-menu", "actions": [],
+                                    "wait_seconds": 60, "readiness_poll_seconds": 2},
+                                   {"name": "ver", "actions": [{"type": "ver\n"}],
+                                    "wait_seconds": 0}]})
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock,
+                                   checks={"start-menu": lambda name: VisualProof(
+                                       False, error="OCR unavailable: executable missing",
+                                       image_name=name, image_sha256="sha", fatal=True)})
+        runner.arm(0)
+        runner.advance(0)
+        self.clock.now = 2
+        runner.advance(2)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(len(self.captured), 1)
+        self.assertEqual(self.performed, [])
+
+    def test_polled_success_requires_current_hashed_capture(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "start-menu", "actions": [{"click": [28, 743]}],
+                                    "wait_seconds": 60, "readiness_poll_seconds": 2},
+                                   {"name": "ver", "actions": [{"type": "ver\n"}],
+                                    "wait_seconds": 0}]})
+        for label, image_name, digest in (("stale frame", "prior-frame.ppm", "sha"),
+                                          ("missing hash", None, "")):
+            with self.subTest(label):
+                performed, captured = [], []
+                runner = InteractionRunner(
+                    script, performed.append, captured.append, self.log, self.clock,
+                    checks={"start-menu": lambda name: VisualProof(
+                        True, "search visible", image_name=image_name or name,
+                        image_sha256=digest)})
+                self.clock.now = 0
+                runner.arm(0)
+                runner.advance(0)
+                self.clock.now = 2
+                runner.advance(2)
+                self.assertTrue(runner.finished)
+                self.assertEqual(runner.failures, 1)
+                self.assertEqual(len(performed), 1, "unbound proof must not type ver")
+                self.assertEqual(len(captured), 1)
+                self.assertFalse(runner.checkpoints["start-menu"].passed)
+
+    def test_readiness_backoff_never_exceeds_eight_seconds(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [{"name": "start-menu", "actions": [],
+                                          "wait_seconds": 60,
+                                          "readiness_poll_seconds": 2}]})
+        runner = InteractionRunner(
+            script, self.performed.append, self.captured.append, self.log, self.clock,
+            checks={"start-menu": lambda name: VisualProof(
+                False, error="not visible", image_name=name, image_sha256="sha")})
+        runner.arm(0)
+        runner.advance(0)
+        for second in (2, 4, 8, 16, 24):
+            self.clock.now = second
+            runner.advance(second)
+        self.assertEqual(len(self.captured), 5)
+
+    def test_polled_step_without_visual_check_never_sends_input(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [{"name": "start-menu",
+                                          "actions": [{"click": [28, 743]}],
+                                          "wait_seconds": 60,
+                                          "readiness_poll_seconds": 2}]})
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock)
+        runner.arm(0)
+        runner.advance(0)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(self.performed, [])
+        self.assertEqual(self.captured, [])
 
     def test_runs_steps_after_settle_and_waits_between_actions_and_screenshots(self):
         runner = self.runner()

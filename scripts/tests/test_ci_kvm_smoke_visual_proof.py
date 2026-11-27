@@ -199,18 +199,23 @@ class VisualProofTests(unittest.TestCase):
     def test_missing_result_or_ocr_failure_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "ver.ppm"
-            self.assertFalse(prove_ver_result(image).passed)
+            self.assertTrue(prove_ver_result(image).fatal)
             image.write_bytes(b"P6\n1 1\n255\n\0\0\0")
             with patch("scripts.ci_kvm_visual_proof.subprocess.run") as ocr:
                 ocr.return_value = subprocess.CompletedProcess([], 0, BOOT2_OCR, "")
                 proof = prove_ver_result(image)
                 self.assertFalse(proof.passed)
+                self.assertFalse(proof.fatal)
                 self.assertEqual(proof.error, "typed ver and response not both visible")
                 self.assertIn("Applications Manager", proof.ocr_text)
                 ocr.side_effect = FileNotFoundError("tesseract")
-                self.assertIn("OCR unavailable", prove_ver_result(image).error)
+                unavailable = prove_ver_result(image)
+                self.assertIn("OCR unavailable", unavailable.error)
+                self.assertTrue(unavailable.fatal)
                 ocr.side_effect = subprocess.TimeoutExpired("tesseract", 20)
-                self.assertIn("OCR unavailable", prove_ver_result(image).error)
+                timeout = prove_ver_result(image)
+                self.assertIn("OCR unavailable", timeout.error)
+                self.assertTrue(timeout.fatal)
 
 
 if __name__ == "__main__":

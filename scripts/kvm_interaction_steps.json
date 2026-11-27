@@ -5,9 +5,9 @@
   "steps": [
     {"name": "baseline", "actions": [], "wait_seconds": 0},
     {"name": "desktop-pointer", "actions": [{"verified_click": [925, 100]}], "wait_seconds": 0},
-    {"name": "start-menu", "actions": [{"click": [28, 743]}], "wait_seconds": 60},
-    {"name": "command-prompt-search", "actions": [{"type": "command"}], "wait_seconds": 10},
-    {"name": "command-prompt", "actions": [{"key": ["ret"]}], "wait_seconds": 120},
+    {"name": "start-menu", "actions": [{"click": [28, 743]}], "wait_seconds": 60, "readiness_poll_seconds": 2},
+    {"name": "command-prompt-search", "actions": [{"type": "command"}], "wait_seconds": 10, "readiness_poll_seconds": 2},
+    {"name": "command-prompt", "actions": [{"key": ["ret"]}], "wait_seconds": 120, "readiness_poll_seconds": 4},
     {"name": "ver", "actions": [{"type": "ver\n"}], "wait_seconds": 20}
   ]
 }
