@@ -151,6 +151,11 @@ impl FastMutexWaitStore {
         if read_owner(mutex) != thread || read_count(mutex) != -waiting {
             return Err(ExecutiveSyncError::NotOwned);
         }
+        if index.is_some_and(|index| self.queues[index].waiters.iter().any(|waiter| {
+            waiter.thread == thread && waiter.granted
+        })) {
+            return Err(ExecutiveSyncError::BlockingWaitRequired);
+        }
         let Some(index) = index else {
             write_state(mutex, 0, 1);
             return Ok(None);
@@ -355,6 +360,32 @@ mod tests {
             assert_eq!(store.cancel_wait(p, B, ticket), Ok(None));
             assert!(store.queues.is_empty());
             assert_eq!(state(&mut m), (0, 1));
+        }
+    }
+
+    #[test]
+    fn fast_mutex_release_requires_completion_of_its_granted_ticket() {
+        let mut m = mutex();
+        let mut store = FastMutexWaitStore::new();
+        let p = m.0.as_mut_ptr();
+        unsafe {
+            assert_eq!(store.begin_wait(p, A, 0xe1), Ok(FastMutexWaitAdmission::Acquired));
+            let FastMutexWaitAdmission::Queued(first) = store.begin_wait(p, B, 0xe2).unwrap() else {
+                panic!("expected first waiter");
+            };
+            let FastMutexWaitAdmission::Queued(second) = store.begin_wait(p, C, 0xe3).unwrap() else {
+                panic!("expected second waiter");
+            };
+            assert_eq!(store.release(p, A), Ok(Some(0xe2)));
+            assert_eq!(store.release(p, B), Err(ExecutiveSyncError::BlockingWaitRequired));
+            assert_eq!(state(&mut m), (B, -1));
+            assert_eq!(store.queues[0].waiters.len(), 2);
+            assert!(store.queues[0].waiters[0].granted);
+            assert!(!store.queues[0].waiters[1].granted);
+            store.complete_wait(p, B, first).unwrap();
+            assert_eq!(store.release(p, B), Ok(Some(0xe3)));
+            store.complete_wait(p, C, second).unwrap();
+            assert_eq!(store.release(p, C), Ok(None));
         }
     }
 }

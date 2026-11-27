@@ -539,6 +539,9 @@ impl ExecutiveResourceStore {
         let owner_index = state
             .owner_index(thread)
             .ok_or(ExecutiveSyncError::NotOwned)?;
+        if state.waiters.iter().any(|waiter| waiter.thread == thread && waiter.granted) {
+            return Err(ExecutiveSyncError::BlockingWaitRequired);
+        }
         if state.owners[owner_index].recursion > 1 {
             state.owners[owner_index].recursion -= 1;
         } else {
@@ -951,6 +954,34 @@ mod tests {
             store.resources[0].owners.push(ResourceOwner { thread: 0x2000, recursion: 1 });
             assert_eq!(store.cancel_wait(resource, 0x2000, ticket), Ok(None));
             assert!(store.resources[0].waiters.is_empty());
+        }
+    }
+
+    #[test]
+    fn resource_release_requires_completion_of_its_granted_ticket() {
+        let mut bytes = Aligned([0u8; eresource_layout::SIZE_OF]);
+        let resource = bytes.0.as_mut_ptr();
+        let mut store = ExecutiveResourceStore::new();
+        unsafe {
+            store.initialize(resource).unwrap();
+            store.acquire(resource, 0x1000, ResourceMode::Exclusive).unwrap();
+            let ResourceWaitAdmission::Queued(first) =
+                store.begin_wait(resource, 0x2000, ResourceMode::Exclusive, 0xabc0).unwrap()
+            else { panic!("expected first waiter"); };
+            let ResourceWaitAdmission::Queued(second) =
+                store.begin_wait(resource, 0x3000, ResourceMode::Exclusive, 0xdef0).unwrap()
+            else { panic!("expected second waiter"); };
+            assert_eq!(store.release_with_handoff(resource, 0x1000), Ok(Some(0xabc0)));
+            assert_eq!(store.release_with_handoff(resource, 0x2000),
+                Err(ExecutiveSyncError::BlockingWaitRequired));
+            assert_eq!(store.acquired_count(resource as u64, 0x2000), Ok(1));
+            assert_eq!(store.resources[0].waiters.len(), 2);
+            assert!(store.resources[0].waiters[0].granted);
+            assert!(!store.resources[0].waiters[1].granted);
+            store.complete_wait(resource, 0x2000, first).unwrap();
+            assert_eq!(store.release_with_handoff(resource, 0x2000), Ok(Some(0xdef0)));
+            store.complete_wait(resource, 0x3000, second).unwrap();
+            assert_eq!(store.release_with_handoff(resource, 0x3000), Ok(None));
         }
     }
 
