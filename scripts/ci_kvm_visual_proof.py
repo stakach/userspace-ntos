@@ -50,8 +50,9 @@ CREATE_PROMPT_CROP = (70, 250, 600, 274)
 # returned prompt down. This original-pixel crop includes all three console rows.
 CREATE_EXISTING_CROP = (70, 220, 480, 286)
 # Command, exact directory header, count row and returned prompt in the pinned
-# 1024x768 console. Whole-frame sparse OCR can read the zero as "@ File(s)".
-DIRECTORY_LIST_CROP = (70, 246, 500, 421)
+# 1024x768 console. Boot 2's persisted-directory message shifts the prompt down.
+# Whole-frame sparse OCR can read the zero as "@ File(s)".
+DIRECTORY_LIST_CROP = (70, 246, 500, 435)
 # The lower console rows in the pinned FileBasic frame show the attrib query,
 # its result and the returned prompt. Sparse full-frame OCR can split `.txt`.
 ATTRIB_READBACK_CROP = (68, 426, 520, 510)

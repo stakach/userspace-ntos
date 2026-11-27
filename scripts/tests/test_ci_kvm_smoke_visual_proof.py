@@ -315,6 +315,37 @@ class VisualProofTests(unittest.TestCase):
              patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=pending):
             self.assertFalse(prove_basicproof_directory(original).passed)
 
+    def test_directory_gate_second_boot_crop_contains_returned_prompt(self):
+        # Original Boot2 probe06 PPM SHA: 1cd9ed43778a9b17a139979df0202c1461f5e1849818938c28ac5c3db4731e0d.
+        # The persisted-directory line moves the listing's returned prompt below the
+        # first boot's crop. Save the exact original pixels at their original coordinates.
+        saved = gzip.decompress((Path(__file__).parent / "fixtures" /
+                                 "directory_reboot_46074485050.ppm.gz").read_bytes())
+        self.assertEqual(hashlib.sha256(saved).hexdigest(),
+                         "770e7b17f5d4a5c4cddb33d77bc67f375682277d279b594b5e270a1a548efa1a")
+        sparse = ("C:\\Users\\User>dir basicproof\n"
+                  "Directory of C:\\Users\\User\\basicproof\n"
+                  "@ File(s)\n2 Dir(s)\nC:\\Users\\User>\n")
+        original = Path("native-kvm-interact-09-basicproof-directory-list-probe-06.ppm")
+        with tempfile.TemporaryDirectory() as directory:
+            cropped = Path(directory) / "original-pixels.ppm"
+            cropped.write_bytes(saved)
+
+            def crop_original_pixels(_image, left, top, right, bottom):
+                self.assertEqual((left, top, right), (70, 246, 500))
+                return crop_ppm(cropped, 0, 0, 430, bottom - top)
+
+            with patch("scripts.ci_kvm_visual_proof._prove_image",
+                       return_value=ci_kvm_visual_proof.VisualProof(
+                           False, sparse, "basicproof directory listing not visible",
+                           original.name,
+                           "1cd9ed43778a9b17a139979df0202c1461f5e1849818938c28ac5c3db4731e0d")), \
+                 patch("scripts.ci_kvm_visual_proof.crop_ppm",
+                       side_effect=crop_original_pixels):
+                proof = prove_basicproof_directory(original)
+        self.assertTrue(proof.passed, proof.error)
+        self.assertIn("C:\\Users\\User>", proof.ocr_text)
+
     def test_start_menu_and_search_result_require_visible_shell_evidence(self):
         # Pinned LiberNT startmnu2.cpp filters Start Menu shortcut names. Its
         # shortcuts.inf names the cmd.exe Accessories link "Command Prompt".
