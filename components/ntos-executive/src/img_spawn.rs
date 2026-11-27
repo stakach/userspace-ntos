@@ -1329,6 +1329,14 @@ pub(crate) unsafe fn spawn_sec_image(
             b"peb-scratch",
         );
         zero_scratch_page(scr + 0x1000);
+        // The creator may inspect the suspended child's PEB before its ntdll runs. In
+        // particular, LiberNT cmd reads ImageSubsystem to decide whether to wait for a CUI
+        // child; a zero value makes it read console input while the child needs that File.
+        nt_ntdll_layout::write_peb_image_subsystem(
+            &mut *((scr + 0x1000) as *mut [u8; 4096]),
+            pe.subsystem(),
+            pe.subsystem_version(),
+        );
         core::ptr::write_volatile((scr + 0x1000 + 0x10) as *mut u64, layout.base()); // ImageBaseAddress
         core::ptr::write_volatile((scr + 0x1000 + 0x20) as *mut u64, SMSS_PARAMS_VA);
         core::ptr::write_volatile(

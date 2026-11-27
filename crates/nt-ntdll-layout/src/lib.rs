@@ -315,7 +315,12 @@ pub struct Peb {
     pub number_of_processors: u32,
     /// `NtGlobalFlag` (offset 0xBC).
     pub nt_global_flag: u32,
-    _rsvd_c0: [u8; 0x2C0 - 0xC0],
+    _rsvd_c0: [u8; 0x128 - 0xC0],
+    /// The main PE's subsystem, visible to the creator before the first child thread runs.
+    pub image_subsystem: u32,
+    pub image_subsystem_major_version: u32,
+    pub image_subsystem_minor_version: u32,
+    _rsvd_134: [u8; 0x2C0 - 0x134],
     /// `SessionId` (offset 0x2C0).
     pub session_id: u32,
     _rsvd_2c4: [u8; 4],
@@ -340,6 +345,18 @@ pub struct Peb {
     /// `FlsHighIndex` (offset 0x350).
     pub fls_high_index: u32,
     _rsvd_354: [u8; 4],
+}
+
+/// Publish PE image identity in a freshly zeroed x64 PEB page. Process creators inspect this
+/// through `NtReadVirtualMemory` while the new process is still suspended.
+pub fn write_peb_image_subsystem(page: &mut [u8; 4096], subsystem: u16, version: (u16, u16)) {
+    for (offset, value) in [
+        (offset_of!(Peb, image_subsystem), u32::from(subsystem)),
+        (offset_of!(Peb, image_subsystem_major_version), u32::from(version.0)),
+        (offset_of!(Peb, image_subsystem_minor_version), u32::from(version.1)),
+    ] {
+        page[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
 }
 
 /// `TEB` — the Thread Environment Block (`peb_teb.h`, x64). Named fields the hosted binaries touch
@@ -463,6 +480,9 @@ const _: () = assert!(offset_of!(Peb, oem_code_page_data) == 0xA8); // live-RE N
 const _: () = assert!(offset_of!(Peb, unicode_case_table_data) == 0xB0); // live-RE l_intl
 const _: () = assert!(offset_of!(Peb, number_of_processors) == 0xB8);
 const _: () = assert!(offset_of!(Peb, nt_global_flag) == 0xBC); // C_ASSERT(... NtGlobalFlag) == 0x0BC
+const _: () = assert!(offset_of!(Peb, image_subsystem) == 0x128);
+const _: () = assert!(offset_of!(Peb, image_subsystem_major_version) == 0x12C);
+const _: () = assert!(offset_of!(Peb, image_subsystem_minor_version) == 0x130);
 const _: () = assert!(offset_of!(Peb, session_id) == 0x2C0); // C_ASSERT(... SessionId) == 0x2C0
 const _: () = assert!(offset_of!(Peb, activation_context_data) == 0x2F8);
 const _: () = assert!(offset_of!(Peb, process_assembly_storage_map) == 0x300);

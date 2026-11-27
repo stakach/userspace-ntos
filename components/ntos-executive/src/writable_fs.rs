@@ -79,7 +79,7 @@ pub(crate) unsafe fn print_quiesce_snapshot_owners() {
 mod file_cleanup;
 pub(crate) use file_cleanup::{
     acquire_file_io, adopt_file_io, cancel_file_io_waiter, cancel_promoted_file_io,
-    file_io_mode, file_io_waiter_count, promote_file_io_waiter, release_file_io, set_file_mode,
+    file_io_mode, file_io_state, file_io_waiter_count, promote_file_io_waiter, release_file_io, set_file_mode,
     redrive_file_cleanup_work,
 };
 use file_cleanup::publish_file_cleanup_effects;

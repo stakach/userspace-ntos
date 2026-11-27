@@ -43,6 +43,12 @@ pub(crate) unsafe fn file_io_waiter_count(file_id: u64) -> Result<u32, u32> {
         .map(|state| state.waiters)
 }
 
+pub(crate) unsafe fn file_io_state(file_id: u64) -> Result<nt_fs::FileIoState, u32> {
+    mounted_namespace_fs()?
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        .zw_file_io_state(file_id)
+}
+
 pub(crate) unsafe fn cancel_file_io_waiter(file_id: u64) -> Result<u32, u32> {
     let fs = mounted_namespace_fs()?.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     let result = fs.zw_cancel_file_io_waiter(file_id);

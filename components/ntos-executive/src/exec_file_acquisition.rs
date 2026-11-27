@@ -3,7 +3,59 @@
 use super::*;
 use nt_io_manager::FileIoWaitRoute;
 
+// Per process generation, keep enough contended acquisitions to diagnose a new child without
+// turning a busy File into unbounded serial output during a long desktop run.
+static FILE_BUSY_TRACE_GENERATIONS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+static FILE_BUSY_TRACE_COUNTS: [AtomicU32; MAX_PI] = [const { AtomicU32::new(0) }; MAX_PI];
+
 impl ExecNtHandler {
+    unsafe fn trace_owned_file_contention(&self, waiter: nt_io_manager::SynchronousFileWaiter) {
+        if self.pi >= MAX_PI { return; }
+        let Some(generation) = self.hosted_process_generation(self.pi) else { return; };
+        if FILE_BUSY_TRACE_GENERATIONS[self.pi].load(Ordering::Acquire) != generation {
+            FILE_BUSY_TRACE_COUNTS[self.pi].store(0, Ordering::Release);
+            FILE_BUSY_TRACE_GENERATIONS[self.pi].store(generation, Ordering::Release);
+        }
+        if FILE_BUSY_TRACE_COUNTS[self.pi].fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+
+        print_str(b"[native-file-busy] pi/pid/gen/tid/ssn/handle=");
+        print_u64(self.pi as u64); print_str(b"/");
+        print_u64(self.pm_pid_for_pi(self.pi).unwrap_or(0) as u64); print_str(b"/");
+        print_u64(generation); print_str(b"/");
+        print_u64(waiter.tid); print_str(b"/");
+        print_u64(waiter.service_number as u64); print_str(b"/0x");
+        print_hex_u64(waiter.handle as u64);
+        match waiter.route {
+            FileIoWaitRoute::Hosted { file_id, device_id, fs_context } => {
+                let owner = self.file_completion.io_lock_owner(file_id);
+                let grant = self.file_completion.io_grant_owner(file_id);
+                let waiters = self.file_completion.io_waiter_count(file_id);
+                print_str(b" route=hosted file/device/context=0x");
+                print_hex_u64(file_id); print_str(b"/0x");
+                print_hex_u64(device_id); print_str(b"/0x");
+                print_hex_u64(fs_context);
+                print_str(b" owner/grant/waiters=");
+                print_u64(owner.ok().flatten().unwrap_or(0)); print_str(b"/");
+                print_u64(grant.ok().flatten().unwrap_or(0)); print_str(b"/");
+                print_u64(waiters.unwrap_or(0) as u64);
+                print_str(b" state-status=0x");
+                print_hex(owner.err().or(grant.err()).or(waiters.err()).unwrap_or(0));
+            }
+            FileIoWaitRoute::LocalOverlay { file_object } => {
+                let state = crate::writable_fs::file_io_state(file_object);
+                print_str(b" route=overlay file=0x");
+                print_hex_u64(file_object);
+                print_str(b" owner/waiters=");
+                print_u64(state.as_ref().ok().and_then(|value| value.owner_tid).unwrap_or(0));
+                print_str(b"/");
+                print_u64(state.as_ref().map(|value| value.waiters).unwrap_or(0) as u64);
+                print_str(b" state-status=0x");
+                print_hex(state.err().unwrap_or(0));
+            }
+        }
+        print_str(b"\n");
+    }
+
     unsafe fn owned_file_io_mode(&self, route: FileIoWaitRoute) -> Result<nt_io_completion::FileIoMode, u32> {
         match route {
             FileIoWaitRoute::Hosted { file_id, .. } => self.file_completion.io_mode(file_id),
@@ -148,6 +200,7 @@ impl ExecNtHandler {
                 Ok(true)
             }
             Ok(nt_io_completion::FileIoAcquireResult::Contended { alertable }) => {
+                self.trace_owned_file_contention(waiter);
                 // The counted acquisition now owns the captured Event even if cancellation follows.
                 self.current_file_transfer_event = None;
                 let apc_queued = alertable && self.pm.peek_user_apc(waiter.tid as u32).is_some();

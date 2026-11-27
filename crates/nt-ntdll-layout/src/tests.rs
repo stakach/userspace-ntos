@@ -20,6 +20,9 @@ fn peb_offsets() {
     assert_eq!(offset_of!(Peb, unicode_case_table_data), 0xB0);
     assert_eq!(offset_of!(Peb, number_of_processors), 0xB8);
     assert_eq!(offset_of!(Peb, nt_global_flag), 0xBC);
+    assert_eq!(offset_of!(Peb, image_subsystem), 0x128);
+    assert_eq!(offset_of!(Peb, image_subsystem_major_version), 0x12C);
+    assert_eq!(offset_of!(Peb, image_subsystem_minor_version), 0x130);
     assert_eq!(offset_of!(Peb, session_id), 0x2C0);
     assert_eq!(offset_of!(Peb, activation_context_data), 0x2F8);
     assert_eq!(offset_of!(Peb, process_assembly_storage_map), 0x300);
@@ -28,6 +31,28 @@ fn peb_offsets() {
         0x308
     );
     assert_eq!(offset_of!(Peb, system_assembly_storage_map), 0x310);
+}
+
+#[test]
+fn child_peb_exposes_its_console_image_subsystem_before_first_thread_runs() {
+    let mut page = [0u8; 4096];
+    write_peb_image_subsystem(&mut page, 3, (6, 1));
+    assert_eq!(u32::from_le_bytes(page[0x128..0x12C].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(page[0x12C..0x130].try_into().unwrap()), 6);
+    assert_eq!(u32::from_le_bytes(page[0x130..0x134].try_into().unwrap()), 1);
+    // IsConsoleProcess reads the suspended child's PEB with NtReadVirtualMemory. A zero here
+    // classifies a CUI child as GUI and makes cmd resume its input read instead of waiting.
+}
+
+#[test]
+fn gui_child_peb_exposes_its_own_subsystem_without_touching_other_fields() {
+    let mut page = [0xA5u8; 4096];
+    write_peb_image_subsystem(&mut page, 2, (6, 0));
+    assert_eq!(u32::from_le_bytes(page[0x128..0x12C].try_into().unwrap()), 2);
+    assert_eq!(u32::from_le_bytes(page[0x12C..0x130].try_into().unwrap()), 6);
+    assert_eq!(u32::from_le_bytes(page[0x130..0x134].try_into().unwrap()), 0);
+    assert_eq!(page[0x127], 0xA5);
+    assert_eq!(page[0x134], 0xA5);
 }
 
 #[test]
