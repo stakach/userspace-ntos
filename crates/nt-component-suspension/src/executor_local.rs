@@ -95,11 +95,65 @@ impl<T> FsInstallAttempt<T> {
 #[derive(Debug)]
 pub struct FsInstallAcknowledgement {
     executor: ExecutorHandle,
+    tcb: TcbIdentity,
+    target_cap: u64,
 }
 
 impl FsInstallAcknowledgement {
     pub const fn executor(&self) -> ExecutorHandle {
         self.executor
+    }
+
+    pub const fn tcb(&self) -> TcbIdentity {
+        self.tcb
+    }
+
+    pub const fn target_cap(&self) -> u64 {
+        self.target_cap
+    }
+}
+
+/// One-use native proof that this worker's bootstrap SC was removed while the exact TCB was
+/// blocked on its private endpoint with its Reply offered. The native owner retains the worker
+/// resources after issuing this proof.
+#[must_use = "activate the exact worker or retain this proof with its native owner"]
+#[derive(Debug)]
+pub struct PassiveWorkerReadyProof {
+    executor: ExecutorHandle,
+    tcb: TcbIdentity,
+    target_cap: u64,
+}
+
+impl PassiveWorkerReadyProof {
+    /// # Safety
+    /// The caller must own this exact physical TCB incarnation and have observed a successful
+    /// zero-word reply to the checked passive-worker SC unbind for its private endpoint and
+    /// offered Reply. A ready message, numeric cap match, or uncertain result is insufficient.
+    pub unsafe fn from_checked_unbind(
+        executor: ExecutorHandle,
+        tcb: TcbIdentity,
+        target_cap: u64,
+    ) -> Result<Self, ExecutorLocalError> {
+        if tcb.slot == 0 || tcb.generation == 0 || target_cap == 0 {
+            return Err(ExecutorLocalError::InvalidTcbIdentity);
+        }
+        Ok(Self {
+            executor,
+            tcb,
+            target_cap,
+        })
+    }
+
+    pub const fn executor(&self) -> ExecutorHandle {
+        self.executor
+    }
+
+    pub const fn tcb(&self) -> TcbIdentity {
+        self.tcb
+    }
+
+    pub const fn target_cap(&self) -> u64 {
+        self.target_cap
     }
 }
 
@@ -370,7 +424,8 @@ impl<T> ExecutorLocalRegistry<T> {
     }
 
     /// Record the kernel's successful reply for the exact SetTLSBase invocation. The returned
-    /// token is the only safe input that may activate the still-unready executor.
+    /// token is the FS-publication input to activation; a separate checked passive-worker
+    /// receive proof is also required before root may route ingress to this executor.
     ///
     /// # Safety
     /// The caller must have observed a successful reply from invoking `attempt.target_cap()`
@@ -391,6 +446,8 @@ impl<T> ExecutorLocalRegistry<T> {
         binding.publication = FsPublication::Published;
         Ok(FsInstallAcknowledgement {
             executor: attempt.executor,
+            tcb: attempt.tcb,
+            target_cap: attempt.target_cap,
         })
     }
 

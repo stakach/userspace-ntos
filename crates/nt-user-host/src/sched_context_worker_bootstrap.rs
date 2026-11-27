@@ -5,6 +5,9 @@
 //! scheduling context.
 //! A native unbind with an uncertain result leaves every resource retained and cannot be replayed.
 
+use nt_component_suspension::executor_local::{PassiveWorkerReadyProof, TcbIdentity};
+use nt_component_suspension::ExecutorHandle;
+
 /// Capabilities and memory that must remain owned from worker creation through passive handoff.
 /// The bootstrap SC remains here after unbind so its eventual retirement has one owner. A native
 /// adapter must authenticate each physical capability before constructing this bundle; equal
@@ -223,6 +226,7 @@ impl PassiveWorkerBootstrap {
                 .resources
                 .take()
                 .expect("ACKed bootstrap retained resources"),
+            ready_proof_issued: false,
         })
     }
 }
@@ -231,6 +235,7 @@ impl PassiveWorkerBootstrap {
 #[must_use = "transfer the passive worker to its native executive owner"]
 pub struct PassiveWorker {
     resources: WorkerBootstrapResources,
+    ready_proof_issued: bool,
 }
 
 impl PassiveWorker {
@@ -248,5 +253,32 @@ impl PassiveWorker {
     }
     pub fn reply_cap(&self) -> u64 {
         self.resources.reply_cap()
+    }
+
+    /// Issue one readiness proof while keeping all bootstrap resources with this native owner.
+    /// A mismatched cap or duplicate request leaves the owner and its resources intact.
+    ///
+    /// # Safety
+    /// `identity` must name the exact physical incarnation owned by `worker_tcb`, and the
+    /// unbind ACK that produced this passive worker must belong to `executor`. The native owner
+    /// must retain the TCB, endpoint, Reply and bootstrap SC across activation and retirement.
+    pub unsafe fn issue_ready_proof_once(
+        &mut self,
+        executor: ExecutorHandle,
+        identity: TcbIdentity,
+        target_cap: u64,
+    ) -> Result<PassiveWorkerReadyProof, BootstrapError> {
+        if self.ready_proof_issued {
+            return Err(BootstrapError::InvalidState);
+        }
+        if target_cap != self.resources.worker_tcb {
+            return Err(BootstrapError::WrongWorker);
+        }
+        let proof = unsafe {
+            PassiveWorkerReadyProof::from_checked_unbind(executor, identity, target_cap)
+        }
+        .map_err(|_| BootstrapError::WrongWorker)?;
+        self.ready_proof_issued = true;
+        Ok(proof)
     }
 }

@@ -4,7 +4,7 @@
 //! native installation tests use unready registration and an acknowledged FS transaction.
 
 use crate::executor_local::{
-    ExecutorLocalError, ExecutorLocalRegistry, PhysicalTcbClaim, TcbIdentity,
+    ExecutorLocalError, ExecutorLocalRegistry, PassiveWorkerReadyProof, PhysicalTcbClaim, TcbIdentity,
     TcbRetirementObservation,
 };
 use crate::{ExecutorError, ExecutorResume, ExecutorState, ExecutorTable, ExecutorYield};
@@ -471,9 +471,17 @@ fn native_fs_install_acknowledgement_is_the_only_path_to_runnable() {
     // Model a checked, successful kernel reply for this exact cap, base and FS selector.
     let acknowledged = unsafe { locals.acknowledge_fs_install(attempt) }.unwrap();
     assert_eq!(acknowledged.executor(), worker);
+    assert_eq!(acknowledged.tcb(), tcb);
+    assert_eq!(acknowledged.target_cap(), 0x501);
     assert_eq!(table.state(worker), Ok(ExecutorState::Unready));
+    let root = match table.resume(root, ExecutorResume::Unrouted) {
+        Err((ExecutorError::NoIdleExecutor, root)) => root,
+        _ => panic!("FS ACK alone cannot make the worker selectable"),
+    };
+    let ready = unsafe { PassiveWorkerReadyProof::from_checked_unbind(worker, tcb, 0x501) }
+        .unwrap();
     assert!(matches!(
-        table.activate_unready(&root, acknowledged),
+        table.activate_unready(&root, acknowledged, ready),
         Ok(activated) if activated == worker,
     ));
     assert_eq!(table.state(worker), Ok(ExecutorState::Idle));
@@ -484,6 +492,70 @@ fn native_fs_install_acknowledgement_is_the_only_path_to_runnable() {
             .executor(),
         worker
     );
+}
+
+#[test]
+fn fs_ack_alone_cannot_activate_a_worker_before_checked_passive_unbind() {
+    let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+    let worker = table.register_unready(&root).unwrap();
+    let tcb = TcbIdentity::new(0x101, 1);
+    let mut locals = ExecutorLocalRegistry::new();
+    let anchor = locals
+        .bind_native(&table, worker, physical(tcb, 0x501), boxed_probe(0x1000, 0x201))
+        .map_err(|(error, _, _)| error)
+        .unwrap();
+    let attempt = locals.begin_fs_install(anchor, &table).unwrap();
+    let fs_ack = unsafe { locals.acknowledge_fs_install(attempt) }.unwrap();
+
+    // No private receive, offered Reply, or checked bootstrap-SC unbind has been observed.
+    // A SetTLSBase reply proves only FS publication; it cannot make this TCB runnable.
+    assert_eq!(fs_ack.executor(), worker);
+    // The activation API requires a separate checked-unbind proof. Holding only this FS ACK
+    // leaves the worker unavailable for root ingress.
+    assert_eq!(table.state(worker), Ok(ExecutorState::Unready));
+    assert!(matches!(
+        table.resume(root, ExecutorResume::Unrouted),
+        Err((ExecutorError::NoIdleExecutor, _))
+    ));
+}
+
+#[test]
+fn mismatched_ready_proofs_return_both_owners_without_publishing() {
+    for mismatch in 0..3 {
+        let (mut table, root) = ExecutorTable::try_new(2).unwrap();
+        let worker = table.register_unready(&root).unwrap();
+        let other = table.register_unready(&root).unwrap();
+        let tcb = TcbIdentity::new(0x101, 1);
+        let mut locals = ExecutorLocalRegistry::new();
+        let anchor = locals
+            .bind_native(&table, worker, physical(tcb, 0x501), boxed_probe(0x1000, 0x201))
+            .map_err(|(error, _, _)| error)
+            .unwrap();
+        let attempt = locals.begin_fs_install(anchor, &table).unwrap();
+        let fs_ack = unsafe { locals.acknowledge_fs_install(attempt) }.unwrap();
+        let ready = unsafe {
+            PassiveWorkerReadyProof::from_checked_unbind(
+                if mismatch == 0 { other } else { worker },
+                if mismatch == 1 { TcbIdentity::new(0x101, 2) } else { tcb },
+                if mismatch == 2 { 0x502 } else { 0x501 },
+            )
+        }
+        .unwrap();
+
+        let (error, returned_fs, returned_ready) = table
+            .activate_unready(&root, fs_ack, ready)
+            .expect_err("different physical workers cannot become selectable");
+        assert_eq!(error, ExecutorError::WorkerProofMismatch);
+        assert_eq!(returned_fs.executor(), worker);
+        assert_eq!(returned_fs.tcb(), tcb);
+        assert_eq!(returned_fs.target_cap(), 0x501);
+        assert_eq!(returned_ready.executor(), if mismatch == 0 { other } else { worker });
+        assert_eq!(table.state(worker), Ok(ExecutorState::Unready));
+        assert!(matches!(
+            table.resume(root, ExecutorResume::Unrouted),
+            Err((ExecutorError::NoIdleExecutor, _))
+        ));
+    }
 }
 
 #[test]

@@ -6,7 +6,8 @@
 //! effect. Arrivals stay retained by ingress; a refusal here changes nothing and consumes nothing.
 
 use crate::{
-    executor_local::FsInstallAcknowledgement, peer_registry::PeerRoute, LaneDispatchIdentity,
+    executor_local::{FsInstallAcknowledgement, PassiveWorkerReadyProof},
+    peer_registry::PeerRoute, LaneDispatchIdentity,
 };
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -55,7 +56,7 @@ impl ExecutorWait {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutorState {
-    /// Created but not yet bound to an acknowledged physical TCB FS base.
+    /// Created but lacking both an acknowledged FS base and checked passive receive.
     Unready,
     /// At loop-top on its own endpoint; may take any unrouted work.
     Idle,
@@ -104,8 +105,10 @@ pub enum ExecutorError {
     WrongDispatch,
     /// Another executor is already parked on this route.
     RouteOccupied,
-    /// Only an unready executor may be activated by an FS-install acknowledgement.
+    /// Only an unready executor may be activated by both physical worker proofs.
     NotUnready,
+    /// FS publication and checked passive receive refer to different physical workers.
+    WorkerProofMismatch,
 }
 
 /// Root's authority to resume an executor. Each table issues exactly one, and it is lent to at
@@ -196,13 +199,14 @@ impl ExecutorTable {
     ///
     /// # Safety
     /// The caller must own the exact physical TCB, have acknowledged its executor-local FS base,
-    /// and have observed that it is blocked on its private receive endpoint before this table
-    /// may select it for ingress. A ready message or numeric TCB identity is insufficient.
+    /// and have observed a checked bootstrap-SC unbind while it is blocked on its private
+    /// receive endpoint with an offered Reply before this table may select it for ingress.
+    /// A ready message or numeric TCB identity is insufficient.
     pub unsafe fn register(&mut self, root: &RunToken) -> Result<ExecutorHandle, ExecutorError> {
         self.register_with_state(root, ExecutorState::Idle)
     }
 
-    /// Register a worker that cannot receive ingress until its FS base is acknowledged.
+    /// Register a worker that cannot receive ingress until FS and passive receive are proven.
     pub fn register_unready(&mut self, root: &RunToken) -> Result<ExecutorHandle, ExecutorError> {
         self.register_with_state(root, ExecutorState::Unready)
     }
@@ -238,23 +242,30 @@ impl ExecutorTable {
         Ok(self.handle(index))
     }
 
-    /// Publish an unready worker only after the registry observed a successful SetTLSBase reply.
-    /// A dropped or mismatched acknowledgement leaves the worker unready.
+    /// Publish an unready worker only after both FS publication and checked passive unbind
+    /// acknowledge the same executor incarnation and physical TCB. Refusal returns both proofs.
     pub fn activate_unready(
         &mut self,
         root: &RunToken,
         acknowledged: FsInstallAcknowledgement,
-    ) -> Result<ExecutorHandle, (ExecutorError, FsInstallAcknowledgement)> {
+        ready: PassiveWorkerReadyProof,
+    ) -> Result<ExecutorHandle, (ExecutorError, FsInstallAcknowledgement, PassiveWorkerReadyProof)> {
         if root.table != self.id {
-            return Err((ExecutorError::WrongTable, acknowledged));
+            return Err((ExecutorError::WrongTable, acknowledged, ready));
         }
         let executor = acknowledged.executor();
+        if ready.executor() != executor
+            || ready.tcb() != acknowledged.tcb()
+            || ready.target_cap() != acknowledged.target_cap()
+        {
+            return Err((ExecutorError::WorkerProofMismatch, acknowledged, ready));
+        }
         if let Err(error) = self.state(executor) {
-            return Err((error, acknowledged));
+            return Err((error, acknowledged, ready));
         }
         let slot = &mut self.slots[executor.index as usize];
         if slot.state != ExecutorState::Unready {
-            return Err((ExecutorError::NotUnready, acknowledged));
+            return Err((ExecutorError::NotUnready, acknowledged, ready));
         }
         slot.state = ExecutorState::Idle;
         Ok(executor)

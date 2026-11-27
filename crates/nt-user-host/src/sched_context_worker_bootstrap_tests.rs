@@ -7,6 +7,8 @@ use super::{
     BlockedWorkerObservation, BootstrapError, BootstrapUnbindIo, PassiveWorkerBootstrap,
     ReplyObservation, UnbindOutcome, WorkerBootstrapResources,
 };
+use nt_component_suspension::executor_local::TcbIdentity;
+use nt_component_suspension::ExecutorTable;
 
 const WORKER_TCB: u64 = 400;
 const PRIVATE_ENDPOINT: u64 = 500;
@@ -117,13 +119,32 @@ fn only_exact_blocked_worker_and_offered_reply_permit_unbind() {
     assert_eq!(unbinder.last_request, Some((
         BOOTSTRAP_SC, WORKER_TCB, PRIVATE_ENDPOINT, REPLY_CAP,
     )));
-    let passive = owner
+    let mut passive = owner
         .take_passive()
         .expect("acknowledged unbind yields passive worker");
     assert_eq!(passive.worker_tcb(), WORKER_TCB);
     assert_eq!(passive.private_endpoint(), PRIVATE_ENDPOINT);
     assert_eq!(passive.bootstrap_sc(), BOOTSTRAP_SC);
     assert_eq!(passive.ipc_buffer(), IPC_BUFFER);
+    assert_eq!(passive.reply_cap(), REPLY_CAP);
+    let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+    let executor = table.register_unready(&root).unwrap();
+    let tcb = TcbIdentity::new(WORKER_TCB, 1);
+    assert!(matches!(
+        unsafe { passive.issue_ready_proof_once(executor, tcb, WORKER_TCB + 1) },
+        Err(BootstrapError::WrongWorker)
+    ));
+    let ready = unsafe { passive.issue_ready_proof_once(executor, tcb, WORKER_TCB) }.unwrap();
+    assert_eq!(ready.executor(), executor);
+    assert_eq!(ready.tcb(), tcb);
+    assert_eq!(ready.target_cap(), WORKER_TCB);
+    assert!(matches!(
+        unsafe { passive.issue_ready_proof_once(executor, tcb, WORKER_TCB) },
+        Err(BootstrapError::InvalidState)
+    ));
+    assert_eq!(passive.worker_tcb(), WORKER_TCB);
+    assert_eq!(passive.private_endpoint(), PRIVATE_ENDPOINT);
+    assert_eq!(passive.bootstrap_sc(), BOOTSTRAP_SC);
     assert_eq!(passive.reply_cap(), REPLY_CAP);
     assert!(owner.take_passive().is_none());
 }
