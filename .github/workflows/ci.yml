@@ -66,6 +66,12 @@ jobs:
         run: cargo test --manifest-path rust-micro/crates/sel4-rt/Cargo.toml --lib 2>&1 | tee sel4-rt-specs.log
       - name: ntdll native-transport specs
         run: cargo test -p nt-ntdll --features native_transport --locked 2>&1 | tee native-transport-specs.log
+      - name: Install OCR dependency for saved desktop frames
+        run: |
+          if ! command -v tesseract >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng
+          fi
       - name: KVM runner and desktop gate specs
         run: python3 -m unittest discover -s scripts/tests -p 'test_ci_kvm_smoke_*.py' 2>&1 | tee kvm-runner-specs.log
       - name: Native acceptance log verifier specs
