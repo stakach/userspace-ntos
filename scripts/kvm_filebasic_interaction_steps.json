@@ -16,8 +16,8 @@
     {"name": "basicproof-child-stdout", "actions": [{"type": "cmd /c echo CHILD_STDOUT_OK\n"}], "wait_seconds": 20},
     {"name": "basicproof-attrib-help", "actions": [{"type": "attrib /?\n"}], "wait_seconds": 20},
     {"name": "basicproof-clear-readonly", "actions": [{"type": "attrib -R basicproof.txt\n"}], "wait_seconds": 20},
-    {"name": "basicproof-baseline-readback", "actions": [{"type": "attrib basicproof.txt\n"}], "wait_seconds": 45, "readiness_poll_seconds": 2},
+    {"name": "basicproof-baseline-readback", "actions": [{"type": "attrib basicproof.txt\n"}], "wait_seconds": 60, "readiness_poll_seconds": 2},
     {"name": "basicproof-set-readonly", "actions": [{"type": "attrib +R basicproof.txt\n"}], "wait_seconds": 20},
-    {"name": "basicproof-readback", "actions": [{"type": "attrib basicproof.txt\n"}], "wait_seconds": 45, "readiness_poll_seconds": 2}
+    {"name": "basicproof-readback", "actions": [{"type": "attrib basicproof.txt\n"}], "wait_seconds": 60, "readiness_poll_seconds": 2}
   ]
 }

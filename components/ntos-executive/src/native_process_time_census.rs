@@ -69,6 +69,9 @@ struct Row {
     families: [FamilyTotal; FAMILY_COUNT],
     hot_file: [HotIoCost; 2],
     reported_calls: u64,
+    sampled_calls: u64,
+    observed_censuses: u8,
+    stalled_reported: bool,
     baseline: Option<ScBaseline>,
     guest_us: u64,
     server_us: u64,
@@ -82,6 +85,7 @@ struct Row {
 impl Row {
     const EMPTY: Self = Self {
         generation: 0, families: [FamilyTotal::EMPTY; FAMILY_COUNT], reported_calls: 0,
+        sampled_calls: 0, observed_censuses: 0, stalled_reported: false,
         hot_file: [HotIoCost::EMPTY; 2],
         baseline: None, guest_us: 0, server_us: 0, wall_us: 0, sc_gaps: 0,
         sc_failures: 0, live_threads: 0, parked_threads: 0,
@@ -100,11 +104,13 @@ struct ScScan {
     donated_us: u64,
     parked: u64,
     failures: u64,
+    single_tid: u64,
+    single_badge: u64,
 }
 
 impl ScScan {
     const EMPTY: Self = Self { signature: 0, count: 0, bound_us: 0,
-        donated_us: 0, parked: 0, failures: 0 };
+        donated_us: 0, parked: 0, failures: 0, single_tid: 0, single_badge: 0 };
 }
 
 static mut ROWS: [Row; MAX_PI] = [Row::EMPTY; MAX_PI];
@@ -276,6 +282,13 @@ pub(crate) fn sample_after_census(handler: &ExecNtHandler) {
         if rows[pi].generation != generation { continue; }
         let scan = &mut scans[pi];
         scan.count = scan.count.saturating_add(1);
+        if scan.count == 1 {
+            scan.single_tid = binding.tid;
+            scan.single_badge = binding.badge;
+        } else {
+            scan.single_tid = 0;
+            scan.single_badge = 0;
+        }
         scan.parked = scan.parked.saturating_add(u64::from(
             thread_wait_state_badge_parked(binding.badge)));
         if lifetime.is_none() {
@@ -328,6 +341,16 @@ pub(crate) fn sample_after_census(handler: &ExecNtHandler) {
             row.baseline = None;
         }
         let calls = row.calls();
+        row.observed_censuses = row.observed_censuses.saturating_add(1);
+        if (2..=6).contains(&row.observed_censuses) && !row.stalled_reported
+            && calls != 0 && calls == row.sampled_calls
+            && scan.count == 1 && scan.parked == 1 && scan.failures == 0
+        {
+            print_recent_parked_owner(handler, pi, row.generation, scan,
+                now_100ns, calls);
+            row.stalled_reported = true;
+        }
+        row.sampled_calls = calls;
         if setup_pi == Some(pi) {
             if let Some(process) = handler.capture_process_identity(pi) {
                 setup_sample = Some(SetupOwnerSample { process_index: pi, pid: process.pid,
@@ -368,6 +391,43 @@ pub(crate) fn sample_after_census(handler: &ExecNtHandler) {
         print_str(b"[native-process-time] replaced-generations=");
         print_u64(unsafe { REPLACED_GENERATIONS }); print_str(b"\n");
     }
+}
+
+/// One bounded stationary sample for a newly observed process generation. The normal census
+/// suppresses unchanged call counts, which hid the FileBasic readback child's parked owner.
+fn print_recent_parked_owner(handler: &ExecNtHandler, pi: usize, generation: u64,
+    scan: ScScan, now_100ns: u64, calls: u64)
+{
+    let Some(process) = handler.capture_process_identity(pi) else { return; };
+    if process.generation != nt_user_host::process_identity::ProcessGeneration::Hosted(generation)
+        || handler.hosted_thread_badge_for_tid(scan.single_tid) != Some(scan.single_badge)
+        || !thread_wait_state_badge_parked(scan.single_badge)
+    { return; }
+    print_str(b"[native-recent-parked] pi/pid/gen/tid/badge/calls/bound-us/donated-us=");
+    for (index, value) in [pi as u64, u64::from(process.pid), generation,
+        scan.single_tid, scan.single_badge, calls, scan.bound_us, scan.donated_us]
+        .into_iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(value);
+    }
+    if let Some(site) = thread_wait_state_badge_park_site(scan.single_badge) {
+        // The table records a badge's first park site; the current thread/process generation
+        // is checked above, but the site itself is diagnostic provenance, not authority.
+        print_str(b" badge-park-site=");
+        print_str(site.file().as_bytes());
+        print_str(b":");
+        print_u64(u64::from(site.line()));
+    }
+    if let Some((sequence, object, age_100ns)) =
+        object_waiter_oldest_unselected_for_thread(pi, process, scan.single_tid, now_100ns)
+    {
+        print_str(b" object-wait-seq/object/age-ms=");
+        print_u64(sequence); print_str(b"/0x"); print_hex_u64(object);
+        print_str(b"/"); print_u64(age_100ns / 10_000);
+    } else {
+        print_str(b" object-wait=none");
+    }
+    print_str(b"\n");
 }
 
 fn print_setup_owner_receipt(handler: &ExecNtHandler, rows: &[Row; MAX_PI], now_100ns: u64,

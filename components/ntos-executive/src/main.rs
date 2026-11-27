@@ -2362,8 +2362,14 @@ static WAIT_REPLY_POOL_SLOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WAIT_REPLY_POOL_RETYPE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WAIT_REPLY_POOL_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy)]
+struct ThreadWaitPark {
+    badge_plus_one: u64,
+    site: &'static core::panic::Location<'static>,
+}
+
 struct ThreadWaitParkTable {
-    badges_plus_one: Vec<u64>,
+    entries: Vec<ThreadWaitPark>,
     allocation_failures: u64,
     store_failures: u64,
 }
@@ -2371,16 +2377,16 @@ struct ThreadWaitParkTable {
 impl ThreadWaitParkTable {
     const fn new() -> Self {
         Self {
-            badges_plus_one: Vec::new(),
+            entries: Vec::new(),
             allocation_failures: 0,
             store_failures: 0,
         }
     }
 
     fn reset(&mut self, initial_reserve: usize) -> bool {
-        self.badges_plus_one.clear();
-        if self.badges_plus_one.capacity() < initial_reserve
-            && self.badges_plus_one.try_reserve(initial_reserve).is_err()
+        self.entries.clear();
+        if self.entries.capacity() < initial_reserve
+            && self.entries.try_reserve(initial_reserve).is_err()
         {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
             return false;
@@ -2390,26 +2396,32 @@ impl ThreadWaitParkTable {
 
     fn contains(&self, badge: u64) -> bool {
         let needle = badge.saturating_add(1);
-        needle != 0 && self.badges_plus_one.contains(&needle)
+        needle != 0 && self.entries.iter().any(|entry| entry.badge_plus_one == needle)
     }
 
-    fn park(&mut self, badge: u64) {
+    fn site(&self, badge: u64) -> Option<&'static core::panic::Location<'static>> {
+        let needle = badge.checked_add(1)?;
+        self.entries.iter().find(|entry| entry.badge_plus_one == needle)
+            .map(|entry| entry.site)
+    }
+
+    fn park(&mut self, badge: u64, site: &'static core::panic::Location<'static>) {
         let encoded = badge.saturating_add(1);
         if encoded == 0 || self.contains(badge) {
             return;
         }
-        if let Some(slot) = self.badges_plus_one.iter_mut().find(|slot| **slot == 0) {
-            *slot = encoded;
+        if let Some(slot) = self.entries.iter_mut().find(|slot| slot.badge_plus_one == 0) {
+            *slot = ThreadWaitPark { badge_plus_one: encoded, site };
             return;
         }
-        if self.badges_plus_one.len() == self.badges_plus_one.capacity() {
-            if self.badges_plus_one.try_reserve(1).is_err() {
+        if self.entries.len() == self.entries.capacity() {
+            if self.entries.try_reserve(1).is_err() {
                 self.allocation_failures = self.allocation_failures.saturating_add(1);
                 self.store_failures = self.store_failures.saturating_add(1);
                 return;
             }
         }
-        self.badges_plus_one.push(encoded);
+        self.entries.push(ThreadWaitPark { badge_plus_one: encoded, site });
     }
 
     fn clear(&mut self, badge: u64) {
@@ -2417,21 +2429,21 @@ impl ThreadWaitParkTable {
         if encoded == 0 {
             return;
         }
-        for slot in &mut self.badges_plus_one {
-            if *slot == encoded {
-                *slot = 0;
+        for slot in &mut self.entries {
+            if slot.badge_plus_one == encoded {
+                slot.badge_plus_one = 0;
             }
         }
     }
 
     fn stats(&self) -> (usize, usize, usize, u64, u64) {
         (
-            self.badges_plus_one
+            self.entries
                 .iter()
-                .filter(|badge| **badge != 0)
+                .filter(|entry| entry.badge_plus_one != 0)
                 .count(),
-            self.badges_plus_one.len(),
-            self.badges_plus_one.capacity(),
+            self.entries.len(),
+            self.entries.capacity(),
             self.allocation_failures,
             self.store_failures,
         )
@@ -18185,9 +18197,11 @@ fn thread_wait_state_reset() -> bool {
     }
 }
 
+#[track_caller]
 fn thread_wait_state_park_badge(badge: u64) {
     unsafe {
-        (&mut *core::ptr::addr_of_mut!(THREAD_WAIT_PARKED)).park(badge);
+        (&mut *core::ptr::addr_of_mut!(THREAD_WAIT_PARKED))
+            .park(badge, core::panic::Location::caller());
     }
 }
 
@@ -18216,6 +18230,7 @@ fn thread_wait_state_set_badge(
     }
 }
 
+#[track_caller]
 fn thread_wait_state_park_badge_waiting(handler: &mut ExecNtHandler, badge: u64) {
     thread_wait_state_park_badge(badge);
     thread_wait_state_set_badge(handler, badge, nt_process::ThreadState::Waiting);
@@ -18257,6 +18272,12 @@ fn thread_wait_state_clear_tid_ready(handler: &mut ExecNtHandler, tid: u64) {
 
 fn thread_wait_state_badge_parked(badge: u64) -> bool {
     unsafe { (&*core::ptr::addr_of!(THREAD_WAIT_PARKED)).contains(badge) }
+}
+
+fn thread_wait_state_badge_park_site(
+    badge: u64,
+) -> Option<&'static core::panic::Location<'static>> {
+    unsafe { (&*core::ptr::addr_of!(THREAD_WAIT_PARKED)).site(badge) }
 }
 
 fn thread_wait_state_stats() -> (usize, usize, usize, u64, u64) {
