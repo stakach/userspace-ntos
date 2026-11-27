@@ -6,7 +6,7 @@
 //!
 //! There is one executor today, the root TCB, and therefore one block. [`local`] is the single
 //! place that changes when an executor gets its own: the block's address is then published
-//! through the TCB's gs base and read back here. Resolve [`local`] at each use. The reference
+//! through the TCB's FS base and read back here. Resolve [`local`] at each use. The reference
 //! belongs to the calling executor and must not be stored in shared state.
 //!
 //! The block is an ordinary image static, with the same mapping as the statics it replaces:
@@ -94,7 +94,7 @@ pub(crate) struct TransientLane {
 }
 
 impl ExecutorLocal {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             ipc_buffer: AtomicU64::new(0),
             reply_main_slot: AtomicU64::new(0),
@@ -117,6 +117,33 @@ impl ExecutorLocal {
 
 /// The root executor's block.
 static ROOT_EXECUTOR_LOCAL: ExecutorLocal = ExecutorLocal::new();
+
+/// Install an executor-local block on the current root TCB. The invocation updates both the
+/// live FS base and the TCB's saved base, so context switches preserve the same selection.
+#[cfg(feature = "executor-local-fs-probe")]
+#[inline]
+fn select_current_tcb(block: &'static ExecutorLocal) -> bool {
+    // Root boot CSpace slot 1 is the current root TCB; selector 0 sets FS, leaving GS for TEB.
+    unsafe {
+        crate::syscall5_call(1, crate::LBL_TCB_SET_TLS_BASE << 12, block as *const _ as u64, 0, 0)
+            == 0
+    }
+}
+
+#[cfg(feature = "executor-local-fs-probe")]
+pub(crate) fn install_root() -> bool {
+    select_current_tcb(&ROOT_EXECUTOR_LOCAL)
+}
+
+#[cfg(feature = "executor-local-fs-probe")]
+pub(crate) fn probe_fs_selection(other: &'static ExecutorLocal) -> bool {
+    let selected = select_current_tcb(other);
+    let observed_other = selected && core::ptr::eq(local(), other);
+    // Restore the root TCB before any result handling, including a failed selection.
+    let restored = select_current_tcb(&ROOT_EXECUTOR_LOCAL);
+    let observed_root = restored && core::ptr::eq(local(), &ROOT_EXECUTOR_LOCAL);
+    selected && observed_other && restored && observed_root
+}
 
 /// The calling executor's block.
 #[inline(always)]

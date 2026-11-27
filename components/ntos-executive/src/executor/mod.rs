@@ -15,3 +15,5 @@
 mod local;
 
 pub(crate) use local::{local, TransientLane, REPLY_MAIN_SLOT, RECEIVE_TRACE_DEPTH};
+#[cfg(feature = "executor-local-fs-probe")]
+pub(crate) use local::{install_root, probe_fs_selection, ExecutorLocal};

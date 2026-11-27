@@ -20,6 +20,9 @@ if [ "${NTOS_MUP_PROVIDER_KERNEL_ONLY:-0}" = 1 ]; then
   fi
   set -- "$@" --features mup-provider-kernel-only
 fi
+if [ "${NTOS_EXECUTOR_LOCAL_FS_PROBE:-0}" = 1 ]; then
+  set -- "$@" --features executor-local-fs-probe
+fi
 
 # Extra args are forwarded to cargo — e.g. `./build.sh --features debug-trace` to enable
 # the grind-era verbose trace diagnostics. The DEFAULT build (no args) is feature-off = ships.

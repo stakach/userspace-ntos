@@ -24,6 +24,8 @@ debug-trace = []
 mup-provider-kernel-only = []
 # Validation-only win32k-origin IRP caller; excluded from production images.
 source-irp-integration = []
+# Native preboot check that the current TCB's FS anchor selects its executor-local block.
+executor-local-fs-probe = []
 
 [dependencies]
 # Kernel ABI + SURT transport.

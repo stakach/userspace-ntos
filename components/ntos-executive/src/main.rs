@@ -29444,9 +29444,26 @@ struct Fat32 {
     root_cl: u32,    // root directory cluster
 }
 
+#[cfg(feature = "executor-local-fs-probe")]
+static PROBE_EXECUTOR_LOCAL: executor::ExecutorLocal = executor::ExecutorLocal::new();
+
 #[no_mangle]
 #[link_section = ".text._start"]
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
+    #[cfg(feature = "executor-local-fs-probe")]
+    {
+        if !executor::install_root() {
+            print_str(b"[boot] root executor FS anchor install failed\n");
+            park();
+        }
+        let passed = executor::probe_fs_selection(&PROBE_EXECUTOR_LOCAL);
+        if passed {
+            print_str(b"[executor-local-fs-probe] PASS\n");
+        } else {
+            print_str(b"[executor-local-fs-probe] FAIL\n");
+            park();
+        }
+    }
     let bi = &*bootinfo;
     if initialize_loader_acpi_root(bi).is_err() {
         print_str(b"[boot] platform did not publish a valid ACPI loader root\n");

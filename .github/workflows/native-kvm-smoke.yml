@@ -42,6 +42,10 @@ on:
         description: Place worker threads on their affinity cores (the default); clear to build with NTOS_GUEST_WORKER_MULTICORE=0 and keep every guest thread on core 0
         type: boolean
         default: true
+      executor_local_fs_probe:
+        description: Build the preboot native FS-selection regression probe
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -193,6 +197,7 @@ jobs:
       - name: Build native image from verified pinned LiberNT release
         env:
           NTOS_GUEST_WORKER_MULTICORE: ${{ inputs.multicore && '1' || '0' }}
+          NTOS_EXECUTOR_LOCAL_FS_PROBE: ${{ inputs.executor_local_fs_probe && '1' || '0' }}
         run: |
           set -o pipefail
           bash rust-micro/scripts/test_simpleboot_source.sh
