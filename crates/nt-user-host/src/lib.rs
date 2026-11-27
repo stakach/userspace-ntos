@@ -45,6 +45,10 @@ mod returned_pump_owner_tests;
 mod retained_owner_table_tests;
 pub mod root_ingress_handoff;
 pub mod root_handoff_readmission;
+pub mod root_executor_turn;
+#[cfg(test)]
+#[path = "root_executor_turn_tests.rs"]
+mod root_executor_turn_tests;
 pub mod root_ingress_result;
 pub mod root_ingress_read_request;
 

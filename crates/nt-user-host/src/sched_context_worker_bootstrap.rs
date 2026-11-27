@@ -56,12 +56,18 @@ impl WorkerBootstrapResources {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplyObservation {
+    /// No receive has offered this object; root's Call cannot bind it to this worker.
     Free,
+    /// The object is offered to the observed worker, unbound to any caller or Reply chain.
+    OfferedToWorker,
+    /// Bound to a caller or offered to a different worker.
     Held,
 }
 
 /// Native observation of the worker blocked at its own first receive. The native adapter must
 /// derive this from authenticated TCB/endpoint/Reply state, not from a request's claimed IDs.
+/// `OfferedToWorker` requires the kernel Reply object to name this exact TCB as its offered
+/// receiver and have no bound caller or Reply-chain links.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockedWorkerObservation {
     pub(super) worker_tcb: u64,
@@ -104,7 +110,7 @@ pub enum BootstrapError {
     InvalidResources,
     InvalidState,
     WrongWorker,
-    ReplyHeld,
+    ReplyNotOffered,
     UnbindIndeterminate(u64),
 }
 
@@ -163,8 +169,8 @@ impl PassiveWorkerBootstrap {
         {
             return Err(BootstrapError::WrongWorker);
         }
-        if observed.reply != ReplyObservation::Free {
-            return Err(BootstrapError::ReplyHeld);
+        if observed.reply != ReplyObservation::OfferedToWorker {
+            return Err(BootstrapError::ReplyNotOffered);
         }
         self.phase = Phase::Blocked;
         Ok(())

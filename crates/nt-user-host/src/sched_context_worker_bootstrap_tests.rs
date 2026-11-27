@@ -4,8 +4,8 @@
 //! establish that physical state before the table may receive a passive-worker proof.
 
 use super::{
-    BlockedWorkerObservation, BootstrapUnbindIo, PassiveWorkerBootstrap, ReplyObservation,
-    UnbindOutcome, WorkerBootstrapResources,
+    BlockedWorkerObservation, BootstrapError, BootstrapUnbindIo, PassiveWorkerBootstrap,
+    ReplyObservation, UnbindOutcome, WorkerBootstrapResources,
 };
 
 const WORKER_TCB: u64 = 400;
@@ -32,6 +32,28 @@ fn observed(tcb: u64, endpoint: u64, reply: ReplyObservation) -> BlockedWorkerOb
     }
 }
 
+#[test]
+fn first_receive_requires_reply_offered_to_the_exact_blocked_worker() {
+    let mut owner = PassiveWorkerBootstrap::new(resources()).unwrap();
+    // rust-micro's receive_ipc offers the Reply object to this worker before blocking.
+    // An unoffered Reply cannot receive root's later Call with this Reply object.
+    assert_eq!(
+        owner.observe_blocked(observed(
+            WORKER_TCB,
+            PRIVATE_ENDPOINT,
+            ReplyObservation::Free
+        )),
+        Err(BootstrapError::ReplyNotOffered),
+    );
+    owner
+        .observe_blocked(observed(
+            WORKER_TCB,
+            PRIVATE_ENDPOINT,
+            ReplyObservation::OfferedToWorker,
+        ))
+        .unwrap();
+}
+
 struct Unbinder {
     result: UnbindOutcome,
     calls: usize,
@@ -46,7 +68,7 @@ impl BootstrapUnbindIo for Unbinder {
 }
 
 #[test]
-fn only_exact_blocked_worker_and_free_reply_permit_unbind() {
+fn only_exact_blocked_worker_and_offered_reply_permit_unbind() {
     let mut owner = PassiveWorkerBootstrap::new(resources()).unwrap();
     let mut unbinder = Unbinder {
         result: UnbindOutcome::Acknowledged,
@@ -59,14 +81,14 @@ fn only_exact_blocked_worker_and_free_reply_permit_unbind() {
         .observe_blocked(observed(
             WORKER_TCB + 1,
             PRIVATE_ENDPOINT,
-            ReplyObservation::Free
+            ReplyObservation::OfferedToWorker
         ))
         .is_err());
     assert!(owner
         .observe_blocked(observed(
             WORKER_TCB,
             PRIVATE_ENDPOINT + 1,
-            ReplyObservation::Free
+            ReplyObservation::OfferedToWorker
         ))
         .is_err());
     assert!(owner
@@ -83,7 +105,7 @@ fn only_exact_blocked_worker_and_free_reply_permit_unbind() {
         .observe_blocked(observed(
             WORKER_TCB,
             PRIVATE_ENDPOINT,
-            ReplyObservation::Free,
+            ReplyObservation::OfferedToWorker,
         ))
         .unwrap();
     assert!(owner.take_passive().is_none());
@@ -107,7 +129,7 @@ fn indeterminate_unbind_retains_owner_and_cannot_replay_native_effect() {
         .observe_blocked(observed(
             WORKER_TCB,
             PRIVATE_ENDPOINT,
-            ReplyObservation::Free,
+            ReplyObservation::OfferedToWorker,
         ))
         .unwrap();
     let mut unbinder = Unbinder {
