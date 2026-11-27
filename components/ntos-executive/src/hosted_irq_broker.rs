@@ -65,7 +65,7 @@ struct ClassCallbackAck {
     output: hosted_irq_stack_lease::IrqStackLeaseId,
 }
 
-/// Bound a live keyboard delivery trace to the first 512 class records. QMP acknowledgement
+/// Bound a live keyboard delivery trace to the first 1024 class records. QMP acknowledgement
 /// proves only host injection; this receipt proves the authenticated port record reached the
 /// class callback and reports how many records kbdclass consumed in the same batch.
 static KEYBOARD_CLASS_RECORD_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -81,7 +81,7 @@ unsafe fn trace_keyboard_class_records(
         return;
     };
     for index in 0..bytes / RECORD_BYTES {
-        if KEYBOARD_CLASS_RECORD_TRACE_COUNT.load(Ordering::Relaxed) >= 512 {
+        if KEYBOARD_CLASS_RECORD_TRACE_COUNT.load(Ordering::Relaxed) >= 1024 {
             break;
         }
         let Some(offset) = source_offset.checked_add((index * RECORD_BYTES) as u64) else {
@@ -94,7 +94,7 @@ unsafe fn trace_keyboard_class_records(
             break;
         }
         let sequence = KEYBOARD_CLASS_RECORD_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-        if sequence >= 512 {
+        if sequence >= 1024 {
             break;
         }
         let code = u16::from_le_bytes([record[2], record[3]]);

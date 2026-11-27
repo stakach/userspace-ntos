@@ -13,6 +13,7 @@ import threading
 import time
 
 if __package__:
+    from .ci_kvm_keyboard_receipt import KeyboardClassReceipt
     from .ci_kvm_cursor import prove_cursor_position
     from .ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script, screenshot_name
     from .ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
@@ -27,6 +28,7 @@ if __package__:
                                       prove_readonly_attribute, prove_ready_prompt,
                                       prove_start_menu_search_box, prove_ver_result)
 else:
+    from ci_kvm_keyboard_receipt import KeyboardClassReceipt
     from ci_kvm_cursor import prove_cursor_position
     from ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script, screenshot_name
     from ci_kvm_qmp_control import (QEMU_SHUTDOWN_ACTION, guest_shutdown_paused,
@@ -62,6 +64,7 @@ VERDICT = ROOT / "native-kvm-verdict.json"
 # The boot ran its whole bound without a fault or a desktop: a setup disk worth continuing.
 BOUND_REACHED_MARKER = ROOT / "native-kvm-bound-reached.txt"
 FILEBASIC_CHECKPOINTS = ("basicproof-baseline-readback", "basicproof-readback")
+KEYBOARD_RECEIPT_TIMEOUT = 10  # one missing event halts input; never replay uncertain effects
 
 # Fixed 60-second QMP samples repeatedly hit the same clock-publication RIP,
 # while the guest's own cycle counter showed that path used only a few seconds.
@@ -544,7 +547,12 @@ def capture_framebuffer(path=SCREENSHOT):
 
 
 def send_input_batches(batches):
-    """Inject guest input over one QMP session, pausing after each batch's sync."""
+    """Inject guest input, waiting for each key's consumed class record."""
+    keyboard = KeyboardClassReceipt(LOG)
+    for events, _pause in batches:
+        for event in events:
+            if event["type"] == "key":
+                keyboard.expected(event)  # reject unmapped events before any QMP side effect
     with socket.socket(socket.AF_UNIX) as connection:
         connection.settimeout(10)
         connection.connect(str(QMP_SOCKET))
@@ -560,6 +568,9 @@ def send_input_batches(batches):
                                           "arguments": {"events": events},
                                           "id": command_id}) + "\n").encode())
                 qmp_reply(stream, command_id)
+                for event in events:
+                    if event["type"] == "key":
+                        keyboard.wait_for(event, KEYBOARD_RECEIPT_TIMEOUT)
                 time.sleep(pause)
 
 

@@ -5,12 +5,14 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.ci_kvm_interaction import (
     DEFAULT_SCRIPT, InteractionRunner, action_batches, chord_batches, load_script,
     parse_script, pointer_batches, relative_deltas, screenshot_name, text_chords,
 )
-from scripts.ci_kvm_smoke import DESKTOP_EPOCH_SEALED_RECORD, SerialPanicDetector
+from scripts.ci_kvm_smoke import (DESKTOP_EPOCH_SEALED_RECORD, SerialPanicDetector,
+                                  send_input_batches)
 from scripts.ci_kvm_cursor import CursorProof, cursor_is_at_target
 from scripts.ci_kvm_visual_proof import VisualProof
 
@@ -185,6 +187,62 @@ class EventGenerationTests(unittest.TestCase):
         self.assertEqual(text_chords("echo x>proof.txt\n")[6], ("shift", "dot"))
         self.assertEqual(keys(action_batches(("type", "v\n"), (1024, 768))),
                          [("v", True), ("v", False), ("ret", True), ("ret", False)])
+
+    def test_qmp_ack_without_class_receipt_holds_the_next_key(self):
+        class QmpStream:
+            def __init__(self):
+                self.commands = []
+                self.pending = [b'{"QMP":{}}\n']
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def write(self, data):
+                command = json.loads(data)
+                self.commands.append(command)
+                self.pending.append((json.dumps({"id": command["id"], "return": {}})
+                                     + "\n").encode())
+
+            def readline(self):
+                return self.pending.pop(0)
+
+        class QmpSocket:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def settimeout(self, _seconds):
+                pass
+
+            def connect(self, _path):
+                pass
+
+            def makefile(self, *_args, **_kwargs):
+                return self.stream
+
+        with tempfile.TemporaryDirectory() as directory:
+            serial = Path(directory) / "serial.log"
+            serial.write_bytes(b"")
+            stream = QmpStream()
+            with (mock.patch("scripts.ci_kvm_smoke.LOG", serial),
+                  mock.patch("scripts.ci_kvm_smoke.QMP_SOCKET", Path(directory) / "qmp"),
+                  mock.patch("scripts.ci_kvm_smoke.socket.socket",
+                             return_value=QmpSocket(stream)),
+                  mock.patch("scripts.ci_kvm_smoke.KEYBOARD_RECEIPT_TIMEOUT", 0.02,
+                             create=True)):
+                with self.assertRaisesRegex(RuntimeError, "keyboard.*class receipt"):
+                    send_input_batches(chord_batches(("m",)))
+            sent = [entry for entry in stream.commands
+                    if entry["execute"] == "input-send-event"]
+            self.assertEqual(len(sent), 1)
 
 
 class FakeClock:
@@ -462,6 +520,24 @@ class InteractionRunnerTests(unittest.TestCase):
         self.assertEqual(runner.failures, 1)
         self.assertEqual(self.captured, [])
 
+    def test_uncertain_input_on_unchecked_step_stops_before_next_action(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [{"name": "text", "actions": [
+                                   {"type": "a"}, {"type": "b"}],
+                                   "wait_seconds": 0}]})
+        calls = []
+        def uncertain(batches):
+            calls.append(batches)
+            raise RuntimeError("keyboard a make missing class receipt")
+        runner = InteractionRunner(script, uncertain, self.captured.append,
+                                   self.log, self.clock)
+        runner.arm(0)
+        runner.advance(0)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.captured, [])
+
     def test_visual_infrastructure_failure_halts_without_retry(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
                                "steps": [
@@ -566,7 +642,7 @@ class InteractionRunnerTests(unittest.TestCase):
                                          "native-kvm-interact-03-ver.ppm"])
         self.assertEqual(runner.failures, 0)
 
-    def test_input_and_capture_errors_are_recorded_not_raised(self):
+    def test_input_and_capture_errors_are_recorded_without_more_input(self):
         def refuse(_batches):
             raise RuntimeError("QMP input-send-event: refused")
 
@@ -579,10 +655,10 @@ class InteractionRunnerTests(unittest.TestCase):
             self.clock.now = now
             runner.advance(now)
         self.assertTrue(runner.finished)
-        self.assertEqual(runner.failures, 6)  # three actions and three screenshots
+        self.assertEqual(runner.failures, 2)  # baseline screenshot, then first input
         entries = [json.loads(line) for line in self.log.read_text().splitlines()]
-        self.assertEqual([entry["event"] for entry in entries].count("error"), 6)
-        self.assertIn("refused", entries[2]["error"])
+        self.assertEqual([entry["event"] for entry in entries].count("error"), 2)
+        self.assertIn("refused", entries[-1]["error"])
 
     def test_missing_ready_prompt_halts_before_typing_ver_and_retains_proof(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,

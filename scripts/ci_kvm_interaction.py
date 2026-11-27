@@ -423,10 +423,10 @@ class InteractionRunner:
                               "argument": list(action[1]) if action[0] != "type" else action[1]})
             except (OSError, RuntimeError, ValueError, KeyError) as error:
                 self._fail(step, f"action {number} {action[0]}", error)
-                if (action[0] == VERIFIED_POINTER_ACTION
-                        or step.readiness_poll_seconds is not None):
-                    self.halted = True
-                    return
+                # A QMP acknowledgement with no class receipt has uncertain effect.
+                # No later action or screenshot may treat that input as complete.
+                self.halted = True
+                return
 
     def _verified_click(self, step, target):
         if self.last_capture is None or self.cursor_probe is None:
