@@ -166,6 +166,9 @@ pub use executor_table::{
     ExecutorError, ExecutorHandle, ExecutorResume, ExecutorRun, ExecutorState, ExecutorTable,
     ExecutorWait, ExecutorYield, RunToken,
 };
+pub mod executor_local;
+#[cfg(test)]
+mod executor_local_tests;
 pub use terminal::{
     ContinueReparkOutcome, ContinueReparkPhase, SharedContinueRepark,
     RetiredNestedRestore, RetiredRootMaintenance, RetiredTerminal, TerminalAttempt, TerminalIdentity, TerminalPhase, TerminalStage,
