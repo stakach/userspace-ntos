@@ -53,6 +53,34 @@ RECORDED_BOOT2_VER_OCR = (Path(__file__).with_name("fixtures") /
 
 
 class VisualProofTests(unittest.TestCase):
+    def test_saved_child_stdout_crop_follows_console_position(self):
+        # KVM 46059546967 probe 5 visibly shows child output and a returned
+        # prompt at y=484. The old prompt crop at y=558 missed the console.
+        fixture = Path(__file__).parent / "fixtures"
+        complete = gzip.decompress((fixture / "child_stdout_complete_46059546967.ppm.gz").read_bytes())
+        pending = gzip.decompress((fixture / "child_stdout_pending_46059546967.ppm.gz").read_bytes())
+        image = Path("native-kvm-interact-12-basicproof-child-stdout-probe-05.ppm")
+        sparse = ("C:\\Users\\User>cmd /c echo CHILD_STDOUT_OK\n"
+                  "CHILD_STDOUT_OK\nCommand,\n___ C:\\Users\\User>\n")
+        original_sha = "77db5143a7a122e90a5eae4660b87a2af1a2fbcb8a599dcc3934bf8c0fe8d8b1"
+        with patch("scripts.ci_kvm_visual_proof._prove_image",
+                   return_value=ci_kvm_visual_proof.VisualProof(
+                       False, sparse, "child stdout marker and returned prompt not visible",
+                       image.name, original_sha)), \
+             patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=complete) as crop:
+            proof = prove_child_stdout_completion(image)
+        self.assertTrue(proof.passed, proof.error)
+        self.assertEqual(proof.image_sha256, original_sha)
+        self.assertIn("CHILD_STDOUT_OK\nC:\\Users\\User>", proof.ocr_text)
+        crop.assert_called_with(image, 68, 420, 500, 500)
+        with patch("scripts.ci_kvm_visual_proof._prove_image",
+                   return_value=ci_kvm_visual_proof.VisualProof(
+                       False, "C:\\Users\\User>cmd /c echo CHILD_STDOUT_OK\n",
+                       "child stdout marker and returned prompt not visible",
+                       image.name, "pending-sha")), \
+             patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=pending):
+            self.assertFalse(prove_child_stdout_completion(image).passed)
+
     def test_saved_attrib_readback_uses_exact_console_pixels_and_returned_prompt(self):
         # KVM 46055607414 probe 3: the mounted clear completed and this original
         # frame rendered `A C:\\Users\\User\\basicproof.txt`, but sparse full-frame
@@ -172,18 +200,26 @@ class VisualProofTests(unittest.TestCase):
             with patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=b"P6\n1 1\n255\n\0\0\0") as crop, \
                     patch("scripts.ci_kvm_visual_proof.subprocess.run") as ocr:
                 ocr.side_effect = [subprocess.CompletedProcess([], 0, recorded, ""),
-                                   subprocess.CompletedProcess([], 0, b"C:\\Users\\User>\n", b"")]
+                                   subprocess.CompletedProcess([], 0,
+                                       b"C:\\Users\\User>cmd /c echo CHILD_STDOUT_OK\n"
+                                       b"CHILD_STDOUT_OK\nC:\\Users\\User>\n", b"")]
                 proof = prove_child_stdout_completion(image)
                 self.assertTrue(proof.passed)
                 self.assertEqual(proof.image_sha256, expected_sha)
-                self.assertIn("child prompt crop: C:\\Users\\User>", proof.ocr_text)
+                self.assertIn("child completion crop: C:\\Users\\User>cmd /c echo CHILD_STDOUT_OK",
+                              proof.ocr_text)
                 crop.assert_called_once()
                 self.assertEqual(ocr.call_args.kwargs["input"], b"P6\n1 1\n255\n\0\0\0")
                 ocr.side_effect = [subprocess.CompletedProcess([], 0, recorded, ""),
-                                   subprocess.CompletedProcess([], 0, b"C:\\Users\\User>attrib /?\n", b"")]
+                                   subprocess.CompletedProcess([], 0,
+                                       b"C:\\Users\\User>cmd /c echo CHILD_STDOUT_OK\n"
+                                       b"CHILD_STDOUT_OK\nC:\\Users\\User>attrib /?\n", b"")]
                 self.assertFalse(prove_child_stdout_completion(image).passed)
                 ocr.side_effect = [subprocess.CompletedProcess([], 0, recorded.replace(
-                    "\nCHILD_STDOUT_OK\n", "\n"), "")]
+                    "\nCHILD_STDOUT_OK\n", "\n"), ""),
+                                   subprocess.CompletedProcess([], 0,
+                                       b"C:\\Users\\User>cmd /c echo CHILD_STDOUT_OK\n"
+                                       b"C:\\Users\\User>\n", b"")]
                 self.assertFalse(prove_child_stdout_completion(image).passed)
 
     def test_directory_gate_rejects_recorded_dropped_input_and_missing_directory(self):
