@@ -995,3 +995,13 @@ diagnosis-free failure.
   executor claims those commands autonomously after each terminal. The row needs a wake
   when the final anchor makes its receipt ready, while between-command latency is a
   separate mounted-executor measurement.
+
+## Apply Replacement Repository Instructions Before Choosing A Workflow
+- When the user supplies replacement `AGENTS.md` instructions, check the current main
+  checkout before starting a branch or PR. The latest instructions in this project require
+  verified increments directly on `main` until the kernel is functional. Record plans and
+  review evidence on issues, run focused crate tests and a native build before a fast-forward
+  push, then inspect main CI. Do not continue an older PR workflow from a stale worktree.
+- For an existing draft whose code is already validated, transfer its commits to `main`,
+  compare the resulting Git tree with the tested source, and close the draft with an exact
+  main commit and evidence link. Preserve unrelated edits and avoid duplicate integration.
