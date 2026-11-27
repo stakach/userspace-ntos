@@ -40,7 +40,7 @@ class FileBasicInteractionTests(unittest.TestCase):
                           "basicproof-baseline-readback", "basicproof-set-readonly",
                           "basicproof-readback"])
         self.assertEqual([step.actions for step in profile.steps[len(desktop.steps):]], [
-            (("type", "if not exist basicproof md basicproof\n"),),
+            (("type", "md basicproof\n"),),
             (("type", "dir basicproof\n"),),
             (("type", "if not exist basicproof.txt echo filebasic>basicproof.txt\n"),),
             (("type", "dir basicproof.txt\n"),),
@@ -54,10 +54,12 @@ class FileBasicInteractionTests(unittest.TestCase):
         self.assertTrue(all(0 < step.wait_seconds <= 120
                             for step in profile.steps[len(desktop.steps):]))
         child_steps = {step.name: step for step in profile.steps}
-        for name in ("basicproof-child-stdout", "basicproof-attrib-help"):
+        for name in ("basicproof-directory-list", "basicproof-child-stdout",
+                     "basicproof-attrib-help"):
             with self.subTest(name=name):
                 self.assertEqual(child_steps[name].readiness_poll_seconds, 2)
-                self.assertGreaterEqual(child_steps[name].wait_seconds, 45)
+                self.assertGreaterEqual(child_steps[name].wait_seconds,
+                                        30 if name == "basicproof-directory-list" else 45)
 
     def test_child_steps_require_their_output_then_a_returned_prompt(self):
         stdout = ci_kvm_visual_proof.contains_child_stdout_completion

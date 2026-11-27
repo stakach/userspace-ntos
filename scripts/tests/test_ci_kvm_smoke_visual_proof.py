@@ -9,8 +9,11 @@ from unittest.mock import patch
 
 from scripts.ci_kvm_ppm import crop_ppm
 from scripts.ci_kvm_visual_proof import (contains_command_prompt_search_result,
+                                         contains_basicproof_directory,
                                          contains_ready_prompt, contains_start_menu_search_box,
-                                         contains_ver_result, prove_command_prompt_search_result,
+                                         contains_ver_result, prove_basicproof_directory,
+                                         prove_child_stdout_completion,
+                                         prove_command_prompt_search_result,
                                          prove_ready_prompt, prove_start_menu_search_box,
                                          prove_ver_result)
 
@@ -47,6 +50,57 @@ RECORDED_BOOT2_VER_OCR = (Path(__file__).with_name("fixtures") /
 
 
 class VisualProofTests(unittest.TestCase):
+    def test_recorded_child_stdout_requires_marker_and_cropped_empty_prompt(self):
+        # Run 46018329889 probe 05: the original frame visibly has both lines,
+        # but sparse full-frame OCR joins desktop glyphs to the prompt.
+        recorded = ("C:\\Users\\User>cmd /c echo CHILD_STDOUT_OK\n"
+                    "CHILD_STDOUT_OK\n_ | C:\\Users\\User>\n")
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "child.ppm"
+            image.write_bytes(b"P6\n1 1\n255\n\0\0\0")
+            expected_sha = hashlib.sha256(image.read_bytes()).hexdigest()
+            with patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=b"P6\n1 1\n255\n\0\0\0") as crop, \
+                    patch("scripts.ci_kvm_visual_proof.subprocess.run") as ocr:
+                ocr.side_effect = [subprocess.CompletedProcess([], 0, recorded, ""),
+                                   subprocess.CompletedProcess([], 0, b"C:\\Users\\User>\n", b"")]
+                proof = prove_child_stdout_completion(image)
+                self.assertTrue(proof.passed)
+                self.assertEqual(proof.image_sha256, expected_sha)
+                self.assertIn("child prompt crop: C:\\Users\\User>", proof.ocr_text)
+                crop.assert_called_once()
+                self.assertEqual(ocr.call_args.kwargs["input"], b"P6\n1 1\n255\n\0\0\0")
+                ocr.side_effect = [subprocess.CompletedProcess([], 0, recorded, ""),
+                                   subprocess.CompletedProcess([], 0, b"C:\\Users\\User>attrib /?\n", b"")]
+                self.assertFalse(prove_child_stdout_completion(image).passed)
+                ocr.side_effect = [subprocess.CompletedProcess([], 0, recorded.replace(
+                    "\nCHILD_STDOUT_OK\n", "\n"), "")]
+                self.assertFalse(prove_child_stdout_completion(image).passed)
+
+    def test_directory_gate_rejects_recorded_dropped_input_and_missing_directory(self):
+        prompt = "C:\\Users\\User>"
+        good = (prompt + "dir basicproof\n"
+                "Directory of C:\\Users\\User\\basicproof\n"
+                "0 File(s) 0 bytes\n" + prompt)
+        self.assertTrue(contains_basicproof_directory(good))
+        self.assertFalse(contains_basicproof_directory(
+            prompt + "if not existproof md basicproof\nSyntax error - md\n"
+            + prompt + "dir basicproof\nDirectory of C:\\Users\\User\nFile not found\n"
+            + prompt))
+        self.assertFalse(contains_basicproof_directory(good.replace(
+            "Directory of C:\\Users\\User\\basicproof",
+            "Directory of C:\\Users\\User")))
+        self.assertFalse(contains_basicproof_directory(good.replace(
+            "0 File(s) 0 bytes", "File not found")))
+        self.assertFalse(contains_basicproof_directory(
+            prompt + "dir basicproof\n0 File(s) 0 bytes\n"
+            "Directory of C:\\Users\\User\\basicproof\n" + prompt))
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "directory.ppm"
+            image.write_bytes(b"P6\n1 1\n255\n\0\0\0")
+            with patch("scripts.ci_kvm_visual_proof.subprocess.run") as ocr:
+                ocr.return_value = subprocess.CompletedProcess([], 0, good, "")
+                self.assertTrue(prove_basicproof_directory(image).passed)
+
     def test_start_menu_and_search_result_require_visible_shell_evidence(self):
         # Pinned LiberNT startmnu2.cpp filters Start Menu shortcut names. Its
         # shortcuts.inf names the cmd.exe Accessories link "Command Prompt".
@@ -194,7 +248,8 @@ class VisualProofTests(unittest.TestCase):
             self.assertEqual(proof.image_name, image.name)
             self.assertEqual(proof.image_sha256, hashlib.sha256(image.read_bytes()).hexdigest())
             self.assertEqual(ocr.call_args.args[0][:3],
-                             ["tesseract", str(image), "stdout"])
+                             ["tesseract", "stdin", "stdout"])
+            self.assertEqual(ocr.call_args.kwargs["input"], image.read_bytes())
 
     def test_missing_result_or_ocr_failure_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:

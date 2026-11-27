@@ -20,6 +20,7 @@ if __package__:
     from .ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
     from .ci_kvm_visual_proof import (VisualProof, prove_attrib_help_completion,
                                       prove_child_stdout_completion,
+                                      prove_basicproof_directory,
                                       prove_command_prompt_search_result,
                                       prove_readonly_attribute, prove_ready_prompt,
                                       prove_start_menu_search_box, prove_ver_result)
@@ -31,6 +32,7 @@ else:
     from ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
     from ci_kvm_visual_proof import (VisualProof, prove_attrib_help_completion,
                                     prove_child_stdout_completion,
+                                    prove_basicproof_directory,
                                     prove_command_prompt_search_result,
                                     prove_readonly_attribute, prove_ready_prompt,
                                     prove_start_menu_search_box, prove_ver_result)
@@ -1052,6 +1054,7 @@ def main():
                 "start-menu": lambda name: prove_start_menu_search_box(ROOT / name),
                 "command-prompt-search": lambda name: prove_command_prompt_search_result(ROOT / name),
                 "command-prompt": lambda name: prove_ready_prompt(ROOT / name),
+                "basicproof-directory-list": lambda name: prove_basicproof_directory(ROOT / name),
                 "basicproof-child-stdout": lambda name: prove_child_stdout_completion(ROOT / name),
                 "basicproof-attrib-help": lambda name: prove_attrib_help_completion(ROOT / name),
                 "basicproof-baseline-readback": lambda name: prove_readonly_attribute(

@@ -39,11 +39,20 @@ SEARCH_MENU_SHUTDOWN = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"Shut down[ \t
 # Pinned 1024x768 LiberNT Start edit interior. The full-frame sparse OCR has
 # misread its tiny text; a doubled crop reads the exact query on saved frames.
 SEARCH_QUERY_CROP = (17, 683, 210, 702)
+# Bottom input row of the pinned 1024x768 Command Prompt in the FileBasic
+# frame. Sparse full-screen OCR can merge desktop glyphs into this row.
+CHILD_PROMPT_CROP = (158, 558, 805, 582)
 # OCR may attach the next prompt's first typed glyph to the child's stdout row.
 # The result is still distinguishable from the echoed `cmd /c echo` command.
 CHILD_STDOUT_LINE = re.compile(
     r"(?im)^(?:" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]*>[a-z]?)?CHILD_STDOUT_OK[ \t]*$"
 )
+DIR_COMMAND = re.compile(
+    r"(?im)^" + OCR_PUNCT_PREFIX +
+    r"(?P<directory>[a-z]:\\[^\r\n>]*)>[ \t]*dir[ \t]+basicproof[ \t]*$"
+)
+DIR_HEADER = re.compile(r"(?im)^[ \t]*Directory of (?P<path>[a-z]:\\[^\r\n]+?)[ \t]*$")
+DIR_TOTAL = re.compile(r"(?im)^[ \t]*\d+[ \t]+File\(s\)")
 ATTRIB_HELP_TAIL = re.compile(
     r"(?im)^Type ATTRIB without a parameter to display the attributes of all files\.[ \t]*$"
 )
@@ -98,6 +107,24 @@ def contains_child_stdout_completion(text):
     return marker is not None and READY_PROMPT.search(text, marker.end()) is not None
 
 
+def contains_basicproof_directory(text):
+    """The requested directory was listed, not a missing parent entry."""
+    commands = list(DIR_COMMAND.finditer(text))
+    if not commands:
+        return False
+    command = commands[-1]
+    expected = command.group("directory").rstrip("\\") + "\\basicproof"
+    tail = text[command.end():]
+    next_prompt = NEXT_PROMPT.search(tail)
+    if next_prompt:
+        tail = tail[:next_prompt.start()]
+    if re.search(r"(?im)^[ \t]*File not found[ \t]*$", tail):
+        return False
+    return any(header.group("path").casefold() == expected.casefold() and
+               DIR_TOTAL.search(tail, header.end()) is not None
+               for header in DIR_HEADER.finditer(tail))
+
+
 def contains_attrib_help_completion(text):
     """The help command reached its final line and returned to cmd."""
     tail = ATTRIB_HELP_TAIL.search(text)
@@ -122,27 +149,32 @@ def _prove_image(image, predicate, missing):
         return VisualProof(False, error=f"screenshot absent: {image}",
                            image_name=image.name, fatal=True)
     try:
-        image_sha256 = hashlib.sha256(image.read_bytes()).hexdigest()
+        frame = image.read_bytes()
+        image_sha256 = hashlib.sha256(frame).hexdigest()
     except OSError as error:
         return VisualProof(False, error=f"cannot read screenshot: {error}",
                            image_name=image.name, fatal=True)
     try:
         result = subprocess.run(
-            ["tesseract", str(image), "stdout", "-l", "eng", "--psm", "11"],
-            capture_output=True, text=True, timeout=20, check=False,
+            ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "11"],
+            input=frame, capture_output=True, timeout=20, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return VisualProof(False, error=f"OCR unavailable: {error}",
                            image_name=image.name,
                            image_sha256=image_sha256, fatal=True)
+    transcript = (result.stdout.decode("utf-8", errors="replace")
+                  if isinstance(result.stdout, bytes) else result.stdout)
+    stderr = (result.stderr.decode("utf-8", errors="replace")
+              if isinstance(result.stderr, bytes) else result.stderr)
     if result.returncode != 0:
-        return VisualProof(False, result.stdout,
-                           f"OCR failed ({result.returncode}): {result.stderr.strip()}",
+        return VisualProof(False, transcript,
+                           f"OCR failed ({result.returncode}): {stderr.strip()}",
                            image.name, image_sha256, fatal=True)
-    if not predicate(result.stdout):
-        return VisualProof(False, result.stdout, missing,
+    if not predicate(transcript):
+        return VisualProof(False, transcript, missing,
                            image.name, image_sha256)
-    return VisualProof(True, result.stdout, image_name=image.name,
+    return VisualProof(True, transcript, image_name=image.name,
                        image_sha256=image_sha256)
 
 
@@ -152,8 +184,36 @@ def prove_ready_prompt(image):
 
 
 def prove_child_stdout_completion(image):
-    return _prove_image(image, contains_child_stdout_completion,
-                        "child stdout marker and returned prompt not visible")
+    result = _prove_image(image, contains_child_stdout_completion,
+                          "child stdout marker and returned prompt not visible")
+    if result.passed or result.fatal or CHILD_STDOUT_LINE.search(result.ocr_text) is None:
+        return result
+    try:
+        prompt_frame = crop_ppm(image, *CHILD_PROMPT_CROP)
+        prompt_ocr = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "7"],
+            input=prompt_frame, capture_output=True, timeout=20, check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return VisualProof(False, result.ocr_text, f"child prompt OCR unavailable: {error}",
+                           result.image_name, result.image_sha256, fatal=True)
+    prompt = prompt_ocr.stdout.decode("utf-8", errors="replace").strip()
+    transcript = result.ocr_text + "\nchild prompt crop: " + prompt
+    if prompt_ocr.returncode != 0:
+        detail = prompt_ocr.stderr.decode("utf-8", errors="replace").strip()
+        return VisualProof(False, transcript,
+                           f"child prompt OCR failed ({prompt_ocr.returncode}): {detail}",
+                           result.image_name, result.image_sha256, fatal=True)
+    if re.fullmatch(r"(?i)[a-z]:\\[^\r\n>]{1,128}>", prompt) is None:
+        return VisualProof(False, transcript, result.error,
+                           result.image_name, result.image_sha256)
+    return VisualProof(True, transcript, image_name=result.image_name,
+                       image_sha256=result.image_sha256)
+
+
+def prove_basicproof_directory(image):
+    return _prove_image(image, contains_basicproof_directory,
+                        "basicproof directory listing not visible")
 
 
 def prove_attrib_help_completion(image):
