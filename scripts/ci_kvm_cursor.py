@@ -16,7 +16,9 @@ except ImportError:
 
 DIFFERENCE_THRESHOLD = 90
 TARGET_TOLERANCE = 3
-SEARCH_RADIUS = 60
+# Run 46031955425 measured a guest-accelerated cursor 76 pixels beyond the target.
+# Keep the search local, but include a bounded overshoot before declaring it unmeasurable.
+SEARCH_RADIUS = 128
 
 
 @dataclass(frozen=True)
@@ -30,7 +32,7 @@ def measure_cursor_hotspot(before, after, origin=(0, 0), search=None):
     """Return the top-left cursor hotspot from changed pixels, or None.
 
     ``origin`` maps a cropped recorded frame back to full-screen coordinates.
-    Runtime captures use the full screen and a narrow ``search`` rectangle.
+    Runtime captures use the full screen and a bounded ``search`` rectangle.
     """
     width, height, old = read_ppm(before)
     new_width, new_height, new = read_ppm(after)

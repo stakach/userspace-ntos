@@ -19,6 +19,7 @@ from ci_kvm_cursor import measure_cursor_hotspot, cursor_is_at_target, prove_cur
 
 FIXTURES = Path(__file__).with_name("fixtures") / "cursor_45184256752"
 OUTSIDE_RADIUS = Path(__file__).with_name("fixtures") / "cursor_45233851099"
+ACCELERATED_OVERSHOOT = Path(__file__).with_name("fixtures") / "cursor_46031955425"
 ICON_SELECTION = Path(__file__).with_name("fixtures") / "icon_selection_45196431411"
 TARGET = (37, 470)
 ORIGIN = (32, 430)
@@ -52,6 +53,21 @@ class CursorProofTests(unittest.TestCase):
     def test_icon_selection_change_is_not_a_cursor(self):
         self.assertIsNone(measure_cursor_hotspot(ICON_SELECTION / "aim.ppm",
                                                 ICON_SELECTION / "selected.ppm"))
+
+    def test_recorded_acceleration_overshoot_is_measured_from_original_frames(self):
+        # Run 46031955425: original baseline SHA-256 8af63714114e876af4646a261dd3e05b
+        # a9b8fdd9b75e0a00498dcd4a49e259dc, aim1 ee2536786af21629ee69c5227a59dfa0
+        # 53e10a679fc6cb42a0113d86fb26511b, aim2 dc4c6d17c402e56087d1b3e717e0c0c
+        # 76109766179c569418079ea5c24440e1d. Crops x=850..1024, y=0..180 retain the
+        # original pixels and exclude the old cursor and desktop clock. Target (925,100) is
+        # (75,100) here; after requested (+36,-26), aim2 hotspot (1001,46) is (151,46).
+        first = prove_cursor_position(ACCELERATED_OVERSHOOT / "baseline.ppm",
+                                      ACCELERATED_OVERSHOOT / "aim1.ppm", (75, 100))
+        self.assertEqual(first.position, (39, 126))
+        proof = prove_cursor_position(ACCELERATED_OVERSHOOT / "baseline.ppm",
+                                      ACCELERATED_OVERSHOOT / "aim2.ppm", (75, 100))
+        self.assertEqual(proof.position, (151, 46))
+        self.assertFalse(cursor_is_at_target(proof.position, (75, 100)))
 
 
 if __name__ == "__main__":

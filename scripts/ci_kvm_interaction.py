@@ -3,9 +3,8 @@
 The q35 machine exposes only the i8042 PS/2 keyboard and mouse, which the guest drives
 through i8042prt + kbdclass/mouclass. A PS/2 mouse is relative-only, so a pointer target
 is reached by first pinning the cursor against the bottom-left corner of the screen and
-then moving by small relative deltas from that known position. win32k adds relative
-deltas 1:1, but small paced packets keep the path exact even if a guest layer
-accelerates or coalesces larger ones.
+then moving by small relative deltas from that known position. Guest pointer acceleration
+can change the resulting position, so verified clicks use measured feedback.
 
 Interaction is evidence, never a verdict: failures are recorded, not raised.
 """
@@ -34,7 +33,8 @@ CLICK_HOLD = 0.15  # a lone click holds long enough for the guest to read the pr
 KEY_PAUSE = 0.05
 POINTER_ACTIONS = ("move", "click", "double_click")
 VERIFIED_POINTER_ACTION = "verified_click"
-MAX_CURSOR_AIMS = 3
+MAX_CURSOR_AIMS = 6
+MAX_CURSOR_CORRECTION = 12  # total requested movement on either axis before remeasuring
 CHAR_QCODES = {" ": "spc", "\n": "ret", "\t": "tab", ".": "dot", ",": "comma",
                "-": "minus", "=": "equal", "/": "slash", "\\": "backslash",
                ";": "semicolon", "'": "apostrophe"}
@@ -237,6 +237,21 @@ def relative_pointer_batches(dx, dy):
     return batches
 
 
+def bounded_cursor_correction(position, target, gain=1):
+    """Request one small correction, then require a new measured position.
+
+    ``gain`` comes from the previous requested and observed correction. The cap
+    keeps an unknown or changing guest acceleration from causing a large jump.
+    """
+    delta = ((target[0] - position[0]) / gain,
+             (target[1] - position[1]) / gain)
+    scale = min(1, MAX_CURSOR_CORRECTION / max(abs(delta[0]), abs(delta[1])))
+    correction = tuple(round(axis * scale) for axis in delta)
+    if correction == (0, 0):
+        raise RuntimeError("guest cursor movement too coarse to correct safely")
+    return correction
+
+
 def held_click_batches():
     return [(_button(True), CLICK_HOLD), (_button(False), BUTTON_PAUSE)]
 
@@ -411,6 +426,8 @@ class InteractionRunner:
         if self.last_capture is None or self.cursor_probe is None:
             raise RuntimeError("verified click requires a prior framebuffer and cursor probe")
         self.perform(pointer_batches(target, self.script.screen))
+        previous_position = None
+        previous_correction = None
         for attempt in range(1, MAX_CURSOR_AIMS + 1):
             name = screenshot_name(self.index + 1, step).removesuffix(".ppm")
             name += f"-aim-{attempt}.ppm"
@@ -428,8 +445,22 @@ class InteractionRunner:
             if proof.position is None:
                 raise RuntimeError("guest cursor not measurable near target")
             if attempt < MAX_CURSOR_AIMS:
-                self.perform(relative_pointer_batches(target[0] - proof.position[0],
-                                                     target[1] - proof.position[1]))
+                gain = 1
+                if previous_correction is not None:
+                    movement = (proof.position[0] - previous_position[0],
+                                proof.position[1] - previous_position[1])
+                    if any(sent * observed < 0 for sent, observed
+                           in zip(previous_correction, movement)):
+                        raise RuntimeError("guest cursor moved opposite the correction")
+                    requested = sum(axis * axis for axis in previous_correction)
+                    observed = sum(sent * moved for sent, moved
+                                   in zip(previous_correction, movement))
+                    if observed:
+                        gain = observed / requested
+                correction = bounded_cursor_correction(proof.position, target, gain)
+                self.perform(relative_pointer_batches(*correction))
+                previous_position = proof.position
+                previous_correction = correction
         raise RuntimeError("guest cursor missed target after bounded correction")
 
     def _fail(self, step, what, error):

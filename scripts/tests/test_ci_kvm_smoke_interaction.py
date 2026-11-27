@@ -11,7 +11,7 @@ from scripts.ci_kvm_interaction import (
     parse_script, pointer_batches, relative_deltas, screenshot_name, text_chords,
 )
 from scripts.ci_kvm_smoke import DESKTOP_EPOCH_SEALED_RECORD, SerialPanicDetector
-from scripts.ci_kvm_cursor import CursorProof
+from scripts.ci_kvm_cursor import CursorProof, cursor_is_at_target
 from scripts.ci_kvm_visual_proof import VisualProof
 
 DOCUMENT = {
@@ -540,7 +540,7 @@ class InteractionRunnerTests(unittest.TestCase):
                                    {"name": "command-prompt", "actions": [
                                        {"verified_click": [37, 470]}],
                                     "wait_seconds": 0}]})
-        positions = iter(((37, 446), (37, 470)))
+        positions = iter(((37, 446), (37, 458), (37, 470)))
         def probe(_before, after, _target):
             return CursorProof(next(positions), after, "recorded-image-sha")
         runner = InteractionRunner(script, self.performed.append, self.captured.append,
@@ -549,14 +549,59 @@ class InteractionRunnerTests(unittest.TestCase):
         runner.advance(0)
         self.assertTrue(runner.finished)
         self.assertEqual(runner.failures, 0)
-        self.assertEqual(len(self.performed), 3)  # aim, correction, then click
-        self.assertEqual(rel_sum(self.performed[1]), (0, 24))
+        self.assertEqual(len(self.performed), 4)  # aim, two measured corrections, then click
+        self.assertEqual([rel_sum(batches) for batches in self.performed[1:3]],
+                         [(0, 12), (0, 12)])
         self.assertEqual([events[0]["data"]["down"]
-                          for events, _pause in self.performed[2]],
+                          for events, _pause in self.performed[3]],
                          [True, False])
-        self.assertGreaterEqual(self.performed[2][0][1], 0.15)
+        self.assertGreaterEqual(self.performed[3][0][1], 0.15)
         self.assertEqual([receipt["position"] for receipt in runner.cursor_receipts],
-                         [[37, 446], [37, 470]])
+                         [[37, 446], [37, 458], [37, 470]])
+
+    def test_verified_click_converges_with_measured_threefold_guest_acceleration(self):
+        # Run 46031955425: a measured (889,126) hotspot moved to (1001,46)
+        # when the runner requested (+36,-26). Every correction must be small
+        # and based on a new measurement before a button event can be sent.
+        target = (925, 100)
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "baseline", "actions": [], "wait_seconds": 0},
+                                   {"name": "desktop-pointer", "actions": [
+                                       {"verified_click": list(target)}], "wait_seconds": 0}]})
+        position = [889, 126]
+        calls = []
+
+        def perform(batches):
+            calls.append(batches)
+            if len(calls) == 1:  # initial corner pin and target aim
+                return
+            dx, dy = rel_sum(batches)
+            if (dx, dy) != (0, 0):
+                position[0] += 3 * dx
+                position[1] += 3 * dy
+
+        def probe(_before, after, _target):
+            return CursorProof(tuple(position), after, "captured-frame-sha")
+
+        runner = InteractionRunner(script, perform, self.captured.append, self.log,
+                                   self.clock, cursor_probe=probe)
+        runner.arm(0)
+        runner.advance(0)
+        self.assertEqual(runner.failures, 0)
+        self.assertLessEqual(len(runner.cursor_receipts), 6)
+        self.assertTrue(cursor_is_at_target(tuple(position), target))
+        corrections = calls[1:-1]
+        self.assertGreaterEqual(len(corrections), 1)
+        self.assertTrue(all(max(map(abs, rel_sum(batches))) <= 12
+                            for batches in corrections))
+        self.assertEqual([events[0]["data"]["down"]
+                          for events, _pause in calls[-1]], [True, False])
+        self.assertTrue(all(not any(event["type"] == "btn"
+                                    for events, _pause in batches for event in events)
+                            for batches in calls[:-1]))
+        self.assertTrue(cursor_is_at_target(tuple(runner.cursor_receipts[-1]["position"]),
+                                            target))
 
     def test_unmeasured_cursor_halts_without_click(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
@@ -588,8 +633,8 @@ class InteractionRunnerTests(unittest.TestCase):
         runner.advance(0)
         self.assertTrue(runner.finished)
         self.assertEqual(runner.failures, 1)
-        self.assertEqual(len(runner.cursor_receipts), 3)
-        self.assertEqual(len(self.performed), 3)  # initial aim and two corrections, no click
+        self.assertEqual(len(runner.cursor_receipts), 6)
+        self.assertEqual(len(self.performed), 6)  # initial aim and five corrections, no click
 
     def test_missing_search_result_halts_before_enter(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
