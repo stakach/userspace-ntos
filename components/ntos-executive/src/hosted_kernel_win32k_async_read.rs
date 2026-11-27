@@ -51,6 +51,9 @@ static mut COMPLETED: Vec<OperationIdentity> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static NESTED_READ_TRACE: AtomicU64 = AtomicU64::new(0);
 static NESTED_READY_TRACE: AtomicU64 = AtomicU64::new(0);
+// RIT asks kbdclass for one KEYBOARD_INPUT_DATA at a time. Keep this diagnostic
+// bounded, but do not sample away the records needed to localize a late key.
+static INPUT_READ_TRACE: AtomicU64 = AtomicU64::new(0);
 
 fn wire_status(error: wire::AsyncReadWireError) -> i32 {
     match error {
@@ -629,6 +632,12 @@ impl Work {
             .delivery
             .begin_output(&self.token)
             .expect("win32k read output claim");
+        let input_record = if bytes.len() == 12 {
+            Some((u16::from_le_bytes([bytes[2], bytes[3]]),
+                  u16::from_le_bytes([bytes[4], bytes[5]])))
+        } else {
+            None
+        };
         if !bytes.is_empty() {
             core::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -639,6 +648,23 @@ impl Work {
         self.delivery
             .confirm_output(&self.token)
             .expect("win32k read output publication");
+        let input_trace = input_record.and_then(|(code, flags)| {
+            let sequence = INPUT_READ_TRACE.fetch_add(1, Ordering::Relaxed);
+            (sequence < 512).then_some((sequence + 1, code, flags))
+        });
+        if let Some((sequence, code, flags)) = input_trace {
+            print_str(b"[win32k-input-read] sequence=");
+            print_u64(sequence);
+            print_str(b" token=");
+            print_u64(self.token);
+            print_str(b" file=");
+            print_u64(self.file.file_id());
+            print_str(b" code=");
+            print_hex(code as u32);
+            print_str(b" flags=");
+            print_hex(flags as u32);
+            print_str(b"\n");
+        }
         let (status, information) = self
             .delivery
             .begin_iosb(&self.token)
@@ -669,6 +695,13 @@ impl Work {
         }
         let mut objects = (*handler).dispatcher_objects(None);
         let selected = crate::service_sec_image::provider_wait_select_ready(&mut objects);
+        if input_trace.is_some() {
+            print_str(b"[win32k-input-read] file-event token=");
+            print_u64(self.token);
+            print_str(b" waits=");
+            print_u64(selected);
+            print_str(b"\n");
+        }
         if trace < 64 {
             // #425: whether the File event's completion released a parked reader.
             print_str(b"[win32k-async-read] file-event-selected token=");

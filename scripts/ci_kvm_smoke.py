@@ -1072,6 +1072,7 @@ def main():
                 interaction_script, send_input_batches,
                 lambda name: capture_framebuffer(ROOT / name), INTERACTION_LOG,
                 checks=checks,
+                serial_offset=lambda: LOG.stat().st_size,
                 cursor_probe=lambda before, after, target: prove_cursor_position(
                     ROOT / before, ROOT / after, target))
             seal_detector = SerialPanicDetector(LOG, DESKTOP_EPOCH_SEALED_RECORD)

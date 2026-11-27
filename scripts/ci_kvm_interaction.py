@@ -269,7 +269,7 @@ class InteractionRunner:
     """
 
     def __init__(self, script, perform, capture, log_path, clock=time.monotonic,
-                 checks=None, cursor_probe=None):
+                 checks=None, cursor_probe=None, serial_offset=None):
         self.script = script
         self.perform = perform
         self.capture = capture
@@ -286,6 +286,7 @@ class InteractionRunner:
         self.checks = checks or {}
         self.checkpoints = {}
         self.cursor_probe = cursor_probe
+        self.serial_offset = serial_offset
         self.cursor_receipts = []
         self.last_capture = None
         self.halted = False
@@ -474,6 +475,11 @@ class InteractionRunner:
 
     def _record(self, entry):
         entry = {"elapsed_seconds": round(self.clock() - (self.armed_at or 0), 2), **entry}
+        if self.serial_offset is not None:
+            try:
+                entry["serial_bytes"] = self.serial_offset()
+            except OSError:
+                entry["serial_bytes"] = None
         try:
             with self.log_path.open("a") as log:
                 log.write(json.dumps(entry) + "\n")

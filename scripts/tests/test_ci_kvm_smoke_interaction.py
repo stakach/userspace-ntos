@@ -209,6 +209,35 @@ class InteractionRunnerTests(unittest.TestCase):
         return InteractionRunner(parse_script(DOCUMENT), perform or self.performed.append,
                                  capture or self.captured.append, self.log, self.clock)
 
+    def test_serial_offsets_bracket_input_and_screenshot(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [{"name": "type", "actions": [{"type": "m"}],
+                                          "wait_seconds": 1}]})
+        serial = Path(self.directory.name) / "serial.log"
+        serial.write_bytes(b"boot\n")
+
+        def perform(_batches):
+            with serial.open("ab") as output:
+                output.write(b"class-record\n")
+
+        def capture(_name):
+            with serial.open("ab") as output:
+                output.write(b"read-terminal\n")
+
+        runner = InteractionRunner(script, perform, capture, self.log, self.clock,
+                                   serial_offset=lambda: serial.stat().st_size)
+        runner.arm(0)
+        runner.advance(0)
+        self.clock.now = 1
+        runner.advance(1)
+        events = [json.loads(line) for line in self.log.read_text().splitlines()]
+        action = next(event for event in events if event["event"] == "action")
+        screenshot = next(event for event in events if event["event"] == "screenshot")
+        self.assertEqual(serial.read_bytes()[:action["serial_bytes"]],
+                         b"boot\nclass-record\n")
+        self.assertEqual(serial.read_bytes()[:screenshot["serial_bytes"]],
+                         b"boot\nclass-record\nread-terminal\n")
+
     def test_start_menu_visual_readiness_advances_before_wait_ceiling(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
                                "steps": [
