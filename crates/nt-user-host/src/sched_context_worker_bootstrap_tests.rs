@@ -57,12 +57,13 @@ fn first_receive_requires_reply_offered_to_the_exact_blocked_worker() {
 struct Unbinder {
     result: UnbindOutcome,
     calls: usize,
+    last_request: Option<(u64, u64, u64, u64)>,
 }
 
 impl BootstrapUnbindIo for Unbinder {
-    fn unbind_bootstrap_sc(&mut self, sc: u64, tcb: u64) -> UnbindOutcome {
-        assert_eq!((sc, tcb), (BOOTSTRAP_SC, WORKER_TCB));
+    fn unbind_bootstrap_sc(&mut self, sc: u64, tcb: u64, endpoint: u64, reply: u64) -> UnbindOutcome {
         self.calls += 1;
+        self.last_request = Some((sc, tcb, endpoint, reply));
         self.result
     }
 }
@@ -73,6 +74,7 @@ fn only_exact_blocked_worker_and_offered_reply_permit_unbind() {
     let mut unbinder = Unbinder {
         result: UnbindOutcome::Acknowledged,
         calls: 0,
+        last_request: None,
     };
 
     assert!(owner.try_unbind(&mut unbinder).is_err());
@@ -100,6 +102,7 @@ fn only_exact_blocked_worker_and_offered_reply_permit_unbind() {
         .is_err());
     assert!(owner.take_passive().is_none());
     assert_eq!(unbinder.calls, 0);
+    assert_eq!(unbinder.last_request, None);
 
     owner
         .observe_blocked(observed(
@@ -111,6 +114,9 @@ fn only_exact_blocked_worker_and_offered_reply_permit_unbind() {
     assert!(owner.take_passive().is_none());
     owner.try_unbind(&mut unbinder).unwrap();
     assert_eq!(unbinder.calls, 1);
+    assert_eq!(unbinder.last_request, Some((
+        BOOTSTRAP_SC, WORKER_TCB, PRIVATE_ENDPOINT, REPLY_CAP,
+    )));
     let passive = owner
         .take_passive()
         .expect("acknowledged unbind yields passive worker");
@@ -135,10 +141,14 @@ fn indeterminate_unbind_retains_owner_and_cannot_replay_native_effect() {
     let mut unbinder = Unbinder {
         result: UnbindOutcome::Indeterminate(0xdead),
         calls: 0,
+        last_request: None,
     };
 
     assert!(owner.try_unbind(&mut unbinder).is_err());
     assert_eq!(unbinder.calls, 1);
+    assert_eq!(unbinder.last_request, Some((
+        BOOTSTRAP_SC, WORKER_TCB, PRIVATE_ENDPOINT, REPLY_CAP,
+    )));
     assert_eq!(owner.retained_resources(), Some(&resources()));
     assert!(owner.take_passive().is_none());
     unbinder.result = UnbindOutcome::Acknowledged;
@@ -147,6 +157,9 @@ fn indeterminate_unbind_retains_owner_and_cannot_replay_native_effect() {
         unbinder.calls, 1,
         "uncertain unbind must not be issued twice"
     );
+    assert_eq!(unbinder.last_request, Some((
+        BOOTSTRAP_SC, WORKER_TCB, PRIVATE_ENDPOINT, REPLY_CAP,
+    )));
     assert_eq!(owner.retained_resources(), Some(&resources()));
     assert!(owner.take_passive().is_none());
 }

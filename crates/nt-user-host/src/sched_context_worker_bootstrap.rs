@@ -100,10 +100,17 @@ pub enum UnbindOutcome {
     Indeterminate(u64),
 }
 
-/// `Acknowledged` means the native adapter observed an exact physical SC unbind ACK for this
-/// SC/TCB pair. A numeric match or issued request is insufficient; uncertain results remain owned.
+/// `Acknowledged` means the native adapter observed an atomic kernel unbind ACK for this exact
+/// SC, blocked worker, private receive endpoint and offered Reply. A prior observation, numeric
+/// match or issued request is insufficient; uncertain results remain owned.
 pub trait BootstrapUnbindIo {
-    fn unbind_bootstrap_sc(&mut self, sc: u64, tcb: u64) -> UnbindOutcome;
+    fn unbind_bootstrap_sc(
+        &mut self,
+        sc: u64,
+        tcb: u64,
+        endpoint: u64,
+        reply: u64,
+    ) -> UnbindOutcome;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,9 +194,14 @@ impl PassiveWorkerBootstrap {
             .resources
             .as_ref()
             .expect("blocked bootstrap owns resources");
-        let (sc, tcb) = (resources.bootstrap_sc, resources.worker_tcb);
+        let (sc, tcb, endpoint, reply) = (
+            resources.bootstrap_sc,
+            resources.worker_tcb,
+            resources.private_endpoint,
+            resources.reply_cap,
+        );
         self.phase = Phase::UnbindInFlight;
-        match io.unbind_bootstrap_sc(sc, tcb) {
+        match io.unbind_bootstrap_sc(sc, tcb, endpoint, reply) {
             UnbindOutcome::Acknowledged => {
                 self.phase = Phase::Unbound;
                 Ok(())
