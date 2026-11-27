@@ -179,6 +179,34 @@ class VisualProofTests(unittest.TestCase):
                 ocr.return_value = subprocess.CompletedProcess([], 0, good, "")
                 self.assertTrue(prove_basicproof_directory(image).passed)
 
+    def test_directory_gate_recovers_saved_zero_count_ocr_with_exact_crop(self):
+        # KVM 46044370404 visibly returned from an empty listing. Sparse whole-frame
+        # OCR read its actual zero as "@ File(s)" and rejected the real directory.
+        prompt = "C:\\Users\\User>"
+        sparse = (prompt + "dir basicproof\n"
+                  "Directory of C:\\Users\\User\\basicproof\n"
+                  "@ File(s)\n0 bytes\n2 Dir(s)\n" + prompt)
+        self.assertFalse(contains_basicproof_directory(sparse))
+        saved = (Path(__file__).parent / "fixtures" /
+                 "directory_46044370404.ppm").read_bytes()
+        original = Path("native-kvm-interact-09-basicproof-directory-list-probe-03.ppm")
+        with patch("scripts.ci_kvm_visual_proof._prove_image",
+                   return_value=ci_kvm_visual_proof.VisualProof(
+                       False, sparse, "basicproof directory listing not visible",
+                       original.name, "a3e4b5022121c89edb8ac836fd1f978ae52c7bff905f795fe5e633c58e9926d6")), \
+             patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=saved):
+            proof = prove_basicproof_directory(original)
+        self.assertTrue(proof.passed, proof.error)
+        self.assertIn("0 File(s)", proof.ocr_text)
+        pending = (Path(__file__).parent / "fixtures" /
+                   "directory_pending_46044370404.ppm").read_bytes()
+        with patch("scripts.ci_kvm_visual_proof._prove_image",
+                   return_value=ci_kvm_visual_proof.VisualProof(
+                       False, sparse, "basicproof directory listing not visible",
+                       original.name, "pending-sha")), \
+             patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=pending):
+            self.assertFalse(prove_basicproof_directory(original).passed)
+
     def test_start_menu_and_search_result_require_visible_shell_evidence(self):
         # Pinned LiberNT startmnu2.cpp filters Start Menu shortcut names. Its
         # shortcuts.inf names the cmd.exe Accessories link "Command Prompt".

@@ -43,6 +43,9 @@ SEARCH_QUERY_CROP = (17, 683, 210, 702)
 # 1024x768 FileBasic frame. Each crop is read from the original captured PPM.
 CREATE_INPUT_CROP = (70, 216, 600, 243)
 CREATE_PROMPT_CROP = (70, 250, 600, 274)
+# Command, exact directory header, count row and returned prompt in the pinned
+# 1024x768 console. Whole-frame sparse OCR can read the zero as "@ File(s)".
+DIRECTORY_LIST_CROP = (70, 246, 500, 421)
 # Bottom input row of the pinned 1024x768 Command Prompt in the FileBasic
 # frame. Sparse full-screen OCR can merge desktop glyphs into this row.
 CHILD_PROMPT_CROP = (158, 558, 805, 582)
@@ -310,8 +313,31 @@ def prove_child_stdout_completion(image):
 
 
 def prove_basicproof_directory(image):
-    return _prove_image(image, contains_basicproof_directory,
-                        "basicproof directory listing not visible")
+    result = _prove_image(image, contains_basicproof_directory,
+                          "basicproof directory listing not visible")
+    if result.passed or result.fatal:
+        return result
+    try:
+        frame = crop_ppm(image, *DIRECTORY_LIST_CROP)
+        ocr = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "6"],
+            input=frame, capture_output=True, timeout=20, check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return VisualProof(False, result.ocr_text, f"directory crop OCR unavailable: {error}",
+                           result.image_name, result.image_sha256, fatal=True)
+    text = ocr.stdout.decode("utf-8", errors="replace")
+    transcript = result.ocr_text + "\ndirectory crop: " + text
+    if ocr.returncode != 0:
+        detail = ocr.stderr.decode("utf-8", errors="replace").strip()
+        return VisualProof(False, transcript,
+                           f"directory crop OCR failed ({ocr.returncode}): {detail}",
+                           result.image_name, result.image_sha256, fatal=True)
+    if not contains_basicproof_directory(text) or READY_PROMPT.search(text) is None:
+        return VisualProof(False, transcript, result.error,
+                           result.image_name, result.image_sha256)
+    return VisualProof(True, transcript, image_name=result.image_name,
+                       image_sha256=result.image_sha256)
 
 
 def prove_attrib_help_completion(image):
