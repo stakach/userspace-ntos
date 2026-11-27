@@ -312,6 +312,29 @@ class InteractionRunnerTests(unittest.TestCase):
         self.assertTrue(all("-probe-" in name for name in self.captured))
         self.assertEqual(len(self.performed), 1, "never type ver without Start proof")
 
+    def test_final_visual_probe_survives_one_boot_loop_tick_of_scheduling_slack(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "start-menu", "actions": [{"click": [28, 743]}],
+                                    "wait_seconds": 4, "readiness_poll_seconds": 2},
+                                   {"name": "ver", "actions": [{"type": "ver\n"}],
+                                    "wait_seconds": 0}]})
+        proofs = iter((False, True))
+        def prove(name):
+            return VisualProof(next(proofs), "Start menu search visible",
+                               image_name=name, image_sha256="frame-sha")
+        runner = InteractionRunner(script, self.performed.append, self.captured.append,
+                                   self.log, self.clock, checks={"start-menu": prove})
+        runner.arm(0)
+        runner.advance(0)
+        self.clock.now = 2
+        runner.advance(2)
+        self.clock.now = 4.1  # the bounded boot loop woke just after the scheduled deadline
+        runner.advance(4.1)
+        self.assertEqual(len(self.captured), 3)
+        self.assertEqual(len(self.performed), 2, "the final exact frame must permit the next step")
+        self.assertEqual(runner.failures, 0)
+
     def test_visual_probe_retries_without_repeating_guest_input(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
                                "steps": [
@@ -377,13 +400,33 @@ class InteractionRunnerTests(unittest.TestCase):
         self.assertEqual(runner.advance(60), ["native-kvm-interact-01-start-menu.ppm"])
         self.assertTrue(runner.finished)
 
-    def test_slow_ocr_cannot_accept_proof_after_deadline(self):
+    def test_frame_capture_after_one_tick_slack_cannot_accept_late_proof(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
                                "steps": [
                                    {"name": "start-menu", "actions": [{"click": [28, 743]}],
                                     "wait_seconds": 6, "readiness_poll_seconds": 2},
                                    {"name": "ver", "actions": [{"type": "ver\n"}],
                                     "wait_seconds": 0}]})
+        def slow_capture(name):
+            self.captured.append(name)
+            self.clock.now = 7.1
+        def proof(name):
+            return VisualProof(True, "Start menu search visible", image_name=name,
+                               image_sha256="sha")
+        runner = InteractionRunner(script, self.performed.append, slow_capture,
+                                   self.log, self.clock, checks={"start-menu": proof})
+        runner.arm(0)
+        runner.advance(0)
+        self.clock.now = 2
+        runner.advance(2)
+        self.assertTrue(runner.finished)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(len(self.performed), 1)
+
+    def test_slow_ocr_of_an_on_time_frame_keeps_its_capture_time(self):
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [{"name": "start-menu", "actions": [],
+                                          "wait_seconds": 6, "readiness_poll_seconds": 2}]})
         def slow_proof(name):
             self.clock.now = 7
             return VisualProof(True, "Start menu search visible", image_name=name,
@@ -395,8 +438,10 @@ class InteractionRunnerTests(unittest.TestCase):
         self.clock.now = 2
         runner.advance(2)
         self.assertTrue(runner.finished)
-        self.assertEqual(runner.failures, 1)
-        self.assertEqual(len(self.performed), 1)
+        self.assertEqual(runner.failures, 0)
+        receipt = next(entry for entry in map(json.loads, self.log.read_text().splitlines())
+                       if entry["event"] == "checkpoint")
+        self.assertEqual(receipt["ready_after_seconds"], 2)
 
     def test_input_error_does_not_advance_on_visual_proof(self):
         script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
@@ -554,7 +599,7 @@ class InteractionRunnerTests(unittest.TestCase):
         runner.arm(0)
         runner.advance(0)
         self.assertTrue(runner.finished)
-        self.assertEqual(runner.index, 1)
+        self.assertEqual(runner.index, 0, "a failed visual step is not completed")
         self.assertEqual(len(self.performed), 1)
         self.assertEqual(runner.failures, 1)
         self.assertEqual(runner.checkpoints["command-prompt"], proof)

@@ -35,6 +35,7 @@ POINTER_ACTIONS = ("move", "click", "double_click")
 VERIFIED_POINTER_ACTION = "verified_click"
 MAX_CURSOR_AIMS = 6
 MAX_CURSOR_CORRECTION = 12  # total requested movement on either axis before remeasuring
+POLL_SCHEDULING_SLACK = 1.0  # the bounded boot loop polls at most once per second
 CHAR_QCODES = {" ": "spc", "\n": "ret", "\t": "tab", ".": "dot", ",": "comma",
                "-": "minus", "=": "equal", "/": "slash", "\\": "backslash",
                ";": "semicolon", "'": "apostrophe"}
@@ -336,7 +337,7 @@ class InteractionRunner:
                 now = self.clock()
                 continue
             polling = step.readiness_poll_seconds is not None
-            if polling and self.clock() > self.step_deadline:
+            if polling and self.clock() > self.step_deadline + POLL_SCHEDULING_SLACK:
                 self._fail(step, "readiness", RuntimeError("visual readiness deadline expired"))
                 self.halted = True
                 break
@@ -349,6 +350,7 @@ class InteractionRunner:
             captured = False
             try:
                 self.capture(name)
+                frame_at = self.clock()
                 captured = True
                 self.last_capture = name
                 self._record({"event": "screenshot", "step": self.index + 1,
@@ -367,9 +369,10 @@ class InteractionRunner:
                                 and (proof.image_name != name or not proof.image_sha256.strip())):
                             proof = replace(proof, passed=False, fatal=True,
                                             error="visual readiness proof does not identify the captured frame")
-                        if polling and completed_at > self.step_deadline:
+                        if (polling and frame_at > self.step_deadline
+                                + POLL_SCHEDULING_SLACK):
                             proof = replace(proof, passed=False,
-                                            error="visual readiness proof completed after deadline")
+                                            error="visual frame captured after deadline")
                         self.checkpoints[step.name] = proof
                         receipt = {"event": "checkpoint", "step": self.index + 1,
                                    "name": step.name, "passed": proof.passed,
@@ -378,7 +381,7 @@ class InteractionRunner:
                         if polling:
                             receipt.update(attempt=self.poll_attempt,
                                            ready_after_seconds=round(
-                                               completed_at - self.step_started_at, 2),
+                                               frame_at - self.step_started_at, 2),
                                            file=name)
                         self._record(receipt)
                         if not proof.passed:
@@ -395,6 +398,8 @@ class InteractionRunner:
                     except (OSError, RuntimeError, ValueError, KeyError) as error:
                         self._fail(step, "checkpoint", error)
                         self.halted = True
+            if self.halted:
+                break
             self.index += 1
             self.acted = False
             now = self.clock()
