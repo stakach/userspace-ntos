@@ -52,9 +52,9 @@ DIRECTORY_LIST_CROP = (70, 246, 500, 421)
 # The lower console rows in the pinned FileBasic frame show the attrib query,
 # its result and the returned prompt. Sparse full-frame OCR can split `.txt`.
 ATTRIB_READBACK_CROP = (68, 426, 520, 510)
-# Bottom input row of the pinned 1024x768 Command Prompt in the FileBasic
-# frame. Sparse full-screen OCR can merge desktop glyphs into this row.
-CHILD_PROMPT_CROP = (158, 558, 805, 582)
+# The command, child output, and returned prompt in the pinned 1024x768
+# console. Full-frame sparse OCR can merge desktop glyphs into the prompt.
+CHILD_COMPLETION_CROP = (68, 420, 500, 500)
 # OCR may attach the next prompt's first typed glyph to the child's stdout row.
 # The result is still distinguishable from the echoed `cmd /c echo` command.
 CHILD_STDOUT_LINE = re.compile(
@@ -295,25 +295,25 @@ def prove_basicproof_create_completion(image):
 def prove_child_stdout_completion(image):
     result = _prove_image(image, contains_child_stdout_completion,
                           "child stdout marker and returned prompt not visible")
-    if result.passed or result.fatal or CHILD_STDOUT_LINE.search(result.ocr_text) is None:
+    if result.passed or result.fatal:
         return result
     try:
-        prompt_frame = crop_ppm(image, *CHILD_PROMPT_CROP)
-        prompt_ocr = subprocess.run(
-            ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "7"],
-            input=prompt_frame, capture_output=True, timeout=20, check=False,
+        completion_frame = crop_ppm(image, *CHILD_COMPLETION_CROP)
+        completion_ocr = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "6"],
+            input=completion_frame, capture_output=True, timeout=20, check=False,
         )
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-        return VisualProof(False, result.ocr_text, f"child prompt OCR unavailable: {error}",
+        return VisualProof(False, result.ocr_text, f"child completion OCR unavailable: {error}",
                            result.image_name, result.image_sha256, fatal=True)
-    prompt = prompt_ocr.stdout.decode("utf-8", errors="replace").strip()
-    transcript = result.ocr_text + "\nchild prompt crop: " + prompt
-    if prompt_ocr.returncode != 0:
-        detail = prompt_ocr.stderr.decode("utf-8", errors="replace").strip()
+    completion = completion_ocr.stdout.decode("utf-8", errors="replace")
+    transcript = result.ocr_text + "\nchild completion crop: " + completion
+    if completion_ocr.returncode != 0:
+        detail = completion_ocr.stderr.decode("utf-8", errors="replace").strip()
         return VisualProof(False, transcript,
-                           f"child prompt OCR failed ({prompt_ocr.returncode}): {detail}",
+                           f"child completion OCR failed ({completion_ocr.returncode}): {detail}",
                            result.image_name, result.image_sha256, fatal=True)
-    if re.fullmatch(r"(?i)[a-z]:\\[^\r\n>]{1,128}>", prompt) is None:
+    if not contains_child_stdout_completion(completion):
         return VisualProof(False, transcript, result.error,
                            result.image_name, result.image_sha256)
     return VisualProof(True, transcript, image_name=result.image_name,
