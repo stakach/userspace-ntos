@@ -11,6 +11,7 @@ impl ExecNtHandler {
         return_single_entry: bool,
         restart_scan: bool,
         capture: &file_capture::HostedFileCapture,
+        pattern_trace: bool,
     ) -> u32 {
         let route = capture.route;
         let file_id = route.file_id;
@@ -36,6 +37,13 @@ impl ExecNtHandler {
             owned.extend_from_slice(&units[..pattern_len]);
             Some(nt_types::UnicodeString::from_owned_units(owned))
         };
+        if pattern_trace {
+            crate::mounted_query_directory_trace::patterned_stage(
+                b"hosted", self.pi, self.hosted_process_generation(self.pi),
+                args[0], pattern.as_ref().map(|name| name.as_units()),
+                None, 0, 0,
+            );
+        }
         let mut routed_output = match try_zeroed_transfer_buffer(length) {
             Ok(output) => output,
             Err(status) => return status,
@@ -102,6 +110,13 @@ impl ExecNtHandler {
             }
             Err(status) => status,
         };
+        if pattern_trace {
+            crate::mounted_query_directory_trace::patterned_stage(
+                b"hosted-dispatch", self.pi, self.hosted_process_generation(self.pi),
+                args[0], None, Some(status), information,
+                pending_irp.map_or(0, |irp| irp.raw()),
+            );
+        }
         if status == STATUS_PENDING {
             let Some(irp_id) = pending_irp else {
                 self.release_file_reference(file_id);
@@ -138,7 +153,9 @@ impl ExecNtHandler {
                 resume_flags: 0,
             });
             self.pending_file_io_wait = synchronous;
-            crate::mounted_query_directory_trace::pending(file_id, irp_id.raw(), information_class);
+            crate::mounted_query_directory_trace::pending(
+                file_id, irp_id.raw(), information_class, pattern_trace,
+            );
             return STATUS_PENDING;
         }
         if nt_io_completion::file_io_status_copies_output(status) {
@@ -159,6 +176,7 @@ impl ExecNtHandler {
         };
         crate::mounted_query_directory_trace::complete_inline(
             file_id, self.pi as u32, information_class, delivered, status, information,
+            pattern_trace,
         );
         self.complete_terminal_file_io(
             file_id,

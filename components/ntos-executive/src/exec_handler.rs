@@ -39297,6 +39297,16 @@ impl ExecNtHandler {
                 let output = args[5];
                 let raw_length = nt_ulong_arg(args[6]) as u64;
                 let information_class = nt_ulong_arg(args[7]);
+                let pattern_trace = crate::mounted_query_directory_trace::sample_patterned(
+                    self.pi, self.hosted_process_generation(self.pi), information_class,
+                    args[9] != 0,
+                );
+                if pattern_trace {
+                    crate::mounted_query_directory_trace::patterned_stage(
+                        b"call", self.pi, self.hosted_process_generation(self.pi),
+                        args[0], None, None, 0, 0,
+                    );
+                }
                 crate::writable_fs::trace_dir_refusal(
                     b"call",
                     self.pi,
@@ -39389,6 +39399,7 @@ impl ExecNtHandler {
                         return_single_entry,
                         restart_scan,
                         &capture,
+                        pattern_trace,
                     );
                 }
 
@@ -39432,6 +39443,12 @@ impl ExecNtHandler {
                             }
                         };
                         let pattern = (args[9] != 0).then_some(&pattern[..pattern_len]);
+                        if pattern_trace {
+                            crate::mounted_query_directory_trace::patterned_stage(
+                                b"local", self.pi, self.hosted_process_generation(self.pi),
+                                args[0], pattern, None, 0, 0,
+                            );
+                        }
                         let event_index = match self.prepare_io_event_for_request(args[0], args[1]) {
                             Ok(index) => index,
                             Err(status) => return status,
@@ -39461,6 +39478,13 @@ impl ExecNtHandler {
                             restart_scan,
                             encoded,
                         );
+                        if pattern_trace {
+                            crate::mounted_query_directory_trace::patterned_stage(
+                                b"local-result", self.pi,
+                                self.hosted_process_generation(self.pi), args[0], pattern,
+                                Some(result.status), result.information as u64, 0,
+                            );
+                        }
                         return self.complete_local_directory_query(
                             args,
                             request_id,
@@ -41780,6 +41804,11 @@ impl ExecNtHandler {
                 let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
                 let information_class = nt_ulong_arg(args[4]);
                 let length = nt_ulong_arg(args[3]) as usize;
+                let basic_trace = information_class == nt_fs::FILE_BASIC_INFORMATION
+                    && self.sample_basic_set();
+                if basic_trace {
+                    self.trace_basic_set(b"call", args[0], None, None);
+                }
                 let Some(contract) = nt_io_manager::set_information_contract(information_class)
                 else {
                     return nt_fs::STATUS_INVALID_INFO_CLASS;
@@ -41801,7 +41830,12 @@ impl ExecNtHandler {
                     args[0], |access| contract.access_granted(access),
                 ) {
                     Ok(capture) => capture,
-                    Err(status) => return status,
+                    Err(status) => {
+                        if basic_trace {
+                            self.trace_basic_set(b"capture-refused", args[0], None, Some(status));
+                        }
+                        return status;
+                    }
                 };
                 if let Some(status) = self.try_set_file_mode_information(
                     args[0], iosb, args[2], length, information_class, capture.as_ref(),
@@ -41809,9 +41843,15 @@ impl ExecNtHandler {
                     return status;
                 }
                 if let Some(capture) = capture.as_ref() {
-                    return self.set_hosted_file_information(
+                    let status = self.set_hosted_file_information(
                         args[0], iosb, args[2], length, information_class, capture,
                     );
+                    if basic_trace {
+                        self.trace_basic_set(
+                            b"hosted", args[0], Some(capture.granted_access), Some(status),
+                        );
+                    }
+                    return status;
                 }
                 let mut payload = match try_zeroed_transfer_buffer(length) {
                     Ok(payload) => payload,
@@ -41826,6 +41866,12 @@ impl ExecNtHandler {
                 };
                 if !contract.access_granted(nt_types::AccessMask::from_bits_retain(granted_access))
                 {
+                    if basic_trace {
+                        self.trace_basic_set(
+                            b"local-access-refused", args[0], Some(granted_access),
+                            Some(STATUS_ACCESS_DENIED),
+                        );
+                    }
                     return STATUS_ACCESS_DENIED;
                 }
                 if information_class == nt_fs::FILE_SHORT_NAME_INFORMATION
@@ -41836,6 +41882,9 @@ impl ExecNtHandler {
                 if let Some(status) = self.try_set_local_file_information(
                     args[0], iosb, information_class, &payload,
                 ) {
+                    if basic_trace {
+                        self.trace_basic_set(b"local", args[0], Some(granted_access), Some(status));
+                    }
                     return status;
                 }
                 nt_fs::STATUS_INVALID_HANDLE

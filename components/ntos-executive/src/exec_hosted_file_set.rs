@@ -3,8 +3,34 @@
 use super::*;
 
 static RETIRE_CURSOR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static BASIC_TRACE_GENERATIONS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+static BASIC_TRACE_COUNTS: [AtomicU32; MAX_PI] = [const { AtomicU32::new(0) }; MAX_PI];
 
 impl ExecNtHandler {
+    pub(super) fn sample_basic_set(&self) -> bool {
+        if self.pi >= MAX_PI { return false; }
+        let Some(generation) = self.hosted_process_generation(self.pi) else { return false; };
+        if generation == 0 { return false; }
+        if BASIC_TRACE_GENERATIONS[self.pi].load(Ordering::Acquire) != generation {
+            BASIC_TRACE_COUNTS[self.pi].store(0, Ordering::Release);
+            BASIC_TRACE_GENERATIONS[self.pi].store(generation, Ordering::Release);
+        }
+        BASIC_TRACE_COUNTS[self.pi].fetch_add(1, Ordering::Relaxed) < 8
+    }
+
+    pub(super) fn trace_basic_set(
+        &self, stage: &[u8], handle: u64, grant: Option<u32>, status: Option<u32>,
+    ) {
+        print_str(b"[native-filebasic] stage="); print_str(stage);
+        print_str(b" pi="); print_u64(self.pi as u64);
+        print_str(b" generation=");
+        print_u64(self.hosted_process_generation(self.pi).unwrap_or(0));
+        print_str(b" handle=0x"); print_hex_u64(handle);
+        print_str(b" grant=0x"); print_hex(grant.unwrap_or(u32::MAX));
+        print_str(b" status=0x"); print_hex(status.unwrap_or(u32::MAX));
+        print_str(b"\n");
+    }
+
     pub(crate) fn set_file_name_caller_is_current(
         &self,
         caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,

@@ -35,6 +35,7 @@ class FileBasicInteractionTests(unittest.TestCase):
         self.assertEqual([step.name for step in profile.steps[len(desktop.steps):]],
                          ["basicproof-create", "basicproof-directory-list",
                           "basicproof-file-create", "basicproof-file-list",
+                          "basicproof-child-stdout", "basicproof-attrib-help",
                           "basicproof-clear-readonly",
                           "basicproof-baseline-readback", "basicproof-set-readonly",
                           "basicproof-readback"])
@@ -43,6 +44,8 @@ class FileBasicInteractionTests(unittest.TestCase):
             (("type", "dir basicproof\n"),),
             (("type", "if not exist basicproof.txt echo filebasic>basicproof.txt\n"),),
             (("type", "dir basicproof.txt\n"),),
+            (("type", "cmd /c echo CHILD_STDOUT_OK\n"),),
+            (("type", "attrib /?\n"),),
             (("type", "attrib -R basicproof.txt\n"),),
             (("type", "attrib basicproof.txt\n"),),
             (("type", "attrib +R basicproof.txt\n"),),
