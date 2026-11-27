@@ -46,6 +46,9 @@ SEARCH_QUERY_CROP = (17, 683, 210, 702)
 # 1024x768 FileBasic frame. Each crop is read from the original captured PPM.
 CREATE_INPUT_CROP = (70, 216, 600, 243)
 CREATE_PROMPT_CROP = (70, 250, 600, 274)
+# On the second boot the persisted directory adds an error line, moving the
+# returned prompt down. This original-pixel crop includes all three console rows.
+CREATE_EXISTING_CROP = (70, 220, 480, 286)
 # Command, exact directory header, count row and returned prompt in the pinned
 # 1024x768 console. Whole-frame sparse OCR can read the zero as "@ File(s)".
 DIRECTORY_LIST_CROP = (70, 246, 500, 421)
@@ -142,6 +145,20 @@ def contains_basicproof_create_completion(text):
         return False
     return re.search(r"(?im)^\s*(?:Syntax error|A subdirectory or file .* already exists)",
                      tail[:returned.start()]) is None
+
+
+def contains_persisted_basicproof_directory(text):
+    """Require the exact existing-directory result and same-directory empty prompt."""
+    commands = list(CREATE_COMMAND.finditer(text))
+    if not commands:
+        return False
+    command = commands[-1]
+    tail = text[command.end():]
+    returned = CREATE_RETURNED.search(tail)
+    if returned is None or returned.group("directory").casefold() != command.group("directory").casefold():
+        return False
+    lines = [line.strip() for line in tail[:returned.start()].splitlines() if line.strip()]
+    return lines == ["A subdirectory or file basicproof already exists."]
 
 
 def contains_basicproof_directory(text):
@@ -252,12 +269,33 @@ def prove_basicproof_create_input(image):
                        image_sha256=result.image_sha256)
 
 
-def prove_basicproof_create_completion(image):
+def prove_basicproof_create_completion(image, *, expect_existing=False):
     """After Return, require a new empty prompt before another command."""
     result = _prove_image(image, contains_basicproof_create_completion,
                           "md basicproof did not return to an empty prompt")
     if result.fatal:
         return result
+    if expect_existing:
+        try:
+            existing_frame = crop_ppm(image, *CREATE_EXISTING_CROP)
+            existing_ocr = subprocess.run(
+                ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "6"],
+                input=existing_frame, capture_output=True, timeout=20, check=False,
+            )
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            return VisualProof(False, result.ocr_text, f"existing directory OCR unavailable: {error}",
+                               result.image_name, result.image_sha256, fatal=True)
+        existing = existing_ocr.stdout.decode("utf-8", errors="replace")
+        transcript = result.ocr_text + "\nexisting directory crop: " + existing
+        if existing_ocr.returncode != 0:
+            detail = existing_ocr.stderr.decode("utf-8", errors="replace").strip()
+            return VisualProof(False, transcript,
+                               f"existing directory OCR failed ({existing_ocr.returncode}): {detail}",
+                               result.image_name, result.image_sha256, fatal=True)
+        passed = contains_persisted_basicproof_directory(existing)
+        return VisualProof(passed, transcript,
+                           "" if passed else "persisted basicproof directory not visible",
+                           result.image_name, result.image_sha256)
     commands = list(CREATE_COMMAND.finditer(result.ocr_text))
     if not commands:
         return result
