@@ -229,6 +229,41 @@ def source_is_ancestor(source_head: str, target_head: str, cwd: Path = ROOT) -> 
     ).returncode == 0
 
 
+def source_matches_target_ancestor_tree(source_head: str, target_head: str) -> bool:
+    """Accept a pre-squash source only when its complete tree is in target history.
+
+    A squash merge can replace a commit without changing its source tree. The installed
+    disk is still authenticated by its run, manifest and hash; this check only establishes
+    that the source build corresponds to an actual ancestor of the target build.
+    """
+    if not isinstance(source_head, str) or not isinstance(target_head, str) \
+            or not COMMIT.fullmatch(source_head) or not COMMIT.fullmatch(target_head):
+        return False
+    try:
+        def verified_commit(sha: str) -> bool:
+            resolved = subprocess.check_output(
+                ["git", "rev-parse", "--verify", f"{sha}^{{commit}}"],
+                cwd=ROOT, text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+            return resolved == sha
+
+        if not verified_commit(source_head) or not verified_commit(target_head):
+            return False
+        source_tree = subprocess.check_output(
+            ["git", "rev-parse", "--verify", f"{source_head}^{{tree}}"],
+            cwd=ROOT, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        if not COMMIT.fullmatch(source_tree):
+            return False
+        ancestor_trees = subprocess.check_output(
+            ["git", "log", "--format=%T", target_head],
+            cwd=ROOT, text=True, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return source_tree in ancestor_trees.splitlines()
+
+
 def migration_submodule_is_compatible(source_sha: object, current_sha: str) -> bool:
     """The kernel submodule may advance or keep the same tree after a squash merge.
 
@@ -280,8 +315,9 @@ def verify_migration_run(run: dict, run_id: int, attempt: int, current: dict) ->
     verify_conclusion(run)
     source_head = run.get("head_sha")
     if not isinstance(source_head, str) or source_head == current["head_sha"] \
-            or not source_is_ancestor(source_head, current["head_sha"]):
-        raise ContinuationError("migration source is not an earlier ancestor of this head")
+            or not (source_is_ancestor(source_head, current["head_sha"])
+                    or source_matches_target_ancestor_tree(source_head, current["head_sha"])):
+        raise ContinuationError("migration source is not an earlier ancestor tree of this head")
     if (run.get("repository") or {}).get("full_name") != current["repo"] \
             or (run.get("head_repository") or {}).get("full_name") != current["repo"]:
         raise ContinuationError("source run belongs to another repository")

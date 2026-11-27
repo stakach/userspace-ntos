@@ -13,6 +13,60 @@ fn pending() -> PendingFileIo {
 }
 
 #[test]
+fn basic_primary_claim_rejects_foreign_table_without_losing_live_reply() {
+    let mut first = PendingFileIoTable::new();
+    let primary = first.reserve_basic_primary().unwrap();
+    let mut second = PendingFileIoTable::new();
+    let live = second.reserve().unwrap();
+    let mut original = pending();
+    original.reply_cap = 41;
+    original.reply_required = true;
+    assert!(second.park_reserved(live, original).is_ok());
+    let published = second.get_exact(live.identity()).unwrap();
+    let offered = PendingFileIo { reply_cap: 99, ..original };
+
+    let (error, returned, primary) = second.try_park_basic_primary(primary, offered)
+        .err().unwrap();
+    assert_eq!(error, PendingFileIoParkError::StaleReservation);
+    assert_eq!(returned, offered);
+    let retained = second.get_exact(live.identity()).unwrap();
+    assert_eq!(retained, published);
+    assert_eq!((retained.irp_id, retained.reply_cap), (original.irp_id, 41));
+    assert_eq!(retained.busy.unwrap().owner(), original.busy.unwrap().owner());
+    assert!(!first.reset());
+    assert!(first.cancel_basic_primary(primary));
+}
+
+#[test]
+fn malformed_basic_primary_retains_its_exact_claim_and_reply() {
+    let mut table = PendingFileIoTable::new();
+    let primary = table.reserve_basic_primary().unwrap();
+    let identity = primary.identity();
+    let malformed = PendingFileIo {
+        route: PendingFileRoute::Local(LocalFileObject::Overlay(19)),
+        irp_id: table.basic_primary_local_operation_id(&primary).unwrap(),
+        major: nt_io_abi::major::IRP_MJ_SET_INFORMATION,
+        operation: PendingFileIoOperation::OwnedBasicPreflight(
+            PendingOwnedBasicPreflight::new(1)),
+        tid: 13,
+        busy: Some(test_busy(11, 13)),
+        iosb_va: 0x2000,
+        reply_cap: 41,
+        reply_required: true,
+        completion_port_suppressed: true,
+        event_obj_idx: u64::MAX,
+        ..PendingFileIo::default()
+    };
+    let (error, returned, primary) = table.try_park_basic_primary(primary, malformed)
+        .err().unwrap();
+    assert_eq!(error, PendingFileIoParkError::InvalidRecord);
+    assert_eq!(returned, malformed);
+    assert!(table.get_exact(identity).is_none());
+    assert!(!table.reset());
+    assert!(table.cancel_basic_primary(primary));
+}
+
+#[test]
 fn refused_transfer_keeps_exact_reservation_and_busy_for_one_later_commit() {
     let mut table = PendingFileIoTable::new();
     let first = table.reserve().unwrap();

@@ -247,7 +247,7 @@ fn full_basic_sidecar_refuses_admission_without_publishing_a_row() {
     assert_eq!(returned_row, row, "the Reply-bearing delivery row belongs to the caller");
     assert!(pending.get_exact(identity).is_none(),
         "sidecar refusal must not leave an independently deliverable SET row");
-    assert!(pending.is_empty());
+    assert_eq!(pending.len(), 0);
     assert_eq!(pending.local_operation_id(reservation), None);
     let next = pending.reserve().unwrap();
     assert_ne!(next, reservation);
@@ -341,4 +341,244 @@ fn exact_basic_admission_parks_its_row_and_owner() {
     let claim = owners.claim_exact(&pending, identity, irp_id).unwrap();
     assert_eq!(owners.claimed_exact(&pending, &claim).unwrap().input(), &input);
     assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn native_admission_refusal_keeps_its_exact_reservation_for_a_real_terminal() {
+    let (fs, handle, input) = prepared();
+    let mut pending = PendingFileIoTable::new();
+    let reservation = pending.reserve().unwrap();
+    let irp_id = pending.local_operation_id(reservation).unwrap();
+    let row = basic_row(irp_id);
+    let before = fs.query_file_object_information(handle).unwrap().metadata;
+    let drops = Rc::new(Cell::new(0));
+    let owner = PendingBasicPreparedOwner::prepare(&fs, handle, input,
+        FileReference(Rc::clone(&drops))).ok().unwrap();
+    let mut owners = PendingBasicPreparedTable::with_limit(0);
+
+    let (reason, mut returned_row, returned_owner) = owners
+        .try_admit_reserved_exact(&mut pending, reservation, row, owner).err().unwrap();
+    assert_eq!(reason, PendingBasicPreparedAdmissionError::SidecarUnavailable);
+    assert_eq!(pending.local_operation_id(reservation), Some(irp_id));
+    assert_eq!(pending.len(), 0);
+    assert!(pending.get_exact(reservation.identity()).is_none());
+    assert_eq!(fs.query_file_object_information(handle).unwrap().metadata, before);
+    assert_eq!(drops.get(), 0);
+
+    returned_row.operation = PendingFileIoOperation::OwnedInline(PendingOwnedInline {
+        status: nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32,
+        information: 0,
+    });
+    assert!(pending.park_reserved(reservation, returned_row).is_ok());
+    assert_eq!(pending.get_exact(reservation.identity()).unwrap().reply_cap, 41);
+    assert_eq!(drops.get(), 0, "the fallback row still owns its File reference");
+    drop(returned_owner.into_file());
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn prepared_basic_snapshot_apply_records_one_terminal_across_redrive() {
+    let (mut fs, handle, input) = prepared();
+    let before = fs.query_file_object_information(handle).unwrap().metadata;
+    let drops = Rc::new(Cell::new(0));
+    let mut pending = PendingFileIoTable::new();
+    let mut owners = PendingBasicPreparedTable::new();
+    let owner = PendingBasicPreparedOwner::prepare(&fs, handle, input,
+        FileReference(Rc::clone(&drops))).ok().unwrap();
+    let (identity, irp_id, _) = admit_row(&mut pending, &mut owners, owner);
+    let claim = owners.claim_exact(&pending, identity, irp_id).unwrap();
+
+    let first = owners.apply_snapshot_claimed_exact(&pending, &claim, &mut fs).unwrap();
+    assert_eq!(first, (STATUS_SUCCESS, true, true));
+    let after = fs.query_file_object_information(handle).unwrap().metadata;
+    assert_ne!(after, before);
+    assert_eq!(after.last_write_time, 777);
+    assert_eq!(owners.apply_snapshot_claimed_exact(&pending, &claim, &mut fs),
+        Some((STATUS_SUCCESS, true, false)));
+    assert_eq!(fs.query_file_object_information(handle).unwrap().metadata, after);
+    assert_eq!(drops.get(), 0);
+
+    let terminal = owners.commit_owned_basic_exact(&mut pending, claim, first.0).ok().unwrap();
+    assert_eq!(pending.get_exact(identity).unwrap().owned_terminal_result(), Some((first.0, 0)));
+    drop(terminal.into_file());
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn no_effect_basic_claim_refusal_can_cancel_without_losing_file_or_reply() {
+    let (fs, handle, input) = prepared();
+    let before = fs.query_file_object_information(handle).unwrap().metadata;
+    let drops = Rc::new(Cell::new(0));
+    let mut pending = PendingFileIoTable::new();
+    let mut owners = PendingBasicPreparedTable::new();
+    let owner = PendingBasicPreparedOwner::prepare(&fs, handle, input,
+        FileReference(Rc::clone(&drops))).ok().unwrap();
+    let (identity, irp_id, _) = admit_row(&mut pending, &mut owners, owner);
+    let claim = owners.claim_exact(&pending, identity, irp_id).unwrap();
+    assert_eq!(owners.release_unentered_claim_exact(&pending, &claim), Some(()));
+    assert!(owners.reclaim_applied_exact(&pending, identity, irp_id).is_none());
+    let abandoned = pending.abandon_transfer_exact(identity.slot(), irp_id).unwrap();
+    assert_eq!(abandoned.reply_cap, 41,
+        "the cancelled caller's exact Reply is returned to teardown");
+
+    let returned = owners.cancel_unentered_exact(&mut pending, identity, irp_id).unwrap();
+    assert_eq!(pending.get_exact(identity).unwrap().owned_terminal_result(),
+        Some((nt_status::NtStatus::CANCELLED.raw() as u32, 0)));
+    let terminal = pending.get_exact(identity).unwrap();
+    assert_eq!(terminal.reply_cap, 0);
+    assert_eq!(terminal.iosb_va, 0);
+    assert!(!terminal.signal_file);
+    assert_eq!(fs.query_file_object_information(handle).unwrap().metadata, before);
+    assert_eq!(drops.get(), 0);
+    drop(returned.into_file());
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn overlapping_basic_set_rebases_captured_input_on_the_same_file() {
+    let (mut fs, handle, input) = prepared();
+    let file = FileReference(Rc::new(Cell::new(0)));
+    let mut owner = PendingBasicPreparedOwner::prepare(&fs, handle, input, file).ok().unwrap();
+    let mut intervening = [0u8; 40];
+    intervening[..8].copy_from_slice(&888u64.to_le_bytes());
+    assert_eq!(fs.zw_set_information_file(handle, nt_fs::FILE_BASIC_INFORMATION,
+        &intervening), STATUS_SUCCESS);
+
+    assert_eq!(owner.apply_snapshot_once(&mut fs), (STATUS_SUCCESS, true));
+    let metadata = fs.query_file_object_information(handle).unwrap().metadata;
+    assert_eq!(metadata.creation_time, 888,
+        "the parked Basic input must preserve a newer independent time field");
+    assert_eq!(metadata.last_write_time, 777);
+    assert_eq!(owner.apply_snapshot_once(&mut fs), (STATUS_SUCCESS, true));
+    assert_eq!(fs.query_file_object_information(handle).unwrap().metadata, metadata);
+}
+
+#[test]
+fn overlapping_rename_rebases_basic_without_restoring_the_old_path() {
+    let (mut fs, handle, input) = prepared();
+    let file = FileReference(Rc::new(Cell::new(0)));
+    let mut owner = PendingBasicPreparedOwner::prepare(&fs, handle, input, file).ok().unwrap();
+    let target: Vec<u8> = "Moved.txt".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert_eq!(fs.zw_rename_file(handle, nt_fs::FileRenameRoot::SourceParent,
+        &target, false), STATUS_SUCCESS);
+    let renamed = fs.query_opened_name(handle).unwrap();
+
+    assert_eq!(owner.apply_snapshot_once(&mut fs), (STATUS_SUCCESS, true));
+    assert_eq!(fs.query_opened_name(handle).unwrap(), renamed);
+    assert_eq!(fs.query_file_object_information(handle).unwrap().metadata.last_write_time, 777);
+}
+
+#[test]
+fn basic_sidecar_capacity_refuses_before_file_retain_or_signal_reset() {
+    let (fs, handle, _) = prepared();
+    let before = fs.query_file_object_information(handle).unwrap().metadata;
+    let mut pending = PendingFileIoTable::new();
+    let primary = pending.reserve_basic_primary().unwrap();
+    let mut owners = PendingBasicPreparedTable::<FileReference>::with_limit(0);
+
+    assert!(owners.reserve_admission().is_none());
+    assert!(pending.cancel_basic_primary(primary));
+    assert_eq!(pending.len(), 0);
+    assert_eq!(fs.query_file_object_information(handle).unwrap().metadata, before);
+}
+
+#[test]
+fn pre_reserved_basic_admits_one_exact_row_without_a_spare_file_slot() {
+    let (fs, handle, input) = prepared();
+    let drops = Rc::new(Cell::new(0));
+    let mut pending = PendingFileIoTable::new();
+    let primary = pending.reserve_basic_primary().unwrap();
+    let irp_id = pending.basic_primary_local_operation_id(&primary).unwrap();
+    let mut owners = PendingBasicPreparedTable::new();
+    let sidecar = owners.reserve_admission().unwrap();
+    let owner = PendingBasicPreparedOwner::prepare(&fs, handle, input,
+        FileReference(Rc::clone(&drops))).ok().unwrap();
+
+    let identity = owners.try_admit_pre_reserved_exact(&mut pending, sidecar,
+        primary, basic_row(irp_id), owner).ok().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(owners.len(), 1);
+    assert_eq!(pending.get_exact(identity).unwrap().irp_id, irp_id);
+    assert_eq!(pending.get_exact(identity).unwrap().reply_cap, 41);
+    assert_eq!(drops.get(), 0);
+    let next = pending.reserve().unwrap();
+    assert_eq!(next.identity().slot(), identity.slot() + 1);
+    assert!(pending.cancel_reservation(next));
+}
+
+#[test]
+fn unused_basic_pair_cancels_without_metadata_effect_or_capacity_loss() {
+    let (fs, handle, _) = prepared();
+    let before = fs.query_file_object_information(handle).unwrap().metadata;
+    let mut pending = PendingFileIoTable::new();
+    let primary = pending.reserve_basic_primary().unwrap();
+    let identity = primary.identity();
+    let mut owners = PendingBasicPreparedTable::<FileReference>::with_limit(1);
+    let sidecar = owners.reserve_admission().unwrap();
+    assert!(owners.reserve_admission().is_none());
+
+    assert!(owners.cancel_admission(sidecar));
+    assert!(pending.cancel_basic_primary(primary));
+    let reused_sidecar = owners.reserve_admission().unwrap();
+    assert!(owners.cancel_admission(reused_sidecar));
+    let reused = pending.reserve().unwrap();
+    assert_eq!(reused.identity().slot(), identity.slot());
+    assert!(pending.cancel_reservation(reused));
+    assert_eq!(fs.query_file_object_information(handle).unwrap().metadata, before);
+}
+
+#[test]
+fn basic_preparation_error_uses_the_same_primary_inline_terminal() {
+    let mut pending = PendingFileIoTable::new();
+    let primary = pending.reserve_basic_primary().unwrap();
+    let irp_id = pending.basic_primary_local_operation_id(&primary).unwrap();
+    let mut owners = PendingBasicPreparedTable::<FileReference>::new();
+    let sidecar = owners.reserve_admission().unwrap();
+    assert!(owners.cancel_admission(sidecar));
+    let mut row = basic_row(irp_id);
+    row.operation = PendingFileIoOperation::OwnedInline(PendingOwnedInline {
+        status: nt_fs::STATUS_INVALID_PARAMETER, information: 0,
+    });
+    row.iosb_va = 0;
+    row.signal_file = false;
+
+    let identity = pending.try_park_basic_primary(primary, row).ok().unwrap();
+    let terminal = pending.get_exact(identity).unwrap();
+    assert_eq!(terminal.owned_terminal_result(), Some((nt_fs::STATUS_INVALID_PARAMETER, 0)));
+    assert_eq!(terminal.reply_cap, 41);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(owners.len(), 0);
+}
+
+#[test]
+fn malformed_basic_commit_returns_both_exact_claims_reply_and_file() {
+    let (fs, handle, input) = prepared();
+    let drops = Rc::new(Cell::new(0));
+    let mut pending = PendingFileIoTable::new();
+    let primary = pending.reserve_basic_primary().unwrap();
+    let irp_id = pending.basic_primary_local_operation_id(&primary).unwrap();
+    let mut owners = PendingBasicPreparedTable::new();
+    let sidecar = owners.reserve_admission().unwrap();
+    let owner = PendingBasicPreparedOwner::prepare(&fs, handle, input,
+        FileReference(Rc::clone(&drops))).ok().unwrap();
+    let mut malformed = basic_row(irp_id);
+    malformed.busy = Some(PendingFileBusy::new(FileIoBusyOwner {
+        key: FileIoWaitKey::LocalOverlay(999), tid: 23,
+        mode: nt_io_completion::FileIoMode::SynchronousNonAlertable,
+    }));
+
+    let (error, returned, owner, primary, sidecar) = owners
+        .try_admit_pre_reserved_exact(&mut pending, sidecar, primary,
+            malformed, owner).err().unwrap();
+    assert_eq!(error, PendingBasicPreparedAdmissionError::PendingRow(
+        PendingFileIoParkError::InvalidRecord));
+    assert_eq!(returned, malformed);
+    assert_eq!(returned.reply_cap, 41);
+    assert!(pending.get_exact(primary.identity()).is_none());
+    assert_eq!(owners.len(), 0);
+    assert_eq!(drops.get(), 0);
+    assert!(owners.cancel_admission(sidecar));
+    assert!(pending.cancel_basic_primary(primary));
+    drop(owner.into_file());
+    assert_eq!(drops.get(), 1);
 }

@@ -44,6 +44,21 @@ impl ExecNtHandler {
         self.reserved_local_file_io_id()
     }
 
+    /// Claim both the primary delivery row and Basic sidecar capacity before File retain/reset.
+    pub(super) unsafe fn reserve_local_basic_file_io_delivery(&mut self) -> Result<u64, u32> {
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
+            || !wait_reply_pool_has_free()
+            || !self.reserve_basic_file_io_owner()
+        {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let primary = self.pending_basic_primary_reservation.as_ref()
+            .expect("accepted Basic SET lost its primary claim");
+        (&*core::ptr::addr_of!(PENDING_FILE_IO))
+            .basic_primary_local_operation_id(primary)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)
+    }
+
     pub(super) unsafe fn begin_retained_local_file_io(
         &mut self,
         file_object: LocalFileObject,

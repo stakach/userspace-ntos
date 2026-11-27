@@ -93,14 +93,23 @@ pub(crate) unsafe fn reserve(
     reservation: PendingFileIoReservation,
     caller: ProviderLogicalCaller,
 ) -> bool {
-    let identity = reservation.identity();
+    reserve_identity(reservation.identity(), caller)
+}
+
+pub(crate) unsafe fn reserve_identity(
+    identity: PendingFileIoIdentity,
+    caller: ProviderLogicalCaller,
+) -> bool {
     (&mut *core::ptr::addr_of_mut!(CALLERS))
         .reserve(identity.slot(), identity, caller)
         .is_ok()
 }
 
 pub(crate) unsafe fn publish(reservation: PendingFileIoReservation, pending: PendingFileIo) {
-    let identity = reservation.identity();
+    publish_identity(reservation.identity(), pending)
+}
+
+pub(crate) unsafe fn publish_identity(identity: PendingFileIoIdentity, pending: PendingFileIo) {
     let caller = (&*core::ptr::addr_of!(CALLERS))
         .get_reserved(identity.slot(), identity)
         .expect("pending File publication lost its reserved caller");
@@ -117,10 +126,20 @@ pub(crate) unsafe fn publish(reservation: PendingFileIoReservation, pending: Pen
 }
 
 pub(crate) unsafe fn cancel_reserved(reservation: PendingFileIoReservation) {
-    let identity = reservation.identity();
+    cancel_reserved_identity(reservation.identity())
+}
+
+pub(crate) unsafe fn cancel_reserved_identity(identity: PendingFileIoIdentity) {
     (&mut *core::ptr::addr_of_mut!(CALLERS))
         .cancel_reserved(identity.slot(), identity)
         .expect("unused pending File reservation lost its original caller");
+}
+
+pub(crate) unsafe fn reserved_caller(
+    reservation: PendingFileIoReservation,
+) -> Option<ProviderLogicalCaller> {
+    let identity = reservation.identity();
+    (&*core::ptr::addr_of!(CALLERS)).get_reserved(identity.slot(), identity)
 }
 
 pub(crate) unsafe fn retire(identity: PendingFileIoIdentity) {
@@ -143,13 +162,6 @@ pub(crate) unsafe fn caller(
     }
     let caller = (&*core::ptr::addr_of!(CALLERS)).get_published(identity.slot(), identity)?;
     matches_caller(caller, live).then_some(caller)
-}
-
-pub(crate) unsafe fn reserved_caller(
-    reservation: PendingFileIoReservation,
-) -> Option<ProviderLogicalCaller> {
-    let identity = reservation.identity();
-    (&*core::ptr::addr_of!(CALLERS)).get_reserved(identity.slot(), identity)
 }
 
 pub(crate) unsafe fn reset() -> bool {
