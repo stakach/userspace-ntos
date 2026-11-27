@@ -1,8 +1,60 @@
-//! Canonical execution identity for provider lifecycle callouts, independent of THREADINFO.
+//! Canonical execution identity and TEB selection for provider lifecycle callouts.
 
 use nt_kernel_abi::ps_hosted_x64 as abi;
 
 const INVALID_CID: u32 = 0xc000_000b;
+const INVALID_PARAMETER: u32 = 0xc000_000d;
+
+/// Read the existing GUI thread's client-info link before selecting its TEB.
+/// The reader supplies the provider's allocation receipt for the native body.
+pub(super) fn ps_retirement_client_info(
+    thread_exit: bool,
+    expected: u64,
+    w32thread: u64,
+    ethread_w32thread: u64,
+    read_pinned: impl FnOnce(u64) -> Option<u64>,
+) -> Result<Option<u64>, u32> {
+    if !thread_exit {
+        if w32thread != 0 || ethread_w32thread != 0 {
+            return Err(INVALID_PARAMETER);
+        }
+        return Ok(None);
+    }
+    if expected == 0 || w32thread != expected || ethread_w32thread != expected {
+        return Err(INVALID_PARAMETER);
+    }
+    read_pinned(w32thread).map(Some).ok_or(INVALID_CID)
+}
+
+/// Choose the TEB for an existing provider lifecycle thread after its exact
+/// process and thread incarnation have been validated. A live THREADINFO
+/// requires its callout TEB; after thread exit, use the retained execution TEB.
+pub(super) fn select_ps_provider_teb(
+    supplied_teb: u64,
+    recorded_teb: u64,
+    callout_teb: u64,
+    thread_client_info: Option<u64>,
+) -> Result<u64, u32> {
+    if supplied_teb != 0 && recorded_teb != 0 && supplied_teb != recorded_teb {
+        return Err(INVALID_CID);
+    }
+    let guest_teb = if supplied_teb != 0 { supplied_teb } else { recorded_teb };
+    if let Some(thread_client_info) = thread_client_info {
+        return nt_user_host::win32k_teb::select_dispatch_teb(
+            nt_user_host::win32k_teb::DispatchTebPurpose::ThreadInfo,
+            nt_user_host::win32k_teb::DispatchTebCandidates {
+                callout_teb,
+                client_teb: guest_teb,
+                thread_client_info,
+            },
+        ).map_err(|_| INVALID_CID);
+    }
+    let teb = if guest_teb != 0 { guest_teb } else { callout_teb };
+    if teb == 0 {
+        return Err(INVALID_CID);
+    }
+    Ok(teb)
+}
 
 fn field_address(body: u64, offset: usize) -> Result<u64, u32> {
     if body == 0 || body & 7 != 0 {

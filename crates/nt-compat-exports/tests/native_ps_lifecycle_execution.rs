@@ -102,6 +102,85 @@ fn non_gui_execution_teb_rejects_missing_or_mismatched_actual_teb() {
     }
 }
 
+#[test]
+fn gui_retirement_selects_the_teb_bound_to_threadinfo_client_info() {
+    assert_eq!(provider_ps_lifecycle::select_ps_provider_teb(
+        0x2000_0000, 0x2000_0000, 0x1000_0000, Some(0x1000_0800),
+    ), Ok(0x1000_0000));
+}
+
+#[test]
+fn gui_retirement_rejects_foreign_or_missing_threadinfo_teb() {
+    for (callout_teb, client_info) in [
+        (0x1000_0000, 0x3000_0800),
+        (0, 0x800),
+        (u64::MAX - 0x7ff, 0x800),
+    ] {
+        assert_eq!(provider_ps_lifecycle::select_ps_provider_teb(
+            0x2000_0000, 0x2000_0000, callout_teb, Some(client_info),
+        ), Err(0xc000_000b));
+    }
+}
+
+#[test]
+fn retirement_rejects_conflicting_guest_tebs_before_gui_selection() {
+    assert_eq!(provider_ps_lifecycle::select_ps_provider_teb(
+        0x2000_0000, 0x3000_0000, 0x1000_0000, Some(0x1000_0800),
+    ), Err(0xc000_000b));
+}
+
+#[test]
+fn process_retirement_without_threadinfo_keeps_canonical_guest_teb() {
+    assert_eq!(provider_ps_lifecycle::select_ps_provider_teb(
+        0x2000_0000, 0x2000_0000, 0x1000_0000, None,
+    ), Ok(0x2000_0000));
+    assert_eq!(provider_ps_lifecycle::select_ps_provider_teb(
+        0, 0x2000_0000, 0x1000_0000, None,
+    ), Ok(0x2000_0000));
+    assert_eq!(provider_ps_lifecycle::select_ps_provider_teb(
+        0, 0, 0x1000_0000, None,
+    ), Ok(0x1000_0000));
+    assert_eq!(provider_ps_lifecycle::select_ps_provider_teb(
+        0, 0, 0, None,
+    ), Err(0xc000_000b));
+}
+
+#[test]
+fn ps_exit_refuses_wrong_threadinfo_identity_before_any_body_read() {
+    use std::cell::Cell;
+    for (thread_exit, expected, recorded, ethread) in [
+        (true, 0x3000, 0x2000, 0x2000),
+        (true, 0x2000, 0x2000, 0x3000),
+        (true, 0, 0x2000, 0x2000),
+        (true, 0x2000, 0, 0),
+        (false, 0x9000, 0x2000, 0x2000),
+        (false, 0x9000, 0, 0x2000),
+    ] {
+        let reads = Cell::new(0);
+        let result = provider_ps_lifecycle::ps_retirement_client_info(
+            thread_exit, expected, recorded, ethread, |_| {
+                reads.set(reads.get() + 1);
+                Some(0x1000_0800)
+            },
+        );
+        assert_eq!(result, Err(0xc000_000d));
+        assert_eq!(reads.get(), 0, "invalid identity must not reach THREADINFO storage");
+    }
+}
+
+#[test]
+fn ps_exit_requires_a_live_allocation_receipt_for_client_info_read() {
+    assert_eq!(provider_ps_lifecycle::ps_retirement_client_info(
+        true, 0x2000, 0x2000, 0x2000, |_| None,
+    ), Err(0xc000_000b));
+    assert_eq!(provider_ps_lifecycle::ps_retirement_client_info(
+        true, 0x2000, 0x2000, 0x2000, |_| Some(0x1000_0800),
+    ), Ok(Some(0x1000_0800)));
+    assert_eq!(provider_ps_lifecycle::ps_retirement_client_info(
+        false, 0x9000, 0, 0, |_| panic!("process exit has no THREADINFO"),
+    ), Ok(None));
+}
+
 fn source() -> syn::File {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../components/ntos-executive/src/win32k_subsystem.rs");

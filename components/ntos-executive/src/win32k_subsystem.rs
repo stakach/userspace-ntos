@@ -10896,6 +10896,7 @@ static WIN32K_TOKEN_HANDLE_CAPACITY: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_PROCESS_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_THREAD_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_PS_TEB_SELECTION_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CALLBACK_RESUME_CONTEXT_RESTORES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_WINDOW_DESTROY_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
@@ -17381,6 +17382,7 @@ unsafe fn win32k_post_driver_entry(status: i32, drv: u64) {
 
 unsafe fn select_existing_ps_provider_context(
     require_thread: bool,
+    expected: u64,
 ) -> Result<(usize, Option<usize>), u32> {
     const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
     const STATUS_INVALID_CID: u32 = 0xC000_000B;
@@ -17425,18 +17427,52 @@ unsafe fn select_existing_ps_provider_context(
     let selected_teb = if let Some(thread_index) = thread_index {
         let recorded_teb = thread_ctx_teb(thread_index);
         let supplied_teb = read_volatile((sh + SH_REQ_CLIENT_TEB) as *const u64);
-        if supplied_teb != 0 && recorded_teb != 0 && supplied_teb != recorded_teb {
-            return Err(STATUS_INVALID_CID);
-        }
-        let teb = if supplied_teb != 0 {
-            supplied_teb
-        } else if recorded_teb != 0 {
-            recorded_teb
-        } else {
-            thread_ctx_callout_teb(thread_index)
-        };
-        if teb == 0 {
-            return Err(STATUS_INVALID_CID);
+        let w32thread = thread_ctx_w32thread(thread_index);
+        let ethread_w32thread = read_volatile((supplied_ethread + KTHREAD_WIN32THREAD_OFF) as *const u64);
+        let thread_client_info = provider_ps_lifecycle::ps_retirement_client_info(
+            require_thread, expected, w32thread, ethread_w32thread, |w32thread| {
+                let field = w32thread.checked_add(THREADINFO_PCLIENTINFO_OFF)?;
+                let (_, pin) = with_provider_allocations(|catalog| {
+                    catalog.pin_containing(w32thread, THREADINFO_PCLIENTINFO_OFF + 8)
+                })?.ok()?;
+                let client_info = read_volatile(field as *const u64);
+                // ExitThreadCallback frees THREADINFO, so keep this receipt only for the read.
+                release_provider_allocation_pin_or_park(pin);
+                Some(client_info)
+            },
+        )?;
+        let callout_teb = thread_ctx_callout_teb(thread_index);
+        let teb = provider_ps_lifecycle::select_ps_provider_teb(
+            supplied_teb,
+            recorded_teb,
+            callout_teb,
+            thread_client_info,
+        )?;
+        let guest_teb = if supplied_teb != 0 { supplied_teb } else { recorded_teb };
+        if let Some(client_info) = thread_client_info {
+            if teb != guest_teb
+                && WIN32K_PS_TEB_SELECTION_TRACES.fetch_add(1, Ordering::Relaxed) < 256
+            {
+                print_str(b"[win32k-ps-teb] pi=");
+                print_u64(pi);
+                print_str(b" pid=");
+                print_u64(pid);
+                print_str(b" tid=");
+                print_u64(tid);
+                print_str(b" generation=");
+                print_u64(generation);
+                print_str(b" w32thread=");
+                print_u64(w32thread);
+                print_str(b" guest-teb=");
+                print_u64(guest_teb);
+                print_str(b" callout-teb=");
+                print_u64(callout_teb);
+                print_str(b" client-info=");
+                print_u64(client_info);
+                print_str(b" selected-teb=");
+                print_u64(teb);
+                print_str(b"\n");
+            }
         }
         teb
     } else {
@@ -17590,7 +17626,7 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
 
     let require_thread = command == PS_WIN32_PROVIDER_THREAD_EXIT;
     let (process_index, thread_index) =
-        match select_existing_ps_provider_context(require_thread) {
+        match select_existing_ps_provider_context(require_thread, expected) {
             Ok(selected) => selected,
             Err(status) => return status as u64,
         };
