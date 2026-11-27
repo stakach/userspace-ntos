@@ -39,6 +39,10 @@ SEARCH_MENU_SHUTDOWN = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"Shut down[ \t
 # Pinned 1024x768 LiberNT Start edit interior. The full-frame sparse OCR has
 # misread its tiny text; a doubled crop reads the exact query on saved frames.
 SEARCH_QUERY_CROP = (17, 683, 210, 702)
+# The top console input row and the next returned prompt row in the pinned
+# 1024x768 FileBasic frame. Each crop is read from the original captured PPM.
+CREATE_INPUT_CROP = (70, 216, 600, 243)
+CREATE_PROMPT_CROP = (70, 250, 600, 274)
 # Bottom input row of the pinned 1024x768 Command Prompt in the FileBasic
 # frame. Sparse full-screen OCR can merge desktop glyphs into this row.
 CHILD_PROMPT_CROP = (158, 558, 805, 582)
@@ -46,6 +50,14 @@ CHILD_PROMPT_CROP = (158, 558, 805, 582)
 # The result is still distinguishable from the echoed `cmd /c echo` command.
 CHILD_STDOUT_LINE = re.compile(
     r"(?im)^(?:" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]*>[a-z]?)?CHILD_STDOUT_OK[ \t]*$"
+)
+CREATE_COMMAND = re.compile(
+    r"(?im)^" + OCR_PUNCT_PREFIX +
+    r"(?P<directory>[a-z]:\\[^\r\n>]{1,128})>md basicproof,{0,2}[ \t]*$"
+)
+CREATE_RETURNED = re.compile(
+    r"(?im)^" + OCR_PUNCT_PREFIX +
+    r"(?P<directory>[a-z]:\\[^\r\n>]{1,128})>,?[ \t]*$"
 )
 DIR_COMMAND = re.compile(
     r"(?im)^" + OCR_PUNCT_PREFIX +
@@ -105,6 +117,20 @@ def contains_child_stdout_completion(text):
     """The child printed its marker and cmd returned to an empty input prompt."""
     marker = CHILD_STDOUT_LINE.search(text)
     return marker is not None and READY_PROMPT.search(text, marker.end()) is not None
+
+
+def contains_basicproof_create_completion(text):
+    """The exact mkdir command finished and returned to its empty input line."""
+    commands = list(CREATE_COMMAND.finditer(text))
+    if not commands:
+        return False
+    command = commands[-1]
+    tail = text[command.end():]
+    returned = CREATE_RETURNED.search(tail)
+    if returned is None or returned.group("directory").casefold() != command.group("directory").casefold():
+        return False
+    return re.search(r"(?im)^\s*(?:Syntax error|A subdirectory or file .* already exists)",
+                     tail[:returned.start()]) is None
 
 
 def contains_basicproof_directory(text):
@@ -181,6 +207,78 @@ def _prove_image(image, predicate, missing):
 def prove_ready_prompt(image):
     """Require a visible ready Command Prompt before any test command is typed."""
     return _prove_image(image, contains_ready_prompt, "ready Command Prompt not visible")
+
+
+def prove_basicproof_create_input(image):
+    """Verify the exact foreground line before sending its Return key."""
+    result = _prove_image(image,
+                          lambda text: READY_TITLE.search(text) is not None
+                          and CREATE_COMMAND.search(text) is not None
+                          and not contains_basicproof_create_completion(text),
+                          "exact md basicproof input line not visible")
+    if not result.passed:
+        return result
+    try:
+        line_frame = crop_ppm(image, *CREATE_INPUT_CROP)
+        line_ocr = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "7"],
+            input=line_frame, capture_output=True, timeout=20, check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return VisualProof(False, result.ocr_text, f"create input OCR unavailable: {error}",
+                           result.image_name, result.image_sha256, fatal=True)
+    line = line_ocr.stdout.decode("utf-8", errors="replace").strip()
+    transcript = result.ocr_text + "\ncreate input crop: " + line
+    if line_ocr.returncode != 0:
+        detail = line_ocr.stderr.decode("utf-8", errors="replace").strip()
+        return VisualProof(False, transcript,
+                           f"create input OCR failed ({line_ocr.returncode}): {detail}",
+                           result.image_name, result.image_sha256, fatal=True)
+    if re.fullmatch(r"(?i)[a-z]:\\[^\r\n>]{1,128}>md basicproof,{0,2}", line) is None:
+        return VisualProof(False, transcript, "exact md basicproof input line not visible",
+                           result.image_name, result.image_sha256)
+    return VisualProof(True, transcript, image_name=result.image_name,
+                       image_sha256=result.image_sha256)
+
+
+def prove_basicproof_create_completion(image):
+    """After Return, require a new empty prompt before another command."""
+    result = _prove_image(image, contains_basicproof_create_completion,
+                          "md basicproof did not return to an empty prompt")
+    if result.fatal:
+        return result
+    commands = list(CREATE_COMMAND.finditer(result.ocr_text))
+    if not commands:
+        return result
+    command = commands[-1]
+    if re.search(
+        r"(?im)^\s*(?:Syntax error|A subdirectory or file .* already exists)",
+        result.ocr_text[command.end():],
+    ) is not None:
+        return VisualProof(False, result.ocr_text, "md basicproof reported an error",
+                           result.image_name, result.image_sha256)
+    try:
+        prompt_frame = crop_ppm(image, *CREATE_PROMPT_CROP)
+        prompt_ocr = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "7"],
+            input=prompt_frame, capture_output=True, timeout=20, check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return VisualProof(False, result.ocr_text, f"create prompt OCR unavailable: {error}",
+                           result.image_name, result.image_sha256, fatal=True)
+    prompt = prompt_ocr.stdout.decode("utf-8", errors="replace").strip()
+    transcript = result.ocr_text + "\ncreate prompt crop: " + prompt
+    if prompt_ocr.returncode != 0:
+        detail = prompt_ocr.stderr.decode("utf-8", errors="replace").strip()
+        return VisualProof(False, transcript,
+                           f"create prompt OCR failed ({prompt_ocr.returncode}): {detail}",
+                           result.image_name, result.image_sha256, fatal=True)
+    match = re.fullmatch(r"(?i)(?P<directory>[a-z]:\\[^\r\n>]{1,128})>,?", prompt)
+    if match is None or match.group("directory").casefold() != command.group("directory").casefold():
+        return VisualProof(False, transcript, "md basicproof did not return to an empty prompt",
+                           result.image_name, result.image_sha256)
+    return VisualProof(True, transcript, image_name=result.image_name,
+                       image_sha256=result.image_sha256)
 
 
 def prove_child_stdout_completion(image):

@@ -65,6 +65,56 @@ struct ClassCallbackAck {
     output: hosted_irq_stack_lease::IrqStackLeaseId,
 }
 
+/// Bound a live keyboard delivery trace to the first 512 class records. QMP acknowledgement
+/// proves only host injection; this receipt proves the authenticated port record reached the
+/// class callback and reports how many records kbdclass consumed in the same batch.
+static KEYBOARD_CLASS_RECORD_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn trace_keyboard_class_records(
+    pin: &hosted_device_allocations::TemporaryPoolPin,
+    start: u64,
+    bytes: usize,
+    consumed: u32,
+) {
+    const RECORD_BYTES: usize = 12; // KEYBOARD_INPUT_DATA
+    let Some(source_offset) = start.checked_sub(pin.allocation().component_address) else {
+        return;
+    };
+    for index in 0..bytes / RECORD_BYTES {
+        if KEYBOARD_CLASS_RECORD_TRACE_COUNT.load(Ordering::Relaxed) >= 512 {
+            break;
+        }
+        let Some(offset) = source_offset.checked_add((index * RECORD_BYTES) as u64) else {
+            break;
+        };
+        let mut record = [0u8; RECORD_BYTES];
+        if hosted_device_allocations::copy_temporary_pool_pin(
+            pin, offset, &mut record,
+        ).is_err() {
+            break;
+        }
+        let sequence = KEYBOARD_CLASS_RECORD_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if sequence >= 512 {
+            break;
+        }
+        let code = u16::from_le_bytes([record[2], record[3]]);
+        let flags = u16::from_le_bytes([record[4], record[5]]);
+        print_str(b"[kbd-class-record] sequence=");
+        print_u64(sequence + 1);
+        print_str(b" code=0x");
+        print_hex(code as u32);
+        print_str(b" flags=0x");
+        print_hex(flags as u32);
+        print_str(b" index=");
+        print_u64(index as u64);
+        print_str(b" batch=");
+        print_u64((bytes / RECORD_BYTES) as u64);
+        print_str(b" consumed=");
+        print_u64(consumed as u64);
+        print_str(b"\n");
+    }
+}
+
 fn arena_status(error: nt_hosted_runtime::HostedIrqArenaError) -> nt_status::NtStatus {
     match error {
         nt_hosted_runtime::HostedIrqArenaError::Busy => nt_status::NtStatus::DEVICE_BUSY,
@@ -1026,6 +1076,9 @@ impl HostedIrqRootSession {
             let _ = hosted_irq_stack_lease::retain_indeterminate(output);
             hosted_class_callback_thunk::block(command.service_id);
             return fatal_service_result(status.raw());
+        }
+        if control == nt_io_manager::retained_connect_forward::ConnectControl::Keyboard {
+            trace_keyboard_class_records(&input, command.arguments[1], bytes, consumed);
         }
         self.class_acks.push(ClassCallbackAck {
             cookie: command.service_id,

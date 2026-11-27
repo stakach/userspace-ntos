@@ -2,9 +2,11 @@
 
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
-from scripts.ci_kvm_interaction import DEFAULT_SCRIPT, load_script, parse_script
+from scripts.ci_kvm_interaction import (DEFAULT_SCRIPT, InteractionRunner, Script,
+                                        load_script, parse_script)
 from scripts import ci_kvm_visual_proof
 from scripts.ci_kvm_verdict import InteractionOutcome, boot_verdict
 from scripts.ci_kvm_visual_proof import VisualProof
@@ -33,14 +35,16 @@ class FileBasicInteractionTests(unittest.TestCase):
                          (desktop.screen, desktop.arm, desktop.settle_seconds))
         self.assertEqual(profile.steps[:len(desktop.steps)], desktop.steps)
         self.assertEqual([step.name for step in profile.steps[len(desktop.steps):]],
-                         ["basicproof-create", "basicproof-directory-list",
+                         ["basicproof-create-input", "basicproof-create",
+                          "basicproof-directory-list",
                           "basicproof-file-create", "basicproof-file-list",
                           "basicproof-child-stdout", "basicproof-attrib-help",
                           "basicproof-clear-readonly",
                           "basicproof-baseline-readback", "basicproof-set-readonly",
                           "basicproof-readback"])
         self.assertEqual([step.actions for step in profile.steps[len(desktop.steps):]], [
-            (("type", "md basicproof\n"),),
+            (("type", "md basicproof"),),
+            (("key", ("ret",)),),
             (("type", "dir basicproof\n"),),
             (("type", "if not exist basicproof.txt echo filebasic>basicproof.txt\n"),),
             (("type", "dir basicproof.txt\n"),),
@@ -54,12 +58,64 @@ class FileBasicInteractionTests(unittest.TestCase):
         self.assertTrue(all(0 < step.wait_seconds <= 120
                             for step in profile.steps[len(desktop.steps):]))
         child_steps = {step.name: step for step in profile.steps}
-        for name in ("basicproof-directory-list", "basicproof-child-stdout",
+        for name in ("basicproof-create-input", "basicproof-create",
+                     "basicproof-directory-list", "basicproof-child-stdout",
                      "basicproof-attrib-help"):
             with self.subTest(name=name):
                 self.assertEqual(child_steps[name].readiness_poll_seconds, 2)
                 self.assertGreaterEqual(child_steps[name].wait_seconds,
+                                        10 if name == "basicproof-create-input" else
+                                        20 if name == "basicproof-create" else
                                         30 if name == "basicproof-directory-list" else 45)
+
+    def test_missing_return_halts_before_directory_input(self):
+        profile = load_script(FILEBASIC_SCRIPT)
+        steps = {step.name: step for step in profile.steps}
+        script = Script(profile.screen, 0, tuple(steps[name] for name in (
+            "basicproof-create-input", "basicproof-create", "basicproof-directory-list")))
+
+        class Clock:
+            now = 0
+
+            def __call__(self):
+                return self.now
+
+        clock = Clock()
+        performed, captured = [], []
+        with tempfile.TemporaryDirectory() as directory:
+            def proof(name):
+                return VisualProof(
+                    "create-input" in name,
+                    "C:\\Users\\User>md basicproof,\n",
+                    "Return did not complete md basicproof",
+                    name,
+                    "original-frame-sha",
+                )
+
+            runner = InteractionRunner(
+                script, performed.append, captured.append,
+                Path(directory) / "interact.jsonl", clock,
+                checks={"basicproof-create-input": proof,
+                        "basicproof-create": proof,
+                        "basicproof-directory-list": proof})
+            runner.arm(0)
+            runner.advance(0)
+            clock.now = 2
+            runner.advance(2)  # exact typed line; only now may Return be sent
+            clock.now = 4
+            runner.advance(4)  # saved run's missing Return: no returned prompt
+            clock.now = 23
+            runner.advance(23)
+            self.assertTrue(runner.finished)
+            self.assertEqual(runner.index, 1)
+            self.assertEqual(len(performed), 2)
+            self.assertEqual(list(runner.checkpoints),
+                             ["basicproof-create-input", "basicproof-create"])
+            self.assertFalse(any("directory-list" in name for name in captured))
+            receipts = [json.loads(line) for line in
+                        (Path(directory) / "interact.jsonl").read_text().splitlines()]
+            self.assertFalse(any(entry.get("name") == "basicproof-directory-list"
+                                 and entry["event"] == "action" for entry in receipts))
 
     def test_child_steps_require_their_output_then_a_returned_prompt(self):
         stdout = ci_kvm_visual_proof.contains_child_stdout_completion

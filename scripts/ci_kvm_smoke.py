@@ -19,6 +19,8 @@ if __package__:
                                      read_run_state, request_quit)
     from .ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
     from .ci_kvm_visual_proof import (VisualProof, prove_attrib_help_completion,
+                                      prove_basicproof_create_completion,
+                                      prove_basicproof_create_input,
                                       prove_child_stdout_completion,
                                       prove_basicproof_directory,
                                       prove_command_prompt_search_result,
@@ -31,6 +33,8 @@ else:
                                     read_run_state, request_quit)
     from ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
     from ci_kvm_visual_proof import (VisualProof, prove_attrib_help_completion,
+                                    prove_basicproof_create_completion,
+                                    prove_basicproof_create_input,
                                     prove_child_stdout_completion,
                                     prove_basicproof_directory,
                                     prove_command_prompt_search_result,
@@ -1054,6 +1058,8 @@ def main():
                 "start-menu": lambda name: prove_start_menu_search_box(ROOT / name),
                 "command-prompt-search": lambda name: prove_command_prompt_search_result(ROOT / name),
                 "command-prompt": lambda name: prove_ready_prompt(ROOT / name),
+                "basicproof-create-input": lambda name: prove_basicproof_create_input(ROOT / name),
+                "basicproof-create": lambda name: prove_basicproof_create_completion(ROOT / name),
                 "basicproof-directory-list": lambda name: prove_basicproof_directory(ROOT / name),
                 "basicproof-child-stdout": lambda name: prove_child_stdout_completion(ROOT / name),
                 "basicproof-attrib-help": lambda name: prove_attrib_help_completion(ROOT / name),

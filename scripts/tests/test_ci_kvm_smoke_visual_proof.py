@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from scripts import ci_kvm_visual_proof
 from scripts.ci_kvm_ppm import crop_ppm
 from scripts.ci_kvm_visual_proof import (contains_command_prompt_search_result,
                                          contains_basicproof_directory,
@@ -50,6 +51,83 @@ RECORDED_BOOT2_VER_OCR = (Path(__file__).with_name("fixtures") /
 
 
 class VisualProofTests(unittest.TestCase):
+    def test_saved_create_input_is_verified_before_return_from_its_own_frame(self):
+        # Run 46025217921 step 7: the exact command is visible with a block
+        # cursor; the subsequent Return never reached the guest.
+        original = ("‘Command Prompt\nC:\\Users\\User>ver\n"
+                    "Microsoft Windows [Version 10.0.26100.1]\n"
+                    "C:\\Users\\User>md basicproof,,\n")
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "native-kvm-interact-07-basicproof-create-input.ppm"
+            image.write_bytes(b"P6\n1 1\n255\n\0\0\0")
+            sha = hashlib.sha256(image.read_bytes()).hexdigest()
+            with patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=b"P6\n1 1\n255\n\0\0\0") as crop, \
+                    patch("scripts.ci_kvm_visual_proof.subprocess.run") as ocr:
+                ocr.side_effect = [subprocess.CompletedProcess([], 0, original, ""),
+                                   subprocess.CompletedProcess([], 0,
+                                       b"C:\\Users\\User>md basicproof,\n", b"")]
+                proof = ci_kvm_visual_proof.prove_basicproof_create_input(image)
+                self.assertTrue(proof.passed)
+                self.assertEqual(proof.image_sha256, sha)
+                self.assertIn("create input crop: C:\\Users\\User>md basicproof,",
+                              proof.ocr_text)
+                crop.assert_called_once()
+                self.assertEqual(ocr.call_args.kwargs["input"], b"P6\n1 1\n255\n\0\0\0")
+                ocr.side_effect = [subprocess.CompletedProcess([], 0, original, ""),
+                                   subprocess.CompletedProcess([], 0,
+                                       b"C:\\Users\\User>md basicproo,\n", b"")]
+                self.assertFalse(ci_kvm_visual_proof.prove_basicproof_create_input(image).passed)
+                ocr.side_effect = [subprocess.CompletedProcess([], 0,
+                                       original.replace("‘Command Prompt\n", ""), "")]
+                self.assertFalse(ci_kvm_visual_proof.prove_basicproof_create_input(image).passed)
+                ocr.side_effect = [subprocess.CompletedProcess([], 0,
+                                       original.replace("basicproof,,", "basicproof")
+                                       + "C:\\Users\\User>\n", "")]
+                self.assertFalse(ci_kvm_visual_proof.prove_basicproof_create_input(image).passed)
+
+    def test_saved_missing_return_cannot_prove_create_completion(self):
+        prompt = "C:\\Users\\User>"
+        complete = prompt + "md basicproof\n_ | " + prompt + "\n"
+        pending = prompt + "md basicproof,,\n"
+        combined = prompt + "md basicproofdir basicproof\n" + prompt + "\n"
+        contains = ci_kvm_visual_proof.contains_basicproof_create_completion
+        self.assertTrue(contains(prompt + "md basicproof\n" + prompt))
+        self.assertTrue(contains(prompt + "md basicproof,,\n" + prompt))
+        self.assertFalse(contains(pending))
+        self.assertFalse(contains(combined))
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "native-kvm-interact-08-basicproof-create.ppm"
+            image.write_bytes(b"P6\n1 1\n255\n\0\0\0")
+            sha = hashlib.sha256(image.read_bytes()).hexdigest()
+            with patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=b"P6\n1 1\n255\n\0\0\0") as crop, \
+                    patch("scripts.ci_kvm_visual_proof.subprocess.run") as ocr:
+                ocr.side_effect = [subprocess.CompletedProcess([], 0, complete, ""),
+                                   subprocess.CompletedProcess([], 0, (prompt + "\n").encode(), b"")]
+                proof = ci_kvm_visual_proof.prove_basicproof_create_completion(image)
+                self.assertTrue(proof.passed)
+                self.assertEqual(proof.image_sha256, sha)
+                self.assertIn("create prompt crop: " + prompt, proof.ocr_text)
+                crop.assert_called_once()
+                ocr.side_effect = [subprocess.CompletedProcess([], 0, pending, ""),
+                                   subprocess.CompletedProcess([], 0,
+                                       (prompt + "md basicproof,,\n").encode(), b"")]
+                self.assertFalse(ci_kvm_visual_proof.prove_basicproof_create_completion(image).passed)
+                ocr.side_effect = [subprocess.CompletedProcess([], 0, combined, "")]
+                self.assertFalse(ci_kvm_visual_proof.prove_basicproof_create_completion(image).passed)
+                ocr.side_effect = [subprocess.CompletedProcess([], 0,
+                                       prompt + "md basicproof\n" + prompt + "\n", ""),
+                                   subprocess.CompletedProcess([], 0,
+                                       (prompt + "dir basicproof\n").encode(), b"")]
+                stale = ci_kvm_visual_proof.prove_basicproof_create_completion(image)
+                self.assertFalse(stale.passed)
+                self.assertEqual(stale.image_sha256, sha)
+                self.assertIn("create prompt crop: " + prompt + "dir basicproof",
+                              stale.ocr_text)
+                ocr.side_effect = [subprocess.CompletedProcess([], 0,
+                                       prompt + "md basicproof\n" + prompt +
+                                       "\nA subdirectory or file basicproof already exists.\n", "")]
+                self.assertFalse(ci_kvm_visual_proof.prove_basicproof_create_completion(image).passed)
+
     def test_recorded_child_stdout_requires_marker_and_cropped_empty_prompt(self):
         # Run 46018329889 probe 05: the original frame visibly has both lines,
         # but sparse full-frame OCR joins desktop glyphs to the prompt.
