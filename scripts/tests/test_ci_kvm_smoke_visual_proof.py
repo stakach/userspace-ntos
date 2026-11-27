@@ -1,6 +1,7 @@
 """A successful QMP send is not evidence that its intended guest window received input."""
 
 from pathlib import Path
+import gzip
 import hashlib
 import subprocess
 import tempfile
@@ -15,7 +16,8 @@ from scripts.ci_kvm_visual_proof import (contains_command_prompt_search_result,
                                          contains_ver_result, prove_basicproof_directory,
                                          prove_child_stdout_completion,
                                          prove_command_prompt_search_result,
-                                         prove_ready_prompt, prove_start_menu_search_box,
+                                         prove_readonly_attribute, prove_ready_prompt,
+                                         prove_start_menu_search_box,
                                          prove_ver_result)
 
 
@@ -51,6 +53,36 @@ RECORDED_BOOT2_VER_OCR = (Path(__file__).with_name("fixtures") /
 
 
 class VisualProofTests(unittest.TestCase):
+    def test_saved_attrib_readback_uses_exact_console_pixels_and_returned_prompt(self):
+        # KVM 46055607414 probe 3: the mounted clear completed and this original
+        # frame rendered `A C:\\Users\\User\\basicproof.txt`, but sparse full-frame
+        # OCR inserted a space after the dot in the basename.
+        sparse = ("C:\\Users\\User>attrib basicproof.txt\n"
+                  "A\nC:\\Users\\User\\basicproof. txt\n"
+                  "C:\\Users\\User>\n")
+        self.assertFalse(ci_kvm_visual_proof.contains_readonly_attribute(
+            sparse, "basicproof.txt", readonly=False))
+        fixture = Path(__file__).parent / "fixtures"
+        complete = gzip.decompress((fixture / "attrib_readback_46055607414.ppm.gz").read_bytes())
+        pending = gzip.decompress((fixture / "attrib_pending_46055607414.ppm.gz").read_bytes())
+        image = Path("native-kvm-interact-15-basicproof-baseline-readback-probe-03.ppm")
+        original_sha = "8c1646207e3958d0ba7bf5dafb5599cc304d12cffcb3a18fc888a0e948f6b558"
+        with patch("scripts.ci_kvm_visual_proof._prove_image",
+                   return_value=ci_kvm_visual_proof.VisualProof(
+                       False, sparse, "exact readback not visible", image.name, original_sha)), \
+             patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=complete) as crop:
+            proof = prove_readonly_attribute(image, "basicproof.txt", readonly=False)
+            self.assertFalse(prove_readonly_attribute(image, "basicproof.txt", readonly=True).passed)
+        self.assertTrue(proof.passed, proof.error)
+        self.assertEqual(proof.image_sha256, original_sha)
+        self.assertIn("A C:\\Users\\User\\basicproof.txt", proof.ocr_text)
+        crop.assert_called_with(image, 68, 426, 520, 510, scale=2)
+        with patch("scripts.ci_kvm_visual_proof._prove_image",
+                   return_value=ci_kvm_visual_proof.VisualProof(
+                       False, sparse, "exact readback not visible", image.name, "pending-sha")), \
+             patch("scripts.ci_kvm_visual_proof.crop_ppm", return_value=pending):
+            self.assertFalse(prove_readonly_attribute(image, "basicproof.txt", readonly=False).passed)
+
     def test_saved_create_input_is_verified_before_return_from_its_own_frame(self):
         # Run 46025217921 step 7: the exact command is visible with a block
         # cursor; the subsequent Return never reached the guest.

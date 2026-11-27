@@ -137,30 +137,39 @@ class FileBasicInteractionTests(unittest.TestCase):
         command = "D:\\Scratch\\Work>attrib basicproof.txt\n"
         result = "     R     D:\\Scratch\\Work\\basicproof.txt\n"
         clear = "           D:\\Scratch\\Work\\basicproof.txt\n"
+        returned = "D:\\Scratch\\Work>\n"
         contains = ci_kvm_visual_proof.contains_readonly_attribute
 
-        self.assertTrue(contains(command + result, "basicproof.txt", readonly=True))
-        self.assertTrue(contains(command + clear, "basicproof.txt", readonly=False))
-        self.assertTrue(contains(command + clear + command + result,
+        # A result row alone does not make the prompt safe for the next command.
+        self.assertFalse(contains(command + result, "basicproof.txt", readonly=True))
+
+        self.assertTrue(contains(command + result + returned, "basicproof.txt", readonly=True))
+        self.assertTrue(contains(command + clear + returned, "basicproof.txt", readonly=False))
+        self.assertTrue(contains(command + clear + returned + command + result + returned,
                                  "basicproof.txt", readonly=True))
-        self.assertFalse(contains(command + clear + command + result,
+        self.assertFalse(contains(command + clear + returned + command + result + returned,
                                   "basicproof.txt", readonly=False))
-        self.assertTrue(contains(command + "A    R     D:\\Scratch\\Work\\BASICPROOF.TXT\n",
+        self.assertTrue(contains(command + "A    R     D:\\Scratch\\Work\\BASICPROOF.TXT\n" + returned,
                                  "basicproof.txt", readonly=True))
         for transcript in (
             "D:\\Scratch\\Work>attrib +R basicproof.txt\n",  # setter is not a readback
             command,  # no result
             command + clear,  # R absent
-            command + "     R     D:\\Scratch\\Work\\other\n",  # another File
-            command + "     R     D:\\Other\\basicproof.txt\n",  # another directory
-            command + "     R     D:\\Scratch\\Work\\basicproof.txt2\n",  # basename prefix
+            command + "     R     D:\\Scratch\\Work\\other\n" + returned,  # another File
+            command + "     R     D:\\Other\\basicproof.txt\n" + returned,  # another directory
+            command + "     R     D:\\Scratch\\Work\\basicproof.txt2\n" + returned,  # basename prefix
             result + command,  # stale output before the readback command
         ):
             with self.subTest(transcript=transcript):
                 self.assertFalse(contains(transcript, "basicproof.txt", readonly=True))
-        self.assertFalse(contains(command + result, "basicproof.txt", readonly=False))
-        self.assertFalse(contains(command + "     R     D:\\Scratch\\Work\\other\n",
+        self.assertFalse(contains(command + result + returned, "basicproof.txt", readonly=False))
+        self.assertFalse(contains(command + "     R     D:\\Scratch\\Work\\other\n" + returned,
                                   "basicproof.txt", readonly=False))
+
+    def test_readback_from_drive_root_keeps_its_exact_returned_prompt(self):
+        self.assertTrue(ci_kvm_visual_proof.contains_readonly_attribute(
+            "C:\\>attrib basicproof.txt\nA C:\\basicproof.txt\nC:\\>\n",
+            "basicproof.txt", readonly=False))
 
     def test_verdict_requires_both_visual_readbacks_for_filebasic_profile(self):
         required = ("basicproof-baseline-readback", "basicproof-readback")
