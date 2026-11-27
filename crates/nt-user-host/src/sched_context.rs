@@ -223,6 +223,5 @@ mod worker_bootstrap_tests;
 
 #[path = "sched_context_worker_bootstrap.rs"]
 mod worker_bootstrap;
-pub use worker_bootstrap::{BlockedWorkerObservation, BootstrapError, BootstrapUnbindIo,
-    PassiveWorker, PassiveWorkerBootstrap, ReplyObservation, UnbindOutcome,
-    WorkerBootstrapResources};
+pub use worker_bootstrap::{BootstrapError, BootstrapUnbindIo, PassiveWorker,
+    PassiveWorkerBootstrap, UnbindOutcome, WorkerBootstrapResources};
