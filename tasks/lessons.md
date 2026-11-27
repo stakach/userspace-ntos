@@ -1005,3 +1005,11 @@ diagnosis-free failure.
 - For an existing draft whose code is already validated, transfer its commits to `main`,
   compare the resulting Git tree with the tested source, and close the draft with an exact
   main commit and evidence link. Preserve unrelated edits and avoid duplicate integration.
+
+## Read The Pinned Guest Source Before Explaining A Boot Trace
+- A current LiberNT branch used a different `cmd.exe` implementation from the pinned released
+  image. Its external-command wait rule pointed at the wrong API. Resolve the release commit
+  from the manifest and inspect that exact source or binary before attributing a guest wait.
+- When a creator reads a suspended child's PEB, seed fields derived from the admitted PE before
+  publishing the process. A correct PE section query does not imply the PEB exposes the same
+  subsystem; test both the byte offset and the value the creator actually reads.

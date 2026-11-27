@@ -1,7 +1,8 @@
 //! Exact physical bootstrap proof for the first passive executive worker.
 //!
 //! The run-token executor table admits a worker only after this owner has observed its private
-//! receive, checked a free Reply and acknowledged removal of the temporary scheduling context.
+//! receive, checked the Reply offered to that worker and acknowledged removal of the temporary
+//! scheduling context.
 //! A native unbind with an uncertain result leaves every resource retained and cannot be replayed.
 
 /// Capabilities and memory that must remain owned from worker creation through passive handoff.
