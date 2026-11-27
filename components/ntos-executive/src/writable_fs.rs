@@ -523,8 +523,8 @@ unsafe fn restore_snapshot_volume(
 ) -> Result<Option<(nt_fs::FileSystem, nt_fs::StoredSnapshotMetadata)>, u32> {
     let store = dev.store();
     // A WAL-bearing snapshot cannot be published until its committed suffix has been
-    // authenticated and replayed. The current native writer still uses legacy snapshots;
-    // the pre-replay reader also admits a complete, empty-WAL v2 baseline.
+    // authenticated and replayed. The pre-replay reader also admits a complete, empty-WAL
+    // v2 baseline while retaining legacy snapshot recovery for older installed disks.
     match nt_fs::FileSystem::restore_volume_snapshot_before_wal_replay_from_store(&store, dev) {
         Ok(Some((fs, metadata))) => Ok(Some((fs, metadata))),
         Ok(None) => {

@@ -122,7 +122,6 @@ static mut WORK: Option<Work> = None;
 const ADMISSION_RETRY_100NS: u64 = 5 * 10_000_000;
 static FOLD_MEASURES: AtomicU64 = AtomicU64::new(0);
 static FOLD_MEASURE_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
-static FIRST_COMMIT_REFUSAL_REPORTED: AtomicBool = AtomicBool::new(false);
 
 fn reserve_trace() -> bool {
     const LIMIT: u64 = 512;
@@ -223,30 +222,6 @@ fn trace_failure(receipt: FailureReceipt, id: u64, mount: SectionMountId,
     print_str(b"\n");
 }
 
-/// Constructor geometry and raw error, after the returned image/proof/lease were retained.
-fn trace_first_commit_refusal(error: nt_fs::SnapshotBlockStoreError, image_bytes: usize,
-    slot_sectors: u64, sector_size: usize, payload_limit: Option<usize>,
-    id: u64, mount: SectionMountId,
-) {
-    if FIRST_COMMIT_REFUSAL_REPORTED.swap(true, Ordering::AcqRel) { return; }
-    print_str(b"[native-system-fold-first-commit-refusal] error=");
-    print_str(match error {
-        nt_fs::SnapshotBlockStoreError::InvalidGeometry => b"invalid-geometry",
-        nt_fs::SnapshotBlockStoreError::OutOfSpace => b"out-of-space",
-        nt_fs::SnapshotBlockStoreError::Io => b"io",
-        nt_fs::SnapshotBlockStoreError::Corrupt => b"corrupt",
-        nt_fs::SnapshotBlockStoreError::OutOfMemory => b"out-of-memory",
-    });
-    print_str(b" id="); print_u64(id);
-    print_str(b" mount="); print_u64(mount.value());
-    print_str(b" image-bytes="); print_u64(image_bytes as u64);
-    print_str(b" slot-sectors="); print_u64(slot_sectors);
-    print_str(b" sector-bytes="); print_u64(sector_size as u64);
-    print_str(b" slot-payload-limit="); print_u64(payload_limit.unwrap_or(0) as u64);
-    print_str(b" limit-available="); print_u64(u64::from(payload_limit.is_some()));
-    print_str(b"\n");
-}
-
 fn stall_before_commit(
     slot: &mut Option<Work>, id: u64, lease: snapshot_storage::Lease,
     token: nt_fs::RegistryWalContinuation, proof: nt_fs::RecheckedPairedWalSnapshot,
@@ -338,17 +313,9 @@ unsafe fn advance_recheck() -> Result<(), u32> {
         image, fold_manifest(manifest), proof) {
         Ok(commit) => commit,
         Err((error, image, proof)) => {
-            let image_bytes = image.as_slice().len();
-            let slot_sectors = lease.store().sector_count() / 2;
-            let sector_size = lease.sector_size();
-            let payload_limit = lease.store().payload_capacity(&lease).ok();
-            let mount = *lease.identity();
-            let status = stall_before_commit(slot, id, lease, token, proof, prepared, Some(image),
+            return Err(stall_before_commit(slot, id, lease, token, proof, prepared, Some(image),
                 b"first-commit-admission",
-                snapshot_store_error_status(error));
-            trace_first_commit_refusal(error, image_bytes, slot_sectors, sector_size,
-                payload_limit, id, mount);
-            return Err(status);
+                snapshot_store_error_status(error)));
         }
     };
     commit.set_max_batch_sectors(crate::driver_launch::native_storage_transfer_sectors())
