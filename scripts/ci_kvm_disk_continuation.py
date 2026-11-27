@@ -230,16 +230,36 @@ def source_is_ancestor(source_head: str, target_head: str, cwd: Path = ROOT) -> 
 
 
 def migration_submodule_is_compatible(source_sha: object, current_sha: str) -> bool:
-    """The kernel submodule may advance between source and target, never diverge.
+    """The kernel submodule may advance or keep the same tree after a squash merge.
 
     Migration replaces the kernel and boot payload on the ESP with this build's, and the
     disk length and ESP geometry are checked separately, so a source built from an earlier
     ancestor of the current kernel commit is migratable like an earlier parent commit is.
+    A squash merge can replace the commit without changing its complete tree.
     """
-    if not isinstance(source_sha, str):
+    if not isinstance(source_sha, str) or not COMMIT.fullmatch(source_sha) \
+            or not COMMIT.fullmatch(current_sha):
         return False
-    return source_sha == current_sha or source_is_ancestor(
-        source_sha, current_sha, cwd=ROOT / "rust-micro")
+    kernel = ROOT / "rust-micro"
+    if source_sha == current_sha or source_is_ancestor(source_sha, current_sha, cwd=kernel):
+        return True
+
+    def commit_tree(sha: str) -> str | None:
+        try:
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "--verify", f"{sha}^{{commit}}"], cwd=kernel,
+                text=True, stderr=subprocess.DEVNULL).strip()
+            if commit != sha:
+                return None
+            tree = subprocess.check_output(
+                ["git", "rev-parse", "--verify", f"{sha}^{{tree}}"], cwd=kernel,
+                text=True, stderr=subprocess.DEVNULL).strip()
+            return tree if COMMIT.fullmatch(tree) else None
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    source_tree = commit_tree(source_sha)
+    return source_tree is not None and source_tree == commit_tree(current_sha)
 
 
 def migration_source_ref(run: dict) -> str:
@@ -292,7 +312,7 @@ def verify_migration_manifest(value: dict, run_id: int, attempt: int,
     if not migration_size_shape(value.get("disk_size_bytes"), current["disk_size_bytes"]):
         raise ContinuationError("migration disk_size_bytes differs from source or current build")
     if not migration_submodule_is_compatible(value.get("submodule_sha"), current["submodule_sha"]):
-        raise ContinuationError("migration submodule_sha is not this build's or an ancestor of it")
+        raise ContinuationError("migration submodule_sha is not this build's ancestor or exact tree")
     for key in ("disk_sha256", "base_disk_sha256", "kernel_sha256",
                 "rootserver_sha256", "ntdll_sha256"):
         if not isinstance(value.get(key), str) or not SHA256.fullmatch(value[key]):
