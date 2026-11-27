@@ -1,0 +1,18 @@
+{
+  "screen": [1024, 768],
+  "arm": "idle",
+  "settle_seconds": 10,
+  "steps": [
+    {"name": "baseline", "actions": [], "wait_seconds": 0},
+    {"name": "desktop-pointer", "actions": [{"verified_click": [925, 100]}], "wait_seconds": 0},
+    {"name": "start-menu", "actions": [{"click": [28, 743]}], "wait_seconds": 60, "readiness_poll_seconds": 2},
+    {"name": "command-prompt-search", "actions": [{"type": "command"}], "wait_seconds": 10, "readiness_poll_seconds": 2},
+    {"name": "command-prompt", "actions": [{"key": ["ret"]}], "wait_seconds": 120, "readiness_poll_seconds": 4},
+    {"name": "ver", "actions": [{"type": "ver\n"}], "wait_seconds": 20},
+    {"name": "basicproof-create", "actions": [{"type": "if not exist basicproof md basicproof\n"}], "wait_seconds": 20},
+    {"name": "basicproof-clear-readonly", "actions": [{"type": "attrib -R basicproof\n"}], "wait_seconds": 20},
+    {"name": "basicproof-baseline-readback", "actions": [{"type": "attrib basicproof\n"}], "wait_seconds": 45, "readiness_poll_seconds": 2},
+    {"name": "basicproof-set-readonly", "actions": [{"type": "attrib +R basicproof\n"}], "wait_seconds": 20},
+    {"name": "basicproof-readback", "actions": [{"type": "attrib basicproof\n"}], "wait_seconds": 45, "readiness_poll_seconds": 2}
+  ]
+}

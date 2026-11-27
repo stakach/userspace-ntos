@@ -2824,6 +2824,53 @@ pub(crate) unsafe fn set_information(file_id: u64, class: u32, data: &[u8]) -> u
     status
 }
 
+/// Move-only correlation for the one I/O reference already retained for a local Basic SET.
+/// The pending delivery row owns and releases that physical reference after a known terminal;
+/// this token keeps its exact File and mount identity beside the prepared sidecar until then.
+#[must_use = "return this File reference to its exact terminal delivery row"]
+pub(crate) struct BasicFileReference {
+    file_id: u64,
+    mount: nt_memory_manager::SectionMountId,
+}
+
+impl BasicFileReference {
+    pub(crate) fn mount(&self) -> nt_memory_manager::SectionMountId { self.mount }
+    pub(crate) fn into_row(self) { let _ = (self.file_id, self.mount); }
+}
+
+pub(crate) unsafe fn prepare_basic_owner(file_id: u64, input: [u8; 40])
+    -> Result<nt_io_manager::PendingBasicPreparedOwner<BasicFileReference>, u32>
+{
+    let mount = (*core::ptr::addr_of!(WRITABLE_MOUNT_ID))
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let fs = writable_fs()?;
+    nt_io_manager::PendingBasicPreparedOwner::prepare(fs, file_id, input,
+        BasicFileReference { file_id, mount }).map_err(|(status, file)| {
+            file.into_row();
+            status
+        })
+}
+
+/// Apply a retained, generation-exact Basic plan through the existing snapshot route. A
+/// repeated redrive observes the sidecar's terminal receipt without re-entering MemFs.
+pub(crate) unsafe fn apply_basic_snapshot_claimed(
+    owners: &mut nt_io_manager::PendingBasicPreparedTable<BasicFileReference>,
+    pending: &nt_io_manager::PendingFileIoTable,
+    claim: &nt_io_manager::PendingBasicPreparedClaim,
+) -> Option<u32> {
+    let mount = owners.claimed_exact(pending, claim)?.file().mount();
+    if *core::ptr::addr_of!(WRITABLE_MOUNT_ID) != Some(mount) {
+        return owners.refuse_snapshot_claimed_exact(pending, claim, nt_fs::STATUS_DATA_ERROR);
+    }
+    let fs = writable_fs().ok()?;
+    let (status, changed, fresh) = owners.apply_snapshot_claimed_exact(pending, claim, fs)?;
+    if fresh && status == nt_fs::STATUS_SUCCESS {
+        OVERLAY_SET_INFO.fetch_add(1, Ordering::Relaxed);
+        if changed { mark_snapshot_dirty(); }
+    }
+    Some(status)
+}
+
 /// Capture create-time security context on the filesystem's open description before its process
 /// handle is published. The filesystem retains this across handle duplication like an FSD CCB.
 pub(crate) unsafe fn capture_open_privileges(

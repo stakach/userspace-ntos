@@ -2,7 +2,7 @@
 //! This is an owner correlation, not a snapshot durability proof or WAL append authority.
 
 use super::{
-    PendingFileIoIdentity, PendingFileIoOperation, PendingFileIoTable, PendingOwnedInline,
+    PendingFileIoIdentity, PendingFileIoOperation, PendingFileIoTable,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,12 +67,8 @@ impl PendingFileIoTable {
         if !matches!(basic.phase, BaselinePhase::Ready { .. }) {
             return None;
         }
-        let row = self.slots[identity.slot].as_mut()?;
-        row.operation = PendingFileIoOperation::OwnedInline(PendingOwnedInline {
-            status: nt_status::NtStatus::CANCELLED.raw() as u32,
-            information: 0,
-        });
-        Some(())
+        self.settle_owned_set_terminal(identity.slot,
+            nt_status::NtStatus::CANCELLED.raw() as u32)
     }
 
     /// Record ownership before entering any checkpoint/fold I/O. A BUSY refusal returns the row

@@ -252,9 +252,12 @@ pub(super) unsafe fn before_post_action(
             assert!(pending.busy.is_none());
             pending.busy = Some(nt_io_manager::PendingFileBusy::new(owner));
         }
-        let reservation = nt_handler
-            .pending_file_io_reservation
-            .expect("accepted File IRP has no pre-dispatch reservation");
+        let reservation = if let Some(primary) = nt_handler.pending_basic_primary_reservation.take() {
+            PendingFileTransferClaim::Basic(primary)
+        } else {
+            PendingFileTransferClaim::Ordinary(nt_handler.pending_file_io_reservation
+                .expect("accepted File IRP has no pre-dispatch reservation"))
+        };
         // The caller is inside IoCallDriver until the driver returns (#427): a kept or queued
         // dispatch parks even an asynchronous caller, which only a STATUS_PENDING return frees.
         let in_flight = matches!(pending.route, nt_io_manager::PendingFileRoute::Hosted(_))
@@ -266,7 +269,6 @@ pub(super) unsafe fn before_post_action(
         let async_in_flight = in_flight && !nt_handler.pending_file_io_wait && !terminating;
         // The source remains in the handler until publication succeeds. Continuing synchronous
         // calls attach their reply in this same commit, never exposing an unarmed delivery row.
-        let identity = reservation.identity();
         let local_terminal = pending.owned_terminal_result().is_some()
             || pending.operation.is_owned_work_uncommitted();
         if let Some(event) = nt_handler.current_file_transfer_event.take() {
@@ -274,15 +276,21 @@ pub(super) unsafe fn before_post_action(
             assert!(pending.event_obj_idx == u64::MAX || pending.event_obj_idx == event.native_identity);
             pending.transfer_event = Some(event);
         }
-        pending_file_io_transfer(
+        let identity = pending_file_io_transfer(
             pending,
             wait_for_completion,
             reservation,
+            nt_handler.pending_basic_prepared_transfer.take(),
+            nt_handler.pending_basic_sidecar_reservation.take(),
+            nt_handler.pending_basic_reply_reservation.take(),
             native_call_transport,
             resume_ip,
             sp,
             flags,
         );
+        let published_pending = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+            .get_exact(identity)
+            .expect("published File handoff lost its exact owner");
         nt_handler.pending_file_io_transfer = None;
         nt_handler.pending_file_io_reservation = None;
         if local_terminal {
@@ -293,24 +301,40 @@ pub(super) unsafe fn before_post_action(
         }
         if wait_for_completion {
             // Publish Waiting before any reentrant completion can make this thread Ready.
-            thread_wait_state_park_badge_waiting(nt_handler, pending.badge);
+            thread_wait_state_park_badge_waiting(nt_handler, published_pending.badge);
         }
         if async_in_flight {
-            hold_async_in_flight(identity, pending.irp_id);
+            hold_async_in_flight(identity, published_pending.irp_id);
         }
         super::pending_pipe_read_trace::parked(
-            nt_handler, identity, pending, wait_for_completion,
+            nt_handler, identity, published_pending, wait_for_completion,
         );
-        super::mounted_read_lifetime_trace::parked(nt_handler, identity, pending);
-        super::mounted_installer_file_trace::parked(nt_handler, identity, pending);
+        super::mounted_read_lifetime_trace::parked(nt_handler, identity, published_pending);
+        super::mounted_installer_file_trace::parked(nt_handler, identity, published_pending);
         Some(PublishedFileIo {
             identity,
-            irp_id: pending.irp_id,
-            badge: pending.badge,
-            tid: pending.tid,
+            irp_id: published_pending.irp_id,
+            badge: published_pending.badge,
+            tid: published_pending.tid,
             wait_for_completion,
         })
     } else {
+        assert!(nt_handler.pending_basic_prepared_transfer.is_none(),
+            "unpublished Basic File owner lost its delivery row");
+        if let Some(reply) = nt_handler.pending_basic_reply_reservation.take() {
+            assert!(reply.cancel_no_effects(),
+                "unused Basic Reply replacement lost its no-effect lease");
+        }
+        if let Some(sidecar) = nt_handler.pending_basic_sidecar_reservation.take() {
+            assert!((&mut *core::ptr::addr_of_mut!(PENDING_BASIC_PREPARED))
+                .cancel_admission(sidecar));
+        }
+        if let Some(primary) = nt_handler.pending_basic_primary_reservation.take() {
+            let identity = primary.identity();
+            assert!((&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .cancel_basic_primary(primary));
+            crate::pending_file_caller::cancel_reserved_identity(identity);
+        }
         if let Some(reservation) = nt_handler.pending_file_io_reservation.take() {
             assert!(
                 (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO)).cancel_reservation(reservation),

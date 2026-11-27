@@ -29,10 +29,12 @@ The workflow is a desktop gate ([scripts/ci_kvm_verdict.py](scripts/ci_kvm_verdi
 
 - Explorer seals its desktop paint milestones.
 - The scripted interaction completes every step with no input errors.
-- The final framebuffer visibly contains the typed `ver` command and its Windows version response; the verdict retains the screenshot hash and OCR transcript.
+- The captured `ver` frame visibly contains the typed command and its Windows version response; the verdict retains the screenshot hash and OCR transcript.
 - The serial log has no executive panic, provider bugcheck, service-loop exit or kernel halt.
 
 Each boot writes `native-kvm-verdict.json`. The workflow defaults to a 1,200-second ceiling per boot. The progress watchdog can stop a stationary guest sooner. After the desktop seals and the guest first goes idle, the runner waits 10 seconds and then drives scripted guest input; the `interact` input is on by default, and clearing it fails the gate. The runner pins the PS/2 cursor at the bottom-left corner, aims with small relative moves, and sends keys over QMP. The Start menu, search result, and ready Command Prompt steps poll their visual checks with bounded backoff and advance as soon as each appears; `wait_seconds` is a hard ceiling for these steps. Each probe retains a distinct `native-kvm-interact-NN-<step>-probe-NN.ppm` and a receipt with its attempt, elapsed time, and screenshot hash. Other steps keep fixed waits, including the final `ver` screenshot at its canonical `native-kvm-interact-NN-ver.ppm` name. CI uses Tesseract to read that original final PPM and fails closed if the result is absent. Edit the steps in [scripts/kvm_interaction_steps.json](scripts/kvm_interaction_steps.json).
+
+Set `interaction_profile` to `filebasic` for the additional writable-volume check. It clears a scratch directory's read-only attribute, verifies the absent state, sets it, and verifies the present state on screen. The verdict also requires successful native FileBasic apply, Reply, File release and row retirement receipts for the same File and exact pending owner on each change.
 
 A failed run still publishes its disk for continuation in two cases: it went idle after setup completed and a user logged on, or it ran its whole bound without a fault.
 

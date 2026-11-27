@@ -6,6 +6,9 @@ use crate::fault_stack_diagnostics::read_fault_stack_word;
 use crate::*;
 use nt_user_host::hosted_return_target::HostedReturnTarget;
 
+#[path = "native_basic_set_handoff.rs"]
+mod native_basic_set_handoff;
+
 #[path = "win32k_staged_output.rs"]
 pub(crate) mod win32k_staged_output;
 #[path = "executor/loop_state.rs"]
@@ -15926,15 +15929,23 @@ pub(crate) fn print_pending_file_route(route: nt_io_manager::PendingFileRoute) {
     }
 }
 
+enum PendingFileTransferClaim {
+    Ordinary(nt_io_manager::PendingFileIoReservation),
+    Basic(nt_io_manager::PendingBasicPrimaryReservation),
+}
+
 unsafe fn pending_file_io_transfer(
     mut pending: nt_io_manager::PendingFileIo,
     wait_for_completion: bool,
-    reservation: nt_io_manager::PendingFileIoReservation,
+    reservation: PendingFileTransferClaim,
+    basic_owner: Option<nt_io_manager::PendingBasicPreparedOwner<crate::writable_fs::BasicFileReference>>,
+    basic_sidecar: Option<nt_io_manager::PendingBasicPreparedReservation>,
+    basic_reply: Option<crate::root_reply_park::RootReplyReservation>,
     native_call_transport: bool,
     resume_ip: u64,
     sp: u64,
     flags: u64,
-) {
+) -> nt_io_manager::PendingFileIoIdentity {
     fn commit_error_code(error: nt_io_manager::PendingFileIoParkError) -> u64 {
         match error {
             nt_io_manager::PendingFileIoParkError::StaleReservation => 1,
@@ -15946,17 +15957,49 @@ unsafe fn pending_file_io_transfer(
 
     unsafe fn commit_or_panic(
         table: &mut nt_io_manager::PendingFileIoTable,
-        reservation: nt_io_manager::PendingFileIoReservation,
+        reservation: PendingFileTransferClaim,
         pending: nt_io_manager::PendingFileIo,
+        basic_owner: Option<nt_io_manager::PendingBasicPreparedOwner<crate::writable_fs::BasicFileReference>>,
+        basic_sidecar: Option<nt_io_manager::PendingBasicPreparedReservation>,
         synchronous: bool,
-    ) {
+    ) -> nt_io_manager::PendingFileIoIdentity {
+        let reservation = match reservation {
+            PendingFileTransferClaim::Basic(primary) => {
+                if let Some(owner) = basic_owner {
+                    let sidecar = basic_sidecar
+                        .expect("prepared Basic owner lost its pre-effect sidecar slot");
+                    return native_basic_set_handoff::publish_basic_preflighted(
+                        table, primary, sidecar, pending, owner,
+                    );
+                }
+                assert!(basic_sidecar.is_none());
+                // Preparation failed before any Basic metadata effect. The same primary's
+                // inline shape and exact Reply were checked before File retain/reset.
+                let identity = match table.try_park_basic_primary(primary, pending) {
+                    Ok(identity) => identity,
+                    Err((_, row, primary)) => {
+                        print_str(b"[basic-inline-invariant] slot/reply=");
+                        print_u64(primary.identity().slot() as u64);
+                        print_str(b"/"); print_u64(row.reply_cap);
+                        print_str(b"\n");
+                        core::mem::forget(primary);
+                        panic!("preflighted Basic inline owner changed before commit");
+                    }
+                };
+                crate::pending_file_caller::publish_identity(identity, pending);
+                return identity;
+            }
+            PendingFileTransferClaim::Ordinary(reservation) => reservation,
+        };
         let error = match table.park_reserved(reservation, pending) {
             Ok(_) => {
                 crate::pending_file_caller::publish(reservation, pending);
-                return;
+                assert!(basic_sidecar.is_none());
+                return reservation.identity();
             }
             Err(error) => error,
         };
+        assert!(basic_sidecar.is_none());
         print_str(b"[pending-file-owner] commit rejected error/file/irp/major/pi/tid/badge/sync/reply=");
         print_u64(commit_error_code(error));
         print_str(b"/");
@@ -15997,10 +16040,23 @@ unsafe fn pending_file_io_transfer(
     if pending.reply_cap == 0 {
         pending.native_call_transport = native_call_transport;
     }
+    if let Some(reply) = basic_reply {
+        assert!(wait_for_completion && pending.reply_cap == 0);
+        pending.reply_cap = reply.active();
+        pending.reply_required = true;
+        pending.resume_ip = resume_ip;
+        pending.resume_sp = sp;
+        pending.resume_flags = flags;
+        let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+        let identity = commit_or_panic(table, reservation, pending, basic_owner,
+            basic_sidecar, true);
+        assert!(reply.commit(), "published Basic row lost its pre-reserved root Reply");
+        return identity;
+    }
     if !wait_for_completion {
         assert_eq!(pending.reply_cap, 0, "nonwaiting File transfer retained a parked Reply");
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-        return commit_or_panic(table, reservation, pending, false);
+        return commit_or_panic(table, reservation, pending, basic_owner, basic_sidecar, false);
     }
     if pending.reply_cap != 0 {
         // The original caller already owns this saved Reply. A redriven CREATE must transfer
@@ -16013,8 +16069,7 @@ unsafe fn pending_file_io_transfer(
         pending.resume_sp = sp;
         pending.resume_flags = flags;
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-        commit_or_panic(table, reservation, pending, true);
-        return;
+        return commit_or_panic(table, reservation, pending, basic_owner, basic_sidecar, true);
     }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(
@@ -16029,8 +16084,9 @@ unsafe fn pending_file_io_transfer(
     pending.resume_sp = sp;
     pending.resume_flags = flags;
     let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-    commit_or_panic(table, reservation, pending, true);
+    let identity = commit_or_panic(table, reservation, pending, basic_owner, basic_sidecar, true);
     reply_park.commit();
+    identity
 }
 
 unsafe fn file_irp_drain_transfer(
@@ -16344,6 +16400,43 @@ unsafe fn pending_file_io_redrive_pass(
             // The transition is recorded before any fallible delivery operation.
             pending = (&*core::ptr::addr_of!(PENDING_FILE_IO)).get_exact(identity)
                 .expect("committed mode lost its delivery row");
+        }
+        if matches!(pending.operation,
+            nt_io_manager::PendingFileIoOperation::OwnedBasicPreflight(_))
+        {
+            let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+            let owners = &mut *core::ptr::addr_of_mut!(PENDING_BASIC_PREPARED);
+            let cancelled = pending.consumer_abandoned
+                .then(|| owners.cancel_unentered_exact(table, identity, pending.irp_id))
+                .flatten();
+            if let Some(owner) = cancelled {
+                owner.into_file().into_row();
+            } else {
+                let Some(claim) = owners.claim_exact(table, identity, pending.irp_id)
+                    .or_else(|| owners.reclaim_applied_exact(table, identity, pending.irp_id))
+                else { continue; };
+                let Some(status) = crate::writable_fs::apply_basic_snapshot_claimed(
+                    owners, table, &claim,
+                ) else {
+                    let _ = owners.release_unentered_claim_exact(table, &claim);
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    continue;
+                };
+                match owners.commit_owned_basic_exact(table, claim, status) {
+                    Ok(owner) => {
+                        file_set_owner_receipts::basic_terminal(
+                            identity, pending, status, owner.stable_file_id(), owner.input(),
+                        );
+                        owner.into_file().into_row();
+                    }
+                    Err(_) => {
+                        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                        continue;
+                    }
+                }
+            }
+            pending = table.get_exact(identity)
+                .expect("settled Basic owner lost its delivery row");
         }
         let Ok(delivery) = pending_file_delivery::Delivery::begin(identity, pending.irp_id)
         else { continue; };
@@ -17299,6 +17392,7 @@ unsafe fn pending_file_io_redrive_pass(
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .mark_reply_published_exact(slot, pending.irp_id)
                 .expect("pending File reply publication owner disappeared");
+            file_set_owner_receipts::reply(identity, pending, terminal_status);
             if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
                 if let Some(file) = hosted_file_id {
                     mounted_create_owner_trace::reply_exact(identity, pending.irp_id,
@@ -17374,6 +17468,7 @@ unsafe fn pending_file_io_redrive_pass(
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .mark_owned_reference_released_exact(slot, pending.irp_id)
                 .expect("released owned File reference lost its pending owner");
+            file_set_owner_receipts::file_released(identity, pending, terminal_status);
         }
         assert!(
             !pending.operation.is_owned_work_uncommitted(),
@@ -17396,6 +17491,7 @@ unsafe fn pending_file_io_redrive_pass(
         let finished = table
             .finish_owner_exact(identity, pending.irp_id)
             .expect("completed pending File owner did not retire");
+        file_set_owner_receipts::retired(identity, finished, terminal_status);
         pending_pipe_read_trace::retired(identity, pending.irp_id);
         mounted_read_lifetime_trace::retired(identity, pending.irp_id);
         mounted_installer_file_trace::retired(identity, pending.irp_id);

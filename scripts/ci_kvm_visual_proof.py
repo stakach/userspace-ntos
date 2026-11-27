@@ -15,6 +15,14 @@ except ImportError:
 OCR_PUNCT_PREFIX = r"[ \t]*[^\w\s]{0,3}[ \t]*"
 COMMAND = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]*>[ \t]*ver[ \t]*$")
 RESULT = re.compile(r"(?im)^[ \t]*Microsoft Windows[ \t]*\[Version[ \t]+\d+(?:\.\d+)+\][ \t]*$")
+ATTRIB_COMMAND = re.compile(
+    r"(?im)^" + OCR_PUNCT_PREFIX +
+    r"(?P<directory>[a-z]:\\[^\r\n>]*)>[ \t]*attrib[ \t]+(?P<name>[a-z0-9._-]+)[ \t]*$"
+)
+ATTRIB_RESULT = re.compile(
+    r"(?im)^[ \t]*(?P<flags>[a-z \t]{0,24})[ \t]+(?P<path>[a-z]:\\[^\r\n]+?)[ \t]*$"
+)
+NEXT_PROMPT = re.compile(r"(?im)^" + OCR_PUNCT_PREFIX + r"[a-z]:\\[^\r\n>]*>")
 READY_TITLE = re.compile(r"(?im)^[^\w\r\n]{0,3}Command Prompt[ \t]*$")
 # Sparse-text OCR may join up to three punctuation glyphs from adjacent desktop
 # text to the prompt line, and read the block cursor as a trailing comma. Keep
@@ -47,6 +55,27 @@ def contains_ver_result(text):
     """Require the typed command and its response in that order in one framebuffer."""
     command = COMMAND.search(text)
     return command is not None and RESULT.search(text, command.end()) is not None
+
+
+def contains_readonly_attribute(text, name, *, readonly):
+    """Match the last typed attrib query to its exact result in the same directory."""
+    if not re.fullmatch(r"[a-z0-9._-]+", name, re.IGNORECASE):
+        return False
+    commands = [match for match in ATTRIB_COMMAND.finditer(text)
+                if match.group("name").casefold() == name.casefold()]
+    if not commands:
+        return False
+    command = commands[-1]
+    directory = command.group("directory").rstrip("\\")
+    expected_path = (directory + "\\" + name).casefold()
+    tail = text[command.end():]
+    next_prompt = NEXT_PROMPT.search(tail)
+    if next_prompt:
+        tail = tail[:next_prompt.start()]
+    for result in ATTRIB_RESULT.finditer(tail):
+        if result.group("path").casefold() == expected_path:
+            return ("r" in result.group("flags").casefold()) == readonly
+    return False
 
 
 def contains_ready_prompt(text):
@@ -142,3 +171,11 @@ def prove_ver_result(image):
     """Require the typed command and its response in the final original PPM."""
     return _prove_image(image, contains_ver_result,
                         "typed ver and response not both visible")
+
+
+def prove_readonly_attribute(image, name, *, readonly):
+    """Require the captured attrib query and its exact before/after state."""
+    state = "present" if readonly else "absent"
+    return _prove_image(image,
+                        lambda text: contains_readonly_attribute(text, name, readonly=readonly),
+                        f"exact {name} attrib readback with read-only {state} not visible")

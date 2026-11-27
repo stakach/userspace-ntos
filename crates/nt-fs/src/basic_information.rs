@@ -17,6 +17,18 @@ pub struct PreparedBasicInformation {
 impl PreparedBasicInformation {
     pub fn resolved_metadata(&self) -> FileMetadata { self.after }
 
+    pub fn changes_volume(&self) -> bool { self.before != self.after }
+
+    /// Snapshot-only Basic work may wait behind an unrelated SET or rename. Recompute from the
+    /// captured input at the last in-memory entry point, but only for the same live File node.
+    /// A future WAL publisher must use its separately validated physical identity instead.
+    pub fn rebase_snapshot(&self, fs: &FileSystem, input: &[u8])
+        -> Result<PreparedBasicInformation, u32> {
+        let object = fs.obj(self.handle).ok_or(STATUS_DATA_ERROR)?;
+        if object.node_id != self.node_id { return Err(STATUS_DATA_ERROR); }
+        fs.prepare_basic_information(self.handle, input)
+    }
+
     /// The exact live entry name captured for a future durable producer. The synchronous Zw
     /// surface uses the same prepared state without allocating or retaining a path.
     pub fn opened_path(&self) -> Option<&str> { self.opened_path.as_deref() }

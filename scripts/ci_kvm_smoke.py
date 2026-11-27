@@ -19,8 +19,8 @@ if __package__:
                                      read_run_state, request_quit)
     from .ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
     from .ci_kvm_visual_proof import (VisualProof, prove_command_prompt_search_result,
-                                      prove_ready_prompt, prove_start_menu_search_box,
-                                      prove_ver_result)
+                                      prove_readonly_attribute, prove_ready_prompt,
+                                      prove_start_menu_search_box, prove_ver_result)
 else:
     from ci_kvm_cursor import prove_cursor_position
     from ci_kvm_interaction import DEFAULT_SCRIPT, InteractionRunner, load_script, screenshot_name
@@ -28,8 +28,8 @@ else:
                                     read_run_state, request_quit)
     from ci_kvm_verdict import DESKTOP_SEALED, EXECUTIVE_PANIC, InteractionOutcome, boot_verdict
     from ci_kvm_visual_proof import (VisualProof, prove_command_prompt_search_result,
-                                    prove_ready_prompt, prove_start_menu_search_box,
-                                    prove_ver_result)
+                                    prove_readonly_attribute, prove_ready_prompt,
+                                    prove_start_menu_search_box, prove_ver_result)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -51,6 +51,7 @@ INTERACTION_LOG = ROOT / "native-kvm-interact.jsonl"
 VERDICT = ROOT / "native-kvm-verdict.json"
 # The boot ran its whole bound without a fault or a desktop: a setup disk worth continuing.
 BOUND_REACHED_MARKER = ROOT / "native-kvm-bound-reached.txt"
+FILEBASIC_CHECKPOINTS = ("basicproof-baseline-readback", "basicproof-readback")
 
 # Fixed 60-second QMP samples repeatedly hit the same clock-publication RIP,
 # while the guest's own cycle counter showed that path used only a few seconds.
@@ -973,6 +974,14 @@ def main():
             interaction_script = load_script(args.interact)
         except (OSError, ValueError) as error:
             parser.error(f"--interact {args.interact}: {error}")
+    required_checkpoints = ()
+    if interaction_script is not None and any(
+        step.name.startswith("basicproof-") for step in interaction_script.steps
+    ):
+        names = {step.name for step in interaction_script.steps}
+        if not set(FILEBASIC_CHECKPOINTS) <= names:
+            parser.error("FileBasic interaction needs both exact readback checkpoints")
+        required_checkpoints = FILEBASIC_CHECKPOINTS
     QMP_SOCKET.unlink(missing_ok=True)
     SCREENSHOT.unlink(missing_ok=True)
     INTERRUPT_TRACE.unlink(missing_ok=True)
@@ -1039,6 +1048,10 @@ def main():
                 "start-menu": lambda name: prove_start_menu_search_box(ROOT / name),
                 "command-prompt-search": lambda name: prove_command_prompt_search_result(ROOT / name),
                 "command-prompt": lambda name: prove_ready_prompt(ROOT / name),
+                "basicproof-baseline-readback": lambda name: prove_readonly_attribute(
+                    ROOT / name, "basicproof", readonly=False),
+                "basicproof-readback": lambda name: prove_readonly_attribute(
+                    ROOT / name, "basicproof", readonly=True),
             }
             interaction = InteractionRunner(
                 interaction_script, send_input_batches,
@@ -1301,6 +1314,7 @@ def main():
                                   total=len(interaction_script.steps),
                                   errors=interaction.failures,
                                   checkpoints=interaction.checkpoints,
+                                  required_checkpoints=required_checkpoints,
                                   cursor_receipts=interaction.cursor_receipts,
                                   visual_proof=visual_proof))
     verdict = boot_verdict(serial, outcome, runner_failures)

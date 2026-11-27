@@ -18,8 +18,10 @@ import re
 
 try:
     from .ci_kvm_visual_proof import VisualProof
+    from .ci_kvm_filebasic_receipts import FileBasicProof, prove_filebasic_receipts
 except ImportError:
     from ci_kvm_visual_proof import VisualProof
+    from ci_kvm_filebasic_receipts import FileBasicProof, prove_filebasic_receipts
 
 DESKTOP_SEALED = re.compile(
     rb"\[quiesce\] Explorer runtime paint milestones complete; boot-progress epoch sealed"
@@ -45,12 +47,15 @@ class InteractionOutcome:
     total: int = 0
     errors: int = 0
     checkpoints: dict = field(default_factory=dict)
+    required_checkpoints: tuple = ()
     cursor_receipts: list = field(default_factory=list)
     visual_proof: VisualProof | None = None
 
     def receipts_passed(self):
         return self.requested and self.armed and self.total > 0 \
-            and self.completed == self.total and self.errors == 0
+            and self.completed == self.total and self.errors == 0 \
+            and all(self.checkpoints.get(name) is not None
+                    and self.checkpoints[name].passed for name in self.required_checkpoints)
 
     def passed(self):
         return self.receipts_passed() and self.visual_proof is not None \
@@ -66,6 +71,9 @@ class InteractionOutcome:
         for name, proof in self.checkpoints.items():
             if not proof.passed:
                 return f"{summary}; {name}: {proof.error}"
+        for name in self.required_checkpoints:
+            if name not in self.checkpoints:
+                return f"{summary}; {name}: required visual checkpoint missing"
         return summary
 
 
@@ -76,6 +84,7 @@ class BootVerdict:
     interaction: InteractionOutcome
     faults: list = field(default_factory=list)
     reasons: list = field(default_factory=list)
+    filebasic_receipts: FileBasicProof | None = None
 
     def to_json(self):
         document = asdict(self)
@@ -99,6 +108,10 @@ def boot_verdict(serial, interaction, runner_failures=()):
     sealed = DESKTOP_SEALED.search(serial) is not None
     faults = serial_faults(serial)
     reasons = list(runner_failures) + faults
+    filebasic = (prove_filebasic_receipts(serial)
+                 if interaction.required_checkpoints else None)
+    if filebasic is not None and not filebasic.passed:
+        reasons.append(filebasic.error)
     if not sealed:
         reasons.append("Explorer desktop never sealed")
     if not interaction.receipts_passed():
@@ -109,4 +122,4 @@ def boot_verdict(serial, interaction, runner_failures=()):
             reason += f": {interaction.visual_proof.error}"
         reasons.append(reason)
     return BootVerdict(passed=not reasons, sealed=sealed, interaction=interaction,
-                       faults=faults, reasons=reasons)
+                       faults=faults, reasons=reasons, filebasic_receipts=filebasic)

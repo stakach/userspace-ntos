@@ -33,6 +33,11 @@ on:
         description: After the sealed Explorer desktop, drive scripts/kvm_interaction_steps.json through QMP input and prove the visible command result. Clearing this fails the gate
         type: boolean
         default: true
+      interaction_profile:
+        description: Select the desktop command proof or the FileBasic attribute before/after proof
+        type: choice
+        default: desktop
+        options: [desktop, filebasic]
       multicore:
         description: Place worker threads on their affinity cores (the default); clear to build with NTOS_GUEST_WORKER_MULTICORE=0 and keep every guest thread on core 0
         type: boolean
@@ -253,10 +258,17 @@ jobs:
           # it blocks migration. Request it; QEMU drops it with a warning when KVM lacks it.
           QEMU_CPU_MODEL: host,invtsc=on
           INTERACT: ${{ inputs.interact && '1' || '' }}
+          INTERACTION_PROFILE: ${{ inputs.interaction_profile || 'desktop' }}
         run: |
           set -euo pipefail
           interact_args=()
-          if [ -n "$INTERACT" ]; then interact_args=(--interact); fi
+          if [ -n "$INTERACT" ]; then
+            case "$INTERACTION_PROFILE" in
+              desktop) interact_args=(--interact) ;;
+              filebasic) interact_args=(--interact scripts/kvm_filebasic_interaction_steps.json) ;;
+              *) echo "unknown interaction profile: $INTERACTION_PROFILE" >&2; exit 1 ;;
+            esac
+          fi
           boot_status=0
           rm -f native-kvm-qemu-stopped
           python3 scripts/ci_kvm_smoke.py --seconds "$BOOT_SECONDS" --trace-interrupts "${interact_args[@]}" || boot_status=$?
