@@ -5,6 +5,13 @@
 //! caller classifies its terminal effect; an uncertain effect retains the original
 //! attempt and cannot authorize a retry, identity query, or mechanism retirement.
 
+use alloc::alloc::alloc;
+use alloc::boxed::Box;
+use core::alloc::Layout;
+use core::cell::UnsafeCell;
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
 use crate::process_identity::ProcessIdentity;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,9 +217,295 @@ impl PhysicalPlacementOwner {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacementReadOwnerError {
+    NoMemory,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadPhase {
+    Idle = 0,
+    Active = 1,
+    Unresolved = 2,
+}
+
+struct PlacementReadState {
+    placement: UnsafeCell<PhysicalPlacementOwner>,
+    nonce: AtomicU64,
+    phase: AtomicU8,
+}
+
+/// Stable allocation for the sole authoritative physical placement owner. A wrapper can move
+/// with its runtime row; its allocation cannot move while the wrapper is retained. The native
+/// adapter must retain the wrapper and its exact TCB/SC caps until the loan is settled.
+pub struct PlacementReadOwner {
+    state: Option<Box<PlacementReadState>>,
+}
+
+impl core::fmt::Debug for PlacementReadOwner {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut debug = formatter.debug_struct("PlacementReadOwner");
+        if let Some(state) = self.state.as_ref() {
+            debug.field("nonce", &state.nonce.load(Ordering::Acquire))
+                .field("phase", &state.phase.load(Ordering::Acquire));
+        }
+        debug.finish()
+    }
+}
+
+impl PlacementReadOwner {
+    /// Allocation failure returns an error before a runtime row publishes this owner.
+    pub fn try_new(placement: PhysicalPlacementOwner) -> Result<Self, PlacementReadOwnerError> {
+        let layout = Layout::new::<PlacementReadState>();
+        // SAFETY: this nonzero fixed-size layout is initialized before Box takes ownership.
+        let ptr = unsafe { alloc(layout) }.cast::<PlacementReadState>();
+        if ptr.is_null() {
+            return Err(PlacementReadOwnerError::NoMemory);
+        }
+        unsafe {
+            ptr.write(PlacementReadState {
+                placement: UnsafeCell::new(placement),
+                nonce: AtomicU64::new(0),
+                phase: AtomicU8::new(ReadPhase::Idle as u8),
+            });
+            Ok(Self { state: Some(Box::from_raw(ptr)) })
+        }
+    }
+
+    fn state(&self) -> &PlacementReadState {
+        self.state.as_deref().expect("live placement owner retains its allocation")
+    }
+
+    /// Acquire one exact job's move-only loan without copying its core.
+    ///
+    /// # Safety
+    /// The caller must retain this stable owner, its TCB/SC capabilities, and the read loan
+    /// throughout the worker Call. Root must not mutate placement while the worker can read it:
+    /// the single executor run token and checked next-receive proof serialize those accesses,
+    /// including when they run on different cores. An uncertain native result retains the owner
+    /// and must use `retain_unresolved`, never retry or release this job.
+    pub unsafe fn acquire(
+        &mut self,
+        identity: PlacementIdentity,
+        nonce: u64,
+    ) -> Result<PlacementReadLoan, PlacementError> {
+        if nonce == 0 {
+            return Err(PlacementError::InvalidIdentity);
+        }
+        let state = self.state();
+        // SAFETY: no placement mutation is possible while the phase is active; before setting
+        // it, the caller owns the sole mutable placement path through this wrapper.
+        unsafe { (&*state.placement.get()).check_identity(identity)? };
+        if state.phase.load(Ordering::Acquire) != ReadPhase::Idle as u8 {
+            return Err(PlacementError::Busy);
+        }
+        state.nonce.store(nonce, Ordering::Relaxed);
+        state.phase.store(ReadPhase::Active as u8, Ordering::Release);
+        Ok(PlacementReadLoan {
+            state: NonNull::from(state),
+            identity,
+            nonce,
+        })
+    }
+
+    pub fn current_core(&self, identity: PlacementIdentity) -> Result<u8, PlacementError> {
+        if self.state().phase.load(Ordering::Acquire) != ReadPhase::Idle as u8 {
+            return Err(PlacementError::Busy);
+        }
+        // SAFETY: a job's read and a placement transition are serialized by the wrapper.
+        unsafe { (&*self.state().placement.get()).current_core(identity) }
+    }
+
+    pub fn begin(
+        &mut self,
+        identity: PlacementIdentity,
+        target_core: u8,
+        active_count: u8,
+    ) -> Result<PlacementAttempt, PlacementError> {
+        let state = self.state();
+        if state.phase.load(Ordering::Acquire) != ReadPhase::Idle as u8 {
+            return Err(PlacementError::Busy);
+        }
+        // SAFETY: no read loan exists, and this wrapper serializes placement transitions.
+        unsafe { (&mut *state.placement.get()).begin(identity, target_core, active_count) }
+    }
+
+    pub fn settle(
+        &mut self,
+        attempt: PlacementAttempt,
+        effect: PlacementEffect,
+    ) -> Result<(), PlacementError> {
+        let state = self.state();
+        if state.phase.load(Ordering::Acquire) != ReadPhase::Idle as u8 {
+            return Err(PlacementError::Busy);
+        }
+        // SAFETY: no read loan exists, and this wrapper serializes placement transitions.
+        unsafe { (&mut *state.placement.get()).settle(attempt, effect) }
+    }
+
+    pub fn reconcile(
+        &mut self,
+        attempt: PlacementAttempt,
+        effect: PlacementEffect,
+    ) -> Result<(), PlacementError> {
+        let state = self.state();
+        if state.phase.load(Ordering::Acquire) != ReadPhase::Idle as u8 {
+            return Err(PlacementError::Busy);
+        }
+        // SAFETY: no read loan exists, and this wrapper serializes placement transitions.
+        unsafe { (&mut *state.placement.get()).reconcile(attempt, effect) }
+    }
+
+    /// A live or unresolved read loan pins the physical mechanism even if its core is known.
+    pub fn may_retire(&self) -> bool {
+        let state = self.state();
+        state.phase.load(Ordering::Acquire) == ReadPhase::Idle as u8
+            && unsafe { (&*state.placement.get()).transition_is_settled() }
+    }
+
+    fn check_loan(
+        &self,
+        loan: &PlacementReadLoan,
+        identity: PlacementIdentity,
+        nonce: u64,
+    ) -> Result<(), PlacementError> {
+        if nonce == 0 {
+            return Err(PlacementError::InvalidIdentity);
+        }
+        // SAFETY: the owner is live through this method, and its allocation is stable.
+        unsafe { (&*self.state().placement.get()).check_identity(identity)? };
+        if loan.identity != identity {
+            return Err(PlacementError::WrongIdentity);
+        }
+        if loan.state.as_ptr() != self.state() as *const PlacementReadState as *mut PlacementReadState
+            || loan.nonce != nonce
+            || self.state().phase.load(Ordering::Acquire) != ReadPhase::Active as u8
+            || self.state().nonce.load(Ordering::Relaxed) != nonce
+        {
+            return Err(PlacementError::StaleAttempt);
+        }
+        Ok(())
+    }
+
+    /// Release only after the exact normal worker terminal, next-receive proof, and hosted
+    /// Reply settlement have all been checked by their native owners.
+    ///
+    /// # Safety
+    /// The caller must have checked those three effects for this same job. A reply attempt,
+    /// missing rearm proof, or uncertain effect cannot settle the loan.
+    pub unsafe fn settle_checked_normal(
+        &mut self,
+        loan: PlacementReadLoan,
+        identity: PlacementIdentity,
+        nonce: u64,
+    ) -> Result<(), (PlacementError, PlacementReadLoan)> {
+        if let Err(error) = self.check_loan(&loan, identity, nonce) {
+            return Err((error, loan));
+        }
+        self.state().nonce.store(0, Ordering::Relaxed);
+        self.state().phase.store(ReadPhase::Idle as u8, Ordering::Release);
+        Ok(())
+    }
+
+    /// Consume the move-only loan into a retained unresolved job. Dropping the loan alone does
+    /// not clear the owner; a worker fault or uncertain native effect must take this path.
+    pub fn retain_unresolved(
+        &mut self,
+        loan: PlacementReadLoan,
+        identity: PlacementIdentity,
+        nonce: u64,
+    ) -> Result<(), (PlacementError, PlacementReadLoan)> {
+        if let Err(error) = self.check_loan(&loan, identity, nonce) {
+            return Err((error, loan));
+        }
+        self.state().phase.store(ReadPhase::Unresolved as u8, Ordering::Release);
+        Ok(())
+    }
+
+    /// Release an unresolved job only after the exact worker TCB is retired and its private
+    /// and hosted Replies have reached checked settlement. The job may never be replayed.
+    ///
+    /// # Safety
+    /// The native owner must have acknowledged those exact physical retirements/settlements.
+    /// An attempted delete or uncertain result does not authorize this call.
+    pub unsafe fn settle_after_worker_retirement(
+        &mut self,
+        identity: PlacementIdentity,
+        nonce: u64,
+    ) -> Result<(), PlacementError> {
+        if nonce == 0 {
+            return Err(PlacementError::InvalidIdentity);
+        }
+        // SAFETY: the owner is live and neither a read nor transition can mutate placement
+        // while the unresolved job remains recorded.
+        unsafe { (&*self.state().placement.get()).check_identity(identity)? };
+        if self.state().nonce.load(Ordering::Relaxed) != nonce {
+            return Err(PlacementError::StaleAttempt);
+        }
+        if self.state().phase.load(Ordering::Acquire) != ReadPhase::Unresolved as u8 {
+            return Err(PlacementError::Busy);
+        }
+        self.state().nonce.store(0, Ordering::Relaxed);
+        self.state().phase.store(ReadPhase::Idle as u8, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Drop for PlacementReadOwner {
+    fn drop(&mut self) {
+        if self.state.as_ref().is_some_and(|state| {
+            state.phase.load(Ordering::Acquire) != ReadPhase::Idle as u8
+        }) {
+            // A caller that violates the unsafe retention contract must not turn a surviving
+            // worker pointer into freed memory. Retain the allocation rather than release it.
+            if let Some(state) = self.state.take() {
+                core::mem::forget(state);
+            }
+        }
+    }
+}
+
+/// One move-only read claim for an exact live worker job. Drop never settles the owner.
+#[must_use = "settle normally or retain this exact loan after uncertain effects"]
+#[derive(Debug)]
+pub struct PlacementReadLoan {
+    state: NonNull<PlacementReadState>,
+    identity: PlacementIdentity,
+    nonce: u64,
+}
+
+impl PlacementReadLoan {
+    /// Read the current authoritative core, including a pending/uncertain placement refusal.
+    /// The unsafe `acquire` contract requires the owner and physical caps to remain retained.
+    pub fn current_core(
+        &self,
+        identity: PlacementIdentity,
+        nonce: u64,
+    ) -> Result<u8, PlacementError> {
+        if identity != self.identity {
+            return Err(PlacementError::WrongIdentity);
+        }
+        if nonce != self.nonce {
+            return Err(PlacementError::StaleAttempt);
+        }
+        // SAFETY: acquire requires the stable owner to outlive this loan. The model records
+        // the job before the worker can read it and never mutates placement while it is live.
+        let state = unsafe { self.state.as_ref() };
+        if state.phase.load(Ordering::Acquire) != ReadPhase::Active as u8 {
+            return Err(PlacementError::Busy);
+        }
+        if state.nonce.load(Ordering::Relaxed) != nonce {
+            return Err(PlacementError::StaleAttempt);
+        }
+        unsafe { (&*state.placement.get()).current_core(identity) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
     use crate::process_identity::{ProcessGeneration, ProcessIdentity};
 
     fn identity(generation: u64, tcb: u64, sc: u64) -> PlacementIdentity {
@@ -360,6 +653,100 @@ mod tests {
                 processor_query_result(Err(error)),
                 nt_process::STATUS_INVALID_HANDLE,
             );
+        }
+    }
+
+    #[test]
+    fn live_read_loan_keeps_the_authoritative_owner_stable_across_row_growth() {
+        let key = identity(7, 100, 200);
+        let mut rows = Vec::with_capacity(1);
+        rows.push(PlacementReadOwner::try_new(
+            PhysicalPlacementOwner::new(key, 2, 4).unwrap(),
+        ).unwrap());
+        // SAFETY: the native adapter retains this fallibly allocated stable owner and the
+        // exact TCB/SC caps until the loan is explicitly settled. Moving the Vec wrapper
+        // cannot move or destroy the placement allocation while the loan is live.
+        let loan = unsafe { rows[0].acquire(key, 41) }.unwrap();
+
+        // The native runtime table may grow after root starts a worker Call. The worker must
+        // read the retained placement owner, not an address inside a movable Vec row or a
+        // processor number copied by root before the Call.
+        for generation in 8..40 {
+            rows.push(PlacementReadOwner::try_new(
+                PhysicalPlacementOwner::new(identity(generation, 100, 200), 0, 4).unwrap(),
+            ).unwrap());
+        }
+        assert_eq!(loan.current_core(key, 41), Ok(2));
+        assert_eq!(loan.current_core(identity(8, 100, 200), 41), Err(PlacementError::WrongIdentity));
+        assert_eq!(loan.current_core(key, 42), Err(PlacementError::StaleAttempt));
+        assert_eq!(rows[0].begin(key, 3, 4), Err(PlacementError::Busy));
+        assert!(!rows[0].may_retire());
+
+        unsafe { rows[0].settle_checked_normal(loan, key, 41) }.unwrap();
+        assert!(rows[0].may_retire());
+        let attempt = rows[0].begin(key, 3, 4).unwrap();
+        rows[0].settle(attempt, PlacementEffect::Applied).unwrap();
+        // SAFETY: the same stable owner and physical caps remain retained for this next job.
+        let next = unsafe { rows[0].acquire(key, 42) }.unwrap();
+        assert_eq!(next.current_core(key, 42), Ok(3));
+        unsafe { rows[0].settle_checked_normal(next, key, 42) }.unwrap();
+    }
+
+    #[test]
+    fn read_loan_admission_and_normal_settlement_require_the_exact_job() {
+        let key = identity(7, 100, 200);
+        let mut owner = PlacementReadOwner::try_new(
+            PhysicalPlacementOwner::new(key, 0, 4).unwrap(),
+        ).unwrap();
+        // SAFETY: this test retains the stable owner and physical cap identities throughout.
+        assert!(matches!(unsafe { owner.acquire(key, 0) }, Err(PlacementError::InvalidIdentity)));
+        for wrong in [identity(8, 100, 200), identity(7, 101, 200), identity(7, 100, 201)] {
+            assert!(matches!(unsafe { owner.acquire(wrong, 7) }, Err(PlacementError::WrongIdentity)));
+        }
+
+        let loan = unsafe { owner.acquire(key, 7) }.unwrap();
+        assert!(matches!(unsafe { owner.acquire(key, 8) }, Err(PlacementError::Busy)));
+        let (error, loan) = unsafe { owner.settle_checked_normal(loan, key, 8) }.unwrap_err();
+        assert_eq!(error, PlacementError::StaleAttempt);
+        assert!(!owner.may_retire());
+        let (error, loan) = unsafe {
+            owner.settle_checked_normal(loan, identity(8, 100, 200), 7)
+        }.unwrap_err();
+        assert_eq!(error, PlacementError::WrongIdentity);
+        assert_eq!(loan.current_core(key, 7), Ok(0));
+        unsafe { owner.settle_checked_normal(loan, key, 7) }.unwrap();
+        assert!(owner.may_retire());
+    }
+
+    #[test]
+    fn unresolved_live_job_retains_placement_until_exact_worker_retirement() {
+        let key = identity(7, 100, 200);
+        for nonce in [11, 12] {
+            let mut owner = PlacementReadOwner::try_new(
+                PhysicalPlacementOwner::new(key, 1, 4).unwrap(),
+            ).unwrap();
+            // SAFETY: the owner and exact physical caps are retained until the explicit
+            // worker-retirement observation settles the unresolved job.
+            let loan = unsafe { owner.acquire(key, nonce) }.unwrap();
+            // Both a checked worker fault and an uncertain Call/Reply/query result take this
+            // conservative path. A dropped worker-side pointer cannot clear the root owner.
+            let (error, loan) = owner.retain_unresolved(loan, key, nonce + 1).unwrap_err();
+            assert_eq!(error, PlacementError::StaleAttempt);
+            owner.retain_unresolved(loan, key, nonce).unwrap();
+            assert_eq!(owner.begin(key, 2, 4), Err(PlacementError::Busy));
+            assert!(!owner.may_retire());
+            assert_eq!(
+                unsafe { owner.settle_after_worker_retirement(key, nonce + 1) },
+                Err(PlacementError::StaleAttempt),
+            );
+            assert_eq!(
+                unsafe { owner.settle_after_worker_retirement(identity(8, 100, 200), nonce) },
+                Err(PlacementError::WrongIdentity),
+            );
+            assert!(!owner.may_retire());
+            unsafe { owner.settle_after_worker_retirement(key, nonce) }.unwrap();
+            assert!(owner.may_retire());
+            assert_eq!(owner.current_core(key), Ok(1));
         }
     }
 }
