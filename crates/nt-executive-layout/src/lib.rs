@@ -127,8 +127,11 @@ pub mod root {
         Region::new("DMA graph slots", 0x0000_0106_0000_0000, 256 * MIB);
     /// Private stacks and IPC buffers of native executive executor TCBs. The first page of
     /// each stack is deliberately left unmapped as a guard.
-    pub const EXECUTOR_WORKERS: Region =
-        Region::new("executive executor workers", DMA_GRAPH_SLOTS.end(), TABLE_SPAN);
+    pub const EXECUTOR_WORKERS: Region = Region::new(
+        "executive executor workers",
+        DMA_GRAPH_SLOTS.end(),
+        TABLE_SPAN,
+    );
 
     /// One [`DYNAMIC_RUNTIME_STRIDE`] per dynamically admitted process. Nothing follows it
     /// below [`DISPLAY_WINDOW`], so the process limit can rise to the badge limit in place.
