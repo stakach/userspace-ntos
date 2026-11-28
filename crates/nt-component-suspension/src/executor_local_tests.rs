@@ -4,8 +4,8 @@
 //! native installation tests use unready registration and an acknowledged FS transaction.
 
 use crate::executor_local::{
-    ExecutorLocalError, ExecutorLocalRegistry, PassiveWorkerReadyProof, PhysicalTcbClaim, TcbIdentity,
-    TcbRetirementObservation,
+    ExecutorLocalError, ExecutorLocalRegistry, PassiveWorkerReadyProof, PhysicalTcbClaim,
+    PhysicalWorkerEndpointClaim, TcbIdentity, TcbRetirementObservation,
 };
 use crate::{
     ExecutorError, ExecutorFaultBinding, ExecutorResume, ExecutorState, ExecutorTable,
@@ -46,6 +46,25 @@ fn retired(tcb: TcbIdentity) -> TcbRetirementObservation {
 // Tests model a native retype owner that keeps this exact cap and slot from being reused.
 fn physical(tcb: TcbIdentity, cap: u64) -> PhysicalTcbClaim {
     unsafe { PhysicalTcbClaim::new(tcb, cap).expect("valid physical TCB claim") }
+}
+
+#[test]
+fn endpoint_claim_accepts_cap_one_and_rejects_only_zero_identity_fields() {
+    let tcb = TcbIdentity::new(2, 3);
+    let claim = physical(tcb, 1);
+    let endpoint = unsafe { PhysicalWorkerEndpointClaim::from_native(&claim, 1, 1).unwrap() };
+    assert_eq!(endpoint.tcb(), tcb);
+    assert_eq!(endpoint.target_cap(), 1);
+    assert_eq!(endpoint.endpoint_cap(), 1);
+    assert_eq!(endpoint.endpoint_generation(), 1);
+    assert_eq!(
+        unsafe { PhysicalWorkerEndpointClaim::from_native(&claim, 0, 1) }.err(),
+        Some(ExecutorLocalError::InvalidEndpointIdentity),
+    );
+    assert_eq!(
+        unsafe { PhysicalWorkerEndpointClaim::from_native(&claim, 1, 0) }.err(),
+        Some(ExecutorLocalError::InvalidEndpointIdentity),
+    );
 }
 
 #[test]

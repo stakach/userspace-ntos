@@ -229,7 +229,32 @@ def source_is_ancestor(source_head: str, target_head: str, cwd: Path = ROOT) -> 
     ).returncode == 0
 
 
-def source_matches_target_ancestor_tree(source_head: str, target_head: str) -> bool:
+def api_commit_tree(commit_sha: str, token: str, repo: str) -> str | None:
+    """Read one exact commit tree from the authenticated source repository."""
+    if not token or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) \
+            or not COMMIT.fullmatch(commit_sha):
+        return None
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/commits/{commit_sha}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            value = json.load(response)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(value, dict) or value.get("sha") != commit_sha:
+        return None
+    commit = value.get("commit")
+    tree = commit.get("tree") if isinstance(commit, dict) else None
+    tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+    return tree_sha if isinstance(tree_sha, str) and COMMIT.fullmatch(tree_sha) else None
+
+
+def source_matches_target_ancestor_tree(
+    source_head: str, target_head: str, repo: str | None = None, token: str | None = None,
+) -> bool:
     """Accept a pre-squash source only when its complete tree is in target history.
 
     A squash merge can replace a commit without changing its source tree. The installed
@@ -241,19 +266,27 @@ def source_matches_target_ancestor_tree(source_head: str, target_head: str) -> b
         return False
     try:
         def verified_commit(sha: str) -> bool:
-            resolved = subprocess.check_output(
-                ["git", "rev-parse", "--verify", f"{sha}^{{commit}}"],
+            try:
+                resolved = subprocess.check_output(
+                    ["git", "rev-parse", "--verify", f"{sha}^{{commit}}"],
+                    cwd=ROOT, text=True, stderr=subprocess.DEVNULL,
+                ).strip()
+                return resolved == sha
+            except (OSError, subprocess.CalledProcessError):
+                return False
+
+        if not verified_commit(target_head):
+            return False
+        if verified_commit(source_head):
+            source_tree = subprocess.check_output(
+                ["git", "rev-parse", "--verify", f"{source_head}^{{tree}}"],
                 cwd=ROOT, text=True, stderr=subprocess.DEVNULL,
             ).strip()
-            return resolved == sha
-
-        if not verified_commit(source_head) or not verified_commit(target_head):
-            return False
-        source_tree = subprocess.check_output(
-            ["git", "rev-parse", "--verify", f"{source_head}^{{tree}}"],
-            cwd=ROOT, text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-        if not COMMIT.fullmatch(source_tree):
+        else:
+            # Squash merges can leave the source run's commit absent from a fresh checkout.
+            # The Actions run authenticates its exact SHA and repository before this lookup.
+            source_tree = api_commit_tree(source_head, token or "", repo or "")
+        if not isinstance(source_tree, str) or not COMMIT.fullmatch(source_tree):
             return False
         ancestor_trees = subprocess.check_output(
             ["git", "log", "--format=%T", target_head],
@@ -313,11 +346,6 @@ def verify_migration_run(run: dict, run_id: int, attempt: int, current: dict) ->
         if run.get(key) != value:
             raise ContinuationError(f"source run {key} mismatch")
     verify_conclusion(run)
-    source_head = run.get("head_sha")
-    if not isinstance(source_head, str) or source_head == current["head_sha"] \
-            or not (source_is_ancestor(source_head, current["head_sha"])
-                    or source_matches_target_ancestor_tree(source_head, current["head_sha"])):
-        raise ContinuationError("migration source is not an earlier ancestor tree of this head")
     if (run.get("repository") or {}).get("full_name") != current["repo"] \
             or (run.get("head_repository") or {}).get("full_name") != current["repo"]:
         raise ContinuationError("source run belongs to another repository")
@@ -326,6 +354,13 @@ def verify_migration_run(run: dict, run_id: int, attempt: int, current: dict) ->
     migration_source_ref(run)
     if run_id == int(os.environ["GITHUB_RUN_ID"]):
         raise ContinuationError("cannot migrate this same workflow run")
+    source_head = run.get("head_sha")
+    if not isinstance(source_head, str) or source_head == current["head_sha"] \
+            or not (source_is_ancestor(source_head, current["head_sha"])
+                    or source_matches_target_ancestor_tree(
+                        source_head, current["head_sha"], current["repo"],
+                        os.environ.get("GITHUB_TOKEN"))):
+        raise ContinuationError("migration source is not an earlier ancestor tree of this head")
 
 
 def verify_migration_manifest(value: dict, run_id: int, attempt: int,

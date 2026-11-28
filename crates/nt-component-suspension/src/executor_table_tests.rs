@@ -568,6 +568,21 @@ fn fault_report(
     }
 }
 
+fn live_fault_report(
+    executor: ExecutorHandle,
+    tcb: TcbIdentity,
+    target_cap: u64,
+    root_reply: RootReplyIdentity,
+    supervisor_reply: RootReplyIdentity,
+    job: LiveJobId,
+) -> ExecutorFaultReport {
+    unsafe {
+        ExecutorFaultReport::acknowledged_live(
+            executor, tcb, target_cap, root_reply, supervisor_reply, job,
+        ).unwrap()
+    }
+}
+
 fn bind_fault(
     root: &mut Root,
     run: &ExecutorRun,
@@ -626,6 +641,309 @@ fn normal_call_completion_keeps_the_bound_worker_eligible() {
     );
     root.yields(next_run, Idle);
     assert_eq!(root.state(executor), ExecutorState::Idle);
+}
+
+fn hosted_reply_owner() -> (RootReplySlotTable, RootReplyIdentity) {
+    let mut owner = RootReplySlotTable::new(1).unwrap();
+    let reply = owner.insert_used(0x150).unwrap();
+    (owner, reply)
+}
+
+fn worker_endpoint(
+    claim: &PhysicalTcbClaim,
+    cap: u64,
+    generation: u64,
+) -> PhysicalWorkerEndpointClaim {
+    // SAFETY: the fixture retains the TCB and the separately owned physical endpoint. Wrong
+    // owner cases below model a different valid endpoint claim, not authority from a bare cap.
+    unsafe { PhysicalWorkerEndpointClaim::from_native(claim, cap, generation).unwrap() }
+}
+
+fn exact_rearm(
+    executor: ExecutorHandle,
+    endpoint: &PhysicalWorkerEndpointClaim,
+    reply: RootReplyIdentity,
+) -> ExactPassiveReceiveProof {
+    // SAFETY: these are memory-only fixtures. The successful case models a checked kernel
+    // query after ReplyRecv; mismatch cases deliberately submit adversarial foreign proofs.
+    // The table must compare the full binding before trusting any such observation.
+    unsafe { ExactPassiveReceiveProof::after_checked_query(executor, endpoint, reply).unwrap() }
+}
+
+#[test]
+fn exhausted_live_job_sequence_refuses_before_loaning_a_call() {
+    let (mut root, run, executor, _, claim, _) = active_fault_binding();
+    let (hosted_owner, hosted_reply) = hosted_reply_owner();
+    let endpoint = worker_endpoint(&claim, 0x180, 1);
+    root.table.next_job_sequence = u64::MAX;
+    assert_eq!(
+        root.table.bind_live_job(&run, &hosted_owner, hosted_reply, &endpoint).unwrap_err(),
+        ExecutorError::IdentityExhausted
+    );
+    assert_eq!(root.table.live_job(executor), Ok(None));
+    assert_eq!(hosted_owner.state(hosted_reply), Ok(RootReplySlotState::Used));
+    root.yields(run, Idle);
+    assert_eq!(root.state(executor), ExecutorState::Idle);
+}
+
+#[test]
+fn live_job_refuses_generic_idle_and_mints_a_new_identity_for_each_call() {
+    let (mut root, run, executor, _, claim, replies) = active_fault_binding();
+    let (mut hosted_owner, hosted_reply) = hosted_reply_owner();
+    let (_foreign_hosted_owner, foreign_hosted_reply) = hosted_reply_owner();
+    let endpoint = worker_endpoint(&claim, 0x180, 1);
+    assert!(root.table.bind_live_job(&run, &hosted_owner, foreign_hosted_reply, &endpoint).is_err());
+    let first_job = root.table.bind_live_job(&run, &hosted_owner, hosted_reply, &endpoint).unwrap();
+
+    let (error, run) = root.refused_yield(run, Idle);
+    assert_eq!(error, ExecutorError::LiveJobOutstanding);
+    assert_eq!(root.table.live_job(executor), Ok(Some(first_job)));
+    assert!(root.token.is_none());
+    let terminal = unsafe {
+        LiveNormalTerminal::acknowledged(
+            first_job,
+            0x2a,
+            replies.root,
+            exact_rearm(executor, &endpoint, replies.root),
+        ).unwrap()
+    };
+    let (token, result) = root.table.accept_live_terminal(run, terminal).unwrap();
+    root.token = Some(token);
+    assert_eq!(result, 0x2a);
+    assert_eq!(root.state(executor), ExecutorState::AwaitingHostedReply);
+    assert_eq!(root.table.live_job(executor), Ok(Some(first_job)));
+    // The worker result does not consume the hosted caller's Reply; root still owns that effect.
+    assert_eq!(hosted_owner.state(hosted_reply), Ok(RootReplySlotState::Used));
+    assert_eq!(root.refused(Unrouted), ExecutorError::NoIdleExecutor);
+    let (mut foreign_owner, foreign_reply) = hosted_reply_owner();
+    let wrong_settlement = unsafe {
+        LiveHostedReplySettlementObservation::after_checked_native_completion(
+            &mut foreign_owner, foreign_reply,
+        ).unwrap()
+    };
+    assert_eq!(root.table.observe_live_hosted_reply_settlement(
+        root.token.as_ref().unwrap(), executor, first_job, wrong_settlement,
+    ).err().unwrap().0, ExecutorError::LiveJobIdentityMismatch);
+    assert_eq!(root.table.live_job(executor), Ok(Some(first_job)));
+    assert_eq!(hosted_owner.state(hosted_reply), Ok(RootReplySlotState::Used));
+    let settled = unsafe {
+        LiveHostedReplySettlementObservation::after_checked_native_completion(
+            &mut hosted_owner, hosted_reply,
+        ).unwrap()
+    };
+    root.table.observe_live_hosted_reply_settlement(
+        root.token.as_ref().unwrap(), executor, first_job, settled,
+    ).unwrap();
+    assert_eq!(root.state(executor), ExecutorState::Idle);
+    assert_eq!(root.table.live_job(executor), Ok(None));
+
+    let next_run = root.resume(Unrouted);
+    bind_fault(&mut root, &next_run, &claim, replies.root, replies.supervisor);
+    let (next_hosted_owner, next_hosted_reply) = hosted_reply_owner();
+    let next_job = root.table.bind_live_job(
+        &next_run, &next_hosted_owner, next_hosted_reply, &endpoint,
+    ).unwrap();
+    assert_ne!(first_job, next_job, "a late terminal must not match a later Call");
+    let stale_terminal = unsafe {
+        LiveNormalTerminal::acknowledged(
+            first_job,
+            0x2a,
+            replies.root,
+            exact_rearm(executor, &endpoint, replies.root),
+        ).unwrap()
+    };
+    let (_, returned_run, _) = root.table.accept_live_terminal(next_run, stale_terminal).err().unwrap();
+    assert_eq!(returned_run.executor(), executor);
+    assert_eq!(root.state(executor), ExecutorState::Quarantined);
+    assert_eq!(root.table.live_job(executor), Ok(Some(next_job)));
+    assert_eq!(next_hosted_owner.state(next_hosted_reply), Ok(RootReplySlotState::Used));
+    assert!(root.token.is_none());
+}
+
+#[test]
+fn live_terminal_rejects_wrong_private_reply_or_rearm_identity_without_replay() {
+    for wrong in 0..3 {
+        let (mut root, run, executor, _, claim, replies) = active_fault_binding();
+        let (hosted_owner, hosted_reply) = hosted_reply_owner();
+        let endpoint = worker_endpoint(&claim, 0x180, 1);
+        let wrong_endpoint = worker_endpoint(&claim, 0x181, 2);
+        let job = root.table.bind_live_job(&run, &hosted_owner, hosted_reply, &endpoint).unwrap();
+        let other_replies = FaultReplyOwners::new();
+        let foreign_root = Root::new(1, 1);
+        let foreign_claim = unsafe {
+            PhysicalTcbClaim::new(TcbIdentity::new(0x21, 8), 0x121).unwrap()
+        };
+        let foreign_endpoint = worker_endpoint(&foreign_claim, 0x182, 1);
+        let (terminal_reply, proof) = match wrong {
+            0 => (other_replies.root, exact_rearm(executor, &endpoint, replies.root)),
+            1 => (replies.root, exact_rearm(executor, &wrong_endpoint, replies.root)),
+            _ => (replies.root, exact_rearm(foreign_root.executors[0], &foreign_endpoint, other_replies.root)),
+        };
+        let terminal = unsafe { LiveNormalTerminal::acknowledged(job, 0, terminal_reply, proof).unwrap() };
+        let (_, returned_run, _) = root.table.accept_live_terminal(run, terminal).err().unwrap();
+        assert_eq!(returned_run.executor(), executor);
+        assert_eq!(root.state(executor), ExecutorState::Quarantined);
+        assert_eq!(root.table.live_job(executor), Ok(Some(job)));
+        assert_eq!(hosted_owner.state(hosted_reply), Ok(RootReplySlotState::Used));
+        assert!(root.token.is_none());
+        assert!(root.table.accept_yield(returned_run, Idle).is_err());
+    }
+}
+
+#[test]
+fn uncertain_live_terminal_retains_the_run_job_and_hosted_reply() {
+    let (mut root, run, executor, _, claim, replies) = active_fault_binding();
+    let (hosted_owner, hosted_reply) = hosted_reply_owner();
+    let endpoint = worker_endpoint(&claim, 0x180, 1);
+    let job = root.table.bind_live_job(&run, &hosted_owner, hosted_reply, &endpoint).unwrap();
+    // A partial or indeterminate native ReplyRecv is not a checked result or rearm proof.
+    let terminal = unsafe { LiveNormalTerminal::uncertain(job, replies.root).unwrap() };
+    let (_, returned_run, _) = root.table.accept_live_terminal(run, terminal).err().unwrap();
+    assert_eq!(returned_run.executor(), executor);
+    assert_eq!(root.state(executor), ExecutorState::Quarantined);
+    assert_eq!(root.table.live_job(executor), Ok(Some(job)));
+    assert_eq!(hosted_owner.state(hosted_reply), Ok(RootReplySlotState::Used));
+    assert!(root.token.is_none());
+    assert!(root.table.accept_yield(returned_run, Idle).is_err());
+}
+
+#[test]
+fn checked_fault_retains_the_live_job_and_hosted_reply() {
+    let (mut root, run, executor, tcb, claim, replies) = active_fault_binding();
+    let (hosted_owner, hosted_reply) = hosted_reply_owner();
+    let endpoint = worker_endpoint(&claim, 0x180, 1);
+    let job = root.table.bind_live_job(&run, &hosted_owner, hosted_reply, &endpoint).unwrap();
+    let report = live_fault_report(executor, tcb, 0x120, replies.root, replies.supervisor, job);
+    root.token = Some(root.table.accept_fault_terminal(run, report).unwrap());
+    assert_eq!(root.state(executor), ExecutorState::Faulted);
+    assert_eq!(root.table.live_job(executor), Ok(Some(job)));
+    assert_eq!(hosted_owner.state(hosted_reply), Ok(RootReplySlotState::Used));
+    assert_eq!(root.refused(Unrouted), ExecutorError::NoIdleExecutor);
+}
+
+#[test]
+fn stale_fault_nonce_cannot_fault_a_later_call_on_the_same_worker_and_private_reply() {
+    let (mut root, first_run, executor, tcb, claim, replies) = active_fault_binding();
+    let endpoint = worker_endpoint(&claim, 0x180, 1);
+    let (mut first_owner, first_reply) = hosted_reply_owner();
+    let first_job = root.table.bind_live_job(
+        &first_run, &first_owner, first_reply, &endpoint,
+    ).unwrap();
+    let terminal = unsafe {
+        LiveNormalTerminal::acknowledged(
+            first_job, 0, replies.root, exact_rearm(executor, &endpoint, replies.root),
+        ).unwrap()
+    };
+    let (token, _) = root.table.accept_live_terminal(first_run, terminal).unwrap();
+    root.token = Some(token);
+    let settled = unsafe {
+        LiveHostedReplySettlementObservation::after_checked_native_completion(
+            &mut first_owner, first_reply,
+        ).unwrap()
+    };
+    root.table.observe_live_hosted_reply_settlement(
+        root.token.as_ref().unwrap(), executor, first_job, settled,
+    ).unwrap();
+
+    let second_run = root.resume(Unrouted);
+    bind_fault(&mut root, &second_run, &claim, replies.root, replies.supervisor);
+    let (second_owner, second_reply) = hosted_reply_owner();
+    let second_job = root.table.bind_live_job(
+        &second_run, &second_owner, second_reply, &endpoint,
+    ).unwrap();
+    assert_ne!(first_job, second_job);
+    let stale = live_fault_report(
+        executor, tcb, 0x120, replies.root, replies.supervisor, first_job,
+    );
+    let (error, returned_run, _) = root.table.accept_fault_terminal(second_run, stale).unwrap_err();
+    assert_eq!(error, ExecutorError::FaultIdentityMismatch);
+    assert_eq!(returned_run.executor(), executor);
+    assert_eq!(root.state(executor), ExecutorState::Quarantined);
+    assert_eq!(root.table.live_job(executor), Ok(Some(second_job)));
+    assert_eq!(second_owner.state(second_reply), Ok(RootReplySlotState::Used));
+    assert!(root.token.is_none());
+}
+
+#[test]
+fn faulted_live_job_waits_for_exact_hosted_reply_settlement_before_slot_reuse() {
+    let (mut root, run, executor, tcb, claim, mut replies) = active_fault_binding();
+    let (mut hosted_owner, hosted_reply) = hosted_reply_owner();
+    let endpoint = worker_endpoint(&claim, 0x180, 1);
+    let job = root.table.bind_live_job(&run, &hosted_owner, hosted_reply, &endpoint).unwrap();
+    let report = live_fault_report(executor, tcb, 0x120, replies.root, replies.supervisor, job);
+    root.token = Some(root.table.accept_fault_terminal(run, report).unwrap());
+
+    let retired_tcb = unsafe { TcbRetirementObservation::new(tcb) };
+    root.table.observe_fault_retirement(
+        root.token.as_ref().unwrap(), executor, FaultRetirementObservation::Tcb(retired_tcb),
+    ).unwrap();
+    let retired_private = replies.retire_root();
+    root.table.observe_fault_retirement(
+        root.token.as_ref().unwrap(), executor, FaultRetirementObservation::Reply(retired_private),
+    ).unwrap();
+    let retired_supervisor = replies.retire_supervisor();
+    root.table.observe_fault_retirement(
+        root.token.as_ref().unwrap(), executor, FaultRetirementObservation::Reply(retired_supervisor),
+    ).unwrap();
+    assert_eq!(root.state(executor), ExecutorState::Faulted);
+    assert_eq!(root.table.live_job(executor), Ok(Some(job)));
+    assert_eq!(root.register(), Err(ExecutorError::NoCapacity));
+    assert_eq!(hosted_owner.state(hosted_reply), Ok(RootReplySlotState::Used));
+
+    // An owner-issued observation for the same numeric cap from another Reply table is not
+    // authority over this hosted caller's Reply.
+    let (mut foreign_owner, foreign_reply) = hosted_reply_owner();
+    let wrong = unsafe {
+        LiveHostedReplySettlementObservation::after_checked_native_completion(
+            &mut foreign_owner, foreign_reply,
+        ).unwrap()
+    };
+    let (error, _) = root.table.observe_fault_retirement(
+        root.token.as_ref().unwrap(), executor, FaultRetirementObservation::HostedReply(wrong),
+    ).err().unwrap();
+    assert_eq!(error, ExecutorError::FaultIdentityMismatch);
+    assert_eq!(root.state(executor), ExecutorState::Faulted);
+    assert_eq!(hosted_owner.state(hosted_reply), Ok(RootReplySlotState::Used));
+    assert_eq!(root.register(), Err(ExecutorError::NoCapacity));
+
+    // SAFETY: the fixture models the root's checked native Reply completion after it answers
+    // the hosted caller. The owner advances its generation before issuing this observation.
+    let settled = unsafe {
+        LiveHostedReplySettlementObservation::after_checked_native_completion(
+            &mut hosted_owner, hosted_reply,
+        ).unwrap()
+    };
+    assert_eq!(hosted_owner.state(hosted_reply), Err(RootReplyReplacementError::StaleIdentity));
+    root.table.observe_fault_retirement(
+        root.token.as_ref().unwrap(), executor, FaultRetirementObservation::HostedReply(settled),
+    ).unwrap();
+    assert_eq!(root.state(executor), ExecutorState::Retired);
+    assert_eq!(root.table.live_job(executor), Ok(None));
+    let replacement = root.register().unwrap();
+    assert_eq!(replacement.index(), executor.index());
+    assert_ne!(replacement.generation(), executor.generation());
+    assert_eq!(root.table.state(executor), Err(ExecutorError::StaleGeneration));
+}
+
+#[test]
+fn uncertain_fault_terminal_quarantines_the_live_job_and_hosted_reply() {
+    let (mut root, run, executor, tcb, claim, replies) = active_fault_binding();
+    let (hosted_owner, hosted_reply) = hosted_reply_owner();
+    let endpoint = worker_endpoint(&claim, 0x180, 1);
+    let job = root.table.bind_live_job(&run, &hosted_owner, hosted_reply, &endpoint).unwrap();
+    let uncertain = unsafe {
+        ExecutorFaultReport::uncertain_live(
+            executor, tcb, 0x120, replies.root, replies.supervisor, job,
+        )
+            .unwrap()
+    };
+    let (_, returned_run, _) = root.table.accept_fault_terminal(run, uncertain).err().unwrap();
+    assert_eq!(returned_run.executor(), executor);
+    assert_eq!(root.state(executor), ExecutorState::Quarantined);
+    assert_eq!(root.table.live_job(executor), Ok(Some(job)));
+    assert_eq!(hosted_owner.state(hosted_reply), Ok(RootReplySlotState::Used));
+    assert!(root.token.is_none());
+    assert!(root.table.accept_yield(returned_run, Idle).is_err());
 }
 
 #[test]

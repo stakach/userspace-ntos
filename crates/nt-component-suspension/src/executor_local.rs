@@ -54,6 +54,56 @@ impl PhysicalTcbClaim {
     }
 }
 
+/// Move-only native ownership of one private worker endpoint bound to an exact physical TCB.
+/// The cap and generation are retained by the native owner; their copied values in a model
+/// record are selectors, never authority to invoke or retire the endpoint.
+#[must_use = "retain the endpoint and TCB claims until their exact native teardown"]
+#[derive(Debug)]
+pub struct PhysicalWorkerEndpointClaim {
+    tcb: TcbIdentity,
+    target_cap: u64,
+    endpoint_cap: u64,
+    endpoint_generation: u64,
+}
+
+impl PhysicalWorkerEndpointClaim {
+    /// # Safety
+    /// The caller must own `tcb` and the live physical endpoint at `endpoint_cap` in this
+    /// generation. Neither slot may be reused until exact native teardown is acknowledged.
+    /// Mint this only at the endpoint's retype/slot owner, before offering a worker Call.
+    pub unsafe fn from_native(
+        tcb: &PhysicalTcbClaim,
+        endpoint_cap: u64,
+        endpoint_generation: u64,
+    ) -> Result<Self, ExecutorLocalError> {
+        if endpoint_cap == 0 || endpoint_generation == 0 {
+            return Err(ExecutorLocalError::InvalidEndpointIdentity);
+        }
+        Ok(Self {
+            tcb: tcb.identity(),
+            target_cap: tcb.target_cap(),
+            endpoint_cap,
+            endpoint_generation,
+        })
+    }
+
+    pub const fn tcb(&self) -> TcbIdentity {
+        self.tcb
+    }
+
+    pub const fn target_cap(&self) -> u64 {
+        self.target_cap
+    }
+
+    pub const fn endpoint_cap(&self) -> u64 {
+        self.endpoint_cap
+    }
+
+    pub const fn endpoint_generation(&self) -> u64 {
+        self.endpoint_generation
+    }
+}
+
 /// Proof from native ownership that this exact TCB can no longer run with its FS anchor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TcbRetirementObservation(TcbIdentity);
@@ -170,6 +220,7 @@ pub enum ExecutorLocalError {
     MissingAnchor,
     StaleAnchor,
     InvalidTcbIdentity,
+    InvalidEndpointIdentity,
     AlreadyBound,
     ExecutorNotIdle,
     ExecutorStillActive,

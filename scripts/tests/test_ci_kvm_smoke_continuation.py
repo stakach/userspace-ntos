@@ -427,6 +427,89 @@ class ContinuationTests(unittest.TestCase):
                     with self.assertRaises(disk.ContinuationError):
                         disk.verify_migration_run(self.run, 101, 2, self.current)
 
+    def test_migration_authenticates_missing_pre_squash_commit_by_remote_tree(self):
+        history = self.root / "history"
+        fresh = self.root / "fresh-checkout"
+        history.mkdir()
+
+        def git(*args, cwd=history):
+            return subprocess.check_output(["git", *args], cwd=cwd, text=True).strip()
+
+        git("init", "-q", "-b", "main")
+        source_file = history / "source.txt"
+        source_file.write_text("base\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "base")
+
+        git("checkout", "-qb", "source")
+        source_file.write_text("installed source\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "pre-squash source")
+        source = git("rev-parse", "HEAD")
+        source_tree = git("rev-parse", f"{source}^{{tree}}")
+
+        git("checkout", "-q", "main")
+        source_file.write_text("installed source\n")
+        git("add", "source.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "squash merge")
+        squash = git("rev-parse", "HEAD")
+        self.assertEqual(source_tree, git("rev-parse", f"{squash}^{{tree}}"))
+        (history / "next.txt").write_text("later target change\n")
+        git("add", "next.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "target")
+        target = git("rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", "--no-local", "--single-branch",
+                        "--branch", "main", str(history), str(fresh)], check=True)
+        self.assertNotEqual(subprocess.run(
+            ["git", "cat-file", "-e", f"{source}^{{commit}}"], cwd=fresh,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode, 0, "the fixture must reproduce a fresh checkout without the source object")
+
+        self.current["head_sha"] = target
+        self.run["head_sha"] = source
+        self.run["head_branch"] = "source"
+
+        def metadata(sha=source, tree=source_tree):
+            return io.BytesIO(json.dumps({
+                "sha": sha, "commit": {"tree": {"sha": tree}},
+            }).encode())
+
+        def exact_lookup(request, timeout):
+            self.assertEqual(request.full_url,
+                             f"https://api.github.com/repos/{self.current['repo']}/commits/{source}")
+            self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
+            return metadata()
+
+        with patch.object(disk, "ROOT", fresh), \
+             patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}):
+            with patch.object(disk.urllib.request, "urlopen", side_effect=exact_lookup) as lookup:
+                disk.verify_migration_run(self.run, 101, 2, self.current)
+                self.assertEqual(lookup.call_count, 1)
+
+            for case, response in (
+                ("wrong response SHA", metadata(sha=target)),
+                ("wrong tree", metadata(tree="0" * 40)),
+                ("missing tree", io.BytesIO(json.dumps({"sha": source}).encode())),
+            ):
+                with self.subTest(case=case), \
+                     patch.object(disk.urllib.request, "urlopen", return_value=response) as lookup, \
+                     self.assertRaises(disk.ContinuationError):
+                    disk.verify_migration_run(self.run, 101, 2, self.current)
+                self.assertEqual(lookup.call_count, 1)
+
+            with patch.object(disk.urllib.request, "urlopen", side_effect=OSError("unavailable")), \
+                 self.assertRaises(disk.ContinuationError):
+                disk.verify_migration_run(self.run, 101, 2, self.current)
+
+            self.run["repository"] = {"full_name": "stakach/another-repo"}
+            with patch.object(disk.urllib.request, "urlopen", return_value=metadata()), \
+                 self.assertRaises(disk.ContinuationError):
+                disk.verify_migration_run(self.run, 101, 2, self.current)
+
     def test_migration_rejects_unrelated_head_release_or_layout(self):
         prior = "1" * 40
         self.run["head_sha"] = prior
