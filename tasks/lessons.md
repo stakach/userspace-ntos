@@ -1024,3 +1024,7 @@ diagnosis-free failure.
   ancestry was lost, use a reviewed zero-content merge commit that retains the source as a
   parent; preserve its parents when merging that PR. Never weaken the migration verifier or
   replace the accepted disk to hide a Git-history mistake.
+
+## Verify emitted CRT memory exports before boot
+- A weak ntdll `memset` or `memcpy` body written with `write_bytes` or `copy_nonoverlapping` can lower to its own intrinsic symbol. One native PE build emitted `jmp` to its own entry for both exports, and SMSS spun while resetting its module table; a prior build from identical source emitted working bodies.
+- Inspect the generated PE entry bytes and the indirect call path, not just the Rust source or export names. Keep the ntdll memory symbols strong and omit the competing `compiler-builtins-mem` definitions in the ntdll build. Use intrinsic-free implementations and a PE verifier gate before staging the source-built DLL.

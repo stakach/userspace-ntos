@@ -11,8 +11,9 @@
 # Toolchain (all bundled with the Rust nightly — no mingw / external linker needed on macOS):
 #   * target : a custom no-CRT spec derived from `x86_64-pc-windows-gnullvm` (mingw import libs +
 #              CRT startup objects stripped; linker = the bundled `rust-lld`, flavor `gnu-lld`).
-#   * -Zbuild-std (core/alloc/panic_abort) with `-Cpanic=immediate-abort` (no_std, no unwinder) and
-#              `compiler-builtins-mem` (supplies memcpy/memcmp/… since we drop msvcrt).
+#   * -Zbuild-std (core/alloc/panic_abort) with `-Cpanic=immediate-abort` (no_std, no unwinder).
+#              ntdll supplies its own strong CRT memory exports so LLVM cannot select a weak
+#              self-recursive body from a competing compiler-builtins-mem definition.
 #   * --no-gc-sections : keep the `.reloc` fixups (gc-sections collects the base-reloc chunks).
 #
 # Requires: a Rust nightly with `rust-src` + the `x86_64-pc-windows-gnullvm` std component:
@@ -38,7 +39,6 @@ if [ -n "${NTDLL_FEATURES:-}" ]; then
 fi
 BUILD_ARGS+=(
   -Z build-std=core,alloc,panic_abort
-  -Z build-std-features=compiler-builtins-mem
   -Z json-target-spec
 )
 
