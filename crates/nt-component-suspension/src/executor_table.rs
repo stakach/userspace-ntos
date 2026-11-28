@@ -592,11 +592,16 @@ impl ExecutorTable {
         if root.table != self.id {
             return Err(ExecutorError::WrongTable);
         }
-        // A retired slot that cannot take a new generation stays retired for good.
+        // A logical terminal does not prove physical endpoint and Reply retirement. Keep an
+        // admitted worker's selector reservation until exact native teardown is modeled.
         let reusable = self
             .slots
             .iter()
-            .position(|slot| slot.state == ExecutorState::Retired && slot.generation < u64::MAX);
+            .position(|slot| {
+                slot.state == ExecutorState::Retired
+                    && slot.private_ingress.is_none()
+                    && slot.generation < u64::MAX
+            });
         let index = match reusable {
             Some(index) => {
                 self.slots[index].generation += 1;
@@ -623,7 +628,7 @@ impl ExecutorTable {
 
     /// Record the exact private ingress resources before a worker becomes runnable.
     /// The native owner retains both physical capabilities; these numeric selectors only
-    /// exclude accidental sharing across the table's live and quarantined workers.
+    /// exclude accidental sharing across live workers and retained retirement tombstones.
     pub fn admit_private_ingress(
         &mut self,
         root: &RunToken,
@@ -648,11 +653,9 @@ impl ExecutorTable {
             return Err(ExecutorError::WorkerProofMismatch);
         }
         if self.slots.iter().any(|slot| {
-            slot.state != ExecutorState::Retired
-                && slot.private_ingress.is_some_and(|owner| {
-                    owner.endpoint_cap == endpoint.endpoint_cap()
-                        || owner.reply_cap == reply.cap()
-                })
+            slot.private_ingress.is_some_and(|owner| {
+                owner.endpoint_cap == endpoint.endpoint_cap() || owner.reply_cap == reply.cap()
+            })
         }) {
             return Err(ExecutorError::DuplicateWorkerIngress);
         }

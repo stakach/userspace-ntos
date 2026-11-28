@@ -575,6 +575,121 @@ fn native_fs_install_acknowledgement_is_the_only_path_to_runnable() {
 }
 
 #[test]
+fn admitted_private_ingress_refuses_other_tcb_or_target_activation() {
+    for mismatch in 0..2 {
+        let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+        let worker = table.register_unready(&root).unwrap();
+        let ingress_tcb = TcbIdentity::new(0x101, 1);
+        let ingress_claim = physical(ingress_tcb, 0x501);
+        let endpoint = unsafe {
+            PhysicalWorkerEndpointClaim::from_native(&ingress_claim, 0x601, 1).unwrap()
+        };
+        let mut replies = RootReplySlotTable::new(1).unwrap();
+        let reply = replies.insert_used(0x701).unwrap();
+        table.admit_private_ingress(&root, worker, &endpoint, &replies, reply).unwrap();
+
+        let published_tcb = if mismatch == 0 {
+            TcbIdentity::new(0x102, 1)
+        } else {
+            ingress_tcb
+        };
+        let published_target = if mismatch == 0 { 0x501 } else { 0x502 };
+        let mut locals = ExecutorLocalRegistry::new();
+        let anchor = locals
+            .bind_native(
+                &table,
+                worker,
+                physical(published_tcb, published_target),
+                boxed_probe(0x1000, 0x201),
+            )
+            .map_err(|(error, _, _)| error)
+            .unwrap();
+        let attempt = locals.begin_fs_install(anchor, &table).unwrap();
+        let fs_ack = unsafe { locals.acknowledge_fs_install(attempt) }.unwrap();
+        let ready = unsafe {
+            PassiveWorkerReadyProof::from_checked_unbind(
+                worker,
+                published_tcb,
+                published_target,
+            )
+        }
+        .unwrap();
+        let (error, returned_fs, returned_ready) = table
+            .activate_unready(&root, fs_ack, ready)
+            .expect_err("admitted private ingress must name the activated physical TCB");
+        assert_eq!(error, ExecutorError::WorkerProofMismatch);
+        assert_eq!(returned_fs.executor(), worker);
+        assert_eq!(returned_fs.tcb(), published_tcb);
+        assert_eq!(returned_fs.target_cap(), published_target);
+        assert_eq!(returned_ready.executor(), worker);
+        assert_eq!(returned_ready.tcb(), published_tcb);
+        assert_eq!(returned_ready.target_cap(), published_target);
+        assert_eq!(table.state(worker), Ok(ExecutorState::Unready));
+        assert!(matches!(
+            table.resume(root, ExecutorResume::Unrouted),
+            Err((ExecutorError::NoIdleExecutor, _))
+        ));
+    }
+}
+
+#[test]
+fn done_keeps_private_endpoint_and_reply_reservations_without_teardown_proof() {
+    let (mut table, root) = ExecutorTable::try_new(2).unwrap();
+    let first = table.register_unready(&root).unwrap();
+    let first_tcb = TcbIdentity::new(0x101, 1);
+    let first_claim = physical(first_tcb, 0x501);
+    let first_endpoint = unsafe {
+        PhysicalWorkerEndpointClaim::from_native(&first_claim, 0x601, 1).unwrap()
+    };
+    let mut first_replies = RootReplySlotTable::new(1).unwrap();
+    let first_reply = first_replies.insert_used(0x701).unwrap();
+    table.admit_private_ingress(
+        &root, first, &first_endpoint, &first_replies, first_reply,
+    ).unwrap();
+    let mut locals = ExecutorLocalRegistry::new();
+    let anchor = locals
+        .bind_native(&table, first, first_claim, boxed_probe(0x1000, 0x201))
+        .map_err(|(error, _, _)| error)
+        .unwrap();
+    let attempt = locals.begin_fs_install(anchor, &table).unwrap();
+    let fs_ack = unsafe { locals.acknowledge_fs_install(attempt) }.unwrap();
+    let ready = unsafe {
+        PassiveWorkerReadyProof::from_checked_unbind(first, first_tcb, 0x501)
+    }.unwrap();
+    table.activate_unready(&root, fs_ack, ready).unwrap();
+    let run = table.resume(root, ExecutorResume::Unrouted).unwrap();
+    let root = table.accept_yield(run, ExecutorYield::Done).unwrap();
+    assert_eq!(table.state(first), Ok(ExecutorState::Retired));
+
+    // Done is a logical terminal, not checked destruction of the endpoint or Reply.
+    let second = table.register_unready(&root).unwrap();
+    assert_ne!(second.index(), first.index());
+    let second_claim = physical(TcbIdentity::new(0x102, 1), 0x502);
+    let reused_endpoint = unsafe {
+        PhysicalWorkerEndpointClaim::from_native(&second_claim, 0x601, 2).unwrap()
+    };
+    let distinct_endpoint = unsafe {
+        PhysicalWorkerEndpointClaim::from_native(&second_claim, 0x602, 1).unwrap()
+    };
+    let mut second_replies = RootReplySlotTable::new(2).unwrap();
+    let distinct_reply = second_replies.insert_used(0x702).unwrap();
+    let reused_reply = second_replies.insert_used(0x701).unwrap();
+    assert_eq!(
+        table.admit_private_ingress(
+            &root, second, &reused_endpoint, &second_replies, distinct_reply,
+        ),
+        Err(ExecutorError::DuplicateWorkerIngress),
+    );
+    assert_eq!(
+        table.admit_private_ingress(
+            &root, second, &distinct_endpoint, &second_replies, reused_reply,
+        ),
+        Err(ExecutorError::DuplicateWorkerIngress),
+    );
+    assert_eq!(table.state(second), Ok(ExecutorState::Unready));
+}
+
+#[test]
 fn fs_ack_alone_cannot_activate_a_worker_before_checked_passive_unbind() {
     let (mut table, root) = ExecutorTable::try_new(1).unwrap();
     let worker = table.register_unready(&root).unwrap();
