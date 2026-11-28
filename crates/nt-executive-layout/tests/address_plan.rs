@@ -38,7 +38,8 @@ fn diagnostic_and_production_executor_slots_have_disjoint_private_pages() {
     let diagnostic = root::executor_worker_slot(0).expect("diagnostic slot");
     let production = root::executor_worker_slot(1).expect("production slot");
     let supervisor = root::EXECUTOR_FAULT_SUPERVISOR;
-    let production_supervisor = root::executor_fault_supervisor_slot(1).expect("production supervisor");
+    let production_supervisor =
+        root::executor_fault_supervisor_slot(1).expect("production supervisor");
     assert_eq!(root::executor_fault_supervisor_slot(0), Some(supervisor));
     assert_eq!(diagnostic.guard.base, root::EXECUTOR_WORKERS.base);
     assert_eq!(diagnostic.guard.len, PAGE);

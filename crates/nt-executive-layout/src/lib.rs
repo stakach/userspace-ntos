@@ -149,7 +149,7 @@ pub mod root {
         match executor_fault_supervisor_slot(0) {
             Some(slot) => slot,
             None => panic!("diagnostic supervisor slot must fit the root address plan"),
-    };
+        };
 
     /// A supervisor occupies the unused half of its worker's 256 KiB address cell.
     pub const fn executor_fault_supervisor_slot(index: usize) -> Option<ExecutorWorkerSlot> {
