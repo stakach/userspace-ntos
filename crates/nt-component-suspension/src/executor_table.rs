@@ -7,8 +7,8 @@
 
 use crate::{
     executor_local::{
-        FsInstallAcknowledgement, PassiveWorkerReadyProof, PhysicalTcbClaim, TcbIdentity,
-        TcbRetirementObservation,
+        FsInstallAcknowledgement, PassiveWorkerReadyProof, PhysicalTcbClaim,
+        PhysicalWorkerEndpointClaim, TcbIdentity, TcbRetirementObservation,
     },
     peer_registry::PeerRoute,
     root_reply_replacement::{
@@ -68,6 +68,8 @@ pub enum ExecutorState {
     /// At loop-top on its own endpoint; may take any unrouted work.
     Idle,
     Running,
+    /// The worker has returned and rearmed, but root still owns its hosted caller's Reply.
+    AwaitingHostedReply,
     /// A checked supervisor terminal returned root's run token. Native resources stay retained.
     Faulted,
     /// A terminal or native effect was uncertain. The outstanding run remains retained.
@@ -128,6 +130,12 @@ pub enum ExecutorError {
     FaultTerminalUncertain,
     /// A fault retirement observation was already accepted.
     FaultAlreadyRetired,
+    /// A bound live job may leave Running only through an exact normal or fault terminal.
+    LiveJobOutstanding,
+    /// The normal terminal did not match the bound job, worker, Reply, or next receive.
+    LiveJobIdentityMismatch,
+    /// The normal native effect or rearm could not be classified.
+    LiveTerminalUncertain,
 }
 
 /// Identities retained before root calls a worker. The native owner keeps the physical claim and
@@ -180,6 +188,7 @@ pub struct ExecutorFaultReport {
     target_cap: u64,
     root_reply: RootReplyIdentity,
     supervisor_reply: RootReplyIdentity,
+    job: Option<LiveJobId>,
     acknowledged: bool,
 }
 
@@ -200,6 +209,30 @@ impl ExecutorFaultReport {
             target_cap,
             root_reply,
             supervisor_reply,
+            None,
+            true,
+        )
+    }
+
+    /// # Safety
+    /// The checked native fault terminal must identify the exact table-issued job nonce as
+    /// well as the physical worker and both private Replies. A delayed earlier report is not
+    /// authority over a later Call on the same worker.
+    pub unsafe fn acknowledged_live(
+        executor: ExecutorHandle,
+        tcb: TcbIdentity,
+        target_cap: u64,
+        root_reply: RootReplyIdentity,
+        supervisor_reply: RootReplyIdentity,
+        job: LiveJobId,
+    ) -> Option<Self> {
+        Self::new(
+            executor,
+            tcb,
+            target_cap,
+            root_reply,
+            supervisor_reply,
+            Some(job),
             true,
         )
     }
@@ -220,6 +253,29 @@ impl ExecutorFaultReport {
             target_cap,
             root_reply,
             supervisor_reply,
+            None,
+            false,
+        )
+    }
+
+    /// # Safety
+    /// The native observer must retain the exact job and every possibly affected resource;
+    /// an indeterminate fault effect cannot be replayed as a later job's terminal.
+    pub unsafe fn uncertain_live(
+        executor: ExecutorHandle,
+        tcb: TcbIdentity,
+        target_cap: u64,
+        root_reply: RootReplyIdentity,
+        supervisor_reply: RootReplyIdentity,
+        job: LiveJobId,
+    ) -> Option<Self> {
+        Self::new(
+            executor,
+            tcb,
+            target_cap,
+            root_reply,
+            supervisor_reply,
+            Some(job),
             false,
         )
     }
@@ -230,6 +286,7 @@ impl ExecutorFaultReport {
         target_cap: u64,
         root_reply: RootReplyIdentity,
         supervisor_reply: RootReplyIdentity,
+        job: Option<LiveJobId>,
         acknowledged: bool,
     ) -> Option<Self> {
         (target_cap != 0 && root_reply != supervisor_reply).then_some(Self {
@@ -238,6 +295,7 @@ impl ExecutorFaultReport {
             target_cap,
             root_reply,
             supervisor_reply,
+            job,
             acknowledged,
         })
     }
@@ -269,6 +327,30 @@ impl FaultReplyRetirementObservation {
 pub enum FaultRetirementObservation {
     Tcb(TcbRetirementObservation),
     Reply(FaultReplyRetirementObservation),
+    HostedReply(LiveHostedReplySettlementObservation),
+}
+
+/// Root's exact observation that a live job's hosted Reply completed and became free.
+/// The old owner-issued identity is retained even though the Reply table advances its generation.
+#[must_use = "record this settlement before reusing the executor slot"]
+#[derive(Debug)]
+pub struct LiveHostedReplySettlementObservation(RootReplyIdentity);
+
+impl LiveHostedReplySettlementObservation {
+    /// # Safety
+    /// Native must have acknowledged completion of the exact hosted Reply. The Reply must no
+    /// longer be the main selector, and the caller must own this table through the transition.
+    /// An attempted or uncertain reply is not completion and must remain retained.
+    pub unsafe fn after_checked_native_completion(
+        owner: &mut RootReplySlotTable,
+        identity: RootReplyIdentity,
+    ) -> Result<Self, RootReplyReplacementError> {
+        if owner.state(identity)? != RootReplySlotState::Used {
+            return Err(RootReplyReplacementError::NotUsed);
+        }
+        owner.mark_free(identity, None)?;
+        Ok(Self(identity))
+    }
 }
 
 struct FaultRecord {
@@ -316,10 +398,120 @@ impl ExecutorRun {
     }
 }
 
+/// Table-issued identity for one native worker Call. Its sequence never wraps or repeats.
+/// This is a selector for checking a terminal; root retains the physical claims and Replies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveJobId {
+    table: u64,
+    sequence: u64,
+}
+
+impl LiveJobId {
+    pub const fn nonce(self) -> u64 {
+        self.sequence
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkerEndpointIdentity {
+    tcb: TcbIdentity,
+    target_cap: u64,
+    endpoint_cap: u64,
+    endpoint_generation: u64,
+}
+
+impl WorkerEndpointIdentity {
+    fn from_claim(claim: &PhysicalWorkerEndpointClaim) -> Self {
+        Self {
+            tcb: claim.tcb(),
+            target_cap: claim.target_cap(),
+            endpoint_cap: claim.endpoint_cap(),
+            endpoint_generation: claim.endpoint_generation(),
+        }
+    }
+}
+
+struct LiveJobRecord {
+    id: LiveJobId,
+    hosted_reply: RootReplyIdentity,
+    endpoint: WorkerEndpointIdentity,
+    hosted_reply_settled: bool,
+}
+
+/// One-use native proof that the exact worker is blocked at its next private receive with
+/// the same Reply offered. The owner must query the physical TCB, Reply, and endpoint together.
+#[must_use = "settle this proof with the exact live job terminal"]
+#[derive(Debug)]
+pub struct ExactPassiveReceiveProof {
+    executor: ExecutorHandle,
+    endpoint: WorkerEndpointIdentity,
+    reply: RootReplyIdentity,
+}
+
+impl ExactPassiveReceiveProof {
+    /// # Safety
+    /// A checked, non-mutating native query must have confirmed that this exact physical TCB
+    /// is blocked on `endpoint` with `reply` offered. The owner must retain all three objects.
+    pub unsafe fn after_checked_query(
+        executor: ExecutorHandle,
+        endpoint: &PhysicalWorkerEndpointClaim,
+        reply: RootReplyIdentity,
+    ) -> Option<Self> {
+        (reply.cap() != 0).then_some(Self {
+            executor,
+            endpoint: WorkerEndpointIdentity::from_claim(endpoint),
+            reply,
+        })
+    }
+}
+
+/// The checked result of one private worker Call, or an uncertain native result. Neither form
+/// owns the hosted Reply: root retains it until it answers or deliberately quarantines it.
+#[must_use = "settle this terminal against the exact bound live job"]
+#[derive(Debug)]
+pub struct LiveNormalTerminal {
+    job: LiveJobId,
+    result: Option<u32>,
+    private_reply: RootReplyIdentity,
+    rearm: Option<ExactPassiveReceiveProof>,
+}
+
+impl LiveNormalTerminal {
+    /// # Safety
+    /// Root must have received the complete checked result on `private_reply`, and the supplied
+    /// rearm proof must come from a checked query after that same atomic ReplyRecv.
+    pub unsafe fn acknowledged(
+        job: LiveJobId,
+        result: u32,
+        private_reply: RootReplyIdentity,
+        rearm: ExactPassiveReceiveProof,
+    ) -> Option<Self> {
+        (private_reply.cap() != 0).then_some(Self {
+            job,
+            result: Some(result),
+            private_reply,
+            rearm: Some(rearm),
+        })
+    }
+
+    /// # Safety
+    /// Native effects or ReplyRecv state must be indeterminate. The caller must retain the
+    /// original job, hosted Reply, worker, and private Replies without replay or reuse.
+    pub unsafe fn uncertain(job: LiveJobId, private_reply: RootReplyIdentity) -> Option<Self> {
+        (private_reply.cap() != 0).then_some(Self {
+            job,
+            result: None,
+            private_reply,
+            rearm: None,
+        })
+    }
+}
+
 struct Slot {
     generation: u64,
     state: ExecutorState,
     fault: Option<FaultRecord>,
+    live: Option<LiveJobRecord>,
 }
 
 /// Owns executor identity and the single derived route-to-waiter view.
@@ -327,6 +519,7 @@ pub struct ExecutorTable {
     id: u64,
     capacity: usize,
     slots: Vec<Slot>,
+    next_job_sequence: u64,
 }
 
 impl ExecutorTable {
@@ -357,6 +550,7 @@ impl ExecutorTable {
                 id,
                 capacity,
                 slots,
+                next_job_sequence: 1,
             },
             RunToken { table: id },
         ))
@@ -397,6 +591,7 @@ impl ExecutorTable {
                 self.slots[index].generation += 1;
                 self.slots[index].state = initial;
                 self.slots[index].fault = None;
+                self.slots[index].live = None;
                 index
             }
             None if self.slots.len() < self.capacity => {
@@ -404,6 +599,7 @@ impl ExecutorTable {
                     generation: 1,
                     state: initial,
                     fault: None,
+                    live: None,
                 });
                 self.slots.len() - 1
             }
@@ -477,6 +673,12 @@ impl ExecutorTable {
             return Err(ExecutorError::StaleGeneration);
         }
         Ok(slot.state)
+    }
+
+    /// The exact job still retained by this executor, including after a fault or quarantine.
+    pub fn live_job(&self, executor: ExecutorHandle) -> Result<Option<LiveJobId>, ExecutorError> {
+        self.state(executor)?;
+        Ok(self.slots[executor.index as usize].live.as_ref().map(|job| job.id))
     }
 
     pub fn running(&self) -> Option<ExecutorHandle> {
@@ -560,6 +762,9 @@ impl ExecutorTable {
         if self.state(run.executor) != Ok(ExecutorState::Running) {
             return Err((ExecutorError::FaultBindingState, run));
         }
+        if self.slots[run.executor.index as usize].live.is_some() {
+            return Err((ExecutorError::LiveJobOutstanding, run));
+        }
         let state = match yielded {
             ExecutorYield::Idle => ExecutorState::Idle,
             ExecutorYield::Done => ExecutorState::Retired,
@@ -600,6 +805,126 @@ impl ExecutorTable {
         Ok(())
     }
 
+    /// Retain the hosted Reply and exact worker endpoint before native Call. The unique job
+    /// identity may be sent to the worker only after this record and its fault binding exist.
+    /// The native route must retain the physical hosted Reply capability and its owner table
+    /// entry, the endpoint claim, and both private Replies until exact settlement or teardown.
+    /// These copied owner-issued identities are selectors; the model cannot own native caps.
+    pub fn bind_live_job(
+        &mut self,
+        run: &ExecutorRun,
+        hosted_owner: &RootReplySlotTable,
+        hosted_reply: RootReplyIdentity,
+        endpoint: &PhysicalWorkerEndpointClaim,
+    ) -> Result<LiveJobId, ExecutorError> {
+        if run.token.table != self.id {
+            return Err(ExecutorError::WrongTable);
+        }
+        if self.state(run.executor) != Ok(ExecutorState::Running) {
+            return Err(ExecutorError::FaultBindingState);
+        }
+        let slot = &self.slots[run.executor.index as usize];
+        if slot.live.is_some() {
+            return Err(ExecutorError::LiveJobOutstanding);
+        }
+        let fault = slot.fault.as_ref().ok_or(ExecutorError::FaultBindingState)?;
+        let endpoint_identity = WorkerEndpointIdentity::from_claim(endpoint);
+        if endpoint_identity.tcb != fault.binding.tcb
+            || endpoint_identity.target_cap != fault.binding.target_cap
+            || hosted_reply == fault.binding.root_reply
+            || hosted_reply == fault.binding.supervisor_reply
+            || hosted_owner.state(hosted_reply) != Ok(RootReplySlotState::Used)
+        {
+            return Err(ExecutorError::LiveJobIdentityMismatch);
+        }
+        let next = self
+            .next_job_sequence
+            .checked_add(1)
+            .ok_or(ExecutorError::IdentityExhausted)?;
+        let id = LiveJobId {
+            table: self.id,
+            sequence: self.next_job_sequence,
+        };
+        self.next_job_sequence = next;
+        self.slots[run.executor.index as usize].live = Some(LiveJobRecord {
+            id,
+            hosted_reply,
+            endpoint: endpoint_identity,
+            hosted_reply_settled: false,
+        });
+        Ok(id)
+    }
+
+    /// Accept a normal worker result only after its exact private Reply and next receive are
+    /// checked. The native route must keep the hosted Reply capability and its owner entry after
+    /// this terminal; a mismatch or uncertain effect quarantines the run and retains every owner.
+    pub fn accept_live_terminal(
+        &mut self,
+        run: ExecutorRun,
+        terminal: LiveNormalTerminal,
+    ) -> Result<(RunToken, u32), (ExecutorError, ExecutorRun, LiveNormalTerminal)> {
+        if run.token.table != self.id {
+            return Err((ExecutorError::WrongTable, run, terminal));
+        }
+        if self.state(run.executor) != Ok(ExecutorState::Running) {
+            return Err((ExecutorError::FaultBindingState, run, terminal));
+        }
+        let slot = &mut self.slots[run.executor.index as usize];
+        let exact = slot
+            .live
+            .as_ref()
+            .zip(slot.fault.as_ref())
+            .zip(terminal.rearm.as_ref())
+            .is_some_and(|((job, fault), proof)| {
+                terminal.job == job.id
+                    && terminal.private_reply == fault.binding.root_reply
+                    && proof.reply == fault.binding.root_reply
+                    && proof.executor == run.executor
+                    && proof.endpoint == job.endpoint
+            });
+        if !exact || terminal.result.is_none() {
+            slot.state = ExecutorState::Quarantined;
+            let error = if terminal.result.is_none() || terminal.rearm.is_none() {
+                ExecutorError::LiveTerminalUncertain
+            } else {
+                ExecutorError::LiveJobIdentityMismatch
+            };
+            return Err((error, run, terminal));
+        }
+        let result = terminal.result.expect("checked terminal contains a result");
+        slot.state = ExecutorState::AwaitingHostedReply;
+        slot.fault = None;
+        Ok((run.token, result))
+    }
+
+    /// A checked normal worker terminal cannot free the hosted Reply. Only the Reply owner may
+    /// complete it and issue this exact settlement; until then the worker cannot take new work.
+    pub fn observe_live_hosted_reply_settlement(
+        &mut self,
+        root: &RunToken,
+        executor: ExecutorHandle,
+        job: LiveJobId,
+        observation: LiveHostedReplySettlementObservation,
+    ) -> Result<(), (ExecutorError, LiveHostedReplySettlementObservation)> {
+        if root.table != self.id {
+            return Err((ExecutorError::WrongTable, observation));
+        }
+        if self.state(executor) != Ok(ExecutorState::AwaitingHostedReply) {
+            return Err((ExecutorError::FaultBindingState, observation));
+        }
+        let slot = &mut self.slots[executor.index as usize];
+        if !slot
+            .live
+            .as_ref()
+            .is_some_and(|live| live.id == job && live.hosted_reply == observation.0)
+        {
+            return Err((ExecutorError::LiveJobIdentityMismatch, observation));
+        }
+        slot.live = None;
+        slot.state = ExecutorState::Idle;
+        Ok(())
+    }
+
     /// A checked supervisor terminal returns the unique run token. Any wrong or uncertain
     /// terminal quarantines the worker and leaves the run with its native owner for reconciliation.
     pub fn accept_fault_terminal(
@@ -617,7 +942,8 @@ impl ExecutorTable {
         let exact = slot
             .fault
             .as_ref()
-            .is_some_and(|fault| fault.binding.matches_report(&report));
+            .is_some_and(|fault| fault.binding.matches_report(&report))
+            && slot.live.as_ref().map(|live| live.id) == report.job;
         if !exact || !report.acknowledged {
             slot.state = ExecutorState::Quarantined;
             let error = if exact {
@@ -632,7 +958,8 @@ impl ExecutorTable {
     }
 
     /// Record one checked native retirement. The faulted slot becomes reusable only after the
-    /// exact worker TCB and both owner-issued Replies (including aliases) have been retired.
+    /// exact worker TCB and both private Replies have been retired. A bound live job also needs
+    /// the exact hosted caller's Reply settlement before its slot becomes reusable.
     pub fn observe_fault_retirement(
         &mut self,
         root: &RunToken,
@@ -661,15 +988,27 @@ impl ExecutorTable {
             {
                 &mut fault.supervisor_reply_retired
             }
+            FaultRetirementObservation::HostedReply(retired) => {
+                let Some(live) = slot.live.as_mut() else {
+                    return Err((ExecutorError::FaultIdentityMismatch, observation));
+                };
+                if retired.0 != live.hosted_reply {
+                    return Err((ExecutorError::FaultIdentityMismatch, observation));
+                }
+                &mut live.hosted_reply_settled
+            }
             _ => return Err((ExecutorError::FaultIdentityMismatch, observation)),
         };
         if *settled {
             return Err((ExecutorError::FaultAlreadyRetired, observation));
         }
         *settled = true;
-        if fault.tcb_retired && fault.root_reply_retired && fault.supervisor_reply_retired {
+        if fault.tcb_retired && fault.root_reply_retired && fault.supervisor_reply_retired
+            && slot.live.as_ref().is_none_or(|live| live.hosted_reply_settled)
+        {
             slot.state = ExecutorState::Retired;
             slot.fault = None;
+            slot.live = None;
         }
         Ok(())
     }

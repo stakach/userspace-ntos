@@ -163,11 +163,13 @@ mod resume_wake;
 pub use resume_wake::{ResumeDemand, ResumeWake, ResumeWakeError, ResumeWakePass};
 mod executor_table;
 pub use executor_table::{
-    ExecutorError, ExecutorFaultBinding, ExecutorFaultReport, ExecutorHandle, ExecutorResume,
-    ExecutorRun, ExecutorState, ExecutorTable, ExecutorWait, ExecutorYield,
-    FaultReplyRetirementObservation, FaultRetirementObservation, RunToken,
+    ExactPassiveReceiveProof, ExecutorError, ExecutorFaultBinding, ExecutorFaultReport,
+    ExecutorHandle, ExecutorResume, ExecutorRun, ExecutorState, ExecutorTable, ExecutorWait,
+    ExecutorYield, FaultReplyRetirementObservation, FaultRetirementObservation,
+    LiveHostedReplySettlementObservation, LiveJobId, LiveNormalTerminal, RunToken,
 };
 pub mod executor_local;
+pub use executor_local::PhysicalWorkerEndpointClaim;
 #[cfg(test)]
 mod executor_local_tests;
 pub use terminal::{
