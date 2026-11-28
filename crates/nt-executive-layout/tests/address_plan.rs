@@ -31,6 +31,43 @@ fn no_two_root_bands_overlap() {
     assert_disjoint("root", root::REGIONS);
 }
 
+/// A faulted diagnostic executor stays mapped while the production executor is admitted.
+/// Their guarded stacks and private IPC pages must therefore occupy different root addresses.
+#[test]
+fn diagnostic_and_production_executor_slots_have_disjoint_private_pages() {
+    let diagnostic = root::executor_worker_slot(0).expect("diagnostic slot");
+    let production = root::executor_worker_slot(1).expect("production slot");
+    let supervisor = root::EXECUTOR_FAULT_SUPERVISOR;
+    let production_supervisor = root::executor_fault_supervisor_slot(1).expect("production supervisor");
+    assert_eq!(root::executor_fault_supervisor_slot(0), Some(supervisor));
+    assert_eq!(diagnostic.guard.base, root::EXECUTOR_WORKERS.base);
+    assert_eq!(diagnostic.guard.len, PAGE);
+    assert_eq!(diagnostic.stack.base, diagnostic.guard.end());
+    assert_eq!(diagnostic.stack.len, 8 * PAGE);
+    assert_eq!(diagnostic.ipc.len, PAGE);
+    assert_eq!(
+        first_overlap(&[
+            diagnostic.guard,
+            diagnostic.stack,
+            diagnostic.ipc,
+            production.guard,
+            production.stack,
+            production.ipc,
+            supervisor.guard,
+            supervisor.stack,
+            supervisor.ipc,
+            production_supervisor.guard,
+            production_supervisor.stack,
+            production_supervisor.ipc,
+        ]),
+        None,
+    );
+    assert!(production.ipc.end() <= root::EXECUTOR_WORKERS.end());
+    assert!(supervisor.ipc.end() <= root::EXECUTOR_WORKERS.end());
+    assert!(production_supervisor.ipc.end() <= root::EXECUTOR_WORKERS.end());
+    assert!(root::executor_worker_slot(usize::MAX).is_none());
+}
+
 #[test]
 fn no_two_component_bands_overlap() {
     assert_disjoint("component", component::REGIONS);
