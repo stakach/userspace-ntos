@@ -21,8 +21,8 @@
 
 #![no_std]
 #![allow(internal_features)]
-// `memcpy`/`memset` are exported weak (compiler-builtins-mem also emits them) — needs `linkage`.
-#![feature(linkage)]
+// Strong intrinsic-free CRT exports are provided by this DLL; the build omits
+// `compiler-builtins-mem` so no competing symbol can be chosen at link time.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
@@ -1738,11 +1738,9 @@ pub unsafe extern "system" fn DllMain(
 }
 
 // ---------------------------------------------------------------------------------------------
-// C-runtime intrinsics normally supplied by mingw's msvcrt. We drop the mingw import libs (no CRT),
-// so `compiler_builtins` provides `mem*` (via the `compiler-builtins-mem` build-std feature), and we
-// supply the `fma`/`fmaf` fused-multiply-add symbols that `libm`'s float traits reference. They are
-// NOT on any live ntdll path here (Step 4.0 exports are trap stubs + a placeholder LdrpInitialize);
-// these are honest fallbacks so the DLL links, computing the un-fused result.
+// C-runtime intrinsics normally supplied by mingw's msvcrt. We drop the mingw import libs
+// (no CRT), provide strong memory exports above, and supply the `fma`/`fmaf` symbols referenced
+// by `libm`'s float traits. The math fallbacks compute the unfused result.
 /// `fma` — fused multiply-add fallback (unfused). Linker-required; not on a live path at Step 4.0.
 ///
 /// # Safety

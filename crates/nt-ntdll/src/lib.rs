@@ -58,6 +58,7 @@ pub use nt_syscall_abi as abi;
 
 pub mod alpc;
 pub mod crt;
+pub mod crt_memory;
 pub mod crypto;
 pub mod csr;
 pub mod dbg;

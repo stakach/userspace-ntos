@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use nt_pe_loader::PeFile;
 use nt_syscall_abi::{NT_SYSCALLS, ZW_ALIASES};
 
+mod crt_entry;
 mod export_compare;
 mod native_stub;
 mod wine_spec;
@@ -158,6 +159,17 @@ fn main() -> ExitCode {
     };
     let names: std::collections::BTreeSet<&str> = exports.iter().map(|e| e.name.as_str()).collect();
     println!("       total exports: {}", exports.len());
+
+    // Check the emitted PE, not the Rust source: LLVM may lower a weak exported CRT body back
+    // into its own intrinsic symbol. A self-branch here spins before SMSS can finish startup.
+    for name in ["memcpy", "memset", "memmove", "RtlCopyMemory"] {
+        let entry = exports.iter().find(|entry| entry.name == name);
+        let body = entry.and_then(|entry| pe.bytes_at_rva(entry.rva, 5));
+        check(
+            body.is_some_and(|bytes| !crt_entry::directly_recurses(bytes)),
+            &format!("export {name} has a readable PE entry without a direct self-branch"),
+        );
+    }
 
     // LdrpInitialize present + report its RVA (Step 4.B points the trampoline here).
     let ldr = exports.iter().find(|e| e.name == "LdrpInitialize");
