@@ -44,6 +44,10 @@ fn main_runtime_rejects_missing_or_replaced_alias_before_publishing_mechanism() 
         _ => None,
     }).unwrap();
     let method = implementation.items.iter().find_map(|item| match item {
+        syn::ImplItem::Fn(method) if method.sig.ident == "preflight_main" => Some(method),
+        _ => None,
+    }).unwrap();
+    let registration = implementation.items.iter().find_map(|item| match item {
         syn::ImplItem::Fn(method) if method.sig.ident == "register_main" => Some(method),
         _ => None,
     }).unwrap();
@@ -81,13 +85,16 @@ fn main_runtime_rejects_missing_or_replaced_alias_before_publishing_mechanism() 
             if let Some((_, branch)) = &expression.else_branch { self.visit_expr(branch); }
         }
         fn visit_expr_return(&mut self, expression: &'ast syn::ExprReturn) {
-            if self.guarded && expression.expr.as_ref().is_some_and(|value| named(value, "None")) {
+            if self.guarded && expression.expr.as_ref().is_some_and(|value|
+                matches!(&**value, Expr::Call(call) if named(&call.func, "Err"))) {
                 self.events.push("reject-alias");
                 self.rejecting = true;
             }
         }
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-            if call.method == "store" { self.events.push("store"); }
+            if call.method == "admit_binding" { self.events.push("admit-binding"); }
+            if call.method == "preflight_main" { self.events.push("preflight-main"); }
+            if call.method == "try_store" { self.events.push("try-store"); }
             syn::visit::visit_expr_method_call(self, call);
         }
         fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
@@ -102,12 +109,20 @@ fn main_runtime_rejects_missing_or_replaced_alias_before_publishing_mechanism() 
     }
     let mut publication = Publication { events: Vec::new(), guarded: false, rejecting: false, zero: false, replacement: false };
     publication.visit_block(&method.block);
-    let position = |name| publication.events.iter().position(|event| *event == name).unwrap();
     assert!(publication.rejecting);
     assert!(publication.zero && publication.replacement,
-        "registration must reject zero aliases and replacement of an existing alias");
-    assert!(position("reject-alias") < position("store"), "alias refusal precedes runtime publication");
-    assert!(position("store") < position("publish-alias"));
-    assert!(position("store") < position("publish-mechanism"));
+        "preflight must reject zero aliases and replacement of an existing alias");
+    {
+        let position = |name| publication.events.iter().position(|event| *event == name).unwrap();
+        assert!(position("reject-alias") < position("admit-binding"),
+            "missing or replaced aliases must be rejected before runtime admission");
+    }
+    publication.events.clear();
+    publication.visit_block(&registration.block);
+    let position = |name| publication.events.iter().position(|event| *event == name).unwrap();
+    assert!(position("preflight-main") < position("try-store"),
+        "registration must run exact alias preflight before a runtime row can publish");
+    assert!(position("try-store") < position("publish-alias"));
+    assert!(position("try-store") < position("publish-mechanism"));
 }
 
