@@ -48,6 +48,10 @@ impl PhysicalTcbClaim {
     pub const fn identity(&self) -> TcbIdentity {
         self.tcb
     }
+
+    pub const fn target_cap(&self) -> u64 {
+        self.target_cap
+    }
 }
 
 /// Proof from native ownership that this exact TCB can no longer run with its FS anchor.
@@ -60,6 +64,10 @@ impl TcbRetirementObservation {
     /// no remaining path to execute it. Attempted or uncertain native teardown is insufficient.
     pub const unsafe fn new(tcb: TcbIdentity) -> Self {
         Self(tcb)
+    }
+
+    pub const fn identity(self) -> TcbIdentity {
+        self.0
     }
 }
 

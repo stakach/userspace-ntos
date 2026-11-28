@@ -540,8 +540,9 @@ impl RootReplySlotTable {
         }
     }
 
-    /// Remove a cap transferred to another authoritative pool. Neither a current main Reply
-    /// nor a reserved cap may be cleared; the old identity then becomes permanently stale.
+    /// Remove an exact cap after its native destruction or transfer to another authoritative
+    /// pool. Neither a current main Reply nor a reserved cap may be cleared; the old identity
+    /// then becomes permanently stale. The native owner must settle the effect before calling.
     pub fn clear(
         &mut self,
         identity: RootReplyIdentity,
