@@ -60,6 +60,19 @@ pub enum PlacementError {
     SequenceExhausted,
 }
 
+/// Translate a placement refusal into the NT status used by native callers.
+pub fn placement_error_status(error: PlacementError) -> u32 {
+    match error {
+        PlacementError::Busy | PlacementError::Uncertain => nt_process::STATUS_DEVICE_BUSY,
+        _ => nt_process::STATUS_INVALID_HANDLE,
+    }
+}
+
+/// `NtGetCurrentProcessorNumber` returns the core in the result register, not a success status.
+pub fn processor_query_result(result: Result<u8, PlacementError>) -> u32 {
+    result.map_or_else(placement_error_status, u32::from)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Known(u8),
@@ -317,5 +330,36 @@ mod tests {
             Err(PlacementError::InvalidCore)
         );
         assert_eq!(placement.current_core(owner), Ok(0));
+    }
+
+    #[test]
+    fn processor_number_query_returns_the_published_core_as_its_result() {
+        // NtGetCurrentProcessorNumber returns a processor number in the syscall result field,
+        // unlike services whose result field is an NTSTATUS success code.
+        assert_eq!(processor_query_result(Ok(0)), 0);
+        assert_eq!(processor_query_result(Ok(63)), 63);
+    }
+
+    #[test]
+    fn processor_number_query_preserves_busy_and_identity_refusals() {
+        for error in [PlacementError::Busy, PlacementError::Uncertain] {
+            assert_eq!(
+                processor_query_result(Err(error)),
+                nt_process::STATUS_DEVICE_BUSY,
+            );
+        }
+        for error in [
+            PlacementError::InvalidIdentity,
+            PlacementError::WrongIdentity,
+            PlacementError::InvalidCore,
+            PlacementError::SameCore,
+            PlacementError::StaleAttempt,
+            PlacementError::SequenceExhausted,
+        ] {
+            assert_eq!(
+                processor_query_result(Err(error)),
+                nt_process::STATUS_INVALID_HANDLE,
+            );
+        }
     }
 }
