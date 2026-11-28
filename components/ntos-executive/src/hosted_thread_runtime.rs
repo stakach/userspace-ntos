@@ -158,6 +158,48 @@ pub(crate) struct HostedThreadRuntimeTable {
     pub(crate) store_failures: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MainRuntimeRefusal {
+    InvalidIdentity,
+    Conflict,
+    Busy,
+    InsufficientResources,
+    PostTransfer(u32),
+}
+
+impl MainRuntimeRefusal {
+    pub(crate) fn status(self) -> u32 {
+        match self {
+            Self::InvalidIdentity | Self::Conflict => nt_process::STATUS_INVALID_PARAMETER,
+            Self::Busy => nt_process::STATUS_DEVICE_BUSY,
+            Self::InsufficientResources => nt_process::STATUS_INSUFFICIENT_RESOURCES,
+            Self::PostTransfer(status) => status,
+        }
+    }
+
+    pub(crate) fn is_permanent(self) -> bool {
+        matches!(self, Self::InvalidIdentity | Self::Conflict)
+    }
+}
+
+enum RuntimeStoreError {
+    Binding(nt_user_host::thread_binding::ThreadBindingError),
+    Conflict,
+    InsufficientResources,
+}
+
+impl From<RuntimeStoreError> for MainRuntimeRefusal {
+    fn from(error: RuntimeStoreError) -> Self {
+        match error {
+            RuntimeStoreError::Binding(
+                nt_user_host::thread_binding::ThreadBindingError::InvalidIdentity,
+            ) => Self::InvalidIdentity,
+            RuntimeStoreError::Binding(_) | RuntimeStoreError::Conflict => Self::Conflict,
+            RuntimeStoreError::InsufficientResources => Self::InsufficientResources,
+        }
+    }
+}
+
 impl HostedThreadRuntimeTable {
     fn placement_topology() -> Option<u8> {
         let count = u8::try_from(SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed)).ok()?;
@@ -200,6 +242,93 @@ impl HostedThreadRuntimeTable {
         self.store(pi, process, tid, tcb, badge, role, None)
     }
 
+    pub(crate) fn preflight_main(
+        &mut self,
+        pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
+        tid: u64,
+        tcb: u64,
+        badge: u64,
+        mechanism: HostedThreadMechanismCaps,
+        teb_alias: u64,
+        prepared_placement: &Option<nt_user_host::thread_physical_placement::PlacementReadOwner>,
+    ) -> Result<(), MainRuntimeRefusal> {
+        use nt_user_host::thread_binding::{ThreadBinding, ThreadBindingAdmission};
+        if tcb <= 1 || mechanism.sched_context <= 1 || !mechanism.is_live()
+            || !process.is_valid() || tid == 0 || teb_alias == 0 || teb_alias & 0xfff != 0
+        {
+            return Err(MainRuntimeRefusal::InvalidIdentity);
+        }
+        if Self::placement_topology().is_none() {
+            return Err(MainRuntimeRefusal::Busy);
+        }
+        if self.get_by_tid(tid).is_some_and(|entry| {
+            entry.teb_alias != 0 && entry.teb_alias != teb_alias
+        }) {
+            return Err(MainRuntimeRefusal::Conflict);
+        }
+        let previous = self.get_by_tid(tid)
+            .map(|entry| entry.mechanism)
+            .unwrap_or(HostedThreadMechanismCaps::empty());
+        if previous.is_live() || !nt_user_host::thread_binding::admits_mechanism_publication(
+            [previous.raw_cnode, previous.cnode, previous.sched_context],
+            [mechanism.raw_cnode, mechanism.cnode, mechanism.sched_context],
+        ) {
+            return Err(MainRuntimeRefusal::Conflict);
+        }
+        let identity = nt_user_host::thread_physical_placement::PlacementIdentity {
+            process, tid, tcb, sched_context: mechanism.sched_context,
+        };
+        let existing = self.entries.iter().filter_map(RuntimeSlot::owner)
+            .filter(|entry| entry.tid == tid)
+            .find_map(|entry| entry.physical_placement.as_ref());
+        if existing.is_some() {
+            return Err(MainRuntimeRefusal::Conflict);
+        }
+        let Some(placement) = prepared_placement.as_ref() else {
+            return Err(MainRuntimeRefusal::InvalidIdentity);
+        };
+        if !placement.may_retire() {
+            return Err(MainRuntimeRefusal::Busy);
+        }
+        if placement.current_core(identity) != Ok(thread_sched_context::GUEST_SCHED_CONTROL_CORE) {
+            return Err(MainRuntimeRefusal::InvalidIdentity);
+        }
+        let admission = self.admit_binding(ThreadBinding {
+            pi, process, tid, tcb, badge, role: HostedThreadRole::Main, reservations: None,
+        }).map_err(|error| MainRuntimeRefusal::from(RuntimeStoreError::Binding(error)))?;
+        match admission {
+            ThreadBindingAdmission::Replay { index } => {
+                if !self.entries[index].owner().is_some_and(|entry|
+                    entry.construction_is_empty()) {
+                    return Err(MainRuntimeRefusal::Conflict);
+                }
+            }
+            ThreadBindingAdmission::Promote { index } => {
+                let Some(entry) = self.entries[index].owner() else {
+                    return Err(MainRuntimeRefusal::Conflict);
+                };
+                if !entry.construction_is_empty()
+                    || entry.runtime.mechanism.is_live()
+                    || entry.runtime.resources.is_live()
+                    || entry.runtime.teb_alias != 0
+                {
+                    return Err(MainRuntimeRefusal::Conflict);
+                }
+            }
+            ThreadBindingAdmission::Insert => {
+                if !self.entries.iter().any(RuntimeSlot::is_empty)
+                    && self.entries.len() == self.entries.capacity()
+                    && self.entries.try_reserve(1).is_err()
+                {
+                    self.allocation_failures = self.allocation_failures.saturating_add(1);
+                    return Err(MainRuntimeRefusal::InsufficientResources);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn register_main(
         &mut self,
         pi: usize,
@@ -210,60 +339,24 @@ impl HostedThreadRuntimeTable {
         mechanism: HostedThreadMechanismCaps,
         teb_alias: u64,
         prepared_placement: &mut Option<nt_user_host::thread_physical_placement::PlacementReadOwner>,
-    ) -> Option<HostedThreadRuntime> {
-        if tcb <= 1 || mechanism.sched_context <= 1 || !mechanism.is_live()
-            || !process.is_valid() || tid == 0 || Self::placement_topology().is_none()
-            || teb_alias == 0 || teb_alias & 0xfff != 0 {
-            return None;
-        }
-        if self.get_by_tid(tid).is_some_and(|entry| {
-            entry.teb_alias != 0 && entry.teb_alias != teb_alias
-        }) {
-            return None;
-        }
-        let previous = self
-            .get_by_tid(tid)
-            .map(|entry| entry.mechanism)
-            .unwrap_or(HostedThreadMechanismCaps::empty());
-        if !nt_user_host::thread_binding::admits_mechanism_publication(
-            [previous.raw_cnode, previous.cnode, previous.sched_context],
-            [
-                mechanism.raw_cnode,
-                mechanism.cnode,
-                mechanism.sched_context,
-            ],
-        ) {
-            return None;
-        }
-        // The constructor reserved this anchor before native effects and initialized it after
-        // SC attach. Publication only transfers ownership; it never allocates here.
-        let identity = nt_user_host::thread_physical_placement::PlacementIdentity {
-            process, tid, tcb, sched_context: mechanism.sched_context,
-        };
-        let existing = self.entries.iter().filter_map(RuntimeSlot::owner)
-            .filter(|entry| entry.tid == tid)
-            .find_map(|entry| entry.physical_placement.as_ref());
-        if existing.is_some_and(|owner| !owner.may_retire() || owner.current_core(identity).is_err()) {
-            return None;
-        }
-        if existing.is_none() && !prepared_placement.as_ref().is_some_and(|placement| {
-            placement.may_retire()
-                && placement.current_core(identity) == Ok(thread_sched_context::GUEST_SCHED_CONTROL_CORE)
-        }) {
-            return None;
-        }
-        let runtime = self.store(pi, process, tid, tcb, badge, HostedThreadRole::Main, None)?;
+    ) -> Result<HostedThreadRuntime, MainRuntimeRefusal> {
+        self.preflight_main(
+            pi, process, tid, tcb, badge, mechanism, teb_alias, prepared_placement,
+        )?;
+        let runtime = self.try_store(
+            pi, process, tid, tcb, badge, HostedThreadRole::Main, None,
+        ).map_err(MainRuntimeRefusal::from)?;
         let entry = self
             .entries
             .iter_mut()
             .filter_map(RuntimeSlot::ordinary_mut)
-            .find(|entry| entry.is_live() && entry.tid == tid)?;
+            .find(|entry| entry.is_live() && entry.tid == tid)
+            .expect("stored exact main runtime remains addressable until ownership transfer");
         entry.runtime.mechanism = mechanism;
         entry.runtime.teb_alias = teb_alias;
-        if entry.physical_placement.is_none() {
-            entry.physical_placement = prepared_placement.take();
-        }
-        Some(HostedThreadRuntime {
+        assert!(entry.physical_placement.is_none(), "new main runtime has no prior placement owner");
+        entry.physical_placement = prepared_placement.take();
+        Ok(HostedThreadRuntime {
             mechanism,
             teb_alias,
             ..runtime
@@ -637,10 +730,36 @@ impl HostedThreadRuntimeTable {
         role: HostedThreadRole,
         reservations: Option<nt_user_host::thread_binding::ThreadRuntimeReservations>,
     ) -> Option<HostedThreadRuntime> {
+        self.try_store(pi, process, tid, tcb, badge, role, reservations).ok()
+    }
+
+    fn admit_binding(
+        &self,
+        binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+    ) -> Result<nt_user_host::thread_binding::ThreadBindingAdmission,
+        nt_user_host::thread_binding::ThreadBindingError>
+    {
+        nt_user_host::thread_binding::admit_thread_binding(
+            binding,
+            self.entries.iter().enumerate()
+                .filter_map(|(index, slot)| slot.owner().map(|entry| (index, entry.binding()))),
+        )
+    }
+
+    fn try_store(
+        &mut self,
+        pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
+        tid: u64,
+        tcb: u64,
+        badge: u64,
+        role: HostedThreadRole,
+        reservations: Option<nt_user_host::thread_binding::ThreadRuntimeReservations>,
+    ) -> Result<HostedThreadRuntime, RuntimeStoreError> {
         use nt_user_host::thread_binding::{
-            admit_thread_binding, ThreadBinding, ThreadBindingAdmission,
+            ThreadBinding, ThreadBindingAdmission,
         };
-        let admission = admit_thread_binding(
+        let admission = self.admit_binding(
             ThreadBinding {
                 pi,
                 process,
@@ -650,30 +769,28 @@ impl HostedThreadRuntimeTable {
                 role,
                 reservations,
             },
-            self.entries
-                .iter()
-                .enumerate()
-                .filter_map(|(index, slot)| slot.owner().map(|entry| (index, entry.binding()))),
         )
-        .ok()?;
+        .map_err(RuntimeStoreError::Binding)?;
         match admission {
             ThreadBindingAdmission::Replay { index } => {
                 return self.entries[index]
                     .ordinary_mut()
                     .filter(|entry| entry.construction_is_empty())
-                    .map(|entry| entry.runtime);
+                    .map(|entry| entry.runtime)
+                    .ok_or(RuntimeStoreError::Conflict);
             }
             ThreadBindingAdmission::Promote { index } => {
-                let existing = self.entries[index].ordinary_mut()?;
+                let existing = self.entries[index].ordinary_mut()
+                    .ok_or(RuntimeStoreError::Conflict)?;
                 if !existing.construction_is_empty()
                     || existing.mechanism.is_live()
                     || existing.resources.is_live()
                     || existing.teb_alias != 0
                 {
-                    return None;
+                    return Err(RuntimeStoreError::Conflict);
                 }
                 existing.runtime.tcb = tcb;
-                return Some(existing.runtime);
+                return Ok(existing.runtime);
             }
             ThreadBindingAdmission::Insert => {}
         }
@@ -698,18 +815,18 @@ impl HostedThreadRuntimeTable {
             empty
                 .insert(HostedThreadRuntimeOwner::new(runtime))
                 .expect("admitted runtime fills a vacant row");
-            return Some(runtime);
+            return Ok(runtime);
         }
         if self.entries.len() == self.entries.capacity() && self.entries.try_reserve(1).is_err() {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
             self.store_failures = self.store_failures.saturating_add(1);
-            return None;
+            return Err(RuntimeStoreError::InsufficientResources);
         }
         let mut slot = RuntimeSlot::empty();
         slot.insert(HostedThreadRuntimeOwner::new(runtime))
             .expect("admitted runtime fills a new row");
         self.entries.push(slot);
-        Some(runtime)
+        Ok(runtime)
     }
 
     pub(crate) fn stats(&self) -> (usize, usize, usize, u64, u64) {
@@ -995,6 +1112,13 @@ impl HostedThreadRuntimeTable {
 
 static mut HOSTED_THREAD_RUNTIME_WORK: HostedThreadRuntimeTable = HostedThreadRuntimeTable::new();
 
+/// Reserve the bootstrap row before SEC_IMAGE constructs its first native TCB and SC. The
+/// handler's later reset retains this capacity, so runtime insertion cannot allocate there.
+pub(crate) fn reserve_primary_main_runtime() -> bool {
+    let table = core::ptr::addr_of_mut!(HOSTED_THREAD_RUNTIME_WORK);
+    unsafe { (&mut *table).entries.try_reserve(HOSTED_THREAD_RUNTIME_INITIAL_RESERVE).is_ok() }
+}
+
 /// Read-only shortcut geometry from an executable runtime's actual fixed-stack inventory.
 /// Missing, pending, unmirrored and caller-stack runtimes expose no fixed mirror range. As with
 /// the memory exclusion queries, no allocation, IPC or callbacks may occur during this borrow.
@@ -1208,6 +1332,22 @@ impl HostedThreadRuntimes {
         unsafe { (&mut *self.table).register(pi, process, tid, tcb, badge, role) }
     }
 
+    pub(crate) fn preflight_main(
+        &mut self,
+        pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
+        tid: u64,
+        tcb: u64,
+        badge: u64,
+        mechanism: HostedThreadMechanismCaps,
+        teb_alias: u64,
+        prepared_placement: &Option<nt_user_host::thread_physical_placement::PlacementReadOwner>,
+    ) -> Result<(), MainRuntimeRefusal> {
+        unsafe { (&mut *self.table).preflight_main(
+            pi, process, tid, tcb, badge, mechanism, teb_alias, prepared_placement,
+        ) }
+    }
+
     pub(crate) fn register_main(
         &mut self,
         pi: usize,
@@ -1218,7 +1358,7 @@ impl HostedThreadRuntimes {
         mechanism: HostedThreadMechanismCaps,
         teb_alias: u64,
         prepared_placement: &mut Option<nt_user_host::thread_physical_placement::PlacementReadOwner>,
-    ) -> Option<HostedThreadRuntime> {
+    ) -> Result<HostedThreadRuntime, MainRuntimeRefusal> {
         unsafe { (&mut *self.table).register_main(pi, process, tid, tcb, badge, mechanism, teb_alias, prepared_placement) }
     }
 

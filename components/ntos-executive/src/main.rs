@@ -19189,7 +19189,7 @@ unsafe fn release_unpublished_sec_image_spawn(
     {
         return false;
     }
-    let mut owner = spawn.vspace_caps;
+    let Some(mut owner) = spawn.vspace_caps else { return false; };
     release_sec_image_vspace_caps(&mut owner)
 }
 
@@ -25480,6 +25480,8 @@ struct PendingPnpOperation {
 
 static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =
     core::mem::MaybeUninit::uninit();
+/// A failed bootstrap cannot discard a constructed TCB/SC or an unpublished VSpace.
+static mut PRIMARY_BOOTSTRAP_FAILURE: Option<service_sec_image::PrimaryBootstrapFailure> = None;
 static EXEC_NT_HANDLER_INITIALIZED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -33496,14 +33498,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     reset_hosted_process_runtimes();
                     register_hosted_process_runtime_for_image(smss_image)
                         .expect("SMSS runtime layout must register before live SEC_IMAGE spawn");
-                    let smss_fault_c = mint_badged(si_fault, smss_image.top_badge)
-                        .expect("session manager requires a valid fault endpoint capability");
+                    let primary_runtime_reserved = reserve_primary_main_runtime();
                     let smss_client_id = ps_bootstrap::hosted_main_client_id(smss_image.pi)
                         .expect("SMSS must own its canonical ClientId before spawn");
                     let smss_priority = ps_bootstrap::with_process_manager(|pm| {
                         native_thread_priority::initial_priority(pm, u64::from(smss_client_id.unique_thread))
                     }).expect("SMSS TCB priority must match its canonical PM thread");
-                    let spawn = spawn_hosted_sec_image_for_image(
+                    let spawn = if primary_runtime_reserved {
+                        let smss_fault_c = mint_badged(si_fault, smss_image.top_badge)
+                            .expect("session manager requires a valid fault endpoint capability");
+                        spawn_hosted_sec_image_for_image(
                         smss_image,
                         nt_memory_manager::MemoryLifetime::Process(
                             nt_memory_manager::ProcessIdentity {
@@ -33524,7 +33528,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         u64::from(smss_client_id.unique_process),
                         u64::from(smss_client_id.unique_thread),
                         smss_priority,
-                    );
+                    )
+                    } else { Err(HostedProcessRuntimeRegistrationError::InsufficientResources) };
                     if let Ok(spawn) = spawn {
                     print_str(b"[diag-smss] spawn returned pml4=0x");
                     print_hex((spawn.pml4 >> 32) as u32);
@@ -33543,7 +33548,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // substituting so smss's ntdll pages (incl. OUR LdrpInitialize .text) fault in
                     // from OUR DLL's bytes; otherwise the real ntdll (fallback).
                     print_str(b"[diag-smss] entering service loop\n");
-                    let (
+                    match service_sec_image(
+                        si_fault,
+                        spawn,
+                        smss_image,
+                        &pe,
+                        SCRATCH_BASE,
+                        (NTDLL_BASE, smss_ntdll_pe),
+                        driver_start_bootstrap,
+                        config_pnp_plan,
+                        config_demand_pnp_plan,
+                    ) {
+                    Ok((
                         sfaults,
                         sfirst,
                         sstop,
@@ -33554,17 +33570,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         live_device_action_report,
                         start_device_call_report,
                         desktop_report,
-                    ) = service_sec_image(
-                        si_fault,
-                        spawn,
-                        smss_image,
-                        &pe,
-                        SCRATCH_BASE,
-                        (NTDLL_BASE, smss_ntdll_pe),
-                        driver_start_bootstrap,
-                        config_pnp_plan,
-                        config_demand_pnp_plan,
-                    );
+                    )) => {
                     desktop_acceptance = desktop_report;
                     // The service has returned its exclusive borrow. Final observations read only
                     // the retained catalog and canonical process ownership tables, not loop context.
@@ -34505,6 +34511,54 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" badge-lookups=0x");
                     print_hex(PM_BADGE_LOOKUPS.load(Ordering::Relaxed) as u32);
                     print_str(b"\n");
+                    }
+                    Err(failure) => {
+                        let stage: &[u8] = match failure.stage {
+                            service_sec_image::PrimaryBootstrapStage::Runtime => b"runtime",
+                            service_sec_image::PrimaryBootstrapStage::ExecutionRole => b"role",
+                            service_sec_image::PrimaryBootstrapStage::Vspace => b"vspace",
+                        };
+                        print_str(b"[sec-init] primary publication refused stage=");
+                        print_str(stage);
+                        print_str(b" status=0x");
+                        print_hex(failure.status);
+                        print_str(b" pi/generation/tid=");
+                        print_u64(failure.origin.pi as u64);
+                        print_str(b"/");
+                        print_u64(failure.origin.generation);
+                        print_str(b"/");
+                        print_u64(failure.origin.tid);
+                        print_str(b" tcb=0x");
+                        print_hex_u64(failure.origin.tcb);
+                        print_str(b" sc=0x");
+                        print_hex_u64(failure.origin.sched_context);
+                        print_str(b" runtime-transferred=");
+                        print_u64(u64::from(failure.runtime_transferred));
+                        if let Some(role_error) = failure.role_error {
+                            use nt_exe_image::execution_role::ExecutionRoleError;
+                            let cause: &[u8] = match role_error {
+                                ExecutionRoleError::InvalidIdentity => b"invalid-identity",
+                                ExecutionRoleError::InvalidBacking => b"invalid-backing",
+                                ExecutionRoleError::StaleTarget => b"stale-target",
+                                ExecutionRoleError::UnregisteredRole => b"unregistered-role",
+                                ExecutionRoleError::UnauthorizedCreator => b"unauthorized-creator",
+                                ExecutionRoleError::AlreadyAdmitted => b"already-admitted",
+                                ExecutionRoleError::Full => b"full",
+                                ExecutionRoleError::NotFound => b"not-found",
+                                ExecutionRoleError::StaleToken => b"stale-token",
+                                ExecutionRoleError::TokenExhausted => b"token-exhausted",
+                            };
+                            print_str(b" role-error=");
+                            print_str(cause);
+                        }
+                        print_str(b"\n");
+                        // initialize_exec_nt_handler_once claims its slot exactly once and
+                        // service_sec_image cannot be reentered after returning this failure.
+                        assert!((&*core::ptr::addr_of!(PRIMARY_BOOTSTRAP_FAILURE)).is_none());
+                        *core::ptr::addr_of_mut!(PRIMARY_BOOTSTRAP_FAILURE) = Some(failure);
+                        check(b"exec_reactos_smss_live_paged", false, &mut passed);
+                    }
+                    }
                     } else {
                         print_str(b"[ntos-exec] SMSS runtime retired before SEC_IMAGE spawn\n");
                         check(b"exec_reactos_smss_live_paged", false, &mut passed);

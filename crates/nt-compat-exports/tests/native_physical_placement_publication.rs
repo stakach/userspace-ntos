@@ -18,20 +18,23 @@ fn published_runtime_owns_exact_physical_placement_until_retirement() {
     let source = source();
     let owner = method(&source, "pub(crate) struct HostedThreadRuntimeOwner {", "impl HostedThreadRuntimeOwner {");
     assert!(owner.contains("PlacementReadOwner"), "the runtime row must retain the stable placement anchor");
+    let main_preflight = method(&source, "pub(crate) fn preflight_main(", "pub(crate) fn register_main(");
     let registration = method(&source, "pub(crate) fn register_main(", "pub(crate) fn prepare_spawn(");
     let spawn_validation = method(&source, "pub(crate) fn validate_spawn(", "pub(crate) fn commit_spawn(");
     let spawn = method(&source, "pub(crate) fn commit_spawn(", "pub(crate) fn reserve(");
-    assert!(registration.contains("sched_context") && registration.contains("placement"),
+    assert!(main_preflight.contains("sched_context") && registration.contains("placement"),
         "main publication must retain its exact bound SC placement");
-    assert!(registration.find("prepared_placement.as_ref()")
-        .is_some_and(|check| registration.find("self.store(")
-            .is_some_and(|publish| check < publish))
+    assert!(main_preflight.contains("prepared_placement.as_ref()")
+        && registration.find("self.preflight_main(")
+            .is_some_and(|check| registration.find("self.try_store(")
+                .is_some_and(|publish| check < publish))
         && registration.contains("prepared_placement.take()"),
         "main publication must validate and transfer the preallocated anchor");
-    assert!(registration.find("owner.current_core(identity)")
-        .is_some_and(|check| registration.find("entry.runtime.mechanism = mechanism")
-            .is_some_and(|publish| check < publish)),
-        "replayed main publication must validate exact placement before changing mechanism metadata");
+    assert!(main_preflight.contains("existing.is_some()")
+        && registration.find("self.preflight_main(")
+            .is_some_and(|check| registration.find("entry.runtime.mechanism = mechanism")
+                .is_some_and(|publish| check < publish)),
+        "main publication must refuse a second placement owner before changing mechanism metadata");
     assert!(spawn_validation.contains("sched_context") && spawn_validation.contains("placement.current_core(identity)"),
         "worker publication must validate its exact bound SC placement");
     assert!(spawn.contains("spawn.take_placement()") && !spawn.contains("PlacementReadOwner::try_new"),
@@ -104,4 +107,93 @@ fn processor_services_read_caller_placement_and_forward_rtl_exports() {
     assert!(rtl.contains("nt_get_current_processor_number()")
         && rtl.contains("nt_get_current_processor_number_ex(processor_number as u64)"),
         "RTL exports must query the native caller placement");
+}
+
+#[test]
+fn refused_main_publication_keeps_the_unregistered_native_spawn_owned() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let handler = std::fs::read_to_string(root.join("components/ntos-executive/src/exec_handler.rs")).unwrap();
+    let service = std::fs::read_to_string(root.join("components/ntos-executive/src/service_sec_image.rs")).unwrap();
+    let child_publication = std::fs::read_to_string(root.join("components/ntos-executive/src/child_main_publication.rs")).unwrap();
+    let routed = std::fs::read_to_string(root.join("components/ntos-executive/src/process_image_snapshot_work.rs")).unwrap();
+    let immediate = std::fs::read_to_string(root.join("components/ntos-executive/src/hosted_spawn_uncertainty.rs")).unwrap();
+    let syscall = std::fs::read_to_string(root.join("components/ntos-executive/src/executor/syscall_nt.rs")).unwrap();
+
+    let registration = method(&handler, "pub(crate) fn register_main_thread_spawn(", "pub(crate) fn hosted_thread_tcb(");
+    let signature = registration.split('{').next().unwrap();
+    assert!(signature.contains("&mut img_spawn::SecImageSpawn")
+        || signature.contains("&mut SecImageSpawn"),
+        "a refused main runtime publication must return with the exact native TCB/SC spawn still owned by its caller");
+
+    let error = method(&service, "pub(crate) enum HostedExeSpawnError {", "pub(crate) unsafe fn publish_reserved_hosted_exe(");
+    assert!(error.contains("SecImageSpawn"),
+        "a child whose native construction completed but runtime publication was refused needs an explicit owned error payload");
+    let child = method(&service, "unsafe fn spawn_requested_hosted_exe(", "/// Initialize the live executive once");
+    assert!(child.contains("ChildMainPublication::new(")
+        && child.contains("child_owner.advance(pi, nt_handler)")
+        && child_publication.contains("register_main_thread_spawn(")
+        && child_publication.contains("self.owner.mechanism_mut()"),
+        "the child must register from the exact retained construction owner across refusal");
+    let child_publication_words = child_publication.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(child_publication_words.contains("placement.may_retire()")
+        && child_publication_words.contains("placement.current_core(identity) == Ok(thread_sched_context::GUEST_SCHED_CONTROL_CORE)"),
+        "child publication must preflight the runtime's exact placement admission before VSpace and PEB effects");
+    assert!(!child.contains("register_main_thread_spawn(pi, child_spawn)"),
+        "passing the spawn by value can discard unregistered physical capabilities on error");
+
+    let routed_owner = method(&routed, "struct Work {", "impl Work {");
+    let immediate_owner = method(&immediate, "struct Uncertain {", "static mut WORK:");
+    assert!(routed_owner.contains("SecImageSpawn") && immediate_owner.contains("SecImageSpawn"),
+        "both entered-spawn lanes must durably retain the owned unregistered spawn, not only a status or process identity");
+    assert!(routed.contains("HostedExeSpawnError::") && syscall.contains("HostedExeSpawnError::"),
+        "both callers must classify the owned error payload rather than dropping it");
+    assert!(service.contains("register_main_thread_spawn(primary_pi, &mut primary_spawn)"),
+        "primary bootstrap must retain its exact spawn across a registration refusal");
+    assert!(!service.contains("register_main_thread_spawn(primary_pi, primary_spawn)\n        .expect"),
+        "primary bootstrap cannot panic and discard an unregistered TCB/SC owner");
+}
+
+#[test]
+fn primary_bootstrap_retains_spawn_when_registration_refuses() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let service = std::fs::read_to_string(root.join("components/ntos-executive/src/service_sec_image.rs")).unwrap();
+    assert!(service.contains("register_main_thread_spawn(primary_pi, &mut primary_spawn)"),
+        "primary bootstrap must keep the constructed TCB/SC owner across a refused registration");
+    assert!(!service.contains("register_main_thread_spawn(primary_pi, primary_spawn)\n        .expect"),
+        "a bootstrap refusal must not panic and discard the exact physical owner");
+}
+
+#[test]
+fn deterministic_main_registration_refusal_cannot_retry_forever_after_vspace_publication() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let runtime = std::fs::read_to_string(root.join("components/ntos-executive/src/hosted_thread_runtime.rs")).unwrap();
+    let handler = std::fs::read_to_string(root.join("components/ntos-executive/src/exec_handler.rs")).unwrap();
+    let child = std::fs::read_to_string(root.join("components/ntos-executive/src/child_main_publication.rs")).unwrap();
+    let registration = method(&runtime, "pub(crate) fn register_main(", "pub(crate) fn prepare_spawn(");
+    assert!(runtime.contains("MainRuntimeRefusal")
+        && runtime.contains("fn try_store(")
+        && registration.contains("Result<HostedThreadRuntime, MainRuntimeRefusal>"),
+        "runtime admission must distinguish a permanent binding conflict from allocation pressure");
+    let handler_registration = method(&handler, "pub(crate) fn register_main_thread_spawn(", "pub(crate) fn hosted_thread_tcb(");
+    assert!(!handler_registration.contains(").ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?"),
+        "native registration cannot report every deterministic refusal as retryable OOM");
+    assert!(child.contains("preflight_main_thread_spawn")
+        && child.contains("refusal.is_permanent()")
+        && child.contains("self.fatal_status = Some(refusal.status())"),
+        "child admission must classify permanent refusal before VSpace effects and retain the exact owner in a fatal terminal state");
+}
+
+#[test]
+fn uncertain_child_vspace_distinguishes_borrowed_journal_from_conflicting_owner() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let handler = std::fs::read_to_string(root.join("components/ntos-executive/src/exec_handler.rs")).unwrap();
+    let child = std::fs::read_to_string(root.join("components/ntos-executive/src/child_main_publication.rs")).unwrap();
+    let reconcile = method(&handler, "pub(crate) fn reconcile_child_vspace_publication(", "pub(crate) fn hosted_vspace_observer(");
+    assert!(handler.contains("ChildVspacePublicationObservation")
+        && reconcile.contains("ChildVspacePublicationObservation::Busy")
+        && reconcile.contains("ChildVspacePublicationObservation::Conflict"),
+        "an active journal borrow may retry, but a different published VSpace owner must be a permanent refusal");
+    assert!(child.contains("ChildVspacePublicationObservation::Conflict")
+        && child.contains("self.fatal_status = Some("),
+        "the child must quarantine its original Reply and physical owner on a conflicting VSpace journal");
 }

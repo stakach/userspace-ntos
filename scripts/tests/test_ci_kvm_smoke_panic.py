@@ -61,6 +61,28 @@ class SerialPanicDetectorTests(unittest.TestCase):
 
 
 class SerialTerminalDetectorTests(unittest.TestCase):
+    def test_retained_main_spawn_failure_stops_boot_without_waiting_for_bound(self):
+        for record, expected in (
+            (b"[sec-image-main] fatal construction identity; retaining Reply/TCB/SC/VSpace pi=5 tid=9\n",
+             "main-spawn-quarantined"),
+            (b"[sec-image-main] fatal routed construction identity; retaining Reply/TCB/SC/VSpace pi=5 tid=9\n",
+             "main-spawn-quarantined"),
+            (b"[sec-image-main] fatal runtime admission; retaining original Reply/TCB/SC pi=5\n",
+             "main-spawn-quarantined"),
+            (b"[sec-image-main] fatal retained runtime admission pi/tid/tcb/sc/status=5/9/10/11/12\n",
+             "main-spawn-quarantined"),
+            (b"[sec-image-main] fatal routed runtime admission pi/tid/tcb/sc/status=5/9/10/11/12\n",
+             "main-spawn-quarantined"),
+            (b"[sec-image-main] fatal retained routed runtime admission pi/tid/tcb/sc/status=5/9/10/11/12\n",
+             "main-spawn-quarantined"),
+            (b"[sec-init] primary publication refused stage=runtime status=0xc000009a\n",
+             "primary-publication-refused"),
+        ):
+            with self.subTest(record=record), tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / "serial.log"
+                log.write_bytes(record)
+                self.assertEqual(terminal_detector(log).poll(), expected)
+
     def test_unhandled_rootserver_page_fault_is_terminal_across_split_writes(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "serial.log"
