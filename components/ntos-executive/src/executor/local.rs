@@ -140,7 +140,7 @@ static ROOT_EXECUTOR_LOCAL: ExecutorLocal = ExecutorLocal::new();
 /// live FS base and the TCB's saved base, so context switches preserve the same selection.
 #[cfg(feature = "executor-local-fs-probe")]
 #[inline]
-fn select_current_tcb(block: &'static ExecutorLocal) -> bool {
+fn select_current_tcb(block: &'static ExecutorLocal) -> u64 {
     // Root boot CSpace slot 1 is the current root TCB; selector 0 sets FS, leaving GS for TEB.
     unsafe { block.initialize_self_anchor() };
     let reply: u64;
@@ -161,22 +161,46 @@ fn select_current_tcb(block: &'static ExecutorLocal) -> bool {
             options(nostack, preserves_flags),
         );
     }
-    reply == 0
+    reply
 }
 
 #[cfg(feature = "executor-local-fs-probe")]
 pub(crate) fn install_root() -> bool {
-    select_current_tcb(&ROOT_EXECUTOR_LOCAL)
+    select_current_tcb(&ROOT_EXECUTOR_LOCAL) == 0
 }
 
 #[cfg(feature = "executor-local-fs-probe")]
 pub(crate) fn probe_fs_selection(other: &'static ExecutorLocal) -> bool {
-    let selected = select_current_tcb(other);
-    let observed_other = selected && core::ptr::eq(local(), other);
+    let select_reply = select_current_tcb(other);
+    let other_seen = if select_reply == 0 {
+        local() as *const ExecutorLocal as u64
+    } else {
+        0
+    };
     // Restore the root TCB before any result handling, including a failed selection.
-    let restored = select_current_tcb(&ROOT_EXECUTOR_LOCAL);
-    let observed_root = restored && core::ptr::eq(local(), &ROOT_EXECUTOR_LOCAL);
-    selected && observed_other && restored && observed_root
+    let restore_reply = select_current_tcb(&ROOT_EXECUTOR_LOCAL);
+    let root_seen = if restore_reply == 0 {
+        local() as *const ExecutorLocal as u64
+    } else {
+        0
+    };
+    crate::print_str(b"[executor-local-fs-probe] select-reply=");
+    crate::print_hex_u64(select_reply);
+    crate::print_str(b" other-seen=");
+    crate::print_hex_u64(other_seen);
+    crate::print_str(b" other-expected=");
+    crate::print_hex_u64(other as *const ExecutorLocal as u64);
+    crate::print_str(b" restore-reply=");
+    crate::print_hex_u64(restore_reply);
+    crate::print_str(b" root-seen=");
+    crate::print_hex_u64(root_seen);
+    crate::print_str(b" root-expected=");
+    crate::print_hex_u64(&ROOT_EXECUTOR_LOCAL as *const ExecutorLocal as u64);
+    crate::print_str(b"\n");
+    select_reply == 0
+        && other_seen == other as *const ExecutorLocal as u64
+        && restore_reply == 0
+        && root_seen == &ROOT_EXECUTOR_LOCAL as *const ExecutorLocal as u64
 }
 
 /// The calling executor's block.
