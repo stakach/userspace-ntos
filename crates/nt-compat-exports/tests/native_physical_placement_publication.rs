@@ -44,7 +44,7 @@ fn processor_services_read_caller_placement_and_forward_rtl_exports() {
     let handler = std::fs::read_to_string(root.join("components/ntos-executive/src/exec_handler.rs")).unwrap();
     let table = std::fs::read_to_string(root.join("components/ntos-executive/src/main.rs")).unwrap();
     let exports = std::fs::read_to_string(root.join("crates/nt-ntdll-dll/src/exports.rs")).unwrap();
-    let query = method(&handler, "fn known_current_caller_physical_core(&self)", "pub(crate) fn reserve_hosted_thread_runtime(");
+    let query = method(&handler, "fn known_current_caller_physical_core(", "pub(crate) fn reserve_hosted_thread_runtime(");
     assert!(query.contains("admit_hosted_thread_ingress(self.current_badge)")
         && query.contains("caller.pi != self.pi || caller.tid != self.current_tid")
         && query.contains("known_hosted_thread_physical_core(caller)"),
