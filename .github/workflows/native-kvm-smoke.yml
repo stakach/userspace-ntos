@@ -50,6 +50,10 @@ on:
         description: Bootstrap one proof-only passive executor before the desktop boot
         type: boolean
         default: false
+      executor_fault_supervisor_probe:
+        description: Prove a checked supervisor terminal for one private worker fault
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -203,6 +207,7 @@ jobs:
           NTOS_GUEST_WORKER_MULTICORE: ${{ inputs.multicore && '1' || '0' }}
           NTOS_EXECUTOR_LOCAL_FS_PROBE: ${{ inputs.executor_local_fs_probe && '1' || '0' }}
           NTOS_EXECUTOR_PASSIVE_WORKER_PROBE: ${{ inputs.executor_passive_worker_probe && '1' || '0' }}
+          NTOS_EXECUTOR_FAULT_SUPERVISOR_PROBE: ${{ inputs.executor_fault_supervisor_probe && '1' || '0' }}
         run: |
           set -o pipefail
           bash rust-micro/scripts/test_simpleboot_source.sh
@@ -270,6 +275,7 @@ jobs:
           INTERACT: ${{ inputs.interact && '1' || '' }}
           INTERACTION_PROFILE: ${{ inputs.interaction_profile || 'desktop' }}
           REQUIRE_PASSIVE_WORKER_PROBE: ${{ inputs.executor_passive_worker_probe && '1' || '' }}
+          REQUIRE_FAULT_SUPERVISOR_PROBE: ${{ inputs.executor_fault_supervisor_probe && '1' || '' }}
         run: |
           set -euo pipefail
           interact_args=()
@@ -286,6 +292,11 @@ jobs:
           if [ -n "$REQUIRE_PASSIVE_WORKER_PROBE" ] \
             && ! grep -aFq '[executor-passive-worker-probe] PASS' native-kvm-smoke.log; then
             echo 'native passive-worker bootstrap proof did not pass' >&2
+            boot_status=1
+          fi
+          if [ -n "$REQUIRE_FAULT_SUPERVISOR_PROBE" ] \
+            && ! grep -aFq '[executor-fault-supervisor-probe] PASS' native-kvm-smoke.log; then
+            echo 'native fault-supervisor terminal proof did not pass' >&2
             boot_status=1
           fi
           if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
@@ -323,6 +334,11 @@ jobs:
             if [ -n "$REQUIRE_PASSIVE_WORKER_PROBE" ] \
               && ! grep -aFq '[executor-passive-worker-probe] PASS' native-kvm-smoke.log; then
               echo 'native passive-worker bootstrap proof did not pass on boot 2' >&2
+              boot_status=1
+            fi
+            if [ -n "$REQUIRE_FAULT_SUPERVISOR_PROBE" ] \
+              && ! grep -aFq '[executor-fault-supervisor-probe] PASS' native-kvm-smoke.log; then
+              echo 'native fault-supervisor terminal proof did not pass on boot 2' >&2
               boot_status=1
             fi
             if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi

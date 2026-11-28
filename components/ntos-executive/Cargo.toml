@@ -28,6 +28,7 @@ source-irp-integration = []
 executor-local-fs-probe = []
 # Opt-in checked bootstrap of one native passive executor; includes the FS selection probe.
 executor-passive-worker-probe = ["executor-local-fs-probe"]
+executor-fault-supervisor-probe = ["executor-passive-worker-probe"]
 
 [dependencies]
 # Kernel ABI + SURT transport.
