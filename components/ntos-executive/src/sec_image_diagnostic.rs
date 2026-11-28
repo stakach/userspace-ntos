@@ -5,7 +5,7 @@ use super::*;
 
 pub(crate) unsafe fn run(
     fault_ep: u64,
-    spawn: img_spawn::SecImageSpawn,
+    spawn: &img_spawn::SecImageSpawn,
     image: nt_exe_image::HostedProcessImageRef<'_>,
     pe: &nt_pe_loader::PeFile,
     scratch_base: u64,

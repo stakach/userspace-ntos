@@ -527,15 +527,29 @@ impl HostedProcessVspaceCaps {
     }
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct SecImageSpawn {
     pub(crate) lifetime: nt_memory_manager::MemoryLifetime,
     pub(crate) layout: nt_exe_image::ProcessImageLayout,
     pub(crate) pml4: u64,
     pub(crate) main_tcb: u64,
     pub(crate) main_mechanism: HostedThreadMechanismCaps,
+    /// Reserved before native construction and initialized after the exact TCB/SC is known.
+    pub(crate) placement: Option<nt_user_host::thread_physical_placement::PlacementReadOwner>,
     pub(crate) vspace_caps: HostedProcessVspaceCaps,
     pub(crate) main_runtime: MainThreadRuntime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecImageSpawnError {
+    Startup(nt_exe_image::StartupTrampolineError),
+    PlacementAllocation,
+    InvalidPlacement,
+}
+
+impl From<nt_exe_image::StartupTrampolineError> for SecImageSpawnError {
+    fn from(error: nt_exe_image::StartupTrampolineError) -> Self {
+        Self::Startup(error)
+    }
 }
 
 /// What this constructor actually installed, not a later reconstruction from process identity.
@@ -979,7 +993,7 @@ pub(crate) unsafe fn spawn_sec_image(
     // across builds (0x1050 in the current build) — so the caller DERIVES it from OUR DLL's export
     // table (nt-pe-loader) and passes it here.
     ldrpinit_rva: u64,
-) -> Result<SecImageSpawn, nt_exe_image::StartupTrampolineError> {
+) -> Result<SecImageSpawn, SecImageSpawnError> {
     assert!(lifetime.is_valid(), "SEC_IMAGE spawn requires exact memory lifetime");
     assert_eq!(layout.size(), u64::from(pe.size_of_image()));
     assert_eq!(layout.entry_rva(), pe.entry_point_rva());
@@ -1009,6 +1023,23 @@ pub(crate) unsafe fn spawn_sec_image(
             effective_ldrp_rva(ldrpinit_rva),
             thread_exit_rva,
         )?)
+    } else {
+        None
+    };
+    // Reserve stable placement storage before the first native capability or VSpace effect.
+    // Diagnostic images have no canonical PM process/thread and never publish a runtime row.
+    let placement_process = if let nt_memory_manager::MemoryLifetime::Process(process) = lifetime {
+        let count = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed);
+        if !process.is_valid() || client_thread_id == 0 || count == 0 || count > 64 {
+            return Err(SecImageSpawnError::InvalidPlacement);
+        }
+        Some((process, count as u8))
+    } else {
+        None
+    };
+    let placement_reservation = if placement_process.is_some() {
+        Some(nt_user_host::thread_physical_placement::PlacementReadReservation::try_new()
+            .map_err(|_| SecImageSpawnError::PlacementAllocation)?)
     } else {
         None
     };
@@ -1732,6 +1763,21 @@ pub(crate) unsafe fn spawn_sec_image(
             park();
         }
     };
+    let placement = placement_reservation.map(|reservation| {
+        let (process, active_count) = placement_process.expect("reservation has a validated process");
+        let identity = nt_user_host::thread_physical_placement::PlacementIdentity {
+            process,
+            tid: client_thread_id,
+            tcb,
+            sched_context,
+        };
+        let placement = nt_user_host::thread_physical_placement::PhysicalPlacementOwner::new(
+            identity,
+            thread_sched_context::GUEST_SCHED_CONTROL_CORE,
+            active_count,
+        ).expect("checked TCB/SC and placement topology remain valid during construction");
+        reservation.initialize(placement)
+    });
     if start_immediately {
         checked_spawn_tcb_op(tcb_resume_r(tcb), tcb, b"secimage-resume");
     }
@@ -1742,6 +1788,7 @@ pub(crate) unsafe fn spawn_sec_image(
         pml4,
         main_tcb: tcb,
         main_mechanism: HostedThreadMechanismCaps::new(raw, cnode, sched_context),
+        placement,
         vspace_caps,
         main_runtime: MainThreadRuntime {
             process_id: client_process_id,

@@ -9466,7 +9466,11 @@ unsafe fn spawn_requested_hosted_exe(
         child_pid as u64,
         child_tid as u64,
         initial_priority,
-    ).map_err(|_| HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
+    ).map_err(|error| HostedExeSpawnError::Unentered(match error {
+        HostedProcessRuntimeRegistrationError::InsufficientResources =>
+            nt_process::STATUS_INSUFFICIENT_RESOURCES,
+        _ => nt_process::STATUS_INVALID_HANDLE,
+    }))?;
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_spawn.pml4;
     nt_handler.publish_hosted_process_vspace(pi, child_spawn.vspace_caps)
@@ -11337,6 +11341,7 @@ pub(crate) unsafe fn service_sec_image(
         driver_starts,
     );
     print_str(b"[sec-init] handler-ready\n");
+    let primary_vspace_caps = primary_spawn.vspace_caps;
     nt_handler.register_main_thread_spawn(primary_pi, primary_spawn)
         .expect("primary runtime publication must precede first execution");
     nt_handler.seed_bootstrap_execution_role(primary_pi, primary_backing)
@@ -11390,7 +11395,7 @@ pub(crate) unsafe fn service_sec_image(
     }
     procs[primary_pi].pml4 = pml4;
     nt_handler
-        .publish_hosted_process_vspace(primary_pi, primary_spawn.vspace_caps)
+        .publish_hosted_process_vspace(primary_pi, primary_vspace_caps)
         .expect("primary VSpace publication requires a registered bootstrap process");
     procs[primary_pi].scratch_base = scratch_base;
     procs[primary_pi].img_end = img_end;
