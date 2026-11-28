@@ -7,7 +7,10 @@ use crate::executor_local::{
     ExecutorLocalError, ExecutorLocalRegistry, PassiveWorkerReadyProof, PhysicalTcbClaim, TcbIdentity,
     TcbRetirementObservation,
 };
-use crate::{ExecutorError, ExecutorResume, ExecutorState, ExecutorTable, ExecutorYield};
+use crate::{
+    ExecutorError, ExecutorFaultBinding, ExecutorResume, ExecutorState, ExecutorTable,
+    ExecutorYield, RootReplySlotTable,
+};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
@@ -409,6 +412,64 @@ fn native_bind_refusal_returns_the_exact_payload_and_physical_claim() {
     let attempt = locals.begin_fs_install(anchor, &table).unwrap();
     assert_eq!(attempt.target_cap(), 0x501);
     assert!(core::ptr::eq(original_address, attempt.base()));
+}
+
+#[test]
+fn fault_binding_borrows_the_registrys_exact_retained_physical_claim() {
+    let (mut table, root) = ExecutorTable::try_new(2).unwrap();
+    let worker = table.register_unready(&root).unwrap();
+    let other = table.register_unready(&root).unwrap();
+    let tcb = TcbIdentity::new(0x101, 3);
+    let other_tcb = TcbIdentity::new(0x102, 3);
+    let mut locals = ExecutorLocalRegistry::new();
+    let anchor = locals
+        .bind_native(&table, worker, physical(tcb, 0x501), boxed_probe(0x1000, 0x201))
+        .map_err(|(error, _, _)| error)
+        .unwrap();
+    let other_anchor = locals
+        .bind_native(
+            &table,
+            other,
+            physical(other_tcb, 0x502),
+            boxed_probe(0x2000, 0x202),
+        )
+        .map_err(|(error, _, _)| error)
+        .unwrap();
+
+    let attempt = locals.begin_fs_install(anchor, &table).unwrap();
+    let fs_ack = unsafe { locals.acknowledge_fs_install(attempt) }.unwrap();
+    let ready = unsafe { PassiveWorkerReadyProof::from_checked_unbind(worker, tcb, 0x501) }
+        .unwrap();
+    table.activate_unready(&root, fs_ack, ready).unwrap();
+    let run = table.resume(root, ExecutorResume::Unrouted).unwrap();
+
+    let claim = locals.physical_claim_for(anchor, tcb, worker).unwrap();
+    assert_eq!((claim.identity(), claim.target_cap()), (tcb, 0x501));
+    assert_eq!(
+        locals.physical_claim_for(anchor, TcbIdentity::new(0x101, 2), worker).err(),
+        Some(ExecutorLocalError::StaleAnchor),
+    );
+    assert_eq!(
+        locals.physical_claim_for(anchor, tcb, other).err(),
+        Some(ExecutorLocalError::StaleAnchor),
+    );
+    assert_eq!(
+        locals.physical_claim_for(other_anchor, tcb, worker).err(),
+        Some(ExecutorLocalError::StaleAnchor),
+    );
+    // A refused lookup never transfers or drops the claim held by the registry.
+    let claim = locals.physical_claim_for(anchor, tcb, worker).unwrap();
+    let mut root_replies = RootReplySlotTable::new(1).unwrap();
+    let mut supervisor_replies = RootReplySlotTable::new(1).unwrap();
+    let root_reply = root_replies.insert_used(0x601).unwrap();
+    let supervisor_reply = supervisor_replies.insert_used(0x602).unwrap();
+    let binding = unsafe {
+        ExecutorFaultBinding::from_native(worker, claim, root_reply, supervisor_reply)
+    }
+    .unwrap();
+    table.bind_fault(&run, binding).unwrap();
+    assert_eq!(table.state(worker), Ok(ExecutorState::Running));
+    assert_eq!(table.state(other), Ok(ExecutorState::Unready));
 }
 
 #[test]

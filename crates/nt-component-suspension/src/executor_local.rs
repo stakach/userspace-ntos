@@ -358,6 +358,22 @@ impl<T> ExecutorLocalRegistry<T> {
             .ok_or(ExecutorLocalError::StaleAnchor)
     }
 
+    /// Borrow the exact native TCB claim without transferring its ownership from this registry.
+    /// The caller must keep the registry and its physical TCB owner alive while using the borrow
+    /// to bind a running executor's fault path.
+    pub fn physical_claim_for(
+        &self,
+        anchor: ExecutorLocalAnchor,
+        tcb: TcbIdentity,
+        executor: ExecutorHandle,
+    ) -> Result<&PhysicalTcbClaim, ExecutorLocalError> {
+        let index = self.binding_index(Some(anchor), tcb, executor)?;
+        self.bindings[index]
+            .native_claim
+            .as_ref()
+            .ok_or(ExecutorLocalError::MissingPhysicalTcbClaim)
+    }
+
     #[cfg(test)]
     pub fn resolve(
         &self,
