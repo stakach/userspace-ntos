@@ -225,24 +225,23 @@ pub(crate) const REPLY_MAIN_SLOT: ReplyMainSlot = ReplyMainSlot;
 mod tests {
     use super::*;
 
-    static PROBE_EXECUTOR_LOCAL: ExecutorLocal = ExecutorLocal::new();
-
     #[test]
-    fn root_and_probe_statics_place_distinct_self_pointers_at_fs_offset_zero() {
+    fn root_and_boxed_probe_place_distinct_self_pointers_at_fs_offset_zero() {
         assert_eq!(core::mem::offset_of!(ExecutorLocal, self_anchor), 0);
         assert_eq!(
             core::mem::size_of::<AtomicPtr<ExecutorLocal>>(),
             core::mem::size_of::<usize>()
         );
+        let probe = Box::new(ExecutorLocal::new());
         unsafe {
             ROOT_EXECUTOR_LOCAL.initialize_self_anchor();
-            PROBE_EXECUTOR_LOCAL.initialize_self_anchor();
+            probe.initialize_self_anchor();
         }
         let root = &ROOT_EXECUTOR_LOCAL as *const ExecutorLocal as *mut ExecutorLocal;
-        let probe = &PROBE_EXECUTOR_LOCAL as *const ExecutorLocal as *mut ExecutorLocal;
+        let probe_address = &*probe as *const ExecutorLocal as *mut ExecutorLocal;
         assert_eq!(ROOT_EXECUTOR_LOCAL.self_anchor.load(Ordering::Acquire), root);
-        assert_eq!(PROBE_EXECUTOR_LOCAL.self_anchor.load(Ordering::Acquire), probe);
-        assert_ne!(root, probe);
+        assert_eq!(probe.self_anchor.load(Ordering::Acquire), probe_address);
+        assert_ne!(root, probe_address);
     }
 
     #[test]
