@@ -19,10 +19,14 @@ pub(crate) enum HostedThreadSpawnFailure {
 pub(crate) struct HostedThreadSpawn {
     construction: RetainedHostedThreadConstruction,
     commitment: Option<exec_handler::PreparedHostedThreadCommitment>,
+    placement: Option<nt_user_host::thread_physical_placement::PlacementReadOwner>,
 }
 
 impl HostedThreadSpawn {
-    pub(crate) fn new(construction: RetainedHostedThreadConstruction) -> Self {
+    pub(crate) fn new(
+        construction: RetainedHostedThreadConstruction,
+        placement: nt_user_host::thread_physical_placement::PlacementReadOwner,
+    ) -> Self {
         construction
             .construction
             .live_slots()
@@ -32,6 +36,7 @@ impl HostedThreadSpawn {
         Self {
             construction,
             commitment: None,
+            placement: Some(placement),
         }
     }
 
@@ -68,6 +73,14 @@ impl HostedThreadSpawn {
 
     pub(crate) fn binding(&self) -> nt_user_host::thread_binding::ThreadBinding<HostedThreadRole> {
         self.construction.binding
+    }
+
+    pub(crate) fn placement(&self) -> Option<&nt_user_host::thread_physical_placement::PlacementReadOwner> {
+        self.placement.as_ref()
+    }
+
+    pub(crate) fn take_placement(&mut self) -> Option<nt_user_host::thread_physical_placement::PlacementReadOwner> {
+        self.placement.take()
     }
 
     /// Rejected publication transfers the original inventory, never reconstructed copied caps.

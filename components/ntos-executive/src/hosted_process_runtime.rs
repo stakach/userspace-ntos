@@ -28,6 +28,8 @@ pub(crate) enum HostedProcessRuntimeRegistrationError {
     NotFound,
     StaleIdentity,
     MissingStartupExport,
+    InsufficientResources,
+    InvalidPlacement,
 }
 
 struct HostedProcessRuntimeTable {
@@ -417,7 +419,14 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
         start_immediately,
         ldrpinit_rva,
     )
-    .map_err(|_| HostedProcessRuntimeRegistrationError::MissingStartupExport)
+    .map_err(|error| match error {
+        img_spawn::SecImageSpawnError::Startup(_) =>
+            HostedProcessRuntimeRegistrationError::MissingStartupExport,
+        img_spawn::SecImageSpawnError::PlacementAllocation =>
+            HostedProcessRuntimeRegistrationError::InsufficientResources,
+        img_spawn::SecImageSpawnError::InvalidPlacement =>
+            HostedProcessRuntimeRegistrationError::InvalidPlacement,
+    })
 }
 
 pub(crate) fn hosted_scratch_base_for_pi(pi: usize) -> Option<u64> {

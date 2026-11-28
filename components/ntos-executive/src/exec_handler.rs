@@ -8737,7 +8737,7 @@ impl ExecNtHandler {
         let commitment = spawn
             .take_commitment()
             .expect("live hosted spawn carries its prepared MM/Ps commitment");
-        self.thread_runtime.commit_spawn(prepared, &spawn);
+        self.thread_runtime.commit_spawn(prepared, &mut spawn);
         unsafe { self.commit_hosted_thread_commitment(pi, commitment) };
         publish_hosted_thread_runtime_gate(pi, role);
     }
@@ -8752,6 +8752,10 @@ impl ExecNtHandler {
         self.thread_runtime.known_physical_core(
             caller.binding(), caller.mechanism.sched_context,
         )
+    }
+
+    pub(crate) fn hosted_thread_placement_may_retire(&self, tid: u64, tcb: u64) -> bool {
+        self.thread_runtime.placement_may_retire(tid, tcb)
     }
 
     /// Re-admit the syscall's captured ingress badge before reading its retained placement.
@@ -8909,7 +8913,7 @@ impl ExecNtHandler {
     pub(crate) fn register_main_thread_spawn(
         &mut self,
         pi: usize,
-        spawn: img_spawn::SecImageSpawn,
+        mut spawn: img_spawn::SecImageSpawn,
     ) -> Result<(), u32> {
         let tid = self.pm_main_tid_for_pi(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         let process = self.capture_thread_process_identity(pi, u64::from(tid))
@@ -8925,6 +8929,7 @@ impl ExecNtHandler {
         { return Err(nt_process::STATUS_INVALID_PARAMETER); }
         self.thread_runtime.register_main(
             pi, process, u64::from(tid), spawn.main_tcb, badge, spawn.main_mechanism, teb_alias,
+            &mut spawn.placement,
         ).ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
         // Retain the actual mechanism before Ps validation. Neither caller may resume the main
         // TCB until this complete tuple and the real stack geometry have been published.

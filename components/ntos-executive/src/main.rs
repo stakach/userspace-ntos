@@ -19427,6 +19427,9 @@ unsafe fn terminate_hosted_thread_mechanism(
         None => return false,
         Some(_) => return false,
     };
+    if !handler.hosted_thread_placement_may_retire(tid, tcb) {
+        return false;
+    }
     // Seal physical cancellation before any parked owner redrives its revoke/retype stages.
     // Shared Reply cleanup consumes this stop ACK, never a numeric capability deletion.
     if tcb_suspend_r(tcb) != 0
@@ -19521,7 +19524,9 @@ unsafe fn terminate_hosted_thread_mechanism(
     } else {
         None
     };
-    let delete = if suspend == 0 {
+    // Cancellation/redrive above may reenter native routing. Recheck the retained placement
+    // immediately before deleting the physical TCB and its SC-bearing mechanism.
+    let delete = if suspend == 0 && handler.hosted_thread_placement_may_retire(tid, tcb) {
         cnode_delete_recycle_r(tcb)
     } else {
         u64::MAX
@@ -27763,6 +27768,22 @@ unsafe fn spawn_hosted_thread_mechanism(
         }
     };
     construction.adopt_object(Role::SchedContext, sched_context).expect("attached SC owner");
+    let placement_identity = nt_user_host::thread_physical_placement::PlacementIdentity {
+        process: binding.process,
+        tid: binding.tid,
+        tcb,
+        sched_context,
+    };
+    let placement = match nt_user_host::thread_physical_placement::PhysicalPlacementOwner::new(
+        placement_identity,
+        physical_core,
+        u8::try_from(SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed)).unwrap_or(0),
+    ).ok().and_then(|owner| {
+        nt_user_host::thread_physical_placement::PlacementReadOwner::try_new(owner).ok()
+    }) {
+        Some(placement) => placement,
+        None => return failed!(b"placement-owner", ThreadConstructionError::Admission("placement-owner"), tcb),
+    };
     Ok(HostedThreadSpawn::new(RetainedHostedThreadConstruction {
         binding,
         resources,
@@ -27774,7 +27795,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         } else {
             0
         },
-    }))
+    }, placement))
 }
 
 /// Next user vaddr the executive hands out for NtAllocateVirtualMemory (bump allocator).
@@ -30287,7 +30308,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
                 let (v, f) = sec_image_diagnostic::run(
                     si_fault,
-                    spawn,
+                    &spawn,
                     sec_image_test_image,
                     &pe,
                     BOOT_SEC_IMAGE_SCRATCH_BASE,
