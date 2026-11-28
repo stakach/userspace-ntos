@@ -36,6 +36,9 @@ VERIFIED_POINTER_ACTION = "verified_click"
 # Six measurements may end one capped correction short after an accelerated first move.
 MAX_CURSOR_AIMS = 7
 MAX_CURSOR_CORRECTION = 12  # total requested movement on either axis before remeasuring
+# Frame differencing can move a measured hotspot by one pixel while the cursor
+# is stationary (KVM run 46141984183). Never treat that as calibration or reversal.
+CURSOR_JITTER_PIXELS = 1
 POLL_SCHEDULING_SLACK = 1.0  # the bounded boot loop polls at most once per second
 CHAR_QCODES = {" ": "spc", "\n": "ret", "\t": "tab", ".": "dot", ",": "comma",
                "-": "minus", "=": "equal", "/": "slash", "\\": "backslash",
@@ -456,13 +459,14 @@ class InteractionRunner:
                 if previous_correction is not None:
                     movement = (proof.position[0] - previous_position[0],
                                 proof.position[1] - previous_position[1])
-                    if any(sent * observed < 0 for sent, observed
+                    if any(sent * observed < 0 and abs(observed) > CURSOR_JITTER_PIXELS
+                           for sent, observed
                            in zip(previous_correction, movement)):
                         raise RuntimeError("guest cursor moved opposite the correction")
                     requested = sum(axis * axis for axis in previous_correction)
                     observed = sum(sent * moved for sent, moved
                                    in zip(previous_correction, movement))
-                    if observed:
+                    if observed > 0 and max(map(abs, movement)) > CURSOR_JITTER_PIXELS:
                         gain = observed / requested
                 correction = bounded_cursor_correction(proof.position, target, gain)
                 self.perform(relative_pointer_batches(*correction))

@@ -42,7 +42,7 @@ struct Capture {
 type ImageRead = RoutedImageRead<(ImageAreaId, RoutedSectionLease), u64, Capture>;
 
 enum Phase { Read, Spawn, AbortChild, ReadyReply, ReplyEntered, ReplySent,
-    RevokeReply, RetypeReply, ReconcileRuntime, Indeterminate }
+    RevokeReply, RetypeReply, ReconcileRuntime, Indeterminate, Quarantined }
 
 struct Work {
     pi: usize,
@@ -63,6 +63,8 @@ struct Work {
     published_handle: Option<u64>,
     child_pi: Option<usize>,
     child_refs: Option<hosted_spawn_uncertainty::ChildRefs>,
+    child_owner: Option<service_sec_image::child_main_publication::ChildMainPublication>,
+    raw_child_spawn: Option<img_spawn::SecImageSpawn>,
     abort: Option<EnteredSpawnAbort>,
     abort_revoke_entered: bool,
     abort_retype_entered: bool,
@@ -216,7 +218,8 @@ pub(crate) unsafe fn submit_routed_process_image(
         service_number: handler.current_service_number, logical,
         read: Some(read), capture: None, bytes: None, phase: Phase::Read,
         status: 0, published_handle: None, child_pi: None,
-        child_refs: None, abort: None, abort_revoke_entered: false,
+        child_refs: None, child_owner: None, raw_child_spawn: None,
+        abort: None, abort_revoke_entered: false,
         abort_retype_entered: false, cancel_requested: false, cancelled: false };
     match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
     park.commit();
@@ -256,7 +259,8 @@ fn has_work() -> bool {
 }
 
 fn has_queued_work() -> bool {
-    unsafe { (&*core::ptr::addr_of!(WORK)).iter().any(Option::is_some) }
+    unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten()
+        .any(|work| !matches!(work.phase, Phase::Quarantined)) }
 }
 
 /// A nested provider pump may yield to the outer service loop only when a retained image row
@@ -311,7 +315,12 @@ pub(crate) unsafe fn redrive(
             let start = CURSOR.load(Ordering::Relaxed) as usize % rows.len();
             (0..rows.len()).find_map(|step| {
                 let index = (start + step) % rows.len();
-                rows[index].take().map(|work| (index, work))
+                if rows[index].as_ref().is_some_and(|work|
+                    matches!(work.phase, Phase::Quarantined)) {
+                    None
+                } else {
+                    rows[index].take().map(|work| (index, work))
+                }
             })
         }
     };
@@ -422,6 +431,46 @@ unsafe fn advance(
                             work.child_refs = Some(child);
                             work.status = status;
                             work.phase = Phase::Indeterminate;
+                            return Step::Wait;
+                        }
+                        Err(service_sec_image::HostedExeSpawnError::EnteredUnregistered(status, owner)) => {
+                            let fatal = owner.fatal_status();
+                            if let Some(fatal_status) = fatal {
+                                print_str(b"[sec-image-main] fatal routed runtime admission pi/tid/tcb/sc/status=");
+                                print_u64(child_pi as u64); print_str(b"/");
+                                print_u64(owner.identity().tid); print_str(b"/");
+                                print_hex_u64(owner.identity().tcb); print_str(b"/");
+                                print_hex_u64(owner.identity().sched_context); print_str(b"/");
+                                print_hex(fatal_status); print_str(b"\n");
+                            }
+                            work.child_pi = Some(child_pi);
+                            work.child_refs = Some(child);
+                            work.child_owner = Some(owner);
+                            work.status = status;
+                            work.phase = if fatal.is_some() {
+                                Phase::Quarantined
+                            } else {
+                                Phase::Indeterminate
+                            };
+                            return Step::Wait;
+                        }
+                        Err(service_sec_image::HostedExeSpawnError::EnteredInvalidOwner(status, spawn)) => {
+                            print_str(b"[sec-image-main] fatal routed construction identity; retaining Reply/TCB/SC/VSpace pi=");
+                            print_u64(child_pi as u64);
+                            print_str(b" tid=");
+                            print_u64(child.tid);
+                            print_str(b" tcb=0x");
+                            print_hex_u64(spawn.main_tcb);
+                            print_str(b" sc=0x");
+                            print_hex_u64(spawn.main_mechanism.sched_context);
+                            print_str(b" status=0x");
+                            print_hex(status);
+                            print_str(b"\n");
+                            work.child_pi = Some(child_pi);
+                            work.child_refs = Some(child);
+                            work.raw_child_spawn = Some(spawn);
+                            work.status = status;
+                            work.phase = Phase::Quarantined;
                             return Step::Wait;
                         }
                         Err(service_sec_image::HostedExeSpawnError::EnteredAbortable(status)) => {
@@ -584,7 +633,42 @@ unsafe fn advance(
             release_capture(handler, work.capture.as_mut().expect("cancelled process snapshot capture"));
             Step::Done
         }
-        Phase::Indeterminate => Step::Wait,
+        Phase::Indeterminate => {
+            let Some(owner) = work.child_owner.as_mut() else { return Step::Wait; };
+            let Some(child) = work.child_refs.as_ref() else { return Step::Wait; };
+            if owner.identity().process != child.identity || owner.identity().tid != child.tid {
+                return Step::Wait;
+            }
+            let _ = owner.advance(work.child_pi.expect("entered child slot"), handler);
+            if let Some(status) = owner.fatal_status() {
+                print_str(b"[sec-image-main] fatal retained routed runtime admission pi/tid/tcb/sc/status=");
+                print_u64(work.child_pi.expect("entered child slot") as u64); print_str(b"/");
+                print_u64(owner.identity().tid); print_str(b"/");
+                print_hex_u64(owner.identity().tcb); print_str(b"/");
+                print_hex_u64(owner.identity().sched_context); print_str(b"/");
+                print_hex(status); print_str(b"\n");
+                work.phase = Phase::Quarantined;
+                return Step::Wait;
+            }
+            if !owner.runtime_published()
+                || handler.hosted_thread_tcb(child.tid) != Some(owner.identity().tcb)
+            {
+                return Step::Wait;
+            }
+            let abort = handler.process_mechanisms.get(work.child_pi.expect("entered child slot"))
+                .filter(|mechanism| mechanism.pid == child.identity.pid
+                    && nt_types::ProcessGeneration::Hosted(mechanism.generation)
+                        == child.identity.generation
+                    && u64::from(mechanism.main_tid) == child.tid)
+                .and_then(|mechanism| EnteredSpawnAbort::begin(
+                    mechanism, AliasFailure::Definite(work.status)).ok());
+            let Some(abort) = abort else { return Step::Wait; };
+            work.child_owner = None;
+            work.abort = Some(abort);
+            work.phase = Phase::AbortChild;
+            Step::Progress
+        },
+        Phase::Quarantined => Step::Wait,
     }
 }
 

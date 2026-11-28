@@ -54,6 +54,8 @@ class DesktopGateTests(unittest.TestCase):
 
     def test_every_guest_fault_fails_a_sealed_desktop(self):
         faults = {
+            "main spawn quarantine": b"[sec-image-main] fatal construction identity; retaining Reply/TCB/SC/VSpace pi=5\r\n",
+            "primary publication refusal": b"[sec-init] primary publication refused stage=runtime status=0xc000009a\r\n",
             "executive panic": b"!@src/win32k_subsystem.rs:3938\r\n",
             "provider bugcheck": b"[provider-bugcheck] code=0x0x000000c4 parameter=0x785\r\n",
             "service-loop exit": b"[service-loop-exit] reason=add-device-parent-retained site=483\r\n",
@@ -75,9 +77,23 @@ class DesktopGateTests(unittest.TestCase):
         self.assertEqual(verdict.reasons, ["provider bugcheck: [provider-bugcheck] terminal",
                                            "Explorer desktop never sealed"])
 
+    def test_each_retained_main_runtime_refusal_fails_even_a_sealed_desktop(self):
+        for record in (
+            b"[sec-image-main] fatal runtime admission; retaining original Reply/TCB/SC pi=5\r\n",
+            b"[sec-image-main] fatal retained runtime admission pi/tid/tcb/sc/status=5/9/10/11/12\r\n",
+            b"[sec-image-main] fatal routed runtime admission pi/tid/tcb/sc/status=5/9/10/11/12\r\n",
+            b"[sec-image-main] fatal retained routed runtime admission pi/tid/tcb/sc/status=5/9/10/11/12\r\n",
+        ):
+            with self.subTest(record=record):
+                verdict = boot_verdict(BOOT + SEALED + record, COMPLETE)
+                self.assertFalse(verdict.passed)
+                self.assertTrue(verdict.faults[0].startswith("main spawn quarantine: "))
+
     def test_quoted_or_malformed_panic_markers_are_not_faults(self):
         noise = (b"guest mentioned !@src/foo.rs:0\r\n[dbg] service loop exit pending\r\n"
-                 b"[provider-bugcheck-diag]\r\n")
+                 b"[provider-bugcheck-diag]\r\n"
+                 b"trace: [sec-image-main] fatal construction identity; retaining Reply/TCB/SC/VSpace pi=5\r\n"
+                 b"trace: [sec-init] primary publication refused stage=runtime status=0xc000009a\r\n")
         self.assertTrue(boot_verdict(BOOT + SEALED + noise, COMPLETE).passed)
 
     def test_runner_stops_fail_the_boot(self):

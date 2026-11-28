@@ -1236,6 +1236,12 @@ pub(super) unsafe fn syscall_nt_route(
                 Err(HostedExeSpawnError::Entered(status)) => {
                     hosted_spawn_uncertainty::retain_entered(prepared, status);
                 }
+                Err(HostedExeSpawnError::EnteredUnregistered(status, owner)) => {
+                    hosted_spawn_uncertainty::retain_unregistered(prepared, status, owner);
+                }
+                Err(HostedExeSpawnError::EnteredInvalidOwner(status, spawn)) => {
+                    hosted_spawn_uncertainty::retain_invalid_owner(prepared, status, spawn);
+                }
                 Err(HostedExeSpawnError::EnteredAbortable(status)) => {
                     hosted_spawn_uncertainty::retain_definite(
                         &nt_handler, prepared, status,

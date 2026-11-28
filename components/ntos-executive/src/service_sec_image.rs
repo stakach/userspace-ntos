@@ -6,6 +6,9 @@ use crate::fault_stack_diagnostics::read_fault_stack_word;
 use crate::*;
 use nt_user_host::hosted_return_target::HostedReturnTarget;
 
+#[path = "child_main_publication.rs"]
+pub(crate) mod child_main_publication;
+
 #[path = "native_basic_set_handoff.rs"]
 mod native_basic_set_handoff;
 
@@ -9403,6 +9406,8 @@ pub(crate) enum HostedExeSpawnError {
     Unentered(u32),
     Entered(u32),
     EnteredAbortable(u32),
+    EnteredUnregistered(u32, child_main_publication::ChildMainPublication),
+    EnteredInvalidOwner(u32, img_spawn::SecImageSpawn),
 }
 
 pub(crate) unsafe fn publish_reserved_hosted_exe(
@@ -9453,7 +9458,7 @@ unsafe fn spawn_requested_hosted_exe(
         .ok_or(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
     let fault_badge = mint_badged(fault_ep, spec.image.top_badge)
         .map_err(HostedExeSpawnError::Unentered)?;
-    let child_spawn = spawn_hosted_sec_image_for_image(
+    let mut child_spawn = spawn_hosted_sec_image_for_image(
         spec.image,
         nt_memory_manager::MemoryLifetime::Process(identity),
         spec.pe,
@@ -9473,13 +9478,24 @@ unsafe fn spawn_requested_hosted_exe(
     }))?;
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_spawn.pml4;
-    nt_handler.publish_hosted_process_vspace(pi, child_spawn.vspace_caps)
-        .map_err(HostedExeSpawnError::Entered)?;
-    if !nt_handler.pm.set_peb_base(child_pid, SMSS_PEB_VA) {
-        return Err(HostedExeSpawnError::Entered(nt_process::STATUS_INVALID_HANDLE));
+    let mut child_owner = match child_main_publication::ChildMainPublication::new(
+        child_spawn, identity, u64::from(child_tid),
+    ) {
+        Ok(owner) => owner,
+        Err(spawn) => return Err(HostedExeSpawnError::EnteredInvalidOwner(
+            nt_process::STATUS_INVALID_PARAMETER, spawn,
+        )),
+    };
+    match child_owner.advance(pi, nt_handler) {
+        Ok(true) => {}
+        Err(status) if child_owner.runtime_published() =>
+            return Err(HostedExeSpawnError::EnteredAbortable(status)),
+        Err(status) =>
+            return Err(HostedExeSpawnError::EnteredUnregistered(status, child_owner)),
+        Ok(false) => return Err(HostedExeSpawnError::EnteredUnregistered(
+            nt_process::STATUS_DEVICE_BUSY, child_owner,
+        )),
     }
-    nt_handler.register_main_thread_spawn(pi, child_spawn)
-        .map_err(HostedExeSpawnError::Entered)?;
     hosted_debug_filter_process::install_hosted_user_alias(nt_handler, pi)
         .map_err(|error| if error.retained_uncertain {
             HostedExeSpawnError::Entered(error.status)
@@ -11155,9 +11171,45 @@ unsafe fn capture_builtin_class_key(
 
 /// Initialize the live executive once and service its hosted processes, starting with the primary
 /// image and its ntdll. Generated SEC_IMAGE probes use `sec_image_diagnostic` instead.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PrimaryBootstrapStage { Runtime, ExecutionRole, Vspace }
+
+#[derive(Clone, Copy)]
+pub(crate) struct PrimaryBootstrapOrigin {
+    pub(crate) pi: usize,
+    pub(crate) generation: u64,
+    pub(crate) tid: u64,
+    pub(crate) tcb: u64,
+    pub(crate) sched_context: u64,
+}
+
+pub(crate) struct PrimaryBootstrapFailure {
+    pub(crate) stage: PrimaryBootstrapStage,
+    pub(crate) status: u32,
+    pub(crate) role_error: Option<nt_exe_image::execution_role::ExecutionRoleError>,
+    pub(crate) origin: PrimaryBootstrapOrigin,
+    pub(crate) runtime_transferred: bool,
+    /// The exact construction inventory remains here if runtime registration refused before
+    /// placement transfer. If transfer happened first, the handler-owned runtime keeps TCB/SC.
+    pub(crate) spawn: img_spawn::SecImageSpawn,
+}
+
+fn primary_bootstrap_failure(
+    stage: PrimaryBootstrapStage,
+    status: u32,
+    role_error: Option<nt_exe_image::execution_role::ExecutionRoleError>,
+    spawn: img_spawn::SecImageSpawn,
+    origin: PrimaryBootstrapOrigin,
+) -> PrimaryBootstrapFailure {
+    let runtime_transferred = spawn.placement.is_none();
+    PrimaryBootstrapFailure {
+        stage, status, role_error, origin, runtime_transferred, spawn,
+    }
+}
+
 pub(crate) unsafe fn service_sec_image(
     fault_ep: u64,
-    primary_spawn: img_spawn::SecImageSpawn,
+    mut primary_spawn: img_spawn::SecImageSpawn,
     primary_image: nt_exe_image::HostedProcessImageRef<'static>,
     pe: &nt_pe_loader::PeFile,
     scratch_base: u64,
@@ -11165,7 +11217,7 @@ pub(crate) unsafe fn service_sec_image(
     driver_starts: DriverStartBootstrap,
     boot_system_pnp_plan: &InlineDriverLaunchPlan,
     demand_pnp_plan: &InlineDriverLaunchPlan,
-) -> (
+) -> Result<(
     u64,
     u64,
     u64,
@@ -11176,7 +11228,7 @@ pub(crate) unsafe fn service_sec_image(
     LiveDeviceActionReport,
     StartDeviceCallReport,
     DesktopAcceptanceReport,
-) {
+), PrimaryBootstrapFailure> {
     let pml4 = primary_spawn.pml4;
     let main_tcb = primary_spawn.main_tcb;
     loader_trace_clear();
@@ -11230,6 +11282,13 @@ pub(crate) unsafe fn service_sec_image(
         primary_target, nt_exe_image::HostedProcessRole::NativeSession,
     ).expect("primary SMSS execution policy must bind once");
     let primary_pi = primary_image.pi;
+    let primary_origin = PrimaryBootstrapOrigin {
+        pi: primary_pi,
+        generation: primary_image.generation,
+        tid: primary_spawn.main_runtime.thread_id,
+        tcb: primary_spawn.main_tcb,
+        sched_context: primary_spawn.main_mechanism.sched_context,
+    };
     if let Some(runtime) = hosted_process_runtime_for_pi(primary_pi) {
         if let Some(spawned) = runtime.spawned {
             spawned.store(1, Ordering::Release);
@@ -11341,11 +11400,24 @@ pub(crate) unsafe fn service_sec_image(
         driver_starts,
     );
     print_str(b"[sec-init] handler-ready\n");
-    let primary_vspace_caps = primary_spawn.vspace_caps;
-    nt_handler.register_main_thread_spawn(primary_pi, primary_spawn)
-        .expect("primary runtime publication must precede first execution");
-    nt_handler.seed_bootstrap_execution_role(primary_pi, primary_backing)
-        .expect("primary execution root requires exact mounted File and live Ps identity");
+    if let Err(status) = nt_handler.register_main_thread_spawn(primary_pi, &mut primary_spawn) {
+        return Err(primary_bootstrap_failure(
+            PrimaryBootstrapStage::Runtime, status.status(), None, primary_spawn, primary_origin,
+        ));
+    }
+    if let Err(status) = nt_handler.seed_bootstrap_execution_role(primary_pi, primary_backing) {
+        return Err(primary_bootstrap_failure(
+            PrimaryBootstrapStage::ExecutionRole,
+            if status == nt_exe_image::execution_role::ExecutionRoleError::Full {
+                nt_process::STATUS_INSUFFICIENT_RESOURCES
+            } else {
+                nt_process::STATUS_INVALID_PARAMETER
+            },
+            Some(status),
+            primary_spawn,
+            primary_origin,
+        ));
+    }
     // Bootstrap and runtime retain one queue at the same address; registration cannot clear it.
     // Keep only the stable owner address across nested driver dispatch. Direct queue loans below
     // end at each call site; queue-taking helpers must return before the next nested rearm.
@@ -11394,9 +11466,14 @@ pub(crate) unsafe fn service_sec_image(
             .unwrap_or(0);
     }
     procs[primary_pi].pml4 = pml4;
-    nt_handler
-        .publish_hosted_process_vspace(primary_pi, primary_vspace_caps)
-        .expect("primary VSpace publication requires a registered bootstrap process");
+    let primary_vspace_caps = *primary_spawn.vspace_caps.as_ref()
+        .expect("primary construction retains its VSpace before publication");
+    if let Err(status) = nt_handler.publish_hosted_process_vspace(primary_pi, primary_vspace_caps) {
+        return Err(primary_bootstrap_failure(
+            PrimaryBootstrapStage::Vspace, status, None, primary_spawn, primary_origin,
+        ));
+    }
+    primary_spawn.vspace_caps.take();
     procs[primary_pi].scratch_base = scratch_base;
     procs[primary_pi].img_end = img_end;
     procs[primary_pi].img_base = img_base;
@@ -11616,7 +11693,7 @@ pub(crate) unsafe fn service_sec_image(
         },
     };
     while loop_body::turn(&mut lp).is_continue() {}
-    post_loop::report(&mut lp, csrss_pi)
+    Ok(post_loop::report(&mut lp, csrss_pi))
 }
 
 #[inline(never)]

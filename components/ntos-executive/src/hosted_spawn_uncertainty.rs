@@ -97,6 +97,9 @@ struct Uncertain {
     _child_identity: nt_types::ProcessIdentity,
     _child_lifetime: nt_process::ThreadLifetime,
     _status: u32,
+    child_owner: Option<service_sec_image::child_main_publication::ChildMainPublication>,
+    raw_child_spawn: Option<img_spawn::SecImageSpawn>,
+    quarantined: bool,
     abort: Option<EnteredSpawnAbort>,
 }
 
@@ -184,7 +187,34 @@ pub(crate) fn release_unentered(handler: &mut ExecNtHandler, mut prepared: Prepa
 /// The physical spawn was entered exactly once. Keep the original Reply and both process
 /// references; a later event must reconcile this exact target before either can be retired.
 pub(crate) unsafe fn retain_entered(prepared: Prepared, status: u32) {
-    retain(prepared, status, None);
+    retain(prepared, status, None, None, None);
+}
+
+pub(crate) unsafe fn retain_unregistered(
+    prepared: Prepared,
+    status: u32,
+    owner: service_sec_image::child_main_publication::ChildMainPublication,
+) {
+    retain(prepared, status, None, Some(owner), None);
+}
+
+pub(crate) unsafe fn retain_invalid_owner(
+    prepared: Prepared,
+    status: u32,
+    spawn: img_spawn::SecImageSpawn,
+) {
+    print_str(b"[sec-image-main] fatal construction identity; retaining Reply/TCB/SC/VSpace pi=");
+    print_u64(prepared.child_pi as u64);
+    print_str(b" tid=");
+    print_u64(prepared.child_tid);
+    print_str(b" tcb=0x");
+    print_hex_u64(spawn.main_tcb);
+    print_str(b" sc=0x");
+    print_hex_u64(spawn.main_mechanism.sched_context);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+    retain(prepared, status, None, None, Some(spawn));
 }
 
 /// A returned alias failure with no entered cap effect may abort the exact child.
@@ -202,10 +232,16 @@ pub(crate) unsafe fn retain_definite(handler: &ExecNtHandler, prepared: Prepared
         .and_then(|mechanism| {
             EnteredSpawnAbort::begin(mechanism, AliasFailure::Definite(status)).ok()
         });
-    retain(prepared, status, abort);
+    retain(prepared, status, abort, None, None);
 }
 
-unsafe fn retain(prepared: Prepared, status: u32, abort: Option<EnteredSpawnAbort>) {
+unsafe fn retain(
+    prepared: Prepared,
+    status: u32,
+    abort: Option<EnteredSpawnAbort>,
+    child_owner: Option<service_sec_image::child_main_publication::ChildMainPublication>,
+    raw_child_spawn: Option<img_spawn::SecImageSpawn>,
+) {
     let Prepared {
         park,
         reply,
@@ -220,6 +256,21 @@ unsafe fn retain(prepared: Prepared, status: u32, abort: Option<EnteredSpawnAbor
         child_lifetime,
     } = prepared;
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    let quarantined = raw_child_spawn.is_some()
+        || child_owner.as_ref().is_some_and(|owner| owner.fatal_status().is_some());
+    if let Some(owner) = child_owner.as_ref().filter(|_| quarantined) {
+        print_str(b"[sec-image-main] fatal runtime admission; retaining original Reply/TCB/SC pi=");
+        print_u64(child_pi as u64);
+        print_str(b" tid=");
+        print_u64(child_tid);
+        print_str(b" tcb=0x");
+        print_hex_u64(owner.identity().tcb);
+        print_str(b" sc=0x");
+        print_hex_u64(owner.identity().sched_context);
+        print_str(b" status=0x");
+        print_hex(owner.fatal_status().unwrap_or(status));
+        print_str(b"\n");
+    }
     assert!(
         rows.len() < rows.capacity(),
         "spawn uncertainty owner lost reserved storage"
@@ -236,9 +287,13 @@ unsafe fn retain(prepared: Prepared, status: u32, abort: Option<EnteredSpawnAbor
         _child_identity: child_identity,
         _child_lifetime: child_lifetime,
         _status: status,
+        child_owner,
+        raw_child_spawn,
+        quarantined,
         abort,
     });
-    if rows.last().is_some_and(|work| work.abort.is_some()) {
+    if rows.last().is_some_and(|work| !work.quarantined
+        && (work.abort.is_some() || work.child_owner.is_some())) {
         RETRY_AT_100NS.store(
             monotonic_time_100ns().saturating_add(RETRY_DELAY_100NS),
             Ordering::Release,
@@ -365,6 +420,56 @@ pub(crate) unsafe fn redrive(
         // callbacks may inspect the work table, so no Vec borrow may span them.
         let row = (&mut *rows).as_mut_ptr().add(index);
         let mut finished = false;
+        if (*row).quarantined {
+            index += 1;
+            continue;
+        }
+        if let Some(owner) = (*row).child_owner.as_mut() {
+            if owner.identity().process != (*row)._child_identity
+                || owner.identity().tid != (*row).child_tid
+            {
+                pending = true;
+                index += 1;
+                continue;
+            }
+            let _ = owner.advance((*row).child_pi, handler);
+            if let Some(status) = owner.fatal_status() {
+                print_str(b"[sec-image-main] fatal retained runtime admission pi/tid/tcb/sc/status=");
+                print_u64((*row).child_pi as u64); print_str(b"/");
+                print_u64(owner.identity().tid); print_str(b"/");
+                print_hex_u64(owner.identity().tcb); print_str(b"/");
+                print_hex_u64(owner.identity().sched_context); print_str(b"/");
+                print_hex(status); print_str(b"\n");
+                (*row).quarantined = true;
+                index += 1;
+                continue;
+            }
+            if !owner.runtime_published() {
+                pending = true;
+                index += 1;
+                continue;
+            }
+            let identity = owner.identity();
+            if handler.hosted_thread_tcb(identity.tid) != Some(identity.tcb) {
+                pending = true;
+                index += 1;
+                continue;
+            }
+            let child = handler.process_mechanisms.get((*row).child_pi)
+                .filter(|mechanism| mechanism.pid == identity.process.pid
+                    && nt_types::ProcessGeneration::Hosted(mechanism.generation)
+                        == identity.process.generation
+                    && u64::from(mechanism.main_tid) == identity.tid);
+            let Some(abort) = child.and_then(|mechanism|
+                EnteredSpawnAbort::begin(mechanism, AliasFailure::Definite((*row)._status)).ok())
+            else {
+                pending = true;
+                index += 1;
+                continue;
+            };
+            (*row).child_owner = None;
+            (*row).abort = Some(abort);
+        }
         // Every successful transition is local and bounded. Drive through to the
         // first genuinely pending external effect before the root blocks in receive.
         for _ in 0..9 {
@@ -492,7 +597,8 @@ pub(crate) unsafe fn redrive(
             }
         }
         if !finished {
-            pending |= (*row).abort.is_some();
+            pending |= !(*row).quarantined
+                && ((*row).abort.is_some() || (*row).child_owner.is_some());
             index += 1;
         }
     }
