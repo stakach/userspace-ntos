@@ -16,11 +16,9 @@ use super::native_probe_resources::{
 use super::ExecutorLocal;
 use crate::*;
 
-const STACK_PAGES: usize = 8;
-const BASE: u64 = nt_executive_layout::root::EXECUTOR_WORKERS.base + 0x2_0000;
-const STACK_FIRST: u64 = BASE + 0x1000;
-const STACK_TOP: u64 = STACK_FIRST + STACK_PAGES as u64 * 0x1000;
-const IPC_VA: u64 = BASE + 0x1_0000;
+const SUPERVISOR_SLOT: nt_executive_layout::root::ExecutorWorkerSlot =
+    nt_executive_layout::root::EXECUTOR_FAULT_SUPERVISOR;
+const STACK_PAGES: usize = (SUPERVISOR_SLOT.stack.len / nt_executive_layout::PAGE) as usize;
 const ROOT_TCB: u64 = 1; // Fixed root TCB boot capability, not a process identity.
 const FAULT_INFO: u64 = (3 << 12) | 5; // x86 UserException, five message words.
 const ILLEGAL_INSTRUCTION: u64 = 6; // x86 #UD exception number.
@@ -31,9 +29,9 @@ pub(crate) const TERMINAL_STATUS: u64 = 0xc000_001d; // STATUS_ILLEGAL_INSTRUCTI
 const UNCERTAIN_STATUS: u64 = 0xc000_0001; // A distinct terminal; root must reject it.
 
 const _: () = {
-    assert!(STACK_FIRST - BASE == 0x1000);
-    assert!(IPC_VA >= STACK_TOP + 0x1000);
-    assert!(IPC_VA + 0x1000 <= nt_executive_layout::root::EXECUTOR_WORKERS.end());
+    assert!(SUPERVISOR_SLOT.stack.base == SUPERVISOR_SLOT.guard.end());
+    assert!(SUPERVISOR_SLOT.ipc.base >= SUPERVISOR_SLOT.stack.end() + 0x1000);
+    assert!(SUPERVISOR_SLOT.ipc.end() <= nt_executive_layout::root::EXECUTOR_WORKERS.end());
 };
 
 struct SupervisorEntryArgs {
@@ -48,6 +46,7 @@ struct SupervisorEntryArgs {
 /// `prepare`; the supervisor never dereferences that owner after root enters the blocking Call.
 #[must_use = "retain supervisor capabilities and Reply aliases until exact native retirement"]
 pub(crate) struct NativeSupervisorProbe {
+    slot: nt_executive_layout::root::ExecutorWorkerSlot,
     attempted: bool,
     tcb: Option<OwnedCap>,
     fault_endpoint: Option<OwnedCap>,
@@ -62,9 +61,16 @@ pub(crate) struct NativeSupervisorProbe {
 
 impl NativeSupervisorProbe {
     pub(crate) fn try_new_boxed() -> Result<Box<Self>, ProbeFailure> {
+        Self::try_new_boxed_for_worker(0)
+    }
+
+    pub(crate) fn try_new_boxed_for_worker(worker_index: usize) -> Result<Box<Self>, ProbeFailure> {
         let _durable = allocator::enter_durable();
+        let slot = nt_executive_layout::root::executor_fault_supervisor_slot(worker_index)
+            .ok_or(ProbeFailure::at(b"supervisor-address-slot", worker_index as u64))?;
         try_box(
             Self {
+                slot,
                 attempted: false,
                 tcb: None,
                 fault_endpoint: None,
@@ -146,7 +152,7 @@ impl NativeSupervisorProbe {
                     b"supervisor-stack-frame",
                 )?
             };
-            let va = STACK_FIRST + index as u64 * 0x1000;
+            let va = self.slot.stack.base + index as u64 * 0x1000;
             if !unsafe { ensure_executive_paging(va) } {
                 return Err(ProbeFailure::at(b"supervisor-stack-paging", va));
             }
@@ -154,18 +160,18 @@ impl NativeSupervisorProbe {
                 page_map_r(frame, va, RW_NX, CAP_INIT_THREAD_VSPACE)
             })?;
         }
-        if !unsafe { ensure_executive_paging(IPC_VA) } {
-            return Err(ProbeFailure::at(b"supervisor-ipc-paging", IPC_VA));
+        if !unsafe { ensure_executive_paging(self.slot.ipc.base) } {
+            return Err(ProbeFailure::at(b"supervisor-ipc-paging", self.slot.ipc.base));
         }
         checked(b"supervisor-ipc-map", unsafe {
-            page_map_r(ipc_frame, IPC_VA, RW_NX, CAP_INIT_THREAD_VSPACE)
+            page_map_r(ipc_frame, self.slot.ipc.base, RW_NX, CAP_INIT_THREAD_VSPACE)
         })?;
 
         checked(b"supervisor-tcb-space", unsafe {
             tcb_set_space_r(tcb, 0, CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE)
         })?;
         checked(b"supervisor-tcb-ipc", unsafe {
-            tcb_set_ipc_buffer_r(tcb, IPC_VA, ipc_frame)
+            tcb_set_ipc_buffer_r(tcb, self.slot.ipc.base, ipc_frame)
         })?;
         checked(b"supervisor-tcb-priority", unsafe {
             tcb_set_priority_r(tcb, 100)
@@ -207,7 +213,7 @@ impl NativeSupervisorProbe {
             tcb_write_registers_r(
                 tcb,
                 supervisor_entry as *const () as u64,
-                STACK_TOP - 8,
+                self.slot.stack.end() - 8,
                 args,
             )
         })?;
