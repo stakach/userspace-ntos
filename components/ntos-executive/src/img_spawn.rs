@@ -443,7 +443,7 @@ pub(crate) enum DebugFilterAliasCopy {
     Present,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DebugFilterProcessAlias {
     pub(crate) cap: u64,
     pub(crate) copy: DebugFilterAliasCopy,
@@ -462,7 +462,7 @@ impl DebugFilterProcessAlias {
     };
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostedProcessVspaceCaps {
     pub(crate) generation: u64,
     pub(crate) pml4: u64,
@@ -535,7 +535,8 @@ pub(crate) struct SecImageSpawn {
     pub(crate) main_mechanism: HostedThreadMechanismCaps,
     /// Reserved before native construction and initialized after the exact TCB/SC is known.
     pub(crate) placement: Option<nt_user_host::thread_physical_placement::PlacementReadOwner>,
-    pub(crate) vspace_caps: HostedProcessVspaceCaps,
+    /// Taken exactly once by the VSpace publication owner.
+    pub(crate) vspace_caps: Option<HostedProcessVspaceCaps>,
     pub(crate) main_runtime: MainThreadRuntime,
 }
 
@@ -1789,7 +1790,7 @@ pub(crate) unsafe fn spawn_sec_image(
         main_tcb: tcb,
         main_mechanism: HostedThreadMechanismCaps::new(raw, cnode, sched_context),
         placement,
-        vspace_caps,
+        vspace_caps: Some(vspace_caps),
         main_runtime: MainThreadRuntime {
             process_id: client_process_id,
             thread_id: client_thread_id,

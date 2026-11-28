@@ -31,6 +31,8 @@ EXECUTIVE_PANIC = re.compile(rb"!@(src/[A-Za-z0-9_./-]+\.rs:[1-9][0-9]*)\r?\n")
 FAULT_RECORDS = (
     ("executive panic", EXECUTIVE_PANIC),
     ("provider bugcheck", re.compile(rb"\[provider-bugcheck\] [^\r\n]*")),
+    ("main spawn quarantine", re.compile(rb"^\[sec-image-main\] fatal [^\r\n]*", re.M)),
+    ("primary publication refusal", re.compile(rb"^\[sec-init\] primary publication refused stage=[^\r\n]*", re.M)),
     ("service-loop exit", re.compile(rb"\[service-loop-exit\] reason=[^\r\n]*")),
     ("kernel panic", re.compile(rb"PANIC: [^\r\n]*\.rs:[0-9]+")),
     ("kernel halt", re.compile(rb"System halted due to unrecoverable error")),

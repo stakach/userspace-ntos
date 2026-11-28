@@ -76,6 +76,8 @@ TERMINAL_BOOT_STOP = re.compile(
     rb"|\[quiesce\] no boot milestone for ~[0-9]+s wall-clock -> run gate"
     rb"|\[cm-flush\] shutdown hive durability refused status=(?:0x){1,2}[0-9a-fA-F]{8}"
     rb"|\[provider-bugcheck\] terminal"
+    rb"|\[sec-image-main\] fatal [^\r\n]*"
+    rb"|\[sec-init\] primary publication refused stage=(?:runtime|role|vspace) status=(?:0x){1,2}[0-9a-fA-F]{8}[^\r\n]*"
     rb"|\[dbg\] err:\(base\\system\\winlogon\\winlogon\.c:[0-9]+\) WL: Failed to initialize Gina"
     rb"|\[user #PF: tcb=1 cr2=0x[0-9a-fA-F]{16} err=0x[0-9a-fA-F]{16} "
     rb"rip=0x[0-9a-fA-F]{16}\]\r?\n"
@@ -376,6 +378,10 @@ class SerialTerminalDetector(SerialPanicDetector):
             return "quiesce"
         if record.startswith("[provider-bugcheck]"):
             return "provider-bugcheck"
+        if record.startswith("[sec-image-main]"):
+            return "main-spawn-quarantined"
+        if record.startswith("[sec-init] primary publication refused"):
+            return "primary-publication-refused"
         if record.startswith("[user #PF: tcb=1"):
             return "rootserver-page-fault"
         if "WL: Failed to initialize Gina" in record:

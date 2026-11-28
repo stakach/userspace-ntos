@@ -9,6 +9,14 @@ use crate::provider_local_event::trace as trace_provider_local_event;
 use nt_io_abi::major;
 use nt_io_manager::{LocalFileObject, PendingFileRoute};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChildVspacePublicationObservation {
+    Applied,
+    NoEffect,
+    Busy,
+    Conflict,
+}
+
 static PNP_START_RESULT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PNP_START_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PNP_START_LOOKUP_CONTEXT_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -8504,6 +8512,33 @@ impl ExecNtHandler {
         (pml4 != 0).then_some(pml4)
     }
 
+    /// Reconcile an entered child publication from the exact journal, without replaying the
+    /// native effect. The commit owner may already be installed: publication has no fallible
+    /// step after that point, and a repeated commit-owner check is idempotent for this process.
+    pub(crate) fn reconcile_child_vspace_publication(
+        &self,
+        pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
+        caps: img_spawn::HostedProcessVspaceCaps,
+    ) -> ChildVspacePublicationObservation {
+        if self.capture_process_identity(pi) != Some(process) {
+            return ChildVspacePublicationObservation::Conflict;
+        }
+        let Some(journal) = self.process_vspace_caps.get(pi) else {
+            return ChildVspacePublicationObservation::Busy;
+        };
+        let Some(projection) = self.process_vspaces.get(pi).copied() else {
+            return ChildVspacePublicationObservation::Conflict;
+        };
+        match (journal, projection) {
+            (Some(published), pml4) if published == caps && pml4 == caps.pml4 =>
+                ChildVspacePublicationObservation::Applied,
+            (None, 0) =>
+                ChildVspacePublicationObservation::NoEffect,
+            _ => ChildVspacePublicationObservation::Conflict,
+        }
+    }
+
     pub(crate) fn hosted_vspace_observer(&self) -> hosted_process_vspace::VSpaceObserver {
         self.process_vspace_caps.observer()
     }
@@ -8910,39 +8945,71 @@ impl ExecNtHandler {
         })
     }
 
+    pub(crate) fn preflight_main_thread_spawn(
+        &mut self,
+        pi: usize,
+        spawn: &img_spawn::SecImageSpawn,
+    ) -> Result<(
+        nt_process::ThreadId,
+        nt_user_host::process_identity::ProcessIdentity,
+        u64,
+        nt_process::ThreadLifetime,
+        u64,
+        u64,
+    ), MainRuntimeRefusal> {
+        let invalid = MainRuntimeRefusal::InvalidIdentity;
+        let tid = self.pm_main_tid_for_pi(pi).ok_or(invalid)?;
+        let process = self.capture_thread_process_identity(pi, u64::from(tid))
+            .ok_or(invalid)?;
+        let badge = self.hosted_process_top_badge(pi).ok_or(invalid)?;
+        let lifetime = self.pm.thread_lifetime(tid).ok_or(invalid)?;
+        let mapped = spawn.main_runtime;
+        let teb = mapped.teb.filter(|teb| *teb != 0).ok_or(invalid)?;
+        let teb_alias = mapped.teb_alias
+            .filter(|alias| *alias != 0 && *alias & 0xfff == 0)
+            .ok_or(invalid)?;
+        if mapped.process_id != u64::from(process.pid) || mapped.thread_id != u64::from(tid)
+            || mapped.started || mapped.entry == 0
+        {
+            return Err(invalid);
+        }
+        self.thread_runtime.preflight_main(
+            pi, process, u64::from(tid), spawn.main_tcb, badge,
+            spawn.main_mechanism, teb_alias, &spawn.placement,
+        )?;
+        Ok((tid, process, badge, lifetime, teb, teb_alias))
+    }
+
     pub(crate) fn register_main_thread_spawn(
         &mut self,
         pi: usize,
-        mut spawn: img_spawn::SecImageSpawn,
-    ) -> Result<(), u32> {
-        let tid = self.pm_main_tid_for_pi(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-        let process = self.capture_thread_process_identity(pi, u64::from(tid))
-            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-        let badge = self.hosted_process_top_badge(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-        let lifetime = self.pm.thread_lifetime(tid).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        spawn: &mut img_spawn::SecImageSpawn,
+    ) -> Result<(), MainRuntimeRefusal> {
+        let (tid, process, badge, lifetime, teb, teb_alias) =
+            self.preflight_main_thread_spawn(pi, spawn)?;
         let mapped = spawn.main_runtime;
-        let teb = mapped.teb.filter(|teb| *teb != 0).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-        let teb_alias = mapped.teb_alias.filter(|alias| *alias != 0 && *alias & 0xfff == 0)
-            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-        if mapped.process_id != u64::from(process.pid) || mapped.thread_id != u64::from(tid)
-            || mapped.started || mapped.entry == 0
-        { return Err(nt_process::STATUS_INVALID_PARAMETER); }
         self.thread_runtime.register_main(
             pi, process, u64::from(tid), spawn.main_tcb, badge, spawn.main_mechanism, teb_alias,
             &mut spawn.placement,
-        ).ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        )?;
+        // The runtime now owns the exact placement anchor. The borrowed construction owner
+        // stays with the caller on every earlier refusal; after this point it is inert for
+        // TCB/SC retirement even if a later Ps publication fails.
+        spawn.main_tcb = 0;
+        spawn.main_mechanism = HostedThreadMechanismCaps::empty();
         // Retain the actual mechanism before Ps validation. Neither caller may resume the main
         // TCB until this complete tuple and the real stack geometry have been published.
         self.pm.publish_initial_thread_runtime(
             lifetime, mapped.entry, teb, mapped.create_time_100ns,
-        )?;
+        ).map_err(MainRuntimeRefusal::PostTransfer)?;
         // `EPROCESS.SectionBaseAddress`: the base this process's image section is mapped at.
         if !self.pm.set_image_base(process.pid, spawn.layout.base()) {
-            return Err(nt_process::STATUS_INVALID_PARAMETER);
+            return Err(MainRuntimeRefusal::PostTransfer(nt_process::STATUS_INVALID_PARAMETER));
         }
         let scratch = crate::executor::local().scratch_base.load(Ordering::Relaxed);
         let process_body = unsafe {
-            crate::ps_object_backing::prepare_process(&self.pm, process.pid, scratch)?
+            crate::ps_object_backing::prepare_process(&self.pm, process.pid, scratch)
+                .map_err(MainRuntimeRefusal::PostTransfer)?
         };
         if let Err(status) = unsafe {
             crate::ps_object_backing::prepare_thread(&self.pm, lifetime, scratch)
@@ -8951,12 +9018,13 @@ impl ExecNtHandler {
                 crate::ps_object_backing::abort_unpublished(&self.pm, process_body, scratch)
                     .expect("unpublished process body remains privately owned");
             }
-            return Err(status);
+            return Err(MainRuntimeRefusal::PostTransfer(status));
         }
-        unsafe { crate::ps_object_backing::publish_prepared_pair(&mut self.pm, lifetime)?; }
+        unsafe { crate::ps_object_backing::publish_prepared_pair(&mut self.pm, lifetime)
+            .map_err(MainRuntimeRefusal::PostTransfer)?; }
         self.thread_runtime.set_user_stack(
             u64::from(tid), HOSTED_MAIN_STACK_ALLOCATION_BASE, STACK_BASE + STACK_FRAMES * 0x1000,
-        ).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        ).ok_or(MainRuntimeRefusal::PostTransfer(nt_process::STATUS_INVALID_PARAMETER))?;
         PM_THREAD_BINDS.fetch_add(1, Ordering::Relaxed);
         publish_hosted_thread_runtime_gate(pi, HostedThreadRole::Main);
         Ok(())
