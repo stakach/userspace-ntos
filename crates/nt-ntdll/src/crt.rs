@@ -14,7 +14,9 @@ use alloc::vec::Vec;
 /// `memcmp`: lexical byte comparison over the common prefix length `n`.
 pub fn memcmp(a: &[u8], b: &[u8], n: usize) -> core::cmp::Ordering {
     let n = n.min(a.len()).min(b.len());
-    a[..n].cmp(&b[..n])
+    // SAFETY: `n` is bounded by both source slices. The explicit byte comparator cannot
+    // lower to ntdll's exported `memcmp` and recurse during early process startup.
+    unsafe { crate::crt_memory::compare_bytes(a.as_ptr(), b.as_ptr(), n) }
 }
 
 /// `memchr`: index of the first byte equal to `c` within the first `n` bytes.

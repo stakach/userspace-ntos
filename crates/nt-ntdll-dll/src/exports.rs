@@ -5823,38 +5823,36 @@ pub unsafe extern "system" fn md5_final(context: *mut nt_ntdll::crypto::Md5Conte
 
 /// `memcpy(void*, const void*, size_t) -> void*`.
 ///
-/// `compiler-builtins-mem` already emits a **weak** `memcpy` for internal codegen (hidden — not in
-/// the PE export table). smss imports `memcpy` from ntdll, so we must ALSO export it. We define ours
-/// **weak** too (`#[linkage = "weak"]`) to avoid a duplicate-strong-symbol link error against the
-/// builtin; being a `pub` symbol in the cdylib root it lands in the PE export directory.
+/// SMSS imports this symbol from ntdll. The DLL build omits `compiler-builtins-mem`, so this
+/// strong export also satisfies the compiler's internal byte-copy calls. Its body uses explicit
+/// string instructions, preventing LLVM from lowering the export back into itself.
 ///
 /// # Safety
 /// `dst`/`src` valid for `n` bytes, non-overlapping.
-#[linkage = "weak"]
 #[export_name = "memcpy"]
 pub unsafe extern "C" fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
-    // SAFETY: caller contract (valid, non-overlapping, n bytes).
-    unsafe { core::ptr::copy_nonoverlapping(src.cast::<u8>(), dst.cast::<u8>(), n) };
+    // SAFETY: caller contract (valid, non-overlapping, n bytes). The helper cannot lower to
+    // this export's own intrinsic symbol.
+    unsafe { nt_ntdll::crt_memory::copy_nonoverlapping_bytes(dst.cast(), src.cast(), n) };
     dst
 }
 
-/// `memset(void*, int, size_t) -> void*`. Weak, for the same reason as [`memcpy`].
+/// `memset(void*, int, size_t) -> void*`. Strong and intrinsic-free like [`memcpy`].
 ///
 /// # Safety
 /// `dst` valid for `n` bytes.
-#[linkage = "weak"]
 #[export_name = "memset"]
 pub unsafe extern "C" fn memset(dst: *mut c_void, c: i32, n: usize) -> *mut c_void {
-    // SAFETY: caller contract (valid for n bytes).
-    unsafe { core::ptr::write_bytes(dst.cast::<u8>(), c as u8, n) };
+    // SAFETY: caller contract (valid for n bytes). The helper cannot lower to this
+    // export's own intrinsic symbol.
+    unsafe { nt_ntdll::crt_memory::set_bytes(dst.cast(), c as u8, n) };
     dst
 }
 
-/// `wcslen(const wchar_t*) -> size_t`. Weak (compiler-builtins-mem also provides it).
+/// `wcslen(const wchar_t*) -> size_t`.
 ///
 /// # Safety
 /// `s` a NUL-terminated UTF-16 string.
-#[linkage = "weak"]
 #[export_name = "wcslen"]
 pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
     // SAFETY: caller contract.
@@ -6551,17 +6549,15 @@ pub unsafe extern "system" fn rtl_set_unhandled_exception_filter(filter: *mut c_
 }
 
 /// `memmove(void* dst, const void* src, size_t n) -> void*` — overlap-safe copy. csrsrv imports it
-/// from ntdll. `core::ptr::copy` is memmove semantics (handles overlap). Weak (like memcpy/memset):
-/// `compiler-builtins-mem` also emits a `memmove`, so ours must be weak to avoid a duplicate-strong
-/// link error while still landing in the PE export directory.
+/// from ntdll. This strong export owns the overlap-safe implementation without lowering to
+/// the compiler's `memmove` intrinsic.
 ///
 /// # Safety
 /// `dst`/`src` valid for `n` bytes.
-#[linkage = "weak"]
 #[export_name = "memmove"]
 pub unsafe extern "C" fn memmove(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
-    // SAFETY: caller contract; copy is overlap-safe (memmove).
-    unsafe { core::ptr::copy(src.cast::<u8>(), dst.cast::<u8>(), n) };
+    // SAFETY: caller contract; the helper handles overlap without invoking `memmove`.
+    unsafe { nt_ntdll::crt_memory::move_bytes(dst.cast(), src.cast(), n) };
     dst
 }
 
@@ -6572,8 +6568,8 @@ pub unsafe extern "C" fn memmove(dst: *mut c_void, src: *const c_void, n: usize)
 /// `dst`/`src` valid for `n` bytes.
 #[export_name = "RtlCopyMemory"]
 pub unsafe extern "C" fn rtl_copy_memory(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    // SAFETY: caller contract; Windows aliases this export to memmove on x64.
-    unsafe { core::ptr::copy(src, dst, n) };
+    // SAFETY: caller contract; Windows gives this export the same overlap-safe behavior.
+    unsafe { nt_ntdll::crt_memory::move_bytes(dst, src, n) };
     dst
 }
 
@@ -8122,21 +8118,15 @@ pub unsafe extern "system" fn ldr_unload_dll(base_address: *mut c_void) -> NtSta
 // correct-by-construction inline body (real semantics, not a seam). Signatures = the MS x64 CRT.
 // =================================================================================================
 
-/// `memcmp(const void*, const void*, size_t) -> int`. Weak (compiler-builtins-mem also provides it).
+/// `memcmp(const void*, const void*, size_t) -> int`. The intrinsic-free byte comparison
+/// prevents a helper from calling back into this strong export.
 ///
 /// # Safety
 /// Both valid for `n` bytes.
-#[linkage = "weak"]
 #[export_name = "memcmp"]
 pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> i32 {
-    // SAFETY: caller contract.
-    let (sa, sb) = unsafe {
-        (
-            core::slice::from_raw_parts(a.cast::<u8>(), n),
-            core::slice::from_raw_parts(b.cast::<u8>(), n),
-        )
-    };
-    match nt_ntdll::crt::memcmp(sa, sb, n) {
+    // SAFETY: caller contract; the byte comparator cannot call the exported symbol again.
+    match unsafe { nt_ntdll::crt_memory::compare_bytes(a.cast(), b.cast(), n) } {
         core::cmp::Ordering::Less => -1,
         core::cmp::Ordering::Equal => 0,
         core::cmp::Ordering::Greater => 1,
@@ -8201,11 +8191,10 @@ pub unsafe extern "C" fn memicmp(a: *const u8, b: *const u8, n: usize) -> i32 {
     ordering_to_int(nt_ntdll::crt::memicmp(sa, sb, n))
 }
 
-/// `strlen(const char*) -> size_t`. Weak (compiler-builtins-mem also provides it).
+/// `strlen(const char*) -> size_t`.
 ///
 /// # Safety
 /// `s` a NUL-terminated byte string.
-#[linkage = "weak"]
 #[export_name = "strlen"]
 pub unsafe extern "C" fn strlen(s: *const core::ffi::c_char) -> usize {
     // SAFETY: caller contract.
