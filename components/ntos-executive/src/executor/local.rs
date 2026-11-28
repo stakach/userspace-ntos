@@ -6,7 +6,7 @@
 //!
 //! There is one executor today, the root TCB, and therefore one block. [`local`] is the single
 //! place that changes when an executor gets its own: the block's address is then published
-//! through the TCB's gs base and read back here. Resolve [`local`] at each use. The reference
+//! through the TCB's FS base and read back here. Resolve [`local`] at each use. The reference
 //! belongs to the calling executor and must not be stored in shared state.
 //!
 //! The block is an ordinary image static, with the same mapping as the statics it replaces:
@@ -14,7 +14,7 @@
 //! that share the image. State a spawned component must write does not belong here.
 
 use core::ops::Deref;
-use core::sync::atomic::{AtomicU64, AtomicUsize};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 pub(crate) const RECEIVE_TRACE_DEPTH: usize = 8;
 
@@ -38,7 +38,11 @@ impl ReceiveTraceFrame {
 
 /// Fields are atomics so the block is `Sync` without `unsafe`. Exactly one executor runs at a
 /// time, and each call site keeps the ordering it used before the state moved here.
+#[repr(C)]
 pub(crate) struct ExecutorLocal {
+    /// `%fs:0` holds this exact block's stable address. Install before publishing the block as
+    /// a TCB's FS base; retain a worker's boxed block until that physical TCB is retired.
+    pub(crate) self_anchor: AtomicPtr<ExecutorLocal>,
     /// VA of this executor's seL4 IPC buffer. Message registers 4 and above, and the extra-cap
     /// words of an invocation, are staged here. Zero until boot publishes the BootInfo address.
     pub(crate) ipc_buffer: AtomicU64,
@@ -94,8 +98,9 @@ pub(crate) struct TransientLane {
 }
 
 impl ExecutorLocal {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
+            self_anchor: AtomicPtr::new(core::ptr::null_mut()),
             ipc_buffer: AtomicU64::new(0),
             reply_main_slot: AtomicU64::new(0),
             scheduler_depth: AtomicU64::new(0),
@@ -113,15 +118,128 @@ impl ExecutorLocal {
             },
         }
     }
+
+    /// Prepare the first word before a native SetTLSBase invocation can select this block.
+    ///
+    /// # Safety
+    /// This address must remain stable and mapped for the entire lifetime of every TCB that may
+    /// select it. Static blocks satisfy this; a worker block must be owned in its stable Box
+    /// until exact physical TCB retirement.
+    pub(crate) unsafe fn initialize_self_anchor(&self) {
+        self.self_anchor
+            .store(self as *const Self as *mut Self, Ordering::Release);
+    }
 }
+
+const _: () = assert!(core::mem::offset_of!(ExecutorLocal, self_anchor) == 0);
 
 /// The root executor's block.
 static ROOT_EXECUTOR_LOCAL: ExecutorLocal = ExecutorLocal::new();
 
+/// Install an executor-local block on the current root TCB. The invocation updates both the
+/// live FS base and the TCB's saved base, so context switches preserve the same selection.
+#[cfg(feature = "executor-local-fs-probe")]
+#[inline]
+fn select_current_tcb(block: &'static ExecutorLocal) -> u64 {
+    // Root boot CSpace slot 1 is the current root TCB; selector 0 sets FS, leaving GS for TEB.
+    unsafe { block.initialize_self_anchor() };
+    unsafe { set_owned_tcb_fs_base(1, block as *const ExecutorLocal) }
+}
+
+/// Publish an already-owned stable block to the exact TCB capability. The caller records its
+/// physical TCB and payload ownership before invoking this native effect. The complete reply
+/// MessageInfo is returned, since a successful label with a nonzero payload is not an ACK.
+///
+/// # Safety
+/// `target` must be the caller's retained physical TCB capability, and `base` must stay mapped
+/// until that exact TCB is retired. The payload's offset-zero self anchor must already be set.
+#[cfg(feature = "executor-local-fs-probe")]
+pub(crate) unsafe fn set_owned_tcb_fs_base(target: u64, base: *const ExecutorLocal) -> u64 {
+    let reply: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inout("rdx") crate::SYS_CALL as u64 => _,
+            inout("rdi") target => _,
+            inout("rsi") crate::LBL_TCB_SET_TLS_BASE << 12 => reply,
+            inout("r10") base as u64 => _,
+            inout("r8") 0u64 => _,
+            inout("r9") 0u64 => _,
+            in("r12") 0u64,
+            in("r13") 0u64,
+            lateout("r15") _,
+            lateout("rax") _,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    reply
+}
+
+#[cfg(feature = "executor-local-fs-probe")]
+pub(crate) fn install_root() -> bool {
+    select_current_tcb(&ROOT_EXECUTOR_LOCAL) == 0
+}
+
+#[cfg(feature = "executor-local-fs-probe")]
+pub(crate) fn probe_fs_selection(other: &'static ExecutorLocal) -> bool {
+    let select_reply = select_current_tcb(other);
+    let other_seen = if select_reply == 0 {
+        local() as *const ExecutorLocal as u64
+    } else {
+        0
+    };
+    // Restore the root TCB before any result handling, including a failed selection.
+    let restore_reply = select_current_tcb(&ROOT_EXECUTOR_LOCAL);
+    let root_seen = if restore_reply == 0 {
+        local() as *const ExecutorLocal as u64
+    } else {
+        0
+    };
+    crate::print_str(b"[executor-local-fs-probe] select-reply=");
+    crate::print_hex_u64(select_reply);
+    crate::print_str(b" other-seen=");
+    crate::print_hex_u64(other_seen);
+    crate::print_str(b" other-expected=");
+    crate::print_hex_u64(other as *const ExecutorLocal as u64);
+    crate::print_str(b" restore-reply=");
+    crate::print_hex_u64(restore_reply);
+    crate::print_str(b" root-seen=");
+    crate::print_hex_u64(root_seen);
+    crate::print_str(b" root-expected=");
+    crate::print_hex_u64(&ROOT_EXECUTOR_LOCAL as *const ExecutorLocal as u64);
+    crate::print_str(b"\n");
+    select_reply == 0
+        && other_seen == other as *const ExecutorLocal as u64
+        && restore_reply == 0
+        && root_seen == &ROOT_EXECUTOR_LOCAL as *const ExecutorLocal as u64
+}
+
 /// The calling executor's block.
 #[inline(always)]
 pub(crate) fn local() -> &'static ExecutorLocal {
-    &ROOT_EXECUTOR_LOCAL
+    #[cfg(feature = "executor-local-fs-probe")]
+    {
+        let selected: *const ExecutorLocal;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, qword ptr fs:[0]",
+                out(reg) selected,
+                options(nostack, preserves_flags),
+            );
+        }
+        if selected.is_null() {
+            crate::print_str(b"[executor-local] missing FS self anchor; parking executor\n");
+            crate::park();
+        }
+        // The native SetTLSBase ACK and retained static/boxed owner keep this address live.
+        return unsafe { &*selected };
+    }
+    #[cfg(not(feature = "executor-local-fs-probe"))]
+    {
+        &ROOT_EXECUTOR_LOCAL
+    }
 }
 
 /// Old-path name for [`ExecutorLocal::reply_main_slot`]. The crate root re-exports it so the
@@ -139,3 +257,38 @@ impl Deref for ReplyMainSlot {
 }
 
 pub(crate) const REPLY_MAIN_SLOT: ReplyMainSlot = ReplyMainSlot;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_and_boxed_probe_place_distinct_self_pointers_at_fs_offset_zero() {
+        assert_eq!(core::mem::offset_of!(ExecutorLocal, self_anchor), 0);
+        assert_eq!(
+            core::mem::size_of::<AtomicPtr<ExecutorLocal>>(),
+            core::mem::size_of::<usize>()
+        );
+        let probe = Box::new(ExecutorLocal::new());
+        unsafe {
+            ROOT_EXECUTOR_LOCAL.initialize_self_anchor();
+            probe.initialize_self_anchor();
+        }
+        let root = &ROOT_EXECUTOR_LOCAL as *const ExecutorLocal as *mut ExecutorLocal;
+        let probe_address = &*probe as *const ExecutorLocal as *mut ExecutorLocal;
+        assert_eq!(ROOT_EXECUTOR_LOCAL.self_anchor.load(Ordering::Acquire), root);
+        assert_eq!(probe.self_anchor.load(Ordering::Acquire), probe_address);
+        assert_ne!(root, probe_address);
+    }
+
+    #[test]
+    fn boxed_worker_keeps_its_self_pointer_when_the_owner_moves() {
+        let worker = Box::new(ExecutorLocal::new());
+        assert!(worker.self_anchor.load(Ordering::Acquire).is_null());
+        unsafe { worker.initialize_self_anchor() };
+        let address = &*worker as *const ExecutorLocal as *mut ExecutorLocal;
+        let owner = worker;
+        assert_eq!(owner.self_anchor.load(Ordering::Acquire), address);
+        assert_eq!(&*owner as *const ExecutorLocal as *mut ExecutorLocal, address);
+    }
+}

@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
+    executor_local::{PhysicalTcbClaim, TcbIdentity, TcbRetirementObservation},
     peer_registry::{PeerIdentity, PeerRegistry},
-    LaneHandle,
+    LaneHandle, RootReplyIdentity, RootReplyReplacementError, RootReplySlotState, RootReplySlotTable,
 };
 use alloc::vec::Vec;
 
@@ -55,7 +56,8 @@ impl Root {
     }
 
     pub(super) fn register(&mut self) -> Result<ExecutorHandle, ExecutorError> {
-        let executor = self.table.register(self.token.as_ref().unwrap())?;
+        // This fixture models an executor already bootstrapped on its private endpoint.
+        let executor = unsafe { self.table.register(self.token.as_ref().unwrap()) }?;
         self.executors.push(executor);
         Ok(executor)
     }
@@ -280,6 +282,21 @@ fn done_retires_the_executor_and_a_reused_slot_gets_a_new_generation() {
 }
 
 #[test]
+fn unready_worker_cannot_receive_unrouted_work_before_fs_publication() {
+    let (mut table, root) = ExecutorTable::try_new(1).unwrap();
+    let worker = table.register_unready(&root).unwrap();
+
+    // The native SetTLSBase acknowledgement has not happened. An unrouted arrival must stay
+    // with root instead of selecting this worker while its FS base is still uninitialized.
+    assert_ne!(table.state(worker), Ok(ExecutorState::Idle));
+    let result = table.resume(root, Unrouted);
+    assert!(
+        matches!(result, Err((ExecutorError::NoIdleExecutor, _))),
+        "unready worker {worker:?} must not be selected before FS publication"
+    );
+}
+
+#[test]
 fn unknown_and_stale_handles_are_refused() {
     let root = Root::new(2, 1);
     let known = root.executors[0];
@@ -355,7 +372,8 @@ fn another_tables_token_is_refused_and_cannot_run_a_second_executor() {
     let (mut other, foreign) = ExecutorTable::try_new(1).unwrap();
     let before = root.states();
 
-    assert_eq!(root.table.register(&foreign), Err(ExecutorError::WrongTable));
+    // The modeled worker is already bootstrapped; authority still belongs to this table.
+    assert_eq!(unsafe { root.table.register(&foreign) }, Err(ExecutorError::WrongTable));
     let (error, foreign) = root.table.resume(foreign, Unrouted).unwrap_err();
     assert_eq!(error, ExecutorError::WrongTable);
     assert_eq!(root.states(), before);
@@ -369,7 +387,7 @@ fn another_tables_token_is_refused_and_cannot_run_a_second_executor() {
     root.yields(run, Idle);
 
     // The refused token is intact for its own table.
-    let only = other.register(&foreign).unwrap();
+    let only = unsafe { other.register(&foreign) }.unwrap();
     assert_eq!(other.resume(foreign, Unrouted).unwrap().executor(), only);
 }
 
@@ -478,4 +496,368 @@ fn any_interleaving_keeps_one_runner_and_one_waiter_per_route() {
     }
     // The walk must exercise both successful and refused transitions to prove anything.
     assert!(resumed > 200 && refused > 200, "resumed {resumed}, refused {refused}");
+}
+
+// Root binds the exact physical worker and both owner-issued Reply identities while its run is
+// active, before calling that worker. The table remains Running: the Call may return normally.
+// If the supervisor suspends the worker and replies to root, root observes the checked fault
+// terminal and only then moves the executor to Faulted. Table-issued identities are selectors;
+// unsafe observation constructors model the checked native effects and alias teardown.
+struct FaultReplyOwners {
+    root_table: RootReplySlotTable,
+    supervisor_table: RootReplySlotTable,
+    root: RootReplyIdentity,
+    supervisor: RootReplyIdentity,
+}
+
+impl FaultReplyOwners {
+    fn new() -> Self {
+        // These distinct owner tables issue generation-bearing identities for the root's Call
+        // Reply and the supervisor's fault Reply. The caps themselves grant no authority.
+        let mut root_table = RootReplySlotTable::new(1).unwrap();
+        let mut supervisor_table = RootReplySlotTable::new(1).unwrap();
+        let root = root_table.insert_used(0x130).unwrap();
+        let supervisor = supervisor_table.insert_used(0x140).unwrap();
+        Self { root_table, supervisor_table, root, supervisor }
+    }
+
+    fn retire_root(&mut self) -> FaultReplyRetirementObservation {
+        // SAFETY: this fixture models acknowledged destruction of the exact Reply and every
+        // alias in the native owner's CSpace, not just release of the numeric cap.
+        let observed = unsafe {
+            FaultReplyRetirementObservation::after_native_teardown(&mut self.root_table, self.root)
+                .unwrap()
+        };
+        assert_eq!(self.root_table.state(self.root), Err(RootReplyReplacementError::StaleIdentity));
+        observed
+    }
+
+    fn retire_supervisor(&mut self) -> FaultReplyRetirementObservation {
+        // SAFETY: the exact supervisor Reply and every alias were acknowledged retired.
+        let observed = unsafe {
+            FaultReplyRetirementObservation::after_native_teardown(
+                &mut self.supervisor_table,
+                self.supervisor,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            self.supervisor_table.state(self.supervisor),
+            Err(RootReplyReplacementError::StaleIdentity)
+        );
+        observed
+    }
+}
+
+fn fault_report(
+    executor: ExecutorHandle,
+    tcb: TcbIdentity,
+    target_cap: u64,
+    root_reply: RootReplyIdentity,
+    supervisor_reply: RootReplyIdentity,
+) -> ExecutorFaultReport {
+    unsafe {
+        ExecutorFaultReport::acknowledged(
+            executor,
+            tcb,
+            target_cap,
+            root_reply,
+            supervisor_reply,
+        )
+        .unwrap()
+    }
+}
+
+fn bind_fault(
+    root: &mut Root,
+    run: &ExecutorRun,
+    claim: &PhysicalTcbClaim,
+    root_reply: RootReplyIdentity,
+    supervisor_reply: RootReplyIdentity,
+) {
+    let binding = unsafe {
+        ExecutorFaultBinding::from_native(run.executor(), claim, root_reply, supervisor_reply)
+            .unwrap()
+    };
+    assert!(root.table.bind_fault(run, binding).is_ok());
+    assert_eq!(root.state(run.executor()), ExecutorState::Running);
+}
+
+fn active_fault_binding() -> (
+    Root,
+    ExecutorRun,
+    ExecutorHandle,
+    TcbIdentity,
+    PhysicalTcbClaim,
+    FaultReplyOwners,
+) {
+    let mut root = Root::new(1, 1);
+    let run = root.resume(Unrouted);
+    let executor = run.executor();
+    let tcb = TcbIdentity::new(0x20, 7);
+    let claim = unsafe { PhysicalTcbClaim::new(tcb, 0x120).unwrap() };
+    let replies = FaultReplyOwners::new();
+    bind_fault(&mut root, &run, &claim, replies.root, replies.supervisor);
+    (root, run, executor, tcb, claim, replies)
+}
+
+fn observed_fault() -> (Root, ExecutorHandle, TcbIdentity, PhysicalTcbClaim, FaultReplyOwners) {
+    let (mut root, run, executor, tcb, claim, replies) = active_fault_binding();
+    let report = fault_report(executor, tcb, 0x120, replies.root, replies.supervisor);
+    root.token = Some(root.table.accept_fault_terminal(run, report).ok().unwrap());
+    assert_eq!(root.state(executor), ExecutorState::Faulted);
+    (root, executor, tcb, claim, replies)
+}
+
+#[test]
+fn normal_call_completion_keeps_the_bound_worker_eligible() {
+    let (mut root, run, executor, _, claim, _replies) = active_fault_binding();
+    root.yields(run, Idle);
+    assert_eq!(root.state(executor), ExecutorState::Idle);
+    let next_run = root.resume(Unrouted);
+    assert_eq!(next_run.executor(), executor);
+    let next_replies = FaultReplyOwners::new();
+    bind_fault(
+        &mut root,
+        &next_run,
+        &claim,
+        next_replies.root,
+        next_replies.supervisor,
+    );
+    root.yields(next_run, Idle);
+    assert_eq!(root.state(executor), ExecutorState::Idle);
+}
+
+#[test]
+fn exact_supervisor_terminal_faults_worker_without_reusing_its_slot() {
+    let (mut root, executor, tcb, _claim, mut replies) = observed_fault();
+
+    assert_eq!(root.state(executor), ExecutorState::Faulted);
+    assert_eq!(root.refused(Unrouted), ExecutorError::NoIdleExecutor);
+    assert_eq!(root.register(), Err(ExecutorError::NoCapacity));
+
+    // Teardown of the prior physical incarnation cannot release this faulted slot.
+    let stale = unsafe { TcbRetirementObservation::new(TcbIdentity::new(0x20, 6)) };
+    assert!(root
+        .table
+        .observe_fault_retirement(
+            root.token.as_ref().unwrap(),
+            executor,
+            FaultRetirementObservation::Tcb(stale),
+        )
+        .is_err());
+    assert_eq!(root.state(executor), ExecutorState::Faulted);
+    assert_eq!(root.register(), Err(ExecutorError::NoCapacity));
+
+    let retired = unsafe { TcbRetirementObservation::new(tcb) };
+    root.table
+        .observe_fault_retirement(
+            root.token.as_ref().unwrap(),
+            executor,
+            FaultRetirementObservation::Tcb(retired),
+        )
+        .unwrap();
+    assert_eq!(root.state(executor), ExecutorState::Faulted);
+    assert_eq!(root.register(), Err(ExecutorError::NoCapacity));
+
+    let root_reply = replies.retire_root();
+    root.table
+        .observe_fault_retirement(
+            root.token.as_ref().unwrap(),
+            executor,
+            FaultRetirementObservation::Reply(root_reply),
+        )
+        .unwrap();
+    assert_eq!(root.state(executor), ExecutorState::Faulted);
+    assert_eq!(root.register(), Err(ExecutorError::NoCapacity));
+
+    let supervisor_reply = replies.retire_supervisor();
+    root.table
+        .observe_fault_retirement(
+            root.token.as_ref().unwrap(),
+            executor,
+            FaultRetirementObservation::Reply(supervisor_reply),
+        )
+        .unwrap();
+    let replacement = root.register().unwrap();
+    assert_eq!(replacement.index(), executor.index());
+    assert_ne!(replacement.generation(), executor.generation());
+    assert_eq!(root.table.state(executor), Err(ExecutorError::StaleGeneration));
+}
+
+#[test]
+fn tcb_and_supervisor_reply_retirement_wait_for_root_reply_and_its_aliases() {
+    let (mut root, executor, tcb, _claim, mut replies) = observed_fault();
+    let token = root.token.as_ref().unwrap();
+    let supervisor_reply = replies.retire_supervisor();
+    root.table
+        .observe_fault_retirement(
+            token,
+            executor,
+            FaultRetirementObservation::Reply(supervisor_reply),
+        )
+        .unwrap();
+    let tcb_retired = unsafe { TcbRetirementObservation::new(tcb) };
+    root.table
+        .observe_fault_retirement(token, executor, FaultRetirementObservation::Tcb(tcb_retired))
+        .unwrap();
+
+    // The root's Reply identity remains Used. A live alias prevents a checked native teardown
+    // observation, so neither physical TCB retirement nor the other Reply can free this slot.
+    assert_eq!(replies.root_table.state(replies.root), Ok(RootReplySlotState::Used));
+    assert_eq!(root.state(executor), ExecutorState::Faulted);
+    assert_eq!(root.register(), Err(ExecutorError::NoCapacity));
+
+    let root_reply = replies.retire_root();
+    root.table
+        .observe_fault_retirement(
+            root.token.as_ref().unwrap(),
+            executor,
+            FaultRetirementObservation::Reply(root_reply),
+        )
+        .unwrap();
+    assert_eq!(root.register().unwrap().index(), executor.index());
+}
+
+#[test]
+fn faulted_slot_refuses_reply_retirement_from_wrong_owner_or_stale_slot_generation() {
+    let (mut root, executor, tcb, _claim, mut replies) = observed_fault();
+    let tcb_retired = unsafe { TcbRetirementObservation::new(tcb) };
+    root.table
+        .observe_fault_retirement(
+            root.token.as_ref().unwrap(),
+            executor,
+            FaultRetirementObservation::Tcb(tcb_retired),
+        )
+        .unwrap();
+
+    // Both wrong observations are genuine retirements issued by different owner tables,
+    // even though those tables use the same numeric caps as this fault's bound Replies.
+    let mut other = FaultReplyOwners::new();
+    for wrong in [other.retire_root(), other.retire_supervisor()] {
+        let (_, _returned) = root
+            .table
+            .observe_fault_retirement(
+                root.token.as_ref().unwrap(),
+                executor,
+                FaultRetirementObservation::Reply(wrong),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(root.state(executor), ExecutorState::Faulted);
+        assert_eq!(root.register(), Err(ExecutorError::NoCapacity));
+    }
+
+    // Reusing the root owner's slot invalidates its old identity. Retirement of the new
+    // incarnation must not settle the old fault, even when the numeric cap is identical.
+    let old_root = replies.root;
+    replies.root_table.clear(old_root, None).unwrap();
+    assert!(unsafe {
+        FaultReplyRetirementObservation::after_native_teardown(&mut replies.root_table, old_root)
+    }
+    .is_err());
+    let replacement = replies.root_table.insert_used(old_root.cap()).unwrap();
+    assert_ne!(replacement, old_root);
+    let newer = unsafe {
+        FaultReplyRetirementObservation::after_native_teardown(&mut replies.root_table, replacement)
+            .unwrap()
+    };
+    let (_, _returned) = root
+        .table
+        .observe_fault_retirement(
+            root.token.as_ref().unwrap(),
+            executor,
+            FaultRetirementObservation::Reply(newer),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(root.state(executor), ExecutorState::Faulted);
+    assert_eq!(root.register(), Err(ExecutorError::NoCapacity));
+}
+
+#[test]
+fn fault_terminal_refuses_stale_worker_and_either_wrong_reply_binding() {
+    for wrong_field in 0..6 {
+        let (mut root, run, executor, tcb, _claim, replies) = active_fault_binding();
+        let other_replies = FaultReplyOwners::new();
+        let report = match wrong_field {
+            0 => fault_report(
+                Root::new(1, 1).executors[0], tcb, 0x120, replies.root, replies.supervisor,
+            ),
+            1 => fault_report(
+                executor, TcbIdentity::new(0x21, 7), 0x120, replies.root, replies.supervisor,
+            ),
+            2 => fault_report(
+                executor, TcbIdentity::new(0x20, 6), 0x120, replies.root, replies.supervisor,
+            ),
+            3 => fault_report(executor, tcb, 0x121, replies.root, replies.supervisor),
+            4 => fault_report(executor, tcb, 0x120, other_replies.root, replies.supervisor),
+            _ => fault_report(executor, tcb, 0x120, replies.root, other_replies.supervisor),
+        };
+        let (_, returned_run, _) = root.table.accept_fault_terminal(run, report).err().unwrap();
+        assert_eq!(returned_run.executor(), executor);
+        assert_eq!(root.state(executor), ExecutorState::Quarantined);
+        assert!(root.token.is_none(), "a mismatched terminal must not return the run token");
+        assert!(root.table.accept_yield(returned_run, Idle).is_err());
+    }
+}
+
+#[test]
+fn uncertain_fault_terminal_retains_the_quarantine_on_duplicate_observation() {
+    let (mut root, run, executor, tcb, _claim, replies) = active_fault_binding();
+    let uncertain = unsafe {
+        ExecutorFaultReport::uncertain(executor, tcb, 0x120, replies.root, replies.supervisor)
+            .unwrap()
+    };
+    let (_, run, _) = root.table.accept_fault_terminal(run, uncertain).err().unwrap();
+    assert_eq!(root.state(executor), ExecutorState::Quarantined);
+    assert!(root.token.is_none());
+
+    // Repeating the same indeterminate observation cannot clear its uncertain native effect.
+    let duplicate = unsafe {
+        ExecutorFaultReport::uncertain(executor, tcb, 0x120, replies.root, replies.supervisor)
+            .unwrap()
+    };
+    let (_, returned_run, _) = root.table.accept_fault_terminal(run, duplicate).err().unwrap();
+    assert_eq!(returned_run.executor(), executor);
+    assert_eq!(root.state(executor), ExecutorState::Quarantined);
+    assert!(root.token.is_none());
+    assert!(root.table.accept_yield(returned_run, Idle).is_err());
+}
+
+#[test]
+fn duplicate_fault_terminal_cannot_return_a_second_run_token() {
+    let mut root = Root::new(2, 2);
+    let first_run = root.resume(Unrouted);
+    let first = first_run.executor();
+    let tcb = TcbIdentity::new(0x20, 7);
+    let first_claim = unsafe { PhysicalTcbClaim::new(tcb, 0x120).unwrap() };
+    let first_replies = FaultReplyOwners::new();
+    bind_fault(&mut root, &first_run, &first_claim, first_replies.root, first_replies.supervisor);
+    let report = fault_report(first, tcb, 0x120, first_replies.root, first_replies.supervisor);
+    root.token = Some(root.table.accept_fault_terminal(first_run, report).ok().unwrap());
+
+    let second_run = root.resume(Unrouted);
+    let second = second_run.executor();
+    assert_ne!(second, first);
+    let second_claim = unsafe { PhysicalTcbClaim::new(TcbIdentity::new(0x21, 1), 0x121).unwrap() };
+    let second_replies = FaultReplyOwners::new();
+    bind_fault(
+        &mut root,
+        &second_run,
+        &second_claim,
+        second_replies.root,
+        second_replies.supervisor,
+    );
+    let duplicate = fault_report(first, tcb, 0x120, first_replies.root, first_replies.supervisor);
+    let (_, returned_run, _) = root
+        .table
+        .accept_fault_terminal(second_run, duplicate)
+        .err()
+        .unwrap();
+    assert_eq!(returned_run.executor(), second);
+    assert_eq!(root.state(first), ExecutorState::Faulted);
+    assert_eq!(root.state(second), ExecutorState::Quarantined);
+    assert!(root.token.is_none(), "duplicate must not return the second worker's token");
+    assert!(root.table.accept_yield(returned_run, Idle).is_err());
 }

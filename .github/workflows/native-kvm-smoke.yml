@@ -42,6 +42,18 @@ on:
         description: Place worker threads on their affinity cores (the default); clear to build with NTOS_GUEST_WORKER_MULTICORE=0 and keep every guest thread on core 0
         type: boolean
         default: true
+      executor_local_fs_probe:
+        description: Build the preboot native FS-selection regression probe
+        type: boolean
+        default: false
+      executor_passive_worker_probe:
+        description: Bootstrap one proof-only passive executor before the desktop boot
+        type: boolean
+        default: false
+      executor_fault_supervisor_probe:
+        description: Prove a checked supervisor terminal for one private worker fault
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -193,6 +205,9 @@ jobs:
       - name: Build native image from verified pinned LiberNT release
         env:
           NTOS_GUEST_WORKER_MULTICORE: ${{ inputs.multicore && '1' || '0' }}
+          NTOS_EXECUTOR_LOCAL_FS_PROBE: ${{ inputs.executor_local_fs_probe && '1' || '0' }}
+          NTOS_EXECUTOR_PASSIVE_WORKER_PROBE: ${{ inputs.executor_passive_worker_probe && '1' || '0' }}
+          NTOS_EXECUTOR_FAULT_SUPERVISOR_PROBE: ${{ inputs.executor_fault_supervisor_probe && '1' || '0' }}
         run: |
           set -o pipefail
           bash rust-micro/scripts/test_simpleboot_source.sh
@@ -259,6 +274,8 @@ jobs:
           QEMU_CPU_MODEL: host,invtsc=on
           INTERACT: ${{ inputs.interact && '1' || '' }}
           INTERACTION_PROFILE: ${{ inputs.interaction_profile || 'desktop' }}
+          REQUIRE_PASSIVE_WORKER_PROBE: ${{ inputs.executor_passive_worker_probe && '1' || '' }}
+          REQUIRE_FAULT_SUPERVISOR_PROBE: ${{ inputs.executor_fault_supervisor_probe && '1' || '' }}
         run: |
           set -euo pipefail
           interact_args=()
@@ -272,6 +289,16 @@ jobs:
           boot_status=0
           rm -f native-kvm-qemu-stopped
           python3 scripts/ci_kvm_smoke.py --seconds "$BOOT_SECONDS" --trace-interrupts "${interact_args[@]}" || boot_status=$?
+          if [ -n "$REQUIRE_PASSIVE_WORKER_PROBE" ] \
+            && ! grep -aFq '[executor-passive-worker-probe] PASS' native-kvm-smoke.log; then
+            echo 'native passive-worker bootstrap proof did not pass' >&2
+            boot_status=1
+          fi
+          if [ -n "$REQUIRE_FAULT_SUPERVISOR_PROBE" ] \
+            && ! grep -aFq '[executor-fault-supervisor-probe] PASS' native-kvm-smoke.log; then
+            echo 'native fault-supervisor terminal proof did not pass' >&2
+            boot_status=1
+          fi
           if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
           sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot1.sha256
           if [ "${{ inputs.boot_runs || '1' }}" = '2' ]; then
@@ -304,6 +331,16 @@ jobs:
             fi
             rm -f native-kvm-qemu-stopped
             python3 scripts/ci_kvm_smoke.py --seconds "$BOOT_SECONDS" --trace-interrupts "${boot2_args[@]}" "${interact_args[@]}" || boot_status=$?
+            if [ -n "$REQUIRE_PASSIVE_WORKER_PROBE" ] \
+              && ! grep -aFq '[executor-passive-worker-probe] PASS' native-kvm-smoke.log; then
+              echo 'native passive-worker bootstrap proof did not pass on boot 2' >&2
+              boot_status=1
+            fi
+            if [ -n "$REQUIRE_FAULT_SUPERVISOR_PROBE" ] \
+              && ! grep -aFq '[executor-fault-supervisor-probe] PASS' native-kvm-smoke.log; then
+              echo 'native fault-supervisor terminal proof did not pass on boot 2' >&2
+              boot_status=1
+            fi
             if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
             sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot2.sha256
             if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi

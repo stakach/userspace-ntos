@@ -29444,9 +29444,33 @@ struct Fat32 {
     root_cl: u32,    // root directory cluster
 }
 
+#[cfg(feature = "executor-local-fs-probe")]
+static PROBE_EXECUTOR_LOCAL: executor::ExecutorLocal = executor::ExecutorLocal::new();
+
+/// The only root handle to the proof worker's durable owner. Publish before the first native
+/// effect; a later exact-TCB retirement path can recover the owner here. Never clear or reuse it
+/// merely because a checked invocation failed or its effect is uncertain.
+#[cfg(feature = "executor-passive-worker-probe")]
+static NATIVE_WORKER_PROBE_OWNER: core::sync::atomic::AtomicPtr<executor::NativeWorkerProbe> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
 #[no_mangle]
 #[link_section = ".text._start"]
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
+    #[cfg(feature = "executor-local-fs-probe")]
+    {
+        if !executor::install_root() {
+            print_str(b"[boot] root executor FS anchor install failed\n");
+            park();
+        }
+        let passed = executor::probe_fs_selection(&PROBE_EXECUTOR_LOCAL);
+        if passed {
+            print_str(b"[executor-local-fs-probe] PASS\n");
+        } else {
+            print_str(b"[executor-local-fs-probe] FAIL\n");
+            park();
+        }
+    }
     let bi = &*bootinfo;
     if initialize_loader_acpi_root(bi).is_err() {
         print_str(b"[boot] platform did not publish a valid ACPI loader root\n");
@@ -29596,6 +29620,59 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     dispatcher_bootstrap::initialize()
         .expect("initialize canonical dispatcher ownership before provider activation");
     register_boot_persistent_clock(bi);
+    #[cfg(feature = "executor-passive-worker-probe")]
+    match executor::NativeWorkerProbe::try_new_boxed() {
+        Ok(owner) => {
+            let raw = Box::into_raw(owner);
+            if NATIVE_WORKER_PROBE_OWNER
+                .compare_exchange(
+                    core::ptr::null_mut(),
+                    raw,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                // The one durable root handle is published before any capability is acquired.
+                // No other thread accesses this owner during the proof-only bootstrap.
+                let owner = unsafe { &mut *raw };
+                match unsafe { owner.start() } {
+                    Ok(()) => {
+                        print_str(b"[executor-passive-worker-probe] PASS\n");
+                        #[cfg(feature = "executor-fault-supervisor-probe")]
+                        match unsafe { owner.prove_supervised_fault_once() } {
+                            Ok(()) => print_str(b"[executor-fault-supervisor-probe] PASS\n"),
+                            Err(error) => {
+                                print_str(b"[executor-fault-supervisor-probe] FAIL stage=");
+                                print_str(error.stage);
+                                print_str(b" status=");
+                                print_hex_u64(error.status);
+                                print_str(b"\n");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        print_str(b"[executor-passive-worker-probe] FAIL stage=");
+                        print_str(error.stage);
+                        print_str(b" status=");
+                        print_hex_u64(error.status);
+                        print_str(b"\n");
+                    }
+                }
+            } else {
+                // This owner never began a native effect; the already-published owner remains.
+                unsafe { drop(Box::from_raw(raw)) };
+                print_str(b"[executor-passive-worker-probe] FAIL stage=duplicate-owner\n");
+            }
+        }
+        Err(error) => {
+            print_str(b"[executor-passive-worker-probe] FAIL stage=");
+            print_str(error.stage);
+            print_str(b" status=");
+            print_hex_u64(error.status);
+            print_str(b"\n");
+        }
+    }
     if !client_frame_registry_reserve_initial() {
         panic!("client frame registry allocation failed");
     }

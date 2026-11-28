@@ -1,9 +1,12 @@
 //! Exact physical bootstrap proof for the first passive executive worker.
 //!
-//! The run-token executor table admits a worker only after this owner has observed its private
-//! receive, checked the Reply offered to that worker and acknowledged removal of the temporary
-//! scheduling context.
+//! The checked kernel unbind atomically proves this worker is blocked on its private receive
+//! with its Reply offered, then removes the temporary scheduling context. Only its exact ACK
+//! lets the run-token executor table admit the worker.
 //! A native unbind with an uncertain result leaves every resource retained and cannot be replayed.
+
+use nt_component_suspension::executor_local::{PassiveWorkerReadyProof, TcbIdentity};
+use nt_component_suspension::ExecutorHandle;
 
 /// Capabilities and memory that must remain owned from worker creation through passive handoff.
 /// The bootstrap SC remains here after unbind so its eventual retirement has one owner. A native
@@ -56,54 +59,20 @@ impl WorkerBootstrapResources {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplyObservation {
-    /// No receive has offered this object; root's Call cannot bind it to this worker.
-    Free,
-    /// The object is offered to the observed worker, unbound to any caller or Reply chain.
-    OfferedToWorker,
-    /// Bound to a caller or offered to a different worker.
-    Held,
-}
-
-/// Native observation of the worker blocked at its own first receive. The native adapter must
-/// derive this from authenticated TCB/endpoint/Reply state, not from a request's claimed IDs.
-/// `OfferedToWorker` requires the kernel Reply object to name this exact TCB as its offered
-/// receiver and have no bound caller or Reply-chain links.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockedWorkerObservation {
-    pub(super) worker_tcb: u64,
-    pub(super) private_endpoint: u64,
-    pub(super) reply: ReplyObservation,
-}
-
-impl BlockedWorkerObservation {
-    /// # Safety
-    /// The native adapter must have inspected the exact physical worker TCB and private endpoint
-    /// after its first receive, and must authenticate the Reply state for that same generation.
-    pub unsafe fn from_native_checked(
-        worker_tcb: u64,
-        private_endpoint: u64,
-        reply: ReplyObservation,
-    ) -> Self {
-        Self {
-            worker_tcb,
-            private_endpoint,
-            reply,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnbindOutcome {
     Acknowledged,
     /// The caller cannot prove whether the native effect occurred. Retain and never retry.
     Indeterminate(u64),
 }
 
-/// `Acknowledged` means the native adapter observed an atomic kernel unbind ACK for this exact
-/// SC, blocked worker, private receive endpoint and offered Reply. A prior observation, numeric
-/// match or issued request is insufficient; uncertain results remain owned.
-pub trait BootstrapUnbindIo {
+/// Native checked-unbind adapter.
+///
+/// # Safety
+/// An implementation may return `Acknowledged` only for the exact zero-word reply to the
+/// kernel's atomic SC/TCB/private-endpoint/offered-Reply check and unbind. An error reply,
+/// timeout, or transport uncertainty must return `Indeterminate` even if it seems to prove no
+/// effect. Never infer readiness from a worker message or matching numeric CPtrs.
+pub unsafe trait BootstrapUnbindIo {
     fn unbind_bootstrap_sc(
         &mut self,
         sc: u64,
@@ -118,14 +87,12 @@ pub enum BootstrapError {
     InvalidResources,
     InvalidState,
     WrongWorker,
-    ReplyNotOffered,
     UnbindIndeterminate(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Created,
-    Blocked,
     UnbindInFlight,
     Unbound,
     Uncertain,
@@ -161,10 +128,9 @@ impl PassiveWorkerBootstrap {
         self.resources.as_ref()
     }
 
-    pub fn observe_blocked(
-        &mut self,
-        observed: BlockedWorkerObservation,
-    ) -> Result<(), BootstrapError> {
+    /// Record the attempt before the native call. Its exact ACK proves the blocked receiver and
+    /// offered Reply; an indeterminate result is sticky and cannot be replayed or handed off.
+    pub fn try_unbind(&mut self, io: &mut impl BootstrapUnbindIo) -> Result<(), BootstrapError> {
         if self.phase != Phase::Created {
             return Err(BootstrapError::InvalidState);
         }
@@ -172,28 +138,6 @@ impl PassiveWorkerBootstrap {
             .resources
             .as_ref()
             .expect("untransferred bootstrap owns resources");
-        if observed.worker_tcb != resources.worker_tcb
-            || observed.private_endpoint != resources.private_endpoint
-        {
-            return Err(BootstrapError::WrongWorker);
-        }
-        if observed.reply != ReplyObservation::OfferedToWorker {
-            return Err(BootstrapError::ReplyNotOffered);
-        }
-        self.phase = Phase::Blocked;
-        Ok(())
-    }
-
-    /// Record the native attempt before calling out. An indeterminate result is sticky; neither
-    /// a second unbind nor a passive handoff is legal without a separately proven ACK protocol.
-    pub fn try_unbind(&mut self, io: &mut impl BootstrapUnbindIo) -> Result<(), BootstrapError> {
-        if self.phase != Phase::Blocked {
-            return Err(BootstrapError::InvalidState);
-        }
-        let resources = self
-            .resources
-            .as_ref()
-            .expect("blocked bootstrap owns resources");
         let (sc, tcb, endpoint, reply) = (
             resources.bootstrap_sc,
             resources.worker_tcb,
@@ -223,6 +167,7 @@ impl PassiveWorkerBootstrap {
                 .resources
                 .take()
                 .expect("ACKed bootstrap retained resources"),
+            ready_proof_issued: false,
         })
     }
 }
@@ -231,6 +176,7 @@ impl PassiveWorkerBootstrap {
 #[must_use = "transfer the passive worker to its native executive owner"]
 pub struct PassiveWorker {
     resources: WorkerBootstrapResources,
+    ready_proof_issued: bool,
 }
 
 impl PassiveWorker {
@@ -248,5 +194,32 @@ impl PassiveWorker {
     }
     pub fn reply_cap(&self) -> u64 {
         self.resources.reply_cap()
+    }
+
+    /// Issue one readiness proof while keeping all bootstrap resources with this native owner.
+    /// A mismatched cap or duplicate request leaves the owner and its resources intact.
+    ///
+    /// # Safety
+    /// `identity` must name the exact physical incarnation owned by `worker_tcb`, and the
+    /// unbind ACK that produced this passive worker must belong to `executor`. The native owner
+    /// must retain the TCB, endpoint, Reply and bootstrap SC across activation and retirement.
+    pub unsafe fn issue_ready_proof_once(
+        &mut self,
+        executor: ExecutorHandle,
+        identity: TcbIdentity,
+        target_cap: u64,
+    ) -> Result<PassiveWorkerReadyProof, BootstrapError> {
+        if self.ready_proof_issued {
+            return Err(BootstrapError::InvalidState);
+        }
+        if target_cap != self.resources.worker_tcb {
+            return Err(BootstrapError::WrongWorker);
+        }
+        let proof = unsafe {
+            PassiveWorkerReadyProof::from_checked_unbind(executor, identity, target_cap)
+        }
+        .map_err(|_| BootstrapError::WrongWorker)?;
+        self.ready_proof_issued = true;
+        Ok(proof)
     }
 }

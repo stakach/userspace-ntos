@@ -103,7 +103,8 @@ impl RootArrivalOwner<u8> for Held {
 
 fn one_idle_executor() -> (ExecutorTable, nt_component_suspension::ExecutorRun) {
     let (mut table, token) = ExecutorTable::try_new(1).unwrap();
-    table.register(&token).unwrap();
+    // The fixture starts after exact native bootstrap and private receive.
+    unsafe { table.register(&token) }.unwrap();
     let run = table.resume(token, ExecutorResume::Unrouted).unwrap();
     (table, run)
 }
@@ -112,7 +113,8 @@ fn one_parked_executor(
     wait: ExecutorWait,
 ) -> (ExecutorTable, nt_component_suspension::ExecutorRun) {
     let (mut table, token) = ExecutorTable::try_new(1).unwrap();
-    table.register(&token).unwrap();
+    // The fixture starts after exact native bootstrap and private receive.
+    unsafe { table.register(&token) }.unwrap();
     let first = table.resume(token, ExecutorResume::Unrouted).unwrap();
     let token = table
         .accept_yield(first, ExecutorYield::Parked(wait))
