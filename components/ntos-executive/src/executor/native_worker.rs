@@ -6,9 +6,7 @@
 //! effect. The root's paging-structure cache and failed SC construction rows retain their own
 //! resources through their existing owners.
 
-use alloc::alloc::alloc;
 use alloc::boxed::Box;
-use core::alloc::Layout;
 
 use nt_component_suspension::executor_local::{
     ExecutorLocalRegistry, FsInstallAcknowledgement, PassiveWorkerReadyProof, PhysicalTcbClaim,
@@ -20,6 +18,9 @@ use nt_user_host::sched_context::{
     WorkerBootstrapResources,
 };
 
+use super::native_probe_resources::{
+    checked, resume_owned_tcb, retype_owned, try_box, OwnedCap, ProbeFailure,
+};
 use super::{local, ExecutorLocal};
 use crate::*;
 
@@ -33,28 +34,6 @@ const _: () = {
     assert!(IPC_VA >= STACK_TOP + 0x1000);
     assert!(IPC_VA + 0x1000 <= nt_executive_layout::root::EXECUTOR_WORKERS.end());
 };
-
-#[derive(Clone, Copy)]
-pub(crate) struct ProbeFailure {
-    pub(crate) stage: &'static [u8],
-    pub(crate) status: u64,
-}
-
-impl ProbeFailure {
-    const fn at(stage: &'static [u8], status: u64) -> Self {
-        Self { stage, status }
-    }
-}
-
-/// A slot is recorded before native retype. It is never recycled by this proof run: even an
-/// error reply leaves its exact allocation and any uncertain object effect with this owner.
-struct OwnedCap(u64);
-
-impl OwnedCap {
-    fn value(&self) -> u64 {
-        self.0
-    }
-}
 
 struct WorkerEntryArgs {
     endpoint: u64,
@@ -317,69 +296,6 @@ impl NativeWorkerProbe {
             }
         }
     }
-}
-
-fn checked(stage: &'static [u8], result: u64) -> Result<(), ProbeFailure> {
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(ProbeFailure::at(stage, result))
-    }
-}
-
-fn try_box<T>(value: T, stage: &'static [u8]) -> Result<Box<T>, ProbeFailure> {
-    let layout = Layout::new::<T>();
-    if layout.size() == 0 {
-        return Err(ProbeFailure::at(stage, u64::MAX));
-    }
-    let ptr = unsafe { alloc(layout) }.cast::<T>();
-    if ptr.is_null() {
-        return Err(ProbeFailure::at(stage, u64::MAX));
-    }
-    unsafe {
-        ptr.write(value);
-        Ok(Box::from_raw(ptr))
-    }
-}
-
-unsafe fn retype_owned(
-    owned: &mut Option<OwnedCap>,
-    object: u64,
-    bits: u32,
-    fresh: bool,
-    stage: &'static [u8],
-) -> Result<u64, ProbeFailure> {
-    let slot = if fresh {
-        try_alloc_slot_run(1)
-    } else {
-        try_alloc_slot()
-    }
-    .ok_or(ProbeFailure::at(stage, u64::MAX))?;
-    *owned = Some(OwnedCap(slot));
-    checked(stage, unsafe {
-        untyped_retype_r(CAP_INIT_UNTYPED, object, bits, 1, slot)
-    })?;
-    Ok(owned.as_ref().ok_or(ProbeFailure::at(stage, 0))?.value())
-}
-
-unsafe fn resume_owned_tcb(tcb: u64) -> u64 {
-    let reply: u64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inout("rdx") SYS_CALL as u64 => _,
-            inout("rdi") tcb => _,
-            inout("rsi") LBL_TCB_RESUME << 12 => reply,
-            inout("r10") 0u64 => _,
-            inout("r8") 0u64 => _,
-            inout("r9") 0u64 => _,
-            in("r12") 0u64,
-            in("r13") 0u64,
-            lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-            options(nostack),
-        );
-    }
-    reply
 }
 
 struct NativeUnbinder;

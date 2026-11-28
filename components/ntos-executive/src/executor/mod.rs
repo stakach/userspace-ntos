@@ -14,6 +14,8 @@
 
 mod local;
 #[cfg(feature = "executor-passive-worker-probe")]
+mod native_probe_resources;
+#[cfg(feature = "executor-passive-worker-probe")]
 mod native_worker;
 
 pub(crate) use local::{local, TransientLane, REPLY_MAIN_SLOT, RECEIVE_TRACE_DEPTH};
