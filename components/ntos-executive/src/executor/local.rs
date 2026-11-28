@@ -143,22 +143,35 @@ static ROOT_EXECUTOR_LOCAL: ExecutorLocal = ExecutorLocal::new();
 fn select_current_tcb(block: &'static ExecutorLocal) -> u64 {
     // Root boot CSpace slot 1 is the current root TCB; selector 0 sets FS, leaving GS for TEB.
     unsafe { block.initialize_self_anchor() };
+    unsafe { set_owned_tcb_fs_base(1, block as *const ExecutorLocal) }
+}
+
+/// Publish an already-owned stable block to the exact TCB capability. The caller records its
+/// physical TCB and payload ownership before invoking this native effect. The complete reply
+/// MessageInfo is returned, since a successful label with a nonzero payload is not an ACK.
+///
+/// # Safety
+/// `target` must be the caller's retained physical TCB capability, and `base` must stay mapped
+/// until that exact TCB is retired. The payload's offset-zero self anchor must already be set.
+#[cfg(feature = "executor-local-fs-probe")]
+pub(crate) unsafe fn set_owned_tcb_fs_base(target: u64, base: *const ExecutorLocal) -> u64 {
     let reply: u64;
     unsafe {
         core::arch::asm!(
             "syscall",
-            in("rdx") crate::SYS_CALL as u64,
-            inout("rdi") 1u64 => _,
+            inout("rdx") crate::SYS_CALL as u64 => _,
+            inout("rdi") target => _,
             inout("rsi") crate::LBL_TCB_SET_TLS_BASE << 12 => reply,
-            in("r10") block as *const _ as u64,
-            in("r8") 0u64,
-            in("r9") 0u64,
+            inout("r10") base as u64 => _,
+            inout("r8") 0u64 => _,
+            inout("r9") 0u64 => _,
             in("r12") 0u64,
             in("r13") 0u64,
+            lateout("r15") _,
             lateout("rax") _,
             lateout("rcx") _,
             lateout("r11") _,
-            options(nostack, preserves_flags),
+            options(nostack),
         );
     }
     reply

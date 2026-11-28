@@ -102,6 +102,7 @@ fn every_root_band_is_where_the_plan_says() {
         (&root::STATIC_SCRATCH, 0x0105_0000_0000, 0x0105_1c00_0000),
         (&root::SHELL_MIRRORS, 0x0105_1c00_0000, 0x0105_1c40_0000),
         (&root::DMA_GRAPH_SLOTS, 0x0106_0000_0000, 0x0106_1000_0000),
+        (&root::EXECUTOR_WORKERS, 0x0106_1000_0000, 0x0106_1020_0000),
         (&root::DYNAMIC_RUNTIME, 0x0107_0000_0000, 0x0107_c800_0000),
         (&root::DISPLAY_WINDOW, 0x0200_0000_0000, 0x0280_0000_0000),
         (&root::DEVICE_MAPPINGS, 0x4000_0000_0000, 0x4001_0000_0000),

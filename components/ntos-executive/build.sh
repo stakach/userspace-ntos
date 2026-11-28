@@ -23,6 +23,9 @@ fi
 if [ "${NTOS_EXECUTOR_LOCAL_FS_PROBE:-0}" = 1 ]; then
   set -- "$@" --features executor-local-fs-probe
 fi
+if [ "${NTOS_EXECUTOR_PASSIVE_WORKER_PROBE:-0}" = 1 ]; then
+  set -- "$@" --features executor-passive-worker-probe
+fi
 
 # Extra args are forwarded to cargo — e.g. `./build.sh --features debug-trace` to enable
 # the grind-era verbose trace diagnostics. The DEFAULT build (no args) is feature-off = ships.
