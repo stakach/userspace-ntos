@@ -5,10 +5,11 @@
 //! caller classifies its terminal effect; an uncertain effect retains the original
 //! attempt and cannot authorize a retry, identity query, or mechanism retirement.
 
-use alloc::alloc::alloc;
+use alloc::alloc::{alloc, dealloc};
 use alloc::boxed::Box;
 use core::alloc::Layout;
 use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
@@ -236,6 +237,48 @@ struct PlacementReadState {
     phase: AtomicU8,
 }
 
+/// Fallible stable storage reserved before a native TCB or SC construction can take effect.
+/// The reservation owns only uninitialized storage; it exposes no read loan or placement state.
+#[must_use = "initialize the reserved placement owner or cancel before native effects"]
+pub struct PlacementReadReservation {
+    storage: NonNull<MaybeUninit<PlacementReadState>>,
+}
+
+impl PlacementReadReservation {
+    pub fn try_new() -> Result<Self, PlacementReadOwnerError> {
+        let layout = Layout::new::<PlacementReadState>();
+        // SAFETY: the fixed-size, nonzero allocation is either retained by the reservation
+        // or reported as a failure before any native construction effect.
+        let storage = unsafe { alloc(layout) }.cast::<MaybeUninit<PlacementReadState>>();
+        let storage = NonNull::new(storage).ok_or(PlacementReadOwnerError::NoMemory)?;
+        Ok(Self { storage })
+    }
+
+    /// Publish a validated placement into the already reserved stable allocation. This does
+    /// not call the allocator and cannot fail after native construction has succeeded.
+    pub fn initialize(self, placement: PhysicalPlacementOwner) -> PlacementReadOwner {
+        let storage = self.storage.cast::<PlacementReadState>();
+        // The allocation transfers to Box; the reservation must not deallocate it on return.
+        core::mem::forget(self);
+        unsafe {
+            storage.as_ptr().write(PlacementReadState {
+                placement: UnsafeCell::new(placement),
+                nonce: AtomicU64::new(0),
+                phase: AtomicU8::new(ReadPhase::Idle as u8),
+            });
+            PlacementReadOwner { state: Some(Box::from_raw(storage.as_ptr())) }
+        }
+    }
+}
+
+impl Drop for PlacementReadReservation {
+    fn drop(&mut self) {
+        // SAFETY: an uninitialized reservation alone owns this exact allocation and has not
+        // transferred it to a PlacementReadOwner.
+        unsafe { dealloc(self.storage.as_ptr().cast::<u8>(), Layout::new::<PlacementReadState>()) };
+    }
+}
+
 /// Stable allocation for the sole authoritative physical placement owner. A wrapper can move
 /// with its runtime row; its allocation cannot move while the wrapper is retained. The native
 /// adapter must retain the wrapper and its exact TCB/SC caps until the loan is settled.
@@ -257,20 +300,7 @@ impl core::fmt::Debug for PlacementReadOwner {
 impl PlacementReadOwner {
     /// Allocation failure returns an error before a runtime row publishes this owner.
     pub fn try_new(placement: PhysicalPlacementOwner) -> Result<Self, PlacementReadOwnerError> {
-        let layout = Layout::new::<PlacementReadState>();
-        // SAFETY: this nonzero fixed-size layout is initialized before Box takes ownership.
-        let ptr = unsafe { alloc(layout) }.cast::<PlacementReadState>();
-        if ptr.is_null() {
-            return Err(PlacementReadOwnerError::NoMemory);
-        }
-        unsafe {
-            ptr.write(PlacementReadState {
-                placement: UnsafeCell::new(placement),
-                nonce: AtomicU64::new(0),
-                phase: AtomicU8::new(ReadPhase::Idle as u8),
-            });
-            Ok(Self { state: Some(Box::from_raw(ptr)) })
-        }
+        Ok(PlacementReadReservation::try_new()?.initialize(placement))
     }
 
     fn state(&self) -> &PlacementReadState {
@@ -690,6 +720,31 @@ mod tests {
         let next = unsafe { rows[0].acquire(key, 42) }.unwrap();
         assert_eq!(next.current_core(key, 42), Ok(3));
         unsafe { rows[0].settle_checked_normal(next, key, 42) }.unwrap();
+    }
+
+    #[test]
+    fn placement_anchor_is_reserved_before_physical_construction_and_initialized_without_allocation() {
+        // Native construction can already own a TCB and SC when it learns their exact placement.
+        // Reserve the stable allocation first, so publication does not acquire a new OOM edge
+        // after those physical effects. The reservation may move before it is initialized.
+        let reservation = PlacementReadReservation::try_new().unwrap();
+        let mut pending = Vec::with_capacity(1);
+        pending.push(reservation);
+        for _ in 0..32 {
+            pending.push(PlacementReadReservation::try_new().unwrap());
+        }
+
+        let key = identity(7, 100, 200);
+        let mut owner = pending.swap_remove(0).initialize(
+            PhysicalPlacementOwner::new(key, 2, 4).unwrap(),
+        );
+        // SAFETY: the initialized stable owner and exact TCB/SC caps stay retained until the
+        // checked terminal settles this job.
+        let loan = unsafe { owner.acquire(key, 49) }.unwrap();
+        assert_eq!(loan.current_core(key, 49), Ok(2));
+        assert!(!owner.may_retire());
+        unsafe { owner.settle_checked_normal(loan, key, 49) }.unwrap();
+        assert!(owner.may_retire());
     }
 
     #[test]
