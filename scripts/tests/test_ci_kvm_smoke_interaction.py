@@ -709,6 +709,56 @@ class InteractionRunnerTests(unittest.TestCase):
         self.assertEqual([receipt["position"] for receipt in runner.cursor_receipts],
                          [[37, 446], [37, 458], [37, 470]])
 
+    def test_verified_click_retries_one_pixel_opposite_drift_without_early_press(self):
+        # KVM run 46141984183: the first correction from (957,78) toward
+        # (925,100) left x unchanged and measured y one pixel higher. A single
+        # noisy frame must not abort the bounded proof or authorize a click.
+        target = (925, 100)
+        measured = [(957, 78), (957, 77), (945, 85),
+                    (933, 94), target]
+        positions = iter(measured)
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "baseline", "actions": [], "wait_seconds": 0},
+                                   {"name": "desktop-pointer", "actions": [
+                                       {"verified_click": list(target)}], "wait_seconds": 0}]})
+        runner = InteractionRunner(
+            script, self.performed.append, self.captured.append, self.log,
+            self.clock,
+            cursor_probe=lambda _before, after, _target:
+                CursorProof(next(positions), after, "recorded-image-sha"))
+        runner.arm(0)
+        runner.advance(0)
+        self.assertEqual(runner.failures, 0)
+        self.assertEqual([receipt["position"] for receipt in runner.cursor_receipts],
+                         [list(position) for position in measured])
+        self.assertEqual(len(self.performed), len(measured) + 1)
+        self.assertTrue(all(not any(event["type"] == "btn"
+                                    for events, _pause in batches for event in events)
+                            for batches in self.performed[:-1]))
+        self.assertEqual([events[0]["data"]["down"]
+                          for events, _pause in self.performed[-1]], [True, False])
+
+    def test_verified_click_rejects_material_opposite_motion_without_press(self):
+        target = (925, 100)
+        positions = iter(((957, 78), (961, 74)))
+        script = parse_script({"screen": [1024, 768], "settle_seconds": 0,
+                               "steps": [
+                                   {"name": "baseline", "actions": [], "wait_seconds": 0},
+                                   {"name": "desktop-pointer", "actions": [
+                                       {"verified_click": list(target)}], "wait_seconds": 0}]})
+        runner = InteractionRunner(
+            script, self.performed.append, self.captured.append, self.log,
+            self.clock,
+            cursor_probe=lambda _before, after, _target:
+                CursorProof(next(positions), after, "recorded-image-sha"))
+        runner.arm(0)
+        runner.advance(0)
+        self.assertEqual(runner.failures, 1)
+        self.assertEqual(len(runner.cursor_receipts), 2)
+        self.assertEqual(len(self.performed), 2)
+        self.assertIn("opposite the correction", self.log.read_text())
+
     def test_verified_click_converges_with_measured_threefold_guest_acceleration(self):
         # Run 46031955425: a measured (889,126) hotspot moved to (1001,46)
         # when the runner requested (+36,-26). Every correction must be small
