@@ -148,7 +148,7 @@ fn select_current_tcb(block: &'static ExecutorLocal) -> u64 {
         core::arch::asm!(
             "syscall",
             in("rdx") crate::SYS_CALL as u64,
-            in("rdi") 1u64,
+            inout("rdi") 1u64 => _,
             inout("rsi") crate::LBL_TCB_SET_TLS_BASE << 12 => reply,
             in("r10") block as *const _ as u64,
             in("r8") 0u64,
