@@ -29637,7 +29637,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // No other thread accesses this owner during the proof-only bootstrap.
                 let owner = unsafe { &mut *raw };
                 match unsafe { owner.start() } {
-                    Ok(()) => print_str(b"[executor-passive-worker-probe] PASS\n"),
+                    Ok(()) => {
+                        print_str(b"[executor-passive-worker-probe] PASS\n");
+                        #[cfg(feature = "executor-fault-supervisor-probe")]
+                        match unsafe { owner.prove_supervised_fault_once() } {
+                            Ok(()) => print_str(b"[executor-fault-supervisor-probe] PASS\n"),
+                            Err(error) => {
+                                print_str(b"[executor-fault-supervisor-probe] FAIL stage=");
+                                print_str(error.stage);
+                                print_str(b" status=");
+                                print_hex_u64(error.status);
+                                print_str(b"\n");
+                            }
+                        }
+                    }
                     Err(error) => {
                         print_str(b"[executor-passive-worker-probe] FAIL stage=");
                         print_str(error.stage);

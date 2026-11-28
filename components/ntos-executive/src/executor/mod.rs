@@ -17,6 +17,8 @@ mod local;
 mod native_probe_resources;
 #[cfg(feature = "executor-passive-worker-probe")]
 mod native_worker;
+#[cfg(feature = "executor-fault-supervisor-probe")]
+mod native_supervisor;
 
 pub(crate) use local::{local, TransientLane, REPLY_MAIN_SLOT, RECEIVE_TRACE_DEPTH};
 #[cfg(feature = "executor-local-fs-probe")]

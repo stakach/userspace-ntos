@@ -9,8 +9,13 @@
 use alloc::boxed::Box;
 
 use nt_component_suspension::executor_local::{
-    ExecutorLocalRegistry, FsInstallAcknowledgement, PassiveWorkerReadyProof, PhysicalTcbClaim,
-    TcbIdentity,
+    ExecutorLocalAnchor, ExecutorLocalRegistry, FsInstallAcknowledgement, PassiveWorkerReadyProof,
+    PhysicalTcbClaim, TcbIdentity,
+};
+#[cfg(feature = "executor-fault-supervisor-probe")]
+use nt_component_suspension::{
+    ExecutorFaultBinding, ExecutorFaultReport, ExecutorResume, ExecutorRun, ExecutorState,
+    ExecutorYield, RootReplyIdentity, RootReplySlotTable,
 };
 use nt_component_suspension::{ExecutorHandle, ExecutorTable, RunToken};
 use nt_user_host::sched_context::{
@@ -21,6 +26,8 @@ use nt_user_host::sched_context::{
 use super::native_probe_resources::{
     checked, resume_owned_tcb, retype_owned, try_box, OwnedCap, ProbeFailure,
 };
+#[cfg(feature = "executor-fault-supervisor-probe")]
+use super::native_supervisor::{NativeSupervisorProbe, TERMINAL_INFO, TERMINAL_STATUS};
 use super::{local, ExecutorLocal};
 use crate::*;
 
@@ -41,17 +48,28 @@ struct WorkerEntryArgs {
     expected_local: *const ExecutorLocal,
 }
 
+#[cfg(feature = "executor-fault-supervisor-probe")]
+struct FaultCallOwner {
+    _root_replies: RootReplySlotTable,
+    _supervisor_replies: RootReplySlotTable,
+    root_reply: RootReplyIdentity,
+    supervisor_reply: RootReplyIdentity,
+    run: Option<ExecutorRun>,
+    refused_report: Option<ExecutorFaultReport>,
+}
+
 /// Root publishes this heap-allocated value before its first native effect and retains the one
 /// handle for eventual exact TCB retirement. The worker dereferences only its separately boxed
 /// entry arguments and executor-local block, never a field of root's stack frame.
 #[must_use = "retain worker caps and FS payload until exact physical TCB retirement"]
 pub(crate) struct NativeWorkerProbe {
     table: ExecutorTable,
-    root: RunToken,
+    root: Option<RunToken>,
     locals: ExecutorLocalRegistry<ExecutorLocal>,
     start_attempted: bool,
     executor: Option<ExecutorHandle>,
     identity: Option<TcbIdentity>,
+    anchor: Option<ExecutorLocalAnchor>,
     tcb: Option<OwnedCap>,
     endpoint: Option<OwnedCap>,
     reply: Option<OwnedCap>,
@@ -65,6 +83,12 @@ pub(crate) struct NativeWorkerProbe {
     ready: Option<PassiveWorkerReadyProof>,
     bootstrap: Option<PassiveWorkerBootstrap>,
     passive: Option<PassiveWorker>,
+    #[cfg(feature = "executor-fault-supervisor-probe")]
+    fault_probe_attempted: bool,
+    #[cfg(feature = "executor-fault-supervisor-probe")]
+    supervisor: Option<Box<NativeSupervisorProbe>>,
+    #[cfg(feature = "executor-fault-supervisor-probe")]
+    fault_call: Option<FaultCallOwner>,
 }
 
 impl NativeWorkerProbe {
@@ -75,11 +99,12 @@ impl NativeWorkerProbe {
         try_box(
             Self {
                 table,
-                root,
+                root: Some(root),
                 locals: ExecutorLocalRegistry::new(),
                 start_attempted: false,
                 executor: None,
                 identity: None,
+                anchor: None,
                 tcb: None,
                 endpoint: None,
                 reply: None,
@@ -93,6 +118,12 @@ impl NativeWorkerProbe {
                 ready: None,
                 bootstrap: None,
                 passive: None,
+                #[cfg(feature = "executor-fault-supervisor-probe")]
+                fault_probe_attempted: false,
+                #[cfg(feature = "executor-fault-supervisor-probe")]
+                supervisor: None,
+                #[cfg(feature = "executor-fault-supervisor-probe")]
+                fault_call: None,
             },
             b"owner-alloc",
         )
@@ -171,7 +202,11 @@ impl NativeWorkerProbe {
 
         let executor = self
             .table
-            .register_unready(&self.root)
+            .register_unready(
+                self.root
+                    .as_ref()
+                    .ok_or(ProbeFailure::at(b"root-owner", 0))?,
+            )
             .map_err(|_| ProbeFailure::at(b"register-unready", u64::MAX))?;
         self.executor = Some(executor);
         let payload = try_box(ExecutorLocal::new(), b"local-alloc")?;
@@ -200,6 +235,7 @@ impl NativeWorkerProbe {
                 return Err(ProbeFailure::at(b"local-bind", u64::MAX));
             }
         };
+        self.anchor = Some(anchor);
         let attempt = self
             .locals
             .begin_fs_install(anchor, &self.table)
@@ -286,7 +322,13 @@ impl NativeWorkerProbe {
             .ready
             .take()
             .ok_or(ProbeFailure::at(b"ready-owner", 0))?;
-        match self.table.activate_unready(&self.root, fs_ack, ready) {
+        match self.table.activate_unready(
+            self.root
+                .as_ref()
+                .ok_or(ProbeFailure::at(b"root-owner", 0))?,
+            fs_ack,
+            ready,
+        ) {
             Ok(activated) if activated == executor => Ok(()),
             Ok(_) => Err(ProbeFailure::at(b"activate-identity", u64::MAX)),
             Err((_, fs_ack, ready)) => {
@@ -296,6 +338,223 @@ impl NativeWorkerProbe {
             }
         }
     }
+
+    /// Give one private Call to the admitted worker. Its deliberate #UD must be delivered to
+    /// the separately scheduled supervisor, which suspends that exact worker and returns the
+    /// terminal on a pre-existing alias of the worker's Reply. Every owner stays published after
+    /// the terminal: this proof does not retire or reuse either Reply or the faulted TCB.
+    ///
+    /// # Safety
+    /// Root is the sole accessor of this published owner. The worker has completed `start`,
+    /// and the native CSpace/VSpace and root TCB are still live.
+    #[cfg(feature = "executor-fault-supervisor-probe")]
+    pub(crate) unsafe fn prove_supervised_fault_once(&mut self) -> Result<(), ProbeFailure> {
+        if core::mem::replace(&mut self.fault_probe_attempted, true) {
+            return Err(ProbeFailure::at(b"fault-probe-already-attempted", u64::MAX));
+        }
+        let _durable = allocator::enter_durable();
+        let executor = self
+            .executor
+            .ok_or(ProbeFailure::at(b"fault-executor-owner", 0))?;
+        if self.table.state(executor) != Ok(ExecutorState::Idle) {
+            return Err(ProbeFailure::at(b"fault-worker-not-idle", 0));
+        }
+        let tcb = self
+            .tcb
+            .as_ref()
+            .ok_or(ProbeFailure::at(b"fault-tcb-owner", 0))?
+            .value();
+        let identity = self
+            .identity
+            .ok_or(ProbeFailure::at(b"fault-tcb-identity", 0))?;
+        let anchor = self
+            .anchor
+            .ok_or(ProbeFailure::at(b"fault-local-anchor", 0))?;
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or(ProbeFailure::at(b"fault-endpoint-owner", 0))?
+            .value();
+        let worker_reply = self
+            .reply
+            .as_ref()
+            .ok_or(ProbeFailure::at(b"fault-reply-owner", 0))?
+            .value();
+
+        // Publish the stable subowner before it acquires a capability. Its entry argument is an
+        // immutable boxed value and never borrows this owner while root blocks in the Call.
+        self.supervisor = Some(NativeSupervisorProbe::try_new_boxed()?);
+        let supervisor = self
+            .supervisor
+            .as_mut()
+            .ok_or(ProbeFailure::at(b"fault-supervisor-owner", 0))?;
+        let fault_endpoint = unsafe { supervisor.prepare(tcb, worker_reply)? };
+        checked(b"fault-handler-install", unsafe {
+            tcb_set_space_r(tcb, fault_endpoint, 0, 0)
+        })?;
+        let fault_reply = supervisor
+            .fault_reply()
+            .ok_or(ProbeFailure::at(b"fault-supervisor-reply", 0))?;
+        let alias = supervisor
+            .root_reply_alias()
+            .ok_or(ProbeFailure::at(b"fault-root-reply-alias", 0))?;
+
+        let mut root_replies = RootReplySlotTable::new(1)
+            .map_err(|_| ProbeFailure::at(b"fault-root-reply-table", u64::MAX))?;
+        let mut supervisor_replies = RootReplySlotTable::new(1)
+            .map_err(|_| ProbeFailure::at(b"fault-supervisor-reply-table", u64::MAX))?;
+        let root_reply = root_replies
+            .insert_free(worker_reply)
+            .map_err(|_| ProbeFailure::at(b"fault-root-reply-id", u64::MAX))?;
+        let supervisor_reply = supervisor_replies
+            .insert_free(fault_reply)
+            .map_err(|_| ProbeFailure::at(b"fault-supervisor-reply-id", u64::MAX))?;
+        // Conservatively claim both Replies before the Call can bind them. The Used state
+        // prevents reuse even if either following native effect is uncertain.
+        root_replies
+            .mark_used(root_reply)
+            .map_err(|_| ProbeFailure::at(b"fault-root-reply-claim", u64::MAX))?;
+        supervisor_replies
+            .mark_used(supervisor_reply)
+            .map_err(|_| ProbeFailure::at(b"fault-supervisor-reply-claim", u64::MAX))?;
+        self.fault_call = Some(FaultCallOwner {
+            _root_replies: root_replies,
+            _supervisor_replies: supervisor_replies,
+            root_reply,
+            supervisor_reply,
+            run: None,
+            refused_report: None,
+        });
+
+        // All fallible physical-identity checks precede the run-token transfer. If the later
+        // pure binding refuses, an ordinary idle yield restores the token before any native Call.
+        let claim = self
+            .locals
+            .physical_claim_for(anchor, identity, executor)
+            .map_err(|_| ProbeFailure::at(b"fault-physical-claim", u64::MAX))?;
+        let binding = unsafe {
+            ExecutorFaultBinding::from_native(executor, claim, root_reply, supervisor_reply)
+        }
+        .ok_or(ProbeFailure::at(b"fault-binding-owner", 0))?;
+
+        let token = self
+            .root
+            .take()
+            .ok_or(ProbeFailure::at(b"fault-root-token", 0))?;
+        let run = match self.table.resume(token, ExecutorResume::Unrouted) {
+            Ok(run) => run,
+            Err((_, token)) => {
+                self.root = Some(token);
+                return Err(ProbeFailure::at(b"fault-run-resume", u64::MAX));
+            }
+        };
+        self.fault_call
+            .as_mut()
+            .ok_or(ProbeFailure::at(b"fault-call-owner", 0))?
+            .run = Some(run);
+        let run = self
+            .fault_call
+            .as_ref()
+            .and_then(|owner| owner.run.as_ref())
+            .ok_or(ProbeFailure::at(b"fault-run-owner", 0))?;
+        if self.table.bind_fault(run, binding).is_err() {
+            let run = self
+                .fault_call
+                .as_mut()
+                .and_then(|owner| owner.run.take())
+                .ok_or(ProbeFailure::at(b"fault-run-owner", 0))?;
+            match self.table.accept_yield(run, ExecutorYield::Idle) {
+                Ok(token) => self.root = Some(token),
+                Err((_, run)) => {
+                    self.fault_call
+                        .as_mut()
+                        .ok_or(ProbeFailure::at(b"fault-call-owner", 0))?
+                        .run = Some(run);
+                }
+            }
+            return Err(ProbeFailure::at(b"fault-binding", u64::MAX));
+        }
+
+        let (reply_info, reply_status) = unsafe { call_worker_once(endpoint) };
+        crate::print_str(b"[executor-fault-supervisor-probe] terminal-info=");
+        crate::print_hex_u64(reply_info);
+        crate::print_str(b" status=");
+        crate::print_hex_u64(reply_status);
+        crate::print_str(b"\n");
+        // The checked terminal and both now-free physical Reply bindings are required before
+        // acknowledging the fault. A mismatched return quarantines the run, never yields it.
+        let exact = reply_info == TERMINAL_INFO
+            && reply_status == TERMINAL_STATUS
+            && unsafe { sel4_rt::reply_binding::query(1, alias) }
+                == Ok(sel4_rt::reply_binding::Binding::Free)
+            && unsafe { sel4_rt::reply_binding::query(tcb, fault_reply) }
+                == Ok(sel4_rt::reply_binding::Binding::Free);
+        let report = if exact {
+            unsafe {
+                ExecutorFaultReport::acknowledged(
+                    executor,
+                    identity,
+                    tcb,
+                    root_reply,
+                    supervisor_reply,
+                )
+            }
+        } else {
+            unsafe {
+                ExecutorFaultReport::uncertain(
+                    executor,
+                    identity,
+                    tcb,
+                    root_reply,
+                    supervisor_reply,
+                )
+            }
+        }
+        .ok_or(ProbeFailure::at(b"fault-report-owner", 0))?;
+        let run = self
+            .fault_call
+            .as_mut()
+            .and_then(|owner| owner.run.take())
+            .ok_or(ProbeFailure::at(b"fault-run-owner", 0))?;
+        match self.table.accept_fault_terminal(run, report) {
+            Ok(token) => self.root = Some(token),
+            Err((_, run, report)) => {
+                let owner = self
+                    .fault_call
+                    .as_mut()
+                    .ok_or(ProbeFailure::at(b"fault-call-owner", 0))?;
+                owner.run = Some(run);
+                owner.refused_report = Some(report);
+                return Err(ProbeFailure::at(b"fault-terminal-uncertain", reply_info));
+            }
+        }
+        if self.table.state(executor) != Ok(ExecutorState::Faulted) {
+            return Err(ProbeFailure::at(b"fault-state", u64::MAX));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "executor-fault-supervisor-probe")]
+unsafe fn call_worker_once(endpoint: u64) -> (u64, u64) {
+    let info: u64;
+    let status: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inout("rdx") SYS_CALL as u64 => _,
+            inout("rdi") endpoint => _,
+            inout("rsi") (0x382u64 << 12) => info,
+            inout("r10") 0u64 => status,
+            inout("r8") 0u64 => _,
+            inout("r9") 0u64 => _,
+            in("r12") 0u64,
+            in("r13") 0u64,
+            lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+            options(nostack),
+        );
+    }
+    (info, status)
 }
 
 struct NativeUnbinder;
