@@ -122,6 +122,8 @@ pub enum ExecutorError {
     NotUnready,
     /// FS publication and checked passive receive refer to different physical workers.
     WorkerProofMismatch,
+    /// A live or uncertain worker already owns this private endpoint or Reply cap.
+    DuplicateWorkerIngress,
     /// A fault binding or retirement observation named a different physical owner.
     FaultIdentityMismatch,
     /// The current run has no fault binding, or it already has one.
@@ -512,6 +514,15 @@ struct Slot {
     state: ExecutorState,
     fault: Option<FaultRecord>,
     live: Option<LiveJobRecord>,
+    private_ingress: Option<PrivateWorkerIngress>,
+}
+
+#[derive(Clone, Copy)]
+struct PrivateWorkerIngress {
+    tcb: TcbIdentity,
+    target_cap: u64,
+    endpoint_cap: u64,
+    reply_cap: u64,
 }
 
 /// Owns executor identity and the single derived route-to-waiter view.
@@ -581,17 +592,23 @@ impl ExecutorTable {
         if root.table != self.id {
             return Err(ExecutorError::WrongTable);
         }
-        // A retired slot that cannot take a new generation stays retired for good.
+        // A logical terminal does not prove physical endpoint and Reply retirement. Keep an
+        // admitted worker's selector reservation until exact native teardown is modeled.
         let reusable = self
             .slots
             .iter()
-            .position(|slot| slot.state == ExecutorState::Retired && slot.generation < u64::MAX);
+            .position(|slot| {
+                slot.state == ExecutorState::Retired
+                    && slot.private_ingress.is_none()
+                    && slot.generation < u64::MAX
+            });
         let index = match reusable {
             Some(index) => {
                 self.slots[index].generation += 1;
                 self.slots[index].state = initial;
                 self.slots[index].fault = None;
                 self.slots[index].live = None;
+                self.slots[index].private_ingress = None;
                 index
             }
             None if self.slots.len() < self.capacity => {
@@ -600,12 +617,55 @@ impl ExecutorTable {
                     state: initial,
                     fault: None,
                     live: None,
+                    private_ingress: None,
                 });
                 self.slots.len() - 1
             }
             None => return Err(ExecutorError::NoCapacity),
         };
         Ok(self.handle(index))
+    }
+
+    /// Record the exact private ingress resources before a worker becomes runnable.
+    /// The native owner retains both physical capabilities; these numeric selectors only
+    /// exclude accidental sharing across live workers and retained retirement tombstones.
+    pub fn admit_private_ingress(
+        &mut self,
+        root: &RunToken,
+        executor: ExecutorHandle,
+        endpoint: &PhysicalWorkerEndpointClaim,
+        reply_owner: &RootReplySlotTable,
+        reply: RootReplyIdentity,
+    ) -> Result<(), ExecutorError> {
+        if root.table != self.id {
+            return Err(ExecutorError::WrongTable);
+        }
+        if self.state(executor)? != ExecutorState::Unready {
+            return Err(ExecutorError::NotUnready);
+        }
+        let index = executor.index as usize;
+        if self.slots[index].private_ingress.is_some() {
+            return Err(ExecutorError::DuplicateWorkerIngress);
+        }
+        if reply_owner.state(reply) != Ok(RootReplySlotState::Used)
+            || reply.cap() == 0 || endpoint.endpoint_cap() == 0
+        {
+            return Err(ExecutorError::WorkerProofMismatch);
+        }
+        if self.slots.iter().any(|slot| {
+            slot.private_ingress.is_some_and(|owner| {
+                owner.endpoint_cap == endpoint.endpoint_cap() || owner.reply_cap == reply.cap()
+            })
+        }) {
+            return Err(ExecutorError::DuplicateWorkerIngress);
+        }
+        self.slots[index].private_ingress = Some(PrivateWorkerIngress {
+            tcb: endpoint.tcb(),
+            target_cap: endpoint.target_cap(),
+            endpoint_cap: endpoint.endpoint_cap(),
+            reply_cap: reply.cap(),
+        });
+        Ok(())
     }
 
     /// Publish an unready worker only after both FS publication and checked passive unbind
@@ -639,6 +699,11 @@ impl ExecutorTable {
         let slot = &mut self.slots[executor.index as usize];
         if slot.state != ExecutorState::Unready {
             return Err((ExecutorError::NotUnready, acknowledged, ready));
+        }
+        if slot.private_ingress.is_some_and(|owner| {
+            owner.tcb != ready.tcb() || owner.target_cap != ready.target_cap()
+        }) {
+            return Err((ExecutorError::WorkerProofMismatch, acknowledged, ready));
         }
         slot.state = ExecutorState::Idle;
         Ok(executor)

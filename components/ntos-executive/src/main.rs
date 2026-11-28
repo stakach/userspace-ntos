@@ -29663,14 +29663,31 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     Ok(()) => {
                         print_str(b"[executor-passive-worker-probe] PASS\n");
                         #[cfg(feature = "executor-fault-supervisor-probe")]
-                        match unsafe { owner.prove_supervised_fault_once() } {
-                            Ok(()) => print_str(b"[executor-fault-supervisor-probe] PASS\n"),
+                        let production_allowed = match unsafe { owner.prove_supervised_fault_once() } {
+                            Ok(()) => {
+                                print_str(b"[executor-fault-supervisor-probe] PASS\n");
+                                true
+                            },
                             Err(error) => {
                                 print_str(b"[executor-fault-supervisor-probe] FAIL stage=");
                                 print_str(error.stage);
                                 print_str(b" status=");
                                 print_hex_u64(error.status);
                                 print_str(b"\n");
+                                false
+                            }
+                        };
+                        #[cfg(feature = "executor-fault-supervisor-probe")]
+                        if production_allowed {
+                            match unsafe { owner.start_production() } {
+                                Ok(()) => print_str(b"[executor-production-worker] PASS\n"),
+                                Err(error) => {
+                                    print_str(b"[executor-production-worker] FAIL stage=");
+                                    print_str(error.stage);
+                                    print_str(b" status=");
+                                    print_hex_u64(error.status);
+                                    print_str(b"\n");
+                                }
                             }
                         }
                     }

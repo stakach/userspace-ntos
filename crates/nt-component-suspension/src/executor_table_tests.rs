@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    executor_local::{PhysicalTcbClaim, TcbIdentity, TcbRetirementObservation},
+    executor_local::{PhysicalTcbClaim, PhysicalWorkerEndpointClaim, TcbIdentity, TcbRetirementObservation},
     peer_registry::{PeerIdentity, PeerRegistry},
     LaneHandle, RootReplyIdentity, RootReplyReplacementError, RootReplySlotState, RootReplySlotTable,
 };
@@ -294,6 +294,62 @@ fn unready_worker_cannot_receive_unrouted_work_before_fs_publication() {
         matches!(result, Err((ExecutorError::NoIdleExecutor, _))),
         "unready worker {worker:?} must not be selected before FS publication"
     );
+}
+
+#[test]
+fn two_worker_ingress_owners_refuse_reused_endpoint_or_reply_caps() {
+    let (mut table, root) = ExecutorTable::try_new(2).unwrap();
+    let diagnostic = table.register_unready(&root).unwrap();
+    let production = table.register_unready(&root).unwrap();
+    let diagnostic_tcb = unsafe {
+        PhysicalTcbClaim::new(TcbIdentity::new(0x120, 1), 0x220).unwrap()
+    };
+    let production_tcb = unsafe {
+        PhysicalTcbClaim::new(TcbIdentity::new(0x121, 1), 0x221).unwrap()
+    };
+    let diagnostic_endpoint = unsafe {
+        PhysicalWorkerEndpointClaim::from_native(&diagnostic_tcb, 0x320, 1).unwrap()
+    };
+    let reused_endpoint = unsafe {
+        PhysicalWorkerEndpointClaim::from_native(&production_tcb, 0x320, 2).unwrap()
+    };
+    let distinct_endpoint = unsafe {
+        PhysicalWorkerEndpointClaim::from_native(&production_tcb, 0x321, 1).unwrap()
+    };
+    // Distinct Reply tables can each believe the same numeric cap is free. The executor table
+    // must still exclude that physical Reply from a second live worker.
+    let mut first_replies = RootReplySlotTable::new(1).unwrap();
+    let first_reply = first_replies.insert_free(0x420).unwrap();
+    first_replies.mark_used(first_reply).unwrap();
+    let mut other_replies = RootReplySlotTable::new(2).unwrap();
+    let distinct_reply = other_replies.insert_free(0x421).unwrap();
+    let reused_reply = other_replies.insert_free(0x420).unwrap();
+    other_replies.mark_used(distinct_reply).unwrap();
+    other_replies.mark_used(reused_reply).unwrap();
+
+    table.admit_private_ingress(&root, diagnostic, &diagnostic_endpoint, &first_replies, first_reply).unwrap();
+    assert_eq!(
+        table.admit_private_ingress(&root, production, &reused_endpoint, &other_replies, distinct_reply),
+        Err(ExecutorError::DuplicateWorkerIngress),
+    );
+    assert_eq!(
+        table.admit_private_ingress(&root, production, &distinct_endpoint, &other_replies, reused_reply),
+        Err(ExecutorError::DuplicateWorkerIngress),
+    );
+    table.admit_private_ingress(
+        &root, production, &distinct_endpoint, &other_replies, distinct_reply,
+    ).unwrap();
+    assert_eq!(
+        table.admit_private_ingress(
+            &root, production, &distinct_endpoint, &other_replies, distinct_reply,
+        ),
+        Err(ExecutorError::DuplicateWorkerIngress),
+    );
+    assert_eq!(table.state(diagnostic), Ok(ExecutorState::Unready));
+    assert_eq!(table.state(production), Ok(ExecutorState::Unready));
+    assert_eq!(diagnostic_endpoint.endpoint_cap(), 0x320);
+    assert_eq!(reused_endpoint.tcb(), production_tcb.identity());
+    assert_eq!(reused_reply.cap(), first_reply.cap());
 }
 
 #[test]

@@ -133,6 +133,52 @@ pub mod root {
         TABLE_SPAN,
     );
 
+    /// One guarded stack and private IPC page per physical executive worker.
+    // Odd 128 KiB cells are reserved for independently scheduled fault supervisors.
+    const EXECUTOR_WORKER_STRIDE: u64 = 0x4_0000;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct ExecutorWorkerSlot {
+        pub guard: Region,
+        pub stack: Region,
+        pub ipc: Region,
+    }
+
+    /// The supervisor retains its own mapped stack and IPC page even after a diagnostic fault.
+    pub const EXECUTOR_FAULT_SUPERVISOR: ExecutorWorkerSlot =
+        match executor_fault_supervisor_slot(0) {
+            Some(slot) => slot,
+            None => panic!("diagnostic supervisor slot must fit the root address plan"),
+        };
+
+    /// A supervisor occupies the unused half of its worker's 256 KiB address cell.
+    pub const fn executor_fault_supervisor_slot(index: usize) -> Option<ExecutorWorkerSlot> {
+        if index >= (EXECUTOR_WORKERS.len / EXECUTOR_WORKER_STRIDE) as usize {
+            return None;
+        }
+        let base = EXECUTOR_WORKERS.base + index as u64 * EXECUTOR_WORKER_STRIDE + 0x2_0000;
+        Some(ExecutorWorkerSlot {
+            guard: Region::new("executor fault supervisor guard", base, PAGE),
+            stack: Region::new("executor fault supervisor stack", base + PAGE, 8 * PAGE),
+            ipc: Region::new("executor fault supervisor IPC", base + 0x1_0000, PAGE),
+        })
+    }
+
+    /// The first slot preserves the existing diagnostic worker mapping. A second worker can
+    /// remain mapped alongside it, even if the diagnostic TCB is faulted and retained.
+    pub const fn executor_worker_slot(index: usize) -> Option<ExecutorWorkerSlot> {
+        if index >= (EXECUTOR_WORKERS.len / EXECUTOR_WORKER_STRIDE) as usize {
+            return None;
+        }
+        // The bound above makes this cast and multiplication safe on every supported host.
+        let base = EXECUTOR_WORKERS.base + index as u64 * EXECUTOR_WORKER_STRIDE;
+        Some(ExecutorWorkerSlot {
+            guard: Region::new("executor worker guard", base, PAGE),
+            stack: Region::new("executor worker stack", base + PAGE, 8 * PAGE),
+            ipc: Region::new("executor worker IPC", base + 0x1_0000, PAGE),
+        })
+    }
+
     /// One [`DYNAMIC_RUNTIME_STRIDE`] per dynamically admitted process. Nothing follows it
     /// below [`DISPLAY_WINDOW`], so the process limit can rise to the badge limit in place.
     pub const DYNAMIC_RUNTIME: Region = Region::new(

@@ -51,7 +51,7 @@ on:
         type: boolean
         default: false
       executor_fault_supervisor_probe:
-        description: Prove a checked supervisor terminal for one private worker fault
+        description: Prove the diagnostic fault terminal and a distinct supervised production worker
         type: boolean
         default: false
 
@@ -278,6 +278,9 @@ jobs:
           REQUIRE_FAULT_SUPERVISOR_PROBE: ${{ inputs.executor_fault_supervisor_probe && '1' || '' }}
         run: |
           set -euo pipefail
+          probe_args=()
+          if [ -n "$REQUIRE_PASSIVE_WORKER_PROBE" ]; then probe_args+=(--require-passive); fi
+          if [ -n "$REQUIRE_FAULT_SUPERVISOR_PROBE" ]; then probe_args+=(--require-supervisor); fi
           interact_args=()
           if [ -n "$INTERACT" ]; then
             case "$INTERACTION_PROFILE" in
@@ -289,14 +292,8 @@ jobs:
           boot_status=0
           rm -f native-kvm-qemu-stopped
           python3 scripts/ci_kvm_smoke.py --seconds "$BOOT_SECONDS" --trace-interrupts "${interact_args[@]}" || boot_status=$?
-          if [ -n "$REQUIRE_PASSIVE_WORKER_PROBE" ] \
-            && ! grep -aFq '[executor-passive-worker-probe] PASS' native-kvm-smoke.log; then
-            echo 'native passive-worker bootstrap proof did not pass' >&2
-            boot_status=1
-          fi
-          if [ -n "$REQUIRE_FAULT_SUPERVISOR_PROBE" ] \
-            && ! grep -aFq '[executor-fault-supervisor-probe] PASS' native-kvm-smoke.log; then
-            echo 'native fault-supervisor terminal proof did not pass' >&2
+          if [ "${#probe_args[@]}" -ne 0 ] \
+            && ! python3 scripts/ci_kvm_probe_markers.py native-kvm-smoke.log "${probe_args[@]}"; then
             boot_status=1
           fi
           if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
@@ -331,14 +328,8 @@ jobs:
             fi
             rm -f native-kvm-qemu-stopped
             python3 scripts/ci_kvm_smoke.py --seconds "$BOOT_SECONDS" --trace-interrupts "${boot2_args[@]}" "${interact_args[@]}" || boot_status=$?
-            if [ -n "$REQUIRE_PASSIVE_WORKER_PROBE" ] \
-              && ! grep -aFq '[executor-passive-worker-probe] PASS' native-kvm-smoke.log; then
-              echo 'native passive-worker bootstrap proof did not pass on boot 2' >&2
-              boot_status=1
-            fi
-            if [ -n "$REQUIRE_FAULT_SUPERVISOR_PROBE" ] \
-              && ! grep -aFq '[executor-fault-supervisor-probe] PASS' native-kvm-smoke.log; then
-              echo 'native fault-supervisor terminal proof did not pass on boot 2' >&2
+            if [ "${#probe_args[@]}" -ne 0 ] \
+              && ! python3 scripts/ci_kvm_probe_markers.py native-kvm-smoke.log "${probe_args[@]}"; then
               boot_status=1
             fi
             if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi

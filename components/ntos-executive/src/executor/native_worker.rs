@@ -10,14 +10,14 @@ use alloc::boxed::Box;
 
 use nt_component_suspension::executor_local::{
     ExecutorLocalAnchor, ExecutorLocalRegistry, FsInstallAcknowledgement, PassiveWorkerReadyProof,
-    PhysicalTcbClaim, TcbIdentity,
+    PhysicalTcbClaim, PhysicalWorkerEndpointClaim, TcbIdentity,
 };
 #[cfg(feature = "executor-fault-supervisor-probe")]
 use nt_component_suspension::{
     ExecutorFaultBinding, ExecutorFaultReport, ExecutorResume, ExecutorRun, ExecutorState,
-    ExecutorYield, RootReplyIdentity, RootReplySlotTable,
+    ExecutorYield,
 };
-use nt_component_suspension::{ExecutorHandle, ExecutorTable, RunToken};
+use nt_component_suspension::{ExecutorHandle, ExecutorTable, RootReplyIdentity, RootReplySlotTable, RunToken};
 use nt_user_host::sched_context::{
     BootstrapError, BootstrapUnbindIo, PassiveWorker, PassiveWorkerBootstrap, UnbindOutcome,
     WorkerBootstrapResources,
@@ -31,13 +31,17 @@ use super::native_supervisor::{NativeSupervisorProbe, TERMINAL_INFO, TERMINAL_ST
 use super::{local, ExecutorLocal};
 use crate::*;
 
-const STACK_PAGES: usize = 8;
-const WORKER_BASE: u64 = nt_executive_layout::root::EXECUTOR_WORKERS.base;
-const STACK_FIRST: u64 = WORKER_BASE + 0x1000;
-const STACK_TOP: u64 = STACK_FIRST + STACK_PAGES as u64 * 0x1000;
-const IPC_VA: u64 = WORKER_BASE + 0x1_0000;
+const WORKER_SLOT: nt_executive_layout::root::ExecutorWorkerSlot =
+    match nt_executive_layout::root::executor_worker_slot(0) {
+        Some(slot) => slot,
+        None => panic!("diagnostic executor slot must fit the root address plan"),
+    };
+const STACK_PAGES: usize = (WORKER_SLOT.stack.len / nt_executive_layout::PAGE) as usize;
+const STACK_FIRST: u64 = WORKER_SLOT.stack.base;
+const STACK_TOP: u64 = WORKER_SLOT.stack.end();
+const IPC_VA: u64 = WORKER_SLOT.ipc.base;
 const _: () = {
-    assert!(STACK_FIRST - WORKER_BASE == 0x1000);
+    assert!(STACK_FIRST == WORKER_SLOT.guard.end());
     assert!(IPC_VA >= STACK_TOP + 0x1000);
     assert!(IPC_VA + 0x1000 <= nt_executive_layout::root::EXECUTOR_WORKERS.end());
 };
@@ -62,10 +66,8 @@ struct FaultCallOwner {
 /// handle for eventual exact TCB retirement. The worker dereferences only its separately boxed
 /// entry arguments and executor-local block, never a field of root's stack frame.
 #[must_use = "retain worker caps and FS payload until exact physical TCB retirement"]
-pub(crate) struct NativeWorkerProbe {
-    table: ExecutorTable,
-    root: Option<RunToken>,
-    locals: ExecutorLocalRegistry<ExecutorLocal>,
+struct NativePassiveWorker {
+    slot: nt_executive_layout::root::ExecutorWorkerSlot,
     start_attempted: bool,
     executor: Option<ExecutorHandle>,
     identity: Option<TcbIdentity>,
@@ -83,10 +85,50 @@ pub(crate) struct NativeWorkerProbe {
     ready: Option<PassiveWorkerReadyProof>,
     bootstrap: Option<PassiveWorkerBootstrap>,
     passive: Option<PassiveWorker>,
+    ingress_claim: Option<PhysicalWorkerEndpointClaim>,
+    private_reply: Option<RootReplyIdentity>,
+}
+
+impl NativePassiveWorker {
+    fn new(slot: nt_executive_layout::root::ExecutorWorkerSlot) -> Self {
+        Self {
+            slot,
+            start_attempted: false,
+            executor: None,
+            identity: None,
+            anchor: None,
+            tcb: None,
+            endpoint: None,
+            reply: None,
+            ipc_frame: None,
+            stack_frames: [const { None }; STACK_PAGES],
+            bootstrap_sc: None,
+            unbound_local: None,
+            unbound_claim: None,
+            entry_args: None,
+            fs_ack: None,
+            ready: None,
+            bootstrap: None,
+            passive: None,
+            ingress_claim: None,
+            private_reply: None,
+        }
+    }
+}
+
+pub(crate) struct NativeWorkerProbe {
+    table: ExecutorTable,
+    root: Option<RunToken>,
+    locals: ExecutorLocalRegistry<ExecutorLocal>,
+    private_replies: RootReplySlotTable,
+    diagnostic: NativePassiveWorker,
+    production: NativePassiveWorker,
     #[cfg(feature = "executor-fault-supervisor-probe")]
     fault_probe_attempted: bool,
     #[cfg(feature = "executor-fault-supervisor-probe")]
     supervisor: Option<Box<NativeSupervisorProbe>>,
+    #[cfg(feature = "executor-fault-supervisor-probe")]
+    production_supervisor: Option<Box<NativeSupervisorProbe>>,
     #[cfg(feature = "executor-fault-supervisor-probe")]
     fault_call: Option<FaultCallOwner>,
 }
@@ -95,33 +137,25 @@ impl NativeWorkerProbe {
     pub(crate) fn try_new_boxed() -> Result<Box<Self>, ProbeFailure> {
         let _durable = allocator::enter_durable();
         let (table, root) =
-            ExecutorTable::try_new(1).map_err(|_| ProbeFailure::at(b"executor-table", u64::MAX))?;
+            ExecutorTable::try_new(2).map_err(|_| ProbeFailure::at(b"executor-table", u64::MAX))?;
+        let private_replies = RootReplySlotTable::new(2)
+            .map_err(|_| ProbeFailure::at(b"private-reply-table", u64::MAX))?;
+        let production_slot = nt_executive_layout::root::executor_worker_slot(1)
+            .ok_or(ProbeFailure::at(b"production-address-slot", 1))?;
         try_box(
             Self {
                 table,
                 root: Some(root),
                 locals: ExecutorLocalRegistry::new(),
-                start_attempted: false,
-                executor: None,
-                identity: None,
-                anchor: None,
-                tcb: None,
-                endpoint: None,
-                reply: None,
-                ipc_frame: None,
-                stack_frames: [const { None }; STACK_PAGES],
-                bootstrap_sc: None,
-                unbound_local: None,
-                unbound_claim: None,
-                entry_args: None,
-                fs_ack: None,
-                ready: None,
-                bootstrap: None,
-                passive: None,
+                private_replies,
+                diagnostic: NativePassiveWorker::new(WORKER_SLOT),
+                production: NativePassiveWorker::new(production_slot),
                 #[cfg(feature = "executor-fault-supervisor-probe")]
                 fault_probe_attempted: false,
                 #[cfg(feature = "executor-fault-supervisor-probe")]
                 supervisor: None,
+                #[cfg(feature = "executor-fault-supervisor-probe")]
+                production_supervisor: None,
                 #[cfg(feature = "executor-fault-supervisor-probe")]
                 fault_call: None,
             },
@@ -137,42 +171,66 @@ impl NativeWorkerProbe {
     /// The root task must be the sole accessor of the published owner throughout bootstrap.
     /// The root's CSpace and VSpace must still be the active native address space.
     pub(crate) unsafe fn start(&mut self) -> Result<(), ProbeFailure> {
+        unsafe { self.start_one(false) }
+    }
+
+    /// Admit a distinct idle worker while the diagnostic worker remains faulted and retained.
+    #[cfg(feature = "executor-fault-supervisor-probe")]
+    pub(crate) unsafe fn start_production(&mut self) -> Result<(), ProbeFailure> {
+        if self.diagnostic.executor
+            .and_then(|executor| self.table.state(executor).ok())
+            != Some(ExecutorState::Faulted)
+        {
+            return Err(ProbeFailure::at(b"diagnostic-not-faulted", 0));
+        }
+        unsafe { self.start_one(true)?; }
+        if self.production.executor
+            .and_then(|executor| self.table.state(executor).ok())
+            != Some(ExecutorState::Idle)
+        {
+            return Err(ProbeFailure::at(b"production-not-idle", 0));
+        }
+        Ok(())
+    }
+
+    unsafe fn start_one(&mut self, production: bool) -> Result<(), ProbeFailure> {
+        let worker = if production { &mut self.production } else { &mut self.diagnostic };
         // A checked error can still leave a partially constructed native owner, and an
         // indeterminate effect must never be replayed. Reject every later attempt before it can
         // overwrite a retained cap, mapping, FS claim or bootstrap state.
-        if core::mem::replace(&mut self.start_attempted, true) {
+        if core::mem::replace(&mut worker.start_attempted, true) {
             return Err(ProbeFailure::at(b"start-already-attempted", u64::MAX));
         }
         let _durable = allocator::enter_durable();
-        let tcb = unsafe { retype_owned(&mut self.tcb, OBJ_TCB, 0, true, b"tcb-retype")? };
+        let tcb = unsafe { retype_owned(&mut worker.tcb, OBJ_TCB, 0, true, b"tcb-retype")? };
         // Fresh root CSpace slots are never recycled by this owner. The retype above creates
         // one physical TCB and this identity is not reused before its confirmed retirement.
         let identity = TcbIdentity::new(tcb, 1);
-        self.identity = Some(identity);
+        worker.identity = Some(identity);
         let endpoint = unsafe {
             retype_owned(
-                &mut self.endpoint,
+                &mut worker.endpoint,
                 OBJ_ENDPOINT,
                 0,
                 false,
                 b"endpoint-retype",
             )?
         };
-        let reply = unsafe { retype_owned(&mut self.reply, OBJ_REPLY, 0, false, b"reply-retype")? };
+        let reply = unsafe { retype_owned(&mut worker.reply, OBJ_REPLY, 0, false, b"reply-retype")? };
         let ipc_frame = unsafe {
             retype_owned(
-                &mut self.ipc_frame,
+                &mut worker.ipc_frame,
                 OBJ_X86_4K_PAGE,
                 PAGING_BITS,
                 false,
                 b"ipc-retype",
             )?
         };
-        for (index, slot) in self.stack_frames.iter_mut().enumerate() {
+        for (index, slot) in worker.stack_frames.iter_mut().enumerate() {
             let frame = unsafe {
                 retype_owned(slot, OBJ_X86_4K_PAGE, PAGING_BITS, false, b"stack-retype")?
             };
-            let va = STACK_FIRST + index as u64 * 0x1000;
+            let va = worker.slot.stack.base + index as u64 * 0x1000;
             if !unsafe { ensure_executive_paging(va) } {
                 return Err(ProbeFailure::at(b"stack-paging", va));
             }
@@ -181,21 +239,21 @@ impl NativeWorkerProbe {
             })?;
         }
         // The pages immediately below and above the mapped stack remain unmapped guards.
-        if !unsafe { ensure_executive_paging(IPC_VA) } {
-            return Err(ProbeFailure::at(b"ipc-paging", IPC_VA));
+        if !unsafe { ensure_executive_paging(worker.slot.ipc.base) } {
+            return Err(ProbeFailure::at(b"ipc-paging", worker.slot.ipc.base));
         }
         checked(b"ipc-map", unsafe {
-            page_map_r(ipc_frame, IPC_VA, RW_NX, CAP_INIT_THREAD_VSPACE)
+            page_map_r(ipc_frame, worker.slot.ipc.base, RW_NX, CAP_INIT_THREAD_VSPACE)
         })?;
 
         checked(b"tcb-space", unsafe {
             tcb_set_space_r(tcb, 0, CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE)
         })?;
         checked(b"tcb-ipc", unsafe {
-            tcb_set_ipc_buffer_r(tcb, IPC_VA, ipc_frame)
+            tcb_set_ipc_buffer_r(tcb, worker.slot.ipc.base, ipc_frame)
         })?;
         checked(b"tcb-priority", unsafe { tcb_set_priority_r(tcb, 100) })?;
-        self.bootstrap_sc = Some(
+        worker.bootstrap_sc = Some(
             unsafe { thread_sched_context::attach_sched_context(tcb) }
                 .map_err(|status| ProbeFailure::at(b"bootstrap-sc", status))?,
         );
@@ -208,19 +266,19 @@ impl NativeWorkerProbe {
                     .ok_or(ProbeFailure::at(b"root-owner", 0))?,
             )
             .map_err(|_| ProbeFailure::at(b"register-unready", u64::MAX))?;
-        self.executor = Some(executor);
+        worker.executor = Some(executor);
         let payload = try_box(ExecutorLocal::new(), b"local-alloc")?;
         unsafe { payload.initialize_self_anchor() };
-        self.unbound_local = Some(payload);
-        self.unbound_claim = Some(
+        worker.unbound_local = Some(payload);
+        worker.unbound_claim = Some(
             unsafe { PhysicalTcbClaim::new(identity, tcb) }
                 .map_err(|_| ProbeFailure::at(b"tcb-claim", u64::MAX))?,
         );
-        let payload = self
+        let payload = worker
             .unbound_local
             .take()
             .ok_or(ProbeFailure::at(b"local-owner", 0))?;
-        let claim = self
+        let claim = worker
             .unbound_claim
             .take()
             .ok_or(ProbeFailure::at(b"tcb-owner", 0))?;
@@ -230,12 +288,35 @@ impl NativeWorkerProbe {
         {
             Ok(anchor) => anchor,
             Err((_, payload, claim)) => {
-                self.unbound_local = Some(payload);
-                self.unbound_claim = Some(claim);
+                worker.unbound_local = Some(payload);
+                worker.unbound_claim = Some(claim);
                 return Err(ProbeFailure::at(b"local-bind", u64::MAX));
             }
         };
-        self.anchor = Some(anchor);
+        worker.anchor = Some(anchor);
+        let ingress_claim = unsafe {
+            PhysicalWorkerEndpointClaim::from_native(
+                self.locals.physical_claim_for(anchor, identity, executor)
+                    .map_err(|_| ProbeFailure::at(b"ingress-tcb-owner", 0))?,
+                endpoint,
+                1,
+            )
+        }.map_err(|_| ProbeFailure::at(b"ingress-endpoint-owner", 0))?;
+        worker.ingress_claim = Some(ingress_claim);
+        let reply_identity = self.private_replies.insert_free(reply)
+            .map_err(|_| ProbeFailure::at(b"ingress-reply-owner", 0))?;
+        worker.private_reply = Some(reply_identity);
+        // Reserve the physical Reply before the worker can offer it in its private receive.
+        // A later failed bootstrap keeps this claim with the durable owner.
+        self.private_replies.mark_used(reply_identity)
+            .map_err(|_| ProbeFailure::at(b"ingress-reply-claim", 0))?;
+        self.table.admit_private_ingress(
+            self.root.as_ref().ok_or(ProbeFailure::at(b"root-owner", 0))?,
+            executor,
+            worker.ingress_claim.as_ref().ok_or(ProbeFailure::at(b"ingress-claim", 0))?,
+            &self.private_replies,
+            reply_identity,
+        ).map_err(|_| ProbeFailure::at(b"ingress-admission", 0))?;
         let attempt = self
             .locals
             .begin_fs_install(anchor, &self.table)
@@ -247,12 +328,12 @@ impl NativeWorkerProbe {
             // The attempt stays Installing and the registry retains its payload and TCB claim.
             return Err(ProbeFailure::at(b"fs-install", result));
         }
-        self.fs_ack = Some(
+        worker.fs_ack = Some(
             unsafe { self.locals.acknowledge_fs_install(attempt) }
                 .map_err(|_| ProbeFailure::at(b"fs-ack", u64::MAX))?,
         );
 
-        self.entry_args = Some(try_box(
+        worker.entry_args = Some(try_box(
             WorkerEntryArgs {
                 endpoint,
                 reply,
@@ -260,24 +341,24 @@ impl NativeWorkerProbe {
             },
             b"entry-alloc",
         )?);
-        let args = self
+        let args = worker
             .entry_args
             .as_deref()
             .ok_or(ProbeFailure::at(b"entry-owner", 0))?
             as *const WorkerEntryArgs as u64;
         checked(b"tcb-registers", unsafe {
-            tcb_write_registers_r(tcb, worker_entry as *const () as u64, STACK_TOP - 8, args)
+            tcb_write_registers_r(tcb, worker_entry as *const () as u64, worker.slot.stack.end() - 8, args)
         })?;
         let resources = unsafe {
             WorkerBootstrapResources::from_native_owned(
                 tcb,
                 endpoint,
-                self.bootstrap_sc.ok_or(ProbeFailure::at(b"sc-owner", 0))?,
+                worker.bootstrap_sc.ok_or(ProbeFailure::at(b"sc-owner", 0))?,
                 ipc_frame,
                 reply,
             )
         };
-        self.bootstrap = Some(
+        worker.bootstrap = Some(
             PassiveWorkerBootstrap::new(resources)
                 .map_err(|_| ProbeFailure::at(b"bootstrap-owner", u64::MAX))?,
         );
@@ -289,10 +370,14 @@ impl NativeWorkerProbe {
         // YieldTo then reports IllegalOperation because the target is already blocked; only
         // the checked unbind ACK below proves the blocked receive and offered Reply.
         let yield_status = sel4_rt::tcb_yield_to(tcb);
-        crate::print_str(b"[executor-passive-worker-probe] yield-status=");
+        crate::print_str(if production {
+            b"[executor-production-worker] yield-status="
+        } else {
+            b"[executor-passive-worker-probe] yield-status="
+        });
         crate::print_hex_u64(yield_status);
         crate::print_str(b"\n");
-        self.bootstrap
+        worker.bootstrap
             .as_mut()
             .ok_or(ProbeFailure::at(b"bootstrap-missing", 0))?
             .try_unbind(&mut NativeUnbinder)
@@ -302,23 +387,37 @@ impl NativeWorkerProbe {
                 }
                 _ => ProbeFailure::at(b"checked-unbind-state", u64::MAX),
             })?;
-        let passive = self
+        let passive = worker
             .bootstrap
             .as_mut()
             .and_then(PassiveWorkerBootstrap::take_passive)
             .ok_or(ProbeFailure::at(b"passive-owner", 0))?;
-        self.passive = Some(passive);
-        self.ready = Some(
+        worker.passive = Some(passive);
+        worker.ready = Some(
             unsafe {
-                self.passive
+                worker.passive
                     .as_mut()
                     .ok_or(ProbeFailure::at(b"passive-missing", 0))?
                     .issue_ready_proof_once(executor, identity, tcb)
             }
             .map_err(|_| ProbeFailure::at(b"ready-proof", u64::MAX))?,
         );
-        let fs_ack = self.fs_ack.take().ok_or(ProbeFailure::at(b"fs-proof", 0))?;
-        let ready = self
+        #[cfg(feature = "executor-fault-supervisor-probe")]
+        if production {
+            // Keep the worker Unready until its separate fault receiver is installed. A
+            // refusal retains both owners, with no path to the run token or a second attempt.
+            self.production_supervisor = Some(
+                NativeSupervisorProbe::try_new_boxed_for_worker(1)?
+            );
+            let supervisor = self.production_supervisor.as_mut()
+                .ok_or(ProbeFailure::at(b"production-supervisor-owner", 0))?;
+            let fault_endpoint = unsafe { supervisor.prepare(tcb, reply)? };
+            checked(b"production-fault-handler", unsafe {
+                tcb_set_space_r(tcb, fault_endpoint, 0, 0)
+            })?;
+        }
+        let fs_ack = worker.fs_ack.take().ok_or(ProbeFailure::at(b"fs-proof", 0))?;
+        let ready = worker
             .ready
             .take()
             .ok_or(ProbeFailure::at(b"ready-owner", 0))?;
@@ -332,8 +431,8 @@ impl NativeWorkerProbe {
             Ok(activated) if activated == executor => Ok(()),
             Ok(_) => Err(ProbeFailure::at(b"activate-identity", u64::MAX)),
             Err((_, fs_ack, ready)) => {
-                self.fs_ack = Some(fs_ack);
-                self.ready = Some(ready);
+                worker.fs_ack = Some(fs_ack);
+                worker.ready = Some(ready);
                 Err(ProbeFailure::at(b"activate-unready", u64::MAX))
             }
         }
@@ -353,29 +452,29 @@ impl NativeWorkerProbe {
             return Err(ProbeFailure::at(b"fault-probe-already-attempted", u64::MAX));
         }
         let _durable = allocator::enter_durable();
-        let executor = self
+        let executor = self.diagnostic
             .executor
             .ok_or(ProbeFailure::at(b"fault-executor-owner", 0))?;
         if self.table.state(executor) != Ok(ExecutorState::Idle) {
             return Err(ProbeFailure::at(b"fault-worker-not-idle", 0));
         }
-        let tcb = self
+        let tcb = self.diagnostic
             .tcb
             .as_ref()
             .ok_or(ProbeFailure::at(b"fault-tcb-owner", 0))?
             .value();
-        let identity = self
+        let identity = self.diagnostic
             .identity
             .ok_or(ProbeFailure::at(b"fault-tcb-identity", 0))?;
-        let anchor = self
+        let anchor = self.diagnostic
             .anchor
             .ok_or(ProbeFailure::at(b"fault-local-anchor", 0))?;
-        let endpoint = self
+        let endpoint = self.diagnostic
             .endpoint
             .as_ref()
             .ok_or(ProbeFailure::at(b"fault-endpoint-owner", 0))?
             .value();
-        let worker_reply = self
+        let worker_reply = self.diagnostic
             .reply
             .as_ref()
             .ok_or(ProbeFailure::at(b"fault-reply-owner", 0))?
